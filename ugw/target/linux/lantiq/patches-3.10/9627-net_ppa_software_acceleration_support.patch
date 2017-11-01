@@ -1,0 +1,162 @@
+# HG changeset patch
+# Parent b2511facad1597e5ff741407631dacd2d12f74e8
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2904,6 +2904,10 @@ static inline void ____napi_schedule(str
+ 	__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
++extern int32_t (*ppa_sw_fastpath_send_hook)(struct sk_buff *skb);
++#endif
++
+ #ifdef CONFIG_RPS
+ 
+ /* One global table that all flow-based protocols share. */
+@@ -3196,6 +3200,15 @@ int netif_rx(struct sk_buff *skb)
+ 	net_timestamp_check(netdev_tstamp_prequeue, skb);
+ 
+ 	trace_netif_rx(skb);
++
++#if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
++        if(ppa_sw_fastpath_send_hook!=NULL) {
++                if(ppa_sw_fastpath_send_hook(skb) == 0)
++                        return NET_RX_SUCCESS;
++        }
++#endif
++
++
+ #ifdef CONFIG_RPS
+ 	if (static_key_false(&rps_needed)) {
+ 		struct rps_dev_flow voidflow, *rflow = &voidflow;
+diff --git a/net/ipv4/ip_input.c b/net/ipv4/ip_input.c
+--- a/net/ipv4/ip_input.c
++++ b/net/ipv4/ip_input.c
+@@ -145,7 +145,9 @@
+ #include <net/xfrm.h>
+ #include <linux/mroute.h>
+ #include <linux/netlink.h>
+-
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
+ /*
+  *	Process Router Attention IP option (RFC 2113)
+  */
+@@ -190,8 +192,29 @@ static int ip_local_deliver_finish(struc
+ {
+ 	struct net *net = dev_net(skb->dev);
+ 
++#if (defined(CONFIG_LTQ_PPA_LRO) && CONFIG_LTQ_PPA_LRO) || (defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH)
++        if ( ppa_hook_session_add_fn != NULL )
++        {
++	    bool accel_st=0;
++#ifdef CONFIG_NETWORK_EXTMARK
++	    GET_DATA_FROM_MARK_OPT(skb->extmark, LROSESS_MASK, LROSESS_START_BIT_POS, accel_st);
++#endif
++	    if (accel_st) {
++		struct nf_conn *ct;
++
++		enum ip_conntrack_info ctinfo;
++		uint32_t flags;
++
++		ct = nf_ct_get(skb, &ctinfo);
++		flags =PPA_F_SESSION_LOCAL_IN;  //  local in
++		flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ? PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
++
++		ppa_hook_session_add_fn(skb, ct, flags);
++	    }
++	}
++#endif
++
+ 	__skb_pull(skb, skb_network_header_len(skb));
+-
+ 	rcu_read_lock();
+ 	{
+ 		int protocol = ip_hdr(skb)->protocol;
+@@ -454,3 +477,45 @@ drop:
+ out:
+ 	return NET_RX_DROP;
+ }
++
++#if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
++int ppa_sw_litepath_local_deliver(struct sk_buff *skb)
++{
++    int ret=0;
++    const struct net_protocol *ipprot;
++    int protocol = ip_hdr(skb)->protocol;
++    struct net *net = dev_net(skb->dev);
++
++    rcu_read_lock();
++    {
++resubmit:
++    
++	ipprot = rcu_dereference(inet_protos[protocol]);
++	if (ipprot != NULL) {
++	    if (!ipprot->no_policy) {
++		if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
++		    kfree_skb(skb);
++		    printk("local_finish failed: %d\n",__LINE__);
++		    goto out;
++		}
++		nf_reset(skb);
++	   }
++			
++	    ret = ipprot->handler(skb);
++	    if (ret < 0) {
++                protocol = -ret;
++		printk("local_finish failed: %d\n",__LINE__);
++                goto resubmit;
++            }
++	    IP_INC_STATS_BH(net, IPSTATS_MIB_INDELIVERS);
++	} else {
++	    IP_INC_STATS_BH(net, IPSTATS_MIB_INDELIVERS);
++            consume_skb(skb);
++        }
++    }
++out:
++    rcu_read_unlock();
++    return ret;
++}
++EXPORT_SYMBOL(ppa_sw_litepath_local_deliver);
++#endif
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -42,6 +42,9 @@
+ #include <linux/gfp.h>
+ #include <linux/module.h>
+ 
++#if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
++extern int32_t (*ppa_sw_litepath_tcp_send_hook)(struct sk_buff *skb);
++#endif
+ /* People can turn this off for buggy TCP's found in printers etc. */
+ int sysctl_tcp_retrans_collapse __read_mostly = 1;
+ 
+@@ -947,7 +950,24 @@ static int tcp_transmit_skb(struct sock 
+ 		TCP_ADD_STATS(sock_net(sk), TCP_MIB_OUTSEGS,
+ 			      tcp_skb_pcount(skb));
+ 
++#if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
++	if (sk->sk_state == TCP_ESTABLISHED) {
++/*		printk("family=%d proto=%d saddr:%pI4 dport:%d daddr:%pI4 dport:%d ct=%x\n",
++          		skb->sk->sk_family,skb->sk->sk_protocol,
++          		&(inet->inet_saddr),inet->inet_sport,
++          		&(inet->inet_daddr),inet->inet_dport, skb->nfct); */
++		if(ppa_sw_litepath_tcp_send_hook) {
++			err = ppa_sw_litepath_tcp_send_hook(skb);	
++			if(!err)
++				goto xmit_done;
++		}
++	} 
++#endif
+ 	err = icsk->icsk_af_ops->queue_xmit(skb, &inet->cork.fl);
++
++#if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
++xmit_done:
++#endif
+ 	if (likely(err <= 0))
+ 		return err;
+ 

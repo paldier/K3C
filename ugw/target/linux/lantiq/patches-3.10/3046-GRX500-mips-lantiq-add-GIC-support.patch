@@ -1,0 +1,2406 @@
+# HG changeset patch
+# Parent e9f9697465372af4c6275b4fc1f8fc960b821180
+
+diff --git a/arch/mips/include/asm/gic.h b/arch/mips/include/asm/gic.h
+--- a/arch/mips/include/asm/gic.h
++++ b/arch/mips/include/asm/gic.h
+@@ -11,6 +11,9 @@
+ #ifndef _ASM_GICREGS_H
+ #define _ASM_GICREGS_H
+ 
++#include <linux/bitmap.h>
++#include <linux/threads.h>
++
+ #undef	GICISBYTELITTLEENDIAN
+ 
+ /* Constants */
+@@ -18,9 +21,13 @@
+ #define GIC_POL_NEG			0
+ #define GIC_TRIG_EDGE			1
+ #define GIC_TRIG_LEVEL			0
+-
++#define GIC_TRIG_DUAL_ENABLE		1
++#define GIC_TRIG_DUAL_DISABLE		0
++#ifndef CONFIG_SOC_GRX500
+ #define GIC_NUM_INTRS			(24 + NR_CPUS * 2)
+-
++#else
++#define GIC_NUM_INTRS		256
++#endif
+ #define MSK(n) ((1 << (n)) - 1)
+ #define REG32(addr)		(*(volatile unsigned int *) (addr))
+ #define REG(base, offs)		REG32((unsigned long)(base) + offs##_##OFS)
+@@ -40,19 +47,18 @@
+ #ifdef GICISBYTELITTLEENDIAN
+ #define GICREAD(reg, data)	((data) = (reg), (data) = le32_to_cpu(data))
+ #define GICWRITE(reg, data)	((reg) = cpu_to_le32(data))
+-#define GICBIS(reg, bits)			\
+-	({unsigned int data;			\
+-		GICREAD(reg, data);		\
+-		data |= bits;			\
+-		GICWRITE(reg, data);		\
+-	})
+-
+ #else
+ #define GICREAD(reg, data)	((data) = (reg))
+ #define GICWRITE(reg, data)	((reg) = (data))
+-#define GICBIS(reg, bits)	((reg) |= (bits))
+ #endif
+ 
++#define GICBIS(reg, mask, bits)			\
++	do { u32 data;				\
++		GICREAD((reg), data);		\
++		data &= ~(mask);		\
++		data |= (bits) & (mask);	\
++		GICWRITE((reg), data);		\
++	} while (0)
+ 
+ /* GIC Address Space */
+ #define SHARED_SECTION_OFS		0x0000
+@@ -167,13 +173,22 @@
+ #define GIC_SH_SET_POLARITY_OFS		0x0100
+ #define GIC_SET_POLARITY(intr, pol) \
+ 	GICBIS(GIC_REG_ADDR(SHARED, GIC_SH_SET_POLARITY_OFS + \
+-		GIC_INTR_OFS(intr)), (pol) << GIC_INTR_BIT(intr))
++		GIC_INTR_OFS(intr)), (1 << GIC_INTR_BIT(intr)), \
++		(pol) << GIC_INTR_BIT(intr))
+ 
+ /* Triggering : Reset Value is always 0 */
+ #define GIC_SH_SET_TRIGGER_OFS		0x0180
+ #define GIC_SET_TRIGGER(intr, trig) \
+ 	GICBIS(GIC_REG_ADDR(SHARED, GIC_SH_SET_TRIGGER_OFS + \
+-		GIC_INTR_OFS(intr)), (trig) << GIC_INTR_BIT(intr))
++		GIC_INTR_OFS(intr)), (1 << GIC_INTR_BIT(intr)), \
++		(trig) << GIC_INTR_BIT(intr))
++
++/* Dual edge triggering : Reset Value is always 0 */
++#define GIC_SH_SET_DUAL_OFS		0x0200
++#define GIC_SET_DUAL(intr, dual) \
++	GICBIS(GIC_REG_ADDR(SHARED, GIC_SH_SET_DUAL_OFS + \
++		GIC_INTR_OFS(intr)), (1 << GIC_INTR_BIT(intr)), \
++		(dual) << GIC_INTR_BIT(intr))
+ 
+ /* Mask manipulation */
+ #define GIC_SH_SMASK_OFS		0x0380
+@@ -194,6 +209,7 @@
+ #define GIC_VPE_WD_MAP_OFS		0x0040
+ #define GIC_VPE_COMPARE_MAP_OFS		0x0044
+ #define GIC_VPE_TIMER_MAP_OFS		0x0048
++#define GIC_VPE_FDC_MAP_OFS		0x004c
+ #define GIC_VPE_PERFCTR_MAP_OFS		0x0050
+ #define GIC_VPE_SWINT0_MAP_OFS		0x0054
+ #define GIC_VPE_SWINT1_MAP_OFS		0x0058
+@@ -204,6 +220,10 @@
+ #define GIC_VPE_COMPARE_LO_OFS		0x00a0
+ #define GIC_VPE_COMPARE_HI_OFS		0x00a4
+ 
++#define GIC_VPE_MAP_OFS			0x0040
++#define GIC_VPE_MAP_TO_PIN(intr) \
++	(GIC_VPE_MAP_OFS + 4 * (intr))
++
+ #define GIC_VPE_EIC_SHADOW_SET_BASE	0x0100
+ #define GIC_VPE_EIC_SS(intr) \
+ 	(GIC_VPE_EIC_SHADOW_SET_BASE + (4 * intr))
+@@ -247,6 +267,10 @@
+ #define GIC_MAP_MSK			(MSK(6) << GIC_MAP_SHF)
+ 
+ /* GIC_VPE_CTL Masks */
++#define GIC_VPE_CTL_FDC_RTBL_SHF	4
++#define GIC_VPE_CTL_FDC_RTBL_MSK	(MSK(1) << GIC_VPE_CTL_FDC_RTBL_SHF)
++#define GIC_VPE_CTL_SWINT_RTBL_SHF	3
++#define GIC_VPE_CTL_SWINT_RTBL_MSK	(MSK(1) << GIC_VPE_CTL_SWINT_RTBL_SHF)
+ #define GIC_VPE_CTL_PERFCNT_RTBL_SHF	2
+ #define GIC_VPE_CTL_PERFCNT_RTBL_MSK	(MSK(1) << GIC_VPE_CTL_PERFCNT_RTBL_SHF)
+ #define GIC_VPE_CTL_TIMER_RTBL_SHF	1
+@@ -303,17 +327,6 @@
+ 	GICWRITE(GIC_REG_ADDR(SHARED, GIC_SH_MAP_TO_VPE_REG_OFF(intr, vpe)), \
+ 		 GIC_SH_MAP_TO_VPE_REG_BIT(vpe))
+ 
+-struct gic_pcpu_mask {
+-	DECLARE_BITMAP(pcpu_mask, GIC_NUM_INTRS);
+-};
+-
+-struct gic_pending_regs {
+-	DECLARE_BITMAP(pending, GIC_NUM_INTRS);
+-};
+-
+-struct gic_intrmask_regs {
+-	DECLARE_BITMAP(intrmask, GIC_NUM_INTRS);
+-};
+ 
+ /*
+  * Interrupt Meta-data specification. The ipiflag helps
+@@ -326,8 +339,10 @@ struct gic_intr_map {
+ 	unsigned int polarity;	/* Polarity : +/-	*/
+ 	unsigned int trigtype;	/* Trigger  : Edge/Levl */
+ 	unsigned int flags;	/* Misc flags	*/
+-#define GIC_FLAG_IPI	       0x01
+-#define GIC_FLAG_TRANSPARENT   0x02
++#define GIC_FLAG_IPI		0x01
++#define GIC_FLAG_TRANSPARENT	0x02
++#define GIC_FLAG_VMB_IPI	0x04
++#define GIC_FLAG_MUX		0x08
+ };
+ 
+ /*
+@@ -347,11 +362,25 @@ struct gic_shared_intr_map {
+ #define GIC_CPU_INT2		2 /* .		      */
+ #define GIC_CPU_INT3		3 /* .		      */
+ #define GIC_CPU_INT4		4 /* .		      */
+-#define GIC_CPU_INT5		5 /* Core Interrupt 5 */
++#define GIC_CPU_INT5		5 /* Core Interrupt 7 */
+ 
+ /* Local GIC interrupts. */
+-#define GIC_INT_TMR		(GIC_CPU_INT5)
+-#define GIC_INT_PERFCTR		(GIC_CPU_INT5)
++#define GIC_LOCAL_INT_WD	0 /* GIC watchdog */
++#define GIC_LOCAL_INT_COMPARE	1 /* GIC count and compare timer */
++#define GIC_LOCAL_INT_TIMER	2 /* CPU CP0 timer interrupt */
++#define GIC_LOCAL_INT_PERFCTR	3 /* CPU performance counter */
++#define GIC_LOCAL_INT_SWINT0	4 /* CPU software interrupt 0 */
++#define GIC_LOCAL_INT_SWINT1	5 /* CPU software interrupt 1 */
++#define GIC_LOCAL_INT_FDC	6 /* CPU fast debug channel */
++#define GIC_NUM_LOCAL_INTRS	7
++
++/* Convert between local/shared IRQ number and GIC HW IRQ number. */
++#define GIC_LOCAL_HWIRQ_BASE	0
++#define GIC_LOCAL_TO_HWIRQ(x)	(GIC_LOCAL_HWIRQ_BASE + (x))
++#define GIC_HWIRQ_TO_LOCAL(x)	((x) - GIC_LOCAL_HWIRQ_BASE)
++#define GIC_SHARED_HWIRQ_BASE	GIC_NUM_LOCAL_INTRS
++#define GIC_SHARED_TO_HWIRQ(x)	(GIC_SHARED_HWIRQ_BASE + (x))
++#define GIC_HWIRQ_TO_SHARED(x)	((x) - GIC_SHARED_HWIRQ_BASE)
+ 
+ /* Add 2 to convert non-EIC hardware interrupt to EIC vector number. */
+ #define GIC_CPU_TO_VEC_OFFSET	(2)
+@@ -382,10 +411,23 @@ extern unsigned int plat_ipi_call_int_xl
+ extern unsigned int plat_ipi_resched_int_xlate(unsigned int);
+ extern void gic_bind_eic_interrupt(int irq, int set);
+ extern unsigned int gic_get_timer_pending(void);
+-extern unsigned int gic_get_int(void);
++extern int gic_get_c0_compare_int(void);
++extern int gic_get_c0_perfcount_int(void);
++extern void gic_shared_irq_dispatch(void);
++extern void gic_shared_irq_vi2_dispatch(void);
++extern void gic_shared_irq_vi3_dispatch(void);
++extern void gic_shared_irq_vi4_dispatch(void);
++extern void gic_shared_irq_vi5_dispatch(void);
++extern void gic_shared_irq_vi6_dispatch(void);
++extern void gic_local_irq_dispatch(void);
+ extern void gic_enable_interrupt(int irq_vec);
+ extern void gic_disable_interrupt(int irq_vec);
+ extern void gic_irq_ack(struct irq_data *d);
+ extern void gic_finish_irq(struct irq_data *d);
++#ifndef CONFIG_SOC_GRX500_A21
++extern void pcie_intx_war(unsigned int irq);
++#endif /* CONFIG_SOC_GRX500_A21 */
++extern bool ltq_vpe_run_linux_os(int cpu_id);
+ extern void gic_platform_init(int irqs, struct irq_chip *irq_controller);
++int gic_yield_setup(unsigned int cpu, unsigned int pin, unsigned int intr);
+ #endif /* _ASM_GICREGS_H */
+diff --git a/arch/mips/include/asm/mach-generic/irq.h b/arch/mips/include/asm/mach-generic/irq.h
+--- a/arch/mips/include/asm/mach-generic/irq.h
++++ b/arch/mips/include/asm/mach-generic/irq.h
+@@ -36,4 +36,13 @@
+ 
+ #endif /* CONFIG_IRQ_CPU */
+ 
++#ifdef CONFIG_IRQ_GIC
++#ifndef MIPS_GIC_IRQ_BASE
++#define MIPS_GIC_IRQ_BASE (MIPS_CPU_IRQ_BASE + 8)
++#endif
++
++#define MIPS_GIC_LOCAL_IRQ_BASE (MIPS_GIC_IRQ_BASE + GIC_NUM_INTRS)
++
++#endif /* CONFIG_IRQ_GIC */
++
+ #endif /* __ASM_MACH_GENERIC_IRQ_H */
+diff --git a/arch/mips/include/asm/mach-lantiq/grx500/irq.h b/arch/mips/include/asm/mach-lantiq/grx500/irq.h
+--- a/arch/mips/include/asm/mach-lantiq/grx500/irq.h
++++ b/arch/mips/include/asm/mach-lantiq/grx500/irq.h
+@@ -3,15 +3,26 @@
+  *  under the terms of the GNU General Public License version 2 as published
+  *  by the Free Software Foundation.
+  *
+- *  Copyright (C) 2010 John Crispin <blogic@openwrt.org>
++ *  Copyright (C) 2014 Lei Chuanhua <Chuanhua.lei@lantiq.com>
+  */
+ 
+ #ifndef __LANTIQ_IRQ_H
+ #define __LANTIQ_IRQ_H
+ 
+-#include <lantiq_irq.h>
++#define MIPS_CPU_IRQ_BASE	0
++#define MIPS_GIC_IRQ_BASE	(MIPS_CPU_IRQ_BASE + 8)
+ 
+-#define NR_IRQS 256
++#define GPIO0_IRQ_BASE		271
++#define GPIO1_IRQ_BASE		303
++#define DMA0_IRQ_BASE		335
++#define DMA1TX_IRQ_BASE		351
++#define DMA1RX_IRQ_BASE		367
++#define DMA2TX_IRQ_BASE		399
++#define DMA2RX_IRQ_BASE		415
++#define DMA3_IRQ_BASE		447
++#define DMA4_IRQ_BASE		511
++
++#define NR_IRQS 527
+ 
+ #include_next <irq.h>
+ 
+diff --git a/arch/mips/include/asm/mach-lantiq/grx500/lantiq_irq.h b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_irq.h
+--- a/arch/mips/include/asm/mach-lantiq/grx500/lantiq_irq.h
++++ b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_irq.h
+@@ -6,21 +6,9 @@
+  *  Copyright (C) 2010 John Crispin <blogic@openwrt.org>
+  */
+ 
+-#ifndef _LANTIQ_XWAY_IRQ_H__
+-#define _LANTIQ_XWAY_IRQ_H__
++#ifndef _LANTIQ_LANTIQ_IRQ_H__
++#define _LANTIQ_LANTIQ_IRQ_H__
+ 
+-#define INT_NUM_IRQ0		8
+-#define INT_NUM_IM0_IRL0	(INT_NUM_IRQ0 + 0)
+-#define INT_NUM_IM1_IRL0	(INT_NUM_IRQ0 + 32)
+-#define INT_NUM_IM2_IRL0	(INT_NUM_IRQ0 + 64)
+-#define INT_NUM_IM3_IRL0	(INT_NUM_IRQ0 + 96)
+-#define INT_NUM_IM4_IRL0	(INT_NUM_IRQ0 + 128)
+-#define INT_NUM_IM_OFFSET	(INT_NUM_IM1_IRL0 - INT_NUM_IM0_IRL0)
+ 
+-#define LTQ_DMA_CH0_INT		(INT_NUM_IM2_IRL0)
+-
+-#define MIPS_CPU_TIMER_IRQ	7
+-
+-#define MAX_IM			5
+ 
+ #endif
+diff --git a/arch/mips/include/asm/time.h b/arch/mips/include/asm/time.h
+--- a/arch/mips/include/asm/time.h
++++ b/arch/mips/include/asm/time.h
+@@ -47,7 +47,7 @@ extern unsigned int mips_hpt_frequency;
+  * so it lives here.
+  */
+ extern int (*perf_irq)(void);
+-
++extern int __weak get_c0_perfcount_int(void);
+ /*
+  * Initialize the calling CPU's compare interrupt as clockevent device
+  */
+diff --git a/arch/mips/kernel/cevt-gic.c b/arch/mips/kernel/cevt-gic.c
+--- a/arch/mips/kernel/cevt-gic.c
++++ b/arch/mips/kernel/cevt-gic.c
+@@ -13,7 +13,6 @@
+ 
+ #include <asm/time.h>
+ #include <asm/gic.h>
+-#include <asm/mips-boards/maltaint.h>
+ 
+ DEFINE_PER_CPU(struct clock_event_device, gic_clockevent_device);
+ int gic_timer_irq_installed;
+@@ -51,7 +50,7 @@ irqreturn_t gic_compare_interrupt(int ir
+ struct irqaction gic_compare_irqaction = {
+ 	.handler = gic_compare_interrupt,
+ 	.flags = IRQF_PERCPU | IRQF_TIMER,
+-	.name = "timer",
++	.name = "Local timer",
+ };
+ 
+ 
+@@ -68,11 +67,12 @@ int __cpuinit gic_clockevent_init(void)
+ 	if (!cpu_has_counter || !gic_frequency)
+ 		return -ENXIO;
+ 
+-	irq = MIPS_GIC_IRQ_BASE;
++	irq = MIPS_GIC_LOCAL_IRQ_BASE
++		+ GIC_LOCAL_TO_HWIRQ(GIC_LOCAL_INT_COMPARE);
+ 
+ 	cd = &per_cpu(gic_clockevent_device, cpu);
+ 
+-	cd->name		= "MIPS GIC";
++	cd->name		= "MIPS GIC Local";
+ 	cd->features		= CLOCK_EVT_FEAT_ONESHOT;
+ 
+ 	clockevent_set_clock(cd, gic_frequency);
+@@ -89,16 +89,10 @@ int __cpuinit gic_clockevent_init(void)
+ 	cd->event_handler	= gic_event_handler;
+ 
+ 	clockevents_register_device(cd);
+-
+-	GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_COMPARE_MAP), 0x80000002);
+-	GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_SMASK), GIC_VPE_SMASK_CMP_MSK);
+-
+-	if (gic_timer_irq_installed)
+-		return 0;
+-
+-	gic_timer_irq_installed = 1;
+-
+-	setup_irq(irq, &gic_compare_irqaction);
+-	irq_set_handler(irq, handle_percpu_irq);
++	if (!gic_timer_irq_installed) {
++		setup_percpu_irq(irq, &gic_compare_irqaction);
++		gic_timer_irq_installed = 1;
++	}
++	enable_percpu_irq(irq, 0);
+ 	return 0;
+ }
+diff --git a/arch/mips/kernel/cevt-r4k.c b/arch/mips/kernel/cevt-r4k.c
+--- a/arch/mips/kernel/cevt-r4k.c
++++ b/arch/mips/kernel/cevt-r4k.c
+@@ -72,9 +72,6 @@ irqreturn_t c0_compare_interrupt(int irq
+ 		/* Clear Count/Compare Interrupt */
+ 		write_c0_compare(read_c0_compare());
+ 		cd = &per_cpu(mips_clockevent_device, cpu);
+-#ifdef CONFIG_CEVT_GIC
+-		if (!gic_present)
+-#endif
+ 		cd->event_handler(cd);
+ 	}
+ 
+@@ -120,7 +117,7 @@ int c0_compare_int_usable(void)
+ 	unsigned int cnt;
+ 
+ #ifdef CONFIG_KVM_GUEST
+-    return 1;
++	return 1;
+ #endif
+ 
+ 	/*
+@@ -210,9 +207,6 @@ int __cpuinit r4k_clockevent_init(void)
+ 	cd->set_mode		= mips_set_clock_mode;
+ 	cd->event_handler	= mips_event_handler;
+ 
+-#ifdef CONFIG_CEVT_GIC
+-	if (!gic_present)
+-#endif
+ 	clockevents_register_device(cd);
+ 
+ 	if (cp0_timer_irq_installed)
+diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
+--- a/arch/mips/kernel/irq-gic.c
++++ b/arch/mips/kernel/irq-gic.c
+@@ -11,8 +11,8 @@
+ #include <linux/smp.h>
+ #include <linux/irq.h>
+ #include <linux/clocksource.h>
++#include <linux/io.h>
+ 
+-#include <asm/io.h>
+ #include <asm/gic.h>
+ #include <asm/setup.h>
+ #include <asm/traps.h>
+@@ -20,18 +20,87 @@
+ #include <linux/hardirq.h>
+ #include <asm-generic/bitops/find.h>
+ 
++/* The following defintions must match the static interrupt routing table */
++#define GIC_VI2_NUM_INTRS	64
++#define GIC_VI3_NUM_INTRS	64
++#define GIC_VI4_NUM_INTRS	32
++#define GIC_VI5_NUM_INTRS	32
++#define GIC_VI6_NUM_INTRS	64
++
++#define GIC_VI2_INTRS_BASE	0
++#define GIC_VI3_INTRS_BASE	GIC_VI2_NUM_INTRS
++#define GIC_VI4_INTRS_BASE	(GIC_VI2_NUM_INTRS + GIC_VI3_NUM_INTRS)
++#define GIC_VI5_INTRS_BASE	(GIC_VI2_NUM_INTRS + GIC_VI3_NUM_INTRS \
++					+ GIC_VI4_NUM_INTRS)
++#define GIC_VI6_INTRS_BASE	(GIC_VI2_NUM_INTRS + GIC_VI3_NUM_INTRS \
++					+ GIC_VI4_NUM_INTRS + GIC_VI5_NUM_INTRS)
++
++/* offset = (irq_base /32) *4 = irq_base >> 3 */
++#define GIC_VI2_SH_PEND		(GIC_SH_PEND_31_0_OFS \
++					+ (GIC_VI2_INTRS_BASE >> 3))
++#define GIC_VI2_SH_MASK		(GIC_SH_MASK_31_0_OFS \
++					+ (GIC_VI2_INTRS_BASE >> 3))
++
++#define GIC_VI3_SH_PEND		(GIC_SH_PEND_31_0_OFS \
++					+ (GIC_VI3_INTRS_BASE >> 3))
++#define GIC_VI3_SH_MASK		(GIC_SH_MASK_31_0_OFS \
++					+ (GIC_VI3_INTRS_BASE >> 3))
++
++#define GIC_VI4_SH_PEND		(GIC_SH_PEND_31_0_OFS \
++					+ (GIC_VI4_INTRS_BASE >> 3))
++#define GIC_VI4_SH_MASK		(GIC_SH_MASK_31_0_OFS \
++					+ (GIC_VI4_INTRS_BASE >> 3))
++
++#define GIC_VI5_SH_PEND		(GIC_SH_PEND_31_0_OFS \
++					+ (GIC_VI5_INTRS_BASE >> 3))
++#define GIC_VI5_SH_MASK		(GIC_SH_MASK_31_0_OFS \
++					+ (GIC_VI5_INTRS_BASE >> 3))
++
++#define GIC_VI6_SH_PEND		(GIC_SH_PEND_31_0_OFS \
++					+ (GIC_VI6_INTRS_BASE >> 3))
++#define GIC_VI6_SH_MASK		(GIC_SH_MASK_31_0_OFS \
++					+ (GIC_VI6_INTRS_BASE >> 3))
++
++struct gic_pcpu_mask {
++	DECLARE_BITMAP(pcpu_mask, GIC_NUM_INTRS);
++};
++
+ unsigned int gic_frequency;
+ unsigned int gic_present;
+ unsigned long _gic_base;
+ unsigned int gic_irq_base;
+ unsigned int gic_irq_flags[GIC_NUM_INTRS];
+-
++static int gic_vpes;
++static DEFINE_SPINLOCK(gic_lock);
+ /* The index into this array is the vector # of the interrupt. */
+ struct gic_shared_intr_map gic_shared_intr_map[GIC_NUM_INTRS];
+ 
+ static struct gic_pcpu_mask pcpu_masks[NR_CPUS];
+-static struct gic_pending_regs pending_regs[NR_CPUS];
+-static struct gic_intrmask_regs intrmask_regs[NR_CPUS];
++
++static inline bool gic_is_local_irq(unsigned int hwirq)
++{
++	return hwirq >= GIC_NUM_INTRS;
++}
++
++static inline unsigned int gic_hw_to_local_irq(unsigned int hwirq)
++{
++	return hwirq - GIC_NUM_INTRS;
++}
++
++static inline unsigned int gic_local_to_hw_irq(unsigned int irq)
++{
++	return irq + GIC_NUM_INTRS;
++}
++
++static inline bool local_irq_is_legacy(unsigned int local_irq)
++{
++	if ((local_irq == GIC_LOCAL_INT_TIMER)
++		|| (local_irq == GIC_LOCAL_INT_PERFCTR))
++		return true;
++	else
++		return false;
++}
++
+ 
+ #if defined(CONFIG_CSRC_GIC) || defined(CONFIG_CEVT_GIC)
+ cycle_t gic_read_count(void)
+@@ -70,9 +139,8 @@ unsigned int gic_get_timer_pending(void)
+ {
+ 	unsigned int vpe_pending;
+ 
+-	GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_OTHER_ADDR), 0);
+-	GICREAD(GIC_REG(VPE_OTHER, GIC_VPE_PEND), vpe_pending);
+-	return (vpe_pending & GIC_VPE_PEND_TIMER_MSK);
++	GICREAD(GIC_REG(VPE_LOCAL, GIC_VPE_PEND), vpe_pending);
++	return vpe_pending & GIC_VPE_PEND_TIMER_MSK;
+ }
+ 
+ void gic_bind_eic_interrupt(int irq, int set)
+@@ -104,54 +172,6 @@ static void gic_eic_irq_dispatch(void)
+ 		spurious_interrupt();
+ }
+ 
+-static void __init vpe_local_setup(unsigned int numvpes)
+-{
+-	unsigned long timer_intr = GIC_INT_TMR;
+-	unsigned long perf_intr = GIC_INT_PERFCTR;
+-	unsigned int vpe_ctl;
+-	int i;
+-
+-	if (cpu_has_veic) {
+-		/*
+-		 * GIC timer interrupt -> CPU HW Int X (vector X+2) ->
+-		 * map to pin X+2-1 (since GIC adds 1)
+-		 */
+-		timer_intr += (GIC_CPU_TO_VEC_OFFSET - GIC_PIN_TO_VEC_OFFSET);
+-		/*
+-		 * GIC perfcnt interrupt -> CPU HW Int X (vector X+2) ->
+-		 * map to pin X+2-1 (since GIC adds 1)
+-		 */
+-		perf_intr += (GIC_CPU_TO_VEC_OFFSET - GIC_PIN_TO_VEC_OFFSET);
+-	}
+-
+-	/*
+-	 * Setup the default performance counter timer interrupts
+-	 * for all VPEs
+-	 */
+-	for (i = 0; i < numvpes; i++) {
+-		GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_OTHER_ADDR), i);
+-
+-		/* Are Interrupts locally routable? */
+-		GICREAD(GIC_REG(VPE_OTHER, GIC_VPE_CTL), vpe_ctl);
+-		if (vpe_ctl & GIC_VPE_CTL_TIMER_RTBL_MSK)
+-			GICWRITE(GIC_REG(VPE_OTHER, GIC_VPE_TIMER_MAP),
+-				 GIC_MAP_TO_PIN_MSK | timer_intr);
+-		if (cpu_has_veic) {
+-			set_vi_handler(timer_intr + GIC_PIN_TO_VEC_OFFSET,
+-				gic_eic_irq_dispatch);
+-			gic_shared_intr_map[timer_intr + GIC_PIN_TO_VEC_OFFSET].local_intr_mask |= GIC_VPE_RMASK_TIMER_MSK;
+-		}
+-
+-		if (vpe_ctl & GIC_VPE_CTL_PERFCNT_RTBL_MSK)
+-			GICWRITE(GIC_REG(VPE_OTHER, GIC_VPE_PERFCTR_MAP),
+-				 GIC_MAP_TO_PIN_MSK | perf_intr);
+-		if (cpu_has_veic) {
+-			set_vi_handler(perf_intr + GIC_PIN_TO_VEC_OFFSET, gic_eic_irq_dispatch);
+-			gic_shared_intr_map[perf_intr + GIC_PIN_TO_VEC_OFFSET].local_intr_mask |= GIC_VPE_RMASK_PERFCNT_MSK;
+-		}
+-	}
+-}
+-
+ unsigned int gic_compare_int(void)
+ {
+ 	unsigned int pending;
+@@ -163,15 +183,57 @@ unsigned int gic_compare_int(void)
+ 		return 0;
+ }
+ 
+-unsigned int gic_get_int(void)
++static bool gic_local_irq_is_routable(int intr)
+ {
+-	unsigned int i;
+-	unsigned long *pending, *intrmask, *pcpu_mask;
++	u32 vpe_ctl;
++
++	/* All local interrupts are routable in EIC mode. */
++	if (cpu_has_veic)
++		return true;
++
++	GICREAD(GIC_REG(VPE_LOCAL, GIC_VPE_CTL), vpe_ctl);
++	switch (intr) {
++	case GIC_LOCAL_INT_TIMER:
++		return vpe_ctl & GIC_VPE_CTL_TIMER_RTBL_MSK;
++	case GIC_LOCAL_INT_PERFCTR:
++		return vpe_ctl & GIC_VPE_CTL_PERFCNT_RTBL_MSK;
++	case GIC_LOCAL_INT_FDC:
++		return vpe_ctl & GIC_VPE_CTL_FDC_RTBL_MSK;
++	case GIC_LOCAL_INT_SWINT0:
++	case GIC_LOCAL_INT_SWINT1:
++		return vpe_ctl & GIC_VPE_CTL_SWINT_RTBL_MSK;
++	default:
++		return true;
++	}
++}
++
++int gic_get_c0_compare_int(void)
++{
++	if (!gic_local_irq_is_routable(GIC_LOCAL_INT_TIMER))
++		return MIPS_CPU_IRQ_BASE + cp0_compare_irq;
++	return MIPS_GIC_LOCAL_IRQ_BASE + GIC_LOCAL_INT_TIMER;
++}
++
++int gic_get_c0_perfcount_int(void)
++{
++	if (!gic_local_irq_is_routable(GIC_LOCAL_INT_PERFCTR)) {
++		/* Is the erformance counter shared with the timer? */
++		if (cp0_perfcount_irq < 0)
++			return -1;
++		return MIPS_CPU_IRQ_BASE + cp0_perfcount_irq;
++	}
++	return MIPS_GIC_LOCAL_IRQ_BASE + GIC_LOCAL_INT_PERFCTR;
++}
++
++void gic_shared_irq_dispatch(void)
++{
++	unsigned int i, intr;
++	unsigned long *pcpu_mask;
+ 	unsigned long *pending_abs, *intrmask_abs;
++	DECLARE_BITMAP(pending, GIC_NUM_INTRS);
++	DECLARE_BITMAP(intrmask, GIC_NUM_INTRS);
+ 
+ 	/* Get per-cpu bitmaps */
+-	pending = pending_regs[smp_processor_id()].pending;
+-	intrmask = intrmask_regs[smp_processor_id()].intrmask;
+ 	pcpu_mask = pcpu_masks[smp_processor_id()].pcpu_mask;
+ 
+ 	pending_abs = (unsigned long *) GIC_REG_ABS_ADDR(SHARED,
+@@ -189,33 +251,253 @@ unsigned int gic_get_int(void)
+ 	bitmap_and(pending, pending, intrmask, GIC_NUM_INTRS);
+ 	bitmap_and(pending, pending, pcpu_mask, GIC_NUM_INTRS);
+ 
+-	return find_first_bit(pending, GIC_NUM_INTRS);
++	intr = find_first_bit(pending, GIC_NUM_INTRS);
++	while (intr != GIC_NUM_INTRS) {
++		do_IRQ(gic_irq_base + intr);
++
++		/* go to next pending bit */
++		bitmap_clear(pending, intr, 1);
++		intr = find_first_bit(pending, GIC_NUM_INTRS);
++	}
++}
++
++#define GIC_SHARED_IRQ_DISPATCH(X)					\
++do {									\
++	unsigned int i, intr;						\
++	unsigned long *pcpu_mask;					\
++	unsigned long *pending_abs, *intrmask_abs;			\
++	DECLARE_BITMAP(pending, GIC_VI##X##_NUM_INTRS);			\
++	DECLARE_BITMAP(intrmask, GIC_VI##X##_NUM_INTRS);		\
++									\
++	/* Get per-cpu bitmaps */					\
++	pcpu_mask = pcpu_masks[smp_processor_id()].pcpu_mask;		\
++	pending_abs = (unsigned long *) GIC_REG_ABS_ADDR(SHARED,	\
++						GIC_VI##X##_SH_PEND);	\
++	intrmask_abs = (unsigned long *) GIC_REG_ABS_ADDR(SHARED,	\
++						GIC_VI##X##_SH_MASK);	\
++	for (i = 0; i < BITS_TO_LONGS(GIC_VI##X##_NUM_INTRS); i++) {	\
++		GICREAD(*pending_abs, pending[i]);			\
++		GICREAD(*intrmask_abs, intrmask[i]);			\
++		pending_abs++;						\
++		intrmask_abs++;						\
++	}								\
++	bitmap_and(pending, pending, intrmask, GIC_VI##X##_NUM_INTRS);	\
++	bitmap_and(pending, pending, pcpu_mask				\
++		+ (GIC_VI##X##_INTRS_BASE >> 5), GIC_VI##X##_NUM_INTRS);\
++	intr = find_first_bit(pending, GIC_VI##X##_NUM_INTRS);		\
++	while (intr != GIC_VI##X##_NUM_INTRS) {				\
++		do_IRQ(gic_irq_base + GIC_VI##X##_INTRS_BASE + intr);	\
++		bitmap_clear(pending, intr, 1);				\
++		intr = find_first_bit(pending, GIC_VI##X##_NUM_INTRS);	\
++	}								\
++} while (0)
++
++#define GIC_VIx_IRQ_DISPATCH(x)						\
++void gic_shared_irq_vi ## x ##_dispatch(void)				\
++{									\
++	GIC_SHARED_IRQ_DISPATCH(x);					\
++}
++
++GIC_VIx_IRQ_DISPATCH(2)
++GIC_VIx_IRQ_DISPATCH(3)
++GIC_VIx_IRQ_DISPATCH(4)
++GIC_VIx_IRQ_DISPATCH(5)
++GIC_VIx_IRQ_DISPATCH(6)
++
++
++void gic_local_irq_dispatch(void)
++{
++	unsigned int intr;
++	unsigned long pending, masked;
++
++	GICREAD(GIC_REG(VPE_LOCAL, GIC_VPE_PEND), pending);
++	GICREAD(GIC_REG(VPE_LOCAL, GIC_VPE_MASK), masked);
++
++	bitmap_and(&pending, &pending, &masked, GIC_NUM_LOCAL_INTRS);
++
++	intr = find_first_bit(&pending, GIC_NUM_LOCAL_INTRS);
++	while (intr != GIC_NUM_LOCAL_INTRS) {
++		do_IRQ(MIPS_GIC_LOCAL_IRQ_BASE + intr);
++		/* go to next pending bit */
++		bitmap_clear(&pending, intr, 1);
++		intr = find_first_bit(&pending, GIC_NUM_LOCAL_INTRS);
++	}
++}
++
++static void gic_mask_local_irq(int irq)
++{
++	int local_irq = gic_hw_to_local_irq(irq);
++
++	if (local_irq_is_legacy(local_irq)) {
++		int i;
++		unsigned long flags;
++
++		spin_lock_irqsave(&gic_lock, flags);
++		for (i = 0; i < gic_vpes; i++) {
++			if (ltq_vpe_run_linux_os(i)) {
++				GICWRITE(GIC_REG(VPE_LOCAL,
++					GIC_VPE_OTHER_ADDR), i);
++				GICWRITE(GIC_REG(VPE_OTHER,
++					GIC_VPE_RMASK), 1 << local_irq);
++			}
++		}
++		spin_unlock_irqrestore(&gic_lock, flags);
++	} else
++		GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_RMASK), 1 << local_irq);
++}
++
++static void gic_unmask_local_irq(int irq)
++{
++	int local_irq = gic_hw_to_local_irq(irq);
++
++	if (local_irq_is_legacy(local_irq)) {
++		int i;
++		unsigned long flags;
++
++		spin_lock_irqsave(&gic_lock, flags);
++		for (i = 0; i < gic_vpes; i++) {
++			if (ltq_vpe_run_linux_os(i)) {
++				GICWRITE(GIC_REG(VPE_LOCAL,
++					GIC_VPE_OTHER_ADDR), i);
++				GICWRITE(GIC_REG(VPE_OTHER,
++					GIC_VPE_SMASK), 1 << local_irq);
++			}
++		}
++		spin_unlock_irqrestore(&gic_lock, flags);
++	} else
++		GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_SMASK), 1 << local_irq);
+ }
+ 
+ static void gic_mask_irq(struct irq_data *d)
+ {
+-	GIC_CLR_INTR_MASK(d->irq - gic_irq_base);
++	unsigned int irq = d->irq - gic_irq_base;
++
++	if (gic_is_local_irq(irq))
++		gic_mask_local_irq(irq);
++	else
++		GIC_CLR_INTR_MASK(irq);
+ }
+ 
+ static void gic_unmask_irq(struct irq_data *d)
+ {
+-	GIC_SET_INTR_MASK(d->irq - gic_irq_base);
++	unsigned int irq = d->irq - gic_irq_base;
++
++	if (gic_is_local_irq(irq))
++		gic_unmask_local_irq(irq);
++	else {
++#ifndef CONFIG_SOC_GRX500_A21
++	#ifdef CONFIG_PCIE_LANTIQ
++		pcie_intx_war(irq);
++	#endif /* CONFIG_PCIE_LANTIQ */
++#endif /* CONFIG_SOC_GRX500_A21 */
++		GIC_SET_INTR_MASK(irq);
++	}
++}
++
++void __weak gic_irq_ack(struct irq_data *d)
++{
++	unsigned int irq = d->irq - gic_irq_base;
++
++	if (gic_is_local_irq(irq))
++		gic_mask_local_irq(irq);
++	else {
++		GIC_CLR_INTR_MASK(irq);
++
++		/* Clear edge detector */
++		if (gic_irq_flags[irq] & GIC_TRIG_EDGE)
++			GICWRITE(GIC_REG(SHARED, GIC_SH_WEDGE), irq);
++	}
++}
++
++void __weak gic_finish_irq(struct irq_data *d)
++{
++	unsigned int irq = d->irq - gic_irq_base;
++
++	if (gic_is_local_irq(irq))
++		gic_unmask_local_irq(irq);
++	else {
++#ifndef CONFIG_SOC_GRX500_A21
++	#ifdef CONFIG_PCIE_LANTIQ
++		pcie_intx_war(irq);
++	#endif /* CONFIG_PCIE_LANTIQ */
++#endif /* CONFIG_SOC_GRX500_A21 */
++		/* Fixed the disable_irq /enable_irq with percpu interrupt */
++		if (!(irqd_irq_disabled(d) && irqd_irq_masked(d)))
++			GIC_SET_INTR_MASK(irq);
++	}
++}
++
++static int gic_set_type(struct irq_data *d, unsigned int type)
++{
++	unsigned int irq = d->irq - gic_irq_base;
++	unsigned long flags;
++	bool is_edge;
++
++	if (gic_is_local_irq(irq))
++		return -EINVAL;
++
++	spin_lock_irqsave(&gic_lock, flags);
++	switch (type & IRQ_TYPE_SENSE_MASK) {
++	case IRQ_TYPE_EDGE_FALLING:
++		GIC_SET_POLARITY(irq, GIC_POL_NEG);
++		GIC_SET_TRIGGER(irq, GIC_TRIG_EDGE);
++		GIC_SET_DUAL(irq, GIC_TRIG_DUAL_DISABLE);
++		is_edge = true;
++		break;
++	case IRQ_TYPE_EDGE_RISING:
++		GIC_SET_POLARITY(irq, GIC_POL_POS);
++		GIC_SET_TRIGGER(irq, GIC_TRIG_EDGE);
++		GIC_SET_DUAL(irq, GIC_TRIG_DUAL_DISABLE);
++		is_edge = true;
++		break;
++	case IRQ_TYPE_EDGE_BOTH:
++		/* polarity is irrelevant in this case */
++		GIC_SET_TRIGGER(irq, GIC_TRIG_EDGE);
++		GIC_SET_DUAL(irq, GIC_TRIG_DUAL_ENABLE);
++		is_edge = true;
++		break;
++	case IRQ_TYPE_LEVEL_LOW:
++		GIC_SET_POLARITY(irq, GIC_POL_NEG);
++		GIC_SET_TRIGGER(irq, GIC_TRIG_LEVEL);
++		GIC_SET_DUAL(irq, GIC_TRIG_DUAL_DISABLE);
++		is_edge = false;
++		break;
++	case IRQ_TYPE_LEVEL_HIGH:
++	default:
++		GIC_SET_POLARITY(irq, GIC_POL_POS);
++		GIC_SET_TRIGGER(irq, GIC_TRIG_LEVEL);
++		GIC_SET_DUAL(irq, GIC_TRIG_DUAL_DISABLE);
++		is_edge = false;
++		break;
++	}
++
++	if (is_edge) {
++		gic_irq_flags[irq] |= GIC_TRIG_EDGE;
++		__irq_set_handler_locked(d->irq, handle_edge_irq);
++	} else {
++		gic_irq_flags[irq] &= ~GIC_TRIG_EDGE;
++		__irq_set_handler_locked(d->irq, handle_level_irq);
++	}
++	spin_unlock_irqrestore(&gic_lock, flags);
++
++	return 0;
+ }
+ 
+ #ifdef CONFIG_SMP
+-static DEFINE_SPINLOCK(gic_lock);
+-
+ static int gic_set_affinity(struct irq_data *d, const struct cpumask *cpumask,
+ 			    bool force)
+ {
+ 	unsigned int irq = (d->irq - gic_irq_base);
+ 	cpumask_t	tmp = CPU_MASK_NONE;
+ 	unsigned long	flags;
+-	int		i;
++	int		cpu;
++
++	if (gic_is_local_irq(irq))
++		return -EINVAL;
+ 
+ 	cpumask_and(&tmp, cpumask, cpu_online_mask);
+ 	if (cpus_empty(tmp))
+-		return -1;
++		return -EINVAL;
+ 
+ 	/* Assumption : cpumask refers to a single CPU */
+ 	spin_lock_irqsave(&gic_lock, flags);
+@@ -224,8 +506,8 @@ static int gic_set_affinity(struct irq_d
+ 	GIC_SH_MAP_TO_VPE_SMASK(irq, first_cpu(tmp));
+ 
+ 	/* Update the pcpu_masks */
+-	for (i = 0; i < NR_CPUS; i++)
+-		clear_bit(irq, pcpu_masks[i].pcpu_mask);
++	for_each_possible_cpu(cpu)
++		clear_bit(irq, pcpu_masks[cpu].pcpu_mask);
+ 	set_bit(irq, pcpu_masks[first_cpu(tmp)].pcpu_mask);
+ 
+ 	cpumask_copy(d->affinity, cpumask);
+@@ -237,33 +519,71 @@ static int gic_set_affinity(struct irq_d
+ 
+ static struct irq_chip gic_irq_controller = {
+ 	.name			=	"MIPS GIC",
++	.irq_enable		=	gic_unmask_irq,
++	.irq_disable		=	gic_irq_ack, /* mask, Yield war */
+ 	.irq_ack		=	gic_irq_ack,
+ 	.irq_mask		=	gic_mask_irq,
+ 	.irq_mask_ack		=	gic_mask_irq,
+ 	.irq_unmask		=	gic_unmask_irq,
++	.irq_set_type		=	gic_set_type,
+ 	.irq_eoi		=	gic_finish_irq,
+ #ifdef CONFIG_SMP
+ 	.irq_set_affinity	=	gic_set_affinity,
+ #endif
+ };
+ 
++int gic_yield_setup(unsigned int cpu, unsigned int pin, unsigned int intr)
++{
++	int cpux;
++	int irq;
++	unsigned long flags;
++#define GIC_YIELD_IRQ_START	192
++#define GIC_YIELD_IRQ_END	199
++	/* Sanity check */
++	if ((cpu >= nr_cpu_ids) || (pin > 0xF) || (intr < MIPS_GIC_IRQ_BASE))
++		return -EINVAL;
++
++	irq = intr - MIPS_GIC_IRQ_BASE;
++	if (irq < GIC_YIELD_IRQ_START || irq > GIC_YIELD_IRQ_END)
++		return -EINVAL;
++
++	spin_lock_irqsave(&gic_lock, flags);
++	GICWRITE(GIC_REG_ADDR(SHARED, GIC_SH_MAP_TO_PIN(irq)),
++		GIC_MAP_TO_YQ_MSK | pin);
++	/* Setup Intr to CPU mapping */
++	GIC_SH_MAP_TO_VPE_SMASK(irq, cpu);
++	/* Clear all yield related percpu mask */
++	for_each_possible_cpu(cpux)
++		clear_bit(irq, pcpu_masks[cpux].pcpu_mask);
++	spin_unlock_irqrestore(&gic_lock, flags);
++	return 0;
++}
++
+ static void __init gic_setup_intr(unsigned int intr, unsigned int cpu,
+ 	unsigned int pin, unsigned int polarity, unsigned int trigtype,
+ 	unsigned int flags)
+ {
+ 	struct gic_shared_intr_map *map_ptr;
+ 
++	/* 1 is hardcoded Voice FW VPE1/core0 */
++	if (!ltq_vpe_run_linux_os(1) && (flags == GIC_FLAG_MUX))
++		return;
++
+ 	/* Setup Intr to Pin mapping */
+ 	if (pin & GIC_MAP_TO_NMI_MSK) {
+ 		int i;
+ 
+ 		GICWRITE(GIC_REG_ADDR(SHARED, GIC_SH_MAP_TO_PIN(intr)), pin);
+ 		/* FIXME: hack to route NMI to all cpu's */
+-		for (i = 0; i < NR_CPUS; i += 32) {
++		for (i = 0; i < num_possible_cpus(); i += 32) {
+ 			GICWRITE(GIC_REG_ADDR(SHARED,
+ 					  GIC_SH_MAP_TO_VPE_REG_OFF(intr, i)),
+ 				 0xffffffff);
+ 		}
++	} else if (pin & GIC_MAP_TO_YQ_MSK) {
++		GICWRITE(GIC_REG_ADDR(SHARED, GIC_SH_MAP_TO_PIN(intr)), pin);
++		/* Setup Intr to CPU mapping */
++		GIC_SH_MAP_TO_VPE_SMASK(intr, cpu);
+ 	} else {
+ 		GICWRITE(GIC_REG_ADDR(SHARED, GIC_SH_MAP_TO_PIN(intr)),
+ 			 GIC_MAP_TO_PIN_MSK | pin);
+@@ -272,7 +592,8 @@ static void __init gic_setup_intr(unsign
+ 		if (cpu_has_veic) {
+ 			set_vi_handler(pin + GIC_PIN_TO_VEC_OFFSET,
+ 				gic_eic_irq_dispatch);
+-			map_ptr = &gic_shared_intr_map[pin + GIC_PIN_TO_VEC_OFFSET];
++			map_ptr = &gic_shared_intr_map
++				[pin + GIC_PIN_TO_VEC_OFFSET];
+ 			if (map_ptr->num_shared_intr >= GIC_MAX_SHARED_INTR)
+ 				BUG();
+ 			map_ptr->intr_list[map_ptr->num_shared_intr++] = intr;
+@@ -287,15 +608,70 @@ static void __init gic_setup_intr(unsign
+ 
+ 	/* Init Intr Masks */
+ 	GIC_CLR_INTR_MASK(intr);
++
+ 	/* Initialise per-cpu Interrupt software masks */
+-	if (flags & GIC_FLAG_IPI)
+-		set_bit(intr, pcpu_masks[cpu].pcpu_mask);
++	set_bit(intr, pcpu_masks[cpu].pcpu_mask);
++
+ 	if ((flags & GIC_FLAG_TRANSPARENT) && (cpu_has_veic == 0))
+ 		GIC_SET_INTR_MASK(intr);
++
+ 	if (trigtype == GIC_TRIG_EDGE)
+ 		gic_irq_flags[intr] |= GIC_TRIG_EDGE;
+ }
+ 
++static unsigned int local_irq_to_map_off(unsigned int intr)
++{
++	switch (intr) {
++	case GIC_LOCAL_INT_PERFCTR:
++		return GIC_VPE_PERFCTR_MAP_OFS;
++	case GIC_LOCAL_INT_SWINT0:
++		return GIC_VPE_SWINT0_MAP_OFS;
++	case GIC_LOCAL_INT_SWINT1:
++		return GIC_VPE_SWINT1_MAP_OFS;
++	case GIC_LOCAL_INT_FDC:
++		return GIC_VPE_FDC_MAP_OFS;
++	default:
++		return GIC_VPE_MAP_OFS + 4 * (intr);
++	}
++}
++
++static void __init gic_setup_local_intr(unsigned int intr, unsigned int pin,
++	unsigned int flags)
++{
++	int i;
++	struct gic_shared_intr_map *map_ptr;
++	unsigned int local_irq = gic_hw_to_local_irq(intr);
++
++	/* Setup Intr to Pin mapping */
++	for (i = 0; i < nr_cpu_ids; i++) {
++		if (ltq_vpe_run_linux_os(i)) {
++			GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_OTHER_ADDR), i);
++			if (pin & GIC_MAP_TO_NMI_MSK) {
++				GICWRITE(GIC_REG_ADDR(VPE_OTHER,
++					local_irq_to_map_off(local_irq)), pin);
++			} else {
++				GICWRITE(GIC_REG_ADDR(VPE_OTHER,
++					local_irq_to_map_off(local_irq)),
++						GIC_MAP_TO_PIN_MSK | pin);
++			}
++			if (!gic_local_irq_is_routable(local_irq))
++				continue;
++			/* Init Intr Masks */
++			GICWRITE(GIC_REG(VPE_OTHER, GIC_VPE_RMASK),
++				1 << local_irq);
++		}
++	}
++
++	if (!(pin & GIC_MAP_TO_NMI_MSK) && cpu_has_veic) {
++		set_vi_handler(pin + GIC_PIN_TO_VEC_OFFSET,
++			gic_eic_irq_dispatch);
++		map_ptr = &gic_shared_intr_map[pin + GIC_PIN_TO_VEC_OFFSET];
++		if (map_ptr->num_shared_intr >= GIC_MAX_SHARED_INTR)
++			BUG();
++		map_ptr->intr_list[map_ptr->num_shared_intr++] = intr;
++	}
++}
++
+ static void __init gic_basic_init(int numintrs, int numvpes,
+ 			struct gic_intr_map *intrmap, int mapsize)
+ {
+@@ -306,6 +682,11 @@ static void __init gic_basic_init(int nu
+ 
+ 	/* Setup defaults */
+ 	for (i = 0; i < numintrs; i++) {
++		/* Bypass VMB/FW IPI initialed by u-boot/IBL */
++		if ((i < GIC_NUM_INTRS) && (i < mapsize)) {
++			if (intrmap[i].flags == GIC_FLAG_VMB_IPI)
++				continue;
++		}
+ 		GIC_SET_POLARITY(i, GIC_POL_POS);
+ 		GIC_SET_TRIGGER(i, GIC_TRIG_LEVEL);
+ 		GIC_CLR_INTR_MASK(i);
+@@ -315,30 +696,29 @@ static void __init gic_basic_init(int nu
+ 			gic_shared_intr_map[i].local_intr_mask = 0;
+ 		}
+ 	}
+-
+ 	/*
+ 	 * In EIC mode, the HW_INT# is offset by (2-1). Need to subtract
+ 	 * one because the GIC will add one (since 0=no intr).
+ 	 */
+ 	if (cpu_has_veic)
+ 		pin_offset = (GIC_CPU_TO_VEC_OFFSET - GIC_PIN_TO_VEC_OFFSET);
+-
+ 	/* Setup specifics */
+ 	for (i = 0; i < mapsize; i++) {
+ 		cpu = intrmap[i].cpunum;
+ 		if (cpu == GIC_UNUSED)
+ 			continue;
+-		if (cpu == 0 && i != 0 && intrmap[i].flags == 0)
+-			continue;
+-		gic_setup_intr(i,
+-			intrmap[i].cpunum,
+-			intrmap[i].pin + pin_offset,
+-			intrmap[i].polarity,
+-			intrmap[i].trigtype,
+-			intrmap[i].flags);
++		if (gic_is_local_irq(i))
++			gic_setup_local_intr(i,
++				intrmap[i].pin + pin_offset,
++				intrmap[i].flags);
++		else
++			gic_setup_intr(i,
++				intrmap[i].cpunum,
++				intrmap[i].pin + pin_offset,
++				intrmap[i].polarity,
++				intrmap[i].trigtype,
++				intrmap[i].flags);
+ 	}
+-
+-	vpe_local_setup(numvpes);
+ }
+ 
+ void __init gic_init(unsigned long gic_base_addr,
+@@ -347,7 +727,7 @@ void __init gic_init(unsigned long gic_b
+ 		     unsigned int irqbase)
+ {
+ 	unsigned int gicconfig;
+-	int numvpes, numintrs;
++	int numintrs;
+ 
+ 	_gic_base = (unsigned long) ioremap_nocache(gic_base_addr,
+ 						    gic_addrspace_size);
+@@ -358,11 +738,11 @@ void __init gic_init(unsigned long gic_b
+ 		   GIC_SH_CONFIG_NUMINTRS_SHF;
+ 	numintrs = ((numintrs + 1) * 8);
+ 
+-	numvpes = (gicconfig & GIC_SH_CONFIG_NUMVPES_MSK) >>
++	gic_vpes = (gicconfig & GIC_SH_CONFIG_NUMVPES_MSK) >>
+ 		  GIC_SH_CONFIG_NUMVPES_SHF;
+-	numvpes = numvpes + 1;
++	gic_vpes = gic_vpes + 1;
++	gic_basic_init(numintrs, gic_vpes, intr_map, intr_map_size);
+ 
+-	gic_basic_init(numintrs, numvpes, intr_map, intr_map_size);
+-
+-	gic_platform_init(numintrs, &gic_irq_controller);
++	gic_platform_init(GIC_NUM_INTRS + GIC_NUM_LOCAL_INTRS,
++		&gic_irq_controller);
+ }
+diff --git a/arch/mips/kernel/perf_event_mipsxx.c b/arch/mips/kernel/perf_event_mipsxx.c
+--- a/arch/mips/kernel/perf_event_mipsxx.c
++++ b/arch/mips/kernel/perf_event_mipsxx.c
+@@ -805,7 +805,7 @@ static void reset_counters(void *arg)
+ 	}
+ }
+ 
+-/* 24K/34K/1004K/interAptiv/loongson1 cores share the same event map. */
++/* 24K/34K/1004K cores can share the same event map. */
+ static const struct mips_perf_event mipsxxcore_event_map
+ 				[PERF_COUNT_HW_MAX] = {
+ 	[PERF_COUNT_HW_CPU_CYCLES] = { 0x00, CNTR_EVEN | CNTR_ODD, P },
+@@ -814,8 +814,8 @@ static const struct mips_perf_event mips
+ 	[PERF_COUNT_HW_BRANCH_MISSES] = { 0x02, CNTR_ODD, T },
+ };
+ 
+-/* 74K/proAptiv core has different branch event code. */
+-static const struct mips_perf_event mipsxxcore_event_map2
++/* 74K core has different branch event code. */
++static const struct mips_perf_event mipsxx74Kcore_event_map
+ 				[PERF_COUNT_HW_MAX] = {
+ 	[PERF_COUNT_HW_CPU_CYCLES] = { 0x00, CNTR_EVEN | CNTR_ODD, P },
+ 	[PERF_COUNT_HW_INSTRUCTIONS] = { 0x01, CNTR_EVEN | CNTR_ODD, T },
+@@ -849,7 +849,7 @@ static const struct mips_perf_event xlp_
+ 	[PERF_COUNT_HW_BRANCH_MISSES] = { 0x1c, CNTR_ALL }, /* PAPI_BR_MSP */
+ };
+ 
+-/* 24K/34K/1004K/interAptiv/loongson1 cores share the same cache event map. */
++/* 24K/34K/1004K cores can share the same cache event map. */
+ static const struct mips_perf_event mipsxxcore_cache_map
+ 				[PERF_COUNT_HW_CACHE_MAX]
+ 				[PERF_COUNT_HW_CACHE_OP_MAX]
+@@ -930,8 +930,8 @@ static const struct mips_perf_event mips
+ },
+ };
+ 
+-/* 74K/proAptiv core has completely different cache event map. */
+-static const struct mips_perf_event mipsxxcore_cache_map2
++/* 74K core has completely different cache event map. */
++static const struct mips_perf_event mipsxx74Kcore_cache_map
+ 				[PERF_COUNT_HW_CACHE_MAX]
+ 				[PERF_COUNT_HW_CACHE_OP_MAX]
+ 				[PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+@@ -971,18 +971,13 @@ static const struct mips_perf_event mips
+ [C(LL)] = {
+ 	[C(OP_READ)] = {
+ 		[C(RESULT_ACCESS)]	= { 0x1c, CNTR_ODD, P },
+-		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN, P },
++		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN | CNTR_ODD, P },
+ 	},
+ 	[C(OP_WRITE)] = {
+ 		[C(RESULT_ACCESS)]	= { 0x1c, CNTR_ODD, P },
+-		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN, P },
++		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN | CNTR_ODD, P },
+ 	},
+ },
+-/*
+- * 74K core does not have specific DTLB events. proAptiv core has
+- * "speculative" DTLB events which are numbered 0x63 (even/odd) and
+- * not included here. One can use raw events if really needed.
+- */
+ [C(ITLB)] = {
+ 	[C(OP_READ)] = {
+ 		[C(RESULT_ACCESS)]	= { 0x04, CNTR_EVEN, T },
+@@ -1383,10 +1378,6 @@ static irqreturn_t mipsxx_pmu_handle_irq
+ #define IS_BOTH_COUNTERS_74K_EVENT(b)					\
+ 	((b) == 0 || (b) == 1)
+ 
+-/* proAptiv */
+-#define IS_BOTH_COUNTERS_PROAPTIV_EVENT(b)				\
+-	((b) == 0 || (b) == 1)
+-
+ /* 1004K */
+ #define IS_BOTH_COUNTERS_1004K_EVENT(b)					\
+ 	((b) == 0 || (b) == 1 || (b) == 11)
+@@ -1400,20 +1391,6 @@ static irqreturn_t mipsxx_pmu_handle_irq
+ #define IS_RANGE_V_1004K_EVENT(r)	((r) == 47)
+ #endif
+ 
+-/* interAptiv */
+-#define IS_BOTH_COUNTERS_INTERAPTIV_EVENT(b)				\
+-	((b) == 0 || (b) == 1 || (b) == 11)
+-#ifdef CONFIG_MIPS_MT_SMP
+-/* The P/V/T info is not provided for "(b) == 38" in SUM, assume P. */
+-#define IS_RANGE_P_INTERAPTIV_EVENT(r, b)				\
+-	((b) == 0 || (r) == 18 || (b) == 21 || (b) == 22 ||		\
+-	 (b) == 25 || (b) == 36 || (b) == 38 || (b) == 39 ||		\
+-	 (r) == 44 || (r) == 174 || (r) == 176 || ((b) >= 50 &&		\
+-	 (b) <= 59) || (r) == 188 || (b) == 61 || (b) == 62 ||		\
+-	 ((b) >= 64 && (b) <= 67))
+-#define IS_RANGE_V_INTERAPTIV_EVENT(r)	((r) == 47 || (r) == 175)
+-#endif
+-
+ /* BMIPS5000 */
+ #define IS_BOTH_COUNTERS_BMIPS5000_EVENT(b)				\
+ 	((b) == 0 || (b) == 1)
+@@ -1474,16 +1451,6 @@ static const struct mips_perf_event *mip
+ 		raw_event.range = P;
+ #endif
+ 		break;
+-	case CPU_PROAPTIV:
+-		if (IS_BOTH_COUNTERS_PROAPTIV_EVENT(base_id))
+-			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
+-		else
+-			raw_event.cntr_mask =
+-				raw_id > 127 ? CNTR_ODD : CNTR_EVEN;
+-#ifdef CONFIG_MIPS_MT_SMP
+-		raw_event.range = P;
+-#endif
+-		break;
+ 	case CPU_1004K:
+ 		if (IS_BOTH_COUNTERS_1004K_EVENT(base_id))
+ 			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
+@@ -1499,21 +1466,6 @@ static const struct mips_perf_event *mip
+ 			raw_event.range = T;
+ #endif
+ 		break;
+-	case CPU_INTERAPTIV:
+-		if (IS_BOTH_COUNTERS_INTERAPTIV_EVENT(base_id))
+-			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
+-		else
+-			raw_event.cntr_mask =
+-				raw_id > 127 ? CNTR_ODD : CNTR_EVEN;
+-#ifdef CONFIG_MIPS_MT_SMP
+-		if (IS_RANGE_P_INTERAPTIV_EVENT(raw_id, base_id))
+-			raw_event.range = P;
+-		else if (unlikely(IS_RANGE_V_INTERAPTIV_EVENT(raw_id)))
+-			raw_event.range = V;
+-		else
+-			raw_event.range = T;
+-#endif
+-		break;
+ 	case CPU_BMIPS5000:
+ 		if (IS_BOTH_COUNTERS_BMIPS5000_EVENT(base_id))
+ 			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
+@@ -1624,24 +1576,14 @@ init_hw_perf_events(void)
+ 		break;
+ 	case CPU_74K:
+ 		mipspmu.name = "mips/74K";
+-		mipspmu.general_event_map = &mipsxxcore_event_map2;
+-		mipspmu.cache_event_map = &mipsxxcore_cache_map2;
++		mipspmu.general_event_map = &mipsxx74Kcore_event_map;
++		mipspmu.cache_event_map = &mipsxx74Kcore_cache_map;
+ 		break;
+ 	case CPU_1004K:
+ 		mipspmu.name = "mips/1004K";
+ 		mipspmu.general_event_map = &mipsxxcore_event_map;
+ 		mipspmu.cache_event_map = &mipsxxcore_cache_map;
+ 		break;
+-	case CPU_INTERAPTIV:
+-		mipspmu.name = "mips/interAptiv";
+-		mipspmu.general_event_map = &mipsxxcore_event_map;
+-		mipspmu.cache_event_map = &mipsxxcore_cache_map;
+-		break;
+-	case CPU_PROAPTIV:
+-		mipspmu.name = "mips/proAptiv";
+-		mipspmu.general_event_map = &mipsxxcore_event_map2;
+-		mipspmu.cache_event_map = &mipsxxcore_cache_map2;
+-		break;
+ 	case CPU_LOONGSON1:
+ 		mipspmu.name = "mips/loongson1";
+ 		mipspmu.general_event_map = &mipsxxcore_event_map;
+diff --git a/arch/mips/kernel/smp-mt.c b/arch/mips/kernel/smp-mt.c
+--- a/arch/mips/kernel/smp-mt.c
++++ b/arch/mips/kernel/smp-mt.c
+@@ -123,16 +123,18 @@ static void mp_send_ipi_single(int cpu, 
+ 	case SMP_CALL_FUNCTION:
+ #ifdef CONFIG_MIPS_MALTA
+ 		gic_send_ipi(plat_ipi_call_int_xlate(cpu));
+-#else
++#elif defined(CONFIG_SOC_GRX500)
+ /*Need to implement [platform specific thing and that function has to go here*/
++                gic_send_ipi(plat_ipi_call_int_xlate(cpu));
+ #endif
+ 		break;
+ 
+ 	case SMP_RESCHEDULE_YOURSELF:
+ #ifdef CONFIG_MIPS_MALTA
+ 		gic_send_ipi(plat_ipi_resched_int_xlate(cpu));
+-#else
++#elif defined(CONFIG_SOC_GRX500)
+ /*Need to implement [platform specific thing and that function has to go here*/
++                gic_send_ipi(plat_ipi_resched_int_xlate(cpu));
+ #endif
+ 		break;
+ 	}
+diff --git a/arch/mips/lantiq/grx500/irq.c b/arch/mips/lantiq/grx500/irq.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/lantiq/grx500/irq.c
+@@ -0,0 +1,923 @@
++/*
++ * Carsten Langgaard, carstenl@mips.com
++ * Copyright (C) 2000, 2001, 2004 MIPS Technologies, Inc.
++ * Copyright (C) 2001 Ralf Baechle
++ * Copyright (C) 2014 ~ 2015 Chuanhua.lei@lantiq.com
++ * Copyright (C) 2016 Intel Corporation
++ *
++ *  This program is free software; you can distribute it and/or modify it
++ *  under the terms of the GNU General Public License (Version 2) as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope it will be useful, but WITHOUT
++ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ *  for more details.
++ *
++ *  You should have received a copy of the GNU General Public License along
++ *  with this program; if not, write to the Free Software Foundation, Inc.,
++ *  59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
++ *
++ * Routines for generic manipulation of the interrupts found on the MIPS
++ * Malta board.
++ * The interrupt controller is located in the South Bridge a PIIX4 device
++ * with two internal 82C95 interrupt controllers.
++ */
++#include <linux/init.h>
++#include <linux/irq.h>
++#include <linux/sched.h>
++#include <linux/smp.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel_stat.h>
++#include <linux/kernel.h>
++#include <linux/random.h>
++#include <linux/of_platform.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <asm/traps.h>
++#include <asm/irq_cpu.h>
++#include <asm/irq_regs.h>
++#include <asm/mach-lantiq/grx500/irq.h>
++#include <asm/mach-lantiq/grx500/lantiq_soc.h>
++#include <asm/gic.h>
++#include <asm/gcmpregs.h>
++#include <asm/setup.h>
++
++enum {
++	NO_OS	= 0,
++	LINUX_OS,
++	VOICE_FW,
++	MPE_FW,
++};
++
++static struct irq_chip *irq_gic;
++int gcmp_present = -1;
++unsigned long _gcmp_base;
++#ifdef CONFIG_MIPS_MT_SMP
++static int gic_resched_int_base = 56;
++static int gic_call_int_base = 60;
++#define GIC_RESCHED_INT(cpu)	(gic_resched_int_base + (cpu))
++#define GIC_CALL_INT(cpu)	(gic_call_int_base + (cpu))
++#endif /* CONFIG_MIPS_MT_SMP */
++
++/*
++ * This GIC specific tabular array defines the association between External
++ * Interrupts and CPUs/Core Interrupts. The nature of the External
++ * Interrupts is also defined here - polarity/trigger.
++ */
++
++#define GIC_CPU_NMI GIC_MAP_TO_NMI_MSK
++#define GIC_CPU_YQ  GIC_MAP_TO_YQ_MSK
++#define GIC_YQ_PIN(X) (GIC_CPU_YQ + (X))
++
++#define X GIC_UNUSED
++
++static struct gic_intr_map gic_intr_map[GIC_NUM_INTRS + GIC_NUM_LOCAL_INTRS] = {
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },/* 0 MPS */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 09 */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },/* PCIe1 legacy*/
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* DMA FCC */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 }, /* SSC0 */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 19 */
++	{ X, X,	   X,		X,	GIC_FLAG_VMB_IPI}, /* VMB IPI to FW */
++	{ X, X,	   X,		X,	GIC_FLAG_VMB_IPI}, /* VMB IPI to FW */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* I2C FIFO eint */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 }, /* PCIe2 msi */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },/* 29 */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 32 I2C b */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 33 I2C lb */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 34 I2C s */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 35 I2C ls */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 36 I2C p */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },/* PCIe 1 msi*/
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },/* 39 */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 49 pcie1 ir */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI}, /* IPI */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI},
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI},
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI}, /* 59 */
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI},
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI},
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI},
++	{ 0, GIC_CPU_INT0, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* DMA */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 69 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* TSO */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* ASC1 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 79 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ X, X,	   X,		X,	GIC_FLAG_VMB_IPI}, /* VMB IPI to FW */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI}, /* VMB */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI}, /* VMB */
++#ifdef CONFIG_LTQ_PPA_MPE_IP97
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 89 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* EIP97 */
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++#else
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 89 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* EIP97 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++#endif /* CONFIG_LTQ_PPA_MPE_IP97 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ X, X,	   X,		X,		0 }, /* FSC */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0}, /* SSC1 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0}, /* 99 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0}, /* ASC0 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0}, /* 109 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI}, /* VMB */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0}, /* MDIO */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0}, /* EIP123 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, GIC_FLAG_MUX},/*GPTC0*/
++	{ X, X,	   X,		X,		0 }, /* 119 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ X, X,	   X,		X,		0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 }, /* PCIe0 MSI */
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 }, /* 129 */
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* pcie 0 legacy */
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 139 */
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* MPS */
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 149 */
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ X, X,	   X,		X,		0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* pcie 0 ir */
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* pcie 2 legacy */
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 159 */
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0}, /* GPTC1 */
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0}, /* GPTC2 */
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0}, /* 169 */
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* GPIO */
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* CBM */
++	{ 1, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 2, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 3, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 1, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 179 */
++	{ 2, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 3, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* TOE */
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },/* 189 */
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_YQ_PIN(0), GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_YQ_PIN(1), GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_YQ_PIN(2), GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_YQ_PIN(3), GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_YQ_PIN(4), GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_YQ_PIN(5), GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_YQ_PIN(6), GIC_POL_POS, GIC_TRIG_EDGE, 0 },
++	{ 0, GIC_YQ_PIN(7), GIC_POL_POS, GIC_TRIG_EDGE, 0 }, /* 199 */
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* MCPY */
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },/* 209, DFEV*/
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* MPS2 */
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 219 */
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* MPE */
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },/* 229 */
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },/* 239 */
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ 0, GIC_CPU_INT4, GIC_POL_POS, GIC_TRIG_LEVEL, 0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },/* 249 */
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },
++	{ X, X,	   X,		X,		0 },/* 255 */
++	{ 0, GIC_CPU_NMI, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* Local WDT */
++	{ 0, GIC_CPU_INT5, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* GIC timer */
++	{ 0, GIC_CPU_INT5, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* CP0 timer */
++	{ 0, GIC_CPU_INT5, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* Perf */
++	{ 0, GIC_CPU_INT5, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* Sw0 */
++	{ 0, GIC_CPU_INT5, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* Sw1 */
++	{ 0, GIC_CPU_INT5, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* fdc */
++};
++#undef X
++
++static const char *os_type[3] = {
++	"LINUX",
++	"VOICEFW",
++	"MPE",
++};
++
++static int ltq_vpe_os_type[NR_CPUS];
++
++static int ltq_vpe_os_type_init(int cpu_id)
++{
++	const char *name;
++	struct device_node *np;
++	char str1[24] = {0};
++	int ret;
++
++	sprintf(str1, "%s%d", "/cpus/cpu@", cpu_id);
++
++	np = of_find_node_by_path(str1);
++	if (!np)
++		return -ENODEV;
++
++	ret = of_property_read_string(np, "default-OS", &name);
++	if (ret < 0 && ret != -EINVAL) {
++		pr_err("Failed to read OS name from DT\n");
++		return ret;
++	}
++
++	if (!strncmp(name, os_type[0], strlen(os_type[0])))
++		ltq_vpe_os_type[cpu_id] = LINUX_OS;
++	else if (!strncmp(name, os_type[1], strlen(os_type[1])))
++		ltq_vpe_os_type[cpu_id] = VOICE_FW;
++	else if (!strncmp(name, os_type[2], strlen(os_type[2])))
++		ltq_vpe_os_type[cpu_id] = MPE_FW;
++	else
++		ltq_vpe_os_type[cpu_id] = NO_OS;
++	return 0;
++}
++
++bool ltq_vpe_run_linux_os(int cpu_id)
++{
++	return (ltq_vpe_os_type[cpu_id] == LINUX_OS) ? true : false;
++}
++
++#ifdef CONFIG_MIPS_MT_SMP
++static irqreturn_t ipi_resched_interrupt(int irq, void *dev_id)
++{
++	scheduler_ipi();
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t ipi_call_interrupt(int irq, void *dev_id)
++{
++	smp_call_function_interrupt();
++	return IRQ_HANDLED;
++}
++
++static struct irqaction irq_resched = {
++	.handler	= ipi_resched_interrupt,
++	.flags		= IRQF_DISABLED|IRQF_PERCPU,
++	.name		= "ipi resched"
++};
++
++static struct irqaction irq_call = {
++	.handler	= ipi_call_interrupt,
++	.flags		= IRQF_DISABLED|IRQF_PERCPU,
++	.name		= "ipi call"
++};
++
++static void __init fill_ipi_map1(int baseintr, int cpu)
++{
++	int intr = baseintr + cpu;
++	gic_intr_map[intr].cpunum = cpu;
++	gic_intr_map[intr].polarity = GIC_POL_POS;
++	gic_intr_map[intr].trigtype = GIC_TRIG_EDGE;
++	gic_intr_map[intr].flags = GIC_FLAG_IPI;
++}
++
++static void __init fill_ipi_map(void)
++{
++	int cpu;
++
++	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
++		if (ltq_vpe_run_linux_os(cpu)) {
++			fill_ipi_map1(gic_resched_int_base, cpu);
++			fill_ipi_map1(gic_call_int_base, cpu);
++		}
++	}
++}
++
++#endif /* CONFIG_MIPS_MT_SMP */
++
++#ifdef CONFIG_SMP
++unsigned int plat_ipi_call_int_xlate(unsigned int cpu)
++{
++	return GIC_CALL_INT(cpu);
++}
++
++unsigned int plat_ipi_resched_int_xlate(unsigned int cpu)
++{
++	return GIC_RESCHED_INT(cpu);
++}
++#endif /* CONFIG_SMP */
++
++/*
++ * GCMP needs to be detected before any SMP initialisation
++ */
++int __init gcmp_probe(unsigned long addr, unsigned long size)
++{
++	unsigned long confaddr = 0;
++
++	if (gcmp_present >= 0)
++		return gcmp_present;
++
++	if (cpu_has_mips_r2 && (read_c0_config3() & MIPS_CONF3_CMGCR)) {
++		/* try CMGCRBase */
++		confaddr = read_c0_cmgcrbase() << 4;
++		_gcmp_base = (unsigned long) ioremap_nocache(confaddr,
++			GCMP_ADDRSPACE_SZ);
++		gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK)
++			== confaddr;
++		if (gcmp_present) {
++			/* reassign it to 'addr' */
++			if (addr != confaddr)
++				GCMPGCB(GCMPB) = (GCMPGCB(GCMPB)
++				& ~GCMP_GCB_GCMPB_GCMPBASE_MSK) | addr;
++			_gcmp_base = (unsigned long) ioremap_nocache(addr,
++				GCMP_ADDRSPACE_SZ);
++			gcmp_present = (GCMPGCB(GCMPB)
++				& GCMP_GCB_GCMPB_GCMPBASE_MSK) == confaddr;
++			confaddr = addr;
++			if (!gcmp_present) {
++				/* reassignment failed, try CMGCRBase again */
++				confaddr = read_c0_cmgcrbase() << 4;
++				_gcmp_base = (unsigned long)ioremap_nocache
++					(confaddr, GCMP_ADDRSPACE_SZ);
++				gcmp_present = (GCMPGCB(GCMPB) &
++					GCMP_GCB_GCMPB_GCMPBASE_MSK)
++					== confaddr;
++			}
++		}
++	}
++
++	if (gcmp_present <= 0) {
++		/* try addr */
++		_gcmp_base = (unsigned long) ioremap_nocache(addr,
++		GCMP_ADDRSPACE_SZ);
++		gcmp_present = (GCMPGCB(GCMPB)
++			& GCMP_GCB_GCMPB_GCMPBASE_MSK) == addr;
++		confaddr = addr;
++	}
++
++	if (gcmp_present <= 0) {
++		/* try GCMP_BASE_ADDR */
++		_gcmp_base = (unsigned long) ioremap_nocache(GCMP_BASE_ADDR,
++		GCMP_ADDRSPACE_SZ);
++		gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK)
++			== GCMP_BASE_ADDR;
++		confaddr = GCMP_BASE_ADDR;
++	}
++
++	if (gcmp_present) {
++		pr_info("GCMP present\n");
++		if (GCMPGCB(GCMPREV) >= 6)
++			cpu_data[0].options |= MIPS_CPU_CM2;
++		if (cpu_has_cm2 && (size > 0x8000)) {
++			GCMPGCB(GCML2S) = (confaddr + 0x8000) | 1;
++			cpu_data[0].options |= MIPS_CPU_CM2_L2SYNC;
++			pr_info("L2-only SYNC available\n");
++		}
++	}
++
++	return gcmp_present;
++}
++
++unsigned int __cpuinit get_c0_compare_int(void)
++{
++	return gic_get_c0_compare_int();
++}
++
++asmlinkage void plat_irq_dispatch(void)
++{
++	unsigned int pending = read_c0_cause() & read_c0_status() & ST0_IM;
++
++	if (unlikely(!pending)) {
++		spurious_interrupt();
++		return;
++	}
++	gic_local_irq_dispatch();
++	gic_shared_irq_dispatch();
++}
++
++int get_c0_perfcount_int(void)
++{
++	return gic_get_c0_perfcount_int();
++}
++
++void gic_enable_interrupt(int irq_vec)
++{
++	unsigned int i, irq_source;
++
++	/* enable all the interrupts associated with this vector */
++	for (i = 0; i < gic_shared_intr_map[irq_vec].num_shared_intr; i++) {
++		irq_source = gic_shared_intr_map[irq_vec].intr_list[i];
++		GIC_SET_INTR_MASK(irq_source);
++	}
++	/* enable all local interrupts associated with this vector */
++	if (gic_shared_intr_map[irq_vec].local_intr_mask) {
++		GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_OTHER_ADDR), 0);
++		GICWRITE(GIC_REG(VPE_OTHER, GIC_VPE_SMASK),
++			gic_shared_intr_map[irq_vec].local_intr_mask);
++	}
++}
++
++void gic_disable_interrupt(int irq_vec)
++{
++	unsigned int i, irq_source;
++
++	/* disable all the interrupts associated with this vector */
++	for (i = 0; i < gic_shared_intr_map[irq_vec].num_shared_intr; i++) {
++		irq_source = gic_shared_intr_map[irq_vec].intr_list[i];
++		GIC_CLR_INTR_MASK(irq_source);
++	}
++	/* disable all local interrupts associated with this vector */
++	if (gic_shared_intr_map[irq_vec].local_intr_mask) {
++		GICWRITE(GIC_REG(VPE_LOCAL, GIC_VPE_OTHER_ADDR), 0);
++		GICWRITE(GIC_REG(VPE_OTHER, GIC_VPE_RMASK),
++			gic_shared_intr_map[irq_vec].local_intr_mask);
++	}
++}
++
++#ifndef CONFIG_SOC_GRX500_A21
++#ifdef CONFIG_PCIE_LANTIQ
++#define PCIE_IRNCR_OFF		0xF8
++static u32 pcie_rc_app_base[3] = {0xb8800000, 0xb8300000, 0xb8d00000};
++
++static u32 pcie_irq_idx_to_bit[4] = {BIT(13), BIT(14), BIT(15), BIT(16)};
++
++void pcie_intx_war(unsigned int irq)
++{
++	if (irq >= 136 && irq <= 139) {/* RC0 */
++		ltq_w32_mask(0, pcie_irq_idx_to_bit[irq - 136],
++			(u32 *)(pcie_rc_app_base[0] + PCIE_IRNCR_OFF));
++	} else if (irq >= 9 && irq <= 12) { /* RC1 */
++		ltq_w32_mask(0, pcie_irq_idx_to_bit[irq - 9],
++			(u32 *)(pcie_rc_app_base[1] + PCIE_IRNCR_OFF));
++	} else if (irq >= 155 && irq <= 158) { /* RC2 */
++		ltq_w32_mask(0, pcie_irq_idx_to_bit[irq - 155],
++			(u32 *)(pcie_rc_app_base[2] + PCIE_IRNCR_OFF));
++	}
++}
++#endif /* CONFIG_PCIE_LANTIQ */
++#endif /* CONFIG_SOC_GRX500_A21 */
++
++void __init gic_platform_init(int irqs, struct irq_chip *irq_controller)
++{
++	irq_gic = irq_controller;
++}
++
++static int gic_map(struct irq_domain *d, unsigned int irq, irq_hw_number_t hw)
++{
++	if (hw >= MIPS_GIC_LOCAL_IRQ_BASE) { /* Local Irq*/
++		int intr = hw - MIPS_GIC_LOCAL_IRQ_BASE;
++		/*
++		* HACK: These are all really percpu interrupts, but the rest
++		* of the MIPS kernel code does not use the percpu IRQ API for
++		* the CP0 timer and performance counter interrupts.
++		*/
++		if ((intr != GIC_LOCAL_INT_TIMER)
++			&& (intr != GIC_LOCAL_INT_PERFCTR)) {
++			irq_set_chip_and_handler(hw,
++					 irq_gic,
++					 handle_percpu_devid_irq);
++			irq_set_percpu_devid(hw);
++		} else
++			goto done;
++	} else
++done :
++		irq_set_chip_and_handler(hw, irq_gic, handle_percpu_irq);
++	return 0;
++}
++
++static const struct irq_domain_ops gic_irq_domain_ops = {
++	.xlate = irq_domain_xlate_onecell,
++	.map = gic_map,
++};
++
++static int __init of_gic_init(struct device_node *node,
++				struct device_node *parent)
++{
++	struct irq_domain *domain;
++	struct resource gic = { 0 };
++	unsigned int gic_rev;
++	int i;
++
++	/* Not all VPE up, can't use OS API to handle it */
++	for (i = 0; i < num_possible_cpus(); i++)
++		ltq_vpe_os_type_init(i);
++
++	if (of_address_to_resource(node, 0, &gic))
++		panic("Failed to get gic memory range");
++	if (!request_mem_region(gic.start, resource_size(&gic),
++				gic.name))
++		panic("Failed to request gic memory");
++
++	if (gcmp_present)  {
++		GCMPGCB(GICBA) = GIC_BASE_ADDR | GCMP_GCB_GICBA_EN_MSK;
++		gic_present = 1;
++	}
++	pr_info("GIC: %spresent\n", (gic_present) ? "" : "not ");
++	pr_info("EIC: %s\n",
++		(current_cpu_data.options & MIPS_CPU_VEIC) ?  "on" : "off");
++	pr_info("GIC map size %d\n", ARRAY_SIZE(gic_intr_map));
++
++	if (!cpu_has_veic) {
++		mips_cpu_irq_init();
++		if (cpu_has_vint) {
++			/* install generic handler */
++			/* 2 - Normal/IPI
++			 * 3 - Normal
++			 * 4 - Normal
++			 * 5 - Normal
++			 * 6 - Normal
++			 * 7 - Local
++			 */
++			set_vi_handler(2, gic_shared_irq_vi2_dispatch);
++			set_vi_handler(3, gic_shared_irq_vi3_dispatch);
++			set_vi_handler(4, gic_shared_irq_vi4_dispatch);
++			set_vi_handler(5, gic_shared_irq_vi5_dispatch);
++			set_vi_handler(6, gic_shared_irq_vi6_dispatch);
++			set_vi_handler(7, gic_local_irq_dispatch);
++			
++			/* Performance Counter, vector 7
++			 * VPE0 timer default HW5
++			 * VPE0 performance counter default HW4
++			 * GIC will re route perofrmance counter to HW5
++			 * However, VPE0 initialized, PMU also initialized
++			 * based on VPE0 default value0
++			 */
++			/* R4K timer handled by OS, vector 7 */
++		}
++	}
++
++#ifdef CONFIG_MIPS_MT_SMP
++	fill_ipi_map();
++#endif /* CONFIG_MIPS_MT_SMP */
++	gic_init(gic.start, resource_size(&gic), gic_intr_map,
++		ARRAY_SIZE(gic_intr_map), MIPS_GIC_IRQ_BASE);
++
++	GICREAD(GIC_REG(SHARED, GIC_SH_REVISIONID), gic_rev);
++	pr_info("gic: revision %d.%d\n", (gic_rev >> 8) & 0xff, gic_rev & 0xff);
++	domain = irq_domain_add_legacy(node,
++		GIC_NUM_INTRS + GIC_NUM_LOCAL_INTRS,
++		gic_irq_base, gic_irq_base, &gic_irq_domain_ops, NULL);
++	if (!domain)
++		panic("Failed to add irqdomain");
++	irq_set_default_host(domain);
++
++#ifdef CONFIG_MIPS_MT_SMP
++	for (i = 0; i < nr_cpu_ids; i++) {
++		if (ltq_vpe_run_linux_os(i)) {
++			setup_irq(gic_irq_base + GIC_RESCHED_INT(i),
++				&irq_resched);
++			setup_irq(gic_irq_base + GIC_CALL_INT(i),
++				&irq_call);
++		}
++	}
++#endif
++	change_c0_status(ST0_IM, STATUSF_IP2 | STATUSF_IP3 | STATUSF_IP4 |
++		STATUSF_IP5 | STATUSF_IP6 | STATUSF_IP7);
++	back_to_back_c0_hazard();
++	pr_info("CPU%d: c0 status register %08x\n", smp_processor_id(),
++		read_c0_status());
++
++	pr_info("%s init done\n", __func__);
++	return 0;
++}
++
++static struct of_device_id __initdata of_irq_ids[] = {
++	{ .compatible = "lantiq,gic-grx500", .data = of_gic_init },
++	{},
++};
++
++void __init arch_init_irq(void)
++{
++	of_irq_init(of_irq_ids);
++}
++
++void grx5xx_be_init(void)
++{
++	/* Could change CM error mask register */
++}
++
++static const char *tr[8] = {
++	"mem",	"gcr",	"gic",	"mmio",
++	"0x04", "0x05", "0x06", "0x07"
++};
++
++static const char *mcmd[32] = {
++	[0x00] = "0x00",
++	[0x01] = "Legacy Write",
++	[0x02] = "Legacy Read",
++	[0x03] = "0x03",
++	[0x04] = "0x04",
++	[0x05] = "0x05",
++	[0x06] = "0x06",
++	[0x07] = "0x07",
++	[0x08] = "Coherent Read Own",
++	[0x09] = "Coherent Read Share",
++	[0x0a] = "Coherent Read Discard",
++	[0x0b] = "Coherent Ready Share Always",
++	[0x0c] = "Coherent Upgrade",
++	[0x0d] = "Coherent Writeback",
++	[0x0e] = "0x0e",
++	[0x0f] = "0x0f",
++	[0x10] = "Coherent Copyback",
++	[0x11] = "Coherent Copyback Invalidate",
++	[0x12] = "Coherent Invalidate",
++	[0x13] = "Coherent Write Invalidate",
++	[0x14] = "Coherent Completion Sync",
++	[0x15] = "0x15",
++	[0x16] = "0x16",
++	[0x17] = "0x17",
++	[0x18] = "0x18",
++	[0x19] = "0x19",
++	[0x1a] = "0x1a",
++	[0x1b] = "0x1b",
++	[0x1c] = "0x1c",
++	[0x1d] = "0x1d",
++	[0x1e] = "0x1e",
++	[0x1f] = "0x1f"
++};
++
++static const char *l2_ins[32] = {
++	[0x00] = "l2_nop",
++	[0x01] = "l2_err_corr",
++	[0x02] = "l2_tag_inv",
++	[0x03] = "l2_ws_clean",
++	[0x04] = "l2_rd_mdyfy_wr",
++	[0x05] = "l2_ws_mru",
++	[0x06] = "l2_evict_ln2",
++	[0x07] = "0x07",
++	[0x08] = "l2_evict",
++	[0x09] = "l2_refl",
++	[0x0a] = "l2_rd",
++	[0x0b] = "l2_wr",
++	[0x0c] = "l2_evict_mru",
++	[0x0d] = "l2_sync",
++	[0x0e] = "l2_efl_err",
++	[0x0f] = "0x0f",
++	[0x10] = "l2_indx_wb_inv",
++	[0x11] = "l2_indx_ld_tag",
++	[0x12] = "l2_indx_st_tag",
++	[0x13] = "l2_indx_st_data",
++	[0x14] = "l2_indx_st_ecc",
++	[0x15] = "0x15",
++	[0x16] = "0x16",
++	[0x17] = "0x17",
++	[0x18] = "l2_ftch_and_lck",
++	[0x19] = "l2_hit_inv",
++	[0x1a] = "l2_hit_wb_inv",
++	[0x1b] = "l2_hit_wb",
++	[0x1c] = "0x1c",
++	[0x1d] = "0x1d",
++	[0x1e] = "0x1e",
++	[0x1f] = "0x1f"
++};
++
++static const char *array_type[4] = {
++	[0] = "none",
++	[1] = "Tag Ecc",
++	[2] = "Data Ecc",
++	[3] = "WS unco dirty parity"
++};
++
++static const char *core[8] = {
++	"Invalid/OK",	"Invalid/Data",
++	"Shared/OK",	"Shared/Data",
++	"Modified/OK",	"Modified/Data",
++	"Exclusive/OK", "Exclusive/Data"
++};
++
++static const char *causes[32] = {
++	"None", "GC_WR_ERR", "GC_RD_ERR", "COH_WR_ERR",
++	"COH_RD_ERR", "MMIO_WR_ERR", "MMIO_RD_ERR", "0x07",
++	"0x08", "0x09", "0x0a", "0x0b",
++	"0x0c", "0x0d", "0x0e", "0x0f",
++	"0x10", "0x11", "0x12", "0x13",
++	"0x14", "0x15", "0x16", "INTVN_WR_ERR",
++	"INTVN_RD_ERR", "0x19", "0x1a", "0x1b",
++	"0x1c", "0x1d", "0x1e", "0x1f"
++};
++
++int grx5xx_be_handler(struct pt_regs *regs, int is_fixup)
++{
++	/* This duplicates the handling in do_be which seems wrong */
++	int retval = is_fixup ? MIPS_BE_FIXUP : MIPS_BE_FATAL;
++
++	if (gcmp_present) {
++		unsigned long cm_error = GCMPGCB(GCMEC);
++		unsigned long cm_addr = GCMPGCB(GCMEA);
++		unsigned long cm_other = GCMPGCB(GCMEO);
++		unsigned long cause, ocause;
++		char buf[256];
++
++		cause = (cm_error & GCMP_GCB_GMEC_ERROR_TYPE_MSK);
++		if (cause != 0) {
++			cause >>= GCMP_GCB_GMEC_ERROR_TYPE_SHF;
++			if (cause < 16) {
++				unsigned long cca_bits = (cm_error >> 15) & 7;
++				unsigned long tr_bits = (cm_error >> 12) & 7;
++				unsigned long mcmd_bits =
++					(cm_error >> 7) & 0x1f;
++				unsigned long stag_bits = (cm_error >> 3) & 15;
++				unsigned long sport_bits = (cm_error >> 0) & 7;
++
++				snprintf(buf, sizeof(buf),
++					 "CCA=%lu TR=%s MCmd=%s STag=%lu "
++					 "SPort=%lu\n",
++					 cca_bits, tr[tr_bits], mcmd[mcmd_bits],
++					 stag_bits, sport_bits);
++			} else  if (cause >= 16 && cause <= 23) {
++				/* glob state & sresp together */
++				unsigned long c3_bits = (cm_error >> 18) & 7;
++				unsigned long c2_bits = (cm_error >> 15) & 7;
++				unsigned long c1_bits = (cm_error >> 12) & 7;
++				unsigned long c0_bits = (cm_error >> 9) & 7;
++				unsigned long sc_bit = (cm_error >> 8) & 1;
++				unsigned long mcmd_bits =
++					(cm_error >> 3) & 0x1f;
++				unsigned long sport_bits = (cm_error >> 0) & 7;
++				snprintf(buf, sizeof(buf),
++					 "C3=%s C2=%s C1=%s C0=%s SC=%s "
++					 "MCmd=%s SPort=%lu\n",
++					 core[c3_bits], core[c2_bits],
++					 core[c1_bits], core[c0_bits],
++					 sc_bit ? "True" : "False",
++					 mcmd[mcmd_bits], sport_bits);
++			} else { /* 24 ~ 26 */
++				unsigned long multi_bit = (cm_error >> 23) & 1;
++				unsigned long ins_bits =
++					(cm_error >> 18) & 0x1f;
++				unsigned long type_bits = (cm_error >> 16) & 3;
++				unsigned long way_bits = (cm_error >> 9) & 7;
++				unsigned long word_bits =
++					(cm_error >> 12) & 0xf;
++				unsigned long mway_bit = (cm_error >> 8) & 1;
++				unsigned long syn_bits = (cm_error >> 0) & 0xff;
++				snprintf(buf, sizeof(buf),
++					 "multi unco=%s l2 ins=%s array type=%s"
++					 "word_bits=%lu way_bits=%lu"
++					 "multi way=%s syndrome=%lu\n",
++					 multi_bit ? "True" : "False",
++					 l2_ins[ins_bits],
++					 array_type[type_bits], word_bits,
++					 way_bits, mway_bit ? "True" : "False",
++					 syn_bits);
++			}
++			ocause = (cm_other & GCMP_GCB_GMEO_ERROR_2ND_MSK) >>
++				 GCMP_GCB_GMEO_ERROR_2ND_SHF;
++
++			pr_err("CM_ERROR=%08lx %s <%s>\n", cm_error,
++				causes[cause], buf);
++			pr_err("CM_ADDR =%08lx\n", cm_addr);
++			pr_err("CM_OTHER=%08lx %s\n", cm_other, causes[ocause]);
++
++			/* reprime cause register */
++			GCMPGCB(GCMEC) = 0;
++		}
++	}
++	return retval;
++}
++
++
+diff --git a/arch/mips/lantiq/irq.c b/arch/mips/lantiq/irq.c
+--- a/arch/mips/lantiq/irq.c
++++ b/arch/mips/lantiq/irq.c
+@@ -103,6 +103,7 @@ static void __iomem *ltq_icu_membase[MAX
+ static void __iomem *ltq_eiu_membase;
+ static struct irq_domain *ltq_domain;
+ static DEFINE_SPINLOCK(ltq_eiu_lock);
++static int ltq_perfcount_irq;
+ 
+ static void ltq_eiu_w32_mask(uint32_t clr, uint32_t set, uint32_t reg_off)
+ {
+@@ -588,7 +589,7 @@ int __init icu_of_init(struct device_nod
+ #endif
+ 
+ 	/* tell oprofile which irq to use */
+-	cp0_perfcount_irq = irq_create_mapping(ltq_domain, LTQ_PERF_IRQ);
++	ltq_perfcount_irq = irq_create_mapping(ltq_domain, LTQ_PERF_IRQ);
+ 
+ 	/*
+ 	 * if the timer irq is not one of the mips irqs we need to
+@@ -605,6 +606,12 @@ unsigned int __cpuinit get_c0_compare_in
+ 	return MIPS_CPU_TIMER_IRQ;
+ }
+ 
++int get_c0_perfcount_int(void)
++{
++	return ltq_perfcount_irq;
++}
++
++
+ static struct of_device_id __initdata of_irq_ids[] = {
+ 	{ .compatible = "lantiq,icu", .data = icu_of_init },
+ 	{},
+diff --git a/arch/mips/mti-malta/malta-time.c b/arch/mips/mti-malta/malta-time.c
+--- a/arch/mips/mti-malta/malta-time.c
++++ b/arch/mips/mti-malta/malta-time.c
+@@ -132,39 +132,31 @@ void read_persistent_clock(struct timesp
+ 	ts->tv_nsec = 0;
+ }
+ 
+-static void __init plat_perf_setup(void)
++int get_c0_perfcount_int(void)
+ {
+-#ifdef MSC01E_INT_BASE
++
+ 	if (cpu_has_veic) {
+ 		set_vi_handler(MSC01E_INT_PERFCTR, mips_perf_dispatch);
+ 		mips_cpu_perf_irq = MSC01E_INT_BASE + MSC01E_INT_PERFCTR;
+-	} else
+-#endif
+-	if (cp0_perfcount_irq >= 0) {
+-		if (cpu_has_vint)
+-			set_vi_handler(cp0_perfcount_irq, mips_perf_dispatch);
++	} else if (gic_present)
++		mips_cpu_perf_irq = gic_get_c0_perfcount_int();
++	else if(cp0_perfcount_irq >= 0)
+ 		mips_cpu_perf_irq = MIPS_CPU_IRQ_BASE + cp0_perfcount_irq;
+-#ifdef CONFIG_SMP
+-		irq_set_handler(mips_cpu_perf_irq, handle_percpu_irq);
+-#endif
+-	}
++	else
++		mips_cpu_perf_irq = -1;
+ }
+ 
+ unsigned int __cpuinit get_c0_compare_int(void)
+ {
+-#ifdef MSC01E_INT_BASE
+ 	if (cpu_has_veic) {
+ 		set_vi_handler(MSC01E_INT_CPUCTR, mips_timer_dispatch);
+ 		mips_cpu_timer_irq = MSC01E_INT_BASE + MSC01E_INT_CPUCTR;
+-	} else
+-#endif
+-	{
+-		if (cpu_has_vint)
+-			set_vi_handler(cp0_compare_irq, mips_timer_dispatch);
++	}
++	} else if (gic_present) {
++		mips_cpu_timer_irq = gic_get_c0_compare_int();
++	} else {
+ 		mips_cpu_timer_irq = MIPS_CPU_IRQ_BASE + cp0_compare_irq;
+ 	}
+-
+-	return mips_cpu_timer_irq;
+ }
+ 
+ void __init plat_time_init(void)
+diff --git a/arch/mips/mti-sead3/sead3-time.c b/arch/mips/mti-sead3/sead3-time.c
+--- a/arch/mips/mti-sead3/sead3-time.c
++++ b/arch/mips/mti-sead3/sead3-time.c
+@@ -6,7 +6,7 @@
+  * Copyright (C) 2012 MIPS Technologies, Inc.  All rights reserved.
+  */
+ #include <linux/init.h>
+-
++#include <asm/gic.h>
+ #include <asm/setup.h>
+ #include <asm/time.h>
+ #include <asm/irq.h>
+@@ -14,21 +14,23 @@
+ 
+ unsigned long cpu_khz;
+ 
+-static int mips_cpu_timer_irq;
+-static int mips_cpu_perf_irq;
++static void __iomem *status_reg = (void __iomem *)0xbf000410;
+ 
+-static void mips_timer_dispatch(void)
++int get_c0_perfcount_int(void)
+ {
+-	do_IRQ(mips_cpu_timer_irq);
++	if (gic_present)
++		return gic_get_c0_compare_int();
++	if (cp0_perfcount_irq >= 0)
++		return MIPS_CPU_IRQ_BASE + cp0_perfcount_irq;
++	return -1;
+ }
+ 
+-static void mips_perf_dispatch(void)
++unsigned int get_c0_compare_int(void)
+ {
+-	do_IRQ(mips_cpu_perf_irq);
++	if (gic_present)
++		return gic_get_c0_compare_int();
++	return MIPS_CPU_IRQ_BASE + cp0_compare_irq;
+ }
+-
+-static void __iomem *status_reg = (void __iomem *)0xbf000410;
+-
+ /*
+  * Estimate CPU frequency.  Sets mips_hpt_frequency as a side-effect.
+  */
+diff --git a/arch/mips/oprofile/op_model_mipsxx.c b/arch/mips/oprofile/op_model_mipsxx.c
+--- a/arch/mips/oprofile/op_model_mipsxx.c
++++ b/arch/mips/oprofile/op_model_mipsxx.c
+@@ -35,6 +35,7 @@
+ #define M_PERFCTL_COUNT_ALL_THREADS	(1UL	  << 13)
+ 
+ static int (*save_perf_irq)(void);
++static int perfcount_irq;
+ 
+ /*
+  * XLR has only one set of counters per core. Designate the
+@@ -421,9 +422,16 @@ static int __init mipsxx_init(void)
+ 
+ 	save_perf_irq = perf_irq;
+ 	perf_irq = mipsxx_perfcount_handler;
++	if (get_c0_perfcount_int)
++		perfcount_irq = get_c0_perfcount_int();
++	else if ((cp0_perfcount_irq >= 0) &&
++		 (cp0_compare_irq != cp0_perfcount_irq))
++		perfcount_irq = MIPS_CPU_IRQ_BASE + cp0_perfcount_irq;
++	else
++		perfcount_irq = -1;
+ 
+-	if ((cp0_perfcount_irq >= 0) && (cp0_compare_irq != cp0_perfcount_irq))
+-		return request_irq(cp0_perfcount_irq, mipsxx_perfcount_int,
++	if (perfcount_irq >= 0)
++		return request_irq(perfcount_irq, mipsxx_perfcount_int,
+ 			0, "Perfcounter", save_perf_irq);
+ 
+ 	return 0;
+@@ -433,8 +441,8 @@ static void mipsxx_exit(void)
+ {
+ 	int counters = op_model_mipsxx_ops.num_counters;
+ 
+-	if ((cp0_perfcount_irq >= 0) && (cp0_compare_irq != cp0_perfcount_irq))
+-		free_irq(cp0_perfcount_irq, save_perf_irq);
++	if (perfcount_irq >= 0)
++		free_irq(perfcount_irq, save_perf_irq);
+ 
+ 	counters = counters_per_cpu_to_total(counters);
+ 	on_each_cpu(reset_counters, (void *)(long)counters, 1);

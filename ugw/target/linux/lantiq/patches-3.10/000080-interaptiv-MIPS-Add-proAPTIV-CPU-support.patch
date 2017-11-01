@@ -1,0 +1,1071 @@
+From 65b4e451fc323d80822c11c90f6323ec109d5a10 Mon Sep 17 00:00:00 2001
+From: Steven J. Hill <Steven.Hill@imgtec.com>
+Date: Fri, 27 Sep 2013 02:59:01 -0500
+Subject: [PATCH 080/105] MIPS: Add proAPTIV CPU support.
+
+FTLB implementation plus preliminary segment registers setup.
+
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+---
+ arch/mips/include/asm/cpu-features.h |   15 ++++
+ arch/mips/include/asm/cpu-info.h     |   16 +++-
+ arch/mips/include/asm/cpu.h          |    8 ++-
+ arch/mips/include/asm/mipsregs.h     |   83 +++++++++++++++++++-
+ arch/mips/include/asm/page.h         |    3 +
+ arch/mips/kernel/cpu-probe.c         |  140 +++++++++++++++++++++++++++++++---
+ arch/mips/kernel/genex.S             |    1 +
+ arch/mips/kernel/idle.c              |    1 +
+ arch/mips/kernel/proc.c              |    9 ++
+ arch/mips/kernel/ptrace.c            |    4 +-
+ arch/mips/kernel/segment.c           |  102 ++++++++++++++++++++++++
+ arch/mips/kernel/spram.c             |    3 +-
+ arch/mips/kernel/traps.c             |   53 ++++++++++++-
+ arch/mips/lib/dump_tlb.c             |   17 +++-
+ arch/mips/lib/r3k_dump_tlb.c         |    7 ++-
+ arch/mips/mm/c-r4k.c                 |    1 +
+ arch/mips/mm/init.c                  |    3 +-
+ arch/mips/mm/sc-mips.c               |    2 +-
+ arch/mips/mm/tlb-r4k.c               |   41 +++++++---
+ arch/mips/mm/tlbex.c                 |    1 +
+ arch/mips/mti-malta/malta-setup.c    |   39 ++++++++++
+ 21 files changed, 505 insertions(+), 44 deletions(-)
+ create mode 100644 arch/mips/kernel/segment.c
+
+diff --git a/arch/mips/include/asm/cpu-features.h b/arch/mips/include/asm/cpu-features.h
+index 5dd5818..c832ba2 100644
+--- a/arch/mips/include/asm/cpu-features.h
++++ b/arch/mips/include/asm/cpu-features.h
+@@ -24,6 +24,9 @@
+ #ifndef cpu_has_tlb
+ #define cpu_has_tlb		(cpu_data[0].options & MIPS_CPU_TLB)
+ #endif
++#ifndef cpu_has_tlbinv
++#define cpu_has_tlbinv          (cpu_data[0].options & MIPS_CPU_TLBINV)
++#endif
+ #ifndef cpu_has_4kex
+ #define cpu_has_4kex		(cpu_data[0].options & MIPS_CPU_4KEX)
+ #endif
+@@ -212,6 +215,18 @@
+ #define cpu_has_userlocal	(cpu_data[0].options & MIPS_CPU_ULRI)
+ #endif
+ 
++#ifndef cpu_has_contextconfig
++#define cpu_has_contextconfig	((cpu_data[0].options & MIPS_CPU_CTXTC) || cpu_has_smartmips)
++#endif
++
++#ifndef cpu_has_segments
++#define cpu_has_segments	(cpu_data[0].options & MIPS_CPU_SEGMENTS)
++#endif
++
++#ifndef cpu_has_eva
++#define cpu_has_eva		(cpu_data[0].options & MIPS_CPU_EVA)
++#endif
++
+ #ifdef CONFIG_32BIT
+ # ifndef cpu_has_nofpuex
+ # define cpu_has_nofpuex	(cpu_data[0].options & MIPS_CPU_NOFPUEX)
+diff --git a/arch/mips/include/asm/cpu-info.h b/arch/mips/include/asm/cpu-info.h
+index 41401d8..aa7e22c 100644
+--- a/arch/mips/include/asm/cpu-info.h
++++ b/arch/mips/include/asm/cpu-info.h
+@@ -52,11 +52,14 @@ struct cpuinfo_mips {
+ 	unsigned int		cputype;
+ 	int			isa_level;
+ 	int			tlbsize;
+-	struct cache_desc	icache; /* Primary I-cache */
+-	struct cache_desc	dcache; /* Primary D or combined I/D cache */
+-	struct cache_desc	scache; /* Secondary cache */
+-	struct cache_desc	tcache; /* Tertiary/split secondary cache */
+-	int			srsets; /* Shadow register sets */
++	int                     tlbsizevtlb;
++	int                     tlbsizeftlbsets;
++	int                     tlbsizeftlbways;
++	struct cache_desc	icache;	/* Primary I-cache */
++	struct cache_desc	dcache;	/* Primary D or combined I/D cache */
++	struct cache_desc	scache;	/* Secondary cache */
++	struct cache_desc	tcache;	/* Tertiary/split secondary cache */
++	int			srsets;	/* Shadow register sets */
+ 	int			core;	/* physical core number */
+ #ifdef CONFIG_64BIT
+ 	int			vmbits; /* Virtual memory size in bits */
+@@ -79,6 +82,9 @@ struct cpuinfo_mips {
+ #define NUM_WATCH_REGS 4
+ 	u16			watch_reg_masks[NUM_WATCH_REGS];
+ 	unsigned int		kscratch_mask; /* Usable KScratch mask. */
++	unsigned int            segctl0; /* Memory Segmentation Control 0 */
++	unsigned int            segctl1; /* Memory Segmentation Control 1 */
++	unsigned int            segctl2; /* Memory Segmentation Control 2 */
+ } __attribute__((aligned(SMP_CACHE_BYTES)));
+ 
+ extern struct cpuinfo_mips cpu_data[];
+diff --git a/arch/mips/include/asm/cpu.h b/arch/mips/include/asm/cpu.h
+index dd86ab2..315aed7 100644
+--- a/arch/mips/include/asm/cpu.h
++++ b/arch/mips/include/asm/cpu.h
+@@ -97,6 +97,8 @@
+ #define PRID_IMP_1074K		0x9a00
+ #define PRID_IMP_M14KC		0x9c00
+ #define PRID_IMP_M14KEC		0x9e00
++#define PRID_IMP_PROAPTIV_UP	0xa200
++#define PRID_IMP_PROAPTIV_MP	0xa300
+ 
+ /*
+  * These are the PRID's for when 23:16 == PRID_COMP_SIBYTE
+@@ -265,7 +267,7 @@ enum cpu_type_enum {
+ 	CPU_4KC, CPU_4KEC, CPU_4KSC, CPU_24K, CPU_34K, CPU_1004K, CPU_74K,
+ 	CPU_ALCHEMY, CPU_PR4450, CPU_BMIPS32, CPU_BMIPS3300, CPU_BMIPS4350,
+ 	CPU_BMIPS4380, CPU_BMIPS5000, CPU_JZRISC, CPU_LOONGSON1, CPU_M14KC,
+-	CPU_M14KEC,
++	CPU_M14KEC, CPU_PROAPTIV,
+ 
+ 	/*
+ 	 * MIPS64 class processors
+@@ -277,6 +279,7 @@ enum cpu_type_enum {
+ 	CPU_LAST
+ };
+ 
++#define MIPS_FTLB_CAPABLE       0x1
+ 
+ /*
+  * ISA Level encodings
+@@ -325,6 +328,9 @@ enum cpu_type_enum {
+ #define MIPS_CPU_PCI		0x00400000 /* CPU has Perf Ctr Int indicator */
+ #define MIPS_CPU_RIXI		0x00800000 /* CPU has TLB Read/eXec Inhibit */
+ #define MIPS_CPU_MICROMIPS	0x01000000 /* CPU has microMIPS capability */
++#define MIPS_CPU_SEGMENTS       0x02000000 /* CPU supports memory segmentation */
++#define MIPS_CPU_EVA            0x04000000 /* CPU supports EVA functionality */
++#define MIPS_CPU_TLBINV         0x08000000 /* CPU supports TLBINV/F */
+ 
+ /*
+  * CPU ASE encodings
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+index b495cb3..b14fcf2 100644
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -580,7 +580,9 @@
+ #define MIPS_CONF1_IA		(_ULCAST_(7) << 16)
+ #define MIPS_CONF1_IL		(_ULCAST_(7) << 19)
+ #define MIPS_CONF1_IS		(_ULCAST_(7) << 22)
+-#define MIPS_CONF1_TLBS		(_ULCAST_(63)<< 25)
++#define MIPS_CONF1_TLBS_SHIFT   (25)
++#define MIPS_CONF1_TLBS_SIZE    (6)
++#define MIPS_CONF1_TLBS         (_ULCAST_(63)<< MIPS_CONF1_TLBS_SHIFT)
+ 
+ #define MIPS_CONF2_SA		(_ULCAST_(15)<<	 0)
+ #define MIPS_CONF2_SL		(_ULCAST_(15)<<	 4)
+@@ -594,29 +596,68 @@
+ #define MIPS_CONF3_TL		(_ULCAST_(1) <<	 0)
+ #define MIPS_CONF3_SM		(_ULCAST_(1) <<	 1)
+ #define MIPS_CONF3_MT		(_ULCAST_(1) <<	 2)
++#define MIPS_CONF3_CDMM		(_ULCAST_(1) <<	 3)
+ #define MIPS_CONF3_SP		(_ULCAST_(1) <<	 4)
+ #define MIPS_CONF3_VINT		(_ULCAST_(1) <<	 5)
+ #define MIPS_CONF3_VEIC		(_ULCAST_(1) <<	 6)
+ #define MIPS_CONF3_LPA		(_ULCAST_(1) <<	 7)
++#define MIPS_CONF3_ITL		(_ULCAST_(1) <<	 8)
++#define MIPS_CONF3_CTXTC	(_ULCAST_(1) <<	 9)
+ #define MIPS_CONF3_DSP		(_ULCAST_(1) << 10)
+ #define MIPS_CONF3_DSP2P	(_ULCAST_(1) << 11)
+ #define MIPS_CONF3_RXI		(_ULCAST_(1) << 12)
+ #define MIPS_CONF3_ULRI		(_ULCAST_(1) << 13)
+ #define MIPS_CONF3_ISA		(_ULCAST_(3) << 14)
+ #define MIPS_CONF3_ISA_OE	(_ULCAST_(1) << 16)
++#define MIPS_CONF3_MCU		(_ULCAST_(1) << 17)
++#define MIPS_CONF3_MMAR		(_ULCAST_(7) << 18)
++#define MIPS_CONF3_IPLW		(_ULCAST_(3) << 21)
+ #define MIPS_CONF3_VZ		(_ULCAST_(1) << 23)
+-
++#define MIPS_CONF3_PW		(_ULCAST_(1) << 24)
++#define MIPS_CONF3_SC		(_ULCAST_(1) << 25)
++#define MIPS_CONF3_BI		(_ULCAST_(1) << 26)
++#define MIPS_CONF3_BP		(_ULCAST_(1) << 27)
++#define MIPS_CONF3_MSA		(_ULCAST_(1) << 28)
++#define MIPS_CONF3_CMGCR	(_ULCAST_(1) << 29)
++#define MIPS_CONF3_BPG		(_ULCAST_(1) << 30)
++
++#define MIPS_CONF4_MMUSIZEEXT_SHIFT	(0)
+ #define MIPS_CONF4_MMUSIZEEXT	(_ULCAST_(255) << 0)
++#define MIPS_CONF4_FTLBSETS_SHIFT	(0)
++#define MIPS_CONF4_FTLBSETS	(_ULCAST_(15) << MIPS_CONF4_FTLBSETS_SHIFT)
++#define MIPS_CONF4_FTLBWAYS_SHIFT	(4)
++#define MIPS_CONF4_FTLBWAYS	(_ULCAST_(15) << MIPS_CONF4_FTLBWAYS_SHIFT)
++#define MIPS_CONF4_FTLBPAGESIZE_SHIFT	(8)
++#define MIPS_CONF4_FTLBPAGESIZE	(_ULCAST_(31) << MIPS_CONF4_FTLBPAGESIZE_SHIFT)
+ #define MIPS_CONF4_MMUEXTDEF	(_ULCAST_(3) << 14)
+ #define MIPS_CONF4_MMUEXTDEF_MMUSIZEEXT (_ULCAST_(1) << 14)
+ 
++#define MIPS_CONF4_MMUEXTDEF_FTLBSIZEEXT	(_ULCAST_(2) << 14)
++#define MIPS_CONF4_MMUEXTDEF_VTLBSIZEEXT	(_ULCAST_(3) << 14)
++#define MIPS_CONF4_KSCREXIST	(_ULCAST_(255) << 16)
++#define MIPS_CONF4_VTLBSIZEEXT_SHIFT	(24)
++#define MIPS_CONF4_VTLBSIZEEXT	(_ULCAST_(15) << MIPS_CONF4_VTLBSIZEEXT_SHIFT)
++#define MIPS_CONF4_AE		(_ULCAST_(1) << 28)
++#define MIPS_CONF4_IE		(_ULCAST_(3) << 29)
++#define MIPS_CONF4_TLBINV	(_ULCAST_(2) << 29)
++
++#define MIPS_CONF5_EVA		(_ULCAST_(1) << 28)
++#define MIPS_CONF5_CV		(_ULCAST_(1) << 29)
++#define MIPS_CONF5_K		(_ULCAST_(1) << 30)
++
++#define MIPS_CONF6_JRCD		(_ULCAST_(1) << 0)
++#define MIPS_CONF6_JRCP		(_ULCAST_(1) << 1)
+ #define MIPS_CONF6_SYND		(_ULCAST_(1) << 13)
++#define MIPS_CONF6_SPCD		(_ULCAST_(1) << 14)
++#define MIPS_CONF6_FTLBEN       (_ULCAST_(1) << 15)
+ 
+ #define MIPS_CONF7_WII		(_ULCAST_(1) << 31)
+ #define MIPS_CONF7_AR		(_ULCAST_(1) << 16)
+ #define MIPS_CONF7_IAR		(_ULCAST_(1) << 10)
+ #define MIPS_CONF7_RPS		(_ULCAST_(1) << 2)
+ 
++/*  EntryHI bit definition */
++#define MIPS_EHINV		(_ULCAST_(1) << 10)
+ 
+ /*
+  * Bits in the MIPS32/64 coprocessor 1 (FPU) revision register.
+@@ -632,6 +673,26 @@
+ #define MIPS_FPIR_HAS2008       (_ULCAST_(1) << 23)
+ #define MIPS_FPIR_FC            (_ULCAST_(1) << 24)
+ 
++/*
++ * Bits in the MIPS32 Memory Segmentation registers.
++ */
++#define MIPS_SEGCFG_PA_SHIFT	9
++#define MIPS_SEGCFG_PA		(_ULCAST_(127) << MIPS_SEGCFG_PA_SHIFT)
++#define MIPS_SEGCFG_AM_SHIFT	4
++#define MIPS_SEGCFG_AM		(_ULCAST_(7) << MIPS_SEGCFG_AM_SHIFT)
++#define MIPS_SEGCFG_EU_SHIFT	3
++#define MIPS_SEGCFG_EU		(_ULCAST_(1) << MIPS_SEGCFG_EU_SHIFT)
++#define MIPS_SEGCFG_C_SHIFT	0
++#define MIPS_SEGCFG_C		(_ULCAST_(7) << MIPS_SEGCFG_C_SHIFT)
++
++#define MIPS_SEGCFG_UUSK	_ULCAST_(6)
++#define MIPS_SEGCFG_USK		_ULCAST_(5)
++#define MIPS_SEGCFG_MUSUK	_ULCAST_(4)
++#define MIPS_SEGCFG_MUSK	_ULCAST_(3)
++#define MIPS_SEGCFG_MSK		_ULCAST_(2)
++#define MIPS_SEGCFG_MK		_ULCAST_(1)
++#define MIPS_SEGCFG_UK		_ULCAST_(0)
++
+ #ifndef __ASSEMBLY__
+ 
+ /*
+@@ -1106,6 +1167,15 @@ do {									\
+ #define read_c0_ebase()		__read_32bit_c0_register($15, 1)
+ #define write_c0_ebase(val)	__write_32bit_c0_register($15, 1, val)
+ 
++/* MIPSR3 */
++#define read_c0_segctl0()	__read_32bit_c0_register($5, 2)
++#define write_c0_segctl0(val)	__write_32bit_c0_register($5, 2, val)
++
++#define read_c0_segctl1()	__read_32bit_c0_register($5, 3)
++#define write_c0_segctl1(val)	__write_32bit_c0_register($5, 3, val)
++
++#define read_c0_segctl2()	__read_32bit_c0_register($5, 4)
++#define write_c0_segctl2(val)	__write_32bit_c0_register($5, 4, val)
+ 
+ /* Cavium OCTEON (cnMIPS) */
+ #define read_c0_cvmcount()	__read_ulong_c0_register($9, 6)
+@@ -1666,6 +1736,15 @@ static inline void tlb_write_random(void)
+ 		".set reorder");
+ }
+ 
++static inline void tlbinvf(void)
++{
++	__asm__ __volatile__(
++		".set push\n\t"
++		".set noreorder\n\t"
++		".word 0x42000004\n\t"
++		".set pop");
++}
++
+ /*
+  * Manipulate bits in a c0 register.
+  */
+diff --git a/arch/mips/include/asm/page.h b/arch/mips/include/asm/page.h
+index d064a86..9c85ca9 100644
+--- a/arch/mips/include/asm/page.h
++++ b/arch/mips/include/asm/page.h
+@@ -33,6 +33,9 @@
+ #define PAGE_SIZE	(_AC(1,UL) << PAGE_SHIFT)
+ #define PAGE_MASK	(~((1 << PAGE_SHIFT) - 1))
+ 
++/* this is used for calculation of real page sizes and should be the same */
++#define BASIC_PAGE_SHIFT    12
++
+ #ifdef CONFIG_MIPS_HUGE_TLB_SUPPORT
+ #define HPAGE_SHIFT	(PAGE_SHIFT + PAGE_SHIFT - 3)
+ #define HPAGE_SIZE	(_AC(1,UL) << HPAGE_SHIFT)
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+index e27c967..ebf456b 100644
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -75,6 +75,8 @@ void __init check_bugs32(void)
+ 	check_errata();
+ }
+ 
++#include <asm/pgtable.h>
++#include <asm/bootinfo.h>
+ /*
+  * Probe whether cpu has config register by trying to play with
+  * alternate cache bit and see whether it matters.
+@@ -190,6 +192,8 @@ static inline unsigned int decode_config0(struct cpuinfo_mips *c)
+ 
+ 	if (((config0 & MIPS_CONF_MT) >> 7) == 1)
+ 		c->options |= MIPS_CPU_TLB;
++	if (((config0 & MIPS_CONF_MT) >> 7) == 4)
++		c->options |= MIPS_CPU_TLB;
+ 	isa = (config0 & MIPS_CONF_AT) >> 13;
+ 	switch (isa) {
+ 	case 0:
+@@ -212,8 +216,6 @@ static inline unsigned int decode_config0(struct cpuinfo_mips *c)
+ 		case 1:
+ 			set_isa(c, MIPS_CPU_ISA_M64R2);
+ 			break;
+-		default:
+-			goto unknown;
+ 		}
+ 		break;
+ 	default:
+@@ -244,8 +246,11 @@ static inline unsigned int decode_config1(struct cpuinfo_mips *c)
+ 		c->options |= MIPS_CPU_FPU;
+ 		c->options |= MIPS_CPU_32FPR;
+ 	}
+-	if (cpu_has_tlb)
++	if (cpu_has_tlb) {
+ 		c->tlbsize = ((config1 & MIPS_CONF1_TLBS) >> 25) + 1;
++		c->tlbsizevtlb = c->tlbsize;
++		c->tlbsizeftlbsets = 0;
++	}
+ 
+ 	return config1 & MIPS_CONF_M;
+ }
+@@ -298,24 +303,119 @@ static inline unsigned int decode_config3(struct cpuinfo_mips *c)
+ 	return config3 & MIPS_CONF_M;
+ }
+ 
+-static inline unsigned int decode_config4(struct cpuinfo_mips *c)
++static unsigned int cpu_capability = 0;
++
++static inline unsigned int decode_config4(struct cpuinfo_mips *c, int pass,
++					  int conf6available)
+ {
+ 	unsigned int config4;
++	unsigned int newcf4;
++	unsigned int config6;
+ 
+ 	config4 = read_c0_config4();
+ 
+-	if ((config4 & MIPS_CONF4_MMUEXTDEF) == MIPS_CONF4_MMUEXTDEF_MMUSIZEEXT
+-	    && cpu_has_tlb)
+-		c->tlbsize += (config4 & MIPS_CONF4_MMUSIZEEXT) * 0x40;
++	if (pass && cpu_has_tlb) {
++		if (config4 & MIPS_CONF4_IE) {
++			if (config4 & MIPS_CONF4_TLBINV) {
++				c->options |= MIPS_CPU_TLBINV;
++				printk("TLBINV/F supported, config4=0x%0x\n",config4);
++			}
++			/* TBW: page walker support starts here */
++		}
++		switch (config4 & MIPS_CONF4_MMUEXTDEF) {
++		case MIPS_CONF4_MMUEXTDEF_MMUSIZEEXT:
++			c->tlbsize =
++			    ((((config4 & MIPS_CONF4_MMUSIZEEXT) >>
++			       MIPS_CONF4_MMUSIZEEXT_SHIFT) <<
++			      MIPS_CONF1_TLBS_SIZE) |
++				(c->tlbsize - 1)) + 1;
++			c->tlbsizevtlb = c->tlbsize;
++			printk("MMUSizeExt found, total TLB=%d\n",c->tlbsize);
++			break;
++		case MIPS_CONF4_MMUEXTDEF_VTLBSIZEEXT:
++			c->tlbsizevtlb = ((c->tlbsizevtlb - 1) |
++				(((config4 & MIPS_CONF4_VTLBSIZEEXT) >>
++				  MIPS_CONF4_VTLBSIZEEXT_SHIFT) <<
++				 MIPS_CONF1_TLBS_SIZE)) + 1;
++			c->tlbsize = c->tlbsizevtlb;
++			/* fall through */
++		case MIPS_CONF4_MMUEXTDEF_FTLBSIZEEXT:
++			newcf4 = (config4 & ~MIPS_CONF4_FTLBPAGESIZE) |
++				((((fls(PAGE_SIZE >> BASIC_PAGE_SHIFT)-1)/2)+1) <<
++				 MIPS_CONF4_FTLBPAGESIZE_SHIFT);
++			write_c0_config4(newcf4);
++			back_to_back_c0_hazard();
++			config4 = read_c0_config4();
++			if (config4 != newcf4) {
++				printk(KERN_ERR "PAGE_SIZE 0x%0lx is not supported by FTLB (config4=0x%0x)\n",
++					PAGE_SIZE, config4);
++				if (conf6available && (cpu_capability & MIPS_FTLB_CAPABLE)) {
++					printk("Switching FTLB OFF\n");
++					config6 = read_c0_config6();
++					write_c0_config6(config6 & ~MIPS_CONF6_FTLBEN);
++				}
++				printk("Total TLB(VTLB) inuse: %d\n",c->tlbsizevtlb);
++				break;
++			}
++			c->tlbsizeftlbsets = 1 <<
++				((config4 & MIPS_CONF4_FTLBSETS) >>
++				 MIPS_CONF4_FTLBSETS_SHIFT);
++			c->tlbsizeftlbways = ((config4 & MIPS_CONF4_FTLBWAYS) >>
++					      MIPS_CONF4_FTLBWAYS_SHIFT) + 2;
++			c->tlbsize += (c->tlbsizeftlbways *
++				       c->tlbsizeftlbsets);
++			printk("V/FTLB found: VTLB=%d, FTLB sets=%d, ways=%d total TLB=%d\n",
++				c->tlbsizevtlb, c->tlbsizeftlbsets, c->tlbsizeftlbways, c->tlbsize);
++			break;
++		}
++	}
+ 
+ 	c->kscratch_mask = (config4 >> 16) & 0xff;
+ 
+ 	return config4 & MIPS_CONF_M;
+ }
+ 
++static inline unsigned int decode_config5(struct cpuinfo_mips *c)
++{
++	unsigned int config5;
++
++	config5 = read_c0_config5();
++
++	if (config5 & MIPS_CONF5_EVA)
++		c->options |= MIPS_CPU_EVA;
++
++	return config5 & MIPS_CONF_M;
++}
++
++static inline unsigned int decode_config6_ftlb(struct cpuinfo_mips *c)
++{
++	unsigned int config6;
++
++	if (cpu_capability & MIPS_FTLB_CAPABLE) {
++
++		/*
++		 * Can't rely on mips_ftlb_disabled since kernel command line
++		 * hasn't been processed yet.  Need to peek at the raw command
++		 * line for "noftlb".
++		 */
++		if (strstr(arcs_cmdline, "noftlb") == NULL) {
++			config6 = read_c0_config6();
++
++			printk("Enable FTLB attempt\n");
++			write_c0_config6(config6 | MIPS_CONF6_FTLBEN);
++			back_to_back_c0_hazard();
++
++			return(1);
++		}
++	}
++
++	return(0);
++}
++
++
+ static void __cpuinit decode_configs(struct cpuinfo_mips *c)
+ {
+-	int ok;
++	int ok, ok3 = 0, ok6 = 0;
+ 
+ 	/* MIPS32 or MIPS64 compliant CPU.  */
+ 	c->options = MIPS_CPU_4KEX | MIPS_CPU_4K_CACHE | MIPS_CPU_COUNTER |
+@@ -324,15 +424,22 @@ static void __cpuinit decode_configs(struct cpuinfo_mips *c)
+ 	c->scache.flags = MIPS_CACHE_NOT_PRESENT;
+ 
+ 	ok = decode_config0(c);			/* Read Config registers.  */
+-	BUG_ON(!ok);				/* Arch spec violation!	 */
++	BUG_ON(!ok);				/* Arch spec violation!  */
+ 	if (ok)
+ 		ok = decode_config1(c);
+ 	if (ok)
+ 		ok = decode_config2(c);
+ 	if (ok)
+-		ok = decode_config3(c);
++		ok = ok3 = decode_config3(c);
++	if (ok)
++		ok = decode_config4(c,0,0);   /* first pass - just return Mbit */
+ 	if (ok)
+-		ok = decode_config4(c);
++		ok = decode_config5(c);
++	if (cpu_capability & MIPS_FTLB_CAPABLE)
++		ok6 = decode_config6_ftlb(c);
++
++	if (ok3)
++		ok = decode_config4(c,1,ok6); /* real parse pass, thanks HW team :-/ */
+ 
+ 	mips_probe_watch_registers(c);
+ 
+@@ -729,7 +836,18 @@ static inline void cpu_probe_mips(struct cpuinfo_mips *c, unsigned int cpu)
+ 		c->cputype = CPU_74K;
+ 		__cpu_name[cpu] = "MIPS 1074Kc";
+ 		break;
++	case PRID_IMP_PROAPTIV_UP:
++		c->cputype = CPU_PROAPTIV;
++		__cpu_name[cpu] = "MIPS proAptiv";
++		cpu_capability = MIPS_FTLB_CAPABLE;
++		break;
++	case PRID_IMP_PROAPTIV_MP:
++		c->cputype = CPU_PROAPTIV;
++		__cpu_name[cpu] = "MIPS proAptiv (multi)";
++		cpu_capability = MIPS_FTLB_CAPABLE;
++		break;
+ 	}
++	decode_configs(c);
+ 
+ 	spram_config();
+ }
+diff --git a/arch/mips/kernel/genex.S b/arch/mips/kernel/genex.S
+index adac3bb..ece8876 100644
+--- a/arch/mips/kernel/genex.S
++++ b/arch/mips/kernel/genex.S
+@@ -484,6 +484,7 @@ NESTED(nmi_handler, PT_SIZE, sp)
+ 	BUILD_HANDLER ov ov sti silent			/* #12 */
+ 	BUILD_HANDLER tr tr sti silent			/* #13 */
+ 	BUILD_HANDLER fpe fpe fpe silent		/* #15 */
++	BUILD_HANDLER ftlb ftlb none silent             /* #16 */
+ 	BUILD_HANDLER mdmx mdmx sti silent		/* #22 */
+ #ifdef	CONFIG_HARDWARE_WATCHPOINTS
+ 	/*
+diff --git a/arch/mips/kernel/idle.c b/arch/mips/kernel/idle.c
+index 0c655de..0c51f66 100644
+--- a/arch/mips/kernel/idle.c
++++ b/arch/mips/kernel/idle.c
+@@ -182,6 +182,7 @@ void __init check_wait(void)
+ 	case CPU_24K:
+ 	case CPU_34K:
+ 	case CPU_1004K:
++	case CPU_PROAPTIV:
+ 		cpu_wait = r4k_wait;
+ 		if (read_c0_config7() & MIPS_CONF7_WII)
+ 			cpu_wait = r4k_wait_irqoff;
+diff --git a/arch/mips/kernel/proc.c b/arch/mips/kernel/proc.c
+index acb3437..cbde072 100644
+--- a/arch/mips/kernel/proc.c
++++ b/arch/mips/kernel/proc.c
+@@ -98,6 +98,7 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ 	if (cpu_has_mipsmt)	seq_printf(m, "%s", " mt");
+ 	if (cpu_has_mmips)	seq_printf(m, "%s", " micromips");
+ 	if (cpu_has_vz)		seq_printf(m, "%s", " vz");
++	if (cpu_has_eva)	seq_printf(m, "%s", " eva");
+ 	seq_printf(m, "\n");
+ 
+ 	if (cpu_has_mmips) {
+@@ -109,6 +110,14 @@ static int show_cpuinfo(struct seq_file *m, void *v)
+ 	seq_printf(m, "kscratch registers\t: %d\n",
+ 		      hweight8(cpu_data[n].kscratch_mask));
+ 	seq_printf(m, "core\t\t\t: %d\n", cpu_data[n].core);
++#if defined(CONFIG_MIPS_MT_SMP) || defined(CONFIG_MIPS_MT_SMTC)
++	if (cpu_has_mipsmt) {
++		seq_printf(m, "VPE\t\t\t: %d\n", cpu_data[n].vpe_id);
++#if defined(CONFIG_MIPS_MT_SMTC)
++		seq_printf(m, "TC\t\t\t: %d\n", cpu_data[n].tc_id);
++#endif
++	}
++#endif
+ 
+ 	sprintf(fmt, "VCE%%c exceptions\t\t: %s\n",
+ 		      cpu_has_vce ? "%u" : "not available");
+diff --git a/arch/mips/kernel/ptrace.c b/arch/mips/kernel/ptrace.c
+index 9c6299c..413f0d0 100644
+--- a/arch/mips/kernel/ptrace.c
++++ b/arch/mips/kernel/ptrace.c
+@@ -222,14 +222,14 @@ int ptrace_set_watch_regs(struct task_struct *child,
+ 	for (i = 0; i < current_cpu_data.watch_reg_use_cnt; i++) {
+ 		__get_user(lt[i], &addr->WATCH_STYLE.watchlo[i]);
+ #ifdef CONFIG_32BIT
+-		if (lt[i] & __UA_LIMIT)
++		if (lt[i] & USER_DS.seg)
+ 			return -EINVAL;
+ #else
+ 		if (test_tsk_thread_flag(child, TIF_32BIT_ADDR)) {
+ 			if (lt[i] & 0xffffffff80000000UL)
+ 				return -EINVAL;
+ 		} else {
+-			if (lt[i] & __UA_LIMIT)
++			if (lt[i] & USER_DS.seg)
+ 				return -EINVAL;
+ 		}
+ #endif
+diff --git a/arch/mips/kernel/segment.c b/arch/mips/kernel/segment.c
+new file mode 100644
+index 0000000..c59da1e
+--- /dev/null
++++ b/arch/mips/kernel/segment.c
+@@ -0,0 +1,102 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 2011 MIPS Technologies, Inc.
++ */
++#include <linux/kernel.h>
++#include <linux/proc_fs.h>
++#include <asm/mipsregs.h>
++
++#ifdef CONFIG_PROC_FS
++static struct proc_dir_entry *segments;
++
++static void proc_build_segment_config(char *str, unsigned int cfg)
++{
++	unsigned int am;
++	int len = 0;
++	static const char *am_str[] =
++		{"UK   ", "MK   ", "MSK  ", "MUSK ", "MUSUK", "USK  ", "UUSK "};
++
++	/* Segment access mode. */
++	am = (cfg & MIPS_SEGCFG_AM) >> MIPS_SEGCFG_AM_SHIFT;
++	len += sprintf(str + len, "%s", am_str[am]);
++
++	/*
++	 * Access modes MK, MSK and MUSK are mapped segments. Therefore
++	 * there is no direct physical address mapping.
++	 */
++	if ((am == 0) || (am > 3))
++		len += sprintf(str + len, "          %03lx",
++			((cfg & MIPS_SEGCFG_PA) >> MIPS_SEGCFG_PA_SHIFT));
++	else
++		len += sprintf(str + len, "          UND");
++
++	/*
++	 * Access modes MK, MSK and MUSK are mapped segments. Therefore
++	 * there is no defined cache mode setting.
++	 */
++	if ((am == 0) || (am > 3))
++		len += sprintf(str + len, "         %01ld",
++			((cfg & MIPS_SEGCFG_C) >> MIPS_SEGCFG_C_SHIFT));
++	else
++		len += sprintf(str + len, "         U");
++
++	/* Exception configuration. */
++	len += sprintf(str + len, "         %01ld\n",
++		((cfg & MIPS_SEGCFG_EU) >> MIPS_SEGCFG_EU_SHIFT));
++}
++
++static int proc_read_segments(char *page, char **start, off_t off,
++			  int count, int *eof, void *data)
++{
++	int len = 0;
++	unsigned int segcfg;
++	char str[42];
++
++	len += sprintf(page + len, "\nSegment   Virtual    Size   Access Mode    Physical    Caching     EU\n");
++
++	len += sprintf(page + len, "-------   --------   ----   -----------   ----------   -------   ------\n");
++
++	segcfg = read_c0_segctl0();
++	proc_build_segment_config(str, segcfg);
++	len += sprintf(page + len, "   0      e0000000   512M      %s", str);
++
++	segcfg >>= 16;
++	proc_build_segment_config(str, segcfg);
++	len += sprintf(page + len, "   1      c0000000   512M      %s", str);
++
++	segcfg = read_c0_segctl1();
++	proc_build_segment_config(str, segcfg);
++	len += sprintf(page + len, "   2      a0000000   512M      %s", str);
++
++	segcfg >>= 16;
++	proc_build_segment_config(str, segcfg);
++	len += sprintf(page + len, "   3      80000000   512M      %s", str);
++
++	segcfg = read_c0_segctl2();
++	proc_build_segment_config(str, segcfg);
++	len += sprintf(page + len, "   4      40000000    1G       %s", str);
++
++	segcfg >>= 16;
++	proc_build_segment_config(str, segcfg);
++	len += sprintf(page + len, "   5      00000000    1G       %s\n", str);
++
++	page += len;
++	return len;
++}
++
++static int __init segments_info(void)
++{
++	if (cpu_has_segments) {
++		segments = create_proc_read_entry("segments", 0444, NULL,
++				proc_read_segments, NULL);
++		if (!segments)
++			return -ENOMEM;
++	}
++	return 0;
++}
++
++__initcall(segments_info);
++#endif /* CONFIG_PROC_FS */
+diff --git a/arch/mips/kernel/spram.c b/arch/mips/kernel/spram.c
+index 6af08d8..8191eca 100644
+--- a/arch/mips/kernel/spram.c
++++ b/arch/mips/kernel/spram.c
+@@ -204,8 +204,9 @@ void __cpuinit spram_config(void)
+ 	switch (c->cputype) {
+ 	case CPU_24K:
+ 	case CPU_34K:
+-	case CPU_74K:
+ 	case CPU_1004K:
++	case CPU_74K:
++	case CPU_PROAPTIV:
+ 		config0 = read_c0_config();
+ 		/* FIXME: addresses are Malta specific */
+ 		if (config0 & (1<<24)) {
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index d6c95d1..45690de 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -76,6 +76,7 @@ extern asmlinkage void handle_cpu(void);
+ extern asmlinkage void handle_ov(void);
+ extern asmlinkage void handle_tr(void);
+ extern asmlinkage void handle_fpe(void);
++extern asmlinkage void handle_ftlb(void);
+ extern asmlinkage void handle_mdmx(void);
+ extern asmlinkage void handle_watch(void);
+ extern asmlinkage void handle_mt(void);
+@@ -1298,6 +1299,7 @@ static inline void parity_protection_init(void)
+ 	case CPU_34K:
+ 	case CPU_74K:
+ 	case CPU_1004K:
++	case CPU_PROAPTIV:
+ 		{
+ #define ERRCTL_PE	0x80000000
+ #define ERRCTL_L2P	0x00800000
+@@ -1379,14 +1381,17 @@ asmlinkage void cache_parity_error(void)
+ 	unsigned int reg_val;
+ 
+ 	/* For the moment, report the problem and hang. */
+-	printk("Cache error exception:\n");
++	printk("Cache error exception, cp0_ecc=0x%08x:\n",read_c0_ecc());
+ 	printk("cp0_errorepc == %0*lx\n", field, read_c0_errorepc());
+ 	reg_val = read_c0_cacheerr();
+ 	printk("c0_cacheerr == %08x\n", reg_val);
+ 
+-	printk("Decoded c0_cacheerr: %s cache fault in %s reference.\n",
+-	       reg_val & (1<<30) ? "secondary" : "primary",
+-	       reg_val & (1<<31) ? "data" : "insn");
++	if ((reg_val & 0xc0000000) == 0xc0000000)
++		printk("Decoded c0_cacheerr: FTLB parity error\n");
++	else
++		printk("Decoded c0_cacheerr: %s cache fault in %s reference.\n",
++			reg_val & (1<<30) ? "secondary" : "primary",
++			reg_val & (1<<31) ? "data" : "insn");
+ 	printk("Error bits: %s%s%s%s%s%s%s%s\n",
+ 	       reg_val & (1<<29) ? "ED " : "",
+ 	       reg_val & (1<<28) ? "ET " : "",
+@@ -1409,6 +1414,45 @@ asmlinkage void cache_parity_error(void)
+ 	panic("Can't handle the cache error!");
+ }
+ 
++asmlinkage void do_ftlb(void)
++{
++	const int field = 2 * sizeof(unsigned long);
++	unsigned int reg_val;
++
++	/* For the moment, report the problem and hang. */
++	printk("FTLB error exception, cp0_ecc=0x%08x:\n",read_c0_ecc());
++	printk("cp0_errorepc == %0*lx\n", field, read_c0_errorepc());
++	reg_val = read_c0_cacheerr();
++	printk("c0_cacheerr == %08x\n", reg_val);
++
++	if ((reg_val & 0xc0000000) == 0xc0000000)
++		printk("Decoded c0_cacheerr: FTLB parity error\n");
++	else
++		printk("Decoded c0_cacheerr: %s cache fault in %s reference.\n",
++		       reg_val & (1<<30) ? "secondary" : "primary",
++		       reg_val & (1<<31) ? "data" : "insn");
++	printk("Error bits: %s%s%s%s%s%s%s%s\n",
++	       reg_val & (1<<29) ? "ED " : "",
++	       reg_val & (1<<28) ? "ET " : "",
++	       reg_val & (1<<27) ? "ES " : "",
++	       reg_val & (1<<26) ? "EE " : "",
++	       reg_val & (1<<25) ? "EB " : "",
++	       reg_val & (1<<24) ? "EI/EF " : "",
++	       reg_val & (1<<23) ? "E1/SP " : "",
++	       reg_val & (1<<22) ? "E0/EW " : "");
++	printk("IDX: 0x%08x\n", reg_val & ((1<<22)-1));
++
++#if defined(CONFIG_CPU_MIPS32) || defined(CONFIG_CPU_MIPS64)
++	if (reg_val & (1<<22))
++		printk("DErrAddr0: 0x%0*lx\n", field, read_c0_derraddr0());
++
++	if (reg_val & (1<<23))
++		printk("DErrAddr1: 0x%0*lx\n", field, read_c0_derraddr1());
++#endif
++
++	panic("Can't handle the FTLB parity error!");
++}
++
+ /*
+  * SDBBP EJTAG debug exception handler.
+  * We skip the instruction and return to the next instruction.
+@@ -1961,6 +2005,7 @@ void __init trap_init(void)
+ 	if (cpu_has_fpu && !cpu_has_nofpuex)
+ 		set_except_vector(15, handle_fpe);
+ 
++	set_except_vector(16, handle_ftlb);
+ 	set_except_vector(22, handle_mdmx);
+ 
+ 	if (cpu_has_mcheck)
+diff --git a/arch/mips/lib/dump_tlb.c b/arch/mips/lib/dump_tlb.c
+index 32b9f21..70519e2 100644
+--- a/arch/mips/lib/dump_tlb.c
++++ b/arch/mips/lib/dump_tlb.c
+@@ -1,8 +1,13 @@
+ /*
+- * Dump R4x00 TLB for debugging purposes.
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
+  *
+  * Copyright (C) 1994, 1995 by Waldorf Electronics, written by Ralf Baechle.
+  * Copyright (C) 1999 by Silicon Graphics, Inc.
++ * Copyright (C) 2011 MIPS Technologies, Inc.
++ *
++ * Dump R4x00 TLB for debugging purposes.
+  */
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+@@ -59,8 +64,10 @@ static void dump_tlb(int first, int last)
+ 
+ 	for (i = first; i <= last; i++) {
+ 		write_c0_index(i);
++		back_to_back_c0_hazard();
+ 		BARRIER();
+ 		tlb_read();
++		back_to_back_c0_hazard();
+ 		BARRIER();
+ 		pagemask = read_c0_pagemask();
+ 		entryhi	 = read_c0_entryhi();
+@@ -68,8 +75,8 @@ static void dump_tlb(int first, int last)
+ 		entrylo1 = read_c0_entrylo1();
+ 
+ 		/* Unused entries have a virtual address of CKSEG0.  */
+-		if ((entryhi & ~0x1ffffUL) != CKSEG0
+-		    && (entryhi & 0xff) == asid) {
++		if (((entryhi & ~0x1ffffUL) != CKSEG0) &&
++		    !(cpu_has_tlbinv && (entryhi & MIPS_EHINV))) {
+ #ifdef CONFIG_32BIT
+ 			int width = 8;
+ #else
+@@ -83,7 +90,7 @@ static void dump_tlb(int first, int last)
+ 			c0 = (entrylo0 >> 3) & 7;
+ 			c1 = (entrylo1 >> 3) & 7;
+ 
+-			printk("va=%0*lx asid=%02lx\n",
++			printk("va=%0*lx asid=%02lx:",
+ 			       width, (entryhi & ~0x1fffUL),
+ 			       entryhi & 0xff);
+ 			printk("\t[pa=%0*llx c=%d d=%d v=%d g=%d] ",
+@@ -105,6 +112,8 @@ static void dump_tlb(int first, int last)
+ 	write_c0_entryhi(s_entryhi);
+ 	write_c0_index(s_index);
+ 	write_c0_pagemask(s_pagemask);
++	BARRIER();
++	back_to_back_c0_hazard();
+ }
+ 
+ void dump_tlb_all(void)
+diff --git a/arch/mips/lib/r3k_dump_tlb.c b/arch/mips/lib/r3k_dump_tlb.c
+index 91615c2..ed9bd4d 100644
+--- a/arch/mips/lib/r3k_dump_tlb.c
++++ b/arch/mips/lib/r3k_dump_tlb.c
+@@ -1,9 +1,14 @@
+ /*
+- * Dump R3000 TLB for debugging purposes.
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
+  *
+  * Copyright (C) 1994, 1995 by Waldorf Electronics, written by Ralf Baechle.
+  * Copyright (C) 1999 by Silicon Graphics, Inc.
+  * Copyright (C) 1999 by Harald Koerfgen
++ * Copyright (C) 2011 MIPS Technologies, Inc.
++ *
++ * Dump R3000 TLB for debugging purposes.
+  */
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index ede5a83..49c6125 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -1103,6 +1103,7 @@ static void __cpuinit probe_pcache(void)
+ 	case CPU_34K:
+ 	case CPU_74K:
+ 	case CPU_1004K:
++	case CPU_PROAPTIV:
+ 		if (c->cputype == CPU_74K)
+ 			alias_74k_erratum(c);
+ 		if (!(read_c0_config7() & MIPS_CONF7_IAR)) {
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+index 32cbfe5..2f4a00f 100644
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -171,7 +171,8 @@ void *kmap_coherent(struct page *page, unsigned long addr)
+ 	return (void*) vaddr;
+ }
+ 
+-#define UNIQUE_ENTRYHI(idx) (CKSEG0 + ((idx) << (PAGE_SHIFT + 1)))
++#define UNIQUE_ENTRYHI(idx) (cpu_has_tlbinv ? ((CKSEG0 + ((idx) << (PAGE_SHIFT + 1))) | MIPS_EHINV) : \
++			     (CKSEG0 + ((idx) << (PAGE_SHIFT + 1))))
+ 
+ void kunmap_coherent(void)
+ {
+diff --git a/arch/mips/mm/sc-mips.c b/arch/mips/mm/sc-mips.c
+index 3ede85f..d413d5a 100644
+--- a/arch/mips/mm/sc-mips.c
++++ b/arch/mips/mm/sc-mips.c
+@@ -74,8 +74,8 @@ static inline int mips_sc_is_activated(struct cpuinfo_mips *c)
+ 	/* Check the bypass bit (L2B) */
+ 	switch (c->cputype) {
+ 	case CPU_34K:
+-	case CPU_74K:
+ 	case CPU_1004K:
++	case CPU_74K:
+ 	case CPU_BMIPS5000:
+ 		if (config2 & (1 << 12))
+ 			return 0;
+diff --git a/arch/mips/mm/tlb-r4k.c b/arch/mips/mm/tlb-r4k.c
+index c643de4..4ffebac 100644
+--- a/arch/mips/mm/tlb-r4k.c
++++ b/arch/mips/mm/tlb-r4k.c
+@@ -27,7 +27,8 @@ extern void build_tlb_refill_handler(void);
+  * Make sure all entries differ.  If they're not different
+  * MIPS32 will take revenge ...
+  */
+-#define UNIQUE_ENTRYHI(idx) (CKSEG0 + ((idx) << (PAGE_SHIFT + 1)))
++#define UNIQUE_ENTRYHI(idx) (cpu_has_tlbinv ? ((CKSEG0 + ((idx) << (PAGE_SHIFT + 1))) | MIPS_EHINV) : \
++			     (CKSEG0 + ((idx) << (PAGE_SHIFT + 1))))
+ 
+ /* Atomicity and interruptability */
+ #ifdef CONFIG_MIPS_MT_SMTC
+@@ -72,6 +73,7 @@ void local_flush_tlb_all(void)
+ 	unsigned long flags;
+ 	unsigned long old_ctx;
+ 	int entry;
++	int ftlbhighset;
+ 
+ 	ENTER_CRITICAL(flags);
+ 	/* Save old context and create impossible VPN2 value */
+@@ -82,14 +84,29 @@ void local_flush_tlb_all(void)
+ 	entry = read_c0_wired();
+ 
+ 	/* Blast 'em all away. */
+-	while (entry < current_cpu_data.tlbsize) {
+-		/* Make sure all entries differ. */
+-		write_c0_entryhi(UNIQUE_ENTRYHI(entry));
+-		write_c0_index(entry);
+-		mtc0_tlbw_hazard();
+-		tlb_write_indexed();
+-		entry++;
+-	}
++	if (cpu_has_tlbinv) {
++		if (current_cpu_data.tlbsizevtlb) {
++			write_c0_index(0);
++			mtc0_tlbw_hazard();
++			tlbinvf();  /* invalide VTLB */
++		}
++		ftlbhighset = current_cpu_data.tlbsizevtlb + current_cpu_data.tlbsizeftlbsets;
++		for (entry=current_cpu_data.tlbsizevtlb;
++		     entry < ftlbhighset;
++		     entry++) {
++			write_c0_index(entry);
++			mtc0_tlbw_hazard();
++			tlbinvf();  /* invalide one FTLB set */
++		}
++	} else
++		while (entry < current_cpu_data.tlbsize) {
++			/* Make sure all entries differ. */
++			write_c0_entryhi(UNIQUE_ENTRYHI(entry));
++			write_c0_index(entry);
++			mtc0_tlbw_hazard();
++			tlb_write_indexed();
++			entry++;
++		}
+ 	tlbw_use_hazard();
+ 	write_c0_entryhi(old_ctx);
+ 	FLUSH_ITLB;
+@@ -127,7 +144,8 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+ 		start = round_down(start, PAGE_SIZE << 1);
+ 		end = round_up(end, PAGE_SIZE << 1);
+ 		size = (end - start) >> (PAGE_SHIFT + 1);
+-		if (size <= current_cpu_data.tlbsize/2) {
++		if ((current_cpu_data.tlbsizeftlbsets && (size <= current_cpu_data.tlbsize/8)) ||
++		    ((!current_cpu_data.tlbsizeftlbsets) && (size <= current_cpu_data.tlbsize/2))) {
+ 			int oldpid = read_c0_entryhi();
+ 			int newpid = cpu_asid(cpu, mm);
+ 
+@@ -166,7 +184,8 @@ void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
+ 	ENTER_CRITICAL(flags);
+ 	size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+ 	size = (size + 1) >> 1;
+-	if (size <= current_cpu_data.tlbsize / 2) {
++	if ((current_cpu_data.tlbsizeftlbsets && (size <= current_cpu_data.tlbsize/8)) ||
++	    ((!current_cpu_data.tlbsizeftlbsets) && (size <= current_cpu_data.tlbsize/2))) {
+ 		int pid = read_c0_entryhi();
+ 
+ 		start &= (PAGE_MASK << 1);
+diff --git a/arch/mips/mm/tlbex.c b/arch/mips/mm/tlbex.c
+index e5a3e87..3d5b090 100644
+--- a/arch/mips/mm/tlbex.c
++++ b/arch/mips/mm/tlbex.c
+@@ -520,6 +520,7 @@ static void __cpuinit build_tlb_write_entry(u32 **p, struct uasm_label **l,
+ 		switch (current_cpu_type()) {
+ 		case CPU_M14KC:
+ 		case CPU_74K:
++		case CPU_PROAPTIV:
+ 			break;
+ 
+ 		default:
+diff --git a/arch/mips/mti-malta/malta-setup.c b/arch/mips/mti-malta/malta-setup.c
+index c72a069..2fd4b87 100644
+--- a/arch/mips/mti-malta/malta-setup.c
++++ b/arch/mips/mti-malta/malta-setup.c
+@@ -243,10 +243,49 @@ static void __init bonito_quirks_setup(void)
+ #endif
+ }
+ 
++void __init plat_eva_setup(void)
++{
++	unsigned int val;
++
++	val = ((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl0(val);
++
++	val = ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl1(val);
++
++	val = ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++		(4 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl2(val);
++	back_to_back_c0_hazard();
++
++	val = read_c0_config5();
++	write_c0_config5(val|MIPS_CONF5_K);
++	back_to_back_c0_hazard();
++
++	printk("Enhanced Virtual Addressing (EVA) active\n");
++}
++
+ void __init plat_mem_setup(void)
+ {
+ 	unsigned int i;
+ 
++	if ((cpu_has_segments) && (cpu_has_eva))
++		plat_eva_setup();
++
+ 	mips_pcibios_init();
+ 
+ 	/* Request I/O space for devices used on the Malta board. */
+-- 
+1.7.1
+

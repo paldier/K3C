@@ -1,0 +1,123 @@
+#!/bin/sh
+# Copyright (C) 2006 OpenWrt.org
+
+#Enable only for debug
+#MPSTATLOG="/tmp/mpstat_log.txt"
+#mpstat 2 100 > $MPSTATLOG &
+
+if [ -r /etc/rc.d/config.sh ]; then
+	. /etc/rc.d/config.sh 2>/dev/null
+fi
+
+export LD_LIBRARY_PATH=/opt/lantiq/lib:/opt/lantiq/usr/lib:${LD_LIBRARY_PATH}
+export PATH=$PATH:/opt/lantiq/sbin:/opt/lantiq/usr/sbin:/opt/lantiq/bin
+
+uc_rcconf() {
+	#/usr/sbin/read_img sysconfig /ramdisk/flash/rc.conf.gz
+	cp /etc/rc.conf.gz /ramdisk/flash/rc.conf.gz
+	/bin/gunzip /ramdisk/flash/rc.conf.gz
+
+	#if [ $? -ne 0 ]; then
+	#	echo "FLASH config file missing/corrupted!"
+	#	/bin/rm -f /ramdisk/flash/rc.conf
+	#	/usr/sbin/upgrade /etc/rc.conf.gz sysconfig 0 1
+	#	/usr/sbin/read_img sysconfig /ramdisk/flash/rc.conf.gz
+	#	/bin/gunzip /ramdisk/flash/rc.conf.gz
+	#fi
+}
+set_passwd() {
+	touch /ramdisk/flash/passwd
+	[ -f /etc/rc.conf ]&& . /etc/rc.conf 2> /dev/null
+	i=0
+	while [ $i -lt $passFileLineCount ]
+	do
+	        eval passVar='$passFileLineCount'$i
+	        echo $passVar >> /ramdisk/flash/passwd
+	        i=`expr $i + 1`
+	done
+}
+
+uptime() {
+	cat /proc/uptime | cut -d" " -f1
+}
+
+if [ "$CONFIG_NEW_FRAMEWORK" = "1" ]; then 
+START_S_FILES="\
+/etc/rc.d/S02boot \
+/etc/rc.d/S03passwd.sh \
+#loading driver modules is handled in eth_sl,
+#disabling call from here.
+#/etc/rc.d/S06load_ppa_modules.sh \
+/etc/rc.d/S11ubus \
+/etc/rc.d/S14load_gphy_firmware.sh \
+/etc/rc.d/S12init_ugwframework.sh \
+/etc/rc.d/S16ifx_load_ifxos_drv.sh \
+#/etc/rc.d/S17ltq_load_cpe_mei_drv.sh \
+#/etc/rc.d/S18ltq_load_dsl_cpe_api.sh \
+/etc/rc.d/S20load_evtlog.sh \
+#/etc/rc.d/S22ltq_cpe_control_init.sh \
+/etc/rc.d/S50lighttpd \
+/etc/rc.d/S70usb_host_device.sh \
+/etc/rc.d/S80mountd \
+"
+fi
+
+#Enable only for debug
+#LOGFILE="/tmp/bootup_log.txt"
+run_scripts() {
+	#echo "Script Name	Start Time	End Time" > $LOGFILE
+if [ "$CONFIG_NEW_FRAMEWORK" = "1" ]; then
+	[ "$1" = "K" ] && return;
+	for i in $START_S_FILES; do
+		if [ -x $i ] ;then 
+			#echo -ne "$i\t $(uptime)\t"  >> $LOGFILE
+			$i $2 2>&1
+			#echo -ne "$(uptime)\n"  >> $LOGFILE
+		fi
+	done
+else
+	for i in /etc/rc.d/$1*; do
+		if [ -x $i ] ;then 
+			#echo -ne "$i\t $(uptime)\t"  >> $LOGFILE
+			$i $2 2>&1
+			#echo -ne "$(uptime)\n"  >> $LOGFILE
+		fi
+	done
+fi
+}
+
+#LOGGER="cat"
+#[ -x /usr/bin/logger ] && LOGGER="logger -s -p 6 -t sysinit"
+
+#uc_rcconf
+#set_passwd
+
+if [ "$1" = "S" ]; then
+	
+	if [ "$CONFIG_PACKAGE_LTQ_CGROUPS" = "1" ]; then                       #if Cgroup Package is set enable below options
+	mount -t tmpfs none /sys/fs/cgroup                                     #mounting an temporary file system for handling cgroups
+	mkdir /sys/fs/cgroup/cpu                                               #Creating subsystem for CPU
+	mkdir /sys/fs/cgroup/memory                                            #Creating Subsystem for Memory
+	mount -t cgroup none /sys/fs/cgroup/cpu -o cpu                         #Mounting CPU Subsystem to Cgroup File System
+	mount -t cgroup none /sys/fs/cgroup/memory -o memory                   #Mounting Memory Subsystem to Cgroup File System
+	cd /sys/fs/cgroup/cpu
+	mkdir high low default                                                 #Creating high low and default groups for CPU Subsystem
+	echo $$ > default/tasks                                                #Keeping all the tasks running to default
+	echo 1 > default/tasks
+	cd /sys/fs/cgroup/memory
+	mkdir high low default                                                 #Creating high low and default groups for CPU Subsystem
+	cd /                                                                   #Keeping the prompt to root
+	
+	fi
+
+	if [ `grep -q shell /proc/cmdline;echo $?` -eq 0 ] ; then              #login to shell without any start_up script
+			/etc/init.d/boot start
+			/etc/init.d/passwd.sh start
+	elif [  `grep -q  bootchartd /proc/cmdline;echo $?` -eq 0 ] ; then
+			run_scripts "$1" "$2"
+	else 
+			run_scripts "$1" "$2" &
+	fi
+else
+        run_scripts "$1" "$2"
+fi

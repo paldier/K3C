@@ -1,0 +1,5430 @@
+From 4e5dd4434d94ae38ae811d9a4d1b56b86c50655c Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Wed, 15 May 2013 14:30:02 -0700
+Subject: [PATCH 081/105] MIPS: MIPS32R2 Segment/EVA support upto 3GB
+
+EVA H/W feature allows an increased physical memory up to 2GB or 3GB
+via direct access from kernel without HIGHMEM.
+This patch provides EVA support (tuned for for Malta board).
+
+EVA also allows an increase of user virtual memory up to 3GB
+but this patch doesn't do any with that yet (it requires some GLIBC debug).
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+(cherry picked from commit 6d56eb2d559bce98a5514599981506280d10dbc9)
+---
+ arch/mips/Kconfig                                  |   35 +
+ arch/mips/include/asm/addrspace.h                  |    2 +
+ arch/mips/include/asm/asm.h                        |   12 +-
+ arch/mips/include/asm/checksum.h                   |   51 +-
+ arch/mips/include/asm/cpu-features.h               |    4 -
+ arch/mips/include/asm/fixmap.h                     |    2 +
+ arch/mips/include/asm/futex.h                      |  141 +++
+ arch/mips/include/asm/mach-generic/spaces.h        |   15 +
+ .../include/asm/mach-malta/kernel-entry-init.h     |   81 ++-
+ arch/mips/include/asm/mach-malta/spaces.h          |   86 ++
+ arch/mips/include/asm/page.h                       |    4 +-
+ arch/mips/include/asm/pgtable-32.h                 |    2 +
+ arch/mips/include/asm/r4kcache.h                   |    4 +-
+ arch/mips/include/asm/uaccess.h                    |  687 +++++++++++++--
+ arch/mips/include/uapi/asm/inst.h                  |   20 +-
+ arch/mips/kernel/cpu-probe.c                       |    2 +
+ arch/mips/kernel/entry.S                           |    6 +
+ arch/mips/kernel/head.S                            |   22 +-
+ arch/mips/kernel/mips_ksyms.c                      |   44 +-
+ arch/mips/kernel/scall32-o32.S                     |   38 +-
+ arch/mips/kernel/signal.c                          |   19 +-
+ arch/mips/kernel/signal32.c                        |   17 +-
+ arch/mips/kernel/traps.c                           |   37 +-
+ arch/mips/kernel/unaligned.c                       |  353 +++++++
+ arch/mips/lib/csum_partial.S                       |  790 +++++++++++++++-
+ arch/mips/lib/memcpy.S                             |  985 +++++++++++++++++++-
+ arch/mips/lib/memset.S                             |  165 ++++
+ arch/mips/lib/strlen_user.S                        |   43 +-
+ arch/mips/lib/strncpy_user.S                       |   46 +-
+ arch/mips/lib/strnlen_user.S                       |   43 +-
+ arch/mips/mm/c-r4k.c                               |   20 +
+ arch/mips/mm/init.c                                |   12 +-
+ arch/mips/mm/pgtable-32.c                          |    4 +
+ arch/mips/mti-malta/malta-init.c                   |   15 +-
+ arch/mips/mti-malta/malta-memory.c                 |  141 +++-
+ arch/mips/mti-malta/malta-setup.c                  |   44 +-
+ 36 files changed, 3819 insertions(+), 173 deletions(-)
+ create mode 100644 arch/mips/include/asm/mach-malta/spaces.h
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -313,6 +313,7 @@ config MIPS_MALTA
+ 	select SWAP_IO_SPACE
+ 	select SYS_HAS_CPU_MIPS32_R1
+ 	select SYS_HAS_CPU_MIPS32_R2
++	select SYS_HAS_CPU_MIPS32_R2_EVA
+ 	select SYS_HAS_CPU_MIPS64_R1
+ 	select SYS_HAS_CPU_MIPS64_R2
+ 	select SYS_HAS_CPU_NEVADA
+@@ -1509,6 +1510,33 @@ config CPU_XLP
+ 	  Netlogic Microsystems XLP processors.
+ endchoice
+ 
++config CPU_MIPS32_R2_EVA
++	bool "MIPS32 Release 2 with EVA support"
++	depends on SYS_HAS_CPU_MIPS32_R2_EVA
++	depends on CPU_MIPS32_R2
++	select EVA
++	help
++	  Choose this option to build a kernel for release 2 or later of the
++	  MIPS32 architecture working in EVA mode. EVA is an Extended Virtual
++	  Addressing but it actually allows extended direct physical memory
++	  addressing in kernel (more than 512MB - 2GB or 3GB). If you know the
++	  specific type of processor in your system, choose those that one
++	  otherwise CPU_MIPS32_R1 is a safe bet for any MIPS32 system.
++	  If unsure, select just CPU_MIPS32_R2 or even CPU_MIPS32_R1.
++
++config EVA_3GB
++	bool "EVA support for 3GB memory"
++	depends on EVA
++	help
++	  Choose this option to build a EVA kernel supporting up to 3GB of
++	  physical memory. This option shifts uncacheble IO registers from KSEG1
++	  to KSEG3 which becomes uncachable and KSEG1 (+KSEG0) can be used for
++	  additional 1GB physical memory. Actually, to minimize changes in
++	  drivers and code the same name (KSEG1) will still be used but it's
++	  address will be changed. The physical I/O address is still the same.
++	  On Malta board it doesn't give you 3GB but it can be used as a start
++	  point for development.
++
+ if CPU_LOONGSON2F
+ config CPU_NOP_WORKAROUNDS
+ 	bool
+@@ -1589,6 +1617,9 @@ config SYS_HAS_CPU_MIPS32_R1
+ config SYS_HAS_CPU_MIPS32_R2
+ 	bool
+ 
++config SYS_HAS_CPU_MIPS32_R2_EVA
++	bool
++
+ config SYS_HAS_CPU_MIPS64_R1
+ 	bool
+ 
+@@ -1701,6 +1732,9 @@ config CPU_MIPSR2
+ 	bool
+ 	default y if CPU_MIPS32_R2 || CPU_MIPS64_R2 || CPU_CAVIUM_OCTEON
+ 
++config EVA
++	bool
++
+ config SYS_SUPPORTS_32BIT_KERNEL
+ 	bool
+ config SYS_SUPPORTS_64BIT_KERNEL
+@@ -2145,6 +2179,7 @@ config HIGHMEM
+ 	bool "High Memory Support"
+ 	depends on 32BIT && CPU_SUPPORTS_HIGHMEM && SYS_SUPPORTS_HIGHMEM
+ 	depends on ( !SMP || NR_CPUS = 1 || NR_CPUS = 2 || NR_CPUS = 3 || NR_CPUS = 4 || NR_CPUS = 5 || NR_CPUS = 6 || NR_CPUS = 7 || NR_CPUS = 8 )
++	depends on !CPU_MIPS32_R2_EVA
+ 
+ config CPU_SUPPORTS_HIGHMEM
+ 	bool
+diff --git a/arch/mips/include/asm/addrspace.h b/arch/mips/include/asm/addrspace.h
+--- a/arch/mips/include/asm/addrspace.h
++++ b/arch/mips/include/asm/addrspace.h
+@@ -94,6 +94,7 @@
+  * Memory segments (32bit kernel mode addresses)
+  * These are the traditional names used in the 32-bit universe.
+  */
++#ifndef KSEG
+ #define KUSEG			0x00000000
+ #define KSEG0			0x80000000
+ #define KSEG1			0xa0000000
+@@ -105,6 +106,7 @@
+ #define CKSEG1			0xa0000000
+ #define CKSEG2			0xc0000000
+ #define CKSEG3			0xe0000000
++#endif
+ 
+ #endif
+ 
+diff --git a/arch/mips/include/asm/asm.h b/arch/mips/include/asm/asm.h
+--- a/arch/mips/include/asm/asm.h
++++ b/arch/mips/include/asm/asm.h
+@@ -149,7 +149,16 @@ 1:		.asciiz string;				\
+ 		pref	hint, addr;			\
+ 		.set	pop
+ 
+-#define PREFX(hint,addr)				\
++#ifdef CONFIG_EVA
++#define PREFE(hint,addr)                                \
++		.set	push;				\
++		.set	mips4;				\
++		.set    eva;                            \
++		prefe   hint, addr;                     \
++		.set	pop
++#endif
++
++#define PREFX(hint,addr)                                \
+ 		.set	push;				\
+ 		.set	mips4;				\
+ 		prefx	hint, addr;			\
+@@ -158,6 +167,7 @@ 1:		.asciiz string;				\
+ #else /* !CONFIG_CPU_HAS_PREFETCH */
+ 
+ #define PREF(hint, addr)
++#define PREFE(hint, addr)
+ #define PREFX(hint, addr)
+ 
+ #endif /* !CONFIG_CPU_HAS_PREFETCH */
+diff --git a/arch/mips/include/asm/checksum.h b/arch/mips/include/asm/checksum.h
+--- a/arch/mips/include/asm/checksum.h
++++ b/arch/mips/include/asm/checksum.h
+@@ -31,6 +31,12 @@
+ 
+ __wsum __csum_partial_copy_user(const void *src, void *dst,
+ 				int len, __wsum sum, int *err_ptr);
++#ifdef  CONFIG_EVA
++__wsum __csum_partial_copy_fromuser(const void *src, void *dst,
++				    int len, __wsum sum, int *err_ptr);
++__wsum __csum_partial_copy_touser(const void *src, void *dst,
++				  int len, __wsum sum, int *err_ptr);
++#endif
+ 
+ /*
+  * this is a new version of the above that records errors it finds in *errp,
+@@ -40,9 +46,34 @@ static inline
+ __wsum csum_partial_copy_from_user(const void __user *src, void *dst, int len,
+ 				   __wsum sum, int *err_ptr)
+ {
++#ifndef CONFIG_EVA
+ 	might_fault();
+ 	return __csum_partial_copy_user((__force void *)src, dst,
+-					len, sum, err_ptr);
++					    len, sum, err_ptr);
++#else
++	if (segment_eq(get_fs(), KERNEL_DS))
++		return __csum_partial_copy_user((__force void *)src, dst,
++						len, sum, err_ptr);
++	else {
++		might_fault();
++		return __csum_partial_copy_fromuser((__force void *)src, dst,
++						    len, sum, err_ptr);
++	}
++#endif
++}
++
++#define _HAVE_ARCH_COPY_AND_CSUM_FROM_USER
++static inline
++__wsum csum_and_copy_from_user (const void __user *src, void *dst,
++				      int len, __wsum sum, int *err_ptr)
++{
++	if (access_ok(VERIFY_READ, src, len))
++		return csum_partial_copy_from_user(src, dst, len, sum, err_ptr);
++
++	if (len)
++		*err_ptr = -EFAULT;
++
++	return sum;
+ }
+ 
+ /*
+@@ -53,10 +84,22 @@ static inline
+ __wsum csum_and_copy_to_user(const void *src, void __user *dst, int len,
+ 			     __wsum sum, int *err_ptr)
+ {
+-	might_fault();
+-	if (access_ok(VERIFY_WRITE, dst, len))
++	if (access_ok(VERIFY_WRITE, dst, len)) {
++#ifndef CONFIG_EVA
++		might_fault();
+ 		return __csum_partial_copy_user(src, (__force void *)dst,
+-						len, sum, err_ptr);
++						  len, sum, err_ptr);
++#else
++		if (segment_eq(get_fs(), KERNEL_DS))
++			return __csum_partial_copy_user(src, (__force void *)dst,
++							  len, sum, err_ptr);
++		else {
++			might_fault();
++			return __csum_partial_copy_touser(src, (__force void *)dst,
++							  len, sum, err_ptr);
++		}
++#endif
++	}
+ 	if (len)
+ 		*err_ptr = -EFAULT;
+ 
+diff --git a/arch/mips/include/asm/cpu-features.h b/arch/mips/include/asm/cpu-features.h
+--- a/arch/mips/include/asm/cpu-features.h
++++ b/arch/mips/include/asm/cpu-features.h
+@@ -215,10 +215,6 @@
+ #define cpu_has_userlocal	(cpu_data[0].options & MIPS_CPU_ULRI)
+ #endif
+ 
+-#ifndef cpu_has_contextconfig
+-#define cpu_has_contextconfig	((cpu_data[0].options & MIPS_CPU_CTXTC) || cpu_has_smartmips)
+-#endif
+-
+ #ifndef cpu_has_segments
+ #define cpu_has_segments	(cpu_data[0].options & MIPS_CPU_SEGMENTS)
+ #endif
+diff --git a/arch/mips/include/asm/fixmap.h b/arch/mips/include/asm/fixmap.h
+--- a/arch/mips/include/asm/fixmap.h
++++ b/arch/mips/include/asm/fixmap.h
+@@ -20,6 +20,7 @@
+ #include <asm/kmap_types.h>
+ #endif
+ 
++#ifndef CONFIG_EVA_3GB
+ /*
+  * Here we define all the compile-time 'special' virtual
+  * addresses. The point is to have a constant address at
+@@ -127,3 +128,4 @@ extern void fixrange_init(unsigned long 
+ 
+ 
+ #endif
++#endif
+diff --git a/arch/mips/include/asm/futex.h b/arch/mips/include/asm/futex.h
+--- a/arch/mips/include/asm/futex.h
++++ b/arch/mips/include/asm/futex.h
+@@ -16,6 +16,7 @@
+ #include <asm/errno.h>
+ #include <asm/war.h>
+ 
++#ifndef CONFIG_EVA
+ #define __futex_atomic_op(insn, ret, oldval, uaddr, oparg)		\
+ {									\
+ 	if (cpu_has_llsc && R10000_LLSC_WAR) {				\
+@@ -73,6 +74,69 @@
+ 	} else								\
+ 		ret = -ENOSYS;						\
+ }
++#else
++#define __futex_atomic_op(insn, ret, oldval, uaddr, oparg)		\
++{									\
++	if (cpu_has_llsc && R10000_LLSC_WAR) {				\
++		__asm__ __volatile__(					\
++		"	.set	push				\n"	\
++		"	.set	noat				\n"	\
++		"	.set	mips3				\n"	\
++		"1:	ll	%1, %4	# __futex_atomic_op	\n"	\
++		"	.set	mips0				\n"	\
++		"	" insn	"				\n"	\
++		"	.set	mips3				\n"	\
++		"2:	sc	$1, %2				\n"	\
++		"	beqzl	$1, 1b				\n"	\
++		__WEAK_LLSC_MB						\
++		"3:						\n"	\
++		"	.insn					\n"	\
++		"	.set	pop				\n"	\
++		"	.set	mips0				\n"	\
++		"	.section .fixup,\"ax\"			\n"	\
++		"4:	li	%0, %6				\n"	\
++		"	j	3b				\n"	\
++		"	.previous				\n"	\
++		"	.section __ex_table,\"a\"		\n"	\
++		"	"__UA_ADDR "\t1b, 4b			\n"	\
++		"	"__UA_ADDR "\t2b, 4b			\n"	\
++		"	.previous				\n"	\
++		: "=r" (ret), "=&r" (oldval), "=R" (*uaddr)		\
++		: "0" (0), "R" (*uaddr), "Jr" (oparg), "i" (-EFAULT)	\
++		: "memory");						\
++	} else if (cpu_has_llsc) {					\
++		__asm__ __volatile__(					\
++		"	.set	push				\n"	\
++		"	.set	noat				\n"	\
++		"       .set    eva                             \n"     \
++		"1:     lwe     %1, %4                          \n"     \
++		"       lwe     %1, %4                          \n"     \
++		"	.set	mips0				\n"	\
++		"	" insn	"				\n"	\
++		"       .set    eva                             \n"     \
++		"2:     swe     $1, %2                          \n"     \
++		"       li      $1, 1                           \n"     \
++		"	beqz	$1, 1b				\n"	\
++		__WEAK_LLSC_MB						\
++		"3:						\n"	\
++		"	.insn					\n"	\
++		"	.set	pop				\n"	\
++		"	.set	mips0				\n"	\
++		"	.section .fixup,\"ax\"			\n"	\
++		"4:	li	%0, %6				\n"	\
++		"	j	3b				\n"	\
++		"	.previous				\n"	\
++		"	.section __ex_table,\"a\"		\n"	\
++		"	"__UA_ADDR "\t1b, 4b			\n"	\
++		"	"__UA_ADDR "\t2b, 4b			\n"	\
++		"	.previous				\n"	\
++		: "=r" (ret), "=&r" (oldval), "=R" (*uaddr)		\
++		: "0" (0), "R" (*uaddr), "Jr" (oparg), "i" (-EFAULT)	\
++		: "memory");						\
++	} else								\
++		ret = -ENOSYS;						\
++}
++#endif
+ 
+ static inline int
+ futex_atomic_op_inuser(int encoded_op, u32 __user *uaddr)
+@@ -131,6 +195,7 @@ futex_atomic_op_inuser(int encoded_op, u
+ 	return ret;
+ }
+ 
++#ifndef CONFIG_EVA
+ static inline int
+ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
+ 			      u32 oldval, u32 newval)
+@@ -201,6 +266,82 @@ futex_atomic_cmpxchg_inatomic(u32 *uval,
+ 	*uval = val;
+ 	return ret;
+ }
++#else
++static inline int
++futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
++			      u32 oldval, u32 newval)
++{
++	int ret = 0;
++	u32 val;
++
++	if (!access_ok(VERIFY_WRITE, uaddr, sizeof(int)))
++		return -EFAULT;
++
++	if (cpu_has_llsc && R10000_LLSC_WAR) {
++		__asm__ __volatile__(
++		"# futex_atomic_cmpxchg_inatomic			\n"
++		"	.set	push					\n"
++		"	.set	noat					\n"
++		"	.set	mips3					\n"
++		"1:     ll      %1, %3                                  \n"
++		"       bne     %1, %z4, 3f                             \n"
++		"	.set	mips0					\n"
++		"       move    $1, %z5                                 \n"
++		"	.set	mips3					\n"
++		"2:     sc      $1, %2                                  \n"
++		"	beqzl	$1, 1b					\n"
++		__WEAK_LLSC_MB
++		"3:							\n"
++		"	.insn						\n"
++		"	.set	pop					\n"
++		"	.section .fixup,\"ax\"				\n"
++		"4:     li      %0, %6                                  \n"
++		"	j	3b					\n"
++		"	.previous					\n"
++		"	.section __ex_table,\"a\"			\n"
++		"	"__UA_ADDR "\t1b, 4b				\n"
++		"	"__UA_ADDR "\t2b, 4b				\n"
++		"	.previous					\n"
++		: "+r" (ret), "=&r" (val), "=R" (*uaddr)
++		: "R" (*uaddr), "Jr" (oldval), "Jr" (newval), "i" (-EFAULT)
++		: "memory");
++	} else if (cpu_has_llsc) {
++		__asm__ __volatile__(
++		"# futex_atomic_cmpxchg_inatomic			\n"
++		"	.set	push					\n"
++		"	.set	noat					\n"
++		"       .set    eva                                     \n"
++		"1:     lwe     %1, %3                                  \n"
++		"       lwe     %1, %3                                  \n"
++		"       bne     %1, %z4, 3f                             \n"
++		"	.set	mips0					\n"
++		"       move    $1, %z5                                 \n"
++		"       .set    eva                                     \n"
++		"2:     swe     $1, %2                                  \n"
++		"       li      $1, 1                                   \n"
++		"	beqz	$1, 1b					\n"
++		__WEAK_LLSC_MB
++		"3:							\n"
++		"	.insn						\n"
++		"	.set	pop					\n"
++		"	.section .fixup,\"ax\"				\n"
++		"4:     li      %0, %6                                  \n"
++		"	j	3b					\n"
++		"	.previous					\n"
++		"	.section __ex_table,\"a\"			\n"
++		"	"__UA_ADDR "\t1b, 4b				\n"
++		"	"__UA_ADDR "\t2b, 4b				\n"
++		"	.previous					\n"
++		: "+r" (ret), "=&r" (val), "=R" (*uaddr)
++		: "R" (*uaddr), "Jr" (oldval), "Jr" (newval), "i" (-EFAULT)
++		: "memory");
++	} else
++		return -ENOSYS;
++
++	*uval = val;
++	return ret;
++}
++#endif
+ 
+ #endif
+ #endif /* _ASM_FUTEX_H */
+diff --git a/arch/mips/include/asm/mach-generic/spaces.h b/arch/mips/include/asm/mach-generic/spaces.h
+--- a/arch/mips/include/asm/mach-generic/spaces.h
++++ b/arch/mips/include/asm/mach-generic/spaces.h
+@@ -101,4 +101,19 @@
+ #endif
+ #endif
+ 
++#ifndef in_module
++/*
++ * If the Instruction Pointer is in module space (0xc0000000), return true;
++ * otherwise, it is in kernel space (0x80000000), return false.
++ *
++ * FIXME: This will not work when the kernel space and module space are the
++ * same. If they are the same, we need to modify scripts/recordmcount.pl,
++ * ftrace_make_nop/call() and the other related parts to ensure the
++ * enabling/disabling of the calling site to _mcount is right for both kernel
++ * and module.
++ *
++ */
++#define in_module(ip)   (((unsigned long)ip) & 0x40000000)
++#endif
++
+ #endif /* __ASM_MACH_GENERIC_SPACES_H */
+diff --git a/arch/mips/include/asm/mach-malta/kernel-entry-init.h b/arch/mips/include/asm/mach-malta/kernel-entry-init.h
+--- a/arch/mips/include/asm/mach-malta/kernel-entry-init.h
++++ b/arch/mips/include/asm/mach-malta/kernel-entry-init.h
+@@ -4,11 +4,41 @@
+  * for more details.
+  *
+  * Chris Dearman (chris@mips.com)
+- * Copyright (C) 2007 Mips Technologies, Inc.
++ * Leonid Yegoshin (yegoshin@mips.com)
++ * Copyright (C) 2012 Mips Technologies, Inc.
+  */
+ #ifndef __ASM_MACH_MIPS_KERNEL_ENTRY_INIT_H
+ #define __ASM_MACH_MIPS_KERNEL_ENTRY_INIT_H
+ 
++	.macro  eva_entry
++#ifdef CONFIG_EVA_3GB
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	mtc0    t0, $5, 2
++	li      t0, ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(4 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	mtc0    t0, $5, 3
++#else
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(4 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	mtc0    t0, $5, 3
++#endif
++	jal	mips_ihb
++	.endm
++
++
+ 	.macro	kernel_entry_setup
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 	mfc0	t0, CP0_CONFIG
+@@ -41,12 +71,61 @@ nonmt_processor:
+ 	__FINIT
+ 0:
+ #endif
++
++#ifdef CONFIG_EVA
++	sync
++	ehb
++
++	mfc0    t0, CP0_CONFIG
++	bgez	t0, 9f
++	mfc0	t0, CP0_CONFIG, 1
++	bgez	t0, 9f
++	mfc0	t0, CP0_CONFIG, 2
++	bgez	t0, 9f
++	mfc0	t0, CP0_CONFIG, 3
++	sll     t0, t0, 6   /* SC bit */
++	bgez    t0, 9f
++
++	eva_entry
++	b       0f
++
++9:
++	/* Assume we came from YAMON... */
++	PTR_LA	v0, 0x9fc00534	/* YAMON print */
++	lw	v0, (v0)
++	move	a0, zero
++	PTR_LA  a1, nonsc_processor
++	jal	v0
++
++	PTR_LA	v0, 0x9fc00520	/* YAMON exit */
++	lw	v0, (v0)
++	li	a0, 1
++	jal	v0
++
++1:	b	1b
++	nop
++
++	__INITDATA
++nonsc_processor:
++	.asciz  "Kernel requires the Segment/EVA to run\n"
++	__FINIT
++#endif
++
++0:
+ 	.endm
+ 
+ /*
+  * Do SMP slave processor setup necessary before we can safely execute C code.
+  */
+ 	.macro	smp_slave_setup
++
++#ifdef CONFIG_EVA
++
++	sync
++	ehb
++	eva_entry
++#endif
++
+ 	.endm
+ 
+ #endif /* __ASM_MACH_MIPS_KERNEL_ENTRY_INIT_H */
+diff --git a/arch/mips/include/asm/mach-malta/spaces.h b/arch/mips/include/asm/mach-malta/spaces.h
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/include/asm/mach-malta/spaces.h
+@@ -0,0 +1,86 @@
++/*
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Author: Leonid Yegoshin (yegoshin@mips.com)
++ * Copyright (C) 2012 MIPS Technologies, Inc.
++ */
++
++#ifndef _ASM_MALTA_SPACES_H
++#define _ASM_MALTA_SPACES_H
++
++#ifdef CONFIG_EVA
++
++/* Malta board EVA memory map basic's:
++
++   Phys memory - 80000000 to ffffffff - 2GB (last 64KB reserved for
++		 correct HIGHMEM macros arithmetics)
++   KV memory   - 0 - 7fffffff (2GB) or even higher
++   Kernel code is located in the same place (80000000) just for keeping
++		 the same YAMON and other stuff, so KSEG0 is used "illegally",
++		 using Malta mirroring of 1st 256MB (see also __pa_symbol below)
++   IO/UNCAC_ADDR ... well, even KSEG1 or KSEG3 but physaddr is 0UL (256MB-512MB)
++   CAC_ADDR      ... it used to revert effect of UNCAC_ADDR
++   VMALLOC is cut to C0000000 to E0000000 (KSEG2)
++   PKMAP/kmap_coherent should be not used - no HIGHMEM
++ */
++
++#define PAGE_OFFSET             _AC(0x0, UL)
++#define PHYS_OFFSET             _AC(0x80000000, UL)
++#define HIGHMEM_START           _AC(0xffff0000, UL)
++
++/* trick definition, just to use kernel symbols from KSEG0 but keep
++   all dynamic memory in EVA's MUSUK KUSEG segment - I am lazy
++   to move kernel code from 80000000 to zero
++   Don't copy it for other boards, it is likely to have a different kernel
++   location */
++#define __pa_symbol(x)          (RELOC_HIDE((unsigned long)(x), 0))
++
++/*  I put INDEX_BASE here to underline the fact that in EVA mode kernel
++    may be located somethere and not in CKSEG0, so CKSEG0 may have
++    a "surprise" location and index-based CACHE may give unexpected result */
++#define INDEX_BASE      CKSEG0
++
++/*
++ * If the Instruction Pointer is in module space (0xc0000000), return true;
++ * otherwise, it is in kernel space (0x80000000), return false.
++ *
++ * FIXME: This will not work when the kernel space and module space are the
++ * same. If they are the same, we need to modify scripts/recordmcount.pl,
++ * ftrace_make_nop/call() and the other related parts to ensure the
++ * enabling/disabling of the calling site to _mcount is right for both kernel
++ * and module.
++ *
++ * It must be changed for 3.5GB memory map. LY22
++ */
++#define in_module(ip)   (((unsigned long)ip) & 0x40000000)
++
++#ifdef CONFIG_EVA_3GB
++
++#define UNCAC_BASE              _AC(0xe0000000, UL)
++#define IO_BASE                 UNCAC_BASE
++
++#define KSEG
++#define KUSEG                   0x00000000
++#define KSEG0                   0x80000000
++#define KSEG3                   0xa0000000
++#define KSEG2                   0xc0000000
++#define KSEG1                   0xe0000000
++
++#define CKUSEG                  0x00000000
++#define CKSEG0                  0x80000000
++#define CKSEG3                  0xa0000000
++#define CKSEG2                  0xc0000000
++#define CKSEG1                  0xe0000000
++
++#define MAP_BASE                CKSEG2
++#define VMALLOC_END             (MAP_BASE + _AC(0x20000000, UL) - 2*PAGE_SIZE)
++
++#endif  /* CONFIG_EVA_3GB */
++
++#endif  /* CONFIG_EVA */
++
++#include <asm/mach-generic/spaces.h>
++
++#endif /* __ASM_MALTA_SPACES_H */
+diff --git a/arch/mips/include/asm/page.h b/arch/mips/include/asm/page.h
+--- a/arch/mips/include/asm/page.h
++++ b/arch/mips/include/asm/page.h
+@@ -171,7 +171,9 @@ typedef struct { unsigned long pgprot; }
+  * https://patchwork.linux-mips.org/patch/1541/
+  */
+ 
+-#define __pa_symbol(x)	__pa(RELOC_HIDE((unsigned long)(x), 0))
++#ifndef __pa_symbol
++#define __pa_symbol(x)  __pa(RELOC_HIDE((unsigned long)(x), 0))
++#endif
+ 
+ #define pfn_to_kaddr(pfn)	__va((pfn) << PAGE_SHIFT)
+ 
+diff --git a/arch/mips/include/asm/pgtable-32.h b/arch/mips/include/asm/pgtable-32.h
+--- a/arch/mips/include/asm/pgtable-32.h
++++ b/arch/mips/include/asm/pgtable-32.h
+@@ -51,11 +51,13 @@
+ 
+ #define PKMAP_BASE		(0xfe000000UL)
+ 
++#ifndef VMALLOC_END
+ #ifdef CONFIG_HIGHMEM
+ # define VMALLOC_END	(PKMAP_BASE-2*PAGE_SIZE)
+ #else
+ # define VMALLOC_END	(FIXADDR_START-2*PAGE_SIZE)
+ #endif
++#endif
+ 
+ #ifdef CONFIG_64BIT_PHYS_ADDR
+ #define pte_ERROR(e) \
+diff --git a/arch/mips/include/asm/r4kcache.h b/arch/mips/include/asm/r4kcache.h
+--- a/arch/mips/include/asm/r4kcache.h
++++ b/arch/mips/include/asm/r4kcache.h
+@@ -28,7 +28,9 @@
+  *  - We need a properly sign extended address for 64-bit code.	 To get away
+  *    without ifdefs we let the compiler do it by a type cast.
+  */
+-#define INDEX_BASE	CKSEG0
++#ifndef INDEX_BASE
++#define INDEX_BASE      CKSEG0
++#endif
+ 
+ #define cache_op(op,addr)						\
+ 	__asm__ __volatile__(						\
+diff --git a/arch/mips/include/asm/uaccess.h b/arch/mips/include/asm/uaccess.h
+--- a/arch/mips/include/asm/uaccess.h
++++ b/arch/mips/include/asm/uaccess.h
+@@ -223,47 +223,96 @@ struct __large_struct { unsigned long bu
+  * for 32 bit mode and old iron.
+  */
+ #ifdef CONFIG_32BIT
++#define __GET_KERNEL_DW(val, ptr) __get_kernel_asm_ll32(val, ptr)
+ #define __GET_USER_DW(val, ptr) __get_user_asm_ll32(val, ptr)
+ #endif
+ #ifdef CONFIG_64BIT
+-#define __GET_USER_DW(val, ptr) __get_user_asm(val, "ld", ptr)
++#define __GET_KERNEL_DW(val, ptr) __get_kernel_asm(val, "ld", ptr)
+ #endif
+ 
++extern void __get_kernel_unknown(void);
+ extern void __get_user_unknown(void);
+ 
+-#define __get_user_common(val, size, ptr)				\
++#define __get_kernel_common(val, size, ptr)                             \
+ do {									\
+-	switch (size) {							\
+-	case 1: __get_user_asm(val, "lb", ptr); break;			\
+-	case 2: __get_user_asm(val, "lh", ptr); break;			\
+-	case 4: __get_user_asm(val, "lw", ptr); break;			\
+-	case 8: __GET_USER_DW(val, ptr); break;				\
+-	default: __get_user_unknown(); break;				\
++	__chk_user_ptr(ptr);                                            \
++	__gu_err = 0;                                                   \
++	switch (size) {                                                 \
++	case 1: __get_kernel_asm(val, "lb", ptr);  break;               \
++	case 2: __get_kernel_asm(val, "lh", ptr);  break;               \
++	case 4: __get_kernel_asm(val, "lw", ptr);  break;               \
++	case 8: __GET_KERNEL_DW(val, ptr); break;                       \
++	default: __get_kernel_unknown(); break;                         \
+ 	}								\
+ } while (0)
+ 
+-#define __get_user_nocheck(x, ptr, size)				\
++#ifdef CONFIG_EVA
++#define __get_user_common(val, size, ptr)                               \
++do {									\
++	__gu_err = 0;                                                   \
++	switch (size) {							\
++	case 1: __get_user_asm(val, "lbe", ptr); break;                 \
++	case 2: __get_user_asm(val, "lhe", ptr); break;                 \
++	case 4: __get_user_asm(val, "lwe", ptr); break;                 \
++	case 8: __GET_USER_DW(val, ptr); break;                         \
++	default: __get_user_unknown(); break;                           \
++	}								\
++} while (0)
++#endif
++
++#ifndef CONFIG_EVA
++#define __get_user_nocheck(x, ptr, size)                                \
+ ({									\
+-	int __gu_err;							\
+-									\
+-	__chk_user_ptr(ptr);						\
+-	__get_user_common((x), size, ptr);				\
++	int __gu_err;                                                   \
++	__get_kernel_common((x), size, ptr);                            \
+ 	__gu_err;							\
+ })
++#else
++#define __get_user_nocheck(x, ptr, size)                                \
++({									\
++	int __gu_err;                                                   \
++	const __typeof__(*(ptr)) __user * __gu_ptr = (ptr);             \
++									\
++	if (segment_eq(get_fs(), KERNEL_DS))                            \
++		__get_kernel_common((x), size, __gu_ptr);               \
++	else {                                                          \
++		__chk_user_ptr(ptr);                                    \
++		__get_user_common((x), size, __gu_ptr);                 \
++	}                                                               \
++	__gu_err;							\
++})
++#endif
+ 
+-#define __get_user_check(x, ptr, size)					\
++#ifndef CONFIG_EVA
++#define __get_user_check(x, ptr, size)                                  \
+ ({									\
+ 	int __gu_err = -EFAULT;						\
+ 	const __typeof__(*(ptr)) __user * __gu_ptr = (ptr);		\
+ 									\
+-	might_fault();							\
+-	if (likely(access_ok(VERIFY_READ,  __gu_ptr, size)))		\
+-		__get_user_common((x), size, __gu_ptr);			\
++	might_fault();                                                  \
++	if (likely(access_ok(VERIFY_READ,  __gu_ptr, size)))            \
++		__get_kernel_common((x), size, __gu_ptr);               \
+ 									\
+ 	__gu_err;							\
+ })
++#else
++#define __get_user_check(x, ptr, size)                                  \
++({									\
++	int __gu_err = -EFAULT;						\
++	const __typeof__(*(ptr)) __user * __gu_ptr = (ptr);		\
++									\
++	if (segment_eq(get_fs(), KERNEL_DS)) {                          \
++		__get_kernel_common((x), size, __gu_ptr);               \
++	} else {                                                        \
++		might_fault();                                          \
++		if (likely(access_ok(VERIFY_READ,  __gu_ptr, size)))    \
++			__get_user_common((x), size, __gu_ptr);         \
++	}                                                               \
++	__gu_err;							\
++})
++#endif
+ 
+-#define __get_user_asm(val, insn, addr)					\
++#define __get_kernel_asm(val, insn, addr)                               \
+ {									\
+ 	long __gu_tmp;							\
+ 									\
+@@ -284,10 +333,34 @@ do {									\
+ 	(val) = (__typeof__(*(addr))) __gu_tmp;				\
+ }
+ 
++#ifdef CONFIG_EVA
++#define __get_user_asm(val, insn, addr)                                 \
++{									\
++	long __gu_tmp;							\
++									\
++	__asm__ __volatile__(						\
++	"       .set    eva                                     \n"     \
++	"1:     " insn "        %1, 0(%3)                          \n"     \
++	"2:							\n"	\
++	"	.insn						\n"	\
++	"	.section .fixup,\"ax\"				\n"	\
++	"3:	li	%0, %4					\n"	\
++	"	j	2b					\n"	\
++	"	.previous					\n"	\
++	"	.section __ex_table,\"a\"			\n"	\
++	"	"__UA_ADDR "\t1b, 3b				\n"	\
++	"	.previous					\n"	\
++	: "=r" (__gu_err), "=r" (__gu_tmp)				\
++	: "0" (0), "r" (addr), "i" (-EFAULT));                     \
++									\
++	(val) = (__typeof__(*(addr))) __gu_tmp;				\
++}
++#endif
++
+ /*
+  * Get a long long 64 using 32 bit registers.
+  */
+-#define __get_user_asm_ll32(val, addr)					\
++#define __get_kernel_asm_ll32(val, addr)                                \
+ {									\
+ 	union {								\
+ 		unsigned long long	l;				\
+@@ -314,18 +387,113 @@ do {									\
+ 									\
+ 	(val) = __gu_tmp.t;						\
+ }
++#ifdef CONFIG_EVA
++#define __get_user_asm_ll32(val, addr)					\
++{									\
++	union {								\
++		unsigned long long	l;				\
++		__typeof__(*(addr))	t;				\
++	} __gu_tmp;							\
++									\
++	__asm__ __volatile__(						\
++	"       .set    eva                                     \n"     \
++	"1:     lwe     %1, (%3)                                \n"     \
++	"2:     lwe     %D1, 4(%3)                              \n"     \
++	"3:							\n"	\
++	"	.insn						\n"	\
++	"	.section	.fixup,\"ax\"			\n"	\
++	"4:	li	%0, %4					\n"	\
++	"	move	%1, $0					\n"	\
++	"	move	%D1, $0					\n"	\
++	"	j	3b					\n"	\
++	"	.previous					\n"	\
++	"	.section	__ex_table,\"a\"		\n"	\
++	"	" __UA_ADDR "	1b, 4b				\n"	\
++	"	" __UA_ADDR "	2b, 4b				\n"	\
++	"	.previous					\n"	\
++	: "=r" (__gu_err), "=&r" (__gu_tmp.l)				\
++	: "0" (0), "r" (addr), "i" (-EFAULT));                          \
++									\
++	(val) = __gu_tmp.t;						\
++}
++#endif
++
+ 
+ /*
+  * Yuck.  We need two variants, one for 64bit operation and one
+  * for 32 bit mode and old iron.
+  */
+ #ifdef CONFIG_32BIT
++#define __PUT_KERNEL_DW(ptr) __put_kernel_asm_ll32(ptr)
+ #define __PUT_USER_DW(ptr) __put_user_asm_ll32(ptr)
+ #endif
+ #ifdef CONFIG_64BIT
+-#define __PUT_USER_DW(ptr) __put_user_asm("sd", ptr)
++#define __PUT_KERNEL_DW(ptr) __put_kernel_asm("sd", ptr)
+ #endif
+ 
++extern void __put_kernel_unknown(void);
++
++#ifdef CONFIG_EVA
++extern void __put_user_unknown(void);
++
++#define __put_kernel_common(size, ptr)                                  \
++do {									\
++	switch (size) {                                                 \
++	case 1: __put_kernel_asm("sb", ptr);  break;                    \
++	case 2: __put_kernel_asm("sh", ptr);  break;                    \
++	case 4: __put_kernel_asm("sw", ptr);  break;                    \
++	case 8: __PUT_KERNEL_DW(ptr); break;                            \
++	default: __put_kernel_unknown(); break;                         \
++	}								\
++} while (0)
++
++#define __put_user_common(size, ptr)                                    \
++do {									\
++	switch (size) {                                                 \
++	case 1: __put_user_asm("sbe", ptr);  break;                     \
++	case 2: __put_user_asm("she", ptr);  break;                     \
++	case 4: __put_user_asm("swe", ptr);  break;                     \
++	case 8: __PUT_USER_DW(ptr); break;                              \
++	default: __put_user_unknown(); break;                           \
++	}								\
++} while (0)
++
++#define __put_user_nocheck(x, ptr, size)                                \
++({									\
++	__typeof__(*(ptr)) __pu_val;                                    \
++	int __pu_err = 0;                                               \
++	const __typeof__(*(ptr)) __user * __pu_ptr = (ptr);             \
++									\
++	if (segment_eq(get_fs(), KERNEL_DS)) {                          \
++		__chk_user_ptr(__pu_ptr);                               \
++		__pu_val = (x);                                         \
++		__put_kernel_common(size, __pu_ptr);                    \
++	} else {                                                        \
++		__chk_user_ptr(__pu_ptr);                               \
++		__pu_val = (x);                                         \
++		__put_user_common(size, __pu_ptr);                      \
++	}                                                               \
++	__pu_err;                                                       \
++})
++
++#define __put_user_check(x, ptr, size)                                  \
++({									\
++	__typeof__(*(ptr)) __pu_val = (x);                              \
++	int __pu_err = -EFAULT;                                         \
++	const __typeof__(*(ptr)) __user * __pu_ptr = (ptr);             \
++									\
++	if (segment_eq(get_fs(), KERNEL_DS))                            \
++		__put_kernel_common(size, __pu_ptr);                    \
++	else {                                                          \
++		might_fault();                                          \
++		if (likely(access_ok(VERIFY_WRITE,  __pu_ptr, size)))   \
++			__put_user_common(size, __pu_ptr);              \
++	}                                                               \
++	__pu_err;                                                       \
++})
++
++#else
++
+ #define __put_user_nocheck(x, ptr, size)				\
+ ({									\
+ 	__typeof__(*(ptr)) __pu_val;					\
+@@ -334,11 +502,11 @@ do {									\
+ 	__chk_user_ptr(ptr);						\
+ 	__pu_val = (x);							\
+ 	switch (size) {							\
+-	case 1: __put_user_asm("sb", ptr); break;			\
+-	case 2: __put_user_asm("sh", ptr); break;			\
+-	case 4: __put_user_asm("sw", ptr); break;			\
+-	case 8: __PUT_USER_DW(ptr); break;				\
+-	default: __put_user_unknown(); break;				\
++	case 1: __put_kernel_asm("sb", ptr); break;                     \
++	case 2: __put_kernel_asm("sh", ptr); break;                     \
++	case 4: __put_kernel_asm("sw", ptr); break;                     \
++	case 8: __PUT_KERNEL_DW(ptr); break;                            \
++	default: __put_kernel_unknown(); break;                         \
+ 	}								\
+ 	__pu_err;							\
+ })
+@@ -352,17 +520,19 @@ do {									\
+ 	might_fault();							\
+ 	if (likely(access_ok(VERIFY_WRITE,  __pu_addr, size))) {	\
+ 		switch (size) {						\
+-		case 1: __put_user_asm("sb", __pu_addr); break;		\
+-		case 2: __put_user_asm("sh", __pu_addr); break;		\
+-		case 4: __put_user_asm("sw", __pu_addr); break;		\
+-		case 8: __PUT_USER_DW(__pu_addr); break;		\
+-		default: __put_user_unknown(); break;			\
++		case 1: __put_kernel_asm("sb", __pu_addr); break;       \
++		case 2: __put_kernel_asm("sh", __pu_addr); break;       \
++		case 4: __put_kernel_asm("sw", __pu_addr); break;       \
++		case 8: __PUT_KERNEL_DW(__pu_addr); break;              \
++		default: __put_kernel_unknown(); break;                 \
+ 		}							\
+ 	}								\
+ 	__pu_err;							\
+ })
++#endif /* CONFIG_EVA */
+ 
+-#define __put_user_asm(insn, ptr)					\
++#ifndef CONFIG_EVA
++#define __put_kernel_asm(insn, ptr)                                     \
+ {									\
+ 	__asm__ __volatile__(						\
+ 	"1:	" insn "	%z2, %3		# __put_user_asm\n"	\
+@@ -379,8 +549,47 @@ do {									\
+ 	: "0" (0), "Jr" (__pu_val), "o" (__m(ptr)),			\
+ 	  "i" (-EFAULT));						\
+ }
++#else
++#define __put_kernel_asm(insn, ptr)                                     \
++{									\
++	__asm__ __volatile__(						\
++	"1:     " insn "        %2, %3         # __put_user_asm\n"      \
++	"2:							\n"	\
++	"	.insn						\n"	\
++	"	.section	.fixup,\"ax\"			\n"	\
++	"3:	li	%0, %4					\n"	\
++	"	j	2b					\n"	\
++	"	.previous					\n"	\
++	"	.section	__ex_table,\"a\"		\n"	\
++	"	" __UA_ADDR "	1b, 3b				\n"	\
++	"	.previous					\n"	\
++	: "=r" (__pu_err)						\
++	: "0" (0), "r" (__pu_val), "o" (__m(ptr)),                      \
++	  "i" (-EFAULT));						\
++}
+ 
+-#define __put_user_asm_ll32(ptr)					\
++#define __put_user_asm(insn, ptr)                                       \
++{									\
++	__asm__ __volatile__(						\
++	"       .set        eva                                 \n"     \
++	"1:     " insn "        %2, 0(%3)         # __put_user_asm\n"   \
++	"2:							\n"	\
++	"	.insn						\n"	\
++	"	.section	.fixup,\"ax\"			\n"	\
++	"3:	li	%0, %4					\n"	\
++	"	j	2b					\n"	\
++	"	.previous					\n"	\
++	"	.section	__ex_table,\"a\"		\n"	\
++	"	" __UA_ADDR "	1b, 3b				\n"	\
++	"	.previous					\n"	\
++	: "=r" (__pu_err)						\
++	: "0" (0), "r" (__pu_val), "r" (ptr),                           \
++	  "i" (-EFAULT));						\
++}
++#endif
++
++
++#define __put_kernel_asm_ll32(ptr)                                      \
+ {									\
+ 	__asm__ __volatile__(						\
+ 	"1:	sw	%2, (%3)	# __put_user_asm_ll32	\n"	\
+@@ -400,8 +609,30 @@ do {									\
+ 	  "i" (-EFAULT));						\
+ }
+ 
+-extern void __put_user_unknown(void);
++#ifdef CONFIG_EVA
++#define __put_user_asm_ll32(ptr)                                        \
++{									\
++	__asm__ __volatile__(						\
++	"       .set    eva                                     \n"     \
++	"1:     swe     %2, (%3)        # __put_user_asm_ll32   \n"     \
++	"2:     swe     %D2, 4(%3)                              \n"     \
++	"3:							\n"	\
++	"	.insn						\n"	\
++	"	.section	.fixup,\"ax\"			\n"	\
++	"4:	li	%0, %4					\n"	\
++	"	j	3b					\n"	\
++	"	.previous					\n"	\
++	"	.section	__ex_table,\"a\"		\n"	\
++	"	" __UA_ADDR "	1b, 4b				\n"	\
++	"	" __UA_ADDR "	2b, 4b				\n"	\
++	"	.previous"						\
++	: "=r" (__pu_err)						\
++	: "0" (0), "r" (__pu_val), "r" (ptr),				\
++	  "i" (-EFAULT));                                               \
++}
++#endif
+ 
++#ifndef CONFIG_EVA
+ /*
+  * put_user_unaligned: - Write a simple value into user space.
+  * @x:	 Value to copy to user space.
+@@ -670,6 +901,8 @@ do {									\
+ 
+ extern void __put_user_unaligned_unknown(void);
+ 
++#endif /* CONFIG_EVA */
++
+ /*
+  * We're generating jump to subroutines which will be outside the range of
+  * jump instructions
+@@ -692,8 +925,12 @@ extern void __put_user_unaligned_unknown
+ #endif
+ 
+ extern size_t __copy_user(void *__to, const void *__from, size_t __n);
++#ifdef CONFIG_EVA
++extern size_t __copy_fromuser(void *__to, const void *__from, size_t __n);
++extern size_t __copy_touser(void *__to, const void *__from, size_t __n);
++#endif
+ 
+-#define __invoke_copy_to_user(to, from, n)				\
++#define __invoke_copy_to_kernel(to, from, n)                            \
+ ({									\
+ 	register void __user *__cu_to_r __asm__("$4");			\
+ 	register const void *__cu_from_r __asm__("$5");			\
+@@ -703,7 +940,7 @@ extern size_t __copy_user(void *__to, co
+ 	__cu_from_r = (from);						\
+ 	__cu_len_r = (n);						\
+ 	__asm__ __volatile__(						\
+-	__MODULE_JAL(__copy_user)					\
++	__MODULE_JAL(__copy_user)                                       \
+ 	: "+r" (__cu_to_r), "+r" (__cu_from_r), "+r" (__cu_len_r)	\
+ 	:								\
+ 	: "$8", "$9", "$10", "$11", "$12", "$14", "$15", "$24", "$31",	\
+@@ -711,6 +948,26 @@ extern size_t __copy_user(void *__to, co
+ 	__cu_len_r;							\
+ })
+ 
++#ifdef CONFIG_EVA
++#define __invoke_copy_to_user(to, from, n)                              \
++({									\
++	register void __user *__cu_to_r __asm__("$4");			\
++	register const void *__cu_from_r __asm__("$5");			\
++	register long __cu_len_r __asm__("$6");				\
++									\
++	__cu_to_r = (to);                                               \
++	__cu_from_r = (from);						\
++	__cu_len_r = (n);						\
++	__asm__ __volatile__(						\
++	__MODULE_JAL(__copy_touser)                                     \
++	: "+r" (__cu_to_r), "+r" (__cu_from_r), "+r" (__cu_len_r)	\
++	:								\
++	: "$8", "$9", "$10", "$11", "$12", "$15", "$24", "$31",		\
++	  DADDI_SCRATCH, "memory");					\
++	__cu_len_r;							\
++})
++#endif
++
+ /*
+  * __copy_to_user: - Copy a block of data into user space, with less checking.
+  * @to:	  Destination address, in user space.
+@@ -725,6 +982,7 @@ extern size_t __copy_user(void *__to, co
+  * Returns number of bytes that could not be copied.
+  * On success, this will be zero.
+  */
++#ifndef CONFIG_EVA
+ #define __copy_to_user(to, from, n)					\
+ ({									\
+ 	void __user *__cu_to;						\
+@@ -734,13 +992,58 @@ extern size_t __copy_user(void *__to, co
+ 	__cu_to = (to);							\
+ 	__cu_from = (from);						\
+ 	__cu_len = (n);							\
+-	might_fault();							\
+-	__cu_len = __invoke_copy_to_user(__cu_to, __cu_from, __cu_len); \
++	might_fault();                                                  \
++	__cu_len = __invoke_copy_to_kernel(__cu_to, __cu_from, __cu_len); \
+ 	__cu_len;							\
+ })
++#else
++#define __copy_to_user(to, from, n)					\
++({									\
++	void __user *__cu_to;						\
++	const void *__cu_from;						\
++	long __cu_len;							\
++									\
++	__cu_to = (to);							\
++	__cu_from = (from);						\
++	__cu_len = (n);							\
++	if (segment_eq(get_fs(), KERNEL_DS))                            \
++		__cu_len = __invoke_copy_to_kernel(__cu_to, __cu_from, __cu_len); \
++	else {                                                          \
++		might_fault();                                                  \
++		__cu_len = __invoke_copy_to_user(__cu_to, __cu_from, __cu_len); \
++	}                                                               \
++	__cu_len;							\
++})
++#endif
+ 
+-extern size_t __copy_user_inatomic(void *__to, const void *__from, size_t __n);
++#ifndef CONFIG_EVA
++#define __copy_to_user_inatomic(to, from, n)                            \
++({                                                                      \
++	void __user *__cu_to;                                           \
++	const void *__cu_from;                                          \
++	long __cu_len;                                                  \
++									\
++	__cu_to = (to);                                                 \
++	__cu_from = (from);                                             \
++	__cu_len = (n);                                                 \
++	__cu_len = __invoke_copy_to_kernel(__cu_to, __cu_from, __cu_len); \
++	__cu_len;                                                       \
++})
+ 
++#define __copy_from_user_inatomic(to, from, n)                          \
++({                                                                      \
++	void *__cu_to;                                                  \
++	const void __user *__cu_from;                                   \
++	long __cu_len;                                                  \
++									\
++	__cu_to = (to);                                                 \
++	__cu_from = (from);                                             \
++	__cu_len = (n);                                                 \
++	__cu_len = __invoke_copy_from_kernel_inatomic(__cu_to, __cu_from, \
++						    __cu_len);          \
++	__cu_len;                                                       \
++})
++#else
+ #define __copy_to_user_inatomic(to, from, n)				\
+ ({									\
+ 	void __user *__cu_to;						\
+@@ -750,7 +1053,10 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_to = (to);							\
+ 	__cu_from = (from);						\
+ 	__cu_len = (n);							\
+-	__cu_len = __invoke_copy_to_user(__cu_to, __cu_from, __cu_len); \
++	if (segment_eq(get_fs(), KERNEL_DS))                            \
++		__cu_len = __invoke_copy_to_kernel(__cu_to, __cu_from, __cu_len); \
++	else                                                            \
++		__cu_len = __invoke_copy_to_user(__cu_to, __cu_from, __cu_len); \
+ 	__cu_len;							\
+ })
+ 
+@@ -763,10 +1069,15 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_to = (to);							\
+ 	__cu_from = (from);						\
+ 	__cu_len = (n);							\
+-	__cu_len = __invoke_copy_from_user_inatomic(__cu_to, __cu_from, \
+-						    __cu_len);		\
++	if (segment_eq(get_fs(), KERNEL_DS))                            \
++		__cu_len = __invoke_copy_from_kernel_inatomic(__cu_to, __cu_from, \
++						    __cu_len);          \
++	else                                                            \
++		__cu_len = __invoke_copy_from_user_inatomic(__cu_to, __cu_from, \
++						    __cu_len);          \
+ 	__cu_len;							\
+ })
++#endif
+ 
+ /*
+  * copy_to_user: - Copy a block of data into user space.
+@@ -781,6 +1092,24 @@ extern size_t __copy_user_inatomic(void 
+  * Returns number of bytes that could not be copied.
+  * On success, this will be zero.
+  */
++#ifndef CONFIG_EVA
++#define copy_to_user(to, from, n)                                       \
++({                                                                      \
++	void __user *__cu_to;                                           \
++	const void *__cu_from;                                          \
++	long __cu_len;                                                  \
++									\
++	__cu_to = (to);                                                 \
++	__cu_from = (from);                                             \
++	__cu_len = (n);                                                 \
++	if (access_ok(VERIFY_WRITE, __cu_to, __cu_len)) {               \
++		might_fault();                                          \
++		__cu_len = __invoke_copy_to_kernel(__cu_to, __cu_from,  \
++						 __cu_len);             \
++	}                                                               \
++	__cu_len;                                                       \
++})
++#else
+ #define copy_to_user(to, from, n)					\
+ ({									\
+ 	void __user *__cu_to;						\
+@@ -790,15 +1119,20 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_to = (to);							\
+ 	__cu_from = (from);						\
+ 	__cu_len = (n);							\
+-	if (access_ok(VERIFY_WRITE, __cu_to, __cu_len)) {		\
+-		might_fault();						\
+-		__cu_len = __invoke_copy_to_user(__cu_to, __cu_from,	\
+-						 __cu_len);		\
+-	}								\
++	if (segment_eq(get_fs(), KERNEL_DS))                            \
++		__cu_len = __invoke_copy_to_kernel(__cu_to, __cu_from,  \
++						 __cu_len);             \
++	else                                                            \
++		if (access_ok(VERIFY_WRITE, __cu_to, __cu_len)) {       \
++			might_fault();                                  \
++			__cu_len = __invoke_copy_to_user(__cu_to, __cu_from, \
++							 __cu_len);     \
++		}                                                       \
+ 	__cu_len;							\
+ })
++#endif
+ 
+-#define __invoke_copy_from_user(to, from, n)				\
++#define __invoke_copy_from_kernel(to, from, n)                          \
+ ({									\
+ 	register void *__cu_to_r __asm__("$4");				\
+ 	register const void __user *__cu_from_r __asm__("$5");		\
+@@ -809,7 +1143,7 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_len_r = (n);						\
+ 	__asm__ __volatile__(						\
+ 	".set\tnoreorder\n\t"						\
+-	__MODULE_JAL(__copy_user)					\
++	__MODULE_JAL(__copy_user)                                       \
+ 	".set\tnoat\n\t"						\
+ 	__UA_ADDU "\t$1, %1, %2\n\t"					\
+ 	".set\tat\n\t"							\
+@@ -821,6 +1155,59 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_len_r;							\
+ })
+ 
++#ifdef CONFIG_EVA
++#define __invoke_copy_from_user(to, from, n)                            \
++({									\
++	register void *__cu_to_r __asm__("$4");				\
++	register const void __user *__cu_from_r __asm__("$5");		\
++	register long __cu_len_r __asm__("$6");				\
++									\
++	__cu_to_r = (to);						\
++	__cu_from_r = (from);						\
++	__cu_len_r = (n);						\
++	__asm__ __volatile__(						\
++	".set\tnoreorder\n\t"						\
++	__MODULE_JAL(__copy_fromuser)                                   \
++	".set\tnoat\n\t"						\
++	__UA_ADDU "\t$1, %1, %2\n\t"					\
++	".set\tat\n\t"							\
++	".set\treorder"							\
++	: "+r" (__cu_to_r), "+r" (__cu_from_r), "+r" (__cu_len_r)	\
++	:								\
++	: "$8", "$9", "$10", "$11", "$12", "$14", "$15", "$24", "$31",	\
++	  DADDI_SCRATCH, "memory");					\
++	__cu_len_r;							\
++})
++#endif
++
++extern size_t __copy_user_inatomic(void *__to, const void *__from, size_t __n);
++
++#define __invoke_copy_from_kernel_inatomic(to, from, n)                 \
++({									\
++	register void *__cu_to_r __asm__("$4");				\
++	register const void __user *__cu_from_r __asm__("$5");		\
++	register long __cu_len_r __asm__("$6");				\
++									\
++	__cu_to_r = (to);						\
++	__cu_from_r = (from);						\
++	__cu_len_r = (n);						\
++	__asm__ __volatile__(						\
++	".set\tnoreorder\n\t"						\
++	__MODULE_JAL(__copy_user_inatomic)                              \
++	".set\tnoat\n\t"						\
++	__UA_ADDU "\t$1, %1, %2\n\t"					\
++	".set\tat\n\t"							\
++	".set\treorder"							\
++	: "+r" (__cu_to_r), "+r" (__cu_from_r), "+r" (__cu_len_r)	\
++	:								\
++	: "$8", "$9", "$10", "$11", "$12", "$14", "$15", "$24", "$31",	\
++	  DADDI_SCRATCH, "memory");					\
++	__cu_len_r;							\
++})
++
++#ifdef CONFIG_EVA
++extern size_t __copy_fromuser_inatomic(void *__to, const void *__from, size_t __n);
++
+ #define __invoke_copy_from_user_inatomic(to, from, n)			\
+ ({									\
+ 	register void *__cu_to_r __asm__("$4");				\
+@@ -832,7 +1219,7 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_len_r = (n);						\
+ 	__asm__ __volatile__(						\
+ 	".set\tnoreorder\n\t"						\
+-	__MODULE_JAL(__copy_user_inatomic)				\
++	__MODULE_JAL(__copy_fromuser_inatomic)                              \
+ 	".set\tnoat\n\t"						\
+ 	__UA_ADDU "\t$1, %1, %2\n\t"					\
+ 	".set\tat\n\t"							\
+@@ -844,6 +1231,32 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_len_r;							\
+ })
+ 
++extern size_t __copy_inuser(void *__to, const void *__from, size_t __n);
++
++#define __invoke_copy_in_user(to, from, n)                              \
++({									\
++	register void *__cu_to_r __asm__("$4");				\
++	register const void __user *__cu_from_r __asm__("$5");		\
++	register long __cu_len_r __asm__("$6");				\
++									\
++	__cu_to_r = (to);						\
++	__cu_from_r = (from);						\
++	__cu_len_r = (n);						\
++	__asm__ __volatile__(						\
++	".set\tnoreorder\n\t"						\
++	__MODULE_JAL(__copy_inuser)                                     \
++	".set\tnoat\n\t"						\
++	__UA_ADDU "\t$1, %1, %2\n\t"					\
++	".set\tat\n\t"							\
++	".set\treorder"							\
++	: "+r" (__cu_to_r), "+r" (__cu_from_r), "+r" (__cu_len_r)	\
++	:								\
++	: "$8", "$9", "$10", "$11", "$12", "$14", "$15", "$24", "$31",	\
++	  DADDI_SCRATCH, "memory");					\
++	__cu_len_r;							\
++})
++#endif
++
+ /*
+  * __copy_from_user: - Copy a block of data from user space, with less checking.
+  * @to:	  Destination address, in kernel space.
+@@ -861,6 +1274,22 @@ extern size_t __copy_user_inatomic(void 
+  * If some data could not be copied, this function will pad the copied
+  * data to the requested size using zero bytes.
+  */
++#ifndef CONFIG_EVA
++#define __copy_from_user(to, from, n)                                   \
++({									\
++	void *__cu_to;							\
++	const void __user *__cu_from;					\
++	long __cu_len;							\
++									\
++	__cu_to = (to);							\
++	__cu_from = (from);						\
++	__cu_len = (n);							\
++	might_fault();							\
++	__cu_len = __invoke_copy_from_kernel(__cu_to, __cu_from,        \
++					   __cu_len);                   \
++	__cu_len;							\
++})
++#else
+ #define __copy_from_user(to, from, n)					\
+ ({									\
+ 	void *__cu_to;							\
+@@ -872,9 +1301,10 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_len = (n);							\
+ 	might_fault();							\
+ 	__cu_len = __invoke_copy_from_user(__cu_to, __cu_from,		\
+-					   __cu_len);			\
++					   __cu_len);                   \
+ 	__cu_len;							\
+ })
++#endif
+ 
+ /*
+  * copy_from_user: - Copy a block of data from user space.
+@@ -892,7 +1322,25 @@ extern size_t __copy_user_inatomic(void 
+  * If some data could not be copied, this function will pad the copied
+  * data to the requested size using zero bytes.
+  */
+-#define copy_from_user(to, from, n)					\
++#ifndef CONFIG_EVA
++#define copy_from_user(to, from, n)                                     \
++({                                                                      \
++	void *__cu_to;                                                  \
++	const void __user *__cu_from;                                   \
++	long __cu_len;                                                  \
++									\
++	__cu_to = (to);                                                 \
++	__cu_from = (from);                                             \
++	__cu_len = (n);                                                 \
++	if (access_ok(VERIFY_READ, __cu_from, __cu_len)) {              \
++		might_fault();                                          \
++		__cu_len = __invoke_copy_from_kernel(__cu_to, __cu_from,  \
++						   __cu_len);           \
++	}                                                               \
++	__cu_len;                                                       \
++})
++#else
++#define copy_from_user(to, from, n)                                     \
+ ({									\
+ 	void *__cu_to;							\
+ 	const void __user *__cu_from;					\
+@@ -901,14 +1349,53 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_to = (to);							\
+ 	__cu_from = (from);						\
+ 	__cu_len = (n);							\
+-	if (access_ok(VERIFY_READ, __cu_from, __cu_len)) {		\
+-		might_fault();						\
+-		__cu_len = __invoke_copy_from_user(__cu_to, __cu_from,	\
+-						   __cu_len);		\
+-	}								\
++	if (segment_eq(get_fs(), KERNEL_DS))                            \
++		__cu_len = __invoke_copy_from_kernel(__cu_to, __cu_from,  \
++						   __cu_len);           \
++	else                                                            \
++		if (access_ok(VERIFY_READ, __cu_from, __cu_len)) {      \
++			might_fault();                                  \
++			__cu_len = __invoke_copy_from_user(__cu_to, __cu_from,  \
++							   __cu_len);   \
++		}                                                       \
+ 	__cu_len;							\
+ })
++#endif
+ 
++#ifndef CONFIG_EVA
++#define __copy_in_user(to, from, n)                                     \
++({                                                                      \
++	void __user *__cu_to;                                           \
++	const void __user *__cu_from;                                   \
++	long __cu_len;                                                  \
++									\
++	__cu_to = (to);                                                 \
++	__cu_from = (from);                                             \
++	__cu_len = (n);                                                 \
++	might_fault();                                                  \
++	__cu_len = __invoke_copy_from_kernel(__cu_to, __cu_from,          \
++					   __cu_len);                   \
++	__cu_len;                                                       \
++})
++
++#define copy_in_user(to, from, n)                                       \
++({                                                                      \
++	void __user *__cu_to;                                           \
++	const void __user *__cu_from;                                   \
++	long __cu_len;                                                  \
++									\
++	__cu_to = (to);                                                 \
++	__cu_from = (from);                                             \
++	__cu_len = (n);                                                 \
++	if (likely(access_ok(VERIFY_READ, __cu_from, __cu_len) &&       \
++		   access_ok(VERIFY_WRITE, __cu_to, __cu_len))) {       \
++		might_fault();                                          \
++		__cu_len = __invoke_copy_from_kernel(__cu_to, __cu_from,  \
++						   __cu_len);           \
++	}                                                               \
++	__cu_len;                                                       \
++})
++#else
+ #define __copy_in_user(to, from, n)					\
+ ({									\
+ 	void __user *__cu_to;						\
+@@ -919,8 +1406,8 @@ extern size_t __copy_user_inatomic(void 
+ 	__cu_from = (from);						\
+ 	__cu_len = (n);							\
+ 	might_fault();							\
+-	__cu_len = __invoke_copy_from_user(__cu_to, __cu_from,		\
+-					   __cu_len);			\
++	__cu_len = __invoke_copy_in_user(__cu_to, __cu_from,          \
++					 __cu_len);                   \
+ 	__cu_len;							\
+ })
+ 
+@@ -936,11 +1423,12 @@ extern size_t __copy_user_inatomic(void 
+ 	if (likely(access_ok(VERIFY_READ, __cu_from, __cu_len) &&	\
+ 		   access_ok(VERIFY_WRITE, __cu_to, __cu_len))) {	\
+ 		might_fault();						\
+-		__cu_len = __invoke_copy_from_user(__cu_to, __cu_from,	\
+-						   __cu_len);		\
++		__cu_len = __invoke_copy_in_user(__cu_to, __cu_from,  \
++						 __cu_len);           \
+ 	}								\
+ 	__cu_len;							\
+ })
++#endif
+ 
+ /*
+  * __clear_user: - Zero a block of memory in user space, with less checking.
+@@ -963,7 +1451,11 @@ static inline __kernel_size_t
+ 		"move\t$4, %1\n\t"
+ 		"move\t$5, $0\n\t"
+ 		"move\t$6, %2\n\t"
++#ifndef CONFIG_EVA
+ 		__MODULE_JAL(__bzero)
++#else
++		__MODULE_JAL(__bzero_user)
++#endif
+ 		"move\t%0, $6"
+ 		: "=r" (res)
+ 		: "r" (addr), "r" (size)
+@@ -1012,7 +1504,11 @@ static inline long
+ 		"move\t$4, %1\n\t"
+ 		"move\t$5, %2\n\t"
+ 		"move\t$6, %3\n\t"
++#ifdef CONFIG_EVA
++		__MODULE_JAL(__strncpy_from_kernel_nocheck_asm)
++#else
+ 		__MODULE_JAL(__strncpy_from_user_nocheck_asm)
++#endif
+ 		"move\t%0, $2"
+ 		: "=r" (res)
+ 		: "r" (__to), "r" (__from), "r" (__len)
+@@ -1039,6 +1535,7 @@ static inline long
+  * If @count is smaller than the length of the string, copies @count bytes
+  * and returns @count.
+  */
++#ifndef CONFIG_EVA
+ static inline long
+ strncpy_from_user(char *__to, const char __user *__from, long __len)
+ {
+@@ -1049,6 +1546,37 @@ strncpy_from_user(char *__to, const char
+ 		"move\t$4, %1\n\t"
+ 		"move\t$5, %2\n\t"
+ 		"move\t$6, %3\n\t"
++		__MODULE_JAL(__strncpy_from_kernel_asm)
++		"move\t%0, $2"
++		: "=r" (res)
++		: "r" (__to), "r" (__from), "r" (__len)
++		: "$2", "$3", "$4", "$5", "$6", __UA_t0, "$31", "memory");
++
++	return res;
++}
++#else
++static inline long
++strncpy_from_user(char *__to, const char __user *__from, long __len)
++{
++	long res;
++
++	if (segment_eq(get_fs(), KERNEL_DS)) {
++		__asm__ __volatile__(
++			"move\t$4, %1\n\t"
++			"move\t$5, %2\n\t"
++			"move\t$6, %3\n\t"
++			__MODULE_JAL(__strncpy_from_kernel_asm)
++			"move\t%0, $2"
++			: "=r" (res)
++			: "r" (__to), "r" (__from), "r" (__len)
++			: "$2", "$3", "$4", "$5", "$6", __UA_t0, "$31", "memory");
++		return res;
++	}
++	might_fault();
++	__asm__ __volatile__(
++		"move\t$4, %1\n\t"
++		"move\t$5, %2\n\t"
++		"move\t$6, %3\n\t"
+ 		__MODULE_JAL(__strncpy_from_user_asm)
+ 		"move\t%0, $2"
+ 		: "=r" (res)
+@@ -1057,6 +1585,7 @@ strncpy_from_user(char *__to, const char
+ 
+ 	return res;
+ }
++#endif
+ 
+ /* Returns: 0 if bad, string length+1 (memory size) of string if ok */
+ static inline long __strlen_user(const char __user *s)
+@@ -1066,7 +1595,11 @@ static inline long __strlen_user(const c
+ 	might_fault();
+ 	__asm__ __volatile__(
+ 		"move\t$4, %1\n\t"
++#ifndef CONFIG_EVA
++		__MODULE_JAL(__strlen_kernel_nocheck_asm)
++#else
+ 		__MODULE_JAL(__strlen_user_nocheck_asm)
++#endif
+ 		"move\t%0, $2"
+ 		: "=r" (res)
+ 		: "r" (s)
+@@ -1096,7 +1629,11 @@ static inline long strlen_user(const cha
+ 	might_fault();
+ 	__asm__ __volatile__(
+ 		"move\t$4, %1\n\t"
++#ifndef CONFIG_EVA
++		__MODULE_JAL(__strlen_kernel_asm)
++#else
+ 		__MODULE_JAL(__strlen_user_asm)
++#endif
+ 		"move\t%0, $2"
+ 		: "=r" (res)
+ 		: "r" (s)
+@@ -1114,7 +1651,11 @@ static inline long __strnlen_user(const 
+ 	__asm__ __volatile__(
+ 		"move\t$4, %1\n\t"
+ 		"move\t$5, %2\n\t"
++#ifndef CONFIG_EVA
++		__MODULE_JAL(__strnlen_kernel_nocheck_asm)
++#else
+ 		__MODULE_JAL(__strnlen_user_nocheck_asm)
++#endif
+ 		"move\t%0, $2"
+ 		: "=r" (res)
+ 		: "r" (s), "r" (n)
+@@ -1137,6 +1678,7 @@ static inline long __strnlen_user(const 
+  * If there is a limit on the length of a valid string, you may wish to
+  * consider using strnlen_user() instead.
+  */
++#ifndef CONFIG_EVA
+ static inline long strnlen_user(const char __user *s, long n)
+ {
+ 	long res;
+@@ -1145,6 +1687,34 @@ static inline long strnlen_user(const ch
+ 	__asm__ __volatile__(
+ 		"move\t$4, %1\n\t"
+ 		"move\t$5, %2\n\t"
++		__MODULE_JAL(__strnlen_kernel_asm)
++		"move\t%0, $2"
++		: "=r" (res)
++		: "r" (s), "r" (n)
++		: "$2", "$4", "$5", __UA_t0, "$31");
++
++	return res;
++}
++#else
++static inline long strnlen_user(const char __user *s, long n)
++{
++	long res;
++
++	if (segment_eq(get_fs(), KERNEL_DS)) {
++		__asm__ __volatile__(
++			"move\t$4, %1\n\t"
++			"move\t$5, %2\n\t"
++			__MODULE_JAL(__strnlen_kernel_asm)
++			"move\t%0, $2"
++			: "=r" (res)
++			: "r" (s), "r" (n)
++			: "$2", "$4", "$5", __UA_t0, "$31");
++		return res;
++	}
++	might_fault();
++	__asm__ __volatile__(
++		"move\t$4, %1\n\t"
++		"move\t$5, %2\n\t"
+ 		__MODULE_JAL(__strnlen_user_asm)
+ 		"move\t%0, $2"
+ 		: "=r" (res)
+@@ -1153,6 +1723,7 @@ static inline long strnlen_user(const ch
+ 
+ 	return res;
+ }
++#endif
+ 
+ struct exception_table_entry
+ {
+diff --git a/arch/mips/include/uapi/asm/inst.h b/arch/mips/include/uapi/asm/inst.h
+--- a/arch/mips/include/uapi/asm/inst.h
++++ b/arch/mips/include/uapi/asm/inst.h
+@@ -74,8 +74,16 @@ enum spec3_op {
+ 	ext_op, dextm_op, dextu_op, dext_op,
+ 	ins_op, dinsm_op, dinsu_op, dins_op,
+ 	lx_op = 0x0a,
+-	bshfl_op = 0x20,
++	lwle_op = 0x19,
++	lwre_op = 0x1a, cachee_op = 0x1b,
++	sbe_op = 0x1c, she_op = 0x1d,
++	sce_op = 0x1e, swe_op = 0x1f,
++	bshfl_op = 0x20, swle_op = 0x21,
++	swre_op = 0x22, prefe_op = 0x23,
+ 	dbshfl_op = 0x24,
++	lbue_op = 0x28, lhue_op = 0x29,
++	lbe_op = 0x2c, lhe_op = 0x2d,
++	lle_op = 0x2e, lwe_op = 0x2f,
+ 	rdhwr_op = 0x3b
+ };
+ 
+@@ -542,6 +550,15 @@ struct p_format {		/* Performance counte
+ 	;))))))
+ };
+ 
++struct spec3_format {   /* SPEC3 */
++	BITFIELD_FIELD(unsigned int opcode : 6,
++	BITFIELD_FIELD(unsigned int rs : 5,
++	BITFIELD_FIELD(unsigned int rt : 5,
++	BITFIELD_FIELD(signed int simmediate : 9,
++	BITFIELD_FIELD(unsigned int ls_func : 7,
++	;)))))
++};
++
+ struct f_format {			/* FPU register format */
+ 	BITFIELD_FIELD(unsigned int opcode : 6,
+ 	BITFIELD_FIELD(unsigned int : 1,
+@@ -858,6 +875,7 @@ union mips_instruction {
+ 	struct c_format c_format;
+ 	struct r_format r_format;
+ 	struct p_format p_format;
++	struct spec3_format spec3_format;
+ 	struct f_format f_format;
+ 	struct ma_format ma_format;
+ 	struct b_format b_format;
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -299,6 +299,8 @@ static inline unsigned int decode_config
+ 		c->options |= MIPS_CPU_MICROMIPS;
+ 	if (config3 & MIPS_CONF3_VZ)
+ 		c->ases |= MIPS_ASE_VZ;
++	if (config3 & MIPS_CONF3_SC)
++		c->options |= MIPS_CPU_SEGMENTS;
+ 
+ 	return config3 & MIPS_CONF_M;
+ }
+diff --git a/arch/mips/kernel/entry.S b/arch/mips/kernel/entry.S
+--- a/arch/mips/kernel/entry.S
++++ b/arch/mips/kernel/entry.S
+@@ -203,10 +203,16 @@ syscall_exit_work:
+  *
+  * For C code use the inline version named instruction_hazard().
+  */
++#ifdef CONFIG_EVA
++	.align  8
++#endif
+ LEAF(mips_ihb)
+ 	.set	mips32r2
+ 	jr.hb	ra
+ 	nop
++#ifdef CONFIG_EVA
++	.align  8
++#endif
+ 	END(mips_ihb)
+ 
+ #endif /* CONFIG_CPU_MIPSR2 or CONFIG_MIPS_MT */
+diff --git a/arch/mips/kernel/head.S b/arch/mips/kernel/head.S
+--- a/arch/mips/kernel/head.S
++++ b/arch/mips/kernel/head.S
+@@ -148,9 +148,13 @@ EXPORT(__image_cmdline)
+ 
+ 	__REF
+ 
++#ifdef CONFIG_EVA
++	.align  8
++#endif
++
+ NESTED(kernel_entry, 16, sp)			# kernel entry point
+ 
+-	kernel_entry_setup			# cpu specific setup
++	kernel_entry_setup                      # cpu specific setup
+ 
+ 	setup_c0_status_pri
+ 
+@@ -158,6 +162,9 @@ NESTED(kernel_entry, 16, sp)			# kernel 
+ 	   so we jump there.  */
+ 	PTR_LA	t0, 0f
+ 	jr	t0
++#ifdef CONFIG_EVA
++	.align  8
++#endif
+ 0:
+ 
+ #ifdef CONFIG_MIPS_MT_SMTC
+@@ -210,7 +217,13 @@ 1:
+  * SMP slave cpus entry point.	Board specific code for bootstrap calls this
+  * function after setting up the stack and gp registers.
+  */
++
++#ifdef CONFIG_EVA
++	.align  8
++#endif
++
+ NESTED(smp_bootstrap, 16, sp)
++
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 	/*
+ 	 * Read-modify-writes of Status must be atomic, and this
+@@ -222,8 +235,10 @@ NESTED(smp_bootstrap, 16, sp)
+ 	DMT	10	# dmt t2 /* t0, t1 are used by CLI and setup_c0_status() */
+ 	jal	mips_ihb
+ #endif /* CONFIG_MIPS_MT_SMTC */
++
++	smp_slave_setup
+ 	setup_c0_status_sec
+-	smp_slave_setup
++
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 	andi	t2, t2, VPECONTROL_TE
+ 	beqz	t2, 2f
+@@ -231,6 +246,9 @@ NESTED(smp_bootstrap, 16, sp)
+ 2:
+ #endif /* CONFIG_MIPS_MT_SMTC */
+ 	j	start_secondary
++#ifdef CONFIG_EVA
++	.align  8
++#endif
+ 	END(smp_bootstrap)
+ #endif /* CONFIG_SMP */
+ 
+diff --git a/arch/mips/kernel/mips_ksyms.c b/arch/mips/kernel/mips_ksyms.c
+--- a/arch/mips/kernel/mips_ksyms.c
++++ b/arch/mips/kernel/mips_ksyms.c
+@@ -17,14 +17,14 @@
+ #include <asm/fpu.h>
+ 
+ extern void *__bzero(void *__s, size_t __count);
+-extern long __strncpy_from_user_nocheck_asm(char *__to,
++extern long __strncpy_from_kernel_nocheck_asm(char *__to,
+ 					    const char *__from, long __len);
+-extern long __strncpy_from_user_asm(char *__to, const char *__from,
++extern long __strncpy_from_kernel_asm(char *__to, const char *__from,
+ 				    long __len);
+-extern long __strlen_user_nocheck_asm(const char *s);
+-extern long __strlen_user_asm(const char *s);
+-extern long __strnlen_user_nocheck_asm(const char *s);
+-extern long __strnlen_user_asm(const char *s);
++extern long __strlen_kernel_nocheck_asm(const char *s);
++extern long __strlen_kernel_asm(const char *s);
++extern long __strnlen_kernel_nocheck_asm(const char *s);
++extern long __strnlen_kernel_asm(const char *s);
+ 
+ /*
+  * Core architecture code
+@@ -52,16 +52,44 @@ EXPORT_SYMBOL(copy_page);
+ EXPORT_SYMBOL(__copy_user);
+ EXPORT_SYMBOL(__copy_user_inatomic);
+ EXPORT_SYMBOL(__bzero);
+-EXPORT_SYMBOL(__strncpy_from_user_nocheck_asm);
+-EXPORT_SYMBOL(__strncpy_from_user_asm);
++EXPORT_SYMBOL(__strlen_kernel_nocheck_asm);
++EXPORT_SYMBOL(__strlen_kernel_asm);
++EXPORT_SYMBOL(__strnlen_kernel_nocheck_asm);
++EXPORT_SYMBOL(__strnlen_kernel_asm);
++EXPORT_SYMBOL(__strncpy_from_kernel_nocheck_asm);
++EXPORT_SYMBOL(__strncpy_from_kernel_asm);
++
++#ifdef CONFIG_EVA
++extern void *__bzero_user(void *__s, size_t __count);
++extern long __strncpy_from_user_nocheck_asm(char *__to,
++					    const char *__from, long __len);
++extern long __strncpy_from_user_asm(char *__to, const char *__from,
++				    long __len);
++extern long __strlen_user_nocheck_asm(const char *s);
++extern long __strlen_user_asm(const char *s);
++extern long __strnlen_user_nocheck_asm(const char *s);
++extern long __strnlen_user_asm(const char *s);
++
++EXPORT_SYMBOL(__copy_touser);
++EXPORT_SYMBOL(__copy_fromuser);
++EXPORT_SYMBOL(__copy_fromuser_inatomic);
++EXPORT_SYMBOL(__copy_inuser);
++EXPORT_SYMBOL(__bzero_user);
+ EXPORT_SYMBOL(__strlen_user_nocheck_asm);
+ EXPORT_SYMBOL(__strlen_user_asm);
+ EXPORT_SYMBOL(__strnlen_user_nocheck_asm);
+ EXPORT_SYMBOL(__strnlen_user_asm);
++EXPORT_SYMBOL(__strncpy_from_user_nocheck_asm);
++EXPORT_SYMBOL(__strncpy_from_user_asm);
++#endif
+ 
+ EXPORT_SYMBOL(csum_partial);
+ EXPORT_SYMBOL(csum_partial_copy_nocheck);
+ EXPORT_SYMBOL(__csum_partial_copy_user);
++#ifdef CONFIG_EVA
++EXPORT_SYMBOL(__csum_partial_copy_fromuser);
++EXPORT_SYMBOL(__csum_partial_copy_touser);
++#endif
+ 
+ EXPORT_SYMBOL(invalid_pte_table);
+ #ifdef CONFIG_FUNCTION_TRACER
+diff --git a/arch/mips/kernel/scall32-o32.S b/arch/mips/kernel/scall32-o32.S
+--- a/arch/mips/kernel/scall32-o32.S
++++ b/arch/mips/kernel/scall32-o32.S
+@@ -125,17 +125,39 @@ stackargs:
+ 
+ 	la	t1, 5f			# load up to 3 arguments
+ 	subu	t1, t3
+-1:	lw	t5, 16(t0)		# argument #5 from usp
+-	.set	push
+-	.set	noreorder
++#ifndef CONFIG_EVA
++1:      lw      t5, 16(t0)              # argument #5 from usp
++	.set    push
++	.set    noreorder
+ 	.set	nomacro
+ 	jr	t1
+ 	 addiu	t1, 6f - 5f
+ 
+-2:	lw	t8, 28(t0)		# argument #8 from usp
+-3:	lw	t7, 24(t0)		# argument #7 from usp
+-4:	lw	t6, 20(t0)		# argument #6 from usp
+-5:	jr	t1
++2:	.insn
++	lw	t8, 28(t0)		# argument #8 from usp
++3:	.insn
++	lw	t7, 24(t0)		# argument #7 from usp
++4:	.insn
++	lw	t6, 20(t0)		# argument #6 from usp
++5:	.insn
++#else
++	.set    eva
++1:      lwe      t5, 16(t0)              # argument #5 from usp
++	.set    push
++	.set    noreorder
++	.set	nomacro
++	jr	t1
++	 addiu	t1, 6f - 5f
++
++2:	.insn
++	lwe      t8, 28(t0)              # argument #8 from usp
++3:	.insn
++	lwe      t7, 24(t0)              # argument #7 from usp
++4:	.insn
++	lwe      t6, 20(t0)              # argument #6 from usp
++5:	.insn
++#endif /* CONFIG_EVA */
++	jr	t1
+ 	 sw	t5, 16(sp)		# argument #5 to ksp
+ 
+ #ifdef CONFIG_CPU_MICROMIPS
+@@ -150,7 +172,7 @@ 5:	jr	t1
+ 	sw	t7, 24(sp)		# argument #7 to ksp
+ 	sw	t6, 20(sp)		# argument #6 to ksp
+ #endif
+-6:	j	stack_done		# go back
++6:      j       stack_done              # go back
+ 	 nop
+ 	.set	pop
+ 
+diff --git a/arch/mips/kernel/signal.c b/arch/mips/kernel/signal.c
+--- a/arch/mips/kernel/signal.c
++++ b/arch/mips/kernel/signal.c
+@@ -68,6 +68,7 @@ struct rt_sigframe {
+ static int protected_save_fp_context(struct sigcontext __user *sc)
+ {
+ 	int err;
++#ifndef CONFIG_EVA
+ 	while (1) {
+ 		lock_fpu_owner();
+ 		err = own_fpu_inatomic(1);
+@@ -83,12 +84,17 @@ static int protected_save_fp_context(str
+ 		if (err)
+ 			break;	/* really bad sigcontext */
+ 	}
++#else
++	lose_fpu(1);
++	err = save_fp_context(sc); /* this might fail */
++#endif  /* CONFIG_EVA */
+ 	return err;
+ }
+ 
+ static int protected_restore_fp_context(struct sigcontext __user *sc)
+ {
+ 	int err, tmp __maybe_unused;
++#ifndef CONFIG_EVA
+ 	while (1) {
+ 		lock_fpu_owner();
+ 		err = own_fpu_inatomic(0);
+@@ -104,6 +110,10 @@ static int protected_restore_fp_context(
+ 		if (err)
+ 			break;	/* really bad sigcontext */
+ 	}
++#else
++	lose_fpu(0);
++	err = restore_fp_context(sc); /* this might fail */
++#endif  /* CONFIG_EVA */
+ 	return err;
+ }
+ 
+@@ -586,6 +596,7 @@ asmlinkage void do_notify_resume(struct 
+ }
+ 
+ #ifdef CONFIG_SMP
++#ifndef CONFIG_EVA
+ static int smp_save_fp_context(struct sigcontext __user *sc)
+ {
+ 	return raw_cpu_has_fpu
+@@ -600,9 +611,11 @@ static int smp_restore_fp_context(struct
+ 	       : fpu_emulator_restore_context(sc);
+ }
+ #endif
++#endif
+ 
+ static int signal_setup(void)
+ {
++#ifndef CONFIG_EVA
+ #ifdef CONFIG_SMP
+ 	/* For now just do the cpu_has_fpu check when the functions are invoked */
+ 	save_fp_context = smp_save_fp_context;
+@@ -615,7 +628,11 @@ static int signal_setup(void)
+ 		save_fp_context = fpu_emulator_save_context;
+ 		restore_fp_context = fpu_emulator_restore_context;
+ 	}
+-#endif
++#endif /* CONFIG_SMP */
++#else
++	save_fp_context = fpu_emulator_save_context;
++	restore_fp_context = fpu_emulator_restore_context;
++#endif /* CONFIG_EVA */
+ 
+ 	return 0;
+ }
+diff --git a/arch/mips/kernel/signal32.c b/arch/mips/kernel/signal32.c
+--- a/arch/mips/kernel/signal32.c
++++ b/arch/mips/kernel/signal32.c
+@@ -83,6 +83,7 @@ struct rt_sigframe32 {
+ static int protected_save_fp_context32(struct sigcontext32 __user *sc)
+ {
+ 	int err;
++#ifndef CONFIG_EVA
+ 	while (1) {
+ 		lock_fpu_owner();
+ 		err = own_fpu_inatomic(1);
+@@ -98,12 +99,17 @@ static int protected_save_fp_context32(s
+ 		if (err)
+ 			break;	/* really bad sigcontext */
+ 	}
++#else
++	lose_fpu(1);
++	err = save_fp_context32(sc); /* this might fail */
++#endif
+ 	return err;
+ }
+ 
+ static int protected_restore_fp_context32(struct sigcontext32 __user *sc)
+ {
+ 	int err, tmp __maybe_unused;
++#ifndef CONFIG_EVA
+ 	while (1) {
+ 		lock_fpu_owner();
+ 		err = own_fpu_inatomic(0);
+@@ -119,6 +125,10 @@ static int protected_restore_fp_context3
+ 		if (err)
+ 			break;	/* really bad sigcontext */
+ 	}
++#else
++	lose_fpu(0);
++	err = restore_fp_context32(sc); /* this might fail */
++#endif /* CONFIG_EVA */
+ 	return err;
+ }
+ 
+@@ -576,6 +586,7 @@ static int smp_restore_fp_context32(stru
+ 
+ static int signal32_init(void)
+ {
++#ifndef CONFIG_EVA
+ #ifdef CONFIG_SMP
+ 	/* For now just do the cpu_has_fpu check when the functions are invoked */
+ 	save_fp_context32 = smp_save_fp_context32;
+@@ -588,7 +599,11 @@ static int signal32_init(void)
+ 		save_fp_context32 = fpu_emulator_save_context32;
+ 		restore_fp_context32 = fpu_emulator_restore_context32;
+ 	}
+-#endif
++#endif /* CONFIG_SMP */
++#else
++	save_fp_context32 = fpu_emulator_save_context32;
++	restore_fp_context32 = fpu_emulator_restore_context32;
++#endif /* CONFIG_EVA */
+ 
+ 	return 0;
+ }
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -844,6 +844,13 @@ asmlinkage void do_bp(struct pt_regs *re
+ 	unsigned int opcode, bcode;
+ 	unsigned long epc;
+ 	u16 instr[2];
++#ifdef CONFIG_EVA
++	mm_segment_t seg;
++
++	seg = get_fs();
++	if (!user_mode(regs))
++		set_fs(KERNEL_DS);
++#endif
+ 
+ 	if (get_isa16_mode(regs->cp0_epc)) {
+ 		/* Calculate EPC. */
+@@ -859,6 +866,9 @@ asmlinkage void do_bp(struct pt_regs *re
+ 				goto out_sigsegv;
+ 		    bcode = (instr[0] >> 6) & 0x3f;
+ 		    do_trap_or_bp(regs, bcode, "Break");
++#ifdef CONFIG_EVA
++		    set_fs(seg);
++#endif
+ 		    return;
+ 		}
+ 	} else {
+@@ -882,23 +892,35 @@ asmlinkage void do_bp(struct pt_regs *re
+ 	 */
+ 	switch (bcode) {
+ 	case BRK_KPROBE_BP:
+-		if (notify_die(DIE_BREAK, "debug", regs, bcode, regs_to_trapnr(regs), SIGTRAP) == NOTIFY_STOP)
++		if (notify_die(DIE_BREAK, "debug", regs, bcode, regs_to_trapnr(regs), SIGTRAP) == NOTIFY_STOP) {
++#ifdef CONFIG_EVA
++			set_fs(seg);
++#endif
+ 			return;
+-		else
++		} else
+ 			break;
+ 	case BRK_KPROBE_SSTEPBP:
+-		if (notify_die(DIE_SSTEPBP, "single_step", regs, bcode, regs_to_trapnr(regs), SIGTRAP) == NOTIFY_STOP)
++		if (notify_die(DIE_SSTEPBP, "single_step", regs, bcode, regs_to_trapnr(regs), SIGTRAP) == NOTIFY_STOP) {
++#ifdef CONFIG_EVA
++			set_fs(seg);
++#endif
+ 			return;
+-		else
++		} else
+ 			break;
+ 	default:
+ 		break;
+ 	}
+ 
+ 	do_trap_or_bp(regs, bcode, "Break");
++#ifdef CONFIG_EVA
++	set_fs(seg);
++#endif
+ 	return;
+ 
+ out_sigsegv:
++#ifdef CONFIG_EVA
++	set_fs(seg);
++#endif
+ 	force_sig(SIGSEGV, current);
+ }
+ 
+@@ -907,6 +929,13 @@ asmlinkage void do_tr(struct pt_regs *re
+ 	u32 opcode, tcode = 0;
+ 	u16 instr[2];
+ 	unsigned long epc = msk_isa16_mode(exception_epc(regs));
++#ifdef CONFIG_EVA
++	mm_segment_t seg;
++
++	seg = get_fs();
++	if (!user_mode(regs))
++		set_fs(KERNEL_DS);
++#endif
+ 
+ 	if (get_isa16_mode(regs->cp0_epc)) {
+ 		if (__get_user(instr[0], (u16 __user *)(epc + 0)) ||
+diff --git a/arch/mips/kernel/unaligned.c b/arch/mips/kernel/unaligned.c
+--- a/arch/mips/kernel/unaligned.c
++++ b/arch/mips/kernel/unaligned.c
+@@ -105,6 +105,255 @@ static u32 unaligned_action;
+ #define unaligned_action UNALIGNED_ACTION_QUIET
+ #endif
+ extern void show_registers(struct pt_regs *regs);
++asmlinkage void do_cpu(struct pt_regs *regs);
++
++#ifdef CONFIG_EVA
++/* EVA variant */
++
++#ifdef __BIG_ENDIAN
++#define     LoadHW(addr, value, res)  \
++		__asm__ __volatile__ (".set\tnoat\n"        \
++			"1:\tlbe\t%0, 0(%2)\n"               \
++			"2:\tlbue\t$1, 1(%2)\n\t"            \
++			"sll\t%0, 0x8\n\t"                  \
++			"or\t%0, $1\n\t"                    \
++			"li\t%1, 0\n"                       \
++			"3:\t.set\tat\n\t"                  \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     LoadW(addr, value, res)   \
++		__asm__ __volatile__ (                      \
++			"1:\tlwle\t%0, (%2)\n"               \
++			"2:\tlwre\t%0, 3(%2)\n\t"            \
++			"li\t%1, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     LoadHWU(addr, value, res) \
++		__asm__ __volatile__ (                      \
++			".set\tnoat\n"                      \
++			"1:\tlbue\t%0, 0(%2)\n"              \
++			"2:\tlbue\t$1, 1(%2)\n\t"            \
++			"sll\t%0, 0x8\n\t"                  \
++			"or\t%0, $1\n\t"                    \
++			"li\t%1, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".set\tat\n\t"                      \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     LoadWU(addr, value, res)  \
++		__asm__ __volatile__ (                      \
++			"1:\tlwle\t%0, (%2)\n"               \
++			"2:\tlwre\t%0, 3(%2)\n\t"            \
++			"dsll\t%0, %0, 32\n\t"              \
++			"dsrl\t%0, %0, 32\n\t"              \
++			"li\t%1, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			"\t.section\t.fixup,\"ax\"\n\t"     \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     StoreHW(addr, value, res) \
++		__asm__ __volatile__ (                      \
++			".set\tnoat\n"                      \
++			"1:\tsbe\t%1, 1(%2)\n\t"             \
++			"srl\t$1, %1, 0x8\n"                \
++			"2:\tsbe\t$1, 0(%2)\n\t"             \
++			".set\tat\n\t"                      \
++			"li\t%0, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%0, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=r" (res)                        \
++			: "r" (value), "r" (addr), "i" (-EFAULT));
++
++#define     StoreW(addr, value, res)  \
++		__asm__ __volatile__ (                      \
++			"1:\tswle\t%1,(%2)\n"                \
++			"2:\tswre\t%1, 3(%2)\n\t"            \
++			"li\t%0, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%0, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++		: "=r" (res)                                \
++		: "r" (value), "r" (addr), "i" (-EFAULT));
++#endif
++
++#ifdef __LITTLE_ENDIAN
++#define     LoadHW(addr, value, res)  \
++		__asm__ __volatile__ (".set\tnoat\n"        \
++			"1:\tlbe\t%0, 1(%2)\n"               \
++			"2:\tlbue\t$1, 0(%2)\n\t"            \
++			"sll\t%0, 0x8\n\t"                  \
++			"or\t%0, $1\n\t"                    \
++			"li\t%1, 0\n"                       \
++			"3:\t.set\tat\n\t"                  \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     LoadW(addr, value, res)   \
++		__asm__ __volatile__ (                      \
++			"1:\tlwle\t%0, 3(%2)\n"              \
++			"2:\tlwre\t%0, (%2)\n\t"             \
++			"li\t%1, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     LoadHWU(addr, value, res) \
++		__asm__ __volatile__ (                      \
++			".set\tnoat\n"                      \
++			"1:\tlbue\t%0, 1(%2)\n"              \
++			"2:\tlbue\t$1, 0(%2)\n\t"            \
++			"sll\t%0, 0x8\n\t"                  \
++			"or\t%0, $1\n\t"                    \
++			"li\t%1, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".set\tat\n\t"                      \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     LoadWU(addr, value, res)  \
++		__asm__ __volatile__ (                      \
++			"1:\tlwle\t%0, 3(%2)\n"              \
++			"2:\tlwre\t%0, (%2)\n\t"             \
++			"dsll\t%0, %0, 32\n\t"              \
++			"dsrl\t%0, %0, 32\n\t"              \
++			"li\t%1, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			"\t.section\t.fixup,\"ax\"\n\t"     \
++			"4:\tli\t%1, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=&r" (value), "=r" (res)         \
++			: "r" (addr), "i" (-EFAULT));
++
++#define     StoreHW(addr, value, res) \
++		__asm__ __volatile__ (                      \
++			".set\tnoat\n"                      \
++			"1:\tsbe\t%1, 0(%2)\n\t"             \
++			"srl\t$1,%1, 0x8\n"                 \
++			"2:\tsbe\t$1, 1(%2)\n\t"             \
++			".set\tat\n\t"                      \
++			"li\t%0, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%0, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++			: "=r" (res)                        \
++			: "r" (value), "r" (addr), "i" (-EFAULT));
++
++#define     StoreW(addr, value, res)  \
++		__asm__ __volatile__ (                      \
++			"1:\tswle\t%1, 3(%2)\n"              \
++			"2:\tswre\t%1, (%2)\n\t"             \
++			"li\t%0, 0\n"                       \
++			"3:\n\t"                            \
++			".insn\n\t"                         \
++			".section\t.fixup,\"ax\"\n\t"       \
++			"4:\tli\t%0, %3\n\t"                \
++			"j\t3b\n\t"                         \
++			".previous\n\t"                     \
++			".section\t__ex_table,\"a\"\n\t"    \
++			STR(PTR)"\t1b, 4b\n\t"              \
++			STR(PTR)"\t2b, 4b\n\t"              \
++			".previous"                         \
++		: "=r" (res)                                \
++		: "r" (value), "r" (addr), "i" (-EFAULT));
++#endif
++
++#else
++/* non-EVA variant */
+ 
+ #ifdef __BIG_ENDIAN
+ #define     LoadHW(addr, value, res)  \
+@@ -420,6 +669,8 @@ extern void show_registers(struct pt_reg
+ 		: "r" (value), "r" (addr), "i" (-EFAULT));
+ #endif
+ 
++#endif
++
+ static void emulate_load_store_insn(struct pt_regs *regs,
+ 	void __user *addr, unsigned int __user *pc)
+ {
+@@ -429,6 +680,9 @@ static void emulate_load_store_insn(stru
+ 	unsigned long origpc;
+ 	unsigned long orig31;
+ 	void __user *fault_addr = NULL;
++#ifdef CONFIG_EVA
++	mm_segment_t seg;
++#endif
+ 
+ 	origpc = (unsigned long)pc;
+ 	orig31 = regs->regs[31];
+@@ -474,6 +728,98 @@ static void emulate_load_store_insn(stru
+ 		 * The remaining opcodes are the ones that are really of
+ 		 * interest.
+ 		 */
++#ifdef CONFIG_EVA
++	case spec3_op:
++
++		/* we can land here only from kernel accessing USER,
++		   so - set user space, temporary for verification */
++		seg = get_fs();
++		set_fs(USER_DS);
++
++		switch (insn.spec3_format.ls_func) {
++
++		case lhe_op:
++			if (!access_ok(VERIFY_READ, addr, 2)) {
++				set_fs(seg);
++				goto sigbus;
++			}
++
++			LoadHW(addr, value, res);
++			if (res) {
++				set_fs(seg);
++				goto fault;
++			}
++			compute_return_epc(regs);
++			regs->regs[insn.spec3_format.rt] = value;
++			break;
++
++		case lwe_op:
++			if (!access_ok(VERIFY_READ, addr, 4)) {
++				set_fs(seg);
++				goto sigbus;
++			}
++
++			LoadW(addr, value, res);
++			if (res) {
++				set_fs(seg);
++				goto fault;
++			}
++			compute_return_epc(regs);
++			regs->regs[insn.spec3_format.rt] = value;
++			break;
++
++		case lhue_op:
++			if (!access_ok(VERIFY_READ, addr, 2)) {
++				set_fs(seg);
++				goto sigbus;
++			}
++
++			LoadHWU(addr, value, res);
++			if (res) {
++				set_fs(seg);
++				goto fault;
++			}
++			compute_return_epc(regs);
++			regs->regs[insn.spec3_format.rt] = value;
++			break;
++
++		case she_op:
++			if (!access_ok(VERIFY_WRITE, addr, 2)) {
++				set_fs(seg);
++				goto sigbus;
++			}
++
++			compute_return_epc(regs);
++			value = regs->regs[insn.spec3_format.rt];
++			StoreHW(addr, value, res);
++			if (res) {
++				set_fs(seg);
++				goto fault;
++			}
++			break;
++
++		case swe_op:
++			if (!access_ok(VERIFY_WRITE, addr, 4)) {
++				set_fs(seg);
++				goto sigbus;
++			}
++
++			compute_return_epc(regs);
++			value = regs->regs[insn.spec3_format.rt];
++			StoreW(addr, value, res);
++			if (res) {
++				set_fs(seg);
++				goto fault;
++			}
++			break;
++
++		default:
++			set_fs(seg);
++			goto sigill;
++		}
++		set_fs(seg);
++		break;
++#endif
+ 	case lh_op:
+ 		if (!access_ok(VERIFY_READ, addr, 2))
+ 			goto sigbus;
+@@ -602,6 +948,13 @@ static void emulate_load_store_insn(stru
+ 	case ldc1_op:
+ 	case swc1_op:
+ 	case sdc1_op:
++#if 0
++		/* temporary fix for mixing AdEL and CpU exceptions in Impresa */
++		if (!(regs->cp0_status & ST0_CU1)) {
++			do_cpu(regs);
++			return;
++		}
++#endif
+ 		die_if_kernel("Unaligned FP access in kernel code", regs);
+ 		BUG_ON(!used_math());
+ 
+diff --git a/arch/mips/lib/csum_partial.S b/arch/mips/lib/csum_partial.S
+--- a/arch/mips/lib/csum_partial.S
++++ b/arch/mips/lib/csum_partial.S
+@@ -9,6 +9,17 @@
+  * Copyright (C) 1999 Silicon Graphics, Inc.
+  * Copyright (C) 2007  Maciej W. Rozycki
+  */
++/*
++ * Hack to resolve longstanding prefetch issue
++ *
++ * Prefetching may be fatal on some systems if we're prefetching beyond the
++ * end of memory on some systems.  It's also a seriously bad idea on non
++ * dma-coherent systems.
++ */
++#if defined(CONFIG_DMA_NONCOHERENT) || defined(CONFIG_MIPS_MALTA)
++#undef CONFIG_CPU_HAS_PREFETCH
++#endif
++
+ #include <linux/errno.h>
+ #include <asm/asm.h>
+ #include <asm/asm-offsets.h>
+@@ -43,6 +54,8 @@
+ #define ADD    daddu
+ #define NBYTES 8
+ 
++#define LOADK  ld
++
+ #else
+ 
+ #define LOAD   lw
+@@ -50,6 +63,8 @@
+ #define ADD    addu
+ #define NBYTES 4
+ 
++#define LOADK  lw
++
+ #endif /* USE_DOUBLE */
+ 
+ #define UNIT(unit)  ((unit)*NBYTES)
+@@ -417,12 +432,18 @@ FEXPORT(csum_partial_copy_nocheck)
+ 	 *
+ 	 * If len < NBYTES use byte operations.
+ 	 */
+-	sltu	t2, len, NBYTES
++	PREF(   0, 0(src) )
++	PREF(   1, 0(dst) )
++	sltu    t2, len, NBYTES
+ 	and	t1, dst, ADDRMASK
+-	bnez	t2, .Lcopy_bytes_checklen
++	PREF(   0, 1*32(src) )
++	PREF(   1, 1*32(dst) )
++	bnez    t2, .Lcopy_bytes_checklen
+ 	 and	t0, src, ADDRMASK
+ 	andi	odd, dst, 0x1			/* odd buffer? */
+-	bnez	t1, .Ldst_unaligned
++	PREF(   0, 2*32(src) )
++	PREF(   1, 2*32(dst) )
++	bnez    t1, .Ldst_unaligned
+ 	 nop
+ 	bnez	t0, .Lsrc_unaligned_dst_aligned
+ 	/*
+@@ -434,7 +455,9 @@ FEXPORT(csum_partial_copy_nocheck)
+ 	beqz	t0, .Lcleanup_both_aligned # len < 8*NBYTES
+ 	 nop
+ 	SUB	len, 8*NBYTES		# subtract here for bgez loop
+-	.align	4
++	PREF(   0, 3*32(src) )
++	PREF(   1, 3*32(dst) )
++	.align  4
+ 1:
+ EXC(	LOAD	t0, UNIT(0)(src),	.Ll_exc)
+ EXC(	LOAD	t1, UNIT(1)(src),	.Ll_exc_copy)
+@@ -462,8 +485,10 @@ EXC(	STORE	t6, UNIT(6)(dst),	.Ls_exc)
+ 	ADDC(sum, t6)
+ EXC(	STORE	t7, UNIT(7)(dst),	.Ls_exc)
+ 	ADDC(sum, t7)
+-	.set	reorder				/* DADDI_WAR */
++	.set    reorder                         /* DADDI_WAR */
+ 	ADD	dst, dst, 8*NBYTES
++	PREF(   0, 8*32(src) )
++	PREF(   1, 8*32(dst) )
+ 	bgez	len, 1b
+ 	.set	noreorder
+ 	ADD	len, 8*NBYTES		# revert len (see above)
+@@ -568,9 +593,11 @@ EXC(	STFIRST t3, FIRST(0)(dst),	.Ls_exc)
+ 	 ADD	src, src, t2
+ 
+ .Lsrc_unaligned_dst_aligned:
+-	SRL	t0, len, LOG_NBYTES+2	 # +2 for 4 units/iter
++	SRL     t0, len, LOG_NBYTES+2    # +2 for 4 units/iter
++	PREF(   0, 3*32(src) )
+ 	beqz	t0, .Lcleanup_src_unaligned
+-	 and	rem, len, (4*NBYTES-1)	 # rem = len % 4*NBYTES
++	 and    rem, len, (4*NBYTES-1)   # rem = len % 4*NBYTES
++	PREF(   1, 3*32(dst) )
+ 1:
+ /*
+  * Avoid consecutive LD*'s to the same register since some mips
+@@ -587,7 +614,8 @@ EXC(	LDFIRST t2, FIRST(2)(src),	.Ll_exc_
+ EXC(	LDFIRST t3, FIRST(3)(src),	.Ll_exc_copy)
+ EXC(	LDREST	t2, REST(2)(src),	.Ll_exc_copy)
+ EXC(	LDREST	t3, REST(3)(src),	.Ll_exc_copy)
+-	ADD	src, src, 4*NBYTES
++	PREF(   0, 9*32(src) )          # 0 is PREF_LOAD  (not streamed)
++	ADD     src, src, 4*NBYTES
+ #ifdef CONFIG_CPU_SB1
+ 	nop				# improves slotting
+ #endif
+@@ -600,7 +628,8 @@ EXC(	STORE	t2, UNIT(2)(dst),	.Ls_exc)
+ EXC(	STORE	t3, UNIT(3)(dst),	.Ls_exc)
+ 	ADDC(sum, t3)
+ 	.set	reorder				/* DADDI_WAR */
+-	ADD	dst, dst, 4*NBYTES
++	PREF(   1, 9*32(dst) )          # 1 is PREF_STORE (not streamed)
++	ADD     dst, dst, 4*NBYTES
+ 	bne	len, rem, 1b
+ 	.set	noreorder
+ 
+@@ -700,9 +729,9 @@ 1:
+ 	 *
+ 	 * Assumes src < THREAD_BUADDR($28)
+ 	 */
+-	LOAD	t0, TI_TASK($28)
++	LOADK   t0, TI_TASK($28)
+ 	 li	t2, SHIFT_START
+-	LOAD	t0, THREAD_BUADDR(t0)
++	LOADK   t0, THREAD_BUADDR(t0)
+ 1:
+ EXC(	lbu	t1, 0(src),	.Ll_exc)
+ 	ADD	src, src, 1
+@@ -715,9 +744,9 @@ EXC(	lbu	t1, 0(src),	.Ll_exc)
+ 	bne	src, t0, 1b
+ 	.set	noreorder
+ .Ll_exc:
+-	LOAD	t0, TI_TASK($28)
++	LOADK   t0, TI_TASK($28)
+ 	 nop
+-	LOAD	t0, THREAD_BUADDR(t0)	# t0 is just past last good address
++	LOADK   t0, THREAD_BUADDR(t0)   # t0 is just past last good address
+ 	 nop
+ 	SUB	len, AT, t0		# len number of uncopied bytes
+ 	/*
+@@ -758,3 +787,738 @@ 1:	sb	zero, 0(dst)
+ 	 sw	v1, (errptr)
+ 	.set	pop
+ 	END(__csum_partial_copy_user)
++
++
++#ifdef CONFIG_EVA
++
++	.set    eva
++
++#undef  LOAD
++#undef  LOADL
++#undef  LOADR
++#undef  STORE
++#undef  STOREL
++#undef  STORER
++#undef  LDFIRST
++#undef  LDREST
++#undef  STFIRST
++#undef  STREST
++#undef  COPY_BYTE
++
++#define LOAD   lwe
++#define LOADL  lwle
++#define LOADR  lwre
++#define STOREL swl
++#define STORER swr
++#define STORE  sw
++
++#ifdef CONFIG_CPU_LITTLE_ENDIAN
++#define LDFIRST LOADR
++#define LDREST  LOADL
++#define STFIRST STORER
++#define STREST  STOREL
++#else
++#define LDFIRST LOADL
++#define LDREST  LOADR
++#define STFIRST STOREL
++#define STREST  STORER
++#endif
++
++LEAF(__csum_partial_copy_fromuser)
++	PTR_ADDU	AT, src, len	/* See (1) above. */
++#ifdef CONFIG_64BIT
++	move	errptr, a4
++#else
++	lw	errptr, 16(sp)
++#endif
++	move	sum, zero
++	move	odd, zero
++	/*
++	 * Note: dst & src may be unaligned, len may be 0
++	 * Temps
++	 */
++	/*
++	 * The "issue break"s below are very approximate.
++	 * Issue delays for dcache fills will perturb the schedule, as will
++	 * load queue full replay traps, etc.
++	 *
++	 * If len < NBYTES use byte operations.
++	 */
++	PREFE(  0, 0(src) )
++	PREF(   1, 0(dst) )
++	sltu    t2, len, NBYTES
++	and	t1, dst, ADDRMASK
++	PREFE(  0, 1*32(src) )
++	PREF(   1, 1*32(dst) )
++	bnez    t2, .LFcopy_bytes_checklen
++	 and	t0, src, ADDRMASK
++	andi	odd, dst, 0x1			/* odd buffer? */
++	PREFE(  0, 2*32(src) )
++	PREF(   1, 2*32(dst) )
++	bnez    t1, .LFdst_unaligned
++	 nop
++	bnez    t0, .LFsrc_unaligned_dst_aligned
++	/*
++	 * use delay slot for fall-through
++	 * src and dst are aligned; need to compute rem
++	 */
++.LFboth_aligned:
++	 SRL	t0, len, LOG_NBYTES+3    # +3 for 8 units/iter
++	beqz    t0, .LFcleanup_both_aligned # len < 8*NBYTES
++	 nop
++	SUB	len, 8*NBYTES		# subtract here for bgez loop
++	PREFE(  0, 3*32(src) )
++	PREF(   1, 3*32(dst) )
++	.align  4
++1:
++EXC(    LOAD    t0, UNIT(0)(src),       .LFl_exc)
++EXC(    LOAD    t1, UNIT(1)(src),       .LFl_exc_copy)
++EXC(    LOAD    t2, UNIT(2)(src),       .LFl_exc_copy)
++EXC(    LOAD    t3, UNIT(3)(src),       .LFl_exc_copy)
++EXC(    LOAD    t4, UNIT(4)(src),       .LFl_exc_copy)
++EXC(    LOAD    t5, UNIT(5)(src),       .LFl_exc_copy)
++EXC(    LOAD    t6, UNIT(6)(src),       .LFl_exc_copy)
++EXC(    LOAD    t7, UNIT(7)(src),       .LFl_exc_copy)
++	SUB	len, len, 8*NBYTES
++	ADD	src, src, 8*NBYTES
++	STORE   t0, UNIT(0)(dst)
++	ADDC(sum, t0)
++	STORE   t1, UNIT(1)(dst)
++	ADDC(sum, t1)
++	STORE   t2, UNIT(2)(dst)
++	ADDC(sum, t2)
++	STORE   t3, UNIT(3)(dst)
++	ADDC(sum, t3)
++	STORE   t4, UNIT(4)(dst)
++	ADDC(sum, t4)
++	STORE   t5, UNIT(5)(dst)
++	ADDC(sum, t5)
++	STORE   t6, UNIT(6)(dst)
++	ADDC(sum, t6)
++	STORE   t7, UNIT(7)(dst)
++	ADDC(sum, t7)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 8*NBYTES
++	PREFE(  0, 8*32(src) )
++	PREF(   1, 8*32(dst) )
++	bgez    len, 1b
++	.set	noreorder
++	ADD	len, 8*NBYTES		# revert len (see above)
++
++	/*
++	 * len == the number of bytes left to copy < 8*NBYTES
++	 */
++.LFcleanup_both_aligned:
++	beqz    len, .LFdone
++	 sltu	t0, len, 4*NBYTES
++	bnez    t0, .LFless_than_4units
++	 and	rem, len, (NBYTES-1)	# rem = len % NBYTES
++	/*
++	 * len >= 4*NBYTES
++	 */
++EXC(    LOAD    t0, UNIT(0)(src),       .LFl_exc)
++EXC(    LOAD    t1, UNIT(1)(src),       .LFl_exc_copy)
++EXC(    LOAD    t2, UNIT(2)(src),       .LFl_exc_copy)
++EXC(    LOAD    t3, UNIT(3)(src),       .LFl_exc_copy)
++	SUB	len, len, 4*NBYTES
++	ADD	src, src, 4*NBYTES
++	STORE   t0, UNIT(0)(dst)
++	ADDC(sum, t0)
++	STORE   t1, UNIT(1)(dst)
++	ADDC(sum, t1)
++	STORE   t2, UNIT(2)(dst)
++	ADDC(sum, t2)
++	STORE   t3, UNIT(3)(dst)
++	ADDC(sum, t3)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	beqz    len, .LFdone
++	.set	noreorder
++.LFless_than_4units:
++	/*
++	 * rem = len % NBYTES
++	 */
++	beq     rem, len, .LFcopy_bytes
++	 nop
++1:
++EXC(    LOAD    t0, 0(src),             .LFl_exc)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++	STORE   t0, 0(dst)
++	ADDC(sum, t0)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	rem, len, 1b
++	.set	noreorder
++
++	/*
++	 * src and dst are aligned, need to copy rem bytes (rem < NBYTES)
++	 * A loop would do only a byte at a time with possible branch
++	 * mispredicts.  Can't do an explicit LOAD dst,mask,or,STORE
++	 * because can't assume read-access to dst.  Instead, use
++	 * STREST dst, which doesn't require read access to dst.
++	 *
++	 * This code should perform better than a simple loop on modern,
++	 * wide-issue mips processors because the code has fewer branches and
++	 * more instruction-level parallelism.
++	 */
++	beqz    len, .LFdone
++	 ADD	t1, dst, len	# t1 is just past last byte of dst
++	li	bits, 8*NBYTES
++	SLL	rem, len, 3	# rem = number of bits to keep
++EXC(    LOAD    t0, 0(src),             .LFl_exc)
++	SUB	bits, bits, rem	# bits = number of bits to discard
++	SHIFT_DISCARD t0, t0, bits
++	STREST  t0, -1(t1)
++	SHIFT_DISCARD_REVERT t0, t0, bits
++	.set reorder
++	ADDC(sum, t0)
++	b       .LFdone
++	.set noreorder
++.LFdst_unaligned:
++	/*
++	 * dst is unaligned
++	 * t0 = src & ADDRMASK
++	 * t1 = dst & ADDRMASK; T1 > 0
++	 * len >= NBYTES
++	 *
++	 * Copy enough bytes to align dst
++	 * Set match = (src and dst have same alignment)
++	 */
++EXC(    LDFIRST t3, FIRST(0)(src),      .LFl_exc)
++	ADD	t2, zero, NBYTES
++EXC(    LDREST  t3, REST(0)(src),       .LFl_exc_copy)
++	SUB	t2, t2, t1	# t2 = number of bytes copied
++	xor	match, t0, t1
++	STFIRST t3, FIRST(0)(dst)
++	SLL	t4, t1, 3		# t4 = number of bits to discard
++	SHIFT_DISCARD t3, t3, t4
++	/* no SHIFT_DISCARD_REVERT to handle odd buffer properly */
++	ADDC(sum, t3)
++	beq     len, t2, .LFdone
++	 SUB	len, len, t2
++	ADD	dst, dst, t2
++	beqz    match, .LFboth_aligned
++	 ADD	src, src, t2
++
++.LFsrc_unaligned_dst_aligned:
++	SRL	t0, len, LOG_NBYTES+2    # +2 for 4 units/iter
++	PREFE(  0, 3*32(src) )
++	beqz    t0, .LFcleanup_src_unaligned
++	 and	rem, len, (4*NBYTES-1)   # rem = len % 4*NBYTES
++	PREF(   1, 3*32(dst) )
++1:
++/*
++ * Avoid consecutive LD*'s to the same register since some mips
++ * implementations can't issue them in the same cycle.
++ * It's OK to load FIRST(N+1) before REST(N) because the two addresses
++ * are to the same unit (unless src is aligned, but it's not).
++ */
++EXC(    LDFIRST t0, FIRST(0)(src),      .LFl_exc)
++EXC(    LDFIRST t1, FIRST(1)(src),      .LFl_exc_copy)
++	SUB     len, len, 4*NBYTES
++EXC(    LDREST  t0, REST(0)(src),       .LFl_exc_copy)
++EXC(    LDREST  t1, REST(1)(src),       .LFl_exc_copy)
++EXC(    LDFIRST t2, FIRST(2)(src),      .LFl_exc_copy)
++EXC(    LDFIRST t3, FIRST(3)(src),      .LFl_exc_copy)
++EXC(    LDREST  t2, REST(2)(src),       .LFl_exc_copy)
++EXC(    LDREST  t3, REST(3)(src),       .LFl_exc_copy)
++	PREFE(  0, 9*32(src) )          # 0 is PREF_LOAD  (not streamed)
++	ADD     src, src, 4*NBYTES
++#ifdef CONFIG_CPU_SB1
++	nop				# improves slotting
++#endif
++	STORE   t0, UNIT(0)(dst)
++	ADDC(sum, t0)
++	STORE   t1, UNIT(1)(dst)
++	ADDC(sum, t1)
++	STORE   t2, UNIT(2)(dst)
++	ADDC(sum, t2)
++	STORE   t3, UNIT(3)(dst)
++	ADDC(sum, t3)
++	PREF(   1, 9*32(dst) )          # 1 is PREF_STORE (not streamed)
++	.set    reorder                         /* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LFcleanup_src_unaligned:
++	beqz    len, .LFdone
++	 and	rem, len, NBYTES-1  # rem = len % NBYTES
++	beq     rem, len, .LFcopy_bytes
++	 nop
++1:
++EXC(    LDFIRST t0, FIRST(0)(src),      .LFl_exc)
++EXC(    LDREST  t0, REST(0)(src),       .LFl_exc_copy)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++	STORE   t0, 0(dst)
++	ADDC(sum, t0)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LFcopy_bytes_checklen:
++	beqz    len, .LFdone
++	 nop
++.LFcopy_bytes:
++	/* 0 < len < NBYTES  */
++	move	t2, zero	# partial word
++	li	t3, SHIFT_START	# shift
++/* use .Ll_exc_copy here to return correct sum on fault */
++#define COPY_BYTE(N)                    \
++EXC(    lbue    t0, N(src), .LFl_exc_copy);      \
++	SUB	len, len, 1;		\
++	sb      t0, N(dst);   \
++	SLLV	t0, t0, t3;		\
++	addu	t3, SHIFT_INC;		\
++	beqz    len, .LFcopy_bytes_done; \
++	 or	t2, t0
++
++	COPY_BYTE(0)
++	COPY_BYTE(1)
++#ifdef USE_DOUBLE
++	COPY_BYTE(2)
++	COPY_BYTE(3)
++	COPY_BYTE(4)
++	COPY_BYTE(5)
++#endif
++EXC(    lbue    t0, NBYTES-2(src), .LFl_exc_copy)
++	SUB	len, len, 1
++	sb      t0, NBYTES-2(dst)
++	SLLV	t0, t0, t3
++	or	t2, t0
++.LFcopy_bytes_done:
++	ADDC(sum, t2)
++.LFdone:
++	/* fold checksum */
++#ifdef USE_DOUBLE
++	dsll32	v1, sum, 0
++	daddu	sum, v1
++	sltu	v1, sum, v1
++	dsra32	sum, sum, 0
++	addu	sum, v1
++#endif
++
++#ifdef CPU_MIPSR2
++	wsbh	v1, sum
++	movn	sum, v1, odd
++#else
++	beqz	odd, 1f			/* odd buffer alignment? */
++	 lui	v1, 0x00ff
++	addu	v1, 0x00ff
++	and	t0, sum, v1
++	sll	t0, t0, 8
++	srl	sum, sum, 8
++	and	sum, sum, v1
++	or	sum, sum, t0
++1:
++#endif
++	.set reorder
++	ADDC32(sum, psum)
++	jr	ra
++	.set noreorder
++
++.LFl_exc_copy:
++	/*
++	 * Copy bytes from src until faulting load address (or until a
++	 * lb faults)
++	 *
++	 * When reached by a faulting LDFIRST/LDREST, THREAD_BUADDR($28)
++	 * may be more than a byte beyond the last address.
++	 * Hence, the lb below may get an exception.
++	 *
++	 * Assumes src < THREAD_BUADDR($28)
++	 */
++	LOADK   t0, TI_TASK($28)
++	 li	t2, SHIFT_START
++	addi    t0, t0, THREAD_BUADDR
++	LOADK   t0, 0(t0)
++1:
++EXC(    lbue     t1, 0(src),     .LFl_exc)
++	ADD	src, src, 1
++	sb	t1, 0(dst)	# can't fault -- we're copy_from_user
++	SLLV	t1, t1, t2
++	addu	t2, SHIFT_INC
++	ADDC(sum, t1)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 1
++	bne	src, t0, 1b
++	.set	noreorder
++.LFl_exc:
++	LOADK   t0, TI_TASK($28)
++	addi    t0, t0, THREAD_BUADDR
++	LOADK   t0, 0(t0)               # t0 is just past last good address
++	SUB	len, AT, t0		# len number of uncopied bytes
++	/*
++	 * Here's where we rely on src and dst being incremented in tandem,
++	 *   See (3) above.
++	 * dst += (fault addr - src) to put dst at first byte to clear
++	 */
++	ADD	dst, t0			# compute start address in a1
++	SUB	dst, src
++	/*
++	 * Clear len bytes starting at dst.  Can't call __bzero because it
++	 * might modify len.  An inefficient loop for these rare times...
++	 */
++	.set	reorder				/* DADDI_WAR */
++	SUB	src, len, 1
++	beqz    len, .LFdone
++	.set	noreorder
++1:	sb	zero, 0(dst)
++	ADD	dst, dst, 1
++	.set	push
++	.set	noat
++#ifndef CONFIG_CPU_DADDI_WORKAROUNDS
++	bnez	src, 1b
++	 SUB	src, src, 1
++#else
++	li	v1, 1
++	bnez	src, 1b
++	 SUB	src, src, v1
++#endif
++	li	v1, -EFAULT
++	b       .LFdone
++	 sw	v1, (errptr)
++
++	.set	pop
++	END(__csum_partial_copy_fromuser)
++
++
++
++#undef  LOAD
++#undef  LOADL
++#undef  LOADR
++#undef  STORE
++#undef  STOREL
++#undef  STORER
++#undef  LDFIRST
++#undef  LDREST
++#undef  STFIRST
++#undef  STREST
++#undef  COPY_BYTE
++
++#define LOAD   lw
++#define LOADL  lwl
++#define LOADR  lwr
++#define STOREL swle
++#define STORER swre
++#define STORE  swe
++
++#ifdef CONFIG_CPU_LITTLE_ENDIAN
++#define LDFIRST LOADR
++#define LDREST  LOADL
++#define STFIRST STORER
++#define STREST  STOREL
++#else
++#define LDFIRST LOADL
++#define LDREST  LOADR
++#define STFIRST STOREL
++#define STREST  STORER
++#endif
++
++LEAF(__csum_partial_copy_touser)
++	PTR_ADDU	AT, src, len	/* See (1) above. */
++#ifdef CONFIG_64BIT
++	move	errptr, a4
++#else
++	lw	errptr, 16(sp)
++#endif
++	move	sum, zero
++	move	odd, zero
++	/*
++	 * Note: dst & src may be unaligned, len may be 0
++	 * Temps
++	 */
++	/*
++	 * The "issue break"s below are very approximate.
++	 * Issue delays for dcache fills will perturb the schedule, as will
++	 * load queue full replay traps, etc.
++	 *
++	 * If len < NBYTES use byte operations.
++	 */
++	PREF(   0, 0(src) )
++	PREFE(  1, 0(dst) )
++	sltu    t2, len, NBYTES
++	and	t1, dst, ADDRMASK
++	PREF(   0, 1*32(src) )
++	PREFE(  1, 1*32(dst) )
++	bnez    t2, .LTcopy_bytes_checklen
++	 and	t0, src, ADDRMASK
++	andi	odd, dst, 0x1			/* odd buffer? */
++	PREF(   0, 2*32(src) )
++	PREFE(  1, 2*32(dst) )
++	bnez    t1, .LTdst_unaligned
++	 nop
++	bnez    t0, .LTsrc_unaligned_dst_aligned
++	/*
++	 * use delay slot for fall-through
++	 * src and dst are aligned; need to compute rem
++	 */
++.LTboth_aligned:
++	 SRL	t0, len, LOG_NBYTES+3    # +3 for 8 units/iter
++	beqz    t0, .LTcleanup_both_aligned # len < 8*NBYTES
++	 nop
++	SUB	len, 8*NBYTES		# subtract here for bgez loop
++	PREF(   0, 3*32(src) )
++	PREFE(  1, 3*32(dst) )
++	.align  4
++1:
++	LOAD    t0, UNIT(0)(src)
++	LOAD    t1, UNIT(1)(src)
++	LOAD    t2, UNIT(2)(src)
++	LOAD    t3, UNIT(3)(src)
++	LOAD    t4, UNIT(4)(src)
++	LOAD    t5, UNIT(5)(src)
++	LOAD    t6, UNIT(6)(src)
++	LOAD    t7, UNIT(7)(src)
++	SUB	len, len, 8*NBYTES
++	ADD	src, src, 8*NBYTES
++EXC(    STORE   t0, UNIT(0)(dst),       .LTs_exc)
++	ADDC(sum, t0)
++EXC(    STORE   t1, UNIT(1)(dst),       .LTs_exc)
++	ADDC(sum, t1)
++EXC(    STORE   t2, UNIT(2)(dst),       .LTs_exc)
++	ADDC(sum, t2)
++EXC(    STORE   t3, UNIT(3)(dst),       .LTs_exc)
++	ADDC(sum, t3)
++EXC(    STORE   t4, UNIT(4)(dst),       .LTs_exc)
++	ADDC(sum, t4)
++EXC(    STORE   t5, UNIT(5)(dst),       .LTs_exc)
++	ADDC(sum, t5)
++EXC(    STORE   t6, UNIT(6)(dst),       .LTs_exc)
++	ADDC(sum, t6)
++EXC(    STORE   t7, UNIT(7)(dst),       .LTs_exc)
++	ADDC(sum, t7)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 8*NBYTES
++	PREF(   0, 8*32(src) )
++	PREFE(  1, 8*32(dst) )
++	bgez    len, 1b
++	.set	noreorder
++	ADD	len, 8*NBYTES		# revert len (see above)
++
++	/*
++	 * len == the number of bytes left to copy < 8*NBYTES
++	 */
++.LTcleanup_both_aligned:
++	beqz    len, .LTdone
++	 sltu	t0, len, 4*NBYTES
++	bnez    t0, .LTless_than_4units
++	 and	rem, len, (NBYTES-1)	# rem = len % NBYTES
++	/*
++	 * len >= 4*NBYTES
++	 */
++	LOAD    t0, UNIT(0)(src)
++	LOAD    t1, UNIT(1)(src)
++	LOAD    t2, UNIT(2)(src)
++	LOAD    t3, UNIT(3)(src)
++	SUB	len, len, 4*NBYTES
++	ADD	src, src, 4*NBYTES
++EXC(    STORE   t0, UNIT(0)(dst),       .LTs_exc)
++	ADDC(sum, t0)
++EXC(    STORE   t1, UNIT(1)(dst),       .LTs_exc)
++	ADDC(sum, t1)
++EXC(    STORE   t2, UNIT(2)(dst),       .LTs_exc)
++	ADDC(sum, t2)
++EXC(    STORE   t3, UNIT(3)(dst),       .LTs_exc)
++	ADDC(sum, t3)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	beqz    len, .LTdone
++	.set	noreorder
++.LTless_than_4units:
++	/*
++	 * rem = len % NBYTES
++	 */
++	beq     rem, len, .LTcopy_bytes
++	 nop
++1:
++	LOAD    t0, 0(src)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++EXC(    STORE   t0, 0(dst),             .LTs_exc)
++	ADDC(sum, t0)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	rem, len, 1b
++	.set	noreorder
++
++	/*
++	 * src and dst are aligned, need to copy rem bytes (rem < NBYTES)
++	 * A loop would do only a byte at a time with possible branch
++	 * mispredicts.  Can't do an explicit LOAD dst,mask,or,STORE
++	 * because can't assume read-access to dst.  Instead, use
++	 * STREST dst, which doesn't require read access to dst.
++	 *
++	 * This code should perform better than a simple loop on modern,
++	 * wide-issue mips processors because the code has fewer branches and
++	 * more instruction-level parallelism.
++	 */
++	beqz    len, .LTdone
++	 ADD	t1, dst, len	# t1 is just past last byte of dst
++	li	bits, 8*NBYTES
++	SLL	rem, len, 3	# rem = number of bits to keep
++	LOAD    t0, 0(src)
++	SUB	bits, bits, rem	# bits = number of bits to discard
++	SHIFT_DISCARD t0, t0, bits
++EXC(    STREST  t0, -1(t1),             .LTs_exc)
++	SHIFT_DISCARD_REVERT t0, t0, bits
++	.set reorder
++	ADDC(sum, t0)
++	b       .LTdone
++	.set noreorder
++.LTdst_unaligned:
++	/*
++	 * dst is unaligned
++	 * t0 = src & ADDRMASK
++	 * t1 = dst & ADDRMASK; T1 > 0
++	 * len >= NBYTES
++	 *
++	 * Copy enough bytes to align dst
++	 * Set match = (src and dst have same alignment)
++	 */
++	LDFIRST t3, FIRST(0)(src)
++	ADD     t2, zero, NBYTES
++	LDREST  t3, REST(0)(src)
++	SUB	t2, t2, t1	# t2 = number of bytes copied
++	xor	match, t0, t1
++EXC(    STFIRST t3, FIRST(0)(dst),      .LTs_exc)
++	SLL	t4, t1, 3		# t4 = number of bits to discard
++	SHIFT_DISCARD t3, t3, t4
++	/* no SHIFT_DISCARD_REVERT to handle odd buffer properly */
++	ADDC(sum, t3)
++	beq     len, t2, .LTdone
++	 SUB	len, len, t2
++	ADD	dst, dst, t2
++	beqz    match, .LTboth_aligned
++	 ADD	src, src, t2
++
++.LTsrc_unaligned_dst_aligned:
++	SRL	t0, len, LOG_NBYTES+2    # +2 for 4 units/iter
++	PREF(   0, 3*32(src) )
++	beqz    t0, .LTcleanup_src_unaligned
++	 and	rem, len, (4*NBYTES-1)   # rem = len % 4*NBYTES
++	PREFE(  1, 3*32(dst) )
++1:
++/*
++ * Avoid consecutive LD*'s to the same register since some mips
++ * implementations can't issue them in the same cycle.
++ * It's OK to load FIRST(N+1) before REST(N) because the two addresses
++ * are to the same unit (unless src is aligned, but it's not).
++ */
++	LDFIRST t0, FIRST(0)(src)
++	LDFIRST t1, FIRST(1)(src)
++	SUB     len, len, 4*NBYTES
++	LDREST  t0, REST(0)(src)
++	LDREST  t1, REST(1)(src)
++	LDFIRST t2, FIRST(2)(src)
++	LDFIRST t3, FIRST(3)(src)
++	LDREST  t2, REST(2)(src)
++	LDREST  t3, REST(3)(src)
++	PREF(   0, 9*32(src) )          # 0 is PREF_LOAD  (not streamed)
++	ADD     src, src, 4*NBYTES
++#ifdef CONFIG_CPU_SB1
++	nop				# improves slotting
++#endif
++EXC(    STORE   t0, UNIT(0)(dst),       .LTs_exc)
++	ADDC(sum, t0)
++EXC(    STORE   t1, UNIT(1)(dst),       .LTs_exc)
++	ADDC(sum, t1)
++EXC(    STORE   t2, UNIT(2)(dst),       .LTs_exc)
++	ADDC(sum, t2)
++EXC(    STORE   t3, UNIT(3)(dst),       .LTs_exc)
++	ADDC(sum, t3)
++	PREFE(  1, 9*32(dst) )          # 1 is PREF_STORE (not streamed)
++	.set    reorder                         /* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LTcleanup_src_unaligned:
++	beqz    len, .LTdone
++	 and	rem, len, NBYTES-1  # rem = len % NBYTES
++	beq     rem, len, .LTcopy_bytes
++	 nop
++1:
++	LDFIRST t0, FIRST(0)(src)
++	LDREST  t0, REST(0)(src)
++	ADD     src, src, NBYTES
++	SUB     len, len, NBYTES
++EXC(    STORE   t0, 0(dst),             .LTs_exc)
++	ADDC(sum, t0)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LTcopy_bytes_checklen:
++	beqz    len, .LTdone
++	 nop
++.LTcopy_bytes:
++	/* 0 < len < NBYTES  */
++	move	t2, zero	# partial word
++	li	t3, SHIFT_START	# shift
++/* use .Ll_exc_copy here to return correct sum on fault */
++#define COPY_BYTE(N)                    \
++	lbu     t0, N(src);     \
++	SUB	len, len, 1;		\
++EXC(    sbe      t0, N(dst), .LTs_exc);   \
++	SLLV	t0, t0, t3;		\
++	addu	t3, SHIFT_INC;		\
++	beqz    len, .LTcopy_bytes_done; \
++	 or	t2, t0
++
++	COPY_BYTE(0)
++	COPY_BYTE(1)
++#ifdef USE_DOUBLE
++	COPY_BYTE(2)
++	COPY_BYTE(3)
++	COPY_BYTE(4)
++	COPY_BYTE(5)
++#endif
++	lbu     t0, NBYTES-2(src)
++	SUB	len, len, 1
++EXC(    sbe     t0, NBYTES-2(dst), .LTs_exc)
++	SLLV	t0, t0, t3
++	or	t2, t0
++.LTcopy_bytes_done:
++	ADDC(sum, t2)
++.LTdone:
++	/* fold checksum */
++#ifdef USE_DOUBLE
++	dsll32	v1, sum, 0
++	daddu	sum, v1
++	sltu	v1, sum, v1
++	dsra32	sum, sum, 0
++	addu	sum, v1
++#endif
++
++#ifdef CPU_MIPSR2
++	wsbh	v1, sum
++	movn	sum, v1, odd
++#else
++	beqz	odd, 1f			/* odd buffer alignment? */
++	 lui	v1, 0x00ff
++	addu	v1, 0x00ff
++	and	t0, sum, v1
++	sll	t0, t0, 8
++	srl	sum, sum, 8
++	and	sum, sum, v1
++	or	sum, sum, t0
++1:
++#endif
++	.set reorder
++	ADDC32(sum, psum)
++	jr	ra
++	.set noreorder
++
++.LTs_exc:
++	li	v0, -1 /* invalid checksum */
++	li	v1, -EFAULT
++	jr	ra
++	 sw	v1, (errptr)
++	END(__csum_partial_copy_touser)
++
++#endif  /* CONFIG_EVA */
+diff --git a/arch/mips/lib/memcpy.S b/arch/mips/lib/memcpy.S
+--- a/arch/mips/lib/memcpy.S
++++ b/arch/mips/lib/memcpy.S
+@@ -116,6 +116,8 @@ 9:	inst_reg, addr;				\
+ #define NBYTES 8
+ #define LOG_NBYTES 3
+ 
++#define LOADK  ld
++
+ /*
+  * As we are sharing code base with the mips32 tree (which use the o32 ABI
+  * register definitions). We need to redefine the register definitions from
+@@ -152,19 +154,21 @@ 9:	inst_reg, addr;				\
+ #define NBYTES 4
+ #define LOG_NBYTES 2
+ 
++#define LOADK  lw
++
+ #endif /* USE_DOUBLE */
+ 
+ #ifdef CONFIG_CPU_LITTLE_ENDIAN
+ #define LDFIRST LOADR
+-#define LDREST	LOADL
++#define LDREST  LOADL
+ #define STFIRST STORER
+-#define STREST	STOREL
++#define STREST  STOREL
+ #define SHIFT_DISCARD SLLV
+ #else
+ #define LDFIRST LOADL
+-#define LDREST	LOADR
++#define LDREST  LOADR
+ #define STFIRST STOREL
+-#define STREST	STORER
++#define STREST  STORER
+ #define SHIFT_DISCARD SRLV
+ #endif
+ 
+@@ -235,7 +239,7 @@ FEXPORT(__copy_user)
+ 	 * src and dst are aligned; need to compute rem
+ 	 */
+ .Lboth_aligned:
+-	 SRL	t0, len, LOG_NBYTES+3	 # +3 for 8 units/iter
++	 SRL	t0, len, LOG_NBYTES+3    # +3 for 8 units/iter
+ 	beqz	t0, .Lcleanup_both_aligned # len < 8*NBYTES
+ 	 and	rem, len, (8*NBYTES-1)	 # rem = len % (8*NBYTES)
+ 	PREF(	0, 3*32(src) )
+@@ -313,7 +317,7 @@ EXC(	STORE	t0, 0(dst),		.Ls_exc_p1u)
+ 	/*
+ 	 * src and dst are aligned, need to copy rem bytes (rem < NBYTES)
+ 	 * A loop would do only a byte at a time with possible branch
+-	 * mispredicts.	 Can't do an explicit LOAD dst,mask,or,STORE
++	 * mispredicts.  Can't do an explicit LOAD dst,mask,or,STORE
+ 	 * because can't assume read-access to dst.  Instead, use
+ 	 * STREST dst, which doesn't require read access to dst.
+ 	 *
+@@ -327,7 +331,7 @@ EXC(	STORE	t0, 0(dst),		.Ls_exc_p1u)
+ 	li	bits, 8*NBYTES
+ 	SLL	rem, len, 3	# rem = number of bits to keep
+ EXC(	LOAD	t0, 0(src),		.Ll_exc)
+-	SUB	bits, bits, rem # bits = number of bits to discard
++	SUB	bits, bits, rem	# bits = number of bits to discard
+ 	SHIFT_DISCARD t0, t0, bits
+ EXC(	STREST	t0, -1(t1),		.Ls_exc)
+ 	jr	ra
+@@ -343,7 +347,7 @@ EXC(	STREST	t0, -1(t1),		.Ls_exc)
+ 	 * Set match = (src and dst have same alignment)
+ 	 */
+ #define match rem
+-EXC(	LDFIRST t3, FIRST(0)(src),	.Ll_exc)
++EXC(	LDFIRST	t3, FIRST(0)(src),	.Ll_exc)
+ 	ADD	t2, zero, NBYTES
+ EXC(	LDREST	t3, REST(0)(src),	.Ll_exc_copy)
+ 	SUB	t2, t2, t1	# t2 = number of bytes copied
+@@ -357,10 +361,10 @@ EXC(	STFIRST t3, FIRST(0)(dst),	.Ls_exc)
+ 	 ADD	src, src, t2
+ 
+ .Lsrc_unaligned_dst_aligned:
+-	SRL	t0, len, LOG_NBYTES+2	 # +2 for 4 units/iter
++	SRL	t0, len, LOG_NBYTES+2    # +2 for 4 units/iter
+ 	PREF(	0, 3*32(src) )
+ 	beqz	t0, .Lcleanup_src_unaligned
+-	 and	rem, len, (4*NBYTES-1)	 # rem = len % 4*NBYTES
++	 and	rem, len, (4*NBYTES-1)   # rem = len % 4*NBYTES
+ 	PREF(	1, 3*32(dst) )
+ 1:
+ /*
+@@ -370,13 +374,13 @@ 1:
+  * are to the same unit (unless src is aligned, but it's not).
+  */
+ 	R10KCBARRIER(0(ra))
+-EXC(	LDFIRST t0, FIRST(0)(src),	.Ll_exc)
+-EXC(	LDFIRST t1, FIRST(1)(src),	.Ll_exc_copy)
+-	SUB	len, len, 4*NBYTES
++EXC(	LDFIRST	t0, FIRST(0)(src),	.Ll_exc)
++EXC(	LDFIRST	t1, FIRST(1)(src),	.Ll_exc_copy)
++	SUB     len, len, 4*NBYTES
+ EXC(	LDREST	t0, REST(0)(src),	.Ll_exc_copy)
+ EXC(	LDREST	t1, REST(1)(src),	.Ll_exc_copy)
+-EXC(	LDFIRST t2, FIRST(2)(src),	.Ll_exc_copy)
+-EXC(	LDFIRST t3, FIRST(3)(src),	.Ll_exc_copy)
++EXC(	LDFIRST	t2, FIRST(2)(src),	.Ll_exc_copy)
++EXC(	LDFIRST	t3, FIRST(3)(src),	.Ll_exc_copy)
+ EXC(	LDREST	t2, REST(2)(src),	.Ll_exc_copy)
+ EXC(	LDREST	t3, REST(3)(src),	.Ll_exc_copy)
+ 	PREF(	0, 9*32(src) )		# 0 is PREF_LOAD  (not streamed)
+@@ -388,7 +392,7 @@ EXC(	STORE	t0, UNIT(0)(dst),	.Ls_exc_p4u
+ EXC(	STORE	t1, UNIT(1)(dst),	.Ls_exc_p3u)
+ EXC(	STORE	t2, UNIT(2)(dst),	.Ls_exc_p2u)
+ EXC(	STORE	t3, UNIT(3)(dst),	.Ls_exc_p1u)
+-	PREF(	1, 9*32(dst) )		# 1 is PREF_STORE (not streamed)
++	PREF(	1, 9*32(dst) )     	# 1 is PREF_STORE (not streamed)
+ 	.set	reorder				/* DADDI_WAR */
+ 	ADD	dst, dst, 4*NBYTES
+ 	bne	len, rem, 1b
+@@ -451,9 +455,9 @@ EXC(	 sb	t0, NBYTES-2(dst), .Ls_exc_p1)
+ 	 *
+ 	 * Assumes src < THREAD_BUADDR($28)
+ 	 */
+-	LOAD	t0, TI_TASK($28)
++	LOADK   t0, TI_TASK($28)
+ 	 nop
+-	LOAD	t0, THREAD_BUADDR(t0)
++	LOADK   t0, THREAD_BUADDR(t0)
+ 1:
+ EXC(	lb	t1, 0(src),	.Ll_exc)
+ 	ADD	src, src, 1
+@@ -463,12 +467,12 @@ EXC(	lb	t1, 0(src),	.Ll_exc)
+ 	bne	src, t0, 1b
+ 	.set	noreorder
+ .Ll_exc:
+-	LOAD	t0, TI_TASK($28)
++	LOADK   t0, TI_TASK($28)
+ 	 nop
+-	LOAD	t0, THREAD_BUADDR(t0)	# t0 is just past last good address
++	LOADK   t0, THREAD_BUADDR(t0)   # t0 is just past last good address
+ 	 nop
+-	SUB	len, AT, t0		# len number of uncopied bytes
+ 	bnez	t6, .Ldone	/* Skip the zeroing part if inatomic */
++	 SUB     len, AT, t0            # len number of uncopied bytes
+ 	/*
+ 	 * Here's where we rely on src and dst being incremented in tandem,
+ 	 *   See (3) above.
+@@ -502,7 +506,7 @@ 1:	sb	zero, 0(dst)
+ 
+ 
+ #define SEXC(n)							\
+-	.set	reorder;			/* DADDI_WAR */ \
++	.set	reorder;			/* DADDI_WAR */	\
+ .Ls_exc_p ## n ## u:						\
+ 	ADD	len, len, n*NBYTES;				\
+ 	jr	ra;						\
+@@ -575,3 +579,940 @@ LEAF(__rmemcpy)					/* a0=dst a1=src a2=
+ 	jr	ra
+ 	 move	a2, zero
+ 	END(__rmemcpy)
++
++#ifdef CONFIG_EVA
++
++	.set    eva
++
++LEAF(__copy_fromuser_inatomic)
++	b       __copy_fromuser_common
++	 li	t6, 1
++	END(__copy_fromuser_inatomic)
++
++#undef  LOAD
++#undef  LOADL
++#undef  LOADR
++#undef  STORE
++#undef  STOREL
++#undef  STORER
++#undef  LDFIRST
++#undef  LDREST
++#undef  STFIRST
++#undef  STREST
++#undef  SHIFT_DISCARD
++#undef  COPY_BYTE
++#undef  SEXC
++
++#define LOAD   lwe
++#define LOADL  lwle
++#define LOADR  lwre
++#define STOREL swl
++#define STORER swr
++#define STORE  sw
++
++#ifdef CONFIG_CPU_LITTLE_ENDIAN
++#define LDFIRST LOADR
++#define LDREST  LOADL
++#define STFIRST STORER
++#define STREST  STOREL
++#define SHIFT_DISCARD SLLV
++#else
++#define LDFIRST LOADL
++#define LDREST  LOADR
++#define STFIRST STOREL
++#define STREST  STORER
++#define SHIFT_DISCARD SRLV
++#endif
++
++LEAF(__copy_fromuser)
++	li	t6, 0	/* not inatomic */
++__copy_fromuser_common:
++	/*
++	 * Note: dst & src may be unaligned, len may be 0
++	 * Temps
++	 */
++
++	R10KCBARRIER(0(ra))
++	/*
++	 * The "issue break"s below are very approximate.
++	 * Issue delays for dcache fills will perturb the schedule, as will
++	 * load queue full replay traps, etc.
++	 *
++	 * If len < NBYTES use byte operations.
++	 */
++	PREFE(  0, 0(src) )
++	PREF(	1, 0(dst) )
++	sltu	t2, len, NBYTES
++	and	t1, dst, ADDRMASK
++	PREFE(  0, 1*32(src) )
++	PREF(	1, 1*32(dst) )
++	bnez    t2, .LFcopy_bytes_checklen
++	 and	t0, src, ADDRMASK
++	PREFE(  0, 2*32(src) )
++	PREF(	1, 2*32(dst) )
++	bnez    t1, .LFdst_unaligned
++	 nop
++	bnez    t0, .LFsrc_unaligned_dst_aligned
++	/*
++	 * use delay slot for fall-through
++	 * src and dst are aligned; need to compute rem
++	 */
++.LFboth_aligned:
++	 SRL	t0, len, LOG_NBYTES+3    # +3 for 8 units/iter
++	beqz    t0, .LFcleanup_both_aligned # len < 8*NBYTES
++	 and	rem, len, (8*NBYTES-1)	 # rem = len % (8*NBYTES)
++	PREFE(  0, 3*32(src) )
++	PREF(	1, 3*32(dst) )
++	.align	4
++1:
++	R10KCBARRIER(0(ra))
++EXC(    LOAD    t0, UNIT(0)(src),       .LFl_exc)
++EXC(    LOAD    t1, UNIT(1)(src),       .LFl_exc_copy)
++EXC(    LOAD    t2, UNIT(2)(src),       .LFl_exc_copy)
++EXC(    LOAD    t3, UNIT(3)(src),       .LFl_exc_copy)
++	SUB	len, len, 8*NBYTES
++EXC(    LOAD    t4, UNIT(4)(src),       .LFl_exc_copy)
++EXC(    LOAD    t7, UNIT(5)(src),       .LFl_exc_copy)
++	STORE   t0, UNIT(0)(dst)
++	STORE   t1, UNIT(1)(dst)
++EXC(    LOAD    t0, UNIT(6)(src),       .LFl_exc_copy)
++EXC(    LOAD    t1, UNIT(7)(src),       .LFl_exc_copy)
++	ADD	src, src, 8*NBYTES
++	ADD	dst, dst, 8*NBYTES
++	STORE   t2, UNIT(-6)(dst)
++	STORE   t3, UNIT(-5)(dst)
++	STORE   t4, UNIT(-4)(dst)
++	STORE   t7, UNIT(-3)(dst)
++	STORE   t0, UNIT(-2)(dst)
++	STORE   t1, UNIT(-1)(dst)
++	PREFE(  0, 8*32(src) )
++	PREF(	1, 8*32(dst) )
++	bne	len, rem, 1b
++	 nop
++
++	/*
++	 * len == rem == the number of bytes left to copy < 8*NBYTES
++	 */
++.LFcleanup_both_aligned:
++	beqz	len, .Ldone
++	 sltu	t0, len, 4*NBYTES
++	bnez    t0, .LFless_than_4units
++	 and	rem, len, (NBYTES-1)	# rem = len % NBYTES
++	/*
++	 * len >= 4*NBYTES
++	 */
++EXC(    LOAD    t0, UNIT(0)(src),       .LFl_exc)
++EXC(    LOAD    t1, UNIT(1)(src),       .LFl_exc_copy)
++EXC(    LOAD    t2, UNIT(2)(src),       .LFl_exc_copy)
++EXC(    LOAD    t3, UNIT(3)(src),       .LFl_exc_copy)
++	SUB	len, len, 4*NBYTES
++	ADD	src, src, 4*NBYTES
++	R10KCBARRIER(0(ra))
++	STORE   t0, UNIT(0)(dst)
++	STORE   t1, UNIT(1)(dst)
++	STORE   t2, UNIT(2)(dst)
++	STORE   t3, UNIT(3)(dst)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	beqz	len, .Ldone
++	.set	noreorder
++.LFless_than_4units:
++	/*
++	 * rem = len % NBYTES
++	 */
++	beq     rem, len, .LFcopy_bytes
++	 nop
++1:
++	R10KCBARRIER(0(ra))
++EXC(    LOAD    t0, 0(src),             .LFl_exc)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++	STORE   t0, 0(dst)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	rem, len, 1b
++	.set	noreorder
++
++	/*
++	 * src and dst are aligned, need to copy rem bytes (rem < NBYTES)
++	 * A loop would do only a byte at a time with possible branch
++	 * mispredicts.  Can't do an explicit LOAD dst,mask,or,STORE
++	 * because can't assume read-access to dst.  Instead, use
++	 * STREST dst, which doesn't require read access to dst.
++	 *
++	 * This code should perform better than a simple loop on modern,
++	 * wide-issue mips processors because the code has fewer branches and
++	 * more instruction-level parallelism.
++	 */
++	beqz	len, .Ldone
++	 ADD	t1, dst, len	# t1 is just past last byte of dst
++	li	bits, 8*NBYTES
++	SLL	rem, len, 3	# rem = number of bits to keep
++EXC(    LOAD    t0, 0(src),             .LFl_exc)
++	SUB	bits, bits, rem	# bits = number of bits to discard
++	SHIFT_DISCARD t0, t0, bits
++	STREST  t0, -1(t1)
++	jr	ra
++	 move	len, zero
++.LFdst_unaligned:
++	/*
++	 * dst is unaligned
++	 * t0 = src & ADDRMASK
++	 * t1 = dst & ADDRMASK; T1 > 0
++	 * len >= NBYTES
++	 *
++	 * Copy enough bytes to align dst
++	 * Set match = (src and dst have same alignment)
++	 */
++#define match rem
++EXC(    LDFIRST t3, FIRST(0)(src),      .LFl_exc)
++	ADD	t2, zero, NBYTES
++EXC(    LDREST  t3, REST(0)(src),       .LFl_exc_copy)
++	SUB	t2, t2, t1	# t2 = number of bytes copied
++	xor	match, t0, t1
++	R10KCBARRIER(0(ra))
++	STFIRST t3, FIRST(0)(dst)
++	beq	len, t2, .Ldone
++	 SUB	len, len, t2
++	ADD	dst, dst, t2
++	beqz    match, .LFboth_aligned
++	 ADD	src, src, t2
++
++.LFsrc_unaligned_dst_aligned:
++	SRL	t0, len, LOG_NBYTES+2    # +2 for 4 units/iter
++	PREFE(  0, 3*32(src) )
++	beqz    t0, .LFcleanup_src_unaligned
++	 and	rem, len, (4*NBYTES-1)   # rem = len % 4*NBYTES
++	PREF(	1, 3*32(dst) )
++1:
++/*
++ * Avoid consecutive LD*'s to the same register since some mips
++ * implementations can't issue them in the same cycle.
++ * It's OK to load FIRST(N+1) before REST(N) because the two addresses
++ * are to the same unit (unless src is aligned, but it's not).
++ */
++	R10KCBARRIER(0(ra))
++EXC(    LDFIRST t0, FIRST(0)(src),      .LFl_exc)
++EXC(    LDFIRST t1, FIRST(1)(src),      .LFl_exc_copy)
++	SUB     len, len, 4*NBYTES
++EXC(    LDREST  t0, REST(0)(src),       .LFl_exc_copy)
++EXC(    LDREST  t1, REST(1)(src),       .LFl_exc_copy)
++EXC(    LDFIRST t2, FIRST(2)(src),      .LFl_exc_copy)
++EXC(    LDFIRST t3, FIRST(3)(src),      .LFl_exc_copy)
++EXC(    LDREST  t2, REST(2)(src),       .LFl_exc_copy)
++EXC(    LDREST  t3, REST(3)(src),       .LFl_exc_copy)
++	PREFE(  0, 9*32(src) )          # 0 is PREF_LOAD  (not streamed)
++	ADD	src, src, 4*NBYTES
++#ifdef CONFIG_CPU_SB1
++	nop				# improves slotting
++#endif
++	STORE   t0, UNIT(0)(dst)
++	STORE   t1, UNIT(1)(dst)
++	STORE   t2, UNIT(2)(dst)
++	STORE   t3, UNIT(3)(dst)
++	PREF(	1, 9*32(dst) )     	# 1 is PREF_STORE (not streamed)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LFcleanup_src_unaligned:
++	beqz	len, .Ldone
++	 and	rem, len, NBYTES-1  # rem = len % NBYTES
++	beq     rem, len, .LFcopy_bytes
++	 nop
++1:
++	R10KCBARRIER(0(ra))
++EXC(    LDFIRST t0, FIRST(0)(src),      .LFl_exc)
++EXC(    LDREST  t0, REST(0)(src),       .LFl_exc_copy)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++	STORE   t0, 0(dst)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LFcopy_bytes_checklen:
++	beqz	len, .Ldone
++	 nop
++.LFcopy_bytes:
++	/* 0 < len < NBYTES  */
++	R10KCBARRIER(0(ra))
++#define COPY_BYTE(N)			\
++EXC(    lbe      t0, N(src), .LFl_exc);   \
++	SUB	len, len, 1;		\
++	beqz	len, .Ldone;		\
++	 sb     t0, N(dst)
++
++	COPY_BYTE(0)
++	COPY_BYTE(1)
++#ifdef USE_DOUBLE
++	COPY_BYTE(2)
++	COPY_BYTE(3)
++	COPY_BYTE(4)
++	COPY_BYTE(5)
++#endif
++EXC(    lbe     t0, NBYTES-2(src), .LFl_exc)
++	SUB	len, len, 1
++	jr	ra
++	 sb     t0, NBYTES-2(dst)
++
++.LFl_exc_copy:
++	/*
++	 * Copy bytes from src until faulting load address (or until a
++	 * lb faults)
++	 *
++	 * When reached by a faulting LDFIRST/LDREST, THREAD_BUADDR($28)
++	 * may be more than a byte beyond the last address.
++	 * Hence, the lb below may get an exception.
++	 *
++	 * Assumes src < THREAD_BUADDR($28)
++	 */
++	LOADK   t0, TI_TASK($28)
++	addi    t0, t0, THREAD_BUADDR
++	LOADK   t0, 0(t0)
++1:
++EXC(    lbe     t1, 0(src),     .LFl_exc)
++	ADD	src, src, 1
++	sb	t1, 0(dst)	# can't fault -- we're copy_from_user
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 1
++	bne	src, t0, 1b
++	.set	noreorder
++.LFl_exc:
++	LOADK   t0, TI_TASK($28)
++	addi    t0, t0, THREAD_BUADDR
++	LOADK   t0, 0(t0)   # t0 is just past last good address
++	bnez	t6, .Ldone	/* Skip the zeroing part if inatomic */
++	 SUB    len, AT, t0             # len number of uncopied bytes
++	/*
++	 * Here's where we rely on src and dst being incremented in tandem,
++	 *   See (3) above.
++	 * dst += (fault addr - src) to put dst at first byte to clear
++	 */
++	ADD	dst, t0			# compute start address in a1
++	SUB	dst, src
++	/*
++	 * Clear len bytes starting at dst.  Can't call __bzero because it
++	 * might modify len.  An inefficient loop for these rare times...
++	 */
++	.set	reorder				/* DADDI_WAR */
++	SUB	src, len, 1
++	beqz	len, .Ldone
++	.set	noreorder
++1:	sb	zero, 0(dst)
++	ADD	dst, dst, 1
++#ifndef CONFIG_CPU_DADDI_WORKAROUNDS
++	bnez	src, 1b
++	 SUB	src, src, 1
++#else
++	.set	push
++	.set	noat
++	li	v1, 1
++	bnez	src, 1b
++	 SUB	src, src, v1
++	.set	pop
++#endif
++	jr	ra
++	 nop
++	END(__copy_fromuser)
++
++
++#undef  LOAD
++#undef  LOADL
++#undef  LOADR
++#undef  STORE
++#undef  STOREL
++#undef  STORER
++#undef  LDFIRST
++#undef  LDREST
++#undef  STFIRST
++#undef  STREST
++#undef  SHIFT_DISCARD
++#undef  COPY_BYTE
++#undef  SEXC
++
++#define LOAD   lw
++#define LOADL  lwl
++#define LOADR  lwr
++#define STOREL swle
++#define STORER swre
++#define STORE  swe
++
++#ifdef CONFIG_CPU_LITTLE_ENDIAN
++#define LDFIRST LOADR
++#define LDREST  LOADL
++#define STFIRST STORER
++#define STREST  STOREL
++#define SHIFT_DISCARD SLLV
++#else
++#define LDFIRST LOADL
++#define LDREST  LOADR
++#define STFIRST STOREL
++#define STREST  STORER
++#define SHIFT_DISCARD SRLV
++#endif
++
++LEAF(__copy_touser)
++	/*
++	 * Note: dst & src may be unaligned, len may be 0
++	 * Temps
++	 */
++
++	R10KCBARRIER(0(ra))
++	/*
++	 * The "issue break"s below are very approximate.
++	 * Issue delays for dcache fills will perturb the schedule, as will
++	 * load queue full replay traps, etc.
++	 *
++	 * If len < NBYTES use byte operations.
++	 */
++	PREF(	0, 0(src) )
++	PREFE(  1, 0(dst) )
++	sltu	t2, len, NBYTES
++	and	t1, dst, ADDRMASK
++	PREF(	0, 1*32(src) )
++	PREFE(  1, 1*32(dst) )
++	bnez    t2, .LTcopy_bytes_checklen
++	 and	t0, src, ADDRMASK
++	PREF(	0, 2*32(src) )
++	PREFE(  1, 2*32(dst) )
++	bnez    t1, .LTdst_unaligned
++	 nop
++	bnez    t0, .LTsrc_unaligned_dst_aligned
++	/*
++	 * use delay slot for fall-through
++	 * src and dst are aligned; need to compute rem
++	 */
++.LTboth_aligned:
++	 SRL	t0, len, LOG_NBYTES+3    # +3 for 8 units/iter
++	beqz    t0, .LTcleanup_both_aligned # len < 8*NBYTES
++	 and	rem, len, (8*NBYTES-1)	 # rem = len % (8*NBYTES)
++	PREF(	0, 3*32(src) )
++	PREFE(  1, 3*32(dst) )
++	.align	4
++1:
++	R10KCBARRIER(0(ra))
++	LOAD    t0, UNIT(0)(src)
++	LOAD    t1, UNIT(1)(src)
++	LOAD    t2, UNIT(2)(src)
++	LOAD    t3, UNIT(3)(src)
++	SUB     len, len, 8*NBYTES
++	LOAD    t4, UNIT(4)(src)
++	LOAD    t7, UNIT(5)(src)
++EXC(    STORE   t0, UNIT(0)(dst),       .Ls_exc_p8u)
++EXC(    STORE   t1, UNIT(1)(dst),       .Ls_exc_p7u)
++	LOAD    t0, UNIT(6)(src)
++	LOAD    t1, UNIT(7)(src)
++	ADD     src, src, 8*NBYTES
++	ADD     dst, dst, 8*NBYTES
++EXC(    STORE   t2, UNIT(-6)(dst),      .Ls_exc_p6u)
++EXC(    STORE   t3, UNIT(-5)(dst),      .Ls_exc_p5u)
++EXC(    STORE   t4, UNIT(-4)(dst),      .Ls_exc_p4u)
++EXC(    STORE   t7, UNIT(-3)(dst),      .Ls_exc_p3u)
++EXC(    STORE   t0, UNIT(-2)(dst),      .Ls_exc_p2u)
++EXC(    STORE   t1, UNIT(-1)(dst),      .Ls_exc_p1u)
++	PREF(	0, 8*32(src) )
++	PREFE(  1, 8*32(dst) )
++	bne	len, rem, 1b
++	 nop
++
++	/*
++	 * len == rem == the number of bytes left to copy < 8*NBYTES
++	 */
++.LTcleanup_both_aligned:
++	beqz	len, .Ldone
++	 sltu	t0, len, 4*NBYTES
++	bnez    t0, .LTless_than_4units
++	 and	rem, len, (NBYTES-1)	# rem = len % NBYTES
++	/*
++	 * len >= 4*NBYTES
++	 */
++	LOAD    t0, UNIT(0)(src)
++	LOAD    t1, UNIT(1)(src)
++	LOAD    t2, UNIT(2)(src)
++	LOAD    t3, UNIT(3)(src)
++	SUB	len, len, 4*NBYTES
++	ADD	src, src, 4*NBYTES
++	R10KCBARRIER(0(ra))
++EXC(    STORE   t0, UNIT(0)(dst),       .Ls_exc_p4u)
++EXC(    STORE   t1, UNIT(1)(dst),       .Ls_exc_p3u)
++EXC(    STORE   t2, UNIT(2)(dst),       .Ls_exc_p2u)
++EXC(    STORE   t3, UNIT(3)(dst),       .Ls_exc_p1u)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	beqz	len, .Ldone
++	.set	noreorder
++.LTless_than_4units:
++	/*
++	 * rem = len % NBYTES
++	 */
++	beq     rem, len, .LTcopy_bytes
++	 nop
++1:
++	R10KCBARRIER(0(ra))
++	LOAD    t0, 0(src)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++EXC(    STORE   t0, 0(dst),             .Ls_exc_p1u)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	rem, len, 1b
++	.set	noreorder
++
++	/*
++	 * src and dst are aligned, need to copy rem bytes (rem < NBYTES)
++	 * A loop would do only a byte at a time with possible branch
++	 * mispredicts.  Can't do an explicit LOAD dst,mask,or,STORE
++	 * because can't assume read-access to dst.  Instead, use
++	 * STREST dst, which doesn't require read access to dst.
++	 *
++	 * This code should perform better than a simple loop on modern,
++	 * wide-issue mips processors because the code has fewer branches and
++	 * more instruction-level parallelism.
++	 */
++	beqz	len, .Ldone
++	 ADD	t1, dst, len	# t1 is just past last byte of dst
++	li	bits, 8*NBYTES
++	SLL	rem, len, 3	# rem = number of bits to keep
++	LOAD    t0, 0(src)
++	SUB	bits, bits, rem	# bits = number of bits to discard
++	SHIFT_DISCARD t0, t0, bits
++EXC(    STREST  t0, -1(t1),             .Ls_exc)
++	jr	ra
++	 move	len, zero
++.LTdst_unaligned:
++	/*
++	 * dst is unaligned
++	 * t0 = src & ADDRMASK
++	 * t1 = dst & ADDRMASK; T1 > 0
++	 * len >= NBYTES
++	 *
++	 * Copy enough bytes to align dst
++	 * Set match = (src and dst have same alignment)
++	 */
++	LDFIRST t3, FIRST(0)(src)
++	ADD     t2, zero, NBYTES
++	LDREST  t3, REST(0)(src)
++	SUB	t2, t2, t1	# t2 = number of bytes copied
++	xor	match, t0, t1
++	R10KCBARRIER(0(ra))
++EXC(    STFIRST t3, FIRST(0)(dst),      .Ls_exc)
++	beq	len, t2, .Ldone
++	 SUB	len, len, t2
++	ADD	dst, dst, t2
++	beqz    match, .LTboth_aligned
++	 ADD	src, src, t2
++
++.LTsrc_unaligned_dst_aligned:
++	SRL	t0, len, LOG_NBYTES+2    # +2 for 4 units/iter
++	PREF(	0, 3*32(src) )
++	beqz    t0, .LTcleanup_src_unaligned
++	 and	rem, len, (4*NBYTES-1)   # rem = len % 4*NBYTES
++	PREFE(  1, 3*32(dst) )
++1:
++/*
++ * Avoid consecutive LD*'s to the same register since some mips
++ * implementations can't issue them in the same cycle.
++ * It's OK to load FIRST(N+1) before REST(N) because the two addresses
++ * are to the same unit (unless src is aligned, but it's not).
++ */
++	R10KCBARRIER(0(ra))
++	LDFIRST t0, FIRST(0)(src)
++	LDFIRST t1, FIRST(1)(src)
++	SUB     len, len, 4*NBYTES
++	LDREST  t0, REST(0)(src)
++	LDREST  t1, REST(1)(src)
++	LDFIRST t2, FIRST(2)(src)
++	LDFIRST t3, FIRST(3)(src)
++	LDREST  t2, REST(2)(src)
++	LDREST  t3, REST(3)(src)
++	PREF(	0, 9*32(src) )		# 0 is PREF_LOAD  (not streamed)
++	ADD	src, src, 4*NBYTES
++#ifdef CONFIG_CPU_SB1
++	nop				# improves slotting
++#endif
++EXC(    STORE   t0, UNIT(0)(dst),       .Ls_exc_p4u)
++EXC(    STORE   t1, UNIT(1)(dst),       .Ls_exc_p3u)
++EXC(    STORE   t2, UNIT(2)(dst),       .Ls_exc_p2u)
++EXC(    STORE   t3, UNIT(3)(dst),       .Ls_exc_p1u)
++	PREFE(  1, 9*32(dst) )          # 1 is PREF_STORE (not streamed)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LTcleanup_src_unaligned:
++	beqz	len, .Ldone
++	 and	rem, len, NBYTES-1  # rem = len % NBYTES
++	beq     rem, len, .LTcopy_bytes
++	 nop
++1:
++	R10KCBARRIER(0(ra))
++	LDFIRST t0, FIRST(0)(src)
++	LDREST  t0, REST(0)(src)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++EXC(    STORE   t0, 0(dst),             .Ls_exc_p1u)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LTcopy_bytes_checklen:
++	beqz	len, .Ldone
++	 nop
++.LTcopy_bytes:
++	/* 0 < len < NBYTES  */
++	R10KCBARRIER(0(ra))
++#define COPY_BYTE(N)			\
++	lb      t0, N(src);             \
++	SUB	len, len, 1;		\
++	beqz	len, .Ldone;		\
++EXC(     sbe    t0, N(dst), .Ls_exc_p1)
++
++	COPY_BYTE(0)
++	COPY_BYTE(1)
++#ifdef USE_DOUBLE
++	COPY_BYTE(2)
++	COPY_BYTE(3)
++	COPY_BYTE(4)
++	COPY_BYTE(5)
++#endif
++	lb      t0, NBYTES-2(src)
++	SUB	len, len, 1
++	jr	ra
++EXC(     sbe    t0, NBYTES-2(dst), .Ls_exc_p1)
++	END(__copy_touser)
++
++
++#undef  LOAD
++#undef  LOADL
++#undef  LOADR
++#undef  STORE
++#undef  STOREL
++#undef  STORER
++#undef  LDFIRST
++#undef  LDREST
++#undef  STFIRST
++#undef  STREST
++#undef  SHIFT_DISCARD
++#undef  COPY_BYTE
++#undef  SEXC
++
++#define LOAD   lwe
++#define LOADL  lwle
++#define LOADR  lwre
++#define STOREL swle
++#define STORER swre
++#define STORE  swe
++
++#ifdef CONFIG_CPU_LITTLE_ENDIAN
++#define LDFIRST LOADR
++#define LDREST  LOADL
++#define STFIRST STORER
++#define STREST  STOREL
++#define SHIFT_DISCARD SLLV
++#else
++#define LDFIRST LOADL
++#define LDREST  LOADR
++#define STFIRST STOREL
++#define STREST  STORER
++#define SHIFT_DISCARD SRLV
++#endif
++
++
++LEAF(__copy_inuser)
++	/*
++	 * Note: dst & src may be unaligned, len may be 0
++	 * Temps
++	 */
++
++	R10KCBARRIER(0(ra))
++	/*
++	 * The "issue break"s below are very approximate.
++	 * Issue delays for dcache fills will perturb the schedule, as will
++	 * load queue full replay traps, etc.
++	 *
++	 * If len < NBYTES use byte operations.
++	 */
++	PREFE(  0, 0(src) )
++	PREFE(  1, 0(dst) )
++	sltu	t2, len, NBYTES
++	and	t1, dst, ADDRMASK
++	PREFE(  0, 1*32(src) )
++	PREFE(  1, 1*32(dst) )
++	bnez    t2, .LIcopy_bytes_checklen
++	 and	t0, src, ADDRMASK
++	PREFE(  0, 2*32(src) )
++	PREFE(  1, 2*32(dst) )
++	bnez    t1, .LIdst_unaligned
++	 nop
++	bnez    t0, .LIsrc_unaligned_dst_aligned
++	/*
++	 * use delay slot for fall-through
++	 * src and dst are aligned; need to compute rem
++	 */
++.LIboth_aligned:
++	 SRL	t0, len, LOG_NBYTES+3    # +3 for 8 units/iter
++	beqz    t0, .LIcleanup_both_aligned # len < 8*NBYTES
++	 and	rem, len, (8*NBYTES-1)	 # rem = len % (8*NBYTES)
++	PREFE(  0, 3*32(src) )
++	PREFE(  1, 3*32(dst) )
++	.align	4
++1:
++	R10KCBARRIER(0(ra))
++EXC(    LOAD    t0, UNIT(0)(src),       .LIl_exc)
++EXC(    LOAD    t1, UNIT(1)(src),       .LIl_exc_copy)
++EXC(    LOAD    t2, UNIT(2)(src),       .LIl_exc_copy)
++EXC(    LOAD    t3, UNIT(3)(src),       .LIl_exc_copy)
++	SUB	len, len, 8*NBYTES
++EXC(    LOAD    t4, UNIT(4)(src),       .LIl_exc_copy)
++EXC(    LOAD    t7, UNIT(5)(src),       .LIl_exc_copy)
++EXC(    STORE   t0, UNIT(0)(dst),       .Ls_exc_p8u)
++EXC(    STORE   t1, UNIT(1)(dst),       .Ls_exc_p7u)
++EXC(    LOAD    t0, UNIT(6)(src),       .LIl_exc_copy)
++EXC(    LOAD    t1, UNIT(7)(src),       .LIl_exc_copy)
++	ADD	src, src, 8*NBYTES
++	ADD	dst, dst, 8*NBYTES
++EXC(    STORE   t2, UNIT(-6)(dst),      .Ls_exc_p6u)
++EXC(    STORE   t3, UNIT(-5)(dst),      .Ls_exc_p5u)
++EXC(    STORE   t4, UNIT(-4)(dst),      .Ls_exc_p4u)
++EXC(    STORE   t7, UNIT(-3)(dst),      .Ls_exc_p3u)
++EXC(    STORE   t0, UNIT(-2)(dst),      .Ls_exc_p2u)
++EXC(    STORE   t1, UNIT(-1)(dst),      .Ls_exc_p1u)
++	PREFE(  0, 8*32(src) )
++	PREFE(  1, 8*32(dst) )
++	bne	len, rem, 1b
++	 nop
++
++	/*
++	 * len == rem == the number of bytes left to copy < 8*NBYTES
++	 */
++.LIcleanup_both_aligned:
++	beqz	len, .Ldone
++	 sltu	t0, len, 4*NBYTES
++	bnez    t0, .LIless_than_4units
++	 and	rem, len, (NBYTES-1)	# rem = len % NBYTES
++	/*
++	 * len >= 4*NBYTES
++	 */
++EXC(    LOAD    t0, UNIT(0)(src),       .LIl_exc)
++EXC(    LOAD    t1, UNIT(1)(src),       .LIl_exc_copy)
++EXC(    LOAD    t2, UNIT(2)(src),       .LIl_exc_copy)
++EXC(    LOAD    t3, UNIT(3)(src),       .LIl_exc_copy)
++	SUB	len, len, 4*NBYTES
++	ADD	src, src, 4*NBYTES
++	R10KCBARRIER(0(ra))
++EXC(    STORE   t0, UNIT(0)(dst),       .Ls_exc_p4u)
++EXC(    STORE   t1, UNIT(1)(dst),       .Ls_exc_p3u)
++EXC(    STORE   t2, UNIT(2)(dst),       .Ls_exc_p2u)
++EXC(    STORE   t3, UNIT(3)(dst),       .Ls_exc_p1u)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	beqz	len, .Ldone
++	.set	noreorder
++.LIless_than_4units:
++	/*
++	 * rem = len % NBYTES
++	 */
++	beq     rem, len, .LIcopy_bytes
++	 nop
++1:
++	R10KCBARRIER(0(ra))
++EXC(    LOAD    t0, 0(src),             .LIl_exc)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++EXC(    STORE   t0, 0(dst),             .Ls_exc_p1u)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	rem, len, 1b
++	.set	noreorder
++
++	/*
++	 * src and dst are aligned, need to copy rem bytes (rem < NBYTES)
++	 * A loop would do only a byte at a time with possible branch
++	 * mispredicts.  Can't do an explicit LOAD dst,mask,or,STORE
++	 * because can't assume read-access to dst.  Instead, use
++	 * STREST dst, which doesn't require read access to dst.
++	 *
++	 * This code should perform better than a simple loop on modern,
++	 * wide-issue mips processors because the code has fewer branches and
++	 * more instruction-level parallelism.
++	 */
++	beqz	len, .Ldone
++	 ADD	t1, dst, len	# t1 is just past last byte of dst
++	li	bits, 8*NBYTES
++	SLL	rem, len, 3	# rem = number of bits to keep
++EXC(    LOAD    t0, 0(src),             .LIl_exc)
++	SUB	bits, bits, rem	# bits = number of bits to discard
++	SHIFT_DISCARD t0, t0, bits
++EXC(    STREST  t0, -1(t1),             .Ls_exc)
++	jr	ra
++	 move	len, zero
++.LIdst_unaligned:
++	/*
++	 * dst is unaligned
++	 * t0 = src & ADDRMASK
++	 * t1 = dst & ADDRMASK; T1 > 0
++	 * len >= NBYTES
++	 *
++	 * Copy enough bytes to align dst
++	 * Set match = (src and dst have same alignment)
++	 */
++EXC(    LDFIRST t3, FIRST(0)(src),      .LIl_exc)
++	ADD	t2, zero, NBYTES
++EXC(    LDREST  t3, REST(0)(src),       .LIl_exc_copy)
++	SUB	t2, t2, t1	# t2 = number of bytes copied
++	xor	match, t0, t1
++	R10KCBARRIER(0(ra))
++EXC(    STFIRST t3, FIRST(0)(dst),      .Ls_exc)
++	beq	len, t2, .Ldone
++	 SUB	len, len, t2
++	ADD	dst, dst, t2
++	beqz    match, .LIboth_aligned
++	 ADD	src, src, t2
++
++.LIsrc_unaligned_dst_aligned:
++	SRL	t0, len, LOG_NBYTES+2    # +2 for 4 units/iter
++	PREFE(  0, 3*32(src) )
++	beqz    t0, .LIcleanup_src_unaligned
++	 and	rem, len, (4*NBYTES-1)   # rem = len % 4*NBYTES
++	PREFE(  1, 3*32(dst) )
++1:
++/*
++ * Avoid consecutive LD*'s to the same register since some mips
++ * implementations can't issue them in the same cycle.
++ * It's OK to load FIRST(N+1) before REST(N) because the two addresses
++ * are to the same unit (unless src is aligned, but it's not).
++ */
++	R10KCBARRIER(0(ra))
++EXC(    LDFIRST t0, FIRST(0)(src),      .LIl_exc)
++EXC(    LDFIRST t1, FIRST(1)(src),      .LIl_exc_copy)
++	SUB     len, len, 4*NBYTES
++EXC(    LDREST  t0, REST(0)(src),       .LIl_exc_copy)
++EXC(    LDREST  t1, REST(1)(src),       .LIl_exc_copy)
++EXC(    LDFIRST t2, FIRST(2)(src),      .LIl_exc_copy)
++EXC(    LDFIRST t3, FIRST(3)(src),      .LIl_exc_copy)
++EXC(    LDREST  t2, REST(2)(src),       .LIl_exc_copy)
++EXC(    LDREST  t3, REST(3)(src),       .LIl_exc_copy)
++	PREFE(  0, 9*32(src) )          # 0 is PREF_LOAD  (not streamed)
++	ADD	src, src, 4*NBYTES
++#ifdef CONFIG_CPU_SB1
++	nop				# improves slotting
++#endif
++EXC(    STORE   t0, UNIT(0)(dst),       .Ls_exc_p4u)
++EXC(    STORE   t1, UNIT(1)(dst),       .Ls_exc_p3u)
++EXC(    STORE   t2, UNIT(2)(dst),       .Ls_exc_p2u)
++EXC(    STORE   t3, UNIT(3)(dst),       .Ls_exc_p1u)
++	PREFE(  1, 9*32(dst) )          # 1 is PREF_STORE (not streamed)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 4*NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LIcleanup_src_unaligned:
++	beqz	len, .Ldone
++	 and	rem, len, NBYTES-1  # rem = len % NBYTES
++	beq     rem, len, .LIcopy_bytes
++	 nop
++1:
++	R10KCBARRIER(0(ra))
++EXC(    LDFIRST t0, FIRST(0)(src),      .LIl_exc)
++EXC(    LDREST  t0, REST(0)(src),       .LIl_exc_copy)
++	ADD	src, src, NBYTES
++	SUB	len, len, NBYTES
++EXC(    STORE   t0, 0(dst),             .Ls_exc_p1u)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, NBYTES
++	bne	len, rem, 1b
++	.set	noreorder
++
++.LIcopy_bytes_checklen:
++	beqz	len, .Ldone
++	 nop
++.LIcopy_bytes:
++	/* 0 < len < NBYTES  */
++	R10KCBARRIER(0(ra))
++#define COPY_BYTE(N)                    \
++EXC(    lbe     t0, N(src), .LIl_exc);  \
++	SUB	len, len, 1;		\
++	beqz	len, .Ldone;		\
++EXC(     sbe    t0, N(dst), .Ls_exc_p1)
++
++	COPY_BYTE(0)
++	COPY_BYTE(1)
++#ifdef USE_DOUBLE
++	COPY_BYTE(2)
++	COPY_BYTE(3)
++	COPY_BYTE(4)
++	COPY_BYTE(5)
++#endif
++EXC(    lbe     t0, NBYTES-2(src), .LIl_exc)
++	SUB	len, len, 1
++	jr	ra
++EXC(     sbe    t0, NBYTES-2(dst), .Ls_exc_p1)
++
++.LIl_exc_copy:
++	/*
++	 * Copy bytes from src until faulting load address (or until a
++	 * lb faults)
++	 *
++	 * When reached by a faulting LDFIRST/LDREST, THREAD_BUADDR($28)
++	 * may be more than a byte beyond the last address.
++	 * Hence, the lb below may get an exception.
++	 *
++	 * Assumes src < THREAD_BUADDR($28)
++	 */
++	LOADK   t0, TI_TASK($28)
++	addi    t0, t0, THREAD_BUADDR
++	LOADK   t0, 0(t0)
++1:
++EXC(    lbe     t1, 0(src),     .LIl_exc)
++	ADD	src, src, 1
++EXC(    sbe     t1, 0(dst),     .Ls_exc)
++	.set	reorder				/* DADDI_WAR */
++	ADD	dst, dst, 1
++	SUB     len, len, 1             # need this because of sbe above
++	bne	src, t0, 1b
++	.set	noreorder
++.LIl_exc:
++	LOADK   t0, TI_TASK($28)
++	addi    t0, t0, THREAD_BUADDR
++	LOADK   t0, 0(t0)               # t0 is just past last good address
++	SUB	len, AT, t0		# len number of uncopied bytes
++	/*
++	 * Here's where we rely on src and dst being incremented in tandem,
++	 *   See (3) above.
++	 * dst += (fault addr - src) to put dst at first byte to clear
++	 */
++	ADD	dst, t0			# compute start address in a1
++	SUB	dst, src
++	/*
++	 * Clear len bytes starting at dst.  Can't call __bzero because it
++	 * might modify len.  An inefficient loop for these rare times...
++	 */
++	.set	reorder				/* DADDI_WAR */
++	SUB	src, len, 1
++	beqz	len, .Ldone
++	.set	noreorder
++1:
++EXC(    sbe     zero, 0(dst),   .Ls_exc)
++	ADD	dst, dst, 1
++#ifndef CONFIG_CPU_DADDI_WORKAROUNDS
++	bnez	src, 1b
++	 SUB	src, src, 1
++#else
++	.set	push
++	.set	noat
++	li	v1, 1
++	bnez	src, 1b
++	 SUB	src, src, v1
++	.set	pop
++#endif
++	jr	ra
++	 nop
++	END(__copy_inuser)
++
++#endif
+diff --git a/arch/mips/lib/memset.S b/arch/mips/lib/memset.S
+--- a/arch/mips/lib/memset.S
++++ b/arch/mips/lib/memset.S
+@@ -40,6 +40,12 @@ 9:	insn	reg, addr;				\
+ 	PTR	9b, handler;				\
+ 	.previous
+ 
++#define EXE(insn,handler)                               \
++9:      .word   insn;                                   \
++	.section __ex_table,"a"; 			\
++	PTR	9b, handler; 				\
++	.previous
++
+ 	.macro	f_fill64 dst, offset, val, fixup
+ 	EX(LONG_S, \val, (\offset +  0 * STORSIZE)(\dst), \fixup)
+ 	EX(LONG_S, \val, (\offset +  1 * STORSIZE)(\dst), \fixup)
+@@ -63,6 +69,26 @@ 9:	insn	reg, addr;				\
+ #endif
+ 	.endm
+ 
++	.macro  f_fill64eva dst, offset, val, fixup
++	.set        eva
++	EX(swe, \val, (\offset +  0 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  1 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  2 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  3 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  4 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  5 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  6 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  7 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  8 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset +  9 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset + 10 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset + 11 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset + 12 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset + 13 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset + 14 * STORSIZE)(\dst), \fixup)
++	EX(swe, \val, (\offset + 15 * STORSIZE)(\dst), \fixup)
++	.endm
++
+ /*
+  * memset(void *s, int c, size_t n)
+  *
+@@ -202,3 +228,142 @@ 2:	jr		ra			/* done */
+ .Llast_fixup:
+ 	jr		ra
+ 	 andi		v1, a2, STORMASK
++
++#ifdef CONFIG_EVA
++/*  ++++++++  */
++/*  EVA stuff */
++/*  ++++++++  */
++
++	.set            eva
++
++#undef  LONG_S_L
++#undef  LONG_S_R
++
++#define LONG_S_L swle
++#define LONG_S_R swre
++
++LEAF(__bzero_user)
++	sltiu		t0, a2, STORSIZE	/* very small region? */
++	bnez            t0, .LEsmall_memset
++	 andi		t0, a0, STORMASK	/* aligned? */
++
++#ifdef CONFIG_CPU_MICROMIPS
++	move		t8, a1
++	move		t9, a1
++#endif
++#ifndef CONFIG_CPU_DADDI_WORKAROUNDS
++	beqz		t0, 1f
++	 PTR_SUBU	t0, STORSIZE		/* alignment in bytes */
++#else
++	.set		noat
++	li		AT, STORSIZE
++	beqz		t0, 1f
++	 PTR_SUBU	t0, AT			/* alignment in bytes */
++	.set		at
++#endif
++
++	R10KCBARRIER(0(ra))
++#ifdef __MIPSEB__
++	EX(LONG_S_L, a1, (a0), .LEfirst_fixup)  /* make word/dword aligned */
++#endif
++#ifdef __MIPSEL__
++	EX(LONG_S_R, a1, (a0), .LEfirst_fixup)  /* make word/dword aligned */
++#endif
++	PTR_SUBU	a0, t0			/* long align ptr */
++	PTR_ADDU	a2, t0			/* correct size */
++
++1:	ori		t1, a2, 0x3f		/* # of full blocks */
++	xori		t1, 0x3f
++	beqz            t1, .LEmemset_partial    /* no block to fill */
++	 andi		t0, a2, 0x40-STORSIZE
++
++	PTR_ADDU	t1, a0			/* end address */
++	.set		reorder
++1:	PTR_ADDIU	a0, 64
++	R10KCBARRIER(0(ra))
++	f_fill64eva a0, -64, a1, .LEfwd_fixup
++	bne		t1, a0, 1b
++	.set		noreorder
++
++.LEmemset_partial:
++	R10KCBARRIER(0(ra))
++	PTR_LA		t1, 2f			/* where to start */
++#ifdef CONFIG_CPU_MICROMIPS
++	LONG_SRL	t7, t0, 1
++#if LONGSIZE == 4
++	PTR_SUBU	t1, t7
++#else
++	.set		noat
++	LONG_SRL	AT, t7, 1
++	PTR_SUBU	t1, AT
++	.set		at
++#endif
++#else
++#if LONGSIZE == 4
++	PTR_SUBU	t1, t0
++#else
++	.set		noat
++	LONG_SRL	AT, t0, 1
++	PTR_SUBU	t1, AT
++	.set		at
++#endif
++#endif
++	jr		t1
++	 PTR_ADDU	a0, t0			/* dest ptr */
++
++	.set		push
++	.set		noreorder
++	.set		nomacro
++	f_fill64eva a0, -64, a1, .LEpartial_fixup   /* ... but first do longs ... */
++2:	.set		pop
++	andi		a2, STORMASK		/* At most one long to go */
++
++	beqz		a2, 1f
++	 PTR_ADDU	a0, a2			/* What's left */
++	R10KCBARRIER(0(ra))
++#ifdef __MIPSEB__
++	EX(LONG_S_R, a1, -1(a0), .LElast_fixup)
++#endif
++#ifdef __MIPSEL__
++	EX(LONG_S_L, a1, -1(a0), .LElast_fixup)
++#endif
++1:	jr		ra
++	 move		a2, zero
++
++.LEsmall_memset:
++	beqz		a2, 2f
++	 PTR_ADDU	t1, a0, a2
++
++1:	PTR_ADDIU	a0, 1			/* fill bytewise */
++	R10KCBARRIER(0(ra))
++	bne		t1, a0, 1b
++	 sb		a1, -1(a0)
++
++2:	jr		ra			/* done */
++	 move		a2, zero
++
++.LEfirst_fixup:
++	jr	ra
++	 nop
++
++.LEfwd_fixup:
++	PTR_L		t0, TI_TASK($28)
++	andi		a2, 0x3f
++	LONG_L		t0, THREAD_BUADDR(t0)
++	LONG_ADDU	a2, t1
++	jr		ra
++	 LONG_SUBU	a2, t0
++
++.LEpartial_fixup:
++	PTR_L		t0, TI_TASK($28)
++	andi		a2, STORMASK
++	LONG_L		t0, THREAD_BUADDR(t0)
++	LONG_ADDU	a2, t1
++	jr		ra
++	 LONG_SUBU	a2, t0
++
++.LElast_fixup:
++	jr		ra
++	 andi		v1, a2, STORMASK
++	END(__bzero_user)
++#endif
+diff --git a/arch/mips/lib/strlen_user.S b/arch/mips/lib/strlen_user.S
+--- a/arch/mips/lib/strlen_user.S
++++ b/arch/mips/lib/strlen_user.S
+@@ -11,7 +11,7 @@
+ #include <asm/asm-offsets.h>
+ #include <asm/regdef.h>
+ 
+-#define EX(insn,reg,addr,handler)			\
++#define EX(insn,reg,addr,handler)                       \
+ 9:	insn	reg, addr;				\
+ 	.section __ex_table,"a";			\
+ 	PTR	9b, handler;				\
+@@ -22,19 +22,38 @@ 9:	insn	reg, addr;				\
+  *
+  * Return 0 for error
+  */
++LEAF(__strlen_kernel_asm)
++	LONG_L          v0, TI_ADDR_LIMIT($28)  # pointer ok?
++	and             v0, a0
++	bnez            v0, .Lfault
++
++FEXPORT(__strlen_kernel_nocheck_asm)
++	move            v0, a0
++1:      EX(lbu, v1, (v0), .Lfault)
++	PTR_ADDIU       v0, 1
++	bnez            v1, 1b
++	PTR_SUBU        v0, a0
++	jr              ra
++	END(__strlen_kernel_asm)
++
++.Lfault:        move            v0, zero
++	jr              ra
++
++#ifdef CONFIG_EVA
++
+ LEAF(__strlen_user_asm)
+-	LONG_L		v0, TI_ADDR_LIMIT($28)	# pointer ok?
+-	and		v0, a0
+-	bnez		v0, .Lfault
++	LONG_L          v0, TI_ADDR_LIMIT($28)  # pointer ok?
++	and             v0, a0
++	bnez            v0, .Lfault
+ 
+ FEXPORT(__strlen_user_nocheck_asm)
+-	move		v0, a0
+-1:	EX(lbu, v1, (v0), .Lfault)
+-	PTR_ADDIU	v0, 1
+-	bnez		v1, 1b
+-	PTR_SUBU	v0, a0
+-	jr		ra
++	move            v0, a0
++	.set            eva
++1:      EX(lbue, v1, (v0), .Lfault)
++	PTR_ADDIU       v0, 1
++	bnez            v1, 1b
++	PTR_SUBU        v0, a0
++	jr              ra
+ 	END(__strlen_user_asm)
+ 
+-.Lfault:	move		v0, zero
+-	jr		ra
++#endif
+diff --git a/arch/mips/lib/strncpy_user.S b/arch/mips/lib/strncpy_user.S
+--- a/arch/mips/lib/strncpy_user.S
++++ b/arch/mips/lib/strncpy_user.S
+@@ -28,17 +28,17 @@ 9:	insn	reg, addr;				\
+  * it happens at most some bytes of the exceptions handlers will be copied.
+  */
+ 
+-LEAF(__strncpy_from_user_asm)
++LEAF(__strncpy_from_kernel_asm)
+ 	LONG_L		v0, TI_ADDR_LIMIT($28)	# pointer ok?
+ 	and		v0, a1
+ 	bnez		v0, .Lfault
+ 
+-FEXPORT(__strncpy_from_user_nocheck_asm)
++FEXPORT(__strncpy_from_kernel_nocheck_asm)
+ 	.set		noreorder
+ 	move		t0, zero
+ 	move		v1, a1
+-1:	EX(lbu, v0, (v1), .Lfault)
+-	PTR_ADDIU	v1, 1
++1:      EX(lbu, v0, (v1), .Lfault)
++	PTR_ADDIU       v1, 1
+ 	R10KCBARRIER(0(ra))
+ 	beqz		v0, 2f
+ 	 sb		v0, (a0)
+@@ -50,12 +50,40 @@ 2:	PTR_ADDU	v0, a1, t0
+ 	bltz		v0, .Lfault
+ 	 nop
+ 	jr		ra			# return n
+-	 move		v0, t0
++	 move           v0, t0
++	END(__strncpy_from_kernel_asm)
++
++.Lfault:
++	jr              ra
++	 li             v0, -EFAULT
++
++#ifdef CONFIG_EVA
++
++LEAF(__strncpy_from_user_asm)
++	LONG_L		v0, TI_ADDR_LIMIT($28)	# pointer ok?
++	and		v0, a1
++	bnez		v0, .Lfault
++
++FEXPORT(__strncpy_from_user_nocheck_asm)
++	.set		noreorder
++	move		t0, zero
++	move		v1, a1
++1:
++	.set            eva
++	EX(lbue, v0, (v1), .Lfault)
++	PTR_ADDIU       v1, 1
++	R10KCBARRIER(0(ra))
++	beqz		v0, 2f
++	 sb		v0, (a0)
++	PTR_ADDIU	t0, 1
++	bne		t0, a2, 1b
++	 PTR_ADDIU	a0, 1
++2:	PTR_ADDU	v0, a1, t0
++	xor		v0, a1
++	bltz		v0, .Lfault
++	 nop
++	jr		ra			# return n
++	 move           v0, t0
+ 	END(__strncpy_from_user_asm)
+ 
+-.Lfault: jr		ra
+-	  li		v0, -EFAULT
+-
+-	.section	__ex_table,"a"
+-	PTR		1b, .Lfault
+-	.previous
++#endif
+diff --git a/arch/mips/lib/strnlen_user.S b/arch/mips/lib/strnlen_user.S
+--- a/arch/mips/lib/strnlen_user.S
++++ b/arch/mips/lib/strnlen_user.S
+@@ -25,22 +25,45 @@ 9:	insn	reg, addr;				\
+  *	 bytes.	 There's nothing secret there.	On 64-bit accessing beyond
+  *	 the maximum is a tad hairier ...
+  */
++LEAF(__strnlen_kernel_asm)
++	LONG_L		v0, TI_ADDR_LIMIT($28)	# pointer ok?
++	and		v0, a0
++	bnez		v0, .Lfault
++
++FEXPORT(__strnlen_kernel_nocheck_asm)
++	move            v0, a0
++	PTR_ADDU        a1, a0                  # stop pointer
++1:      beq             v0, a1, 2f              # limit reached?
++	EX(lb, t0, (v0), .Lfault)
++	PTR_ADDIU       v0, 1
++	bnez            t0, 1b
++2:      PTR_SUBU        v0, a0
++	jr              ra
++	END(__strnlen_kernel_asm)
++
++
++.Lfault:
++	move		v0, zero
++	jr		ra
++
++
++#ifdef CONFIG_EVA
++
+ LEAF(__strnlen_user_asm)
+ 	LONG_L		v0, TI_ADDR_LIMIT($28)	# pointer ok?
+ 	and		v0, a0
+ 	bnez		v0, .Lfault
+ 
+ FEXPORT(__strnlen_user_nocheck_asm)
+-	move		v0, a0
+-	PTR_ADDU	a1, a0			# stop pointer
+-1:	beq		v0, a1, 1f		# limit reached?
+-	EX(lb, t0, (v0), .Lfault)
+-	PTR_ADDIU	v0, 1
+-	bnez		t0, 1b
+-1:	PTR_SUBU	v0, a0
+-	jr		ra
++	move            v0, a0
++	PTR_ADDU        a1, a0                  # stop pointer
++1:      beq             v0, a1, 2f              # limit reached?
++	.set            eva
++	EX(lbe, t0, (v0), .Lfault)
++	PTR_ADDIU       v0, 1
++	bnez            t0, 1b
++2:      PTR_SUBU        v0, a0
++	jr              ra
+ 	END(__strnlen_user_asm)
+ 
+-.Lfault:
+-	move		v0, zero
+-	jr		ra
++#endif
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -413,10 +413,12 @@ static inline void local_r4k_flush_cache
+ static void r4k_flush_cache_range(struct vm_area_struct *vma,
+ 	unsigned long start, unsigned long end)
+ {
++#ifndef CONFIG_EVA
+ 	int exec = vma->vm_flags & VM_EXEC;
+ 
+ 	if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc))
+ 		r4k_on_each_cpu(local_r4k_flush_cache_range, vma);
++#endif
+ }
+ 
+ static inline void local_r4k_flush_cache_mm(void * args)
+@@ -529,7 +531,11 @@ static inline void local_r4k_flush_cache
+ 			dontflash = 1;
+ 		} else
+ 			if (map_coherent || !cpu_has_ic_aliases)
++#ifndef CONFIG_EVA
+ 				r4k_blast_icache_page(addr);
++#else
++				r4k_blast_icache();
++#endif
+ 	}
+ 
+ 	if (vaddr) {
+@@ -542,7 +548,11 @@ static inline void local_r4k_flush_cache
+ 	/*  in case of I-cache aliasing - blast it via coherent page */
+ 	if (exec && cpu_has_ic_aliases && (!dontflash) && !map_coherent) {
+ 		vaddr = kmap_coherent(page, addr);
++#ifndef CONFIG_EVA
+ 		r4k_blast_icache_page((unsigned long)vaddr);
++#else
++		r4k_blast_icache();
++#endif
+ 		kunmap_coherent();
+ 	}
+ }
+@@ -592,10 +602,14 @@ static inline void local_r4k_flush_icach
+ 
+ 	wmb();
+ 
++#ifndef CONFIG_EVA
+ 	if (end - start > icache_size)
+ 		r4k_blast_icache();
+ 	else
+ 		protected_blast_icache_range(start, end);
++#else
++	r4k_blast_icache();
++#endif
+ }
+ 
+ static inline void local_r4k_flush_icache_range_ipi(void *args)
+@@ -698,6 +712,9 @@ static void r4k_dma_cache_inv(unsigned l
+  */
+ static void local_r4k_flush_cache_sigtramp(void * arg)
+ {
++#ifdef CONFIG_EVA
++	__flush_cache_all();
++#else
+ 	unsigned long ic_lsize = cpu_icache_line_size();
+ 	unsigned long dc_lsize = cpu_dcache_line_size();
+ 	unsigned long sc_lsize = cpu_scache_line_size();
+@@ -728,6 +745,7 @@ static void local_r4k_flush_cache_sigtra
+ 			:
+ 			: "i" (Hit_Invalidate_I));
+ 	}
++#endif
+ 	if (MIPS_CACHE_SYNC_WAR)
+ 		__asm__ __volatile__ ("sync");
+ }
+@@ -739,7 +757,9 @@ static void r4k_flush_cache_sigtramp(uns
+ 
+ static void r4k_flush_icache_all(void)
+ {
++#ifndef CONFIG_EVA
+ 	if (cpu_has_vtag_icache)
++#endif
+ 		r4k_blast_icache();
+ }
+ 
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -116,6 +116,11 @@ static inline void kmap_coherent_init(vo
+ 
+ void *kmap_coherent(struct page *page, unsigned long addr)
+ {
++#ifdef CONFIG_EVA
++	dump_stack();
++	panic("kmap_coherent");
++#else
++
+ 	enum fixed_addresses idx;
+ 	unsigned long vaddr, flags, entrylo;
+ 	unsigned long old_ctx;
+@@ -123,7 +128,6 @@ void *kmap_coherent(struct page *page, u
+ 	int tlbidx;
+ 
+ 	/* BUG_ON(Page_dcache_dirty(page)); - removed for I-cache flush */
+-
+ 	inc_preempt_count();
+ 	idx = (addr >> PAGE_SHIFT) & (FIX_N_COLOURS - 1);
+ #ifdef CONFIG_MIPS_MT_SMTC
+@@ -169,6 +173,7 @@ void *kmap_coherent(struct page *page, u
+ 	EXIT_CRITICAL(flags);
+ 
+ 	return (void*) vaddr;
++#endif /* CONFIG_EVA */
+ }
+ 
+ #define UNIQUE_ENTRYHI(idx) (cpu_has_tlbinv ? ((CKSEG0 + ((idx) << (PAGE_SHIFT + 1))) | MIPS_EHINV) : \
+@@ -450,7 +455,12 @@ void free_initrd_mem(unsigned long start
+ void __init_refok free_initmem(void)
+ {
+ 	prom_free_prom_memory();
++#ifdef CONFIG_EVA
++	free_init_pages("unused memory", __pa_symbol(&__init_begin),
++		__pa_symbol(&__init_end));
++#else
+ 	free_initmem_default(POISON_FREE_INITMEM);
++#endif
+ }
+ 
+ #ifndef CONFIG_MIPS_PGD_C0_CONTEXT
+diff --git a/arch/mips/mm/pgtable-32.c b/arch/mips/mm/pgtable-32.c
+--- a/arch/mips/mm/pgtable-32.c
++++ b/arch/mips/mm/pgtable-32.c
+@@ -32,9 +32,11 @@ void pgd_init(unsigned long page)
+ 
+ void __init pagetable_init(void)
+ {
++#if defined(CONFIG_HIGHMEM) || defined(FIXADDR_START)
+ 	unsigned long vaddr;
+ 	unsigned long vend;
+ 	pgd_t *pgd_base;
++#endif
+ #ifdef CONFIG_HIGHMEM
+ 	pgd_t *pgd;
+ 	pud_t *pud;
+@@ -47,6 +49,7 @@ void __init pagetable_init(void)
+ 	pgd_init((unsigned long)swapper_pg_dir
+ 		 + sizeof(pgd_t) * USER_PTRS_PER_PGD);
+ 
++#ifdef FIXADDR_START
+ 	pgd_base = swapper_pg_dir;
+ 
+ 	/*
+@@ -57,6 +60,7 @@ void __init pagetable_init(void)
+ 	vend = vaddr + FIXADDR_SIZE;
+ 	vaddr = vaddr & PMD_MASK;
+ 	fixrange_init(vaddr, vend, pgd_base);
++#endif
+ 
+ #ifdef CONFIG_HIGHMEM
+ 	/*
+diff --git a/arch/mips/mti-malta/malta-init.c b/arch/mips/mti-malta/malta-init.c
+--- a/arch/mips/mti-malta/malta-init.c
++++ b/arch/mips/mti-malta/malta-init.c
+@@ -230,9 +230,22 @@ mips_pci_controller:
+ 			  MSC01_PCI_SWAP_BYTESWAP << MSC01_PCI_SWAP_MEM_SHF |
+ 			  MSC01_PCI_SWAP_BYTESWAP << MSC01_PCI_SWAP_BAR0_SHF);
+ #endif
+-		/* Fix up target memory mapping.  */
++		/* Fix up target memory mapping. */
++#ifndef CONFIG_EVA
+ 		MSC_READ(MSC01_PCI_BAR0, mask);
+ 		MSC_WRITE(MSC01_PCI_P2SCMSKL, mask & MSC01_PCI_BAR0_SIZE_MSK);
++#else
++		/* Setup the Malta max (2GB) memory for PCI DMA in host bridge
++		   in transparent addressing mode, starting from 80000000.
++		   Don't believe in registers content */
++		mask = 0x80000008;
++		MSC_WRITE(MSC01_PCI_BAR0, mask);
++
++		mask = 0x80000000;
++		MSC_WRITE(MSC01_PCI_HEAD4, mask);
++		MSC_WRITE(MSC01_PCI_P2SCMSKL, mask);
++		MSC_WRITE(MSC01_PCI_P2SCMAPL, mask);
++#endif
+ 
+ 		/* Don't handle target retries indefinitely.  */
+ 		if ((data & MSC01_PCI_CFG_MAXRTRY_MSK) ==
+diff --git a/arch/mips/mti-malta/malta-memory.c b/arch/mips/mti-malta/malta-memory.c
+--- a/arch/mips/mti-malta/malta-memory.c
++++ b/arch/mips/mti-malta/malta-memory.c
+@@ -21,10 +21,19 @@
+ 
+ static fw_memblock_t mdesc[FW_MAX_MEMBLOCKS];
+ 
+-/* determined physical memory size, not overridden by command line args	 */
++#ifdef DEBUG
++static char *mtypes[3] = {
++	"Dont use memory",
++	"YAMON PROM memory",
++	"Free memmory",
++};
++#endif
++
++/* determined physical memory size, not overridden by command line args  */
+ unsigned long physical_memsize = 0L;
+ 
+-fw_memblock_t * __init fw_getmdesc(void)
++#ifndef CONFIG_EVA
++static inline fw_memblock_t * __init prom_getmdesc(void)
+ {
+ 	char *memsize_str, *ptr;
+ 	unsigned int memsize;
+@@ -93,6 +102,110 @@ fw_memblock_t * __init fw_getmdesc(void)
+ 	return &mdesc[0];
+ }
+ 
++#else
++
++static inline fw_memblock_t * __init prom_getevamdesc(void)
++{
++	char *memsize_str;
++	char *ememsize_str;
++	unsigned long memsize = 0;
++	unsigned long ememsize = 0;
++	char *ptr;
++	static char cmdline[COMMAND_LINE_SIZE] __initdata;
++
++	/* otherwise look in the environment */
++	memsize_str = fw_getenv("memsize");
++#ifdef DEBUG
++	pr_debug("prom_memsize = %s\n", memsize_str);
++#endif
++	if (memsize_str)
++		memsize = simple_strtol(memsize_str, NULL, 0);
++	ememsize_str = fw_getenv("ememsize");
++#ifdef DEBUG
++	pr_debug("fw_ememsize = %s\n", ememsize_str);
++#endif
++	if (ememsize_str)
++		ememsize = simple_strtol(ememsize_str, NULL, 0);
++
++	if ((!memsize) && !ememsize) {
++		printk(KERN_WARNING
++		       "memsize not set in boot prom, set to default (32Mb)\n");
++		physical_memsize = 0x02000000;
++	} else {
++		physical_memsize = ememsize;
++		if (!physical_memsize)
++			physical_memsize = memsize;
++	}
++
++#ifdef CONFIG_CPU_BIG_ENDIAN
++	/* SOC-it swaps, or perhaps doesn't swap, when DMA'ing the last
++	   word of physical memory */
++	physical_memsize -= PAGE_SIZE;
++#endif
++
++	memsize = 0;
++	/* Check the command line for a memsize directive that overrides
++	   the physical/default amount */
++	strcpy(cmdline, arcs_cmdline);
++	ptr = strstr(cmdline, " memsize=");
++	if (ptr && (ptr != cmdline))
++		memsize = memparse(ptr + 9, &ptr);
++	ptr = strstr(cmdline, " ememsize=");
++	if (ptr && (ptr != cmdline))
++		memsize = memparse(ptr + 10, &ptr);
++	if (!memsize) {
++		ptr = strstr(cmdline, "memsize=");
++		if (ptr && (ptr != cmdline))
++			memsize = memparse(ptr + 8, &ptr);
++		ptr = strstr(cmdline, "ememsize=");
++		if (ptr && (ptr != cmdline))
++			memsize = memparse(ptr + 9, &ptr);
++	}
++	if (!memsize)
++		memsize = physical_memsize;
++
++	if ((memsize == 0x10000000) && !ememsize)
++		if ((!ptr) || (ptr == cmdline)) {
++			printk("YAMON reports memsize=256M but doesn't report ememsize option\n");
++			printk("If you install > 256MB memory, upgrade YAMON or use boot option memsize=XXXM\n");
++		}
++	/* Don't use last 64KB - it is just for macros arithmetics overflow */
++	if (memsize > 0x7fff0000)
++		memsize = 0x7fff0000;
++
++	memset(mdesc, 0, sizeof(mdesc));
++
++	mdesc[0].type = fw_dontuse;
++	mdesc[0].base = PHYS_OFFSET;
++	mdesc[0].size = 0x00001000;
++
++	mdesc[1].type = fw_code;
++	mdesc[1].base = mdesc[0].base + 0x00001000UL;
++	mdesc[1].size = 0x000ef000;
++
++	/*
++	 * The area 0x000f0000-0x000fffff is allocated for BIOS memory by the
++	 * south bridge and PCI access always forwarded to the ISA Bus and
++	 * BIOSCS# is always generated.
++	 * This mean that this area can't be used as DMA memory for PCI
++	 * devices.
++	 */
++	mdesc[2].type = fw_dontuse;
++	mdesc[2].base = mdesc[0].base + 0x000f0000UL;
++	mdesc[2].size = 0x00010000;
++
++	mdesc[3].type = fw_dontuse;
++	mdesc[3].base = mdesc[0].base + 0x00100000UL;
++	mdesc[3].size = CPHYSADDR(PFN_ALIGN((unsigned long)&_end)) - 0x00100000UL;
++
++	mdesc[4].type = fw_free;
++	mdesc[4].base = mdesc[0].base + CPHYSADDR(PFN_ALIGN(&_end));
++	mdesc[4].size = memsize - CPHYSADDR(mdesc[4].base);
++
++	return &mdesc[0];
++}
++#endif /* CONFIG_EVA */
++
+ static int __init fw_memtype_classify(unsigned int type)
+ {
+ 	switch (type) {
+@@ -105,10 +218,34 @@ static int __init fw_memtype_classify(un
+ 	}
+ }
+ 
++fw_memblock_t __init *fw_getmdesc(void)
++{
++	fw_memblock_t *p;
++
++#ifndef CONFIG_EVA
++	p = prom_getmdesc();
++#else
++	p = prom_getevamdesc();
++#endif
++	return p;
++}
++
+ void __init fw_meminit(void)
+ {
+ 	fw_memblock_t *p;
+ 
++#ifdef DEBUG
++	pr_debug("YAMON MEMORY DESCRIPTOR dump:\n");
++	p = fw_getmdesc();
++
++	while (p->size) {
++		int i = 0;
++		pr_debug("[%d,%p]: base<%08lx> size<%x> type<%s>\n",
++			 i, p, p->base, p->size, mtypes[p->type]);
++		p++;
++		i++;
++	}
++#endif
+ 	p = fw_getmdesc();
+ 
+ 	while (p->size) {
+diff --git a/arch/mips/mti-malta/malta-setup.c b/arch/mips/mti-malta/malta-setup.c
+--- a/arch/mips/mti-malta/malta-setup.c
++++ b/arch/mips/mti-malta/malta-setup.c
+@@ -130,8 +130,9 @@ static int __init plat_enable_iocoherenc
+ 	} else if (gcmp_niocu() != 0) {
+ 		/* Nothing special needs to be done to enable coherency */
+ 		pr_info("CMP IOCU detected\n");
+-		if ((*(unsigned int *)0xbf403000 & 0x81) != 0x81) {
+-			pr_crit("IOCU OPERATION DISABLED BY SWITCH - DEFAULTING TO SW IO COHERENCY\n");
++		if ((*(unsigned int *)CKSEG1ADDR(0xbf403000) & 0x81) != 0x81) {
++			pr_crit("IOCU OPERATION DISABLED BY SWITCH"
++				" - DEFAULTING TO SW IO COHERENCY\n");
+ 			return 0;
+ 		}
+ 		supported = 1;
+@@ -243,10 +244,28 @@ static void __init bonito_quirks_setup(v
+ #endif
+ }
+ 
++#ifdef CONFIG_EVA
+ void __init plat_eva_setup(void)
+ {
+ 	unsigned int val;
+ 
++#ifdef CONFIG_EVA_3GB
++	val = ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl0(val);
++
++	val = ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |=  (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(4 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl1(val);
++#else
+ 	val = ((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT));
+@@ -259,32 +278,41 @@ void __init plat_eva_setup(void)
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT));
+ 	val |= (((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
+-		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(4 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+ 	write_c0_segctl1(val);
++#endif
+ 
+-	val = ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(6 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(4 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
+-		(1 << MIPS_SEGCFG_EU_SHIFT));
+-	val |= (((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
+-		(0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+ 	write_c0_segctl2(val);
+ 	back_to_back_c0_hazard();
+ 
+ 	val = read_c0_config5();
+-	write_c0_config5(val|MIPS_CONF5_K);
++	write_c0_config5(val|MIPS_CONF5_K|MIPS_CONF5_CV|MIPS_CONF5_EVA);
+ 	back_to_back_c0_hazard();
+ 
+ 	printk("Enhanced Virtual Addressing (EVA) active\n");
+ }
++#endif
+ 
+ void __init plat_mem_setup(void)
+ {
+ 	unsigned int i;
+ 
++#ifdef CONFIG_EVA
+ 	if ((cpu_has_segments) && (cpu_has_eva))
+ 		plat_eva_setup();
++	else {
++	    printk("cpu_has_segments=%ld cpu_has_eva=%ld\n",cpu_has_segments,cpu_has_eva);
++	    printk("Kernel is built for EVA support but EVA or segment control registers are not found\n");
++	    panic("EVA absent");
++	}
++#endif
+ 
+ 	mips_pcibios_init();
+ 

@@ -1,0 +1,2837 @@
+update powertop to v1.13, based on ubuntu archive and patch
+
+diff --git a/utils/powertop/Makefile b/utils/powertop/Makefile
+--- a/utils/powertop/Makefile
++++ b/utils/powertop/Makefile
+@@ -8,12 +8,12 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=powertop
+-PKG_VERSION:=1.11
++PKG_VERSION:=1.13
+ PKG_RELEASE:=2
+ 
+-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+-PKG_SOURCE_URL:=http://www.lesswatts.org/projects/powertop/download/
+-PKG_MD5SUM:=3498f5983c683c3a57dce7379a722082
++PKG_SOURCE:=powertop-1.13_1.13.orig.tar.gz
++PKG_SOURCE_URL:=http://archive.ubuntu.com/ubuntu/pool/universe/p/powertop-1.13/
++PKG_MD5SUM:=78aa17c8f55178004223bf236654298e
+ 
+ PKG_INSTALL:=1
+ PKG_FIXUP:=autoreconf
+@@ -34,7 +34,8 @@ define Package/powertop/description
+ endef
+ 
+ define Package/powertop/install
+-	$(CP) $(PKG_INSTALL_DIR)/* $(1)
++	$(INSTALL_DIR) $(1)/usr/bin/
++	$(CP) $(PKG_INSTALL_DIR)/usr/bin/* $(1)/usr/bin/
+ endef
+ 
+ $(eval $(call BuildPackage,powertop))
+diff --git a/utils/powertop/patches/000-powertop-1.13_1.13-1ubuntu2~oneiric2.patch b/utils/powertop/patches/000-powertop-1.13_1.13-1ubuntu2~oneiric2.patch
+new file mode 100644
+--- /dev/null
++++ b/utils/powertop/patches/000-powertop-1.13_1.13-1ubuntu2~oneiric2.patch
+@@ -0,0 +1,2742 @@
++--- a/powertop.h
+++++ b/powertop.h
++@@ -28,6 +28,16 @@
++ 
++ #include <libintl.h>
++ 
+++/*
+++ * Define the MAX values for [CP]STATES "big enough".
+++ * Defining it too less will result in missing some C/P state information.
+++ * Defining the values too high will result in memory wastage.
+++ */
+++#define MAX_NUM_CSTATES 10
+++#define MAX_NUM_PSTATES 16
+++
+++#define MAX_CSTATE_LINES (MAX_NUM_CSTATES + 3)
+++
++ struct line {
++ 	char	*string;
++ 	int	count;
++@@ -41,6 +51,8 @@ extern struct line     *lines;
++ extern int             linehead;
++ extern int             linesize;
++ extern int             linectotal;
+++extern int             maxcstate;
+++extern int             maxpstate;
++ 
++ extern double displaytime;
++ 
++@@ -70,8 +82,8 @@ void devicepm_activity_hint(void);
++ 
++ 
++ 
++-extern char cstate_lines[12][200];
++-extern char cpufreqstrings[6][80];
+++extern char cstate_lines[MAX_CSTATE_LINES][200];
+++extern char cpufreqstrings[MAX_NUM_PSTATES+1][80];
++ 
++ extern int topcstate;
++ extern int topfreq;
++--- a/intelcstates.c
+++++ b/intelcstates.c
++@@ -101,8 +101,10 @@ void print_intel_cstates(void)
++ 			      entry->d_name);
++ 
++ 		dir = opendir(filename);
++-		if (!dir)
+++		if (!dir) {
+++			closedir(cpudir);
++ 			return;
+++		}
++ 
++ 		/* For each C-state, there is a stateX directory which
++ 		 * contains a 'usage' and a 'time' (duration) file */
++--- a/README
+++++ b/README
++@@ -36,8 +36,8 @@ provide feedback, problem reports or fix
++ Website:      http://www.linuxpowertop.org
++ IRC:          irc.oftc.net    #powertop channel
++ Mailing list: http://www.bughost.org/mailman/listinfo/power
++-Tags: intel, linux
++-
+++Tags:         intel, linux
+++Git:          git://gitorious.org/meego-developer-tools/powertop.git
++ 
++ 
++ If you have bugreports or patches, I prefer that you use the mailing list
++--- a/Makefile
+++++ b/Makefile
++@@ -1,27 +1,31 @@
++ VERSION = 1.13
++ 
++-BINDIR=/usr/bin
++-LOCALESDIR=/usr/share/locale
++-MANDIR=/usr/share/man/man8
++-WARNFLAGS=-Wall -Wshadow -W -Wformat -Wimplicit-function-declaration -Wimplicit-int
++-CFLAGS?=-O1 -g ${WARNFLAGS}
++-CC?=gcc
+++PREFIX     ?= /usr
+++BINDIR      = $(PREFIX)/bin
+++LOCALESDIR  = $(PREFIX)/share/locale
+++MANDIR      = $(PREFIX)/share/man/man8
+++
+++WARNFLAGS = -Wall -Wshadow -W -Wformat -Wimplicit-function-declaration -Wimplicit-int
+++CFLAGS?= -O1 -g
+++CFLAGS += ${WARNFLAGS}
+++CC ?= gcc
++ 
++-CFLAGS+=-D VERSION=\"$(VERSION)\"
+++CFLAGS += -D VERSION=\"$(VERSION)\"
++ 
++-# 
+++#
++ # The w in -lncursesw is not a typo; it is the wide-character version
++ # of the ncurses library, needed for multi-byte character languages
++ # such as Japanese and Chinese etc.
++ #
++ # On Debian/Ubuntu distros, this can be found in the
++-# libncursesw5-dev package. 
+++# libncursesw5-dev package.
++ #
++ 
++-OBJS = powertop.o config.o process.o misctips.o bluetooth.o display.o suggestions.o wireless.o cpufreq.o \
++-	sata.o xrandr.o ethernet.o cpufreqstats.o usb.o urbnum.o intelcstates.o wifi-new.o perf.o \
+++OBJS = powertop.o config.o process.o misctips.o bluetooth.o display.o \
+++	suggestions.o wireless.o cpufreq.o sata.o xrandr.o ethernet.o \
+++	cpufreqstats.o usb.o urbnum.o intelcstates.o wifi-new.o perf.o \
++ 	alsa-power.o ahci-alpm.o dmesg.o devicepm.o
++-	
+++
++ 
++ powertop: $(OBJS) Makefile powertop.h
++ 	$(CC) ${CFLAGS} $(LDFLAGS) $(OBJS) -lncursesw -o powertop
++@@ -36,7 +40,7 @@ install: powertop powertop.8.gz
++ 	mkdir -p ${DESTDIR}${MANDIR}
++ 	cp powertop.8.gz ${DESTDIR}${MANDIR}
++ 	@(cd po/ && env LOCALESDIR=$(LOCALESDIR) DESTDIR=$(DESTDIR) $(MAKE) $@)
++-	
+++
++ valgrind: powertop
++ 	 sudo valgrind ./powertop -d -t 5 1> /dev/null
++ 
++@@ -46,7 +50,7 @@ uptrans:
++ 	@(cd po/ && env LG=$(LG) $(MAKE) $@)
++ 
++ clean:
++-	rm -f *~ powertop powertop.8.gz po/powertop.pot DEADJOE svn-commit* *.o *.orig 
+++	rm -f *~ powertop powertop.8.gz po/powertop.pot DEADJOE svn-commit* *.o *.orig
++ 	@(cd po/ && $(MAKE) $@)
++ 
++ 
++--- a/perf.c
+++++ b/perf.c
++@@ -36,13 +36,16 @@
++ #include <sys/stat.h>
++ #include <sys/ioctl.h>
++ 
+++#if defined(__ia64__) || defined(__alpha__)
+++#include <asm-generic/unistd.h>
+++#endif
+++
++ #include <fcntl.h>
++ 
++ #include "perf_event.h"
++ 
++ #include "powertop.h"
++ 
++-
++ /* some people have stale headers */
++ #ifndef __NR_perf_event_open
++ #ifdef __i386__
++@@ -79,8 +82,10 @@ static int get_trace_type(void)
++ 	if (!file)
++ 		return 0;
++ 
++-	if (fgets(line, 4095, file) == NULL)
+++	if (fgets(line, 4095, file) == NULL) {
+++		fclose(file);
++ 		return 0;
+++	}
++ 
++ 	this_trace = strtoull(line, NULL, 10);
++ 	fclose(file);
++--- a/Changelog
+++++ b/Changelog
++@@ -35,10 +35,10 @@
++ 	* fix socket fd leak, found by Nikerabbit on #powertop
++ 	* Add support for deferrable timers (Scott Lamb)
++ 	* Add active hint to enable USB autosuspend on Fedora 7
++- 	* Show blue color if the cpu is 25% or more busy to indicate
+++	* Show blue color if the cpu is 25% or more busy to indicate
++ 	  that idle wakeups no longer is the nr 1 power causer
++ 	  (Santiago Gala)
++-  	* merge the -d option from Bill Nottingham (Fedora) to allow
+++	* merge the -d option from Bill Nottingham (Fedora) to allow
++ 	  automated collection of data
++ 
++ 1.7 --  Jun 17th, 2007
++@@ -66,7 +66,7 @@
++ 	  actually waking up a lot:
++ 	  - beagle (even latest wakes up 10 times/second when not indexing)
++ 	  - hal (suggest to stop cdrom polling)
++-	  - gnome-power-manager 
+++	  - gnome-power-manager
++ 	  These only show if these actually wake up the cpu 'a lot'; so if
++ 	  these get fixed then the suggestion will not display.
++ 
++@@ -82,7 +82,7 @@
++ 	* report "hidden but suprious" timer ticks (due to missing hpet or
++ 	  lack of NO_HZ)
++ 	* check for HPET being present; if not suggest user to toggle in
++-   	  BIOS or apply the patch
+++	  BIOS or apply the patch
++ 	* Some suggestions have become "active", you can press a key to
++ 	  tune it right away.
++ 	* Add active suggestion to enable AC97 powersave mode at runtime
++@@ -102,19 +102,19 @@
++ 1.2 -- May 14th, 2007
++ 	* Manpage contributed by Carlo Segre from the Debian project
++ 	* Fix "shows power usage even on AC" bug, spotted by Steinar
++- 	  Gunderson
++- 	* Fix for batteries that report mA instead of mW from Friedrich
+++	  Gunderson
+++	* Fix for batteries that report mA instead of mW from Friedrich
++ 	  Oslage
++ 
++ 1.1 -- May 13th, 2007
++-	* Fix bug that shows "you don't have C-states" on mobile CPUs when 
+++	* Fix bug that shows "you don't have C-states" on mobile CPUs when
++ 	  the cpu is 100% busy as reported by Friedrich
++ 	* Cosmetic code cleanups (Lindent) as suggested by David Brownell
++-	* Get rid of popen() and the static sized events array 
+++	* Get rid of popen() and the static sized events array
++ 	  (Keith Packard)
++ 	* Add some more tips for kernel config options based on various
++ 	  reports/feedback
++-	* Improve "you are not root so can't get timerstats" message to say 
+++	* Improve "you are not root so can't get timerstats" message to say
++ 	  that you need to be root rather than that you need to change your
++ 	  kernel config
++ 	* Make a better effort at locating the kernel .config file
++@@ -122,7 +122,7 @@
++ 	  doesn't even support CONFIG_FOO (yet)
++ 	* Show absolute per-second wakeup counts too (multiple requestors)
++ 	* Add capability to suggest disabling daemons and the like
++-	
+++
++ 
++ 1.0 -- May 11th, 2007
++ 	* Initial Release
++--- a/ethernet.c
+++++ b/ethernet.c
++@@ -112,11 +112,6 @@ void suggest_WOL_off(void)
++ 		return;
++ 	}
++ 
++-	if (ifr.ifr_flags & (IFF_UP | IFF_RUNNING)) {
++-		close(sock);
++-		return;
++-	}
++-
++ 	memset(&wol, 0, sizeof(wol));
++ 
++ 	wol.cmd = ETHTOOL_GWOL;
++@@ -127,7 +122,7 @@ void suggest_WOL_off(void)
++ 		add_suggestion(_(
++ 			"Disable Ethernet Wake-On-Lan with the following command:\n"
++ 			"  ethtool -s eth0 wol d \n"
++-			"Wake-on-Lan keeps the phy active, this costs power."), 5,
+++			"Wake-on-Lan keeps the phy active, even when the system is turned off."), 5,
++ 			'W', _(" W - disable Wake-On-Lan "), activate_WOL_suggestion);
++ 
++ 
++--- a/usb.c
+++++ b/usb.c
++@@ -52,7 +52,7 @@ void activate_usb_autosuspend(void)
++ 		/* skip usb input devices */
++ 		sprintf(filename, "/sys/bus/usb/devices/%s/driver", dirent->d_name);
++ 		memset(linkto, 0, sizeof(linkto));
++-		len = readlink(filename, linkto, sizeof(link) - 1);
+++		len = readlink(filename, linkto, sizeof(linkto) - 1);
++ 		if (strstr(linkto, "usbhid"))
++ 			continue;
++ 
++--- a/devicepm.c
+++++ b/devicepm.c
++@@ -257,7 +257,7 @@ static void update_devstats_spi(char *pa
++ 		fgets(ptr->human_name, sizeof(ptr->human_name), file);
++ 		fclose(file);
++ 	}
++-	
+++
++ 
++ 	c = strchr(ptr->human_name, '\n');
++ 	if (c) *c = 0;
++--- a/.gitignore
+++++ b/.gitignore
++@@ -3,3 +3,4 @@
++ po/*mo
++ powertop
++ powertop.8.gz
+++powertop-*.tar.gz
++--- a/ahci-alpm.c
+++++ b/ahci-alpm.c
++@@ -89,6 +89,7 @@ static char *disk_name(char *path, char 
++ 			c = strchr(line, '\n');
++ 			if (c)
++ 				*c = 0;
+++			closedir(dir);
++ 			return strdup(line);
++ 		}
++ 	}
++--- a/cpufreqstats.c
+++++ b/cpufreqstats.c
++@@ -37,12 +37,12 @@ struct cpufreqdata {
++ 	uint64_t	count;
++ };
++ 
++-struct cpufreqdata freqs[16];
++-struct cpufreqdata oldfreqs[16];
+++struct cpufreqdata freqs[MAX_NUM_PSTATES];
+++struct cpufreqdata oldfreqs[MAX_NUM_PSTATES];
++ 
++-struct cpufreqdata delta[16];
+++struct cpufreqdata delta[MAX_NUM_PSTATES];
++ 
++-char cpufreqstrings[6][80];
+++char cpufreqstrings[MAX_NUM_PSTATES+1][80];
++ int topfreq = -1;
++ 
++ static void zap(void)
++@@ -107,14 +107,15 @@ void  do_cpufreq_stats(void)
++ 	char line[1024];
++ 
++ 	int ret = 0;
++-	int maxfreq = 0;
++ 	uint64_t total_time = 0;
++ 
+++	maxpstate = 0;
+++
++ 	memcpy(&oldfreqs, &freqs, sizeof(freqs));
++ 	memset(&cpufreqstrings, 0, sizeof(cpufreqstrings));
++ 	sprintf(cpufreqstrings[0], _("P-states (frequencies)\n"));
++ 
++-	for (ret = 0; ret<16; ret++)
+++	for (ret = 0; ret < MAX_NUM_PSTATES; ret++)
++ 		freqs[ret].count = 0;
++ 
++ 	dir = opendir("/sys/devices/system/cpu");
++@@ -150,10 +151,10 @@ void  do_cpufreq_stats(void)
++ 			freqs[i].frequency = f;
++ 			freqs[i].count += count;
++ 
++-			if (f && maxfreq < i)
++-				maxfreq = i;
+++			if (f && maxpstate < i)
+++				maxpstate = i;
++ 			i++;
++-			if (i>15)
+++			if (i >= MAX_NUM_PSTATES)
++ 				break;
++ 		}
++ 		fclose(file);
++@@ -161,7 +162,7 @@ void  do_cpufreq_stats(void)
++ 
++ 	closedir(dir);
++ 
++-	for (ret = 0; ret < 16; ret++) {
+++	for (ret = 0; ret < MAX_NUM_PSTATES; ret++) {
++ 		delta[ret].count = freqs[ret].count - oldfreqs[ret].count;
++ 		total_time += delta[ret].count;
++ 		delta[ret].frequency = freqs[ret].frequency;
++@@ -173,16 +174,19 @@ void  do_cpufreq_stats(void)
++ 	if (!total_time)
++ 		return;
++ 
++-	qsort(&delta, maxfreq+1, sizeof(struct cpufreqdata), sort_by_count);
++-	if (maxfreq>4)
++-		maxfreq=4;
++-	qsort(&delta, maxfreq+1, sizeof(struct cpufreqdata), sort_by_freq);
+++	if (!dump) {
+++		qsort(&delta, maxpstate+1, sizeof(struct cpufreqdata),
+++		sort_by_count);
+++		if (maxpstate>4)
+++			maxpstate=4;
+++	}
+++	qsort(&delta, maxpstate+1, sizeof(struct cpufreqdata), sort_by_freq);
++ 
++ 	if (delta[0].frequency == delta[1].frequency + 1000)
++ 		turbo_hz = delta[0].frequency;
++ 
++ 	topfreq = -1;
++-	for (ret = 0 ; ret<=maxfreq; ret++) {
+++	for (ret = 0 ; ret<=maxpstate; ret++) {
++ 		sprintf(cpufreqstrings[ret+1], "%6s   %5.1f%%\n", HzToHuman(delta[ret].frequency), delta[ret].count * 100.0 / total_time);
++ 		if (delta[ret].count > total_time/2)
++ 			topfreq = ret;
++--- a/display.c
+++++ b/display.c
++@@ -44,6 +44,12 @@ static WINDOW *suggestion_window;
++ static WINDOW *status_bar_window;
++ 
++ #define print(win, y, x, fmt, args...) do { if (dump) printf(fmt, ## args); else mvwprintw(win, y, x, fmt, ## args); } while (0)
+++#define p_wattrset(win, c) do { if (!dump ) wattrset(win, c); } while (0)
+++#define p_wattron(win, a) do { if (!dump ) wattron(win, a); } while (0)
+++#define p_wattroff(win, a) do { if (!dump ) wattroff(win, a); } while (0)
+++#define p_wbkgd(win, c) do { if (!dump ) wbkgd(win, c); } while (0)
+++#define p_werase(win) do { if (!dump ) werase(win); } while (0)
+++#define p_wrefresh(win) do { if (!dump ) wrefresh(win); } while (0)
++ 
++ char status_bar_slots[10][40];
++ 
++@@ -91,15 +97,29 @@ int maxwidth = 200;
++ 
++ void setup_windows(void)
++ {
+++	int i, yline, maxcstateline = -2;
+++	for (i = 0; i <= MAX_CSTATE_LINES; i++) {
+++		if (strlen(cstate_lines[i]))
+++			maxcstateline++;
+++	}
+++
+++	yline = (maxcstateline >= maxpstate) ? maxcstateline: maxpstate;
+++
+++	/* number of states is one more than the MAX state! */
+++	if (!maxcstate && !maxpstate)
+++		yline = 0;
+++	else
+++		yline++;
+++
++ 	getmaxyx(stdscr, maxy, maxx);
++ 
++ 	zap_windows();
++ 
++ 	title_bar_window = subwin(stdscr, 1, maxx, 0, 0);
++-	cstate_window = subwin(stdscr, 7, maxx, 2, 0);
++-	wakeup_window = subwin(stdscr, 1, maxx, 9, 0);
++-	battery_power_window = subwin(stdscr, 2, maxx, 10, 0);
++-	timerstat_window = subwin(stdscr, maxy-16, maxx, 12, 0);
+++	cstate_window = subwin(stdscr, (yline + 3), maxx, 2, 0);
+++	wakeup_window = subwin(stdscr, 1, maxx, (yline + 4), 0);
+++	battery_power_window = subwin(stdscr, 2, maxx, (yline + 5), 0);
+++	timerstat_window = subwin(stdscr, maxy-16, maxx, (yline + 7), 0);
++ 	maxtimerstats = maxy-16  -2;
++ 	maxwidth = maxx - 18;
++ 	suggestion_window = subwin(stdscr, 3, maxx, maxy-4, 0);
++@@ -108,7 +128,7 @@ void setup_windows(void)
++ 	strcpy(status_bar_slots[0], _(" Q - Quit "));
++ 	strcpy(status_bar_slots[1], _(" R - Refresh "));
++ 
++-	werase(stdscr);
+++	p_werase(stdscr);
++ 	refresh();
++ }
++ 
++@@ -139,55 +159,74 @@ void show_title_bar(void)
++ {
++ 	int i;
++ 	int x;
++-	wattrset(title_bar_window, COLOR_PAIR(PT_COLOR_HEADER_BAR));
++-	wbkgd(title_bar_window, COLOR_PAIR(PT_COLOR_HEADER_BAR));
++-	werase(title_bar_window);
+++	p_wattrset(title_bar_window, COLOR_PAIR(PT_COLOR_HEADER_BAR));
+++	p_wbkgd(title_bar_window, COLOR_PAIR(PT_COLOR_HEADER_BAR));
+++	p_werase(title_bar_window);
++ 
++ 	print(title_bar_window, 0, 0,  "     PowerTOP version %s      (C) 2007 Intel Corporation", VERSION);
++ 
++-	wrefresh(title_bar_window);
+++	p_wrefresh(title_bar_window);
++ 
++-	werase(status_bar_window);
+++	p_werase(status_bar_window);
++ 
++ 	x = 0;
++ 	for (i=0; i<10; i++) {
++ 		if (strlen(status_bar_slots[i])==0)
++ 			continue;
++-		wattron(status_bar_window, A_REVERSE);
+++		p_wattron(status_bar_window, A_REVERSE);
++ 		print(status_bar_window, 0, x, "%s", status_bar_slots[i]);
++-		wattroff(status_bar_window, A_REVERSE);
+++		p_wattroff(status_bar_window, A_REVERSE);
++ 		x+= strlen(status_bar_slots[i])+1;
++ 	}
++-	wrefresh(status_bar_window);
+++	p_wrefresh(status_bar_window);
++ }
++ 
++-void show_cstates(void)
+++void show_c_and_p_states(void)
++ {
++ 	int i, count = 0;
++-	werase(cstate_window);
++ 
++-	for (i=0; i < 10; i++) {
+++	p_werase(cstate_window);
+++
+++	for (i = 0; i <= MAX_CSTATE_LINES; i++) {
++ 		if (i == topcstate+1)
++-			wattron(cstate_window, A_BOLD);
+++			p_wattron(cstate_window, A_BOLD);
++ 		else
++-			wattroff(cstate_window, A_BOLD);
++-		if (strlen(cstate_lines[i]) && count <= 6) {
+++			p_wattroff(cstate_window, A_BOLD);
+++		if (strlen(cstate_lines[i])) {
++ 			print(cstate_window, count, 0, "%s", cstate_lines[i]);
++ 			count++;
++ 		}
++ 	}
++ 
++-	for (i=0; i<6; i++) {
+++	for (i = 0; i <= (dump ? MAX_NUM_PSTATES : maxpstate + 1); i++) {
++ 		if (i == topfreq+1)
++-			wattron(cstate_window, A_BOLD);
+++			p_wattron(cstate_window, A_BOLD);
++ 		else
++-			wattroff(cstate_window, A_BOLD);
+++			p_wattroff(cstate_window, A_BOLD);
++ 		print(cstate_window, i, 38, "%s", cpufreqstrings[i]);
++ 	}
++ 
++-	wrefresh(cstate_window);
+++	p_wrefresh(cstate_window);
++ }
++ 
+++void show_cstates(void)
+++{
+++
+++	if (!maxcstate) {
+++		strcpy(cstate_lines[0], "<C-state information is unavailable>\n");
+++		strcpy(cstate_lines[1], "");
+++		topcstate = 99; /* Dummy value, to avoid "bold" text */
+++	}
+++
+++	if (!maxpstate) {
+++		strcpy(cpufreqstrings[0],
+++		       "<P-state information is unavailable>\n");
+++		strcpy(cpufreqstrings[1], "");
+++		topfreq = 99; /* Dummy value, to avoid "bold" text */
+++	}
+++
+++	show_c_and_p_states();
+++}
++ 
++ void show_acpi_power_line(double rate, double cap, double capdelta, time_t ti)
++ {
++@@ -195,7 +234,7 @@ void show_acpi_power_line(double rate, d
++ 
++ 	sprintf(buffer,  _("no ACPI power usage estimate available") );
++ 
++-	werase(battery_power_window);
+++	p_werase(battery_power_window);
++ 	if (rate > 0.001) {
++ 		char *c;
++ 		sprintf(buffer, _("Power usage (ACPI estimate): %3.1fW (%3.1f hours)"), rate, cap/rate);
++@@ -208,7 +247,7 @@ void show_acpi_power_line(double rate, d
++ 		sprintf(buffer, _("Power usage (5 minute ACPI estimate) : %5.1f W (%3.1f hours left)"), 3600*capdelta / ti, cap / (3600*capdelta/ti+0.01));
++ 
++ 	print(battery_power_window, 0, 0, "%s\n", buffer);
++-	wrefresh(battery_power_window);
+++	p_wrefresh(battery_power_window);
++ }
++ 
++ void show_pmu_power_line(unsigned sum_voltage_mV,
++@@ -243,38 +282,38 @@ void show_pmu_power_line(unsigned sum_vo
++ 		snprintf(buffer, sizeof(buffer),
++ 			 _("no power usage estimate available") );
++ 
++-	werase(battery_power_window);
+++	p_werase(battery_power_window);
++ 	print(battery_power_window, 0, 0, "%s\n", buffer);
++-	wrefresh(battery_power_window);
+++	p_wrefresh(battery_power_window);
++ }
++ 
++ 
++ void show_wakeups(double d, double interval, double C0time)
++ {
++-	werase(wakeup_window);
+++	p_werase(wakeup_window);
++ 
++-	wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_RED));
+++	p_wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_RED));
++ 	if (d <= 25.0)
++-		wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_YELLOW));
+++		p_wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_YELLOW));
++ 	if (d <= 10.0)
++-		wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_GREEN));
+++		p_wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_GREEN));
++ 
++ 	/*
++ 	 * if the cpu is really busy.... then make it blue to indicate
++ 	 * that it's not the primary power consumer anymore
++ 	 */
++ 	if (C0time > 25.0)
++-		wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_BLUE));
+++		p_wbkgd(wakeup_window, COLOR_PAIR(PT_COLOR_BLUE));
++ 
++-	wattron(wakeup_window, A_BOLD);
+++	p_wattron(wakeup_window, A_BOLD);
++ 	print(wakeup_window, 0, 0, _("Wakeups-from-idle per second : %4.1f\tinterval: %0.1fs\n"), d, interval);
++-	wrefresh(wakeup_window);
+++	p_wrefresh(wakeup_window);
++ }
++ 
++ void show_timerstats(int nostats, int ticktime)
++ {
++ 	int i;
++-	werase(timerstat_window);
+++	p_werase(timerstat_window);
++ 
++ 	if (!nostats) {
++ 		int counter = 0;
++@@ -285,9 +324,9 @@ void show_timerstats(int nostats, int ti
++ 				if (lines[i].disk_count)
++ 					c = 'D';
++ 				if ((lines[i].count * 1.0 / ticktime) >= 10.0)
++-					wattron(timerstat_window, A_BOLD);
+++					p_wattron(timerstat_window, A_BOLD);
++ 				else
++-					wattroff(timerstat_window, A_BOLD);
+++					p_wattroff(timerstat_window, A_BOLD);
++ 				if (showpids)
++ 					print(timerstat_window, i+1, 0," %5.1f%% (%5.1f)%c  [%6s] %s\n", lines[i].count * 100.0 / linectotal,
++ 						lines[i].count * 1.0 / ticktime, c,
++@@ -308,12 +347,12 @@ void show_timerstats(int nostats, int ti
++ 	}
++ 
++ 
++-	wrefresh(timerstat_window);
+++	p_wrefresh(timerstat_window);
++ }
++ 
++ void show_suggestion(char *sug)
++ {
++-	werase(suggestion_window);
+++	p_werase(suggestion_window);
++ 	print(suggestion_window, 0, 0, "%s", sug);
++-	wrefresh(suggestion_window);
+++	p_wrefresh(suggestion_window);
++ }
++--- a/powertop.c
+++++ b/powertop.c
++@@ -41,9 +41,9 @@
++ #include "powertop.h"
++ 
++ 
++-uint64_t start_usage[8], start_duration[8];
++-uint64_t last_usage[8], last_duration[8];
++-char cnames[8][16];
+++uint64_t start_usage[MAX_NUM_CSTATES], start_duration[MAX_NUM_CSTATES];
+++uint64_t last_usage[MAX_NUM_CSTATES], last_duration[MAX_NUM_CSTATES];
+++char cnames[MAX_NUM_CSTATES][16];
++ 
++ double ticktime = 15.0;
++ 
++@@ -51,7 +51,8 @@ int interrupt_0, total_interrupt;
++ 
++ int showpids = 0;
++ 
++-static int maxcstate = 0;
+++int maxcstate;
+++int maxpstate;
++ int topcstate = 0;
++ 
++ int dump = 0;
++@@ -173,12 +174,52 @@ int update_irq(int irq, uint64_t count, 
++ 	return count;
++ }
++ 
++-static int percpu_hpet_timer(char *name)
+++static const char *clockevent_device[] = {
+++	"apbt",
+++	"hpet",
+++	NULL,
+++};
+++
+++static const char *timerlist_clockevent[] = {
+++	"Clock Event Device: apbt",
+++	"Clock Event Device: hpet",
+++	NULL,
+++};
+++
+++static char *is_percpu_clockevent(char *name)
+++{
+++	char *c;
+++	int i = 0;
+++
+++	while (clockevent_device[i]) {
+++		c = strstr(name, clockevent_device[i]);
+++		if (c)
+++			return c;
+++		i++;
+++	}
+++	return NULL;
+++}
+++
+++static char *is_timerlist_clockevent(char *name)
+++{
+++	char *c;
+++	int i = 0;
+++
+++	while (timerlist_clockevent[i]) {
+++		c = strstr(name, timerlist_clockevent[i]);
+++		if (c)
+++			return c;
+++		i++;
+++	}
+++	return NULL;
+++}
+++
+++static int is_percpu_timer(char *name)
++ {
++ 	static int timer_list_read;
++-	static int percpu_hpet_start = INT_MAX, percpu_hpet_end = INT_MIN;
+++	static int percpu_timer_start = INT_MAX, percpu_timer_end = INT_MIN;
++ 	char *c;
++-	long hpet_chan;
+++	long timer_chan;
++ 
++ 	if (!timer_list_read) {
++ 		char file_name[20];
++@@ -193,24 +234,23 @@ static int percpu_hpet_timer(char *name)
++ 
++ 		while (fgets(ln, sizeof(ln), fp) != NULL)
++ 		{
++-			c = strstr(ln, "Clock Event Device: hpet");
+++			c = is_timerlist_clockevent(ln);
++ 			if (!c)
++ 				continue;
++-
++ 			c += 24;
++ 			if (!isdigit(c[0]))
++ 				continue;
++ 
++-			hpet_chan = strtol(c, NULL, 10);
++-			if (hpet_chan < percpu_hpet_start)
++-				percpu_hpet_start = hpet_chan;
++-			if (hpet_chan > percpu_hpet_end)
++-				percpu_hpet_end = hpet_chan;
+++			timer_chan = strtol(c, NULL, 10);
+++			if (timer_chan < percpu_timer_start)
+++				percpu_timer_start = timer_chan;
+++			if (timer_chan > percpu_timer_end)
+++				percpu_timer_end = timer_chan;
++ 		}
++ 		fclose(fp);
++ 	}
++ 
++-	c = strstr(name, "hpet");
+++	c = is_percpu_clockevent(name);
++ 	if (!c)
++ 		return 0;
++ 
++@@ -218,8 +258,8 @@ static int percpu_hpet_timer(char *name)
++ 	if (!isdigit(c[0]))
++ 		return 0;
++ 
++-	hpet_chan = strtol(c, NULL, 10);
++-	if (percpu_hpet_start <= hpet_chan && hpet_chan <= percpu_hpet_end)
+++	timer_chan = strtol(c, NULL, 10);
+++	if (percpu_timer_start <= timer_chan && timer_chan <= percpu_timer_end)
++ 		return 1;
++ 
++ 	return 0;
++@@ -317,7 +357,7 @@ static void do_proc_irq(void)
++ 			sprintf(line2, _("%s interrupt"), _("PS/2 keyboard/mouse/touchpad"));
++ 
++ 		/* skip per CPU timer interrupts */
++-		if (percpu_hpet_timer(name))
+++		if (is_percpu_timer(name))
++ 			delta = 0;
++ 
++ 		if (nr > 0 && delta > 0)
++@@ -330,6 +370,11 @@ static void do_proc_irq(void)
++ 	fclose(file);
++ }
++ 
+++static int is_invalid_dir(char *d_name)
+++{
+++	return (strcmp(d_name, ".") == 0) || (strcmp(d_name, "..") == 0);
+++}
+++
++ static void read_data_acpi(uint64_t * usage, uint64_t * duration)
++ {
++ 	DIR *dir;
++@@ -346,7 +391,7 @@ static void read_data_acpi(uint64_t * us
++ 	if (!dir)
++ 		return;
++ 	while ((entry = readdir(dir))) {
++-		if (strlen(entry->d_name) < 3)
+++		if (is_invalid_dir(entry->d_name))
++ 			continue;
++ 		sprintf(line, "/proc/acpi/processor/%s/power", entry->d_name);
++ 		file = fopen(line, "r");
++@@ -371,7 +416,9 @@ static void read_data_acpi(uint64_t * us
++ 			duration[clevel] += strtoull(c, NULL, 10);
++ 
++ 			clevel++;
++-			if (clevel > maxcstate)
+++			/* set maxcstate only if clevel is a valid state */
+++			if (clevel > maxcstate &&
+++			    (usage[clevel] || duration[clevel]))
++ 				maxcstate = clevel;
++ 
++ 		}
++@@ -399,7 +446,7 @@ static void read_data_cpuidle(uint64_t *
++ 
++ 	/* Loop over cpuN entries */
++ 	while ((entry = readdir(cpudir))) {
++-		if (strlen(entry->d_name) < 3)
+++		if (is_invalid_dir(entry->d_name))
++ 			continue;
++ 
++ 		if (!isdigit(entry->d_name[3]))
++@@ -409,15 +456,17 @@ static void read_data_cpuidle(uint64_t *
++ 			      entry->d_name);
++ 
++ 		dir = opendir(filename);
++-		if (!dir)
+++		if (!dir) {
+++			closedir(cpudir);
++ 			return;
+++		}
++ 
++ 		clevel = 0;
++ 
++ 		/* For each C-state, there is a stateX directory which
++ 		 * contains a 'usage' and a 'time' (duration) file */
++ 		while ((entry = readdir(dir))) {
++-			if (strlen(entry->d_name) < 3)
+++			if (is_invalid_dir(entry->d_name))
++ 				continue;
++ 			sprintf(filename + len, "/%s/desc", entry->d_name);
++ 			file = fopen(filename, "r");
++@@ -450,6 +499,10 @@ static void read_data_cpuidle(uint64_t *
++ 					sprintf(cnames[clevel], "%s\t", "C1 halt");
++ 				}
++ 			}
+++
+++			if (clevel > maxcstate)
+++				maxcstate = clevel;
+++
++ 			sprintf(filename + len, "/%s/usage", entry->d_name);
++ 			file = fopen(filename, "r");
++ 			if (!file)
++@@ -477,9 +530,6 @@ static void read_data_cpuidle(uint64_t *
++ 			duration[clevel] += 1+strtoull(line, NULL, 10);
++ 
++ 			clevel++;
++-			if (clevel > maxcstate)
++-				maxcstate = clevel;
++-
++ 		}
++ 		closedir(dir);
++ 
++@@ -572,7 +622,7 @@ int print_battery_proc_acpi(void)
++ 		double watts_left = 0.0;
++ 		char line[1024];
++ 
++-		if (strlen(dirent->d_name) < 3)
+++		if (is_invalid_dir(dirent->d_name))
++ 			continue;
++ 
++ 		sprintf(filename, "/proc/acpi/battery/%s/state", dirent->d_name);
++@@ -824,7 +874,7 @@ void print_battery_sysfs(void)
++ 	show_acpi_power_line(rate, cap, prev_bat_cap - cap, time(NULL) - prev_bat_time);
++ }
++ 
++-char cstate_lines[12][200];
+++char cstate_lines[MAX_CSTATE_LINES][200];
++ 
++ void usage()
++ {
++@@ -848,7 +898,7 @@ int main(int argc, char **argv)
++ 	char line[1024];
++ 	int ncursesinited=0;
++ 	FILE *file = NULL;
++-	uint64_t cur_usage[8], cur_duration[8];
+++	uint64_t cur_usage[MAX_NUM_CSTATES], cur_duration[MAX_NUM_CSTATES];
++ 	double wakeups_per_second = 0;
++ 
++ 	setlocale (LC_ALL, "");
++@@ -957,25 +1007,22 @@ int main(int argc, char **argv)
++ 		do_proc_irq();
++ 		read_data(&cur_usage[0], &cur_duration[0]);
++ 
+++		if (maxcstate >= MAX_NUM_CSTATES) {
+++			printf("Actual CSTATES (%d) > MAX_NUM_CSTATES (%d)!\n",
+++				maxcstate+1, MAX_NUM_CSTATES);
+++			exit(1);
+++		}
+++
++ 		totalticks = 0;
++ 		totalevents = 0;
++-		for (i = 0; i < 8; i++)
+++		for (i = 0; i <= maxcstate; i++)
++ 			if (cur_usage[i]) {
++ 				totalticks += cur_duration[i] - last_duration[i];
++ 				totalevents += cur_usage[i] - last_usage[i];
++ 			}
++ 
++-		if (!dump) {
++-			if (!ncursesinited) {
++-				initialize_curses();
++-				ncursesinited++;
++-			}
++-			setup_windows();
++-			show_title_bar();
++-		}
++-
++ 		memset(&cstate_lines, 0, sizeof(cstate_lines));
++-		topcstate = -4;
+++		topcstate = -(maxcstate);
++ 		if (totalevents == 0 && maxcstate <= 1) {
++ 			sprintf(cstate_lines[5],_("< Detailed C-state information is not available.>\n"));
++ 		} else {
++@@ -989,7 +1036,7 @@ int main(int argc, char **argv)
++ 			sprintf(cstate_lines[1], _("C0 (cpu running)        (%4.1f%%)\n"), percentage);
++ 			if (percentage > 50)
++ 				topcstate = 0;
++-			for (i = 0; i < 8; i++)
+++			for (i = 0; i <= maxcstate; i++)
++ 				if (cur_usage[i]) {
++ 					sleept = (cur_duration[i] - last_duration[i]) / (cur_usage[i] - last_usage[i]
++ 											+ 0.1) / FREQ;
++@@ -1010,6 +1057,21 @@ int main(int argc, char **argv)
++ 				}
++ 		}
++ 		do_cpufreq_stats();
+++
+++		if (maxpstate > MAX_NUM_PSTATES) {
+++			printf("Actual PSTATES (%d) > MAX_NUM_PSTATES (%d)!\n",
+++				maxpstate, MAX_NUM_PSTATES);
+++			exit(1);
+++		}
+++
+++		if (!dump) {
+++			if (!ncursesinited) {
+++				initialize_curses();
+++				ncursesinited++;
+++			}
+++			setup_windows();
+++			show_title_bar();
+++		}
++ 		show_cstates();
++ 		/* now the timer_stats info */
++ 		memset(line, 0, sizeof(line));
++@@ -1090,7 +1152,7 @@ int main(int argc, char **argv)
++ 		}
++ 
++ 		if (file)
++-			pclose(file);
+++			fclose(file);
++ 
++ 		reset_suggestions();
++ 
++@@ -1191,8 +1253,8 @@ int main(int argc, char **argv)
++ 		suggest_kernel_config("CONFIG_CPU_FREQ_STAT", 1,
++ 				    _("Suggestion: Enable the CONFIG_CPU_FREQ_STAT kernel configuration option.\n"
++ 				      "This option allows PowerTOP to show P-state percentages \n" "P-states correspond to CPU frequencies."), 2);
++-		suggest_kernel_config("CONFIG_INOTIFY", 1,
++-				    _("Suggestion: Enable the CONFIG_INOTIFY kernel configuration option.\n"
+++		suggest_kernel_config("CONFIG_INOTIFY_USER", 1,
+++				    _("Suggestion: Enable the CONFIG_INOTIFY_USER kernel configuration option.\n"
++ 				      "This option allows programs to wait for changes in files and directories\n"
++ 				      "instead of having to poll for these changes"), 5);
++ 
++--- /dev/null
+++++ b/debian/compat
++@@ -0,0 +1 @@
+++9
++--- /dev/null
+++++ b/debian/copyright
++@@ -0,0 +1,33 @@
+++This package was debianized by Petter Reinholdtsen <pere@hungry.com> on
+++Sat May 12 23:22:21 CEST 2007.
+++
+++It was downloaded from http://www.lesswatts.org/projects/powertop/download/
+++
+++Upstream Author:
+++
+++    Arjan van de Ven <arjan@linux.intel.com>
+++
+++Copyright:
+++
+++    Copyright 2007 Intel Corporation
+++
+++License:
+++
+++    This package is free software; you can redistribute it and/or modify
+++    it under the terms of the GNU General Public License as published by
+++    the Free Software Foundation version 2 of the License.
+++
+++    This package is distributed in the hope that it will be useful,
+++    but WITHOUT ANY WARRANTY; without even the implied warranty of
+++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+++    GNU General Public License for more details.
+++
+++    You should have received a copy of the GNU General Public License
+++    along with this package; if not, write to the Free Software
+++    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
+++
+++On Debian systems, the complete text of the GNU General
+++Public License can be found in `/usr/share/common-licenses/GPL-2'.
+++
+++The Debian packaging is copyrighted 2007, Petter Reinholdtsen <pere@hungry.com> and
+++is licensed under the GPL, see above.
++--- /dev/null
+++++ b/debian/watch
++@@ -0,0 +1,3 @@
+++version=3
+++http://www.lesswatts.org/projects/powertop/download.php \
+++ download/powertop-([\d\.]*).tar.gz
++--- /dev/null
+++++ b/debian/control
++@@ -0,0 +1,25 @@
+++Source: powertop-1.13
+++Section: utils
+++Priority: optional
+++Maintainer: Steve Langasek <steve.langasek@ubuntu.com>
+++Build-Depends: debhelper (>= 8~), libncursesw5-dev, libncurses5-dev
+++Standards-Version: 3.9.2
+++Homepage: http://www.lesswatts.org/projects/powertop/
+++
+++Package: powertop-1.13
+++Architecture: any
+++Depends: ${shlibs:Depends}, ${misc:Depends}
+++Suggests: cpufrequtils, laptop-mode-tools
+++Description: Linux tool to find out what is using power on a laptop
+++ PowerTOP is a Linux tool that finds the software component(s) that
+++ make your laptop use more power than necessary while it is idle. As of
+++ Linux kernel version 2.6.21, the kernel no longer has a fixed 1000Hz
+++ timer tick. This will (in theory) give a huge power savings because
+++ the CPU stays in low power mode for longer periods of time during
+++ system idle.
+++ .
+++ However... there are many things that can ruin the party, both inside
+++ the kernel and in userspace. PowerTOP combines various sources of
+++ information from the kernel into one convenient screen so that you can
+++ see how well your system is doing, and which components are the
+++ biggest problem.
++--- /dev/null
+++++ b/debian/rules
++@@ -0,0 +1,15 @@
+++#!/usr/bin/make -f
+++
+++%:
+++	dh $@
+++
+++override_dh_auto_install:
+++	make install BINDIR=/usr/sbin DESTDIR=`pwd`/debian/powertop-1.13
+++	mv debian/powertop-1.13/usr/sbin/powertop \
+++		debian/powertop-1.13/usr/sbin/powertop-1.13
+++	mv debian/powertop-1.13/usr/share/man/man8/powertop.8.gz \
+++	   debian/powertop-1.13/usr/share/man/man8/powertop-1.13.8.gz
+++
+++override_dh_auto_build:
+++	dh_auto_build
+++	make uptrans || true
++--- /dev/null
+++++ b/debian/changelog
++@@ -0,0 +1,280 @@
+++powertop-1.13 (1.13-1ubuntu2~oneiric2) oneiric-backports; urgency=low
+++
+++  * Soften debhelper build-dep to alleviate depwait. (LP: #891112)
+++
+++ -- Evan Broder <evan@ebroder.net>  Sat, 10 Dec 2011 10:29:19 -0800
+++
+++powertop-1.13 (1.13-1ubuntu2~oneiric1) oneiric-backports; urgency=low
+++
+++  * Automated backport upload; no source changes.
+++
+++ -- Evan Broder <evan@ebroder.net>  Mon, 28 Nov 2011 14:22:05 +0000
+++
+++powertop-1.13 (1.13-1ubuntu2) precise; urgency=low
+++
+++  * Merge powertop Ubuntu bits from 1.13-1ubuntu1 to 1.13-1.1ubuntu1 including
+++    Debian's 1.13-1.1.
+++  * Fix watch file to work against the upstream download page rather than the
+++    download dir which wont list released tarballs.
+++  * Merge latest upstream bits from gitorious repo f5d9a33..f0a31eb; fix
+++    various bugs, improve support for some Intel platforms, additional
+++    P-states, ARM and more; keep only Debian/Ubuntu change to Makefile (change
+++    "CFLAGS ?=" to "CFLAGS =" to avoid overriding CFLAGS during build -- not
+++    exactly sure why it's a good idea though).
+++  * Bump Standards-Version.
+++  * Use old powertop (1.x) Homepage in control.
+++  * Drop useless debian/manpages.
+++
+++ -- Loïc Minier <loic.minier@ubuntu.com>  Sun, 13 Nov 2011 23:04:01 +0100
+++
+++powertop-1.13 (1.13-1ubuntu1) precise; urgency=low
+++
+++  [ Steve Langasek ]
+++  * Reintroduce the old version of powertop as a separate source package.
+++
+++  [ Jamie Strandboge ]
+++  * add Makefile change present in the Debian tarball but not present in the
+++    upstream tarball
+++  * debian/copyright: update download location
+++
+++ -- Jamie Strandboge <jamie@ubuntu.com>  Fri, 11 Nov 2011 13:36:57 -0600
+++
+++powertop (1.13-1.1ubuntu1) natty; urgency=low
+++
+++  * Merge from debian unstable (LP: #681768), remaining changes:
+++    - Cherrypick upstream patch 0a8620213f1841a to stop hardcoding the maximum
+++      number of C and P states. This makes powertop work on ARM processors as
+++      well, which have a lot of those states. Thanks to Amit Arora for the
+++      patch! (LP: #627975)
+++
+++ -- Jesper Larsen <knorr@es.aau.dk>  Fri, 26 Nov 2010 15:24:12 +0100
+++
+++powertop (1.13-1.1) unstable; urgency=low
+++
+++  * Non-maintainer upload.
+++  * Add missing include to fix FTBFS on ia64 and alpha (Closes: #570662)
+++
+++ -- Serafeim Zanikolas <sez@debian.org>  Fri, 15 Oct 2010 00:07:37 +0200
+++
+++powertop (1.13-1ubuntu1) maverick; urgency=low
+++
+++  * Cherrypick upstream patch 0a8620213f1841a to stop hardcoding the maximum
+++    number of C and P states. This makes powertop work on ARM processors as
+++    well, which have a lot of those states. Thanks to Amit Arora for the
+++    patch! (LP: #627975)
+++
+++ -- Martin Pitt <martin.pitt@ubuntu.com>  Wed, 15 Sep 2010 13:43:46 +0200
+++
+++powertop (1.13-1) unstable; urgency=low
+++
+++  * New upstream version
+++    + Should fix FTBFS an alpha (Closes: #570662)
+++    + Fix crash with too long config files (Closes: #589438)
+++
+++ -- Patrick Winnertz <winnie@debian.org>  Thu, 29 Jul 2010 11:32:48 +0200
+++
+++powertop (1.13~pre20100125-1) unstable; urgency=low
+++
+++  * Package git snapshot from 2010-01-25 (Closes: #563498)
+++    - fix reporting of incorrect wattage
+++      (Closes: #497929, #558776)
+++    - doesn't exit when xterm is resized (Closes: #488973)
+++    - show P-states again in some rare cases (Closes: #562516)
+++      at least this bug is not longer reproducable with this
+++      new version
+++    - number of wakeups should be now correct (Closes: #502596)
+++    - manpage contains now more informations (Closes: #470498)
+++  * remove now unneeded patches and dropped dpatch build system
+++  * bumped standards version to 3.8.3, no further changes needed
+++  * fix lintian warning about copyright template
+++
+++ -- Patrick Winnertz <winnie@debian.org>  Mon, 25 Jan 2010 23:20:55 +0100
+++
+++powertop (1.11-1) unstable; urgency=low
+++
+++  * New upstream release
+++     + reports now correct wattage (at least for me) (Closes: #497929)
+++  * Add patch in order to remove bashism in output (Closes: #509811)
+++  * Removed patches as they are now applied upstream:
+++     + patches/fix-eof.dpatch
+++     + patches/add-support-for-charge_now.dpatch
+++     + patches/fix-suggest-usb-autosuspend.dpatch
+++     + patches/fix-hal-disable-polling.dpatch
+++
+++
+++ -- Patrick Winnertz <winnie@debian.org>  Tue, 13 Jan 2009 00:02:01 +0100
+++
+++powertop (1.10-2) unstable; urgency=high
+++
+++  * Support batteries that do not report energy_now, by reading change_now.
+++    (Closes: #486873, #495638, #495348)
+++
+++ -- Patrick Winnertz <winnie@debian.org>  Mon, 01 Sep 2008 20:31:51 +0200
+++
+++powertop (1.10-1) unstable; urgency=low
+++
+++  * New upstream version (Closes: #486510)
+++    - changed from proc to sys interface (Closes: #462796, #483603)
+++  * Build a PO template on package build (Closes: #471852)
+++  * spell Linux correctly: Linux (control file)
+++  * powertop now quits if it get a EOF (Closes: 458984)
+++  * Updated watch file (Closes: #486509)
+++  * Removed usb patch, source has changed completely. hopefully it was fixed
+++    by upstream.
+++
+++ -- Patrick Winnertz <winnie@debian.org>  Mon, 16 Jun 2008 23:55:10 +0200
+++
+++powertop (1.9-2) unstable; urgency=low
+++
+++  * Changed my maintainer address
+++  * Bumped Standards-Version to 3.7.3.
+++  * Instead of using /dev/scd0 as disk drive use /dev/cdrom for
+++    hal-disable-polling (Created patch fix-hal-disable-polling.dpatch)
+++    (Closes: #443594)
+++  * This time fix really the usb autosuspend issue. (Closes: #444817)
+++  * Add a Homepage field to control.
+++
+++ -- Patrick Winnertz <winnie@debian.org>  Sun, 16 Dec 2007 23:33:32 +0100
+++
+++powertop (1.9-1) unstable; urgency=low
+++
+++  * Packaging new upstream release. (Closes: #451370)
+++  * Fix the wrong implementation of usb autosuspend (Closes: #444817)
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Thu, 22 Nov 2007 13:17:38 +0100
+++
+++powertop (1.8-1) unstable; urgency=low
+++
+++  * Packaging new upstream release.
+++  * Correct the dependency to laptop-mode-tools. (Closes: #438616)
+++  * Correct the command line syntax of hal-disable-polling (Closes: #435882)
+++  * Allow powertop to build on all archs since some information are still
+++    there (wakeup counts).
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Mon, 20 Aug 2007 22:23:53 +0200
+++
+++powertop (1.7~svn-r227-3) unstable; urgency=low
+++
+++  * debian/control:
+++   + Changed the `arch" field to: `i386 amd64 ia64'. (Closes: #435972)
+++  * debian/copyright:
+++   + Fixed the license related issue, updated to just GPL2 including the
+++   license address to `/usr/share/common-licenses/GPL-2'. (Closes: #436367)
+++
+++ -- Jose Luis Rivas <ghostbar38@gmail.com>  Thu, 16 Aug 2007 23:01:09 -0400
+++
+++powertop (1.7~svn-r227-2) unstable; urgency=low
+++
+++  * Thanks to Krzysztof Burghardt for the new package release, but
+++    remove him as co-maintainer, as he is none after all
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Fri, 13 Jul 2007 20:39:21 +0200
+++
+++powertop (1.7~svn-r227-1) unstable; urgency=low
+++
+++  * New co-maintainer
+++  * New upstream (closes: #429305, #430035, #427345)
+++  * Moved binary to /usr/sbin as it need to be run by root (closes: #427548)
+++  * debian/copyright:
+++   + changed a bit to fulfill standard look
+++
+++ -- Krzysztof Burghardt <krzysztof@burghardt.pl>  Sat, 23 Jun 2007 20:30:02 +0200
+++
+++powertop (1.5-2) unstable; urgency=low
+++
+++  * debian/control:
+++   + Two leading spaces for Homepage (Closes: #426606)
+++  * debian/changelog:
+++   + Fixed typo on "Cooperation" now "Corporation" (Closes: #426605)
+++
+++ -- Jose Luis Rivas <ghostbar38@gmail.com>  Wed, 30 May 2007 08:46:08 -0400
+++
+++powertop (1.5-1) unstable; urgency=low
+++
+++  * New upstream release available (Closes: #426507)
+++  * Adding Build-Depends: libncursesw5-dev since powertop fails to build without it.
+++  * Modified debian/copyright:
+++    - added (c) 2007 Intel Corporation
+++    - powertop is licensed under GPL v2 (added v2)
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Tue, 29 May 2007 13:43:06 +0200
+++
+++powertop (1.4-2) unstable; urgency=low
+++
+++  [ Jose Luis Rivas ]
+++  * debian/control:
+++   + Fixed the Homepage field (Closes: #426205)
+++   + Modified the uploader name to "Jose Luis Rivas"
+++
+++  [ Patrick Winnertz ]
+++  * Fixed FTBFS, by depending on libncurses5-dev (Closes: #426235)
+++  * Uses $(CURDIR) instead of `pwd` in rules.
+++  * Upload sponsored by Petter Reinholdtsen
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Sun, 27 May 2007 17:59:38 +0200
+++
+++powertop (1.4-1) unstable; urgency=low
+++
+++  * New upstream release
+++  * Now powertop uses the full width of a terminal. (Fixed by upstream)
+++    (Closes: #423735)
+++  * Changed the destdir in debian/rules so that the locale files are installed correctly
+++    to debian/powertop/usr/share/locale/:
+++      - DESTDIR=debian/powertop  --> DESTDIR=`pwd`/debian/powertop
+++  * Upload sponsored by Petter Reinholdtsen
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Sat, 26 May 2007 17:24:27 +0200
+++
+++powertop (1.3-1) unstable; urgency=low
+++
+++  * New upstream release (Closes: #425498)
+++  * Suggests cpufrequtils (Closes: #423986)
+++  * Clean up debian/rules:
+++      - removes simple-patchsys.mk since it not used
+++      - remove the installation of the manpage since we now use debian/manpages
+++        ( Thanks to Jose )
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Fri, 25 May 2007 16:48:52 +0200
+++
+++powertop (1.2-1) unstable; urgency=low
+++
+++  * New upstream release available.
+++  * Took the package from pere, and added me as Maintainer and Jose Luis
+++    Rivas Contreras into the Uploader field.
+++  * Removed the manpage from the debian-dir since it is now upstream and adjusted
+++    the install command in debian/rules.
+++  * Removed the makefile patch, since it is now upstream
+++
+++ -- Patrick Winnertz <patrick.winnertz@skolelinux.org>  Wed, 16 May 2007 12:35:58 +0200
+++
+++powertop (1.1-3) unstable; urgency=low
+++
+++  * Add watch file written by  Ralf Meyer for Ubuntu.  Removed
+++    most of the examples.
+++
+++ -- Petter Reinholdtsen <pere@debian.org>  Mon, 14 May 2007 08:08:24 +0200
+++
+++powertop (1.1-2) unstable; urgency=low
+++
+++  * Add powertop(1) manual page.  Written by Carlo
+++    Segre. (Closes: #423607)
+++
+++ -- Petter Reinholdtsen <pere@debian.org>  Sun, 13 May 2007 21:13:00 +0200
+++
+++powertop (1.1-1) unstable; urgency=low
+++
+++  * New upstream release.
+++  * Rewrite debian/rules to use cdbs and simple-patchsys.
+++  * Change section from x11 to utils.  It make more sense
+++    for this tool.
+++  * Rewrite 10_makefile.patch as most of the changes are
+++    included upstream.
+++
+++ -- Petter Reinholdtsen <pere@debian.org>  Sun, 13 May 2007 12:10:15 +0200
+++
+++powertop (1.0-1) unstable; urgency=low
+++
+++  * Initial release (Closes: #423504)
+++
+++ -- Petter Reinholdtsen <pere@debian.org>  Sat, 12 May 2007 23:13:05 +0200
+++
++--- /dev/null
+++++ b/debian/source/format
++@@ -0,0 +1 @@
+++1.0
++--- a/po/ro.po
+++++ b/po/ro.po
++@@ -2,102 +2,98 @@
++ # Copyright (C) 2009 The anerley copyright holder
++ # This file is distributed under the same license as the anerley package.
++ # Cosmin Bordeianu <elloxar@gmail.com>, 2009.
++-#
+++# Lucian Adrian Grijincu <lucian.grijincu@gmail.com>, 2010.
++ msgid ""
++ msgstr ""
++ "Project-Id-Version: powertop\n"
++ "Report-Msgid-Bugs-To: \n"
++-"POT-Creation-Date: 2009-08-12 15:39-0700\n"
++-"PO-Revision-Date: 2009-09-14 12:23+0200\n"
++-"Last-Translator: Cosmin Bordeianu <elloxar@gmail.com>\n"
++-"Language-Team: Moblin Romania <live@moblin.ro>\n"
+++"POT-Creation-Date: 2010-07-31 02:32+0000\n"
+++"PO-Revision-Date: 2010-08-15 19:06+0300\n"
+++"Last-Translator: Lucian Adrian Grijincu <lucian.grijincu@gmail.com>\n"
+++"Language-Team: Romanian Gnome Team <gnomero-list@lists.sourceforge.net>\n"
+++"Language: ro\n"
++ "MIME-Version: 1.0\n"
++ "Content-Type: text/plain; charset=utf-8\n"
++ "Content-Transfer-Encoding: 8bit\n"
++-"X-Poedit-Language: Romanian\n"
+++"Plural-Forms: nplurals=3; plural=(n==1 ? 0 : (n==0 || (n%100 > 0 && n%100 < "
+++"20)) ? 1 : 2);;\n"
+++"X-Generator: Virtaal 0.6.1\n"
+++"X-Launchpad-Export-Date: 2010-08-15 13:40+0000\n"
++ "X-Poedit-Country: ROMANIA\n"
+++"X-Poedit-Language: Romanian\n"
++ "X-Poedit-SourceCharset: utf-8\n"
++ 
++-#: ../powertop.c:303
++-#: ../powertop.c:306
++-#, c-format
++-msgid "    <interrupt> : %s"
++-msgstr "    <întrerupe> : %s"
++-
++-#: ../powertop.c:1072
++-msgid "    <interrupt> : extra timer interrupt"
++-msgstr "    <întrerupe> : întrerupere extra timp"
++-
++-#: ../powertop.c:301
++-#, c-format
++-msgid "   <kernel IPI> : %s"
++-msgstr "   <IPI kernel> : %s"
++-
++-#: ../powertop.c:821
+++#: ../powertop.c:832
++ #, c-format
++-msgid "  -d, --dump            read wakeups once and print list of top offenders\n"
++-msgstr "  -d, --dump            citește o dată pornirile și imprimă o listă cu contravențiile importante\n"
+++msgid ""
+++"  -d, --dump            read wakeups once and print list of top offenders\n"
+++msgstr "  -d, --dump            citește o dată pornirile și imprimă o listă cu "
+++"contravențiile importante\n"
++ 
++-#: ../powertop.c:824
+++#: ../powertop.c:835
++ #, c-format
++ msgid "  -h, --help            Show this help message\n"
++ msgstr "  -h, --help            Arată acest mesaj de ajutor\n"
++ 
++-#: ../powertop.c:823
+++#: ../powertop.c:834
++ #, c-format
++ msgid "  -p, --pids            show pids in wakeups list\n"
++ msgstr "  -p, --pids            arată aceste pid-uri în lista de porniri\n"
++ 
++-#: ../powertop.c:822
+++#: ../powertop.c:833
++ #, c-format
++ msgid "  -t, --time=DOUBLE     default time to gather data in seconds\n"
++ msgstr "  -t, --time=DOUBLE     timpul implicit în secunde pentru a colecta date\n"
++ 
++-#: ../powertop.c:825
+++#: ../powertop.c:836
++ #, c-format
++ msgid "  -v, --version         Show version information and exit\n"
++-msgstr "  -v, --version         Arată informații despre versiune apoi părăsește pagina\n"
+++msgstr "  -v, --version         Arată informații despre versiune și ieși\n"
++ 
++ #: ../misctips.c:125
++ msgid " A - Turn AC97 powersave on "
++ msgstr " A - Activează economizatorul de energie pentru AC97 "
++ 
++-#: ../misctips.c:165
+++#: ../alsa-power.c:195 ../misctips.c:165
++ msgid " A - Turn HD audio powersave on "
++-msgstr " A - Activează economizatorul de energie audio pentru HD "
+++msgstr " A - Activează economizatorul de energie pentru HD audio"
++ 
++-#: ../bluetooth.c:146
+++#: ../bluetooth.c:152
++ msgid " B - Turn Bluetooth off "
++ msgstr " B - Dezactivează Bluetooth "
++ 
++-#: ../misctips.c:257
+++#: ../misctips.c:256
++ msgid " C - Power aware CPU scheduler "
++-msgstr " C - Jurnalul de putere a procesorului "
+++msgstr " C - Planificator de procesor care ia în considerare consumul energetic"
++ 
++-#: ../wifi-new.c:196
+++#: ../wifi-new.c:198
++ msgid " D - disable wireless "
++ msgstr " D - dezactivează conexiunea fără fir "
++ 
++-#: ../wireless.c:322
+++#: ../wireless.c:317
++ msgid " I - disable WIFI Radio "
++-msgstr " I - dezactivează Radio WIFI"
+++msgstr " I - dezactivează Radio WIFI "
++ 
++-#: ../process.c:84
+++#: ../process.c:86
++ #, c-format
++ msgid " K - kill %s "
++ msgstr " K - termină %s "
++ 
++ #: ../misctips.c:61
++ msgid " N - Turn NMI watchdog off "
++-msgstr " N - Dezactivează gardianul NMI"
+++msgstr " N - Dezactivează gardianul NMI "
++ 
++ #: ../cpufreq.c:118
++ msgid " O - enable Ondemand governor "
++ msgstr " O - activează guvernatorul Ondemand "
++ 
++-#: ../wifi-new.c:201
++-msgid " P - Enable wireless power saving "
++-msgstr " P - Activează economizatorul de energie pentru conexiunea fără fir "
+++#: ../devicepm.c:123
+++msgid " P - Enable Runtime PM"
+++msgstr " P - Activează managementul consumului în timpul execuției"
+++
+++#: ../devicepm.c:378
+++msgid " P - Enable device power management "
+++msgstr " P - Activează gestiunea consumului dispozitivelor"
++ 
++ #: ../display.c:108
++ msgid " Q - Quit "
++@@ -107,16 +103,15 @@ msgstr " Q - Ieșire "
++ msgid " R - Refresh "
++ msgstr " R - Reîmprospătare "
++ 
++-#: ../sata.c:104
+++#: ../ahci-alpm.c:259 ../sata.c:105
++ msgid " S - SATA Link Power Management "
++-msgstr " S - Gestionarea Consumului de Energie pentru SATA Link "
+++msgstr " S - Gestionarea consumului de energie pentru SATA Link "
++ 
++ #: ../misctips.c:194
++ msgid " T - enable noatime "
++ msgstr " T - activează noatime "
++ 
++-#: ../urbnum.c:222
++-#: ../usb.c:116
+++#: ../urbnum.c:218 ../usb.c:119
++ msgid " U - Enable USB suspend "
++ msgstr " U - Permite suspendarea USB-ului "
++ 
++@@ -124,14 +119,17 @@ msgstr " U - Permite suspendarea USB-ulu
++ msgid " V - Disable TV out "
++ msgstr " V - Dezactivează ieșirea TV "
++ 
++-#: ../wireless.c:311
++-#: ../wireless.c:317
+++#: ../wifi-new.c:203
+++msgid " W - Enable Wireless power saving "
+++msgstr " W - Activează economizatorul de energie pentru conexiunea fără fir "
+++
+++#: ../wireless.c:306 ../wireless.c:312
++ msgid " W - Enable wireless power saving "
++ msgstr " W - Activează economizatorul de energie pentru conexiunea fără fir "
++ 
++-#: ../misctips.c:292
+++#: ../misctips.c:291
++ msgid " W - Increase Writeback time "
++-msgstr " W - Mărește timpul de Răspuns în scris "
+++msgstr " W - Mărește timpul de scriere înapoi a datelor (writeback) "
++ 
++ #: ../ethernet.c:131
++ msgid " W - disable Wake-On-Lan "
++@@ -140,47 +138,57 @@ msgstr " W - dezactivează Wake-On-Lan "
++ #: ../cpufreqstats.c:91
++ #, c-format
++ msgid "%6.2f Ghz"
++-msgstr "%6.2f Ghz"
+++msgstr "%6.2f GHz"
++ 
++ #: ../cpufreqstats.c:88
++ #, c-format
++ msgid "%6lli Mhz"
++-msgstr "%6lli Mhz"
+++msgstr "%6lli MHz"
++ 
++ #: ../cpufreqstats.c:85
++ #, c-format
++ msgid "%9lli"
++ msgstr "%9lli"
++ 
++-#: ../powertop.c:983
+++#: ../devicepm.c:347
+++#, c-format
+++msgid "%i more devices without runtime PM ommitted\n"
+++msgstr "%i dispozitive fără management al consumului în timpul execuției omise\n"
+++
+++#: ../powertop.c:1003
++ #, c-format
++ msgid "%s\t%5.1fms (%4.1f%%)\n"
++ msgstr "%s\t%5.1fms (%4.1f%%)\n"
++ 
+++#: ../powertop.c:317
+++#, c-format
+++msgid "%s interrupt"
+++msgstr "întrerupere %s"
+++
++ #: ../display.c:205
++ #, c-format
++ msgid "(long term: %3.1fW,/%3.1fh)"
++ msgstr "(termen lung: %3.1fW,/%3.1fh)"
++ 
++-#: ../display.c:301
+++#: ../display.c:304
++ msgid "(which is CONFIG_DEBUG_KERNEL=y in the config file)\n"
++ msgstr "(care este CONFIG_DEBUG_KERNEL=y în fișierul de configurare)\n"
++ 
++-#: ../powertop.c:960
+++#: ../powertop.c:980
++ #, c-format
++ msgid "< Detailed C-state information is not available.>\n"
++-msgstr "< Informații detaliate despre C-state nu sunt disponibile.>\n"
+++msgstr "< Informații detaliate despre C-stare nu sunt disponibile.>\n"
++ 
++-#: ../powertop.c:1040
++-msgid "<kernel core>"
++-msgstr "<nucleu kernel>"
++-
++-#: ../powertop.c:1036
++-#: ../powertop.c:1038
++-msgid "<kernel module>"
++-msgstr "<modul kernel>"
+++#: ../ahci-alpm.c:255
+++#, c-format
+++msgid ""
+++"A SATA device is active %1.1f%% of the time:\n"
+++"%s"
+++msgstr ""
+++"Un dispozitiv SATA este activ %4.1f%% din timp:\n"
+++"%s"
++ 
++-#: ../urbnum.c:217
+++#: ../urbnum.c:213
++ #, c-format
++ msgid ""
++ "A USB device is active %4.1f%% of the time:\n"
++@@ -189,24 +197,50 @@ msgstr ""
++ "Un dispozitiv USB este activ %4.1f%% din timp:\n"
++ "%s"
++ 
++-#: ../urbnum.c:186
+++#: ../devicepm.c:373
+++#, c-format
+++msgid ""
+++"A device is active %4.1f%% of the time:\n"
+++"%s"
+++msgstr ""
+++"Un dispozitiv este activ %4.1f%% din timp:\n"
+++"%s"
+++
+++#: ../ahci-alpm.c:220
+++msgid "Active\tPartial\tSlumber\tDevice name"
+++msgstr ""
+++
+++#: ../alsa-power.c:158 ../devicepm.c:326 ../urbnum.c:181
++ msgid "Active  Device name"
++-msgstr "Nume Dispozitiv  activ"
+++msgstr "Nume dispozitiv activ"
+++
+++#: ../alsa-power.c:190
+++#, c-format
+++msgid ""
+++"An audio device is active %4.1f%% of the time:\n"
+++"%s"
+++msgstr ""
+++"Un dispozitiv audio este activ %4.1f%% din timp:\n"
+++"%s"
++ 
++-#: ../powertop.c:969
+++#: ../powertop.c:989
++ #, c-format
++ msgid "C0 (cpu running)        (%4.1f%%)\n"
++ msgstr "C0 (procesorul rulează)        (%4.1f%%)\n"
++ 
++-#: ../powertop.c:966
+++#: ../powertop.c:986
++ #, c-format
++ msgid "Cn\t          Avg residency\n"
++ msgstr "Cn\t          Rezidență medie\n"
++ 
++-#: ../powertop.c:903
+++#: ../powertop.c:923
++ #, c-format
++ msgid "Collecting data for %i seconds \n"
++-msgstr "Colecteză date pentru %i secunde \n"
+++msgstr "Se colectează date timp de %i secunde \n"
+++
+++#: ../devicepm.c:337
+++msgid "Devices without runtime PM"
+++msgstr "Dispozitive fără management al consumului în timpul execuției"
++ 
++ #: ../ethernet.c:128
++ msgid ""
++@@ -218,42 +252,59 @@ msgstr ""
++ "  ethtool -s eth0 wol d \n"
++ "Această opțiune păstrează phy-ul activ dar și consumă energie."
++ 
++-#: ../powertop.c:1187
+++#: ../powertop.c:1234
++ msgid ""
++ "Disable the SE-Alert software by removing the 'setroubleshoot-server' rpm\n"
++ "SE-Alert alerts you about SELinux policy violations, but also\n"
++ "has a bug that wakes it up 10 times per second."
++ msgstr ""
++-"Dezactivează softul SE-Alert prin eliminarea pachetului rpm 'setroubleshoot-server'\n"
++-"Acest soft vă avertizează cu privire la politica de încălcare SELinux, dar\n"
+++"Dezactivează softul SE-Alert prin eliminarea pachetului rpm 'setroubleshoot-"
+++"server'\n"
+++"Acest pachet vă avertizează cu privire la încălcările politicilor SELinux, "
+++"dar\n"
++ "are un bug care îl activează la fiecare 10 secunde."
++ 
++-#: ../display.c:304
++-msgid "No detailed statistics available; PowerTOP needs root privileges for that\n"
++-msgstr "Nu sunt disponibile statistici detaliate; PowerTOP are nevoie de privilegii de root pentru aceasta\n"
+++#: ../perf.c:262
+++#, c-format
+++msgid "Disk accesses:\n"
+++msgstr "Accese disc:\n"
++ 
++-#: ../display.c:299
++-msgid "No detailed statistics available; please enable the CONFIG_TIMER_STATS kernel option\n"
++-msgstr "Nu sunt disponibile statistici detaliate; vă rog să activaţi opțiunea CONFIG_TIMER_STATS al kernelului\n"
+++#: ../powertop.c:1060
+++msgid "Load balancing tick"
+++msgstr ""
+++
+++#: ../display.c:307
+++msgid ""
+++"No detailed statistics available; PowerTOP needs root privileges for that\n"
+++msgstr "Nu sunt disponibile statistici detaliate; PowerTOP are nevoie de privilegii "
+++"de root pentru aceasta\n"
++ 
++ #: ../display.c:302
+++msgid ""
+++"No detailed statistics available; please enable the CONFIG_TIMER_STATS "
+++"kernel option\n"
+++msgstr "Nu sunt disponibile statistici detaliate; activați opțiunea "
+++"CONFIG_TIMER_STATS al kernelului\n"
+++
+++#: ../display.c:305
++ msgid "Note: this is only available in 2.6.21 and later kernels\n"
++-msgstr "Notă: acest lucru este disponibil numai în versiunea 2.6.21 şi kernelurile ulterioare\n"
+++msgstr "Notă: acest lucru este disponibil numai în versiunea 2.6.21 și kernelurile "
+++"ulterioare\n"
++ 
++ #: ../cpufreqstats.c:115
++ #, c-format
++ msgid "P-states (frequencies)\n"
++-msgstr "P-states (frecvențe)\n"
+++msgstr "P-stări (frecvențe)\n"
++ 
++-#: ../powertop.c:170
++-#: ../powertop.c:306
+++#: ../powertop.c:317
++ msgid "PS/2 keyboard/mouse/touchpad"
++ msgstr "tastatură PS/2/maus/touchpad"
++ 
++ #: ../display.c:208
++ #, c-format
++ msgid "Power usage (5 minute ACPI estimate) : %5.1f W (%3.1f hours left)"
++-msgstr "Consumul de energie (ACPI estimează 5 minute) : %5.1f W (%3.1f ore rămase)"
+++msgstr ""
+++"Consumul de energie (ACPI estimează 5 minute) : %5.1f W (%3.1f ore rămase)"
++ 
++ #: ../display.c:201
++ #, c-format
++@@ -265,220 +316,297 @@ msgstr "Consumul de energie (ACPI estime
++ msgid "Power usage: %3.1fW (%3.1f hours)"
++ msgstr "Consumul de energie: %3.1fW (%3.1f ore)"
++ 
++-#: ../powertop.c:902
+++#: ../powertop.c:922
++ #, c-format
++ msgid "PowerTOP needs to be run as root to collect enough information\n"
++-msgstr "PowerTOP trebuie să ruleze ca root pentru a colecta informaţii suficiente\n"
+++msgstr "PowerTOP trebuie să ruleze ca root pentru a colecta informații suficiente\n"
+++
+++#: ../ahci-alpm.c:219
+++msgid "Recent SATA AHCI link activity statistics"
+++msgstr "Statistici activitate recentă SATA AHCI link"
++ 
++-#: ../urbnum.c:185
+++#: ../urbnum.c:180
++ msgid "Recent USB suspend statistics"
++-msgstr "Statistici USB recent suspendate"
+++msgstr "Statistici suspendări USB recente"
++ 
++-#: ../powertop.c:1181
+++#: ../alsa-power.c:157
+++msgid "Recent audio activity statistics"
+++msgstr "Statistici activitate audio recentă"
+++
+++#: ../devicepm.c:325
+++msgid "Runtime Device Power Management statistics"
+++msgstr ""
+++"Statistici pentru gestiunea consumului dispozitivelor în timpul execuției"
+++
+++#: ../powertop.c:1228
++ msgid ""
++ "Suggestion: Disable 'hal' from polling your cdrom with:  \n"
++-"hal-disable-polling --device /dev/cdrom 'hal' is the component that auto-opens a\n"
+++"hal-disable-polling --device /dev/cdrom 'hal' is the component that auto-"
+++"opens a\n"
++ "window if you plug in a CD but disables SATA power saving from kicking in."
++ msgstr ""
++-"Sugestie: Dezactivează modul în care 'hal' obține drepturi la cdrom:  \n"
++-"hal-disable-polling --device /dev/cdrom 'hal' este o componentă ce deschide automat o\n"
++-"fereastră dacă introduceți un CD dar și dezactivează modul econom pentru SATA."
+++"Sugestie: Dezactivați modul în care „hal” verifică dacă există un disc în "
+++"cdrom cu:  \n"
+++"hal-disable-polling --device /dev/cdrom 'hal' este o componentă ce deschide "
+++"automat o\n"
+++"fereastră dacă introduceți un CD dar și dezactivează modul econom pentru "
+++"SATA."
++ 
++-#: ../powertop.c:1155
++-#: ../powertop.c:1159
+++#: ../powertop.c:1202 ../powertop.c:1206
++ msgid ""
++ "Suggestion: Disable or remove 'beagle' from your system. \n"
++ "Beagle is the program that indexes for easy desktop search, however it's \n"
++ "not very efficient and costs a significant amount of battery life."
++ msgstr ""
++-"Sugestie: Dezactivează sau eliminăi 'beagle' din sistem. \n"
++-"Beagle este un program ce indexează conținutul pentru a ușura căutările, totuși nu \n"
+++"Sugestie: Dezactivați sau eliminați „beagle” din sistem. \n"
+++"Beagle este un program ce indexează conținutul pentru a ușura căutările, "
+++"totuși nu \n"
++ "este foarte eficient și scade durata de viață a bateriei."
++ 
++-#: ../powertop.c:1168
+++#: ../powertop.c:1215
++ msgid ""
++ "Suggestion: Disable or remove 'gnome-power-manager' from your system. \n"
++ "Older versions of gnome-power-manager wake up far more often than \n"
++ "needed costing you some power."
++ msgstr ""
++-"Sugestie: Dezactivează sau elimină 'gnome-power-manager' din sistem. \n"
++-"Versiunile mai vechi de gnome-power-manager se deschid mult mai repede decât \n"
+++"Sugestie: Dezactivați sau eliminați „gnome-power-manager” din sistem. \n"
+++"Versiunile mai vechi de gnome-power-manager se deschid mult mai des decât \n"
++ "este nevoie, astfel consumul este mai mare."
++ 
++-#: ../powertop.c:1174
+++#: ../powertop.c:1221
++ msgid ""
++ "Suggestion: Disable or remove 'pcscd' from your system. \n"
++ "pcscd tends to keep the USB subsystem out of power save mode\n"
++ "and your processor out of deeper powersave states."
++ msgstr ""
++-"Sugestie: Dezactivează sau elimină 'pcscd' din sistem. \n"
++-"În modul de economisire pcscd tinde să păstreze subsistemul USB fără putere\n"
++-"și nu permite procesorului să ruleze la frecvențe mai joase."
+++"Sugestie: Dezactivați sau eliminați „pcscd” din sistem. \n"
+++"În modul de economisire pcscd tinde să păstreze subsistemul USB\n"
+++"în afara modului de economisire a energiei și nu permite procesorului\n"
+++"să ruleze la frecvențe mai joase."
++ 
++-#: ../powertop.c:1143
+++#: ../powertop.c:1190
++ msgid ""
++ "Suggestion: Disable the CONFIG_IRQBALANCE kernel configuration option.\n"
++-"The in-kernel irq balancer is obsolete and wakes the CPU up far more than needed."
+++"The in-kernel irq balancer is obsolete and wakes the CPU up far more than "
+++"needed."
++ msgstr ""
++-"Sugestie: Dezactivează opțiunea CONFIG_IRQBALANCE a kernelului.\n"
++-"Balanța in-kernel irq este absolută și folosește procesorul mai mult decât este nevoie."
+++"Sugestie: Dezactivați opțiunea CONFIG_IRQBALANCE a kernelului.\n"
+++"Balansarea întreruperilor în kernel este învechită și folosește procesorul "
+++"mai mult decât este nevoie."
++ 
++-#: ../wireless.c:320
+++#: ../wireless.c:315
++ #, c-format
++ msgid ""
++-"Suggestion: Disable the unused WIFI radio by executing the following command:\n"
+++"Suggestion: Disable the unused WIFI radio by executing the following "
+++"command:\n"
++ "  echo 1 > %s \n"
++ msgstr ""
++-"Sugestie: Dezactivează rețeaua fără fir atunci când nu este folosită cu următoarea comandă:\n"
+++"Sugestie: Dezactivați radioul WIFI atunci când nu este folosit cu următoarea "
+++"comandă:\n"
++ "  echo 1 > %s \n"
++ 
++-#: ../wifi-new.c:194
+++#: ../wifi-new.c:196
++ #, c-format
++ msgid ""
++ "Suggestion: Disable the unused WIFI radio by setting the interface down:\n"
++ " ifconfig %s down\n"
++ msgstr ""
++-"Sugestie: Dezactivează rețeaua fără fir atunci când nu este folosită prin închiderea acesteia:\n"
+++"Sugestie: Dezactivați radioul WIFI atunci când nu este folosit prin "
+++"închiderea interfeței acestuia:\n"
++ " ifconfig %s down\n"
++ 
++-#: ../bluetooth.c:144
+++#: ../bluetooth.c:150
++ msgid ""
++-"Suggestion: Disable the unused bluetooth interface with the following command:\n"
+++"Suggestion: Disable the unused bluetooth interface with the following "
+++"command:\n"
++ "  hciconfig hci0 down ; rmmod hci_usb\n"
++-"Bluetooth is a radio and consumes quite some power, and keeps USB busy as well.\n"
+++"Bluetooth is a radio and consumes quite some power, and keeps USB busy as "
+++"well.\n"
++ msgstr ""
++-"Sugestie: Dezactivează interfața bluetooth atunci când nu este folosit cu următoarea comandă:\n"
+++"Sugestie: Dezactivați interfața bluetooth atunci când nu este folosită cu "
+++"următoarea comandă:\n"
++ "  hciconfig hci0 down ; rmmod hci_usb\n"
++-"Bluetooth-ul folosește unde, astfel consumă destul de multă energie, dar și ține portul USB ocupat.\n"
+++"Bluetooth-ul folosește radio, consumă destul de multă energie și ține portul "
+++"USB ocupat.\n"
+++
+++#: ../devicepm.c:121
+++msgid "Suggestion: Enable Device Power Management by pressing the P key\n"
+++msgstr "Sugestie: Activați Gestiunea consumului dispozitivelor apăsând tasta P\n"
++ 
++-#: ../sata.c:101
+++#: ../sata.c:102
++ msgid ""
++ "Suggestion: Enable SATA ALPM link power management via: \n"
++ "  echo min_power > /sys/class/scsi_host/host0/link_power_management_policy\n"
++ "or press the S key."
++ msgstr ""
++-"Sugestie: Activează modul de gestionare a energiei SATA ALPM prin intermediul comenzii: \n"
+++"Sugestie: Activați gestiunea consumului SATA ALPM link prin intermediul "
+++"comenzii: \n"
++ "  echo min_power > /sys/class/scsi_host/host0/link_power_management_policy\n"
++ "sau apăsați tasta S."
++ 
++-#: ../usb.c:114
++-msgid "Suggestion: Enable USB autosuspend for non-input devices by pressing the U key\n"
++-msgstr "Sugestie: Activează modul de suspendare automată a USB-ului pentru dispozitele non-input prin apăsarea tastei U\n"
+++#: ../usb.c:117
+++msgid ""
+++"Suggestion: Enable USB autosuspend for non-input devices by pressing the U "
+++"key\n"
+++msgstr "Sugestie: Activați modul de suspendare automată a USB-ului pentru "
+++"dispozitivele non-input prin apăsarea tastei U\n"
++ 
++-#: ../powertop.c:1131
+++#: ../powertop.c:1175
++ msgid ""
++ "Suggestion: Enable the CONFIG_ACPI_BATTERY kernel configuration option.\n"
++ " This option is required to get power estimages from PowerTOP"
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_ACPI_BATTERY a kernelului.\n"
++-" Această opţiune este necesară pentru a obţine, de la PowerTOP, informații estimative despre puterea de consum"
+++"Sugestie: Activați opțiunea CONFIG_ACPI_BATTERY a kernelului.\n"
+++" Această opțiune este necesară pentru a obține informații estimative despre "
+++"consumul de energie de la PowerTOP"
++ 
++-#: ../powertop.c:1128
+++#: ../powertop.c:1172
++ msgid ""
++-"Suggestion: Enable the CONFIG_CPU_FREQ_GOV_ONDEMAND kernel configuration option.\n"
+++"Suggestion: Enable the CONFIG_CPU_FREQ_GOV_ONDEMAND kernel configuration "
+++"option.\n"
++ "The 'ondemand' CPU speed governor will minimize the CPU power usage while\n"
++ "giving you performance when it is needed."
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_CPU_FREQ_GOV_ONDEMAND a kernelului.\n"
++-"Această opțiune va minimaliza consumul de energie a procesorului,\n"
+++"Sugestie: Activați opțiunea CONFIG_CPU_FREQ_GOV_ONDEMAND a kernelului.\n"
+++"Guvernatorul „ondemand” va minimiza consumul de energie a procesorului,\n"
++ "oferind performanțele necesare atunci când este nevoie."
++ 
++-#: ../powertop.c:1145
+++#: ../powertop.c:1192
++ msgid ""
++ "Suggestion: Enable the CONFIG_CPU_FREQ_STAT kernel configuration option.\n"
++ "This option allows PowerTOP to show P-state percentages \n"
++ "P-states correspond to CPU frequencies."
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_CPU_FREQ_STAT a kernelului.\n"
++-"Această opțiune permite ca PowerTOP să arate procente P-state \n"
++-"Acestea corespund procentelor procesorului."
+++"Sugestie: Activați opțiunea CONFIG_CPU_FREQ_STAT a kernelului.\n"
+++"Această opțiune permite ca PowerTOP să arate procentele pentru P-stări \n"
+++"Acestea corespund frecvențelor de utilizare a procesorului."
++ 
++-#: ../powertop.c:1134
+++#: ../powertop.c:1178
++ msgid ""
++ "Suggestion: Enable the CONFIG_HPET_TIMER kernel configuration option.\n"
++ "Without HPET support the kernel needs to wake up every 20 milliseconds for \n"
++ "some housekeeping tasks."
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_HPET_TIMER a kernelului.\n"
++-"Fără suport HPET, kernelul trebuie să se activeze odată la 20 de milisecunde pentru \n"
++-"sarcini de menaj."
+++"Sugestie: Activați opțiunea CONFIG_HPET_TIMER a kernelului.\n"
+++"Fără suport HPET, kernelul trebuie să se activeze odată la fiecare 20 de\n"
+++"milisecunde pentru a rezolva sarcini interne."
++ 
++-#: ../powertop.c:1148
+++#: ../powertop.c:1195
++ msgid ""
++ "Suggestion: Enable the CONFIG_INOTIFY kernel configuration option.\n"
++ "This option allows programs to wait for changes in files and directories\n"
++ "instead of having to poll for these changes"
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_INOTIFY a kernelului.\n"
++-"Această opțiune permite programelor să aștepte modificări ale fișierelor și dosarelor\n"
++-"în loc să verifice fiecare fișier și dosar în parte"
+++"Sugestie: Activați opțiunea CONFIG_INOTIFY a kernelului.\n"
+++"Această opțiune permite programelor să aștepte modificări ale fișierelor\n"
+++"și ale dosarelor în loc să verifice fiecare fișier și dosar în parte"
++ 
++-#: ../powertop.c:1130
+++#: ../powertop.c:1174
++ msgid ""
++ "Suggestion: Enable the CONFIG_NO_HZ kernel configuration option.\n"
++ "This option is required to get any kind of longer sleep times in the CPU."
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_NO_HZ a kernelului.\n"
++-"Această opțiune permite procesorului să primească durate mai lungi de repaus."
+++"Sugestie: Activați opțiunea CONFIG_NO_HZ a kernelului.\n"
+++"Această opțiune permite procesorului să primească durate de repaus de orice "
+++"lungime."
+++
+++#: ../powertop.c:1181
+++msgid ""
+++"Suggestion: Enable the CONFIG_PCIEASPM kernel configuration option.\n"
+++"PCI Link Powermanagement (ASPM) allows the hardware to go to low power mode\n"
+++"automatically when a PCI-E device is idle."
+++msgstr ""
+++"Sugestie: Activați opțiunea CONFIG_PCIEASPM a kernelului.\n"
+++"PCI Link Powermanagement (ASPM) permite hardware-ului să treacă automat la\n"
+++"un nivel de consum energetic scăzut atunci când un dispozitiv PCI-E este "
+++"inactiv."
+++
+++#: ../powertop.c:1168
+++msgid ""
+++"Suggestion: Enable the CONFIG_PM_ADVANCED_DEBUG kernel configuration "
+++"option.\n"
+++"This option will allow PowerTOP to collect runtime power management "
+++"statistics."
+++msgstr ""
+++"Sugestie: Activați opțiunea CONFIG_PM_ADVANCED_DEBUG a kernelului.\n"
+++"Această opțiune va permite PowerTOP să colecteze statistici de gestiune a "
+++"consumului."
+++
+++#: ../powertop.c:1170
+++msgid ""
+++"Suggestion: Enable the CONFIG_PM_RUNTIME kernel configuration option.\n"
+++"This option enables the kernel to manage power for various devices in your "
+++"computer."
+++msgstr ""
+++"Sugestie: Activați opțiunea CONFIG_PM_RUNTIME a kernelului.\n"
+++"Această opțiune permite kernelului să gestioneze puterea pentru diverse "
+++"dispozitive de pe calculator."
++ 
++-#: ../powertop.c:1139
+++#: ../powertop.c:1186
++ msgid ""
++-"Suggestion: Enable the CONFIG_SND_AC97_POWER_SAVE kernel configuration option.\n"
+++"Suggestion: Enable the CONFIG_SND_AC97_POWER_SAVE kernel configuration "
+++"option.\n"
++ "This option will automatically power down your sound codec when not in use,\n"
++ "and can save approximately half a Watt of power."
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_SND_AC97_POWER_SAVE a kernelului.\n"
++-"Această opțiune va închide automat codecul de sunet atunci când nu este folosit,\n"
++-"astfel se poate salva aproximativ jumătate din energia consumată."
+++"Sugestie: Activați opțiunea CONFIG_SND_AC97_POWER_SAVE a kernelului.\n"
+++"Această opțiune va închide automat codecul de sunet atunci când nu este "
+++"folosit,\n"
+++"astfel se poate salva aproximativ jumătate de Watt."
++ 
++-#: ../powertop.c:1126
+++#: ../powertop.c:1166
++ msgid ""
++ "Suggestion: Enable the CONFIG_USB_SUSPEND kernel configuration option.\n"
++ "This option will automatically disable UHCI USB when not in use, and may\n"
++ "save approximately 1 Watt of power."
++ msgstr ""
++-"Sugestie: Activează opțiunea CONFIG_USB_SUSPEND a kernelului.\n"
++-"Această opțiune va dezactiva automat UHCI USB atunci când nu este folosit, astfel se poate\n"
++-"salva aproximativ 1 Watt de energie."
+++"Sugestie: Activați opțiunea CONFIG_USB_SUSPEND a kernelului.\n"
+++"Această opțiune va dezactiva automat UHCI USB atunci când nu este folosit, "
+++"astfel se poate\n"
+++"salva aproximativ 1 Watt."
++ 
++ #: ../cpufreq.c:116
++ msgid ""
++ "Suggestion: Enable the ondemand cpu speed governor for all processors via: \n"
++ " echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \n"
++ msgstr ""
++-"Sugestie: Activează guvernatorul de viteză a procesorului folosind comanda: \n"
+++"Sugestie: Activați guvernatorul de viteză a procesorului „ondemand” folosind "
+++"comanda: \n"
++ " echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \n"
++ 
++-#: ../wireless.c:314
+++#: ../wireless.c:309
++ #, c-format
++ msgid ""
++-"Suggestion: Enable wireless power saving mode by executing the following command:\n"
+++"Suggestion: Enable wireless power saving mode by executing the following "
+++"command:\n"
++ "  echo 5 > %s \n"
++ "This will sacrifice network performance slightly to save power."
++ msgstr ""
++-"Sugestie: Activează modul de economisire a rețelei fără fir folosind comanda:\n"
+++"Sugestie: Activați modul de economisire a rețelei fără fir folosind comanda:\n"
++ "  echo 5 > %s \n"
++ "Această opțiune va sacrifica ușor performața rețelei pentru a salva energie."
++ 
++-#: ../wifi-new.c:198
+++#: ../wifi-new.c:200
++ #, c-format
++ msgid ""
++-"Suggestion: Enable wireless power saving mode by executing the following command:\n"
+++"Suggestion: Enable wireless power saving mode by executing the following "
+++"command:\n"
++ "  iwconfig %s power timeout 500ms\n"
++ "This will sacrifice network performance slightly to save power."
++ msgstr ""
++-"Sugestie: Activează modul de economisire a rețelei fără fir folosind comanda:\n"
+++"Sugestie: Activați modul de economisire a rețelei fără fir folosind comanda:\n"
++ "  iwconfig %s power timeout 500ms\n"
++ "Această opțiune va sacrifica ușor performața rețelei pentru a salva energie."
++ 
++-#: ../wireless.c:308
+++#: ../wireless.c:303
++ #, c-format
++ msgid ""
++-"Suggestion: Enable wireless power saving mode by executing the following command:\n"
+++"Suggestion: Enable wireless power saving mode by executing the following "
+++"command:\n"
++ "  iwpriv %s set_power 5 \n"
++ "This will sacrifice network performance slightly to save power."
++ msgstr ""
++-"Sugestie: Activează modul de economisire a rețelei fără fir folosind comanda:\n"
+++"Sugestie: Activați modul de economisire a rețelei fără fir folosind comanda:\n"
++ "  iwpriv %s set_power 5 \n"
++ "Această opțiune va sacrifica ușor performața rețelei pentru a salva energie."
++ 
++@@ -488,9 +616,9 @@ msgid ""
++ "  xrandr --output TV --off \n"
++ "or press the V key."
++ msgstr ""
++-"Sugestie: dezactivează ieșirea TV prin comanda: \n"
+++"Sugestie: dezactivați ieșirea TV prin comanda: \n"
++ "  xrandr --output TV --off \n"
++-"sau apasă tasta V."
+++"sau apăsați tasta V."
++ 
++ #: ../misctips.c:59
++ msgid ""
++@@ -498,9 +626,10 @@ msgid ""
++ "   echo 0 > /proc/sys/kernel/nmi_watchdog \n"
++ "The NMI watchdog is a kernel debug mechanism to detect deadlocks"
++ msgstr ""
++-"Sugestie: dezactivează gardianul NMI prin executarea următoarei comenzi:\n"
+++"Sugestie: dezactivați gardianul NMI prin executarea următoarei comenzi:\n"
++ "   echo 0 > /proc/sys/kernel/nmi_watchdog \n"
++-"Gardianul NMI este un mecanism de depanare a kernelului folosit pentru a detecta partajări (zone moarte)"
+++"Gardianul NMI este un mecanism de depanare a kernelului folosit pentru a "
+++"detecta blocările"
++ 
++ #: ../misctips.c:123
++ msgid ""
++@@ -508,19 +637,21 @@ msgid ""
++ "   echo 1 > /sys/module/snd_ac97_codec/parameters/power_save \n"
++ "or by passing power_save=1 as module parameter."
++ msgstr ""
++-"Sugestie: activează modul de economisire AC97 folosind următoarea comandă:\n"
+++"Sugestie: activați modul de economisire AC97 folosind următoarea comandă:\n"
++ "   echo 1 > /sys/module/snd_ac97_codec/parameters/power_save \n"
++-"sau prin trecerea parametrului power_save=1 a modulului."
+++"sau oferind modulului parametrul power_save=1."
++ 
++ #: ../misctips.c:163
++ msgid ""
++-"Suggestion: enable HD audio powersave mode by executing the following command:\n"
+++"Suggestion: enable HD audio powersave mode by executing the following "
+++"command:\n"
++ "   echo 1 > /sys/module/snd_hda_intel/parameters/power_save \n"
++ "or by passing power_save=1 as module parameter."
++ msgstr ""
++-"Sugestie: activează modul de economisire audio HD folosind următoarea comandă:\n"
+++"Sugestie: activați modul de economisire audio HD folosind următoarea "
+++"comandă:\n"
++ "   echo 1 > /sys/module/snd_ac97_codec/parameters/power_save \n"
++-"sau prin trecerea parametrului power_save=1 a modulului."
+++"sau oferind modulului parametrul power_save=1."
++ 
++ #: ../misctips.c:87
++ msgid ""
++@@ -528,44 +659,81 @@ msgid ""
++ "the kernel patch to force-enable HPET. HPET support allows Linux to \n"
++ "have much longer sleep intervals."
++ msgstr ""
++-"Sugestie: activează HPET (Multimedia Timer) în BIOS sau adaugă \n"
++-"patchul force-enable HPET a kernelului. Sprijinul oferit de HPET sistemului permite acestuia\n"
++-"să primească durate mai lungi de repaus."
+++"Sugestie: activați HPET (Multimedia Timer) în BIOS sau adăugați \n"
+++"patchul force-enable HPET kernelului. Sprijinul oferit de HPET sistemului\n"
+++"permite acestuia să primească durate mai lungi de repaus."
++ 
++ #: ../misctips.c:192
++ msgid ""
++-"Suggestion: enable the noatime filesystem option by executing the following command:\n"
+++"Suggestion: enable the noatime filesystem option by executing the following "
+++"command:\n"
++ "   mount -o remount,noatime /          or by pressing the T key \n"
++-"noatime disables persistent access time of file accesses, which causes lots of disk IO."
+++"noatime disables persistent access time of file accesses, which causes lots "
+++"of disk IO."
++ msgstr ""
++-"Sugestie: activează opțiunea de sistem noatime cu următoarea comandă:\n"
+++"Sugestie: activați opțiunea „noatime” pentru sisteme de fișiere cu "
+++"următoarea comandă:\n"
++ "   mount -o remount,noatime /          sau prin apăsarea tastei T \n"
++-"noatime dezactivează accesul repetat la fișiere, acces ce poate cauza multe defecțiuni ale discului."
+++"noatime dezactivează actualizarea timpului de acces la fișiere, ce duce la "
+++"multe accese la disc."
++ 
++-#: ../misctips.c:255
+++#: ../misctips.c:254
++ msgid ""
++-"Suggestion: enable the power aware CPU scheduler with the following command:\n"
+++"Suggestion: enable the power aware CPU scheduler with the following "
+++"command:\n"
++ "  echo 1 > /sys/devices/system/cpu/sched_mc_power_savings\n"
++ "or by pressing the C key."
++ msgstr ""
++-"Sugestie: activează jurnalul de putere a procesorului cu ajutorul următoarei comenzi:\n"
+++"Sugestie: activați planificatorul al procesorului ce ține cont de consumul "
+++"energetic cu ajutorul următoarei comenzi:\n"
++ "  echo 1 > /sys/devices/system/cpu/sched_mc_power_savings\n"
++ "sau prin apăsarea tastei C."
++ 
++-#: ../misctips.c:288
+++#: ../misctips.c:287
++ #, c-format
++ msgid ""
++-"Suggestion: increase the VM dirty writeback time from %1.2f to 15 seconds with:\n"
+++"Suggestion: increase the VM dirty writeback time from %1.2f to 15 seconds "
+++"with:\n"
++ "  echo 1500 > /proc/sys/vm/dirty_writeback_centisecs \n"
++ "This wakes the disk up less frequently for background VM activity"
++ msgstr ""
++-"Sugestie: mărește timpul de răspuns în scris VM de la %1.2f la 15 secunde cu:\n"
+++"Sugestie: măriți timpul de răspuns în scriere înapoi (writeback) a VM de la "
+++"%1.2f la 15 secunde cu:\n"
++ "  echo 1500 > /proc/sys/vm/dirty_writeback_centisecs \n"
++-"Această opțiune accesează discul mai rar pentru activitatea de fundal VM"
+++"Această opțiune accesează discul mai rar pentru activitățile de fundal ale "
+++"VM"
+++
+++#: ../powertop.c:1239
+++msgid ""
+++"The Intel Integrated Graphics driver failed to enable Memory self refresh.\n"
+++"Memory Self Refresh is important for good memory power savings.\n"
+++"Please check your OS vendor for a kernel update and/or report a bug."
+++msgstr ""
+++"Driverul de pentru placa grafică integrată Intel nu a reușit să activeze "
+++"auto reîmprospătarea memoriei.\n"
+++"Auto reîmprospătarea memoriei este importantă pentru economisirea energiei "
+++"consumate de memorie.\n"
+++"Consultați furnizorul sistemului de operare pentru o actualizare a nucleului "
+++"sau raportați o problemă."
++ 
++-#: ../display.c:300
++-msgid "This option is located in the Kernel Debugging section of menuconfig\n"
++-msgstr "Această opţiune este situată în menuconfig, secțiunea Depanare Kernel\n"
+++#: ../perf.c:248
+++#, c-format
+++msgid "The application '%s' is writing to file '%s' on /dev/%s\n"
+++msgstr "Aplicația „%s” scrie în fișierul „%s” de pe /dev/%s\n"
+++
+++#: ../perf.c:243
+++#, c-format,
+++msgid ""
+++"The program '%s' is writing to file '%s' on /dev/%s.\n"
+++"This prevents the disk from going to powersave mode."
+++msgstr ""
+++"Aplicația „%s” scrie în fișierul „%s” de pe /dev/%s\n"
+++"Aceasta nu permite discului să intre în modul de economisire a energiei."
+++
+++#: ../display.c:303
+++msgid ""
+++"This option is located in the Kernel Debugging section of menuconfig\n"
+++msgstr "Această opțiune este situată în menuconfig, secțiunea Depanare Kernel\n"
++ 
++ #: ../display.c:281
++ msgid "Top causes for wakeups:\n"
++@@ -580,25 +748,51 @@ msgstr "Modul Turbo"
++ msgid "USB device %4s : %s (%s)"
++ msgstr "Dispozitivul USB %4s : %s (%s)"
++ 
++-#: ../powertop.c:820
+++#: ../powertop.c:831
++ #, c-format
++ msgid "Usage: powertop [OPTION...]\n"
++-msgstr "În uz: powertop [OPTION...]\n"
+++msgstr "Utilizare: powertop [OPȚIUNE...]\n"
++ 
++ #: ../display.c:270
++ #, c-format
++ msgid "Wakeups-from-idle per second : %4.1f\tinterval: %0.1fs\n"
++-msgstr "Wakeups-from-idle pe secundă : %4.1f\tinterval: %0.1fs\n"
+++msgstr "Treziri-din-inactivitate pe secundă : %4.1f\tinterval: %0.1fs\n"
++ 
++ #: ../intelcstates.c:152
++ #, c-format
++ msgid "Your BIOS reports the following C-states : "
++-msgstr "BIOS-ul raportează următoarele stări C-states : "
+++msgstr "BIOS-ul raportează următoarele C-stări : "
++ 
++ #: ../intelcstates.c:143
++ #, c-format
++ msgid "Your CPU supports the following C-states : "
++-msgstr "Procesorul suportă următoarele stări C-states : "
+++msgstr "Procesorul suportă următoarele C-stări : "
+++
+++#: ../powertop.c:314
+++#, c-format
+++msgid "[%s] <interrupt>"
+++msgstr "[%s] <întrerupere>"
+++
+++#: ../powertop.c:312
+++#, c-format
+++msgid "[%s] <kernel IPI>"
+++msgstr "[%s] <kernel IPI>"
+++
+++#: ../powertop.c:1108
+++msgid "[extra timer interrupt]"
+++msgstr "[întrerupere cronometru suplimentar]"
+++
+++#: ../powertop.c:1067
+++msgid "[kernel core]"
+++msgstr "[kernel core]"
+++
+++#: ../powertop.c:1063 ../powertop.c:1065
+++msgid "[kernel module]"
+++msgstr "[modul kernel]"
+++
+++#: ../powertop.c:1059
+++msgid "[kernel scheduler]"
+++msgstr "[planificator kernel]"
++ 
++ #: ../display.c:196
++ #, c-format
++@@ -610,12 +804,11 @@ msgstr "nici o estimare a puterii de uti
++ msgid "no power usage estimate available"
++ msgstr "nici o estimare a puterii de utilizare disponibilă"
++ 
++-#: ../powertop.c:433
+++#: ../powertop.c:444
++ msgid "polling"
++ msgstr "de votare"
++ 
++-#: ../powertop.c:831
+++#: ../powertop.c:842
++ #, c-format
++ msgid "powertop version %s\n"
++ msgstr "versiune powertop %s\n"
++-
++--- /dev/null
+++++ b/kernel-patches/linux-2.6.37-rc1-vfs-tracepoints.patch
++@@ -0,0 +1,116 @@
+++From f56c995174cf42d84fdad06beebacd56e700b05d Mon Sep 17 00:00:00 2001
+++From: Arjan van de Ven <arjan@linux.intel.com>
+++Date: Sun, 25 Oct 2009 15:37:04 -0700
+++Subject: [PATCH] vfs: Add a trace point in the mark_inode_dirty function
+++
+++PowerTOP would like to be able to show who is keeping the disk
+++busy by dirtying data. The most logical spot for this is in the vfs
+++in the mark_inode_dirty() function, doing this on the block level
+++is not possible because by the time the IO hits the block layer the
+++guilty party can no longer be found ("kjournald" and "pdflush" are not
+++useful answers to "who caused this file to be dirty).
+++
+++The trace point follows the same logic/style as the block_dump code
+++and pretty much dumps the same data, just not to dmesg (and thus to
+++/var/log/messages) but via the trace events streams.
+++
+++Signed-of-by: Arjan van de Ven <arjan@linux.intel.com>
+++---
+++ fs/fs-writeback.c          |    4 +++
+++ fs/inode.c                 |    4 +++
+++ include/trace/events/vfs.h |   53 +++++++++++++++++++++++++++++++++++++++++++++
+++ 3 files changed, 61 insertions(+)
+++ create mode 100644 include/trace/events/vfs.h
+++
+++Index: linux.trees.git/fs/fs-writeback.c
+++===================================================================
+++--- linux.trees.git.orig/fs/fs-writeback.c
++++++ linux.trees.git/fs/fs-writeback.c
+++@@ -27,6 +27,7 @@
+++ #include <linux/backing-dev.h>
+++ #include <linux/buffer_head.h>
+++ #include <linux/tracepoint.h>
++++#include <trace/events/vfs.h>
+++ #include "internal.h"
+++
+++ /*
+++@@ -937,6 +938,9 @@ void __mark_inode_dirty(struct inode *in
+++ 			sb->s_op->dirty_inode(inode);
+++ 	}
+++
++++	if (flags & (I_DIRTY_SYNC | I_DIRTY_DATASYNC | I_DIRTY_PAGES))
++++		trace_dirty_inode(inode, current);
++++
+++ 	/*
+++ 	 * make sure that changes are seen by all cpus before we test i_state
+++ 	 * -- mikulas
+++Index: linux.trees.git/fs/inode.c
+++===================================================================
+++--- linux.trees.git.orig/fs/inode.c
++++++ linux.trees.git/fs/inode.c
+++@@ -1708,3 +1708,7 @@ void inode_init_owner(struct inode *inod
+++ 	inode->i_mode = mode;
+++ }
+++ EXPORT_SYMBOL(inode_init_owner);
++++
++++#define CREATE_TRACE_POINTS
++++#include <trace/events/vfs.h>
++++
+++Index: linux.trees.git/include/trace/events/vfs.h
+++===================================================================
+++--- /dev/null
++++++ linux.trees.git/include/trace/events/vfs.h
+++@@ -0,0 +1,53 @@
++++#undef TRACE_SYSTEM
++++#define TRACE_SYSTEM vfs
++++
++++#if !defined(_TRACE_VFS_H) || defined(TRACE_HEADER_MULTI_READ)
++++#define _TRACE_VFS_H
++++
++++/*
++++ * Tracepoint for dirtying an inode:
++++ */
++++TRACE_EVENT(dirty_inode,
++++
++++	TP_PROTO(struct inode *inode, struct task_struct *task),
++++
++++	TP_ARGS(inode, task),
++++
++++	TP_STRUCT__entry(
++++		__array( char,	comm,	TASK_COMM_LEN	)
++++		__field( pid_t,	pid			)
++++		__array( char,  dev,    16		)
++++		__array( char,  file,   32		)
++++	),
++++
++++	TP_fast_assign(
++++		if (inode->i_ino || strcmp(inode->i_sb->s_id, "bdev")) {
++++			struct dentry *dentry;
++++			const char *name = "?";
++++
++++			dentry = d_find_alias(inode);
++++			if (dentry) {
++++				spin_lock(&dentry->d_lock);
++++				name = (const char *) dentry->d_name.name;
++++			}
++++
++++			memcpy(__entry->comm, task->comm, TASK_COMM_LEN);
++++			__entry->pid = task->pid;
++++			strlcpy(__entry->file, name, 32);
++++			strlcpy(__entry->dev, inode->i_sb->s_id, 16);
++++
++++			if (dentry) {
++++				spin_unlock(&dentry->d_lock);
++++				dput(dentry);
++++			}
++++		}
++++	),
++++
++++	TP_printk("task=%i (%s) file=%s dev=%s",
++++		__entry->pid, __entry->comm, __entry->file, __entry->dev)
++++);
++++
++++#endif /* _TRACE_VFS_H */
++++
++++/* This part must be outside protection */
++++#include <trace/define_trace.h>
++--- /dev/null
+++++ b/kernel-patches/linux-2.6.37-rc1-ahci-alpm-accounting.patch
++@@ -0,0 +1,302 @@
+++From: Arjan van de Ven <arjan@linux.intel.com>
+++Subject: [PATCH] libata: Add ALPM power state accounting to the AHCI driver
+++
+++PowerTOP wants to be able to show the user how effective the ALPM link
+++power management is for the user. ALPM is worth around 0.5W on a quiet
+++link; PowerTOP wants to be able to find cases where the "quiet link" isn't
+++actually quiet.
+++
+++This patch adds state accounting functionality to the AHCI driver for
+++PowerTOP to use.
+++The parts of the patch are
+++1) the sysfs logic of exposing the stats for each state in sysfs
+++2) the basic accounting logic that gets update on link change interrupts
+++   (or when the user accesses the info from sysfs)
+++3) a "accounting enable" flag; in order to get the accounting to work,
+++   the driver needs to get phyrdy interrupts on link status changes.
+++   Normally and currently this is disabled by the driver when ALPM is
+++   on (to reduce overhead); when PowerTOP is running this will need
+++   to be on to get usable statistics... hence the sysfs tunable.
+++
+++The PowerTOP output currently looks like this:
+++
+++Recent SATA AHCI link activity statistics
+++Active	Partial	Slumber	Device name
+++  0.5%	 99.5%	  0.0%	host0
+++
+++(work to resolve "host0" to a more human readable name is in progress)
+++
+++Signed-off-by: Arjan van de Ven <arjan@linux.intel.com>
+++
+++---
+++ drivers/ata/ahci.h    |   15 ++++
+++ drivers/ata/libahci.c |  187 +++++++++++++++++++++++++++++++++++++++++++++++++-
+++ 2 files changed, 200 insertions(+), 2 deletions(-)
+++
+++Index: linux.trees.git/drivers/ata/ahci.h
+++===================================================================
+++--- linux.trees.git.orig/drivers/ata/ahci.h
++++++ linux.trees.git/drivers/ata/ahci.h
+++@@ -262,6 +262,13 @@ struct ahci_em_priv {
+++ 	unsigned long led_state;
+++ };
+++
++++enum ahci_port_states {
++++	AHCI_PORT_NOLINK = 0,
++++	AHCI_PORT_ACTIVE = 1,
++++	AHCI_PORT_PARTIAL = 2,
++++	AHCI_PORT_SLUMBER = 3
++++};
++++
+++ struct ahci_port_priv {
+++ 	struct ata_link		*active_link;
+++ 	struct ahci_cmd_hdr	*cmd_slot;
+++@@ -280,6 +287,14 @@ struct ahci_port_priv {
+++ 	int			fbs_last_dev;	/* save FBS.DEV of last FIS */
+++ 	/* enclosure management info per PM slot */
+++ 	struct ahci_em_priv	em_priv[EM_MAX_SLOTS];
++++
++++	/* ALPM accounting state and stats */
++++	unsigned int 		accounting_active:1;
++++	u64			active_jiffies;
++++	u64			partial_jiffies;
++++	u64			slumber_jiffies;
++++	int			previous_state;
++++	int			previous_jiffies;
+++ };
+++
+++ struct ahci_host_priv {
+++Index: linux.trees.git/drivers/ata/libahci.c
+++===================================================================
+++--- linux.trees.git.orig/drivers/ata/libahci.c
++++++ linux.trees.git/drivers/ata/libahci.c
+++@@ -58,6 +58,17 @@ MODULE_PARM_DESC(ignore_sss, "Ignore sta
+++
+++ static int ahci_set_lpm(struct ata_link *link, enum ata_lpm_policy policy,
+++ 			unsigned hints);
++++static ssize_t ahci_alpm_show_active(struct device *dev,
++++				  struct device_attribute *attr, char *buf);
++++static ssize_t ahci_alpm_show_slumber(struct device *dev,
++++				  struct device_attribute *attr, char *buf);
++++static ssize_t ahci_alpm_show_partial(struct device *dev,
++++				  struct device_attribute *attr, char *buf);
++++static ssize_t ahci_alpm_show_accounting(struct device *dev,
++++				  struct device_attribute *attr, char *buf);
++++static ssize_t ahci_alpm_set_accounting(struct device *dev,
++++				  struct device_attribute *attr,
++++				  const char *buf, size_t count);
+++ static ssize_t ahci_led_show(struct ata_port *ap, char *buf);
+++ static ssize_t ahci_led_store(struct ata_port *ap, const char *buf,
+++ 			      size_t size);
+++@@ -117,6 +128,12 @@ static DEVICE_ATTR(ahci_host_caps, S_IRU
+++ static DEVICE_ATTR(ahci_host_cap2, S_IRUGO, ahci_show_host_cap2, NULL);
+++ static DEVICE_ATTR(ahci_host_version, S_IRUGO, ahci_show_host_version, NULL);
+++ static DEVICE_ATTR(ahci_port_cmd, S_IRUGO, ahci_show_port_cmd, NULL);
++++static DEVICE_ATTR(ahci_alpm_active, S_IRUGO, ahci_alpm_show_active, NULL);
++++static DEVICE_ATTR(ahci_alpm_partial, S_IRUGO, ahci_alpm_show_partial, NULL);
++++static DEVICE_ATTR(ahci_alpm_slumber, S_IRUGO, ahci_alpm_show_slumber, NULL);
++++static DEVICE_ATTR(ahci_alpm_accounting, S_IRUGO | S_IWUSR,
++++		ahci_alpm_show_accounting, ahci_alpm_set_accounting);
++++
+++ static DEVICE_ATTR(em_buffer, S_IWUSR | S_IRUGO,
+++ 		   ahci_read_em_buffer, ahci_store_em_buffer);
+++
+++@@ -128,6 +145,10 @@ struct device_attribute *ahci_shost_attr
+++ 	&dev_attr_ahci_host_cap2,
+++ 	&dev_attr_ahci_host_version,
+++ 	&dev_attr_ahci_port_cmd,
++++	&dev_attr_ahci_alpm_active,
++++	&dev_attr_ahci_alpm_partial,
++++	&dev_attr_ahci_alpm_slumber,
++++	&dev_attr_ahci_alpm_accounting,
+++ 	&dev_attr_em_buffer,
+++ 	NULL
+++ };
+++@@ -653,9 +674,14 @@ static int ahci_set_lpm(struct ata_link
+++ 		 * Disable interrupts on Phy Ready. This keeps us from
+++ 		 * getting woken up due to spurious phy ready
+++ 		 * interrupts.
++++		 *
++++		 * However, when accounting_active is set, we do want
++++		 * the interrupts for accounting purposes.
+++ 		 */
+++-		pp->intr_mask &= ~PORT_IRQ_PHYRDY;
+++-		writel(pp->intr_mask, port_mmio + PORT_IRQ_MASK);
++++		if (!pp->accounting_active) {
++++			pp->intr_mask &= ~PORT_IRQ_PHYRDY;
++++			writel(pp->intr_mask, port_mmio + PORT_IRQ_MASK);
++++		}
+++
+++ 		sata_link_scr_lpm(link, policy, false);
+++ 	}
+++@@ -1570,6 +1596,162 @@ static void ahci_error_intr(struct ata_p
+++ 		ata_port_abort(ap);
+++ }
+++
++++static int get_current_alpm_state(struct ata_port *ap)
++++{
++++	u32 status = 0;
++++
++++	ahci_scr_read(&ap->link, SCR_STATUS, &status);
++++
++++	/* link status is in bits 11-8 */
++++	status = status >> 8;
++++	status = status & 0x7;
++++
++++	if (status == 6)
++++		return AHCI_PORT_SLUMBER;
++++	if (status == 2)
++++		return AHCI_PORT_PARTIAL;
++++	if (status == 1)
++++		return AHCI_PORT_ACTIVE;
++++	return AHCI_PORT_NOLINK;
++++}
++++
++++static void account_alpm_stats(struct ata_port *ap)
++++{
++++	struct ahci_port_priv *pp;
++++
++++	int new_state;
++++	u64 new_jiffies, jiffies_delta;
++++
++++	if (ap == NULL)
++++		return;
++++	pp = ap->private_data;
++++
++++	if (!pp) return;
++++
++++	new_state = get_current_alpm_state(ap);
++++	new_jiffies = jiffies;
++++
++++	jiffies_delta = new_jiffies - pp->previous_jiffies;
++++
++++	switch (pp->previous_state) {
++++	case AHCI_PORT_NOLINK:
++++		pp->active_jiffies = 0;
++++		pp->partial_jiffies = 0;
++++		pp->slumber_jiffies = 0;
++++		break;
++++	case AHCI_PORT_ACTIVE:
++++		pp->active_jiffies += jiffies_delta;
++++		break;
++++	case AHCI_PORT_PARTIAL:
++++		pp->partial_jiffies += jiffies_delta;
++++		break;
++++	case AHCI_PORT_SLUMBER:
++++		pp->slumber_jiffies += jiffies_delta;
++++		break;
++++	default:
++++		break;
++++	}
++++	pp->previous_state = new_state;
++++	pp->previous_jiffies = new_jiffies;
++++}
++++
++++static ssize_t ahci_alpm_show_active(struct device *dev,
++++				   struct device_attribute *attr, char *buf)
++++{
++++	struct Scsi_Host *shost = class_to_shost(dev);
++++	struct ata_port *ap = ata_shost_to_port(shost);
++++	struct ahci_port_priv *pp;
++++
++++	if (!ap || ata_port_is_dummy(ap))
++++		return -EINVAL;
++++	pp = ap->private_data;
++++	account_alpm_stats(ap);
++++
++++	return sprintf(buf, "%u\n", jiffies_to_msecs(pp->active_jiffies));
++++}
++++
++++static ssize_t ahci_alpm_show_partial(struct device *dev,
++++				   struct device_attribute *attr, char *buf)
++++{
++++	struct Scsi_Host *shost = class_to_shost(dev);
++++	struct ata_port *ap = ata_shost_to_port(shost);
++++	struct ahci_port_priv *pp;
++++
++++	if (!ap || ata_port_is_dummy(ap))
++++		return -EINVAL;
++++
++++	pp = ap->private_data;
++++	account_alpm_stats(ap);
++++
++++	return sprintf(buf, "%u\n", jiffies_to_msecs(pp->partial_jiffies));
++++}
++++
++++static ssize_t ahci_alpm_show_slumber(struct device *dev,
++++				   struct device_attribute *attr, char *buf)
++++{
++++	struct Scsi_Host *shost = class_to_shost(dev);
++++	struct ata_port *ap = ata_shost_to_port(shost);
++++	struct ahci_port_priv *pp;
++++
++++	if (!ap || ata_port_is_dummy(ap))
++++		return -EINVAL;
++++
++++	pp = ap->private_data;
++++
++++	account_alpm_stats(ap);
++++
++++	return sprintf(buf, "%u\n", jiffies_to_msecs(pp->slumber_jiffies));
++++}
++++
++++static ssize_t ahci_alpm_show_accounting(struct device *dev,
++++				  struct device_attribute *attr, char *buf)
++++{
++++	struct Scsi_Host *shost = class_to_shost(dev);
++++	struct ata_port *ap = ata_shost_to_port(shost);
++++	struct ahci_port_priv *pp;
++++
++++	if (!ap || ata_port_is_dummy(ap))
++++		return -EINVAL;
++++
++++	pp = ap->private_data;
++++
++++	return sprintf(buf, "%u\n", pp->accounting_active);
++++}
++++
++++static ssize_t ahci_alpm_set_accounting(struct device *dev,
++++				  struct device_attribute *attr,
++++				  const char *buf, size_t count)
++++{
++++	unsigned long flags;
++++	struct Scsi_Host *shost = class_to_shost(dev);
++++	struct ata_port *ap = ata_shost_to_port(shost);
++++	struct ahci_port_priv *pp;
++++	void __iomem *port_mmio;
++++
++++	if (!ap || ata_port_is_dummy(ap))
++++		return 1;
++++
++++	pp = ap->private_data;
++++	port_mmio = ahci_port_base(ap);
++++
++++	if (!pp)
++++		return 1;
++++	if (buf[0] == '0')
++++		pp->accounting_active = 0;
++++	if (buf[0] == '1')
++++		pp->accounting_active = 1;
++++
++++	/* we need to enable the PHYRDY interrupt when we want accounting */
++++	if (pp->accounting_active) {
++++		spin_lock_irqsave(ap->lock, flags);
++++		pp->intr_mask |= PORT_IRQ_PHYRDY;
++++		writel(pp->intr_mask, port_mmio + PORT_IRQ_MASK);
++++		spin_unlock_irqrestore(ap->lock, flags);
++++	}
++++	return count;
++++}
++++
++++
+++ static void ahci_port_intr(struct ata_port *ap)
+++ {
+++ 	void __iomem *port_mmio = ahci_port_base(ap);
+++@@ -1590,6 +1772,7 @@ static void ahci_port_intr(struct ata_po
+++ 	/* if LPM is enabled, PHYRDY doesn't mean anything */
+++ 	if (ap->link.lpm_policy > ATA_LPM_MAX_POWER) {
+++ 		status &= ~PORT_IRQ_PHYRDY;
++++		account_alpm_stats(ap);
+++ 		ahci_scr_write(&ap->link, SCR_ERROR, SERR_PHYRDY_CHG);
+++ 	}
+++
+diff --git a/utils/powertop/patches/100-no-wide-ncurses.patch b/utils/powertop/patches/100-no-wide-ncurses.patch
+--- a/utils/powertop/patches/100-no-wide-ncurses.patch
++++ b/utils/powertop/patches/100-no-wide-ncurses.patch
+@@ -1,11 +1,11 @@
+ --- a/Makefile
+ +++ b/Makefile
+-@@ -20,7 +20,7 @@ OBJS = powertop.o config.o process.o mis
+- 	
++@@ -28,7 +28,7 @@ OBJS = powertop.o config.o process.o mis
++ 
+  
+  powertop: $(OBJS) Makefile powertop.h
+--	$(CC) ${CFLAGS}  $(OBJS) -lncursesw -o powertop
+-+	$(CC)  ${LDFLAGS}  $(OBJS) -lncurses -o powertop
++-	$(CC) ${CFLAGS} $(LDFLAGS) $(OBJS) -lncursesw -o powertop
+++	$(CC) ${CFLAGS} $(LDFLAGS) $(OBJS) -lncurses -o powertop
+  	@(cd po/ && $(MAKE))
+  
+- powertop.1.gz: powertop.1
++ powertop.8.gz: powertop.8
+diff --git a/utils/powertop/patches/200-no-gettext.patch b/utils/powertop/patches/200-no-gettext.patch
+--- a/utils/powertop/patches/200-no-gettext.patch
++++ b/utils/powertop/patches/200-no-gettext.patch
+@@ -10,8 +10,8 @@
+  #include <ctype.h>
+  #include <assert.h>
+  #include <locale.h>
+-@@ -783,9 +785,11 @@ int main(int argc, char **argv)
+- 	uint64_t cur_usage[8], cur_duration[8];
++@@ -901,9 +903,11 @@ int main(int argc, char **argv)
++ 	uint64_t cur_usage[MAX_NUM_CSTATES], cur_duration[MAX_NUM_CSTATES];
+  	double wakeups_per_second = 0;
+  
+ +#ifdef ENABLE_GETTEXT
+@@ -20,8 +20,8 @@
+  	textdomain ("powertop");
+ +#endif
+  
+-  	while (1) {
+-  		static struct option opts[] = {
++ 	start_data_dirty_capture();
++ 
+ --- a/powertop.h
+ +++ b/powertop.h
+ @@ -26,7 +26,9 @@
+@@ -32,9 +32,9 @@
+  #include <libintl.h>
+ +#endif
+  
+- struct line {
+- 	char	*string;
+-@@ -86,7 +88,11 @@ extern suggestion_func *suggestion_activ
++ /*
++  * Define the MAX values for [CP]STATES "big enough".
++@@ -104,7 +106,11 @@ extern suggestion_func *suggestion_activ
+          _x < _y ? _x : _y; })
+  
+  

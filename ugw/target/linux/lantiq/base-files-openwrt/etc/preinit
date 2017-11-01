@@ -1,0 +1,129 @@
+#!/bin/sh
+# Copyright (C) 2006 OpenWrt.org
+# Copyright (C) 2010 Vertical Communications
+
+[ -z "$PREINIT" ] && exec /sbin/init
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+[ -f /sbin/ltq_function.sh ] && . /sbin/ltq_function.sh
+
+mount_ubi_data_vol()
+{
+	dest="$1"
+
+	/usr/sbin/vol_mgmt create_ubi_nodes >&- 2>&-
+	/usr/sbin/vol_mgmt mount_ubi_data_vol "$dest"
+
+	return 0
+}
+
+mount_jffs2_data_vol()
+{
+	local dest="$1"; local fb
+
+	mtdpart=`grep -w data_vol /proc/mtd | awk -F':' '{print $1}' | sed 's/mtd*//g'`
+	[ -z $mtdpart ] && { echo "MTD Partition: data_vol not found"; return 1; }
+	echo "MTD Partition: data_vol found at $mtdpart"
+
+	## This should be only firsttime
+	fb=`get_uboot_env firstboot 1`
+	[ $fb = 1 ] && { flash_eraseall -j /dev/mtd$mtdpart; }
+
+	mount -t jffs2 -o noatime /dev/mtdblock$mtdpart "$dest"
+	return $?
+}
+
+do_overlay()
+{
+	local overlay_enabled=0; local ret=1
+
+	mount -t debugfs -o defaults debugfs /sys/kernel/debug
+	mount -t tmpfs tmpfs /dev/shm
+
+	mkdir -p /overlay
+	mkdir -p /mnt/data
+
+	if grep -w -q do_overlay /proc/cmdline; then
+		overlay_enabled=1
+	fi
+	grep "ubi.mtd" /proc/cmdline >&- 2>&-
+	if [ $? -eq 0 ]; then
+		if [ $overlay_enabled = 1 ]; then
+			mount_ubi_data_vol "/overlay"
+			ret=$?
+		else
+			mount_ubi_data_vol "/mnt/data"
+			ret=$?
+		fi
+	else
+		if [ $overlay_enabled = 1 ]; then
+			mount_jffs2_data_vol "/overlay"
+			ret=$?
+		else
+			mount_jffs2_data_vol "/mnt/data"
+			ret=$?
+		fi
+	fi
+
+	[ $ret -ne 0 ] && { echo "mount failed"; return 1; }
+	[ $overlay_enabled = 0 ] && { echo "Overlay is disabled"; return 0; }
+
+	mount -t overlayfs -o lowerdir=/,upperdir=/overlay "overlayfs:/overlay" /mnt && root=/mnt
+
+	pivot_root /mnt /mnt/rom && {
+		mount -o move /rom/dev /dev
+		mount -o move /rom/proc /proc
+		mount -o move /rom/sys /sys
+		mount -o move /rom/overlay /overlay
+		mount -o move /rom/tmp /tmp
+	}
+
+	#   mount -t ramfs -o nr_inodes=1k,mode=770 /dev/ram /ramdisk
+	#mkdir -p /ramdisk
+	#mount -t ramfs -o nr_inodes=1k,mode=770 /dev/ram /ramdisk
+	#cp -ar /ramdisk_copy/* /ramdisk
+
+}
+
+do_overlay
+
+pi_ifname=
+pi_ip=192.168.1.1
+pi_broadcast=192.168.1.255
+pi_netmask=255.255.255.0
+
+fs_failsafe_ifname=
+fs_failsafe_ip=192.168.1.1
+fs_failsafe_broadcast=192.168.1.255
+fs_failsafe_netmask=255.255.255.0
+
+fs_failsafe_wait_timeout=2
+
+pi_suppress_stderr="y"
+pi_init_suppress_stderr="y"
+pi_init_path="/bin:/sbin:/usr/bin:/usr/sbin"
+pi_init_cmd="/sbin/init"
+
+. /lib/functions.sh
+. /lib/functions/preinit.sh
+. /lib/functions/system.sh
+
+boot_hook_init preinit_essential
+boot_hook_init preinit_main
+boot_hook_init failsafe
+boot_hook_init initramfs
+boot_hook_init preinit_mount_root
+
+for pi_source_file in /lib/preinit/*; do
+	. $pi_source_file
+done
+
+boot_run_hook preinit_essential
+
+pi_mount_skip_next=false
+pi_jffs2_mount_success=false
+pi_failsafe_net_message=false
+
+boot_run_hook preinit_main
+

@@ -1,0 +1,93 @@
+#!/bin/sh
+
+if [ ! "$ENVLOADED" ]; then
+	if [ -r /etc/rc.conf ]; then
+		 . /etc/rc.conf 2> /dev/null
+		ENVLOADED="1"
+	fi
+fi
+
+WAN=$default_wan_conn_iface
+
+if [ -n "$routing_Count" -a "$routing_Count" -gt 0 ]; then
+	i=0
+	while [ "$i" -ge 0 -a "$i" -lt $routing_Count ]
+	do
+		eval staticRoute_dst='$'route_${i}_dstIp
+		eval staticRoute_netmask='$'route_${i}_dstMask
+		eval staticRoute_iface='$'route_${i}_routeIf
+
+		eval cpeId='$'route_${i}_cpeId
+		status_tag="route_${cpeId}"
+		status_tag_value="route_${cpeId}_status"
+		eval staticRoute_gw='$'route_${i}_gw
+		eval staticRoute_type='$'route_${i}_type
+                
+		case "$staticRoute_iface" in
+                    *WANPPP*)
+                            interface_index="`echo $staticRoute_iface | sed -n 's,WANPPP,,;1p'`"
+                            eval staticRoute_iface='$'wanppp_${interface_index}_ifppp
+                            echo "$staticRoute_iface"
+                            ;;
+                    *WANIP*)
+                            interface_index="`echo $staticRoute_iface | sed -n 's,WANIP,,;1p'`"
+                            eval staticRoute_iface='$'wanip_${interface_index}_iface
+                            echo "$staticRoute_iface"
+                            ;;
+                esac
+
+		#	before adding this route, 
+		if [ "$staticRoute_type" = "1" ]; then
+			if [ -n "$staticRoute_gw" -a "$staticRoute_gw" = "0.0.0.0" ]; then
+				if [ -z "$staticRoute_iface" ]; then
+					# staticRoute="default dev $WAN"
+					# Interface=$WAN
+
+					/usr/sbin/status_oper SET $status_tag $status_tag_value ERROR 
+					i=$(( $i + 1 ))
+					continue
+				else
+					staticRoute="default dev $staticRoute_iface"
+					Interface=$staticRoute_iface
+				fi
+			else
+				staticRoute="default gw $staticRoute_gw"
+			fi
+		elif [ "$staticRoute_type" = "2" ]; then
+			staticRoute="$staticRoute_dst"
+			if [ -n "$staticRoute_gw" ]; then
+				staticRoute="$staticRoute gw $staticRoute_gw"
+			fi
+			if [ -n "$staticRoute_iface" ]; then
+				staticRoute="$staticRoute dev $staticRoute_iface"
+			fi
+		elif [ "$staticRoute_type" = "3" ]; then
+			if [ -z "$staticRoute_iface" ]; then
+				staticRoute="-net $staticRoute_dst netmask $staticRoute_netmask gw $staticRoute_gw"
+			else
+				staticRoute="-net $staticRoute_dst netmask $staticRoute_netmask dev $staticRoute_iface"
+			fi
+		fi
+
+		if [ -n "$Interface" ]; then
+			iface_stat=`ifconfig $Interface`
+			case $iface_stat in
+				*UP\ *) /usr/sbin/status_oper SET $status_tag $status_tag_value UP
+					;;
+				*)  /usr/sbin/status_oper SET $status_tag $status_tag_value DOWN 
+				i=$(( $i + 1 ))
+				continue
+				;;
+			esac
+			
+		fi
+
+   		/sbin/route add ${staticRoute}
+		if [ $? -ne 0 ]; then
+				/usr/sbin/status_oper SET $status_tag $status_tag_value ERROR 
+		fi
+		#i=$(($i+1))
+		i=$(( $i + 1 ))
+	done
+fi
+

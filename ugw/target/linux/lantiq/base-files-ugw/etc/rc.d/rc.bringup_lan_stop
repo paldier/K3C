@@ -1,0 +1,149 @@
+#!/bin/sh
+
+if [ ! "$ENVLOADED" ]; then
+	if [ -r /etc/rc.conf ]; then
+		 . /etc/rc.conf 2> /dev/null
+		ENVLOADED="1"
+	fi
+fi
+
+if [ ! "$CONFIGLOADED" ]; then
+	if [ -r /etc/rc.d/config.sh ]; then
+		. /etc/rc.d/config.sh 2>/dev/null
+		CONFIGLOADED="1"
+	fi
+fi
+
+#stop(){
+        if  [ "$CONFIG_FEATURE_WIRELESS" = "1" ]; then
+        	if [ -z $CONFIG_FEATURE_WIRELESS_WAVE300 = "1" ]; then
+			. /etc/rc.d/rc.bringup_wlan stop
+		fi
+	fi
+
+	if [ -z "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -a -z "$CONFIG_TARGET_LANTIQ_VBG500_VBG500" ]; then
+		# Disable execution of this script if NFS is enabled
+		cat /proc/mounts | grep nfs > /dev/null
+		if [ $? = 1 ]; then	
+		#NFS is disabled
+			. /etc/init.d/ltq_switch_config.sh undo_switch_config
+		fi
+	fi
+
+	# Stop Avahi Daemon
+	if [ -n "$CONFIG_PACKAGE_AVAHI_DAEMON" -a "$CONFIG_PACKAGE_AVAHI_DAEMON" = "1" ]; then
+		. /etc/rc.d/init.d/avahi-daemon stop > /dev/null
+	fi
+	i=0
+        while [ $i -lt $lan_main_Count ]
+        do
+                eval giface='$'lan_main_${i}_interface
+			eval global_subnet='$'lan_main_${i}_VIPEnable
+			eval gip='$'lan_main_${i}_ipAddr
+                        eval gnetmask='$'lan_main_${i}_netmask
+			/sbin/ifconfig $giface $gip netmask $gnetmask down 2>/dev/null
+                if [ "$giface" = "br0:1" ]; then
+                        /usr/sbin/iptables -t nat -D POSTROUTING --source $gip/$gnetmask -j RETURN 2>/dev/null
+                fi
+		i=$(( $i + 1 ))
+	done
+	if  [ $CONFIG_FEATURE_DHCP_SERVER -a $CONFIG_FEATURE_DHCP_SERVER = "1" ]; then
+		idx=0
+		while [ $idx -lt $lan_main_Count ]
+		do
+			eval dhcp_mode='$lan_main_'$idx'_dhcpMode'
+			eval dhcp_enable='$'lan_dhcps_dhcpMode
+			if [ "$dhcp_mode" = "server" -o  "$dhcp_mode" = "relay" -a "$dhcp_enable" = "1" ]; then
+				. /etc/init.d/udhcpd stop > /dev/null
+			fi
+		idx=$(( $idx + 1 ))
+		done
+	fi
+
+
+	if [ -f /usr/sbin/naptcfg ]; then
+		i=0
+		while [ $i -lt $lan_main_Count ]
+		do
+			eval iface='$lan_main_'$i'_interface'
+			/usr/sbin/naptcfg --DELLAN $iface 2>/dev/null
+			i=$(( $i + 1 ))	
+		done
+	fi
+#	LAN="`/etc/rc.d/get_lan_if`"
+	. /etc/rc.d/get_lan_if
+	LAN=$LAN_IFNAME
+#Manamohan, commented on 4,July 2012
+#	if  [ "$CONFIG_FEATURE_DIFFSERV" = "1" ]; then
+#		if [ "$QOS_ENABLE" = 1 -a "$DIFFSERV_VIRTUAL_SERVER" = "1" ]; then
+#		. /etc/rc.d/init.d/qos stop_lan
+#		fi
+#	fi
+	/usr/sbin/status_oper SET Lan1_IF_Info STATUS DOWN
+
+	if [ "$CONFIG_FEATURE_INETD" = "1" ]; then
+		#start inetd superserver
+		. /etc/init.d/inetd restart
+	fi
+
+	i=0
+	while [ $i -lt $lan_main_Count ]
+	do
+		eval addr_type='$'lan_main_${i}_ipAddrType
+		if [ -n "$CONFIG_PACKAGE_AVAHI_AUTOIPD" -a "$CONFIG_PACKAGE_AVAHI_AUTOIPD" = "1" ]; then
+			# stop avahi-autoipd to release zeroconf ip
+			if [ -f /etc/avahi/avahi-autoipd.action ]; then
+				. /etc/rc.d/init.d/avahi-autoipd stop $i
+			fi
+		fi
+		if [ -n "$CONFIG_FEATURE_LTQ_HNX_CONFIG" -a "$CONFIG_FEATURE_LTQ_HNX_CONFIG" = "1" -o -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" = "1" ]; then
+			if [ "$addr_type" = "2" ]; then
+				eval ip='$lan_main_'$i'_ipAddr'
+				eval iface='$lan_main_'$i'_interface'
+				eval gw='$lan_main_'$i'_gw'
+				/sbin/ifconfig $iface 0.0.0.0
+				/usr/sbin/status_oper SET Lan1_IF_Info STATUS "DOWN"
+				# delete default route with gateway
+				if [ "$gw" != "0.0.0.0" -a "$gw" != "$ip" ]; then
+					/sbin/route del default gw $gw
+				fi
+				# reset /etc/resolv.conf
+				echo -n > /etc/resolv.conf
+			fi
+		fi
+		if [ -f /etc/rc.d/udhcpc_lan.script -a "$addr_type" = "1" ]; then
+			. /etc/rc.d/init.d/udhcpc release $i
+			. /etc/rc.d/init.d/udhcpc stop $i
+		fi
+		i=$(( $i + 1 ))
+	done
+
+	# Stop UPnP-DM
+	if  [ -n "$CONFIG_PACKAGE_UPNPDM" -a "$CONFIG_PACKAGE_UPNPDM" = "1" -a "$upnpdm_enable" = "1" ]; then
+		/etc/rc.d/init.d/upnpdm stop > /dev/null
+	fi
+
+	if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" ]; then
+		eval dhcpcEna='$'gbc_dhcpClntEna
+		if [ -f /etc/rc.d/udhcpc_lan.script -a "$dhcpcEna" = "1" ]; then
+			. /etc/rc.d/init.d/udhcpc release 0
+			. /etc/rc.d/init.d/udhcpc stop 0
+		fi
+	fi
+
+	# PPA 
+	eval g_wan_phy_mode='$'wanphy_phymode
+
+
+	if [ "1$CONFIG_FEATURE_PPA_SUPPORT" = "11" ]; then
+		if [ "$g_wan_phy_mode" = "1" ]; then # Eth on MII0
+			# . /etc/rc.d/ppa_config.sh dellan eth0.$lan_vid_all
+			. /etc/rc.d/ppa_config.sh dellan eth0.501 #hardcoding because lan_vid_all is not available in this script
+		else
+                        . /etc/rc.d/ppa_config.sh dellan eth0
+		fi
+
+		. /etc/rc.d/ppa_config.sh dellan $LAN_IFNAME
+	fi
+
+#}

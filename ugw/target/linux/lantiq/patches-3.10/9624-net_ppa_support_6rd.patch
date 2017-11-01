@@ -1,0 +1,272 @@
+# HG changeset patch
+# Parent 3e38f5ba8ac0eae43303a97d801efeefe02084c8
+
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -19,6 +19,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/capability.h>
+ #include <linux/errno.h>
+@@ -56,6 +57,9 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#include <net/ppa_stack_al.h>
++#endif
+ /*
+    This version of net/ipv6/sit.c is cloned of net/ipv4/ip_gre.c
+ 
+@@ -76,6 +80,22 @@ static bool check_6rd(struct ip_tunnel *
+ 		      __be32 *v4dst);
+ static struct rtnl_link_ops sit_link_ops __read_mostly;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    extern int (*ppa_get_6rd_dmac_fn)(struct net_device *, uint8_t *mac);
++#else
++    extern int (*ppa_get_6rd_dmac_fn)(struct net_device *, struct sk_buff *skb, uint8_t *mac);
++#endif
++    extern struct net_device * (*ppa_get_6rd_phyif_fn)(struct net_device *);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    static int ppa_get_6rd_dmac(struct net_device *dev, uint8_t *mac);
++#else
++    static int ppa_get_6rd_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac);
++#endif
++    static  struct net_device *ppa_get_6rd_phyif(struct net_device *dev);
++#endif
++
++
+ static int sit_net_id __read_mostly;
+ struct sit_net {
+ 	struct ip_tunnel __rcu *tunnels_r_l[HASH_SIZE];
+@@ -1572,6 +1592,12 @@ static int __init sit_init(void)
+ 		pr_info("%s: can't add protocol\n", __func__);
+ 		goto xfrm_tunnel_failed;
+ 	}
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++    ppa_get_6rd_dmac_fn = ppa_get_6rd_dmac;
++    ppa_get_6rd_phyif_fn = ppa_get_6rd_phyif;
++#endif
++
+ 	err = rtnl_link_register(&sit_link_ops);
+ 	if (err < 0)
+ 		goto rtnl_link_failed;
+@@ -1586,6 +1612,211 @@ xfrm_tunnel_failed:
+ 	goto out;
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++int ppa_get_6rd_dmac(struct net_device *dev, uint8_t *mac)
++#else
++int ppa_get_6rd_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac)
++#endif
++{
++    struct ip_tunnel *tunnel;
++    struct iphdr *iph;
++    struct rtable *rt = NULL;
++    struct dst_entry *dst = NULL;
++    struct hh_cache *hh;
++
++    tunnel = netdev_priv(dev);
++    iph = &tunnel->parms.iph;
++
++	if (iph->daddr) {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    	struct flowi fl = { .nl_u = { .ip4_u =
++    				      { .daddr = iph->daddr,
++    					.saddr = iph->saddr,
++    					.tos = RT_TOS(iph->tos) } },
++    			    .oif = tunnel->parms.link,
++    			    .proto = IPPROTO_IPV6 };
++#else
++
++/*      struct flowi fl = { .u = { .ip4 = { .__fl_common = 
++						      { .flowic_tos = RT_TOS(iph->tos),
++				           .flowic_oif = tunnel->parms.link,
++				           .flowic_proto = IPPROTO_IPV6 } }, 
++					        .daddr = iph->daddr,
++						     .saddr = iph->saddr } }; */
++
++      struct flowi4 fl; 
++      fl.flowi4_tos = RT_TOS(iph->tos);
++		fl.flowi4_oif = tunnel->parms.link;
++		fl.flowi4_proto = IPPROTO_IPV6; 
++		fl.daddr = iph->daddr;
++		fl.saddr = iph->saddr; 
++
++#endif
++
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    	if (!ip_route_output_key(dev_net(dev), &rt, &fl)) {
++#else
++
++    	rt=ip_route_output_key(dev_net(dev), &fl);
++      {
++#endif
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,36)
++                    dst = &rt->u.dst;
++#else
++                    dst = &rt->dst;
++#endif
++    		}
++	}
++	
++    if(!dst){
++        goto MAC_ERROR;
++    }
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    hh = dst->hh;
++    if(!hh){
++       if ( dst->neighbour 
++                && (dst->neighbour->ha[0] != 0
++                || dst->neighbour->ha[1] != 0
++                || dst->neighbour->ha[2] != 0
++                || dst->neighbour->ha[3] != 0
++                || dst->neighbour->ha[4] != 0
++                || dst->neighbour->ha[5] != 0) ){
++                
++            memcpy(mac, (uint8_t *)dst->neighbour->ha, ETH_ALEN);
++        }else{
++            goto MAC_ERROR;
++        }
++#else
++    struct neighbour *neigh;
++    neigh = dst_neigh_lookup_skb(dst,skb);
++
++    if(neigh == NULL)
++    {
++       return -1;
++    }
++
++    //if(dst->dev->header_ops->cache == NULL)
++    {
++       ppa_neigh_hh_init(neigh,dst);   
++       ppa_neigh_update_hhs(neigh);
++    }
++    hh = &neigh->hh;
++    if ( !hh )
++    {
++        if ( neigh
++            && (neigh->ha[0] != 0
++                || neigh->ha[1] != 0
++                || neigh->ha[2] != 0
++                || neigh->ha[3] != 0
++                || neigh->ha[4] != 0
++                || neigh->ha[5] != 0) )
++        {
++            memcpy(mac, (uint8_t *)neigh->ha, ETH_ALEN);
++        }else{
++            goto MAC_ERROR;
++        }
++
++#endif
++    }else{
++        unsigned int seq;
++
++        do {
++            seq = read_seqbegin(&hh->hh_lock);
++            if ( hh->hh_len != ETH_HLEN )
++            {
++                //printk("head length is not correct: hh->hh_len = %d, ETH_HLEN = %d\n", (int)hh->hh_len, ETH_HLEN);
++                goto MAC_ERROR;
++            }
++            else
++            {
++                memcpy(mac, (uint8_t *)hh->hh_data + HH_DATA_ALIGN(hh->hh_len) - hh->hh_len, ETH_ALEN);
++            }
++        } while ( read_seqretry(&hh->hh_lock, seq) );
++    }
++
++    ip_rt_put(rt);
++
++    return 0;
++    
++MAC_ERROR:
++
++    ip_rt_put(rt);
++    return -1;
++    
++}
++
++static  struct net_device *ppa_get_6rd_phyif(struct net_device *dev)
++{
++    struct ip_tunnel *tunnel;
++    struct iphdr *iph;
++    struct rtable *rt = NULL;
++    struct dst_entry *dst = NULL;
++    struct net_device *phydev = NULL;
++
++    tunnel = netdev_priv(dev);
++    iph = &tunnel->parms.iph;
++
++	if (iph->daddr) {
++		
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++      struct flowi fl = { .nl_u = { .ip4_u =
++					      { .daddr = iph->daddr,
++						.saddr = iph->saddr,
++						.tos = RT_TOS(iph->tos) } },
++				    .oif = tunnel->parms.link,
++				    .proto = IPPROTO_IPV6 };
++#else
++
++     /* struct flowi fl = { .u = { .ip4 = { .__fl_common = 
++						      { .flowic_tos = RT_TOS(iph->tos),
++				           .flowic_oif = tunnel->parms.link,
++				           .flowic_proto = IPPROTO_IPV6 } }, 
++					        .daddr = iph->daddr,
++						     .saddr = iph->saddr } }; */
++
++/*      struct flowi fl; 
++      fl.u.ip4.flowi4_tos = RT_TOS(iph->tos);
++		fl.u.ip4.flowi4_oif = tunnel->parms.link;
++		fl.u.ip4.flowi4_proto = IPPROTO_IPV6; 
++		fl.u.ip4.daddr = iph->daddr;
++		fl.u.ip4.saddr = iph->saddr;  */
++
++      struct flowi4 fl; 
++      fl.flowi4_tos = RT_TOS(iph->tos);
++		fl.flowi4_oif = tunnel->parms.link;
++		fl.flowi4_proto = IPPROTO_IPV6; 
++		fl.daddr = iph->daddr;
++		fl.saddr = iph->saddr; 
++
++#endif
++
++		struct rtable *rt;
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    	if (!ip_route_output_key(dev_net(dev), &rt, &fl)) {
++#else
++		rt=ip_route_output_key(dev_net(dev),&fl);
++      {
++#endif
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,36)
++              phydev = rt->u.dst.dev;
++#else
++              phydev = rt->dst.dev;
++#endif
++			ip_rt_put(rt);
++		}
++	}
++
++    return phydev;   
++}
++
++#endif
++
++
+ module_init(sit_init);
+ module_exit(sit_cleanup);
+ MODULE_LICENSE("GPL");

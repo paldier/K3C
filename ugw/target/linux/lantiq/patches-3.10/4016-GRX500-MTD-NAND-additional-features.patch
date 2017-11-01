@@ -1,0 +1,916 @@
+# HG changeset patch
+# Parent 2c09eb042c5e896704d876b428c655d08ee3150b
+
+diff --git a/drivers/mtd/nand/xway_dmanand.c b/drivers/mtd/nand/xway_dmanand.c
+--- a/drivers/mtd/nand/xway_dmanand.c
++++ b/drivers/mtd/nand/xway_dmanand.c
+@@ -203,7 +203,7 @@
+ 
+ #define MLC_NAND_DMA_BURST_LEN	  DMA_BURSTL_8DW
+ #define LQ_MTD_MLC_NAND_BANK_NAME "ifx_nand"
+-#define DMA_NAND_EVENT		  0x98
++#define DMA_NAND_EVENT		  1
+ #define DMA_NAND_WRITE		  0x80
+ 
+ /* special nand flashes which need care in
+@@ -214,16 +214,11 @@
+ #define HYNIX_MLC_FLASH		0xaddc
+ 
+ #ifndef CONFIG_EVA
+- #define NANDPHYSADDR(x)    CPHYSADDR(x)
++#define NANDPHYSADDR(x)    CPHYSADDR(x)
+ #else
+- #ifdef CONFIG_EVA_2GB
+-  #define NANDPHYSADDR(x) CPHYSADDR(x)
+- #else
+-  #define NANDPHYSADDR(x) RPHYSADDR(x)
+- #endif
++#define NANDPHYSADDR(x) RPHYSADDR(x)
+ #endif /* CONFIG_EVA */
+ 
+-
+ static struct dma_device_info *dma_device;
+ static void update_mlc_nand_addr_lp(struct mtd_info *mtd,
+ 							int page_addr, int col, int cmd);
+@@ -272,16 +267,15 @@ struct dma_nand_priv {
+ 	u8 multiplane_rd_cmd;
+ 
+ 	struct mtd_info *mtd_priv;
++	//struct dma_device_info *dma_device;
+ 
+ 	wait_queue_head_t dma_nand_wait;
+-	unsigned long wait_flag;
++	volatile unsigned long wait_flag;
+ 
+ };
+ 
+ static u8 *tmp_wr_buf;
+ static u8 *tmp_rd_buf;
+-struct dma_nand_priv *dma_nand_dev;
+-static struct mtd_info *dma_nand_mtd;
+ 
+ /* Reed Solomon calculation based on hardware implementation
+  * of ECC generator/calculator
+@@ -375,8 +369,9 @@ static u8 g_add(u8 arg3, u8 arg4)
+ 	return s;
+ };
+ 
+-static void reed_solomn_128bytes_ecc(const u8 *data_bytes_partial,
+-			u8 *ecc_data)
++static void reed_solomn_128bytes_ecc(struct dma_nand_priv *mlc, 
++									const u8 *data_bytes_partial,
++									u8 *ecc_data)
+ {
+ 	u8 g[4];
+ 	u8 temp[3] = {0, 0, 0};
+@@ -385,7 +380,7 @@ static void reed_solomn_128bytes_ecc(con
+ 	u8 bytes;
+ 	u8 y;
+ 	u8 i;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	
+ 	/* 3 bytes ECC */
+ 	if (mlc->ecc_mode == 0) {
+ 		g[3] = 14;
+@@ -528,7 +523,7 @@ static void ltq_dmanand_cmd_ctrl(struct 
+ 			NAND_CLE_CLEAR;
+ 			NAND_ALE_SET;
+ 			xway_latchcmd = NAND_WRITE_ADDR;
+-		}
++		}  
+ 	}
+ 
+ 	if (cmd != NAND_CMD_NONE) {
+@@ -563,7 +558,7 @@ static int ltq_dmanand_write_oob(struct 
+ 	int i, length = mtd->oobsize;
+ 	int offs = 0;
+ 	struct nand_oobfree *free = chip->ecc.layout->oobfree;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	unsigned long nandaddr = (unsigned long) chip->IO_ADDR_W;
+ 	unsigned long flags;
+ 
+@@ -660,7 +655,7 @@ static int ltq_dmanand_write_page_raw(st
+ 			const u8 *buf, int oob_required)
+ {
+ 	int writesize = mtd->writesize;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct dma_nand_priv *mlc = chip->priv;
+ 
+ 	chip->write_buf(mtd, buf, writesize);
+ 
+@@ -675,7 +670,7 @@ static int ltq_dmanand_read_page_raw(str
+ 			u8 *buf, int oob_required, int page)
+ {
+ 	int writesize = mtd->writesize;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct dma_nand_priv *mlc = chip->priv;
+ 
+ 	/* read bypassing ecc hardware block */
+ 	mlc->dma_ecc_mode = 1;
+@@ -695,7 +690,7 @@ static int ltq_dmanand_read_page_hwecc(s
+ 			u8 *buf, int oob_required, int page)
+ {
+ 	int ret, writesize = mtd->writesize;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct dma_nand_priv *mlc = chip->priv;
+ 
+ 	NAND_CE_SET;
+ 	asm("sync");
+@@ -779,7 +774,7 @@ static int ltq_dmanand_write_page_hwecc(
+ 			struct nand_chip *chip,
+ 			const u8 *buf, int oob_required)
+ {
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	int i, writesize = mtd->writesize;
+ 	int pagestatus = check_empty_page(buf, writesize);
+ 	int eccbytes = chip->ecc.bytes;
+@@ -808,7 +803,7 @@ static int ltq_dmanand_write_page_hwecc(
+ 	 * to zero
+ 	*/
+ 	if (oob_required == 1) {
+-		pr_info("writing using EBU method at page %d, size: %d oobsize: %d\n",
++		pr_info("writing NAND with OOB data at page %d, size: %d oobsize: %d\n",
+ 				page_addr, writesize, mtd->oobsize);
+ 
+ 		mlc->oob_data_status = 1;
+@@ -832,7 +827,7 @@ static int ltq_dmanand_write_page_hwecc(
+ 			chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, mlc->current_page);
+ 
+ 			for (i = 0; eccsteps; eccsteps--, i += eccbytes, p += eccsize)
+-				reed_solomn_128bytes_ecc(p, &ecc_data[i]);
++				reed_solomn_128bytes_ecc(mlc, p, &ecc_data[i]);
+ 
+ 			for (i = 0; i < chip->ecc.total; i++)
+ 				chip->oob_poi[eccpos[i]] = ecc_data[i];
+@@ -876,9 +871,9 @@ static int ltq_dmanand_write_page_hwecc(
+ 
+ static void ltq_nand_write_buf(struct mtd_info *mtd, const u8 *buf, int len)
+ {
++	struct nand_chip *chip = mtd->priv;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	struct dma_device_info *dma_dev = dma_device;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
+-	struct nand_chip *chip = mtd->priv;
+ 	int ret_len;
+ 	int type = mlc->type;
+ 	int page_count = mlc->pcount;
+@@ -931,10 +926,9 @@ static void ltq_nand_write_buf(struct mt
+ 		ltq_dma_nand_w32(0xffffffff, DMA_NAND_CSMSG1);
+ 	}
+ 
+-
+ 	ltq_dma_nand_w32(reg, DMA_NAND_ND_PARA0);
+ 	reg = 0x0;
+-	ltq_dma_nand_w32(0, DMA_NAND_HSMD_CTL);
++	//ltq_dma_nand_w32(0, DMA_NAND_HSMD_CTL);
+ 	reg |= ((mlc->bbt_msg_offset << 17) | (mlc->empty_page_check << 16) | 
+ 			(mlc->oob_ecc_offset << 11) | mlc->cs_trigger |
+ 			(1 << 10) | dma_ecc_mode);
+@@ -948,6 +942,10 @@ static void ltq_nand_write_buf(struct mt
+ 	ltq_dma_nand_w32((ltq_dma_nand_r32(DMA_NAND_HSMD_CTL) | (1 << 2)),
+ 		DMA_NAND_HSMD_CTL);
+ 
++	asm("sync");
++	
++	pr_debug("HSMD_CTL: %08x\n", ltq_dma_nand_r32(DMA_NAND_HSMD_CTL));
++
+ 	ret_len = dma_device_write(dma_dev, (u8 *)buf, len, NULL);
+ 	if (ret_len != len) {
+ 		pr_err("DMA write to NAND failed!\n");
+@@ -965,14 +963,16 @@ static void ltq_nand_write_buf(struct mt
+ 	ltq_dma_nand_w32((ltq_dma_nand_r32(DMA_NAND_INT_STAT) |
+ 				(1 << 4)), DMA_NAND_INT_STAT);
+ 
++
+ 	return;
+ 
+ }
+ 
+ static void ltq_nand_read_buf(struct mtd_info *mtd, u8 *buf, int len)
+ {
++	struct nand_chip *chip = mtd->priv;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	struct dma_device_info *dma_dev = dma_device;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
+ 	int type = mlc->type;
+ 	int page_count = mlc->pcount;
+ 	int ecc_mode = mlc->ecc_mode;
+@@ -981,7 +981,7 @@ static void ltq_nand_read_buf(struct mtd
+ 	int ecc_strength = mlc->ecc_strength;
+ 	int block_cnt = mlc->pib;
+ 	int page, pagesize = mlc->pagesize;
+-	int chan = dma_device->current_rx_chan;
++	int chan = dma_dev->current_rx_chan;
+ 	int dma_ecc_mode = mlc->dma_ecc_mode;
+ 	u32 reg = 0;
+ 
+@@ -1011,18 +1011,18 @@ static void ltq_nand_read_buf(struct mtd
+ 
+ 	pr_debug("NAND READ PARA0 reg: %08x\n", reg);
+ 	pr_debug("NAND read length: %d\n", len);
++
+ 	ltq_dma_nand_w32(reg, DMA_NAND_ND_PARA0);
+ 
+-	ltq_dma_nand_w32(0x1, DMA_NAND_HSMD_CTL);
+ 	/* pr_debug("reg: %08x, PARA0: %08x, dma chan: %d\n",
+ 	   reg, LTQ_REG_R32(LTQ_ND_PARA0), chan); */
+ 	dma_device_desc_setup(dma_dev, (u8 *) buf, len);
+ 
+-	reg = 0x0;
+-	reg |= ((mlc->bbt_msg_offset << 17) |
++	reg = ((mlc->bbt_msg_offset << 17) |
+ 			(mlc->empty_page_check << 16) |
+ 			(mlc->oob_ecc_offset << 11) |
+ 			mlc->cs_trigger | dma_ecc_mode);
++
+ 	ltq_dma_nand_w32(reg, DMA_NAND_HSMD_CTL);
+ 
+ 	/* Update ndac address registers */
+@@ -1042,18 +1042,20 @@ static void ltq_nand_read_buf(struct mtd
+ 
+ 	ltq_dma_nand_w32((ltq_dma_nand_r32(DMA_NAND_INT_STAT) | (7 << 4)),
+ 					DMA_NAND_INT_STAT);
+-
++		
+ 	/* we have to poll the complete and OWN bit so as to allow the bits
+ 	 * to be cleared before the next read, otherwise DMA descriptor update
+ 	 * will fail */
+-	poll_dma_ownership_bit(dma_device);
++	poll_dma_ownership_bit(dma_dev);
++
+ 
+ 	return;
+ }
+ 
+ static void update_mlc_nand_addr_sp(struct mtd_info *mtd, int page, int cmd)
+ {
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct nand_chip *chip = mtd->priv;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	int writesize = mlc->pagesize;
+ 	u32 tmp_addr, addr_0, addr_1, addr_2 = 0;
+ 	u32 addr_3 = 0;
+@@ -1095,7 +1097,8 @@ static void update_mlc_nand_addr_sp(stru
+ static void update_mlc_nand_addr_lp(struct mtd_info *mtd,
+ 		int page_addr, int col, int cmd)
+ {
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct nand_chip *chip = mtd->priv;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	int writesize = mlc->pagesize;
+ 	u32 tmp_addr;
+ 	u32 addr_0 = 0;
+@@ -1103,6 +1106,7 @@ static void update_mlc_nand_addr_lp(stru
+ 	u32 addr_3 = 0, addr_4 = 0;
+ 
+ 	mlc->current_page = page_addr;
++
+ 	 pr_debug("page address: %d\n", page_addr); 
+ 	 pr_debug("multiplane: %d, address cycle: %d",
+ 			mlc->multiplane_rd_cmd, (mlc->addr_cycle)); 
+@@ -1160,7 +1164,7 @@ static void ltq_dmanand_command_sp(struc
+ {
+ 		register struct nand_chip *chip = mtd->priv;
+ 		int ctrl = NAND_CTRL_CLE | NAND_CTRL_CHANGE;
+-		struct dma_nand_priv *mlc = dma_nand_dev;
++		struct dma_nand_priv *mlc = chip->priv;
+ 
+ 		/* for commands with NAND_CMD_SEQIN or NAND_CMD_READ0 with
+ 		 * column bigger than pagesize are meant for oob reads which
+@@ -1287,11 +1291,11 @@ static void ltq_dmanand_command_lp(struc
+ 			int column, int page_addr)
+ {
+ 		register struct nand_chip *chip = mtd->priv;
+-		struct dma_nand_priv *mlc = dma_nand_dev;
++		struct dma_nand_priv *mlc = chip->priv;
+ 
+ 		/* write page command */
+ 		if ((command == NAND_CMD_SEQIN) && (column < mtd->writesize)) {
+-			if (!mlc->oob_data_status) {
++			if (!mlc->oob_data_status || (mlc->supports_msg_offset == 1)) {
+ 				update_mlc_nand_addr_lp(mtd, page_addr, column,
+ 							DMA_NAND_WRITE);
+ 				return;
+@@ -1430,13 +1434,13 @@ static void ltq_dmanand_command_lp(struc
+ 		nand_wait_ready(mtd);
+ }
+ 
+-static int lq_dma_mlcnand_intr_handler(
++int lq_dma_mlcnand_intr_handler(
+ 			struct dma_device_info *dma_dev,
+ 			int status)
+ {
+-	struct dma_nand_priv *mlc = dma_nand_dev;
+ 	int i;
+ 	u32 ecc_stat;
++	struct dma_nand_priv *mlc = dma_dev->priv;
+ 
+ 	switch (status) {
+ 	case RCV_INT:
+@@ -1453,7 +1457,9 @@ static int lq_dma_mlcnand_intr_handler(
+ 			ltq_dma_nand_w32((
+ 				ltq_dma_nand_r32(DMA_NAND_INT_STAT) |
+ 				(3 << 5)), DMA_NAND_INT_STAT);
+-		}
++		} else 
++			mlc->ecc_status = 0;
++			
+ 		asm("sync");
+ 		pr_debug("--ecc_stat: %08x--\n", ecc_stat);
+ 
+@@ -1544,7 +1550,7 @@ static int dma_nand_info_query(struct dm
+ 	return 0;
+ }
+ 
+-static int ltq_nand_dma_setup(void)
++static int ltq_nand_dma_setup(struct dma_nand_priv *mlc)
+ {
+ 	int i;
+ 
+@@ -1563,6 +1569,7 @@ static int ltq_nand_dma_setup(void)
+ 	dma_device->rx_burst_len = MLC_NAND_DMA_BURST_LEN;
+ 	dma_device->num_rx_chan = 1;
+ 	dma_device->num_tx_chan = 1;
++	dma_device->priv = mlc;
+ 
+ 	/* DMA Channel Config for TX direction */
+ 	for (i = 0; i < dma_device->num_tx_chan; i++) {
+@@ -1589,13 +1596,6 @@ static int ltq_nand_dma_setup(void)
+ 		return -EAGAIN;
+ 	}
+ 
+-#if 0
+-	for (i = 0; i < dma_device->num_rx_chan; i++) {
+-		dma_device->rx_chan[i]->reset(dma_device->rx_chan[i]);
+-		dma_device->rx_chan[i]->close(dma_device->rx_chan[i]);
+-	}
+-#endif
+-
+ 	return 0;
+ }
+ 
+@@ -1608,7 +1608,7 @@ static void pre_allocate_ecc_location(st
+ 	 * oobsize
+ 	 */
+ 
+-	pr_info("oobsize: %d\n", oobsize);
++	pr_debug("oobsize: %d\n", oobsize);
+ 	/* check if spare area mode */
+ 	if (!(mlc->ecc_location)) {
+ 		switch (oobsize) {
+@@ -1656,7 +1656,7 @@ static void pre_allocate_ecc_location(st
+ static int ltq_pre_scan_chip_info(struct mtd_info *mtd,
+ 	struct nand_chip *chip, u8 *id)
+ {
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	int extid, busw;
+ 	u16 tmp_id;
+ 
+@@ -1667,17 +1667,6 @@ static int ltq_pre_scan_chip_info(struct
+ 	mlc->pib = 0;
+ 	mlc->oob_data_status = 0;
+ 
+-#if 0
+-	if ((mlc->ecc_strength) && (mlc->ecc_mode))
+-		chip->ecc.strength = 3;
+-	else if ((!mlc->ecc_strength) && (mlc->ecc_mode))
+-		chip->ecc.strength = 2;
+-	else if ((mlc->ecc_strength) && (!mlc->ecc_mode))
+-		chip->ecc.strength = 2;
+-	else
+-		chip->ecc.strength = 1;
+-#endif
+-
+ 	mtd->bitflip_threshold = chip->ecc.strength;
+ 
+ 	/* meant to identify specific chips during page address
+@@ -1761,15 +1750,11 @@ static int ltq_pre_scan_chip_info(struct
+ 
+ static void ltq_onfi_driver_settings(struct mtd_info *mtd) 
+ {
+-	struct dma_nand_priv *mlc = dma_nand_dev;
+ 	struct nand_chip *chip = mtd->priv;
++	struct dma_nand_priv *mlc = chip->priv;
+ 	struct nand_onfi_params *p = &chip->onfi_params;
+ 	u16 id = (p->model[0] << 8 | p->model[1]);
+ 
+-	/* Some ONFI chips which are configured non-onfi way */
+-	//if (mlc->chip_id != 0)
+-	//	return;
+-	
+ 	mlc->chip_id = (int) id;
+ 	mlc->addr_cycle = (p->addr_cycles >> 4) + (p->addr_cycles & 0xf);
+ 	mlc->addr_cycle -= 3;
+@@ -1787,15 +1772,15 @@ static void ltq_onfi_driver_settings(str
+ 	
+ 	chip->ecc.total = chip->ecc.bytes * chip->ecc.steps;
+ 
+-	pr_info("id: 0x%04x, addr cycle: %d", id, mlc->addr_cycle);
++	pr_debug("id: 0x%04x, addr cycle: %d", id, mlc->addr_cycle);
+ 
+ 	pre_allocate_ecc_location(mtd, mlc, chip, mtd->oobsize);
+ 	return;
+ }
+ 
+ static int nand_define_flash_bbt(int pagesize, struct nand_chip *chip)
+-{
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++{	
++	struct dma_nand_priv *mlc = chip->priv;
+ 
+ 	switch (pagesize) {
+ 	case 512:
+@@ -1857,8 +1842,8 @@ static int ltq_nand_chip_init(struct pla
+ 	struct mtd_info *mtd)
+ {
+ 	u32 cs_flag = 0;
+-	struct dma_nand_priv *mlc = dma_nand_dev;
+ 	struct nand_chip *this = mtd->priv;
++	struct dma_nand_priv *mlc = this->priv;
+ 
+ 	unsigned long nandaddr = (unsigned long) this->IO_ADDR_W;
+ 	const __be32 *cs = of_get_property(pdev->dev.of_node,
+@@ -1870,6 +1855,11 @@ static int ltq_nand_chip_init(struct pla
+ 	const __be32 *ecc_strength = of_get_property(pdev->dev.of_node,
+ 					"lantiq,eccstrength", NULL);
+ 
++	if (!ecc_location || !ecc_strength ||
++			!ecc_mode) {
++		pr_err("Error reading DTS info. Please check your DTS configurations\n");
++		return -EINVAL;
++	}
+ 	/* set configuration for hardware  */
+ 	/* 1: 4B ecc, 0: 3B ecc */
+ 	mlc->ecc_mode = *ecc_mode;
+@@ -1913,7 +1903,6 @@ static int ltq_nand_chip_init(struct pla
+                 | ADDSEL1_MASK(2) | ADDSEL1_REGEN, EBU_ADDSEL1);
+         } else if (of_machine_is_compatible("lantiq,grx500")) {
+             ltq_ebu_w32(0x17400051, EBU_ADDSEL0);
+-            //ltq_ebu_w32(0x17c00051, EBU_ADDSEL1);
+             ltq_ebu_w32(NANDPHYSADDR(nandaddr)
+                 | ADDSEL1_MASK(5) | ADDSEL1_REGEN, EBU_ADDSEL1);
+         } else {
+@@ -1996,6 +1985,8 @@ static int __init ltq_dmanand_probe(stru
+ 	const struct of_device_id *match;
+ 	const struct lantiq_dmanand_cfg *config;
+ 	void __iomem *io_base;
++	struct mtd_info *dma_nand_mtd;
++	struct dma_nand_priv *dma_nand_dev;
+ 
+ 	/* clear address */
+ 	dma_nand_dev = kmalloc(sizeof(struct dma_nand_priv),
+@@ -2041,13 +2032,19 @@ static int __init ltq_dmanand_probe(stru
+ 	dma_nand_dev->ndac_ctl_2 = 0x0;
+ 	dma_nand_dev->current_page = 0x0;
+ 	dma_nand_dev->dma_ecc_mode = 1;
++	dma_nand_dev->pagesize = 0;	/* set to zero first and config later */
++	dma_nand_dev->pcount = 0; /* try out one page read/write 1st */
++	dma_nand_dev->ecc_status = 0;
++	dma_nand_dev->addr_cycle = 0;
++	dma_nand_dev->pib = 0;
++	dma_nand_dev->oob_data_status = 0;
+ 
+ 	dma_nand_dev->empty_page_check = config->empty_page_ecc_check;
+ 	dma_nand_dev->bbt_msg_offset = config->bbt_msg_offset;
+ 	dma_nand_dev->oob_ecc_offset = config->has_ecc_offset;
+ 	dma_nand_dev->supports_msg_offset = config->supports_msg_offset;
+ 
+-	pr_debug("epty pg: %d, bbt_offset: %d, oob_ecc_offset %d, support_msg_offset: %d\n",
++	pr_info("empty pg: %d, bbt_offset: %d, oob_ecc_offset %d, support_msg_offset: %d\n",
+ 		dma_nand_dev->empty_page_check, dma_nand_dev->bbt_msg_offset, 
+ 		dma_nand_dev->oob_ecc_offset, dma_nand_dev->supports_msg_offset);
+ 
+@@ -2057,12 +2054,11 @@ static int __init ltq_dmanand_probe(stru
+ 	if (!dma_nand_mtd) {
+ 		pr_info("Unable to allocate MLC MTD device structure\n");
+ 		err = -ENOMEM;
+-		return err;
++		goto out;
+ 	}
+ 
+ 	this = (struct nand_chip *)(&dma_nand_mtd[1]);
+ 	memset(dma_nand_mtd, 0, sizeof(struct mtd_info));
+-	memset(this, 0, sizeof(struct nand_chip));
+ 
+ 	dma_nand_mtd->name = LQ_MTD_MLC_NAND_BANK_NAME;
+ 
+@@ -2090,6 +2086,8 @@ static int __init ltq_dmanand_probe(stru
+ 	this->options = NAND_SKIP_BBTSCAN | NAND_NO_SUBPAGE_WRITE;
+ 	this->bbt_options = NAND_BBT_USE_FLASH | NAND_BBT_CREATE_EMPTY;
+ 	this->read_byte = ltq_dmanand_read_byte;
++	
++	this->priv = dma_nand_dev;
+ 
+ 	ltq_nand_chip_init(pdev, dma_nand_mtd);
+ 
+@@ -2117,11 +2115,13 @@ static int __init ltq_dmanand_probe(stru
+ 	/* dummy otherwise nand scan will fail*/
+ 	this->ecc.size = 128;
+ 	
+-	err = ltq_nand_dma_setup();
++	err = ltq_nand_dma_setup(dma_nand_dev);
+ 	if (err < 0) {
+ 		pr_err("MLC NAND DMA setup failed\n");
+-		goto out;
++		goto out_mtd;
+ 	}
++	
++	platform_set_drvdata(pdev, dma_nand_dev);
+ 
+ 	/* check if ONFI, initate ecc.layout to make linux kernel happy
+ 	 * else BUG() will be called as 2.6.32 does not support nand flash
+@@ -2132,7 +2132,7 @@ static int __init ltq_dmanand_probe(stru
+ 	if (nand_scan(dma_nand_mtd, 1)) {
+ 		pr_err("Probing for NAND flash failed, flash not found!\n");
+ 		err = -ENXIO;
+-		goto out;
++		goto out_mtd;
+ 	}
+ 
+ 	if (this->onfi_version) {
+@@ -2144,13 +2144,13 @@ static int __init ltq_dmanand_probe(stru
+ 	tmp_rd_buf = kmalloc(dma_nand_mtd->writesize, GFP_KERNEL);
+ 	if (!tmp_rd_buf) {
+ 		pr_err("Error allocating read buffer\n");
+-		goto out;
++		goto out_rd;
+ 	}
+ 
+ 	tmp_wr_buf = kmalloc(dma_nand_mtd->writesize, GFP_KERNEL);
+ 	if (!tmp_wr_buf) {
+ 		pr_err("Error allocating write buffer\n");
+-		goto out;
++		goto out_rd;
+ 	}
+ 
+ 	this->read_buf = ltq_nand_read_buf;
+@@ -2177,7 +2177,7 @@ static int __init ltq_dmanand_probe(stru
+ 								mtd_parts,
+ 								n);
+ 	if (err < 0)
+-		goto out;
++		goto out_wr;
+ 
+ 	pr_info("ecc size: %d, ecc bytes: %d, ecc total: %d\n",
+ 		this->ecc.size, this->ecc.bytes, this->ecc.total);
+@@ -2188,10 +2188,14 @@ static int __init ltq_dmanand_probe(stru
+ 	pr_info("Success in initializing MLC NAND\n");
+ 	return 0;
+ 
++out_wr:
++	kfree(tmp_wr_buf);
++out_rd:
++	kfree(tmp_rd_buf);
++out_mtd:
++	kfree(dma_nand_mtd);
+ out:
+-	kfree(dma_nand_mtd);
+-	kfree(tmp_rd_buf);
+-	kfree(tmp_wr_buf);
++	kfree(dma_nand_dev);
+ 
+ 	return err;
+ 
+@@ -2199,13 +2203,14 @@ out:
+ 
+ static int ltq_dmanand_exit(struct platform_device *pdev)
+ {
+-	struct dma_nand_priv *mlc = dma_nand_dev;
++	
++	struct dma_nand_priv *mlc = platform_get_drvdata(pdev);
+ 
+-	nand_release(dma_nand_mtd);
++	nand_release(mlc->mtd_priv);
+ 
+ 	dma_device_release(dma_device);
+ 	dma_device_unregister(dma_device);
+-	kfree(dma_nand_mtd);
++	kfree(mlc->mtd_priv);
+ 	kfree(mlc);
+ 	kfree(tmp_rd_buf);
+ 	kfree(tmp_wr_buf);
+diff --git a/drivers/mtd/nand/xway_dmanand.h b/drivers/mtd/nand/xway_dmanand.h
+--- a/drivers/mtd/nand/xway_dmanand.h
++++ b/drivers/mtd/nand/xway_dmanand.h
+@@ -36,6 +36,16 @@
+ #define ltq_dma_nand_w32(x, y)	  ltq_w32(x, ltq_dmanand_membase + (y))
+ #define ltq_dma_nand_r32(x)		  ltq_r32(ltq_dmanand_membase + (x))
+ 
++#ifndef CONFIG_SOC_GRX500
++/* calculate respective offset - x: page size, y: ECC Length */
++#define BBT_OFFS(x,y) (8 + (x / 128) * y)
++#define VER_OFFS(x,y) (12 + (x / 128) * y)
++#else
++/* BBT Marker @ OOB[3] to OOB[6], Version @ OOB[7] */
++#define BBT_OFFS(x,y) 3
++#define VER_OFFS(x,y) 7
++#endif
++
+ extern __iomem void *ltq_dmanand_membase;
+ 
+ /* bad block table descriptor which defines where in the
+@@ -52,9 +62,9 @@ uint8_t generic_mirror_pattern[] = {'1',
+ struct nand_bbt_descr ltq_nand_main_desc_8192 = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 264,
++	.offs = BBT_OFFS(8192, 4),
+ 	.len = 4,
+-	.veroffs = 268,
++	.veroffs = VER_OFFS(8192, 4),
+ 	.maxblocks = 4,
+ 	.pattern = generic_bbt_pattern,
+ };
+@@ -62,9 +72,9 @@ struct nand_bbt_descr ltq_nand_main_desc
+ struct nand_bbt_descr ltq_nand_mirror_desc_8192 = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 264,
++	.offs = BBT_OFFS(8192, 4),
+ 	.len = 4,
+-	.veroffs = 268,
++	.veroffs = VER_OFFS(8192, 4),
+ 	.maxblocks = 4,
+ 	.pattern = generic_mirror_pattern,
+ };
+@@ -72,9 +82,9 @@ struct nand_bbt_descr ltq_nand_mirror_de
+ struct nand_bbt_descr ltq_nand_main_desc_8192_3BECC = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 		| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 200,
++	.offs = BBT_OFFS(8192, 3),
+ 	.len = 4,
+-	.veroffs = 204,
++	.veroffs = VER_OFFS(8192, 3),
+ 	.maxblocks = 4,
+ 	.pattern = generic_mirror_pattern,
+ };
+@@ -82,9 +92,9 @@ struct nand_bbt_descr ltq_nand_main_desc
+ struct nand_bbt_descr ltq_nand_mirror_desc_8192_3BECC = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 		| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 200,
++	.offs = BBT_OFFS(8192, 3),
+ 	.len = 4,
+-	.veroffs = 204,
++	.veroffs = VER_OFFS(8192, 3),
+ 	.maxblocks = 4,
+ 	.pattern = generic_mirror_pattern,
+ };
+@@ -92,9 +102,9 @@ struct nand_bbt_descr ltq_nand_mirror_de
+ struct nand_bbt_descr ltq_nand_main_desc_4096 = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 136,
++	.offs = BBT_OFFS(4096, 4),
+ 	.len = 4,
+-	.veroffs = 140,
++	.veroffs = VER_OFFS(4096, 4),
+ 	.maxblocks = 4,
+ 	.pattern = generic_bbt_pattern,
+ };
+@@ -102,9 +112,9 @@ struct nand_bbt_descr ltq_nand_main_desc
+ struct nand_bbt_descr ltq_nand_mirror_desc_4096 = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 136,
++	.offs = BBT_OFFS(4096, 4),
+ 	.len = 4,
+-	.veroffs = 140,
++	.veroffs = VER_OFFS(4096, 4),
+ 	.maxblocks = 4,
+ 	.pattern = generic_mirror_pattern,
+ };
+@@ -112,9 +122,9 @@ struct nand_bbt_descr ltq_nand_mirror_de
+ struct nand_bbt_descr ltq_nand_main_desc_4096_3BECC = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 104,
++	.offs = BBT_OFFS(4096, 3),
+ 	.len = 4,
+-	.veroffs = 108,
++	.veroffs = VER_OFFS(4096, 3),
+ 	.maxblocks = 4,
+ 	.pattern = generic_bbt_pattern,
+ };
+@@ -122,9 +132,9 @@ struct nand_bbt_descr ltq_nand_main_desc
+ struct nand_bbt_descr ltq_nand_mirror_desc_4096_3BECC = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 104,
++	.offs = BBT_OFFS(4096, 3),
+ 	.len = 4,
+-	.veroffs = 108,
++	.veroffs = VER_OFFS(4096, 3),
+ 	.maxblocks = 4,
+ 	.pattern = generic_mirror_pattern,
+ };
+@@ -132,9 +142,9 @@ struct nand_bbt_descr ltq_nand_mirror_de
+ struct nand_bbt_descr ltq_nand_main_desc_2048 = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 56,
++	.offs = BBT_OFFS(2048, 3),
+ 	.len = 4,
+-	.veroffs = 60,
++	.veroffs = VER_OFFS(2048, 3),
+ 	.maxblocks = 4,
+ 	.pattern = generic_bbt_pattern,
+ };
+@@ -142,9 +152,9 @@ struct nand_bbt_descr ltq_nand_main_desc
+ struct nand_bbt_descr ltq_nand_mirror_desc_2048 = {
+ 	.options = NAND_BBT_CREATE | NAND_BBT_WRITE
+ 			| NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_LASTBLOCK,
+-	.offs = 56,
++	.offs = BBT_OFFS(2048, 3),
+ 	.len = 4,
+-	.veroffs = 60,
++	.veroffs = VER_OFFS(2048, 3),
+ 	.maxblocks = 4,
+ 	.pattern = generic_mirror_pattern,
+ };
+@@ -237,6 +247,7 @@ struct nand_ecclayout B4_byte_ecc_oobinf
+ 	.oobfree = { {0, 0} }
+ };
+ 
++#ifndef CONFIG_SOC_GRX500
+ struct nand_ecclayout B4_byte_ecc_oobinfo_4096 = {
+ 	.eccbytes = 128,
+ 	.eccpos = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+@@ -330,7 +341,7 @@ struct nand_ecclayout B3_byte_ecc_oobinf
+ 		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
+ 		93, 94, 95, 96	},
+ 	.oobavail = 128,
+-	.oobfree = { {97, 127} }
++	.oobfree = { {97, 128} }
+ };
+ 
+ struct nand_ecclayout B3_byte_ecc_oobinfo_4096_other = {
+@@ -346,7 +357,7 @@ struct nand_ecclayout B3_byte_ecc_oobinf
+ 		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
+ 		93, 94, 95, 96 },
+ 	.oobavail = 122,
+-	.oobfree = { {97, 121} }
++	.oobfree = { {97, 122} }
+ };
+ 
+ struct nand_ecclayout B3_byte_ecc_oobinfo_8192 = {
+@@ -370,9 +381,154 @@ struct nand_ecclayout B3_byte_ecc_oobinf
+ 		163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
+ 		173, 174, 175, 176, 177, 178, 179, 180, 181, 182,
+ 		183, 184, 185, 186, 187, 188, 189, 190, 191 },
+-	.oobavail = 240,
++	.oobavail = 241,
+ 	.oobfree = { {192, 241} }
+ };
++#else
++struct nand_ecclayout B4_byte_ecc_oobinfo_4096 = {
++	.eccbytes = 128,
++	.eccpos = { 8, 9, 10, 11, 12,
++		13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
++		23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
++		33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++		43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
++		53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
++		63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
++		73, 74, 75, 76, 77, 78, 79, 80, 81, 82,
++		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
++		93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
++		103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
++		113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
++		123, 124, 125, 126, 127, 128, 129, 130, 131,
++		132, 133, 134, 135 },
++	.oobavail = 88,
++	.oobfree = { {136, 88} }
++};
++
++struct nand_ecclayout B4_byte_ecc_oobinfo_4096_other = {
++	.eccbytes = 128,
++	.eccpos = { 8, 9, 10, 11, 12,
++		13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
++		23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
++		33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++		43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
++		53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
++		63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
++		73, 74, 75, 76, 77, 78, 79, 80, 81, 82,
++		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
++		93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
++		103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
++		113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
++		123, 124, 125, 126, 127, 128, 129, 130, 131,
++		        132, 133, 134, 135 },
++	.oobavail = 82,
++	.oobfree = { {136, 82} }
++};
++
++struct nand_ecclayout B4_byte_ecc_oobinfo_8192 = {
++	.eccbytes = 256,
++	.eccpos = { 8, 9, 10, 11, 12,
++		13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
++		23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
++		33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++		43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
++		53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
++		63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
++		73, 74, 75, 76, 77, 78, 79, 80, 81, 82,
++		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
++		93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
++		103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
++		113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
++		123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
++		133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
++		143, 144, 145, 146, 147, 148, 149, 150, 151, 152,
++		153, 154, 155, 156, 157, 158, 159, 160, 161, 162,
++		163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
++		173, 174, 175, 176, 177, 178, 179, 180, 181, 182,
++		183, 184, 185, 186, 187, 188, 189, 190, 191, 192,
++		193, 194, 195, 196, 197, 198, 199, 200, 201, 202,
++		203, 204, 205, 206, 207, 208, 209, 210, 211, 212,
++		213, 214, 215, 216, 217, 218, 219, 220, 221, 222,
++		223, 224, 225, 226, 227, 228, 229, 230, 231, 232,
++		233, 234, 235, 236, 237, 238, 239, 240, 241, 242,
++		243, 244, 245, 246, 247, 248, 249, 250, 251, 252,
++		253, 254, 255, 256, 257, 258, 259, 260, 261, 262,
++		263, 264, },
++	.oobavail = 168,
++	.oobfree = { {265, 168} }
++};
++
++struct nand_ecclayout B3_byte_ecc_oobinfo_2048 = {
++	.eccbytes = 48,
++	.eccpos = { 8, 9, 10, 11, 12,
++		13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
++		23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
++		33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++		43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
++		53, 54 },
++	.oobfree = { {55, 8} }
++};
++
++struct nand_ecclayout B3_byte_ecc_oobinfo_4096 = {
++	.eccbytes = 96,
++	.eccpos = { 8, 9, 10, 11, 12,
++		13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
++		23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
++		33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++		43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
++		53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
++		63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
++		73, 74, 75, 76, 77, 78, 79, 80, 81, 82,
++		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
++		93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
++		103, 104 },
++	.oobavail = 116,
++	.oobfree = { {105, 116} }
++};
++
++struct nand_ecclayout B3_byte_ecc_oobinfo_4096_other = {
++	.eccbytes = 96,
++	.eccpos = { 8, 9, 10, 11, 12,
++		13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
++		23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
++		33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++		43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
++		53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
++		63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
++		73, 74, 75, 76, 77, 78, 79, 80, 81, 82,
++		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
++		93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
++		103, 104 },
++	.oobavail = 114,
++	.oobfree = { {105, 114} }
++};
++
++struct nand_ecclayout B3_byte_ecc_oobinfo_8192 = {
++	.eccbytes = 192,
++	.eccpos = { 8, 9, 10, 11, 12,
++		13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
++		23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
++		33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++		43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
++		53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
++		63, 64, 65, 66, 67, 68, 69, 70, 71, 72,
++		73, 74, 75, 76, 77, 78, 79, 80, 81, 82,
++		83, 84, 85, 86, 87, 88, 89, 90, 91, 92,
++		93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
++		103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
++		113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
++		123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
++		133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
++		143, 144, 145, 146, 147, 148, 149, 150, 151, 152,
++		153, 154, 155, 156, 157, 158, 159, 160, 161, 162,
++		163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
++		173, 174, 175, 176, 177, 178, 179, 180, 181, 182,
++		183, 184, 185, 186, 187, 188, 189, 190, 191, 192,
++		193, 194, 195, 196, 197, 198, 199 },
++	.oobavail = 232,
++	.oobfree = { {200, 232} }
++};
++#endif /* CONFIG_SOC_GRX500 */
+ 
+ struct nand_ecclayout embedded_ecc_generic = {
+ 	.eccbytes = 0,

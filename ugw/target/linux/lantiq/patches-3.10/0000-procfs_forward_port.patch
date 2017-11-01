@@ -1,0 +1,432 @@
+diff --git a/fs/proc/generic.c b/fs/proc/generic.c
+--- a/fs/proc/generic.c
++++ b/fs/proc/generic.c
+@@ -312,6 +312,262 @@ static const struct inode_operations pro
+ 	.getattr	= proc_getattr,
+ 	.setattr	= proc_notify_change,
+ };
++/* buffer size is one page but our output routines use some slack for overruns */
++#define PROC_BLOCK_SIZE	(PAGE_SIZE - 1024)
++static ssize_t
++__proc_file_read(struct file *file, char __user *buf, size_t nbytes,
++	       loff_t *ppos)
++{
++	struct inode * inode = file->f_path.dentry->d_inode;
++	char 	*page;
++	ssize_t	retval=0;
++	int	eof=0;
++	ssize_t	n, count;
++	char	*start;
++	struct proc_dir_entry * dp;
++	unsigned long long pos;
++
++	/*
++	 * Gaah, please just use "seq_file" instead. The legacy /proc
++	 * interfaces cut loff_t down to off_t for reads, and ignore
++	 * the offset entirely for writes..
++	 */
++	pos = *ppos;
++	if (pos > MAX_NON_LFS)
++		return 0;
++	if (nbytes > MAX_NON_LFS - pos)
++		nbytes = MAX_NON_LFS - pos;
++
++	dp = PDE(inode);
++	if (!(page = (char*) __get_free_page(GFP_TEMPORARY)))
++		return -ENOMEM;
++
++	while ((nbytes > 0) && !eof) {
++		count = min_t(size_t, PROC_BLOCK_SIZE, nbytes);
++
++		start = NULL;
++		if (dp->read_proc) {
++			/*
++			 * How to be a proc read function
++			 * ------------------------------
++			 * Prototype:
++			 *    int f(char *buffer, char **start, off_t offset,
++			 *          int count, int *peof, void *dat)
++			 *
++			 * Assume that the buffer is "count" bytes in size.
++			 *
++			 * If you know you have supplied all the data you
++			 * have, set *peof.
++			 *
++			 * You have three ways to return data:
++			 * 0) Leave *start = NULL.  (This is the default.)
++			 *    Put the data of the requested offset at that
++			 *    offset within the buffer.  Return the number (n)
++			 *    of bytes there are from the beginning of the
++			 *    buffer up to the last byte of data.  If the
++			 *    number of supplied bytes (= n - offset) is 
++			 *    greater than zero and you didn't signal eof
++			 *    and the reader is prepared to take more data
++			 *    you will be called again with the requested
++			 *    offset advanced by the number of bytes 
++			 *    absorbed.  This interface is useful for files
++			 *    no larger than the buffer.
++			 * 1) Set *start = an unsigned long value less than
++			 *    the buffer address but greater than zero.
++			 *    Put the data of the requested offset at the
++			 *    beginning of the buffer.  Return the number of
++			 *    bytes of data placed there.  If this number is
++			 *    greater than zero and you didn't signal eof
++			 *    and the reader is prepared to take more data
++			 *    you will be called again with the requested
++			 *    offset advanced by *start.  This interface is
++			 *    useful when you have a large file consisting
++			 *    of a series of blocks which you want to count
++			 *    and return as wholes.
++			 *    (Hack by Paul.Russell@rustcorp.com.au)
++			 * 2) Set *start = an address within the buffer.
++			 *    Put the data of the requested offset at *start.
++			 *    Return the number of bytes of data placed there.
++			 *    If this number is greater than zero and you
++			 *    didn't signal eof and the reader is prepared to
++			 *    take more data you will be called again with the
++			 *    requested offset advanced by the number of bytes
++			 *    absorbed.
++			 */
++			n = dp->read_proc(page, &start, *ppos,
++					  count, &eof, dp->data);
++		} else
++			break;
++
++		if (n == 0)   /* end of file */
++			break;
++		if (n < 0) {  /* error */
++			if (retval == 0)
++				retval = n;
++			break;
++		}
++
++		if (start == NULL) {
++			if (n > PAGE_SIZE) {
++				printk(KERN_ERR
++				       "proc_file_read: Apparent buffer overflow!\n");
++				n = PAGE_SIZE;
++			}
++			n -= *ppos;
++			if (n <= 0)
++				break;
++			if (n > count)
++				n = count;
++			start = page + *ppos;
++		} else if (start < page) {
++			if (n > PAGE_SIZE) {
++				printk(KERN_ERR
++				       "proc_file_read: Apparent buffer overflow!\n");
++				n = PAGE_SIZE;
++			}
++			if (n > count) {
++				/*
++				 * Don't reduce n because doing so might
++				 * cut off part of a data block.
++				 */
++				printk(KERN_WARNING
++				       "proc_file_read: Read count exceeded\n");
++			}
++		} else /* start >= page */ {
++			unsigned long startoff = (unsigned long)(start - page);
++			if (n > (PAGE_SIZE - startoff)) {
++				printk(KERN_ERR
++				       "proc_file_read: Apparent buffer overflow!\n");
++				n = PAGE_SIZE - startoff;
++			}
++			if (n > count)
++				n = count;
++		}
++		
++ 		n -= copy_to_user(buf, start < page ? page : start, n);
++		if (n == 0) {
++			if (retval == 0)
++				retval = -EFAULT;
++			break;
++		}
++
++		*ppos += start < page ? (unsigned long)start : n;
++		nbytes -= n;
++		buf += n;
++		retval += n;
++	}
++	free_page((unsigned long) page);
++	return retval;
++}
++
++static ssize_t
++proc_file_read(struct file *file, char __user *buf, size_t nbytes,
++	       loff_t *ppos)
++{
++	struct proc_dir_entry *pde = PDE(file->f_path.dentry->d_inode);
++	ssize_t rv = -EIO;
++
++	spin_lock(&pde->pde_unload_lock);
++	if (!pde->proc_fops) {
++		spin_unlock(&pde->pde_unload_lock);
++		return rv;
++	}
++	pde->pde_users++;
++	spin_unlock(&pde->pde_unload_lock);
++
++	rv = __proc_file_read(file, buf, nbytes, ppos);
++
++	pde_users_dec(pde);
++	return rv;
++}
++
++static ssize_t
++proc_file_write(struct file *file, const char __user *buffer,
++		size_t count, loff_t *ppos)
++{
++	struct proc_dir_entry *pde = PDE(file->f_path.dentry->d_inode);
++	ssize_t rv = -EIO;
++
++	if (pde->write_proc) {
++		spin_lock(&pde->pde_unload_lock);
++		if (!pde->proc_fops) {
++			spin_unlock(&pde->pde_unload_lock);
++			return rv;
++		}
++		pde->pde_users++;
++		spin_unlock(&pde->pde_unload_lock);
++
++		/* FIXME: does this routine need ppos?  probably... */
++		rv = pde->write_proc(file, buffer, count, pde->data);
++		pde_users_dec(pde);
++	}
++	return rv;
++}
++
++
++static loff_t
++proc_file_lseek(struct file *file, loff_t offset, int orig)
++{
++	loff_t retval = -EINVAL;
++	switch (orig) {
++	case 1:
++		offset += file->f_pos;
++	/* fallthrough */
++	case 0:
++		if (offset < 0 || offset > MAX_NON_LFS)
++			break;
++		file->f_pos = retval = offset;
++	}
++	return retval;
++}
++static const struct file_operations proc_file_operations = { 
++        .llseek         = proc_file_lseek, 
++        .read           = proc_file_read, 
++        .write          = proc_file_write, 
++}; 
++
++static int proc_register1(struct proc_dir_entry * dir, struct proc_dir_entry * dp)
++{
++        struct proc_dir_entry *tmp;
++        int ret;
++
++        ret = proc_alloc_inum(&dp->low_ino);
++        if (ret)
++                return ret;
++
++        if (S_ISDIR(dp->mode)) {
++                if (dp->proc_iops == NULL) {
++                        dp->proc_fops = &proc_dir_operations;
++                        dp->proc_iops = &proc_dir_inode_operations;
++                }
++                dir->nlink++;
++        } else if (S_ISLNK(dp->mode)) {
++                if (dp->proc_iops == NULL)
++                        dp->proc_iops = &proc_link_inode_operations;
++        } else if (S_ISREG(dp->mode)) {
++                if (dp->proc_fops == NULL)
++                        dp->proc_fops = &proc_file_operations;
++                if (dp->proc_iops == NULL)
++                        dp->proc_iops = &proc_file_inode_operations;
++        }
++
++        spin_lock(&proc_subdir_lock);
++
++        for (tmp = dir->subdir; tmp; tmp = tmp->next)
++                if (strcmp(tmp->name, dp->name) == 0) {
++                        WARN(1, KERN_WARNING "proc_dir_entry '%s/%s' already registered\n",
++                                dir->name, dp->name);
++                        break;
++                }
++
++        dp->next = dir->subdir;
++        dp->parent = dir;
++        dir->subdir = dp;
++        spin_unlock(&proc_subdir_lock);
++
++        return 0;
++}
++
+ 
+ static int proc_register(struct proc_dir_entry * dir, struct proc_dir_entry * dp)
+ {
+@@ -449,6 +705,35 @@ struct proc_dir_entry *proc_mkdir(const 
+ 	return proc_mkdir_data(name, 0, parent, NULL);
+ }
+ EXPORT_SYMBOL(proc_mkdir);
++struct proc_dir_entry *create_proc_entry(const char *name, umode_t mode,
++                                         struct proc_dir_entry *parent)
++{
++        struct proc_dir_entry *ent;
++        nlink_t nlink;
++
++        if (S_ISDIR(mode)) {
++                if ((mode & S_IALLUGO) == 0)
++                        mode |= S_IRUGO | S_IXUGO;
++                nlink = 2;
++        } else {
++                if ((mode & S_IFMT) == 0)
++                        mode |= S_IFREG;
++                if ((mode & S_IALLUGO) == 0)
++                        mode |= S_IRUGO;
++                nlink = 1;
++        }
++
++        ent = __proc_create(&parent, name, mode, nlink);
++        if (ent) {
++                if (proc_register1(parent, ent) < 0) {
++                        kfree(ent);
++                        ent = NULL;
++                }
++        }
++        return ent;
++}
++EXPORT_SYMBOL(create_proc_entry);
++
+ 
+ struct proc_dir_entry *proc_create_data(const char *name, umode_t mode,
+ 					struct proc_dir_entry *parent,
+diff --git a/fs/proc/inode.c b/fs/proc/inode.c
+--- a/fs/proc/inode.c
++++ b/fs/proc/inode.c
+@@ -130,7 +130,20 @@ static const struct super_operations pro
+ 	.remount_fs	= proc_remount,
+ 	.show_options	= proc_show_options,
+ };
++static void __pde_users_dec(struct proc_dir_entry *pde)
++{
++        pde->pde_users--;
++        if (pde->pde_unload_completion && pde->pde_users == 0)
++                complete(pde->pde_unload_completion);
++}  
+ 
++void pde_users_dec(struct proc_dir_entry *pde)
++{       
++        spin_lock(&pde->pde_unload_lock);
++        __pde_users_dec(pde);
++        spin_unlock(&pde->pde_unload_lock);
++}               
++                        
+ enum {BIAS = -1U<<31};
+ 
+ static inline int use_pde(struct proc_dir_entry *pde)
+diff --git a/fs/proc/internal.h b/fs/proc/internal.h
+--- a/fs/proc/internal.h
++++ b/fs/proc/internal.h
+@@ -29,27 +29,6 @@ struct mempolicy;
+  * /proc file has a parent, but "subdir" is NULL for all
+  * non-directory entries).
+  */
+-struct proc_dir_entry {
+-	unsigned int low_ino;
+-	umode_t mode;
+-	nlink_t nlink;
+-	kuid_t uid;
+-	kgid_t gid;
+-	loff_t size;
+-	const struct inode_operations *proc_iops;
+-	const struct file_operations *proc_fops;
+-	struct proc_dir_entry *next, *parent, *subdir;
+-	void *data;
+-	atomic_t count;		/* use count */
+-	atomic_t in_use;	/* number of callers into module in progress; */
+-			/* negative -> it's going away RSN */
+-	struct completion *pde_unload_completion;
+-	struct list_head pde_openers;	/* who did ->open, but not ->release */
+-	spinlock_t pde_unload_lock; /* proc_fops checks and pde_users bumps */
+-	u8 namelen;
+-	char name[];
+-};
+-
+ union proc_op {
+ 	int (*proc_get_link)(struct dentry *, struct path *);
+ 	int (*proc_read)(struct task_struct *task, char *page);
+@@ -204,6 +183,8 @@ struct pde_opener {
+ };
+ extern const struct inode_operations proc_link_inode_operations;
+ 
++void pde_users_dec(struct proc_dir_entry *pde);
++
+ extern const struct inode_operations proc_pid_link_inode_operations;
+ 
+ extern void proc_init_inodecache(void);
+diff --git a/include/linux/proc_fs.h b/include/linux/proc_fs.h
+--- a/include/linux/proc_fs.h
++++ b/include/linux/proc_fs.h
+@@ -11,9 +11,44 @@ struct proc_dir_entry;
+ 
+ #ifdef CONFIG_PROC_FS
+ 
++typedef int (read_proc_t)(char *page, char **start, off_t off,
++                          int count, int *eof, void *data);
++typedef int (write_proc_t)(struct file *file, const char __user *buffer,
++                           unsigned long count, void *data);
++extern struct proc_dir_entry *create_proc_entry(const char *name, umode_t mode,
++                                                struct proc_dir_entry *parent);
++
++
++struct proc_dir_entry {
++	unsigned int low_ino;
++	umode_t mode;
++	nlink_t nlink;
++	kuid_t uid;
++	kgid_t gid;
++	loff_t size;
++	const struct inode_operations *proc_iops;
++	const struct file_operations *proc_fops;
++	struct proc_dir_entry *next, *parent, *subdir;
++	void *data;
++	int pde_users;
++	read_proc_t *read_proc;
++	write_proc_t *write_proc;
++	atomic_t count;		/* use count */
++	atomic_t in_use;	/* number of callers into module in progress; */
++			/* negative -> it's going away RSN */
++	struct completion *pde_unload_completion;
++	struct list_head pde_openers;	/* who did ->open, but not ->release */
++	spinlock_t pde_unload_lock; /* proc_fops checks and pde_users bumps */
++	u8 namelen;
++	char name[];
++};
++
+ extern void proc_root_init(void);
+ extern void proc_flush_task(struct task_struct *);
+ 
++extern struct proc_dir_entry *create_proc_entry(const char *name, umode_t mode,
++						struct proc_dir_entry *parent);
++
+ extern struct proc_dir_entry *proc_symlink(const char *,
+ 		struct proc_dir_entry *, const char *);
+ extern struct proc_dir_entry *proc_mkdir(const char *, struct proc_dir_entry *);
+@@ -34,6 +69,17 @@ static inline struct proc_dir_entry *pro
+ 	return proc_create_data(name, mode, parent, proc_fops, NULL);
+ }
+ 
++static inline struct proc_dir_entry *create_proc_read_entry(const char *name,
++	umode_t mode, struct proc_dir_entry *base, 
++	read_proc_t *read_proc, void * data)
++{
++	struct proc_dir_entry *res=create_proc_entry(name,mode,base);
++	if (res) {
++		res->read_proc=read_proc;
++		res->data=data;
++	}
++	return res;
++}
+ extern void proc_set_size(struct proc_dir_entry *, loff_t);
+ extern void proc_set_user(struct proc_dir_entry *, kuid_t, kgid_t);
+ extern void *PDE_DATA(const struct inode *);

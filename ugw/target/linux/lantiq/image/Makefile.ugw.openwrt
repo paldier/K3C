@@ -1,0 +1,65 @@
+include $(TOPDIR)/rules.mk
+include $(INCLUDE_DIR)/image.mk
+
+JFFS2_BLOCKSIZE:=$(call qstrip,$(CONFIG_TARGET_ROOTFS_IMAGE_PHYSICAL_ERASE_SIZE))
+
+# add_image_padding <input_image_name> <block_size(bytes)> <size_to_less(bytes)>
+# Result: <input_image_name>.padded
+define add_image_padding
+	len=`wc -c $(1) | awk '{ printf $$1 }'`; \
+	pad=`expr $(2) - $$len % $(2)`; \
+	pad=`expr $$pad % $(2)`; \
+	pad=`expr $$pad - $(3)`; [ $$pad -lt 0 ] && pad=0; \
+	cat $(1) > $(1).padded; \
+	dd if=/dev/zero of=$(1).padded bs=1 count=$$pad seek=$$len
+endef
+
+define Image/Lantiq/fullimage
+	echo -en "\n\033[32;02mCreating fullimage.img\033[00m\n"
+	$$(call add_image_padding,$(KDIR)/root.$(1),\
+		$(if $(CONFIG_TARGET_UBI_MTD_SUPPORT),4,16), 0)
+	mkimage -A MIPS -O Linux -C lzma -T filesystem -e 0x00 -a 0x00 -n "LTQCPE RootFS" \
+		-d $(KDIR)/root.$(1).padded $(KDIR)/rootfs.img.padded
+	mkdir -p $(TARGET_IMG_DIR)
+	$(CP) $(KDIR)/rootfs.img.padded $(TARGET_IMG_DIR)/rootfs.img
+
+	$$(call add_image_padding,$(KDIR)/vmlinux-$(2).lzma,\
+		$(if $(JFFS2_BLOCKSIZE),$(shell expr $(patsubst %k,%,$(JFFS2_BLOCKSIZE)) \* 1024),16),\
+		$(if $(JFFS2_BLOCKSIZE),64,0))
+
+	load_addr=0x$(shell grep -w _text $(KDIR)/linux-$(LINUX_VERSION)/System.map 2>/dev/null| awk '{ printf "%s", $$1 }'); \
+	entry_addr=0x$(shell grep -w kernel_entry $(KDIR)/linux-$(LINUX_VERSION)/System.map 2>/dev/null| awk '{ printf "%s", $$1 }'); \
+	if [ -n "$(CONFIG_EVA)" ]; then \
+		s_load_addr=`printf "%#x" $$$$((load_addr & 0x1fffffff | 0xa0000000))`; \
+		s_entry_addr=`printf "%#x" $$$$((entry_addr & 0x1fffffff | 0xa0000000))`; \
+	else \
+		s_load_addr=$$$${load_addr}; \
+		s_entry_addr=$$$${entry_addr}; \
+	fi; \
+	mkimage -A mips -O linux -T kernel \
+		-a $$$${s_load_addr} -C lzma -e $$$${s_entry_addr} \
+		-n 'MIPS LTQCPE Linux-$(LINUX_VERSION)' \
+		-d $(KDIR)/vmlinux-$(2).lzma.padded $(KDIR)/uImage.padded
+
+	$(CP) $(KDIR)/uImage.padded $(TARGET_IMG_DIR)/uImage
+
+	cat $(TARGET_IMG_DIR)/rootfs.img $(TARGET_IMG_DIR)/uImage > $(TARGET_IMG_DIR)/fullimage.img.tmp
+	mkimage -A MIPS -O Linux -C none -T multi -e 0x00 -a 0x00 \
+		-n "OPENWRT Fullimage" -d $(TARGET_IMG_DIR)/fullimage.img.tmp $(TARGET_IMG_DIR)/fullimage.img
+	rm -f $(TARGET_IMG_DIR)/fullimage.img.tmp
+	chmod 644 $(TARGET_IMG_DIR)/fullimage.img
+endef
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx500),y)
+
+Image/BuildKernel/Profile/easy350_anywan=$(call Image/BuildKernel/Template,easy350_anywan)
+Image/Build/Profile/easy350_anywan=$(call Image/Build/$(1),$(1),easy350_anywan)
+
+endif
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx200),y)
+
+Image/BuildKernel/Profile/easy220_v2=$(call Image/BuildKernel/Template,easy220_v2)
+Image/Build/Profile/easy220_v2=$(call Image/Build/$(1),$(1),easy220_v2)
+
+endif

@@ -1,0 +1,259 @@
+From 27eefa2f9ecfb170eb53a8efa8673051706ce492 Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Tue, 2 Apr 2013 13:20:53 -0700
+Subject: [PATCH 085/105] MIPS: Add interAptiv CPU support.
+
+CPU siblings configuration for scheduler and index cache flushes.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Signed-off-by: Markos Chandras <markos.chandras@imgtec.com>
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+---
+ arch/mips/include/asm/cpu.h          |    4 +++-
+ arch/mips/include/asm/smp.h          |    4 +++-
+ arch/mips/include/asm/topology.h     |    5 +++++
+ arch/mips/kernel/cpu-probe.c         |    8 ++++++++
+ arch/mips/kernel/idle.c              |    1 +
+ arch/mips/kernel/smp-cmp.c           |    4 +---
+ arch/mips/kernel/smp.c               |   15 ++++++++++-----
+ arch/mips/kernel/spram.c             |    1 +
+ arch/mips/kernel/traps.c             |    1 +
+ arch/mips/mm/c-r4k.c                 |    5 +++--
+ arch/mips/oprofile/common.c          |    1 +
+ arch/mips/oprofile/op_model_mipsxx.c |    8 ++++++++
+ 12 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/arch/mips/include/asm/cpu.h b/arch/mips/include/asm/cpu.h
+index 315aed7..ec62551 100644
+--- a/arch/mips/include/asm/cpu.h
++++ b/arch/mips/include/asm/cpu.h
+@@ -97,6 +97,8 @@
+ #define PRID_IMP_1074K		0x9a00
+ #define PRID_IMP_M14KC		0x9c00
+ #define PRID_IMP_M14KEC		0x9e00
++#define PRID_IMP_INTERAPTIV_UP	0xa000
++#define PRID_IMP_INTERAPTIV_MP	0xa100
+ #define PRID_IMP_PROAPTIV_UP	0xa200
+ #define PRID_IMP_PROAPTIV_MP	0xa300
+ 
+@@ -267,7 +269,7 @@ enum cpu_type_enum {
+ 	CPU_4KC, CPU_4KEC, CPU_4KSC, CPU_24K, CPU_34K, CPU_1004K, CPU_74K,
+ 	CPU_ALCHEMY, CPU_PR4450, CPU_BMIPS32, CPU_BMIPS3300, CPU_BMIPS4350,
+ 	CPU_BMIPS4380, CPU_BMIPS5000, CPU_JZRISC, CPU_LOONGSON1, CPU_M14KC,
+-	CPU_M14KEC, CPU_PROAPTIV,
++	CPU_M14KEC, CPU_PROAPTIV, CPU_INTERAPTIV,
+ 
+ 	/*
+ 	 * MIPS64 class processors
+diff --git a/arch/mips/include/asm/smp.h b/arch/mips/include/asm/smp.h
+index eb60087..5a7283a 100644
+--- a/arch/mips/include/asm/smp.h
++++ b/arch/mips/include/asm/smp.h
+@@ -16,12 +16,14 @@
+ #include <linux/smp.h>
+ #include <linux/threads.h>
+ #include <linux/cpumask.h>
++#include <linux/cache.h>
+ 
+ #include <linux/atomic.h>
+ #include <asm/smp-ops.h>
++#include <asm/percpu.h>
+ 
+ extern int smp_num_siblings;
+-extern cpumask_t cpu_sibling_map[];
++DECLARE_PER_CPU_SHARED_ALIGNED(cpumask_t, cpu_sibling_map);
+ 
+ #define raw_smp_processor_id() (current_thread_info()->cpu)
+ 
+diff --git a/arch/mips/include/asm/topology.h b/arch/mips/include/asm/topology.h
+index 12609a1..8cd0efb 100644
+--- a/arch/mips/include/asm/topology.h
++++ b/arch/mips/include/asm/topology.h
+@@ -4,6 +4,7 @@
+  * for more details.
+  *
+  * Copyright (C) 2007 by Ralf Baechle
++ * Copyright (C) 2012 by Leonid Yegoshin
+  */
+ #ifndef __ASM_TOPOLOGY_H
+ #define __ASM_TOPOLOGY_H
+@@ -12,6 +13,10 @@
+ 
+ #ifdef CONFIG_SMP
+ #define smt_capable()	(smp_num_siblings > 1)
++#define topology_thread_cpumask(cpu)    (&per_cpu(cpu_sibling_map, cpu))
++#define topology_core_id(cpu)           (cpu_data[cpu].core)
++#define topology_core_cpumask(cpu)      ((void)(cpu), cpu_online_mask)
++#define topology_physical_package_id(cpu)   ((void)cpu, 0)
+ #endif
+ 
+ #endif /* __ASM_TOPOLOGY_H */
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+index 41a0eb1..e131b55 100644
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -848,6 +848,14 @@ static inline void cpu_probe_mips(struct cpuinfo_mips *c, unsigned int cpu)
+ 		__cpu_name[cpu] = "MIPS proAptiv (multi)";
+ 		cpu_capability = MIPS_FTLB_CAPABLE;
+ 		break;
++	case PRID_IMP_INTERAPTIV_UP:
++		c->cputype = CPU_INTERAPTIV;
++		__cpu_name[cpu] = "MIPS interAptiv UP";
++		break;
++	case PRID_IMP_INTERAPTIV_MP:
++		c->cputype = CPU_INTERAPTIV;
++		__cpu_name[cpu] = "MIPS interAptiv";
++		break;
+ 	}
+ 	decode_configs(c);
+ 
+diff --git a/arch/mips/kernel/idle.c b/arch/mips/kernel/idle.c
+index 0c51f66..3298e0e 100644
+--- a/arch/mips/kernel/idle.c
++++ b/arch/mips/kernel/idle.c
+@@ -183,6 +183,7 @@ void __init check_wait(void)
+ 	case CPU_34K:
+ 	case CPU_1004K:
+ 	case CPU_PROAPTIV:
++	case CPU_INTERAPTIV:
+ 		cpu_wait = r4k_wait;
+ 		if (read_c0_config7() & MIPS_CONF7_WII)
+ 			cpu_wait = r4k_wait_irqoff;
+diff --git a/arch/mips/kernel/smp-cmp.c b/arch/mips/kernel/smp-cmp.c
+index 7267dcf..cf87640 100644
+--- a/arch/mips/kernel/smp-cmp.c
++++ b/arch/mips/kernel/smp-cmp.c
+@@ -95,9 +95,7 @@ static void cmp_init_secondary(void)
+ 	change_c0_status(ST0_IM, STATUSF_IP3 | STATUSF_IP4 | STATUSF_IP6 |
+ 				 STATUSF_IP7);
+ 
+-	/* Enable per-cpu interrupts: platform specific */
+-
+-	c->core = (read_c0_ebase() >> 1) & 0x1ff;
++	c->core = (read_c0_ebase() & 0x3ff) >> (fls(smp_num_siblings)-1);
+ #if defined(CONFIG_MIPS_MT_SMP) || defined(CONFIG_MIPS_MT_SMTC)
+ 	if (cpu_has_mipsmt)
+ 		c->vpe_id = (read_c0_tcbind() >> TCBIND_CURVPE_SHIFT) &
+diff --git a/arch/mips/kernel/smp.c b/arch/mips/kernel/smp.c
+index 6e7862a..54c2046 100644
+--- a/arch/mips/kernel/smp.c
++++ b/arch/mips/kernel/smp.c
+@@ -60,12 +60,17 @@ int smp_num_siblings = 1;
+ EXPORT_SYMBOL(smp_num_siblings);
+ 
+ /* representing the TCs (or siblings in Intel speak) of each logical CPU */
+-cpumask_t cpu_sibling_map[NR_CPUS] __read_mostly;
+-EXPORT_SYMBOL(cpu_sibling_map);
++DEFINE_PER_CPU_SHARED_ALIGNED(struct cpumask, cpu_sibling_map);
++EXPORT_PER_CPU_SYMBOL(cpu_sibling_map);
+ 
+ /* representing cpus for which sibling maps can be computed */
+ static cpumask_t cpu_sibling_setup_map;
+ 
++/* CPU siblings in MIPS:
++ *
++ *      SMVP kernel - VPEs on common core are siblings
++ *      SMTC kernel - TC's on common core are siblings
++ */
+ static inline void set_cpu_sibling_map(int cpu)
+ {
+ 	int i;
+@@ -75,12 +80,12 @@ static inline void set_cpu_sibling_map(int cpu)
+ 	if (smp_num_siblings > 1) {
+ 		for_each_cpu_mask(i, cpu_sibling_setup_map) {
+ 			if (cpu_data[cpu].core == cpu_data[i].core) {
+-				cpu_set(i, cpu_sibling_map[cpu]);
+-				cpu_set(cpu, cpu_sibling_map[i]);
++				cpu_set(i, per_cpu(cpu_sibling_map, cpu));
++				cpu_set(cpu, per_cpu(cpu_sibling_map, i));
+ 			}
+ 		}
+ 	} else
+-		cpu_set(cpu, cpu_sibling_map[cpu]);
++		cpu_set(cpu, per_cpu(cpu_sibling_map, cpu));
+ }
+ 
+ struct plat_smp_ops *mp_ops;
+diff --git a/arch/mips/kernel/spram.c b/arch/mips/kernel/spram.c
+index 8191eca..39091a6 100644
+--- a/arch/mips/kernel/spram.c
++++ b/arch/mips/kernel/spram.c
+@@ -207,6 +207,7 @@ void __cpuinit spram_config(void)
+ 	case CPU_1004K:
+ 	case CPU_74K:
+ 	case CPU_PROAPTIV:
++	case CPU_INTERAPTIV:
+ 		config0 = read_c0_config();
+ 		/* FIXME: addresses are Malta specific */
+ 		if (config0 & (1<<24)) {
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index 9e620ad..0008f08 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -1329,6 +1329,7 @@ static inline void parity_protection_init(void)
+ 	case CPU_74K:
+ 	case CPU_1004K:
+ 	case CPU_PROAPTIV:
++	case CPU_INTERAPTIV:
+ 		{
+ #define ERRCTL_PE	0x80000000
+ #define ERRCTL_L2P	0x00800000
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index ea227e9..ec349a4 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -92,10 +92,10 @@ static inline void r4k_indexop_on_each_cpu(void (*func) (void *info), void *info
+ 			this_cpu = smp_processor_id();
+ 			for_each_online_cpu(cpu) {
+ 
+-				if (cpumask_test_cpu(cpu, (&cpu_sibling_map[this_cpu])))
++				if (cpumask_test_cpu(cpu, (&per_cpu(cpu_sibling_map, this_cpu))))
+ 					continue;
+ 
+-				if (cpumask_intersects(&tmp_mask, (&cpu_sibling_map[cpu])))
++				if (cpumask_intersects(&tmp_mask, (&per_cpu(cpu_sibling_map, cpu))))
+ 					continue;
+ 				cpu_set(cpu, tmp_mask);
+ 				n++;
+@@ -1352,6 +1352,7 @@ static void __cpuinit probe_pcache(void)
+ 	case CPU_74K:
+ 	case CPU_1004K:
+ 	case CPU_PROAPTIV:
++	case CPU_INTERAPTIV:
+ 		if (c->cputype == CPU_74K)
+ 			alias_74k_erratum(c);
+ 		if (!(read_c0_config7() & MIPS_CONF7_IAR)) {
+diff --git a/arch/mips/oprofile/common.c b/arch/mips/oprofile/common.c
+index af763e8..d576b5c 100644
+--- a/arch/mips/oprofile/common.c
++++ b/arch/mips/oprofile/common.c
+@@ -86,6 +86,7 @@ int __init oprofile_arch_init(struct oprofile_operations *ops)
+ 	case CPU_1004K:
+ 	case CPU_74K:
+ 	case CPU_LOONGSON1:
++	case CPU_INTERAPTIV:
+ 	case CPU_SB1:
+ 	case CPU_SB1A:
+ 	case CPU_R10000:
+diff --git a/arch/mips/oprofile/op_model_mipsxx.c b/arch/mips/oprofile/op_model_mipsxx.c
+index e4b1140..4908c69 100644
+--- a/arch/mips/oprofile/op_model_mipsxx.c
++++ b/arch/mips/oprofile/op_model_mipsxx.c
+@@ -376,6 +376,14 @@ static int __init mipsxx_init(void)
+ 		op_model_mipsxx_ops.cpu_type = "mips/74K";
+ 		break;
+ 
++	case CPU_PROAPTIV:
++		op_model_mipsxx_ops.cpu_type = "mips/proAptiv";
++		break;
++
++	case CPU_INTERAPTIV:
++		op_model_mipsxx_ops.cpu_type = "mips/interAptiv";
++		break;
++
+ 	case CPU_5KC:
+ 		op_model_mipsxx_ops.cpu_type = "mips/5K";
+ 		break;
+-- 
+1.7.1
+

@@ -1,0 +1,101 @@
+#!/bin/sh /etc/rc.common
+
+START=02
+
+start() {
+
+	# Added to support dual image in UBI
+	if [ -n "$CONFIG_UBOOT_CONFIG_DUAL_IMAGE" ]; then
+		active_bank=$(sed -e 's/.*active_bank=\(.*\)/\1/' -e 's/\(\([^ ]*\) \)\{1\}.*/\2/' /proc/cmdline)
+		[ -n "$active_bank" -a "$active_bank" = "A" ] && active_bank=A || active_bank=B
+		update_chk=$(sed -e 's/.*update_chk=\(.*\)/\1/' -e 's/\(\([^ ]*\) \)\{1\}.*/\2/' /proc/cmdline)
+	fi
+
+	# Mount DSL Firmware
+	if ! [ "$CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS" = "1" ]; then
+		if [ -n "$CONFIG_UBOOT_CONFIG_DUAL_IMAGE" ]; then
+			local fw_mtd=$(grep -w firmware${active_bank} /proc/mtd|cut -d: -f1)
+		else
+			local fw_mtd=$(grep -w firmware /proc/mtd|cut -d: -f1)
+		fi
+		local fw_mtd_hdr=`/bin/dd if=/dev/$fw_mtd bs=4 count=1 2>/dev/null`;
+		if [ "$fw_mtd_hdr" = "sqlz" ] || [ "$fw_mtd_hdr" = "qshs" ] || [ "$fw_mtd_hdr" = "hsqs" ]; then
+			echo "Mounting ADSL firmware.."
+			/bin/mount -t squashfs /dev/mtdblock${fw_mtd:3} /firmware
+		else
+			echo "ADSL firmware not found..!"
+		fi
+	fi
+
+	#[ `mount|grep -q nfs;echo $?` -eq  0 ] || /sbin/ifconfig eth0 0.0.0.0 up 2>/dev/null
+	#if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_NONE" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_NONE" = "1" -o -n "$CONFIG_TARGET_LTQCPE_PLATFORM_VR9_NONE" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_VR9_NONE" = "1" ]; then
+	#	[ `mount|grep -q nfs;echo $?` -eq  0 ] || /sbin/ifconfig eth1 0.0.0.0 up 2>/dev/null
+	#fi
+	#cd /tmp
+	#chmod 777 .
+
+	# check for factory reset button
+	if [ "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" = "1" ]; then
+		echo timer > /sys/class/leds/pwr:green/trigger
+		if [ -e /dev/exin0 ] && [ "`cat /dev/exin0`" = "0" ]; then
+			echo 100 > /sys/class/leds/pwr:green/delay_off
+			echo 100 > /sys/class/leds/pwr:green/delay_on
+			/usr/sbin/upgrade /etc/rc.conf.gz sysconfig 0 1 2>/dev/null
+		fi
+		echo 500 > /sys/class/leds/pwr:green/delay_off
+		echo 500 > /sys/class/leds/pwr:green/delay_on
+	fi
+	if [ -f /lib/modules/*/sw_reset.ko -a -f /usr/sbin/swreset ]; then
+		if [ -n "$CONFIG_PACKAGE_KMOD_LTQCPE_AR10_F2_SUPPORT" ]; then
+			local reg_val=`mem -s 0x1e100b48 -d -u | cut -d: -f2`
+			mem -s 0x1e100b48 -w 0x246 -u
+			mem -s 0x1e100b40 -w 0x200 -u
+			mem -s 0x1e100b48 -w $reg_val -u
+		fi
+		insmod sw_reset;
+		mknod /dev/sw_reset c 151 0;
+		swreset &
+	fi
+
+	/usr/sbin/read_img sysconfig /ramdisk/flash/rc.conf.gz
+	/bin/gunzip -f /ramdisk/flash/rc.conf.gz 2>/dev/null
+	if [ $? -ne 0 ]; then
+		/bin/rm -f /ramdisk/flash/rc.conf
+		/usr/sbin/upgrade /etc/rc.conf.gz sysconfig 0 1 2>/dev/null
+		/usr/sbin/read_img sysconfig /ramdisk/flash/rc.conf.gz
+		/bin/gunzip -f /ramdisk/flash/rc.conf.gz
+	fi
+
+	if [ "`grep "@@@@@CERTSTART@@@@@" /flash/rc.conf`" ]; then
+		if [ "`grep "BEGIN CERTIFICATE" /flash/rc.conf`" ]; then
+			sed -n -e '/@@@@@CERTSTART@@@@@/,$p' /flash/rc.conf > /tmp/lower.txt
+			sed -n -e '1,/@@@@@CERTSTART@@@@@/p' /flash/rc.conf > /tmp/sed_upper.txt
+			sed '/@@@@@CERTSTART@@@@@/d' /tmp/sed_upper.txt > /tmp/upper.txt
+			sed '/@@@@@CERTSTART@@@@@/d' /tmp/lower.txt > /tmp/lower1.txt
+			mv /tmp/lower1.txt /flash/Cert.pem
+			mv /tmp/upper.txt /flash/rc.conf
+			rm -rf /tmp/sed_upper.txt /tmp/lower.txt
+		else
+			sed '/@@@@@CERTSTART@@@@@/d' /flash/rc.conf > /tmp/rc.conf.tmp
+			mv /tmp/rc.conf.tmp /flash/rc.conf
+		fi
+	fi
+
+	# Switch bank concept of dual image in UBI
+	if [ -n "$CONFIG_UBOOT_CONFIG_DUAL_IMAGE" ]; then
+		if [ "$active_bank" = "B" -a "$update_chk" = "0" ]; then
+			/usr/sbin/uboot_env --set --name update_chk --value  2
+		elif [ "$active_bank" = "A" -a "$update_chk" != "0" ]; then
+			/usr/sbin/uboot_env --set --name update_chk --value 0
+		fi
+	fi
+
+	# Reset Sierra HL7548 LTE chip
+	plat_form=${CONFIG_BUILD_SUFFIX%%_*}
+	platform=`echo $plat_form |tr '[:lower:]' '[:upper:]'`
+	if [ "$platform" = "GRX220" ]; then
+		if [ -f /lib/modules/*/sierra_lte_reset.ko ]; then
+			insmod /lib/modules/*/sierra_lte_reset.ko
+		fi
+	fi
+}

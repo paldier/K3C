@@ -1,0 +1,553 @@
+# 
+# Copyright (C) 2006 OpenWrt.org
+#
+# This is free software, licensed under the GNU General Public License v2.
+# See /LICENSE for more information.
+#
+include $(TOPDIR)/rules.mk
+
+UGW_VERSION:=UGW-$(shell cat $(TOPDIR)/ugw_version)
+JFFS2_BLOCKSIZE:=$(call qstrip,$(CONFIG_TARGET_ROOTFS_IMAGE_PHYSICAL_ERASE_SIZE))
+include $(INCLUDE_DIR)/image.mk
+
+#ifeq ($(CONFIG_IFX_CONFIG_CPU),"AMAZON_S")
+#  CPE_NAME:=xRX100
+#else
+#  CPE_NAME:=$(CONFIG_IFX_CONFIG_CPU)
+#endif
+CPE_NAME:=$(shell echo $(SUBTARGET) | awk '{ print toupper($$1) }')
+UGW_BANNER:=Lantiq UGW Software $(UGW_VERSION) on $(CPE_NAME) CPE
+
+ifeq ($(CONFIG_PACKAGE_kmod-ltqcpe_mlcnand),y)
+  UBINIZE_OPTS:= -p $(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE)) -m 8192 -s 8192
+else
+  ifeq ($(CONFIG_TARGET_lantiq_xrx330),y)
+    UBINIZE_OPTS:= -p $(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE)) -m 512 -s 256
+  else
+    UBINIZE_OPTS:= -p $(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE)) -m 2048 -s 512
+  endif
+endif
+
+define put_ltq_banner
+	b_str=" | $(UGW_BANNER) |"; \
+	b_chars=`echo -n $$b_str | wc -m`; \
+	(echo -n " +"; for ((i=2;i<$$b_chars;i++)); do echo -n "-"; done; echo "+"; \
+	echo "$$b_str";echo -n " +";for ((i=2;i<$$b_chars;i++));do echo -n "-";done;echo -en "+\n\n") > $(1)
+endef
+
+# add_image_padding <input_image_name> <block_size(bytes)> <size_to_less(bytes)>
+# Result: <input_image_name>.padded
+define add_image_padding
+	len=`wc -c $(1) | awk '{ printf $$1 }'`; \
+	pad=`expr $(2) - $$len % $(2)`; \
+	pad=`expr $$pad % $(2)`; \
+	pad=`expr $$pad - $(3)`; [ $$pad -lt 0 ] && pad=0; \
+	cat $(1) > $(1).padded; \
+	dd if=/dev/zero of=$(1).padded bs=1 count=$$pad seek=$$len
+endef
+
+# Function to convert Kb/Mb/Gb to bytes
+define conv_bytes
+	_flg=$$(echo $(1) | sed 's/[0-9]//g'); \
+	_num=$$(echo $(1) | sed 's/[a-zA-Z]//g'); \
+	case $$_flg in \
+		"k"|"K") echo $$((_num*1024));; \
+		"m"|"M") echo $$((_num*1024*1024));; \
+		"g"|"G") echo $$((_num*1024*1024*1024));; \
+		*) echo $$_num;; \
+	esac
+endef
+
+# add '|| exit 1' to python commands to throw errors instead of warnings
+# example
+# python $(STAGING_DIR_HOST)/bin/merge.py -v $(STAGING_DIR_HOST)/bin/target_validate.xsd *_control*.xml -o=control.xml || exit 1;
+define gen_xml_db
+        $(if $(wildcard $(STAGING_DIR)/xml/*_control.xml), \
+                $(if $(wildcard $(STAGING_DIR)/xml/*_data.xml), \
+                        cd $(STAGING_DIR)/xml/ && { \
+                                $(STAGING_DIR_HOST)/bin/python $(STAGING_DIR_HOST)/bin/merge.py -v $(STAGING_DIR_HOST)/bin/target_validate.xsd *_control*.xml -o=control.xml || exit 1; \
+                                $(STAGING_DIR_HOST)/bin/openssl aes-256-cbc -base64 -in control.xml -out $(TARGET_DIR)/etc/ctrlcfg -pass pass:SEINTELCHK ; \
+                                $(STAGING_DIR_HOST)/bin/python $(STAGING_DIR_HOST)/bin/merge.py -v $(STAGING_DIR_HOST)/bin/target_validate.xsd *_data*.xml -o=data.xml || exit 1; \
+                                $(STAGING_DIR_HOST)/bin/openssl aes-256-cbc -base64 -in data.xml -out $(TARGET_DIR)/etc/datacfg -pass pass:SEINTELCHK ;\
+                        } \
+                )
+        )
+	-rm -f $(TARGET_DIR)/$(call qstrip,$(VENDOR_PATH))/xml/*
+endef
+
+
+# Function to strip config macros from /etc/config.sh. Reference file used: tmp/ifx_config.sh
+# Scan path: etc/ opt/ ramdisk_copy/ bin/ usr/ lib/
+define strip_config_macros
+	if [ -f $(TMP_DIR)/ifx_config.sh ]; then \
+		scan_dirs="etc/ opt/ ramdisk_copy/ bin/ usr/ lib/"; \
+		rm -rf $(TMP_DIR)/stripmacros; mkdir -p $(TMP_DIR)/stripmacros; \
+		echo -en "\nStripping config macros from 'etc/config.sh'\nScanning: $$scan_dirs\n"; \
+		echo -en "#\n# Automatically generated config for system scripts. Don't edit.\n#\n" \
+			> $(TMP_DIR)/stripmacros/config.sh; \
+		tot_macros=$$(grep export $(TMP_DIR)/ifx_config.sh | wc -l); \
+		found=0; inc=0; cd $(TARGET_DIR)/; \
+		fls="$$(find $$scan_dirs -type f | xargs grep -lI 'CONFIG_' | grep -v "etc\/config.sh" | sort -u)"; \
+		grep export $(TMP_DIR)/ifx_config.sh | \
+		  ( while read cfg_macro; do \
+			cfgm=$$(echo $$cfg_macro | sed -e 's/export[ ]*//g' -e 's/=.*//g'); \
+			val="$$(grep -wl $$cfgm $$fls)"; \
+			if [ -n "$$val" ]; then \
+				found=$$(expr $$found + 1); \
+				echo "$$cfg_macro" >> $(TMP_DIR)/stripmacros/config.sh; \
+			fi; inc=$$(expr $$inc + 1); \
+			echo -en "Processing: $$inc/$$tot_macros macros. Used macros: $$found\r"; \
+		  done ); echo -en "\n\n"; \
+		if [ -f $(TMP_DIR)/stripmacros/config.sh ]; then \
+		$(INSTALL_BIN) $(TMP_DIR)/stripmacros/config.sh $(TARGET_DIR)/etc/config.sh; fi; \
+	else echo -en "\nERROR: Unable to find $(TMP_DIR)/ifx_config.sh for macro stripping!!\n\n"; fi
+endef
+
+define CompressLzma
+  $(STAGING_DIR_HOST)/bin/lzma e $(1) $(2)
+endef
+
+DT_SIZE=16384
+ifeq ($(CONFIG_TARGET_lantiq_xrx500),y)
+DT_SIZE=32768
+endif
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_4kec),y)
+DT_SIZE=32768
+endif
+
+define PatchKernelLzma
+	cp $(KDIR)/vmlinux $(KDIR)/vmlinux-$(1)
+	$(if $(wildcard ./dts/$(1).dts),
+	  $(LINUX_DIR)/scripts/dtc/dtc -O dtb -o $(KDIR)/$(1).dtb ./dts/$(1).dts
+	  $(STAGING_DIR_HOST)/bin/patch-dtb $(KDIR)/vmlinux-$(1) $(KDIR)/$(1).dtb $(DT_SIZE)
+	,
+	  echo -en "\033[34;01m WARNING: Missing Device Tree file: $(1).dts. Creating uImage without Device Tree Blob!!\033[00;00m\n"
+	)
+	$(call CompressLzma,$(KDIR)/vmlinux-$(1),$(KDIR)/vmlinux-$(1).lzma)
+	mv $(KDIR)/vmlinux-$(1).lzma $(KDIR)/vmlinux.lzma
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_4kec),y) 
+	cp -f $(KDIR)/vmlinux-$(1) $(KDIR)/vmlinux-BOOTCORE
+	mv $(KDIR)/vmlinux-$(1) $(KDIR)/vmlinux_$(1)
+endif
+
+ifeq ($(CONFIG_USE_EMULATOR),y)
+	chmod +x $(LINUX_DIR)/scripts/ikos_ram_ddr_file_gen
+	$(LINUX_DIR)/scripts/ikos_ram_ddr_file_gen $(KDIR)/vmlinux-$(1) 10000 EB
+	$(CP) -f $(LINUX_KERNEL)-$(1).txt.02 $(LINUX_KERNEL).asc
+	rm -f $(LINUX_KERNEL)-$(1).*txt.*
+endif
+endef
+
+define mkimage_extra_checks
+$(if $(CONFIG_UBOOT_CONFIG_LTQ_IMAGE_EXTRA_CHECKS), \
+	-B $(CONFIG_UBOOT_CONFIG_VENDOR_NAME) \
+	-V $(CONFIG_UBOOT_CONFIG_BOARD_NAME) \
+	-b $(CONFIG_UBOOT_CONFIG_BOARD_VERSION) \
+	-c $(CONFIG_UBOOT_CONFIG_CHIP_NAME) \
+	-p $(CONFIG_UBOOT_CONFIG_CHIP_VERSION) \
+	-s $(CONFIG_UBOOT_CONFIG_SW_VERSION) \
+)
+endef
+
+	image_name:=$(KDIR)/vmlinux.lzma.padded
+	compression_type:=lzma
+	image_header:=MIPS LTQCPE Linux-$(LINUX_VERSION)
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_4kec),y)
+	image_name:=$(KDIR)/vmlinux-BOOTCORE.padded
+	compression_type:=none
+	sign_image:=$(KDIR)/uImage.padded
+	image_header:=MIPS 4Kec Bootcore
+endif
+
+ifeq ($(CONFIG_UBOOT_CONFIG_CERTIFICATION_SUPPORT),y)
+	CERT :=	-cert $(CONFIG_UBOOT_CONFIG_CERTIFICATION)
+else
+	CERT:=
+endif
+
+define Image/BuildKernel
+	$(call PatchKernelLzma,$(PROFILE),$(if $(2),$(2) machtype=$(PROFILE),))
+	mkimage -A mips -O linux -T kernel -a 0x80002000 -C lzma -e \
+		0x80002000 \
+		-n 'MIPS OpenWrt Linux-$(LINUX_VERSION)' \
+		-d $(KDIR)/vmlinux.lzma $(KDIR)/uImage
+
+	$$(call add_image_padding,$(KDIR)/vmlinux.lzma,\
+		$(if $(JFFS2_BLOCKSIZE),$(shell expr $(patsubst %k,%,$(JFFS2_BLOCKSIZE)) \* 1024),16),\
+		$(if $(JFFS2_BLOCKSIZE),64,0))
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_4kec),y)
+		$$(call add_image_padding,$(KDIR)/vmlinux-BOOTCORE,\
+    $(if $(JFFS2_BLOCKSIZE),$(shell expr $(patsubst %k,%,$(JFFS2_BLOCKSIZE)) \* 1024),16),\
+    $(if $(JFFS2_BLOCKSIZE),64,0))
+endif
+
+
+	load_addr=0x$(shell grep -w _text $(KDIR)/linux-$(LINUX_VERSION)/System.map 2>/dev/null| awk '{ printf "%s", $$1 }'); \
+	entry_addr=0x$(shell grep -w kernel_entry $(KDIR)/linux-$(LINUX_VERSION)/System.map 2>/dev/null| awk '{ printf "%s", $$1 }'); \
+	if [ -n "$(CONFIG_EVA)" ]; then \
+		s_load_addr=`printf "%#x" $$$$((load_addr & 0x1fffffff | 0xa0000000))`; \
+		s_entry_addr=`printf "%#x" $$$$((entry_addr & 0x1fffffff | 0xa0000000))`; \
+	else \
+		s_load_addr=$$$${load_addr}; \
+		s_entry_addr=$$$${entry_addr}; \
+	fi; \
+	$(KDIR)/u-boot-*/tools/mkimage -A mips -O linux -T kernel \
+		-a $$$${s_load_addr} -C $(compression_type) -e $$$${s_entry_addr} \
+  	-n '$(image_header)' $(call mkimage_extra_checks) \
+  	-d $(image_name) $(KDIR)/uImage.padded
+
+	mkdir -p $(TARGET_IMG_DIR)
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_4kec),y)
+ifeq ($(CONFIG_UBOOT_CONFIG_LTQ_SECURE_BOOT),y)
+	echo "Building a secure Image for bootcore"
+	$(CONFIG_UBOOT_CONFIG_SIGNTOOL)  sign -type BLw  -infile $(image_name) \
+                -prikey $(CONFIG_UBOOT_CONFIG_PRIVATE_KEY) \
+                -wrapkey $(CONFIG_UBOOT_CONFIG_PROD_UNIQUE_KEY) \
+                -attribute rollback=2 \
+                -attribute 0x80000000=0x88000000 \
+                -attribute 0x80000001=0x00000001 \
+                -attribute 0x80000002=0x88000000 \
+                -encattr \
+                $(CERT) \
+                -kdk \
+                -pubkeytype otp \
+                -algo aes256 \
+                -outfile signed_bootcore.bin
+
+	mv signed_bootcore.bin $(KDIR)/signed_uImage
+	rm -f *.bin
+
+	mv $(KDIR)/signed_uImage $(KDIR)/signed_uImage.bin
+
+	mkimage -A mips -O linux -T kernel -a 0x80002000 -C none -e \
+      0x80002000 \
+      -n '$(image_header)' \
+      -d $(KDIR)/signed_uImage.bin $(KDIR)/Secure_uImage
+
+	cp -f $(KDIR)/Secure_uImage $(TARGET_IMG_DIR)/uImage
+
+
+else
+	cp -f $(KDIR)/uImage.padded $(TARGET_IMG_DIR)/uImage
+
+endif
+
+endif
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_4kec),)
+ifeq ($(CONFIG_UBOOT_CONFIG_LTQ_SECURE_BOOT),y)
+	echo "Building a secure boot kernel Image"
+	$(CONFIG_UBOOT_CONFIG_SIGNTOOL)  sign -type BLw  -infile $(KDIR)/uImage.padded \
+                -prikey $(CONFIG_UBOOT_CONFIG_PRIVATE_KEY) \
+                -wrapkey $(CONFIG_UBOOT_CONFIG_PROD_UNIQUE_KEY) \
+                -attribute rollback=2 \
+                -attribute 0x80000000=0xa0020000 \
+                -attribute 0x80000001=0x00000001 \
+                -attribute 0x80000002=0xa002df00 \
+                -encattr \
+                $(CERT) \
+                -kdk \
+                -pubkeytype otp \
+                -algo aes256 \
+                -outfile signed_uImage.bin
+	mv signed_uImage.bin $(KDIR)/signed_uImage.bin
+	rm -f *.bin
+	$$(call add_image_padding,$(KDIR)/signed_uImage.bin,\
+		$(if $(JFFS2_BLOCKSIZE),$(shell expr $(patsubst %k,%,$(JFFS2_BLOCKSIZE)) \* 1024),16),\
+		$(if $(JFFS2_BLOCKSIZE),64,0))
+	mv $(KDIR)/signed_uImage.bin.padded $(KDIR)/signed_uImage.bin
+	mkimage -A mips -O linux -T kernel -a 0x80002000 -C lzma -e \
+			0x80002000 \
+			-n 'MIPS OpenWrt Linux-$(LINUX_VERSION)' \
+			-d $(KDIR)/signed_uImage.bin $(KDIR)/Secure_uImage
+
+	cp -f $(KDIR)/Secure_uImage $(TARGET_IMG_DIR)/uImage
+
+else 
+
+	cp -f $(KDIR)/uImage.padded $(TARGET_IMG_DIR)/uImage
+endif
+
+endif
+
+endef
+
+define Image/mkfs/prepare/platform
+	- echo "$(UGW_VERSION)" > $(TARGET_DIR)/etc/version
+	- date +%H%M-%d%b%y > $(TARGET_DIR)/etc/timestamp
+	- echo "$(CONFIG_GCC_VERSION)" > $(TARGET_DIR)/etc/toolchain_ver
+	- $(if $(CONFIG_LIBC_VERSION),echo "/$(CONFIG_LIBC_VERSION)" >> $(TARGET_DIR)/etc/toolchain_ver)
+	- date +%Y-%m-%dT%H:%M:%S > $(TARGET_DIR)/etc/ntp_timestamp
+	- @$$(call put_ltq_banner,$(TARGET_DIR)/etc/banner)
+	- $(if $(wildcard $(TOPDIR)/patches.list), install -m644 $(TOPDIR)/patches.list $(TARGET_DIR)/etc/)
+	- rm -rf $(TARGET_DIR)/tmp
+	- cd $(TARGET_DIR); ln -sf ramdisk/tmp tmp
+	- $(CP) $(TMP_DIR)/ifx_config.sh $(TARGET_DIR)/etc/config.sh
+	- $(if $(CONFIG_EXTERNAL_TOOLCHAIN),$(CP) $(TOOLCHAIN_ROOT_DIR)/lib/librt-*.so $(TOOLCHAIN_ROOT_DIR)/lib/libutil-*.so $(TARGET_DIR)/lib, \
+	$(CP) $(TOOLCHAIN_DIR)/lib/librt-*.so $(TOOLCHAIN_DIR)/lib/libutil-*.so $(TARGET_DIR)/lib)
+	- cat $(TOPDIR)/patches.list > $(TARGET_DIR)/etc/ugwinfo
+	@$$(call strip_config_macros)
+	@$(if $(CONFIG_NEW_FRAMEWORK),$(call gen_xml_db))
+#As service libraries starting the netifd daemon, removing the startup script from /etc/init.d directory
+	@$(if $(CONFIG_NEW_FRAMEWORK), rm -f $(TARGET_DIR)/etc/init.d/network)
+#As ltq uses syslog-ng, logd daemon provided by opnsource utility - ubox is not required
+	@$(if $(CONFIG_NEW_FRAMEWORK), rm -f $(TARGET_DIR)/etc/init.d/log)
+
+endef
+
+define Image/Build/squashfs
+	mkdir -p $(TARGET_DIR)/overlay
+	$(if $(CONFIG_TARGET_UBI_MTD_SUPPORT),
+		mkdir -p $(TARGET_DIR)/mnt/data
+		$(if $(CONFIG_TARGET_DATAFS_JFFS2),
+			echo jffs2:$(CONFIG_TARGET_ROOTFS_DATAFS_SIZE) > $(TARGET_DIR)/mnt/data/fs)
+		$(if $(CONFIG_TARGET_DATAFS_UBIFS),
+			echo ubifs:$(CONFIG_TARGET_ROOTFS_DATAFS_SIZE) > $(TARGET_DIR)/mnt/data/fs)
+	)
+	$(STAGING_DIR_HOST)/bin/mksquashfs4 $(TARGET_DIR) $(KDIR)/root.squashfs $(if $(CONFIG_TARGET_UBI_MTD_SUPPORT),,-nopad) \
+		-noappend -root-owned $(if $(CONFIG_LINUX_2_6),$(SQUASHFS_OPTS),-comp xz -Xpreset 9 -Xe -Xlc 0 -Xlp 2 -Xpb 2 -processors 1)
+	$(if $(CONFIG_TARGET_UBI_MTD_SUPPORT),,$$(call add_image_padding,$(KDIR)/root.$(1),16,0))
+	$(KDIR)/u-boot-*/tools/mkimage -A MIPS -O Linux -C lzma -T filesystem -e 0x00 -a 0x00 -n "LTQCPE RootFS" \
+		$(call mkimage_extra_checks) \
+		-d $(if $(CONFIG_TARGET_UBI_MTD_SUPPORT),$(KDIR)/root.$(1),$(KDIR)/root.$(1).padded) $(KDIR)/rootfs.img.padded
+	mkdir -p $(TARGET_IMG_DIR)
+	cp -f $(KDIR)/rootfs.img.padded $(TARGET_IMG_DIR)/rootfs.img
+endef
+
+define Image/Build/jffs2-$(JFFS2_BLOCKSIZE)
+	mkdir -p $(TARGET_IMG_DIR)
+	$(if $(CONFIG_TARGET_UBI_MTD_SUPPORT),
+	    $(eval jffs2_blk_size:=$(shell echo $$(($(patsubst %k,%,$(JFFS2_BLOCKSIZE))-$(patsubst %k,%,$(JFFS2_BLOCKSIZE))/64))KiB))
+	,
+	    $(eval jffs2_blk_size:=$(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE))))
+	$(STAGING_DIR_HOST)/bin/mkfs.jffs2 -n -p $(JFFS2OPTS) \
+		-e $(jffs2_blk_size) \
+		-o $(KDIR)/root.$(1) \
+		-d $(TARGET_DIR) 2>&1 1>/dev/null | awk '/^.+$$$$/'
+	$(if $(CONFIG_TARGET_UBI_MTD_SUPPORT),
+		cp -f $(KDIR)/root.$(1) $(TARGET_IMG_DIR)/rootfs.img
+	,
+		$(KDIR)/u-boot-*/tools/mkimage -A MIPS -O Linux -C gzip -T filesystem -e 0x00 -a 0x00 -n "LTQCPE RootFS" \
+			$(call mkimage_extra_checks) -d $(KDIR)/root.$(1) \
+			$(TARGET_IMG_DIR)/rootfs.img
+	)
+endef
+
+define Image/Build
+	$(call Image/Build/$(1),$(1))
+endef
+
+define Image/Build/firmware
+	FIRMWARE_DIR_NAME="firmware"; \
+	GET_FIRMWARE_PATH="$(STAGING_DIR)"; \
+	PUT_FIRMWARE_PATH="$(TARGET_IMG_DIR)"; \
+	OUT_FIRMWARE_NAME="firmware.img"; \
+	\
+	PLATFORM=`echo $(SUBTARGET)|cut -d_ -f2-|awk '{ print toupper($$1) }'`; \
+	if [ -n "$(CONFIG_PACKAGE_open_uboot)" -a -z "$(CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS)" ]; then \
+	   if [ -d $$GET_FIRMWARE_PATH/$$FIRMWARE_DIR_NAME ]; then \
+		rm -rf $$PUT_FIRMWARE_PATH/$$OUT_FIRMWARE_NAME; \
+		cd $$GET_FIRMWARE_PATH; rm -f $(KDIR)/firmware.squashfs; \
+		$(STAGING_DIR_HOST)/bin/mksquashfs4 $$FIRMWARE_DIR_NAME $(KDIR)/firmware.squashfs \
+			$(if $(CONFIG_LINUX_2_6),$(SQUASHFS_OPTS),-comp xz -Xpreset 9 -Xe -Xlc 0 -Xlp 2 -Xpb 2 -processors 1); \
+		mkdir -p $(TARGET_IMG_DIR); \
+		$(KDIR)/u-boot-*/tools/mkimage -A MIPS -O Linux -C lzma -T $$FIRMWARE_DIR_NAME -e 0x00 -a 0x00 \
+			$(call mkimage_extra_checks) -n \
+			"$$PLATFORM Firmware" -d $(KDIR)/firmware.squashfs $$OUT_FIRMWARE_NAME; \
+		mkdir -p $$PUT_FIRMWARE_PATH; \
+		mv $$OUT_FIRMWARE_NAME $$PUT_FIRMWARE_PATH/; \
+		chmod 644 $$PUT_FIRMWARE_PATH/$$OUT_FIRMWARE_NAME; \
+	   else \
+		echo "$$GET_FIRMWARE_PATH/$$FIRMWARE_DIR_NAME not found..!"; \
+		exit 1; \
+	   fi; \
+	fi;
+endef
+
+define Image/Build/fullimage
+	echo -en "\n\033[32;02mCreating fullimage.img\033[00m\n";\
+	if [ -n "$(CONFIG_UBOOT_CONFIG_LTQ_SECURE_BOOT)" ]; then \
+	ONEIMAGE="$(TARGET_IMG_DIR)/fullimage.img"; \
+	cp $(KDIR)/uImage.padded  $$ONEIMAGE.tmp;\
+	cat $(KDIR)/root.squashfs >> $$ONEIMAGE.tmp;\
+	$(CONFIG_UBOOT_CONFIG_SIGNTOOL)  sign -type BLw  -infile $$ONEIMAGE.tmp \
+                -prikey $(CONFIG_UBOOT_CONFIG_PRIVATE_KEY) \
+                -wrapkey $(CONFIG_UBOOT_CONFIG_PROD_UNIQUE_KEY) \
+                -attribute rollback=2 \
+                -attribute 0x80000000=0xdeadbeef \
+                -attribute 0x80000001=0x00000001 \
+                -attribute 0x80000002=0xdeadbeef \
+                -encattr \
+                $(CERT) \
+                -kdk \
+                -pubkeytype otp \
+                -algo aes256 \
+                -outfile $$ONEIMAGE.signed;\
+	$(KDIR)/u-boot-*/tools/mkimage -A mips -O linux -T kernel -a 0xDEADBEEF -C none -e 0xDEADBEEF -n \
+	'MIPS OpenWrt Linux-$(LINUX_VERSION)'	-d $$ONEIMAGE.signed $$ONEIMAGE;\
+	rm -rf $$ONEIMAGE.signed;\
+	rm -f *.bin;\
+	else \
+	IMAGE_LIST="$(TARGET_IMG_DIR)/rootfs.img \
+		$(TARGET_IMG_DIR)/uImage"; \
+	if [ -n "$(CONFIG_PACKAGE_open_uboot)" -a -z "$(CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS)" ]; then \
+		IMAGE_LIST="$$IMAGE_LIST $(TARGET_IMG_DIR)/firmware.img"; \
+	fi; \
+	ONEIMAGE="$(TARGET_IMG_DIR)/fullimage.img"; \
+	PLATFORM=`echo $(SUBTARGET)|cut -d_ -f2-|awk '{ print toupper($$1) }'`; \
+	rm -f $$ONEIMAGE; \
+	for i in $$IMAGE_LIST; do \
+		if [ -e $$i  ] ; then \
+			len=`wc -c $$i | awk '{ printf $$1 }'`; \
+			pad=`expr 16 - $$len % 16`; \
+			pad=`expr $$pad % 16`; \
+			if [ -e $$ONEIMAGE.tmp ] ; then \
+				cat $$i >> $$ONEIMAGE.tmp; \
+			else \
+				cat $$i > $$ONEIMAGE.tmp; \
+			fi; \
+			while [ $$pad -ne 0 ]; do \
+				echo -n "0" >> $$ONEIMAGE.tmp; \
+				pad=`expr $$pad - 1`; \
+			done; \
+		else \
+			echo "$$i not found!"; \
+			rm -f $$ONEIMAGE.tmp; \
+			exit 1; \
+		fi; \
+	done; \
+	$(KDIR)/u-boot-*/tools/mkimage -A MIPS -O Linux -C none -T multi -e 0x00 -a 0x00 \
+		$(call mkimage_extra_checks) -n  \
+		"$$PLATFORM Fullimage" -d $$ONEIMAGE.tmp $$ONEIMAGE; \
+	fi; \
+	rm -f $$ONEIMAGE.tmp; \
+	chmod 644 $$ONEIMAGE;
+
+endef
+
+define Image/Build/system_sw
+	if [ -n "$(CONFIG_UBOOT_CONFIG_BOOT_FROM_NAND)" -a -n "$(CONFIG_TARGET_UBI_MTD_SUPPORT)" ]; then \
+		echo -en "\n\033[32;02mCreating UBI image system_sw.bin\033[00m\n"; \
+		OUT_DIR="$(TARGET_IMG_DIR)/flashprogram_bins"; mkdir -p $$OUT_DIR; \
+		if [ -z "$(CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS)" ]; then \
+			$(CP) ./ubinize_fw.cfg $(KDIR)/ubinize.cfg; \
+		else $(CP) ./ubinize.cfg $(KDIR)/; fi; \
+		(cd $(KDIR)/ && \
+			$(STAGING_DIR_HOST)/bin/ubinize $(UBINIZE_OPTS) \
+			-o $$OUT_DIR/system_sw.bin ubinize.cfg); \
+	fi;
+endef
+
+define Image/Build/totalimage
+	if [ -n "$(CONFIG_PACKAGE_open_uboot)" ]; then \
+	  echo -en "\n\033[32;02mCreating totalimage.img\033[00m\n"; \
+	  PLATFORM=`echo $(SUBTARGET)|cut -d_ -f2-|awk '{ print toupper($$1) }'`; \
+	  if [ -n "$(CONFIG_UBOOT_CONFIG_BOOT_FROM_NAND)" ]; then \
+		UBOOT_IMG="$(TARGET_IMG_DIR)/u-boot-nand.bin"; \
+	  else UBOOT_IMG="$(TARGET_IMG_DIR)/u-boot.ltq"; fi; \
+	  $(KDIR)/u-boot-*/tools/mkimage -A MIPS -T uboot -C lzma -a 0x00 -e 0x00 -n 'U-Boot Img' \
+		  $(call mkimage_extra_checks) -d $$UBOOT_IMG $(KDIR)/u-bootimg.ltq || exit 1; \
+	  cat $(KDIR)/u-bootimg.ltq > $(KDIR)/totalimage.tmp || exit 1; \
+	  if [ -z "$(CONFIG_UBOOT_CONFIG_VR9_GPHY_FW_EMBEDDED)" -a -n "$(CONFIG_PACKAGE_ltq-gphy-firmware)" ]; then \
+		cp -f $(TARGET_IMG_DIR)/gphy_firmware.img $(KDIR)/; \
+		$(if $(JFFS2_BLOCKSIZE),padd_blksize=$(shell expr $(patsubst %k,%,$(JFFS2_BLOCKSIZE)) \* 1024),padd_blksize=16384); \
+		if [ $$padd_blksize -gt 262144 ]; then padd_blksize="262144"; fi; \
+		$(KDIR)/u-boot-*/scripts_platform/pad2align.sh -n $$padd_blksize $(KDIR)/gphy_firmware.img; \
+		$(KDIR)/u-boot-*/tools/mkimage -A mips -T firmware -C lzma -a 0x00 -e 0x00 \
+			$(call mkimage_extra_checks) \
+			-n "gphyfw" -d $(KDIR)/gphy_firmware.img $(KDIR)/gphy_firmwareimg.img || exit 1; \
+		cat $(KDIR)/gphy_firmwareimg.img >> $(KDIR)/totalimage.tmp || exit 1; \
+	  fi; echo "Adding fullimage.."; \
+	  cat $(TARGET_IMG_DIR)/rootfs.img >> $(KDIR)/totalimage.tmp || exit 1; \
+	  cat $(TARGET_IMG_DIR)/uImage >> $(KDIR)/totalimage.tmp || exit 1; \
+	  if [ -z "$(CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS)" ]; then \
+		cat $(TARGET_IMG_DIR)/firmware.img >> $(KDIR)/totalimage.tmp || exit 1; \
+	  fi; \
+	  $(KDIR)/u-boot-*/tools/mkimage -A MIPS -O Linux -C none -T multi -e 0x00 -a 0x00 \
+		$(call mkimage_extra_checks) -n "$$PLATFORM Totalimage" -d $(KDIR)/totalimage.tmp \
+		$(TARGET_IMG_DIR)/totalimage.img || exit 1; \
+	  chmod 644 $(TARGET_IMG_DIR)/totalimage.img; \
+	fi
+endef
+
+define Image/Build/flashprogrammer
+	if [ -n "$(CONFIG_TARGET_UBI_MTD_SUPPORT)" ]; then \
+	  echo -en "\n\033[32;02mCreating binaries for flashprogrammer\033[00m\n"; \
+	  MODEL_PREFIX=`echo $(CONFIG_IFX_MODEL_NAME)|cut -d_ -f1`; \
+	  OUT_DIR="$(TARGET_IMG_DIR)/flashprogram_bins"; mkdir -p $$OUT_DIR; \
+	  OUT_BIN="$$OUT_DIR/flashimage-$$MODEL_PREFIX-NAND-$(JFFS2_BLOCKSIZE).bin"; \
+	  mtdparts="`echo $(CONFIG_UBOOT_CONFIG_MTDPARTS)|cut -d: -f2-|sed 's/,/ /g'`"; \
+	  cd $$OUT_DIR/ && ( \
+		rm -f $$OUT_BIN; \
+		for mtdb in $$mtdparts; do \
+			echo $$mtdb; mtd_info=(`echo $$mtdb|sed 's/[()]/ /g'`); \
+			m_byte=`$(call conv_bytes,$${mtd_info[0]})`; \
+			case $${mtd_info[1]} in \
+			   "uboot") ln -sf ../u-boot-nand.bin u-boot-nand.bin; \
+				$(call add_image_padding,u-boot-nand.bin,$$m_byte,0); \
+				cat u-boot-nand.bin.padded >> $$OUT_BIN;; \
+			   "uboot+gphyfw") echo "uboot"; ln -sf ../u-boot-nand.bin u-boot-nand.bin; \
+				$(call add_image_padding,u-boot-nand.bin,$$(($$m_byte/2)),0); \
+				cat u-boot-nand.bin.padded >> $$OUT_BIN; \
+				echo "gphy_firmware"; ln -sf ../gphy_firmware.img gphy_firmware.bin; \
+				$(call add_image_padding,gphy_firmware.bin,$$(($$m_byte/2)),0); \
+				cat gphy_firmware.bin.padded >> $$OUT_BIN;; \
+			   "ubootconfig"*) ln -sf ../ubootenv.img ubootenv.bin; \
+				$(call add_image_padding,ubootenv.bin,$$m_byte,0); \
+				cat ubootenv.bin.padded >> $$OUT_BIN;; \
+			   "gphyfirmware") ln -sf ../gphy_firmware.img gphy_firmware.bin; \
+				$(call add_image_padding,gphy_firmware.bin,$$m_byte,0); \
+				cat gphy_firmware.bin.padded >> $$OUT_BIN;; \
+			   "system_sw") cat system_sw.bin >> $$OUT_BIN;; \
+			esac; rm -f *.padded; \
+		done;); \
+	fi
+endef
+
+ifeq ($(CONFIG_TARGET_ROOTFS_INITRAMFS),)
+
+ifneq ($(CONFIG_TARGET_lantiq),)
+  define Image/mkfs/firmware
+	$(call Image/Build,firmware)
+  endef
+
+  define Image/mkfs/fullimage
+	$(call Image/Build,fullimage)
+	$(call Image/Build,system_sw)
+	$(call Image/Build,totalimage)
+	$(call Image/Build,flashprogrammer)
+  endef
+
+  define Image/mkfs/platform
+	$$(call Image/Build,firmware)
+	$$(call Image/Build,fullimage)
+	$$(call Image/Build,system_sw)
+	$$(call Image/Build,totalimage)
+	$$(call Image/Build,flashprogrammer)
+  endef
+endif
+endif
+
+define BuildImage_platform
+rootfs:
+	$(call Image/mkfs/prepare)
+	$(call Image/Build,jffs2)
+	$(call Image/Build,squashfs)
+	$(call Image/mkfs/targz)
+	$(call Image/mkfs/cpiogz)
+	$(call Image/mkfs/iso)
+	$(call Image/mkfs/ubifs)
+
+firmware:
+	$$(call Image/mkfs/firmware)
+
+fullimage:
+	$$(call Image/mkfs/fullimage)
+
+endef
+
+$(eval $(call BuildImage))
+$(eval $(call BuildImage_platform))

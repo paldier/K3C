@@ -1,0 +1,1175 @@
+# HG changeset patch
+# Parent 3a3594b76782cf76a1f506968ec94f4be50a5e1e
+
+diff --git a/arch/mips/include/asm/asmmacro.h b/arch/mips/include/asm/asmmacro.h
+--- a/arch/mips/include/asm/asmmacro.h
++++ b/arch/mips/include/asm/asmmacro.h
+@@ -62,6 +62,17 @@
+ 	.endm
+ #endif /* CONFIG_MIPS_MT_SMTC */
+ 
++#ifdef CONFIG_CPU_MIPSR2
++	.macro	_EXT	rd, rs, p, s
++	ext	\rd, \rs, \p, \s
++	.endm
++#else /* !CONFIG_CPU_MIPSR2 */
++	.macro	_EXT	rd, rs, p, s
++	srl	\rd, \rs, \p
++	andi	\rd, \rd, (1 << \s) - 1
++	.endm
++#endif /* !CONFIG_CPU_MIPSR2 */
++
+ /*
+  * Temporary until all gas have MT ASE support
+  */
+diff --git a/arch/mips/include/asm/cpu-info.h b/arch/mips/include/asm/cpu-info.h
+--- a/arch/mips/include/asm/cpu-info.h
++++ b/arch/mips/include/asm/cpu-info.h
+@@ -97,4 +97,10 @@ extern void cpu_report(void);
+ extern const char *__cpu_name[];
+ #define cpu_name_string()	__cpu_name[smp_processor_id()]
+ 
++#if defined(CONFIG_MIPS_MT_SMP) || defined(CONFIG_MIPS_MT_SMTC)
++# define cpu_vpe_id(cpuinfo)	((cpuinfo)->vpe_id)
++#else
++# define cpu_vpe_id(cpuinfo)	0
++#endif
++
+ #endif /* __ASM_CPU_INFO_H */
+diff --git a/arch/mips/include/asm/gcmpregs.h b/arch/mips/include/asm/gcmpregs.h
+--- a/arch/mips/include/asm/gcmpregs.h
++++ b/arch/mips/include/asm/gcmpregs.h
+@@ -63,6 +63,10 @@
+ #define	 GCMP_GCB_GCSRAP_CMACCESS_SHF	0
+ #define	 GCMP_GCB_GCSRAP_CMACCESS_MSK	GCMPGCBMSK(GCSRAP_CMACCESS, 8)
+ #define GCMP_GCB_GCMPREV_OFS		0x0030	/* GCMP Revision Register */
++#define	 GCMP_GCB_GCMPREV_MAJOR_SHF	8
++#define	 GCMP_GCB_GCMPREV_MAJOR_MSK	GCMPGCBMSK(GCMPREV_MAJOR, 8)
++#define	 GCMP_GCB_GCMPREV_MINOR_SHF	0
++#define	 GCMP_GCB_GCMPREV_MINOR_MSK	GCMPGCBMSK(GCMPREV_MINOR, 8)
+ #define GCMP_GCB_GCMEM_OFS		0x0040	/* Global CM Error Mask */
+ #define GCMP_GCB_GCMEC_OFS		0x0048	/* Global CM Error Cause */
+ #define	 GCMP_GCB_GMEC_ERROR_TYPE_SHF	27
+@@ -81,6 +85,11 @@
+ #define	 GCMP_GCB_GICBA_BASE_MSK	GCMPGCBMSK(GICBA_BASE, 15)
+ #define	 GCMP_GCB_GICBA_EN_SHF		0
+ #define	 GCMP_GCB_GICBA_EN_MSK		GCMPGCBMSK(GICBA_EN, 1)
++#define	GCMP_GCB_CPCBA_OFS              0x0088  /* CPC Base Address */
++#define	 GCMP_GCB_CPCBA_BASE_SHF	15
++#define	 GCMP_GCB_CPCBA_BASE_MSK	GCMPGCBMSK(CPCBA_BASE, 17)
++#define	 GCMP_GCB_CPCBA_EN_SHF		0
++#define	 GCMP_GCB_CPCBA_EN_MSK		GCMPGCBMSK(CPCBA_EN, 1)
+ 
+ /* GCB Regions */
+ #define GCMP_GCB_CMxBASE_OFS(n)		(0x0090+16*(n))		/* Global Region[0-3] Base Address */
+@@ -96,6 +105,13 @@
+ #define	 GCMP_GCB_CMxMASK_CMREGTGT_IOCU1 2
+ #define	 GCMP_GCB_CMxMASK_CMREGTGT_IOCU2 3
+ 
++/* GCB registers */
++#define	GCMP_GCB_GICST_OFS		0x00d0	/* GIC status */
++#define	 GCMP_GCB_GICST_EX_SHF		0
++#define	 GCMP_GCB_GICST_EX_MSK		GCMPGCBMSK(GICST_EX, 1)
++#define	GCMP_GCB_CPCST_OFS		0x00f0	/* CPC status */
++#define	 GCMP_GCB_CPCST_EX_SHF		0
++#define	 GCMP_GCB_CPCST_EX_MSK		GCMPGCBMSK(CPCST_EX, 1)
+ 
+ /* Core local/Core other control block registers */
+ #define GCMP_CCB_RESETR_OFS		0x0000			/* Reset Release */
+diff --git a/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h
+--- a/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h
++++ b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h
+@@ -59,6 +59,11 @@ void ltq_rcu_w32_mask(uint32_t clr, uint
+ #define GIC_BASE_ADDR                   (0x12320000)
+ #define GIC_ADDRSPACE_SZ                (128 * 1024)
+ 
++/*      
++ * CPC Specific definitions
++ */     
++#define CPC_BASE_ADDR                   0x12310000
++
+ /*
+  * during early_printk no ioremap is possible
+  * lets use KSEG1 instead
+diff --git a/arch/mips/include/asm/mips-cpc.h b/arch/mips/include/asm/mips-cpc.h
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/include/asm/mips-cpc.h
+@@ -0,0 +1,150 @@
++/*
++ * Copyright (C) 2013 Imagination Technologies
++ * Author: Paul Burton <paul.burton@imgtec.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#ifndef __MIPS_ASM_MIPS_CPC_H__
++#define __MIPS_ASM_MIPS_CPC_H__
++
++#include <linux/io.h>
++#include <linux/types.h>
++
++/* The base address of the CPC registers */
++extern void __iomem *mips_cpc_base;
++
++/**
++ * mips_cpc_default_phys_base - retrieve the default physical base address of
++ *                              the CPC
++ *
++ * Returns the default physical base address of the Cluster Power Controller
++ * memory mapped registers. This is platform dependant & must therefore be
++ * implemented per-platform.
++ */
++extern phys_t mips_cpc_default_phys_base(void);
++
++/**
++ * mips_cpc_phys_base - retrieve the physical base address of the CPC
++ *
++ * This function returns the physical base address of the Cluster Power
++ * Controller memory mapped registers, or 0 if no Cluster Power Controller
++ * is present. It may be overriden by individual platforms which determine
++ * this address in a different way.
++ */
++extern phys_t __weak mips_cpc_phys_base(void);
++
++/**
++ * mips_cpc_probe - probe for a Cluster Power Controller
++ *
++ * Attempt to detect the presence of a Cluster Power Controller. Returns 0 if
++ * a CPC is successfully detected, else -errno.
++ */
++#ifdef CONFIG_MIPS_CPC
++extern int mips_cpc_probe(void);
++#else
++static inline int mips_cpc_probe(void)
++{
++	return -ENODEV;
++}
++#endif
++
++/**
++ * mips_cpc_present - determine whether a Cluster Power Controller is present
++ *
++ * Returns true if a CPC is present in the system, else false.
++ */
++static inline bool mips_cpc_present(void)
++{
++#ifdef CONFIG_MIPS_CPC
++	return mips_cpc_base != NULL;
++#else
++	return false;
++#endif
++}
++
++/* Offsets from the CPC base address to various control blocks */
++#define MIPS_CPC_GCB_OFS	0x0000
++#define MIPS_CPC_CLCB_OFS	0x2000
++#define MIPS_CPC_COCB_OFS	0x4000
++
++/* Macros to ease the creation of register access functions */
++#define BUILD_CPC_R_(name, off) \
++static inline u32 read_cpc_##name(void)				\
++{								\
++	return __raw_readl(mips_cpc_base + (off));		\
++}
++
++#define BUILD_CPC__W(name, off) \
++static inline void write_cpc_##name(u32 value)			\
++{								\
++	__raw_writel(value, mips_cpc_base + (off));		\
++}
++
++#define BUILD_CPC_RW(name, off)					\
++	BUILD_CPC_R_(name, off)					\
++	BUILD_CPC__W(name, off)
++
++#define BUILD_CPC_Cx_R_(name, off)				\
++	BUILD_CPC_R_(cl_##name, MIPS_CPC_CLCB_OFS + (off))	\
++	BUILD_CPC_R_(co_##name, MIPS_CPC_COCB_OFS + (off))
++
++#define BUILD_CPC_Cx__W(name, off)				\
++	BUILD_CPC__W(cl_##name, MIPS_CPC_CLCB_OFS + (off))	\
++	BUILD_CPC__W(co_##name, MIPS_CPC_COCB_OFS + (off))
++
++#define BUILD_CPC_Cx_RW(name, off)				\
++	BUILD_CPC_Cx_R_(name, off)				\
++	BUILD_CPC_Cx__W(name, off)
++
++/* GCB register accessor functions */
++BUILD_CPC_RW(access,		MIPS_CPC_GCB_OFS + 0x00)
++BUILD_CPC_RW(seqdel,		MIPS_CPC_GCB_OFS + 0x08)
++BUILD_CPC_RW(rail,		MIPS_CPC_GCB_OFS + 0x10)
++BUILD_CPC_RW(resetlen,		MIPS_CPC_GCB_OFS + 0x18)
++BUILD_CPC_R_(revision,		MIPS_CPC_GCB_OFS + 0x20)
++
++/* Core Local & Core Other accessor functions */
++BUILD_CPC_Cx_RW(cmd,		0x00)
++BUILD_CPC_Cx_RW(stat_conf,	0x08)
++BUILD_CPC_Cx_RW(other,		0x10)
++
++/* CPC_Cx_CMD register fields */
++#define CPC_Cx_CMD_SHF				0
++#define CPC_Cx_CMD_MSK				(_ULCAST_(0xf) << 0)
++#define  CPC_Cx_CMD_CLOCKOFF			(_ULCAST_(0x1) << 0)
++#define  CPC_Cx_CMD_PWRDOWN			(_ULCAST_(0x2) << 0)
++#define  CPC_Cx_CMD_PWRUP			(_ULCAST_(0x3) << 0)
++#define  CPC_Cx_CMD_RESET			(_ULCAST_(0x4) << 0)
++
++/* CPC_Cx_STAT_CONF register fields */
++#define CPC_Cx_STAT_CONF_PWRUPE_SHF		23
++#define CPC_Cx_STAT_CONF_PWRUPE_MSK		(_ULCAST_(0x1) << 23)
++#define CPC_Cx_STAT_CONF_SEQSTATE_SHF		19
++#define CPC_Cx_STAT_CONF_SEQSTATE_MSK		(_ULCAST_(0xf) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_D0		(_ULCAST_(0x0) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_U0		(_ULCAST_(0x1) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_U1		(_ULCAST_(0x2) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_U2		(_ULCAST_(0x3) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_U3		(_ULCAST_(0x4) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_U4		(_ULCAST_(0x5) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_U5		(_ULCAST_(0x6) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_U6		(_ULCAST_(0x7) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_D1		(_ULCAST_(0x8) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_D3		(_ULCAST_(0x9) << 19)
++#define  CPC_Cx_STAT_CONF_SEQSTATE_D2		(_ULCAST_(0xa) << 19)
++#define CPC_Cx_STAT_CONF_CLKGAT_IMPL_SHF	17
++#define CPC_Cx_STAT_CONF_CLKGAT_IMPL_MSK	(_ULCAST_(0x1) << 17)
++#define CPC_Cx_STAT_CONF_PWRDN_IMPL_SHF		16
++#define CPC_Cx_STAT_CONF_PWRDN_IMPL_MSK		(_ULCAST_(0x1) << 16)
++#define CPC_Cx_STAT_CONF_EJTAG_PROBE_SHF	15
++#define CPC_Cx_STAT_CONF_EJTAG_PROBE_MSK	(_ULCAST_(0x1) << 15)
++
++/* CPC_Cx_OTHER register fields */
++#define CPC_Cx_OTHER_CORENUM_SHF		16
++#define CPC_Cx_OTHER_CORENUM_MSK		(_ULCAST_(0xff) << 16)
++
++#endif /* __MIPS_ASM_MIPS_CPC_H__ */
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -574,11 +574,23 @@
+ #define MIPS_CONF1_PC		(_ULCAST_(1) <<	 4)
+ #define MIPS_CONF1_MD		(_ULCAST_(1) <<	 5)
+ #define MIPS_CONF1_C2		(_ULCAST_(1) <<	 6)
++#define MIPS_CONF1_DA_SHF	7
++#define MIPS_CONF1_DA_SZ	3
+ #define MIPS_CONF1_DA		(_ULCAST_(7) <<	 7)
++#define MIPS_CONF1_DL_SHF	10
++#define MIPS_CONF1_DL_SZ	3
+ #define MIPS_CONF1_DL		(_ULCAST_(7) << 10)
++#define MIPS_CONF1_DS_SHF	13
++#define MIPS_CONF1_DS_SZ	3
+ #define MIPS_CONF1_DS		(_ULCAST_(7) << 13)
++#define MIPS_CONF1_IA_SHF	16
++#define MIPS_CONF1_IA_SZ	3
+ #define MIPS_CONF1_IA		(_ULCAST_(7) << 16)
++#define MIPS_CONF1_IL_SHF	19
++#define MIPS_CONF1_IL_SZ	3
+ #define MIPS_CONF1_IL		(_ULCAST_(7) << 19)
++#define MIPS_CONF1_IS_SHF	22
++#define MIPS_CONF1_IS_SZ	3
+ #define MIPS_CONF1_IS		(_ULCAST_(7) << 22)
+ #define MIPS_CONF1_TLBS_SHIFT   (25)
+ #define MIPS_CONF1_TLBS_SIZE    (6)
+@@ -656,6 +668,10 @@
+ #define MIPS_CONF7_IAR		(_ULCAST_(1) << 10)
+ #define MIPS_CONF7_RPS		(_ULCAST_(1) << 2)
+ 
++/* CMGCRBase bit definitions */
++#define MIPS_CMGCRB_BASE	11
++#define MIPS_CMGCRF_BASE	(~_ULCAST_((1 << MIPS_CMGCRB_BASE) - 1))
++
+ /*  EntryHI bit definition */
+ #define MIPS_EHINV		(_ULCAST_(1) << 10)
+ 
+@@ -694,7 +710,7 @@
+ #define MIPS_SEGCFG_UK		_ULCAST_(0)
+ 
+ /* ebase register bit definition */
+-#define MIPS_EBASE_WG           _ULCAST_(11)
++#define MIPS_EBASE_WG           (_ULCAST_(1) << 11)
+ 
+ #ifndef __ASSEMBLY__
+ 
+diff --git a/arch/mips/include/asm/smp-cps.h b/arch/mips/include/asm/smp-cps.h
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/include/asm/smp-cps.h
+@@ -0,0 +1,33 @@
++/*
++ * Copyright (C) 2013 Imagination Technologies
++ * Author: Paul Burton <paul.burton@imgtec.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#ifndef __MIPS_ASM_SMP_CPS_H__
++#define __MIPS_ASM_SMP_CPS_H__
++
++#ifndef __ASSEMBLY__
++
++struct boot_config {
++	unsigned int core;
++	unsigned int vpe;
++	unsigned long pc;
++	unsigned long sp;
++	unsigned long gp;
++};
++
++extern struct boot_config mips_cps_bootcfg;
++
++extern void mips_cps_core_entry(void);
++
++#else /* __ASSEMBLY__ */
++
++.extern mips_cps_bootcfg;
++
++#endif /* __ASSEMBLY__ */
++#endif /* __MIPS_ASM_SMP_CPS_H__ */
+diff --git a/arch/mips/include/asm/smp-ops.h b/arch/mips/include/asm/smp-ops.h
+--- a/arch/mips/include/asm/smp-ops.h
++++ b/arch/mips/include/asm/smp-ops.h
+@@ -43,6 +43,9 @@ static inline void plat_smp_setup(void)
+ 	mp_ops->smp_setup();
+ }
+ 
++extern void gic_send_ipi_single(int cpu, unsigned int action);
++extern void gic_send_ipi_mask(const struct cpumask *mask, unsigned int action);
++
+ #else /* !CONFIG_SMP */
+ 
+ struct plat_smp_ops;
+@@ -97,4 +100,13 @@ static inline int register_vsmp_smp_ops(
+ #endif
+ }
+ 
++#ifdef CONFIG_MIPS_CPS
++extern int register_cps_smp_ops(void);
++#else
++static inline int register_cps_smp_ops(void)
++{
++	return -ENODEV;
++}
++#endif
++
+ #endif /* __ASM_SMP_OPS_H */
+diff --git a/arch/mips/kernel/Makefile b/arch/mips/kernel/Makefile
+--- a/arch/mips/kernel/Makefile
++++ b/arch/mips/kernel/Makefile
+@@ -52,6 +52,8 @@ obj-$(CONFIG_MIPS_MT_FPAFF)	+= mips-mt-f
+ obj-$(CONFIG_MIPS_MT_SMTC)	+= smtc.o smtc-asm.o smtc-proc.o
+ obj-$(CONFIG_MIPS_MT_SMP)	+= smp-mt.o
+ obj-$(CONFIG_MIPS_CMP)		+= smp-cmp.o
++obj-$(CONFIG_MIPS_CPS)          += smp-cps.o cps-vec.o
++obj-$(CONFIG_MIPS_GIC_IPI)      += smp-gic.o
+ obj-$(CONFIG_CPU_MIPSR2)	+= spram.o
+ 
+ obj-$(CONFIG_MIPS_VPE_LOADER)	+= vpe.o
+@@ -96,6 +98,8 @@ obj-$(CONFIG_HW_PERF_EVENTS)	+= perf_eve
+ 
+ obj-$(CONFIG_JUMP_LABEL)	+= jump_label.o
+ 
++obj-$(CONFIG_MIPS_CPC)          += mips-cpc.o
++
+ #
+ # DSP ASE supported for MIPS32 or MIPS64 Release 2 cores only.
+ #
+diff --git a/arch/mips/kernel/asm-offsets.c b/arch/mips/kernel/asm-offsets.c
+--- a/arch/mips/kernel/asm-offsets.c
++++ b/arch/mips/kernel/asm-offsets.c
+@@ -16,6 +16,7 @@
+ #include <linux/suspend.h>
+ #include <asm/ptrace.h>
+ #include <asm/processor.h>
++#include <asm/smp-cps.h>
+ 
+ #include <linux/kvm_host.h>
+ 
+@@ -394,3 +395,15 @@ void output_kvm_defines(void)
+ 	OFFSET(COP0_STATUS, mips_coproc, reg[MIPS_CP0_STATUS][0]);
+ 	BLANK();
+ }
++
++#ifdef CONFIG_MIPS_CPS
++void output_cps_defines(void)
++{
++	COMMENT(" MIPS CPS offsets. ");
++	OFFSET(BOOTCFG_CORE, boot_config, core);
++	OFFSET(BOOTCFG_VPE, boot_config, vpe);
++	OFFSET(BOOTCFG_PC, boot_config, pc);
++	OFFSET(BOOTCFG_SP, boot_config, sp);
++	OFFSET(BOOTCFG_GP, boot_config, gp);
++}
++#endif
+diff --git a/arch/mips/kernel/cps-vec.S b/arch/mips/kernel/cps-vec.S
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/kernel/cps-vec.S
+@@ -0,0 +1,187 @@
++/*
++ * Copyright (C) 2013 Imagination Technologies
++ * Author: Paul Burton <paul.burton@imgtec.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <asm/addrspace.h>
++#include <asm/asm.h>
++/*#include <asm/bitops.h>*/
++#include <asm/asm-offsets.h>
++#include <asm/asmmacro.h>
++#include <asm/cacheops.h>
++#include <asm/mipsregs.h>
++
++#define GCR_CL_COHERENCE_OFS 0x2008
++
++.section .text.cps-vec
++.balign 0x1000
++.set noreorder
++
++LEAF(mips_cps_core_entry)
++	/*
++	 * These first 8 bytes will be patched by cps_smp_setup to load the
++	 * base address of the CM GCRs into register v1.
++	 */
++	.quad	0
++
++	/* Check whether we're here due to an NMI */
++	mfc0	k0, CP0_STATUS
++	and	k0, t0, ST0_NMI
++	beqz	k0, not_nmi
++	 nop
++
++	/* This is an NMI */
++	la	k0, nmi_handler
++	jr	k0
++	 nop
++
++not_nmi:
++	/* Setup Cause */
++	li	t0, CAUSEF_IV
++	mtc0	t0, CP0_CAUSE
++
++	/* Setup Status */
++	li	t0, ST0_CU1 | ST0_CU0
++	mtc0	t0, CP0_STATUS
++
++	/*
++	 * Clear the bits used to index the caches. Note that the architecture
++	 * dictates that writing to any of TagLo or TagHi selects 0 or 2 should
++	 * be valid for all MIPS32 CPUs, even those for which said writes are
++	 * unnecessary.
++	 */
++	mtc0	zero, CP0_TAGLO, 0
++	mtc0	zero, CP0_TAGHI, 0
++	mtc0	zero, CP0_TAGLO, 2
++	mtc0	zero, CP0_TAGHI, 2
++	ehb
++
++	/* Primary cache configuration is indicated by Config1 */
++	mfc0	v0, CP0_CONFIG, 1
++
++	/* Detect I-cache line size */
++	_EXT	t0, v0, MIPS_CONF1_IL_SHF, MIPS_CONF1_IL_SZ
++	beqz	t0, icache_done
++	 li	t1, 2
++	sllv	t0, t1, t0
++
++	/* Detect I-cache size */
++	_EXT	t1, v0, MIPS_CONF1_IS_SHF, MIPS_CONF1_IS_SZ
++	xori	t2, t1, 0x7
++	beqz	t2, 1f
++	 li	t3, 32
++	addi	t1, t1, 1
++	sllv	t1, t3, t1
++1:	/* At this point t1 == I-cache sets per way */
++	_EXT	t2, v0, MIPS_CONF1_IA_SHF, MIPS_CONF1_IA_SZ
++	addi	t2, t2, 1
++	mul	t1, t1, t0
++	mul	t1, t1, t2
++
++	li	a0, KSEG0
++	add	a1, a0, t1
++1:	cache	Index_Store_Tag_I, 0(a0)
++	add	a0, a0, t0
++	bne	a0, a1, 1b
++	 nop
++icache_done:
++
++	/* Detect D-cache line size */
++	_EXT	t0, v0, MIPS_CONF1_DL_SHF, MIPS_CONF1_DL_SZ
++	beqz	t0, dcache_done
++	 li	t1, 2
++	sllv	t0, t1, t0
++
++	/* Detect D-cache size */
++	_EXT	t1, v0, MIPS_CONF1_DS_SHF, MIPS_CONF1_DS_SZ
++	xori	t2, t1, 0x7
++	beqz	t2, 1f
++	 li	t3, 32
++	addi	t1, t1, 1
++	sllv	t1, t3, t1
++1:	/* At this point t1 == D-cache sets per way */
++	_EXT	t2, v0, MIPS_CONF1_DA_SHF, MIPS_CONF1_DA_SZ
++	addi	t2, t2, 1
++	mul	t1, t1, t0
++	mul	t1, t1, t2
++
++	li	a0, KSEG0
++	addu	a1, a0, t1
++	subu	a1, a1, t0
++1:	cache	Index_Store_Tag_D, 0(a0)
++	bne	a0, a1, 1b
++	 add	a0, a0, t0
++dcache_done:
++
++	/* Set Kseg0 cacheable, coherent, write-back, write-allocate */
++	mfc0	t0, CP0_CONFIG
++	ori	t0, 0x7
++	xori	t0, 0x2
++	mtc0	t0, CP0_CONFIG
++	ehb
++
++	/* Enter the coherent domain */
++	li	t0, 0xff
++	sw	t0, GCR_CL_COHERENCE_OFS(v1)
++	ehb
++
++	/* Jump to kseg0 */
++	la	t0, 1f
++	jr	t0
++	 nop
++
++1:	/* We're up, cached & coherent */
++
++	/*
++	 * TODO: We should check the VPE number we intended to boot here, and
++	 *       if non-zero we should start that VPE and stop this one. For
++	 *       the moment this doesn't matter since CPUs are brought up
++	 *       sequentially and in order, but once hotplug is implemented
++	 *       this will need revisiting.
++	 */
++
++	/* Off we go! */
++	la	t0, mips_cps_bootcfg
++	lw	t1, BOOTCFG_PC(t0)
++	lw	gp, BOOTCFG_GP(t0)
++	lw	sp, BOOTCFG_SP(t0)
++	jr	t1
++	 nop
++	END(mips_cps_core_entry)
++
++.org 0x200
++LEAF(excep_tlbfill)
++	b	.
++	END(excep_tlbfill)
++
++.org 0x280
++LEAF(excep_xtlbfill)
++	b	.
++	END(excep_xtlbfill)
++
++.org 0x300
++LEAF(excep_cache)
++	b	.
++	END(excep_cache)
++
++.org 0x380
++LEAF(excep_genex)
++	b	.
++	END(excep_genex)
++
++.org 0x400
++LEAF(excep_intex)
++	b	.
++	END(excep_intex)
++
++.org 0x480
++LEAF(excep_ejtag)
++	la	k0, ejtag_debug_handler
++	jr	k0
++	 nop
++	END(excep_ejtag)
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -445,8 +445,10 @@ static void decode_configs(struct cpuinf
+ 
+ 	mips_probe_watch_registers(c);
+ 
++#ifndef CONFIG_MIPS_CPS
+ 	if (cpu_has_mips_r2)
+ 		c->core = read_c0_ebase() & 0x3ff;
++#endif
+ }
+ 
+ #define R4K_OPTS (MIPS_CPU_TLB | MIPS_CPU_4KEX | MIPS_CPU_4K_CACHE \
+diff --git a/arch/mips/kernel/mips-cpc.c b/arch/mips/kernel/mips-cpc.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/kernel/mips-cpc.c
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (C) 2013 Imagination Technologies
++ * Author: Paul Burton <paul.burton@imgtec.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/bitmap.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/threads.h>
++
++#include <asm/gcmpregs.h>
++#include <asm/gic.h>
++#include <asm/mips-cpc.h>
++
++extern int gcmp_present;
++void __iomem *mips_cpc_base;
++
++phys_t __weak mips_cpc_phys_base(void)
++{
++	u32 cpc_base;
++
++	if (!gcmp_present)
++		return 0;
++
++	if (!(GCMPGCB(CPCST) & GCMP_GCB_CPCST_EX_MSK))
++		return 0;
++
++	/* If the CPC is already enabled, leave it so */
++	cpc_base = GCMPGCB(CPCBA);
++	if (cpc_base & GCMP_GCB_CPCBA_EN_MSK)
++		return cpc_base & GCMP_GCB_CPCBA_BASE_MSK;
++
++	/* Otherwise, give it the default address & enable it */
++	cpc_base = mips_cpc_default_phys_base();
++	GCMPGCB(CPCBA) = cpc_base | GCMP_GCB_CPCBA_EN_MSK;
++	return cpc_base;
++}
++
++int mips_cpc_probe(void)
++{
++	phys_t addr;
++
++	addr = mips_cpc_phys_base();
++	if (!addr)
++		return -ENODEV;
++
++	mips_cpc_base = ioremap_nocache(addr, 0x8000);
++	if (!mips_cpc_base)
++		return -ENXIO;
++
++	return 0;
++}
+diff --git a/arch/mips/kernel/smp-cps.c b/arch/mips/kernel/smp-cps.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/kernel/smp-cps.c
+@@ -0,0 +1,436 @@
++/*
++ * Copyright (C) 2013 Imagination Technologies
++ * Author: Paul Burton <paul.burton@imgtec.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/io.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/smp.h>
++#include <linux/types.h>
++
++#include <asm/regdef.h>
++#include <asm/cacheflush.h>
++#include <asm/gcmpregs.h>
++#include <asm/gic.h>
++#include <asm/mips-cpc.h>
++#include <asm/mips_mt.h>
++#include <asm/mipsregs.h>
++#include <asm/smp-cps.h>
++#include <asm/time.h>
++#include <asm/uasm.h>
++
++extern int gcmp_present;
++
++static DECLARE_BITMAP(core_power, NR_CPUS);
++
++struct boot_config mips_cps_bootcfg;
++
++static void init_core(void)
++{
++	unsigned int nvpes, t;
++	u32 mvpconf0, vpeconf0, vpecontrol, tcstatus, tcbind, status;
++
++	if (!cpu_has_mipsmt)
++		return;
++
++	/* Enter VPE configuration state */
++	dvpe();
++	set_c0_mvpcontrol(MVPCONTROL_VPC);
++
++	/* Retrieve the count of VPEs in this core */
++	mvpconf0 = read_c0_mvpconf0();
++	nvpes = ((mvpconf0 & MVPCONF0_PVPE) >> MVPCONF0_PVPE_SHIFT) + 1;
++	smp_num_siblings = nvpes;
++
++	for (t = 1; t < nvpes; t++) {
++		/* Use a 1:1 mapping of TC index to VPE index */
++		settc(t);
++
++		/* Bind 1 TC to this VPE */
++		tcbind = read_tc_c0_tcbind();
++		tcbind &= ~TCBIND_CURVPE;
++		tcbind |= t << TCBIND_CURVPE_SHIFT;
++		write_tc_c0_tcbind(tcbind);
++
++		/* Set exclusive TC, non-active, master */
++		vpeconf0 = read_vpe_c0_vpeconf0();
++		vpeconf0 &= ~(VPECONF0_XTC | VPECONF0_VPA);
++		vpeconf0 |= t << VPECONF0_XTC_SHIFT;
++		vpeconf0 |= VPECONF0_MVP;
++		write_vpe_c0_vpeconf0(vpeconf0);
++
++		/* Declare TC non-active, non-allocatable & interrupt exempt */
++		tcstatus = read_tc_c0_tcstatus();
++		tcstatus &= ~(TCSTATUS_A | TCSTATUS_DA);
++		tcstatus |= TCSTATUS_IXMT;
++		write_tc_c0_tcstatus(tcstatus);
++
++		/* Halt the TC */
++		write_tc_c0_tchalt(TCHALT_H);
++
++		/* Allow only 1 TC to execute */
++		vpecontrol = read_vpe_c0_vpecontrol();
++		vpecontrol &= ~VPECONTROL_TE;
++		write_vpe_c0_vpecontrol(vpecontrol);
++
++		/* Copy (most of) Status from VPE 0 */
++		status = read_c0_status();
++		status &= ~(ST0_IM | ST0_IE | ST0_KSU);
++		status |= ST0_CU0;
++		write_vpe_c0_status(status);
++
++		/* Copy Config from VPE 0 */
++		write_vpe_c0_config(read_c0_config());
++		write_vpe_c0_config7(read_c0_config7());
++
++		/* Ensure no software interrupts are pending */
++		write_vpe_c0_cause(0);
++
++		/* Sync Count */
++		write_vpe_c0_count(read_c0_count());
++	}
++
++	/* Leave VPE configuration state */
++	clear_c0_mvpcontrol(MVPCONTROL_VPC);
++}
++
++static void __init cps_smp_setup(void)
++{
++	unsigned int ncores, nvpes, core_vpes;
++	int c, v;
++	u32 core_cfg, *entry_code;
++
++	/* Detect & record VPE topology */
++	ncores = ((GCMPGCB(GC) & GCMP_GCB_GC_NUMCORES_MSK) >>
++		  GCMP_GCB_GC_NUMCORES_SHF) + 1;
++	pr_info("VPE topology ");
++	for (c = nvpes = 0; c < ncores; c++) {
++		if (cpu_has_mipsmt && config_enabled(CONFIG_MIPS_MT_SMP)) {
++			GCMPCLCB(OTHER) = c << GCMP_CCB_OTHER_CORENUM_SHF;
++			core_cfg = GCMPCOCB(CFG);
++			core_vpes = ((core_cfg & GCMP_CCB_CFG_NUMVPE_MSK) >>
++				     GCMP_CCB_CFG_NUMVPE_SHF) + 1;
++		} else {
++			core_vpes = 1;
++		}
++
++		pr_cont("%c%u", c ? ',' : '{', core_vpes);
++
++		for (v = 0; v < min_t(int, core_vpes, NR_CPUS - nvpes); v++) {
++			cpu_data[nvpes + v].core = c;
++#ifdef CONFIG_MIPS_MT_SMP
++			cpu_data[nvpes + v].vpe_id = v;
++#endif
++		}
++
++		nvpes += core_vpes;
++	}
++	pr_cont("} total %u\n", nvpes);
++
++	/* Indicate present CPUs (CPU being synonymous with VPE) */
++	for (v = 0; v < min_t(unsigned, nvpes, NR_CPUS); v++) {
++		set_cpu_possible(v, true);
++		set_cpu_present(v, true);
++		__cpu_number_map[v] = v;
++		__cpu_logical_map[v] = v;
++	}
++
++	/* Core 0 is powered up (we're running on it) */
++	bitmap_set(core_power, 0, 1);
++
++	/* Disable MT - we only want to run 1 TC per VPE */
++	if (cpu_has_mipsmt)
++		dmt();
++
++	/* Initialise core 0 */
++	init_core();
++
++	/* Patch the start of mips_cps_core_entry to provide the CM base */
++	entry_code = (u32 *)&mips_cps_core_entry;
++	UASM_i_LA(&entry_code, 3, (long)_gcmp_base);
++
++	/* Make core 0 coherent with everything */
++	GCMPCLCB(COHCTL) = 0xff;
++}
++
++static void __init cps_prepare_cpus(unsigned int max_cpus)
++{
++	mips_mt_set_cpuoptions();
++}
++
++/*static*/ void boot_core(struct boot_config *cfg)
++{
++	/* Select the appropriate core */
++	GCMPCLCB(OTHER) = cfg->core << GCMP_CCB_OTHER_CORENUM_SHF;
++
++	/* Set its reset vector */
++	GCMPCOCB(RESETBASE) = (unsigned long)0xBFC00000; //CKSEG1ADDR((unsigned long)mips_cps_core_entry);
++
++	/* Ensure its coherency is disabled */
++	GCMPCOCB(COHCTL) = 0;
++
++	/* Ensure the core can access the GCRs */
++	GCMPGCB(GCSRAP) |= 1 << (GCMP_GCB_GCSRAP_CMACCESS_SHF + cfg->core);
++
++	/* Copy cfg */
++	mips_cps_bootcfg = *cfg;
++
++	if (mips_cpc_present()) {
++		/* Select the appropriate core */
++		write_cpc_cl_other(cfg->core << CPC_Cx_OTHER_CORENUM_SHF);
++
++		/* Reset the core */
++		write_cpc_co_cmd(CPC_Cx_CMD_RESET);
++
++	} else {
++		/* Take the core out of reset */
++		GCMPCOCB(RESETR) = 0;
++	}
++
++	/* The core is now powered up */
++	bitmap_set(core_power, cfg->core, 1);
++
++	printk("\n%s: cfg->core = %d; cfg->vpe = %d; cfg->pc = 0x%p\n", __func__, cfg->core, cfg->vpe, (void *)cfg->pc);
++}
++
++/*static*/ void boot_vpe(void *info)
++{
++	struct boot_config *cfg = info;
++	u32 tcstatus, vpeconf0;
++
++	/* Enter VPE configuration state */
++	dvpe();
++	set_c0_mvpcontrol(MVPCONTROL_VPC);
++
++	settc(cfg->vpe);
++
++	/* Set the TC restart PC */
++	write_tc_c0_tcrestart((unsigned long)cfg->pc);
++
++	/* Activate the TC, allow interrupts */
++	tcstatus = read_tc_c0_tcstatus();
++	tcstatus &= ~TCSTATUS_IXMT;
++	tcstatus |= TCSTATUS_A;
++	write_tc_c0_tcstatus(tcstatus);
++
++	/* Clear the TC halt bit */
++	write_tc_c0_tchalt(0);
++
++	/* Activate the VPE */
++	vpeconf0 = read_vpe_c0_vpeconf0();
++	vpeconf0 |= VPECONF0_VPA;
++	write_vpe_c0_vpeconf0(vpeconf0);
++
++	/* Set the stack & global pointer registers */
++	write_tc_gpr_sp(cfg->sp);
++	write_tc_gpr_gp(cfg->gp);
++
++	/* Leave VPE configuration state */
++	clear_c0_mvpcontrol(MVPCONTROL_VPC);
++
++	/* Enable other VPEs to execute */
++	evpe(EVPE_ENABLE);
++
++        printk("\n%s: cfg->core = %d; cfg->vpe = %d; cfg->pc = 0x%p\n", __func__, cfg->core, cfg->vpe, (void *)cfg->pc);
++
++}
++
++/*
++ * MPS SRAM Base Address
++ */
++#define MBX_BASEADDRESS                 0xBF800000
++#define MPS_MEM_SEG_DATASIZE            512
++
++/*
++ * MPS SRAM backup mem pointer
++ */
++static  char    *argv;
++
++/*static*/ void boot_eva_core(void)
++{
++    	void *start, *end;
++#ifdef CONFIG_EVA
++        unsigned int val;
++#endif
++
++	        /* Cache the reset code of this function */
++        __asm__ __volatile__ (
++                "       .set    push                            \n"
++                "       .set    mips3                           \n"
++                "       la      %0,startpoint_eva               \n"
++                "       la      %1,endpoint_eva                 \n"
++                "       .set    pop                             \n"
++                : "=r" (start), "=r" (end)
++                :
++        );
++
++//      printk("start = %p, end = %p", start, end);
++    	memcpy((u8*)argv, (u8*)MBX_BASEADDRESS, MPS_MEM_SEG_DATASIZE);
++    	memcpy((u8*)MBX_BASEADDRESS, (u8*)start, (end - start));
++
++    /* jump to MPS memory */
++//    __asm__("jr     %0"::"r"(MBX_BASEADDRESS));
++
++    	__asm__ __volatile__ (
++            "startpoint_eva:                                    \n"
++    	);
++#ifdef CONFIG_EVA
++	/*CFG0*/
++        val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++                (5 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
++                (1 << MIPS_SEGCFG_EU_SHIFT));
++	/*CFG1*/
++        val |= (((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++                (6 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
++                (1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++        write_c0_segctl0(val);
++
++	/*CFG2*/
++        val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++                (1 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
++                (1 << MIPS_SEGCFG_EU_SHIFT));
++	/*CFG3*/
++        val |= (((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
++                (1 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++                (1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++        write_c0_segctl1(val);
++
++	/*CFG4*/
++        val = ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++                (2 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++                (1 << MIPS_SEGCFG_EU_SHIFT));
++	/*CFG5*/
++        val |= (((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++                (0 << MIPS_SEGCFG_PA_SHIFT) | (3 << MIPS_SEGCFG_C_SHIFT) |
++                (1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++
++        write_c0_segctl2(val);
++        back_to_back_c0_hazard();
++
++        val = read_c0_config5();
++        write_c0_config5(val|MIPS_CONF5_K|MIPS_CONF5_CV);
++        back_to_back_c0_hazard();
++
++#endif /* CONFIG_EVA */
++
++//    __asm__("jr     %0"::"r"( end + 16 ));
++
++    	__asm__ __volatile__ (
++            	"endpoint_eva:                                      \n"
++    	);
++
++	return;
++}
++
++static void cps_boot_secondary(int cpu, struct task_struct *idle)
++{
++	struct boot_config cfg;
++	unsigned int remote;
++	int err;
++                
++	cfg.core = cpu_data[cpu].core;
++	cfg.vpe = cpu_vpe_id(&cpu_data[cpu]);
++
++	/* Except that VPE0, all others should be in legacy mapping by default for pc */
++	cfg.pc = CKSEG1ADDR((unsigned long)&smp_bootstrap);
++	cfg.sp = __KSTK_TOS(idle);
++	cfg.gp = (unsigned long)task_thread_info(idle);
++	
++	if (!test_bit(cfg.core, core_power)) {
++		printk("boot a Powered down core\n");
++		/* Boot a VPE on a powered down core */
++    		/* malloc MPS backup mem */
++    		argv = kmalloc(MPS_MEM_SEG_DATASIZE, GFP_KERNEL);
++//		boot_eva_core();
++		boot_core(&cfg);
++    		/* free MPS backup mem */
++    		kfree(argv);		
++		return;
++	}
++
++	if (cfg.core != current_cpu_data.core) {
++		/* Boot a VPE on another powered up core */
++		for (remote = 0; remote < NR_CPUS; remote++) {
++			if (cpu_data[remote].core != cfg.core)
++				continue;
++			if (cpu_online(remote))
++				break;
++		}
++		printk("remote=%d\n", remote);
++		BUG_ON(remote >= NR_CPUS);
++		err = smp_call_function_single(remote, boot_vpe, &cfg, 1);
++		if (err)
++			panic("Failed to call remote CPU\n");
++		return;
++	}
++
++	BUG_ON(!cpu_has_mipsmt);
++
++	/* Boot a VPE on this core */
++	boot_vpe(&cfg);
++}
++
++static void cps_init_secondary(void)
++{
++	/* Disable MT - we only want to run 1 TC per VPE */
++	if (cpu_has_mipsmt)
++		dmt();
++
++	/* TODO: revisit this assumption once hotplug is implemented */
++	if (cpu_vpe_id(&current_cpu_data) == 0)
++		init_core();
++
++	change_c0_status(ST0_IM, STATUSF_IP3 | STATUSF_IP4 |
++				 STATUSF_IP6 | STATUSF_IP7);
++}
++
++static void cps_smp_finish(void)
++{
++	write_c0_compare(read_c0_count() + (8 * mips_hpt_frequency / HZ));
++
++#ifdef CONFIG_MIPS_MT_FPAFF
++	/* If we have an FPU, enroll ourselves in the FPU-full mask */
++	if (cpu_has_fpu)
++		cpu_set(smp_processor_id(), mt_fpu_cpumask);
++#endif /* CONFIG_MIPS_MT_FPAFF */
++
++	local_irq_enable();
++}
++
++static void cps_cpus_done(void)
++{
++}
++
++static struct plat_smp_ops cps_smp_ops = {
++	.smp_setup		= cps_smp_setup,
++	.prepare_cpus		= cps_prepare_cpus,
++	.boot_secondary		= cps_boot_secondary,
++	.init_secondary		= cps_init_secondary,
++	.smp_finish		= cps_smp_finish,
++	.send_ipi_single	= gic_send_ipi_single,
++	.send_ipi_mask		= gic_send_ipi_mask,
++	.cpus_done		= cps_cpus_done,
++};
++
++int register_cps_smp_ops(void)
++{
++	if (!gcmp_present) {
++		pr_warn("MIPS CPS SMP unable to proceed without a CM\n");
++		return -ENODEV;
++	}
++
++	/* check we have a GIC - we need one for IPIs */
++	if (!(GCMPGCB(GICST) & GCMP_GCB_GICST_EX_MSK)) {
++		pr_warn("MIPS CPS SMP unable to proceed without a GIC\n");
++		return -ENODEV;
++	}
++
++	register_smp_ops(&cps_smp_ops);
++	return 0;
++}
+diff --git a/arch/mips/kernel/smp-gic.c b/arch/mips/kernel/smp-gic.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/kernel/smp-gic.c
+@@ -0,0 +1,53 @@
++/*
++ * Copyright (C) 2013 Imagination Technologies
++ * Author: Paul Burton <paul.burton@imgtec.com>
++ *
++ * Based on smp-cmp.c:
++ *  Copyright (C) 2007 MIPS Technologies, Inc.
++ *  Author: Chris Dearman (chris@mips.com)
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/printk.h>
++
++#include <asm/gic.h>
++#include <asm/smp-ops.h>
++
++void gic_send_ipi_single(int cpu, unsigned int action)
++{
++	unsigned long flags;
++	unsigned int intr;
++
++	pr_debug("CPU%d: %s cpu %d action %u status %08x\n",
++		 smp_processor_id(), __func__, cpu, action, read_c0_status());
++
++	local_irq_save(flags);
++
++	switch (action) {
++	case SMP_CALL_FUNCTION:
++		intr = plat_ipi_call_int_xlate(cpu);
++		break;
++
++	case SMP_RESCHEDULE_YOURSELF:
++		intr = plat_ipi_resched_int_xlate(cpu);
++		break;
++
++	default:
++		BUG();
++	}
++
++	gic_send_ipi(intr);
++	local_irq_restore(flags);
++}
++
++void gic_send_ipi_mask(const struct cpumask *mask, unsigned int action)
++{
++	unsigned int i;
++
++	for_each_cpu(i, mask)
++		gic_send_ipi_single(i, action);
++}

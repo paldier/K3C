@@ -1,0 +1,161 @@
+In kernel 3.9 onwards CONFIG_EXPRIMENTAL is removed.
+ref: http://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=5a958db311c416345a61b7bddc62a5c6c7112c7f
+
+diff --git a/net/netfilter/Kconfig b/net/netfilter/Kconfig
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -1038,7 +1038,6 @@ config NETFILTER_XT_MATCH_IPVS
+ 
+ config NETFILTER_XT_MATCH_LAYER7
+ 	tristate '"layer7" match support'
+-	depends on EXPERIMENTAL
+ 	depends on NETFILTER_XTABLES
+ 	depends on NETFILTER_ADVANCED
+ 	depends on NF_CONNTRACK
+diff --git a/net/netfilter/xt_layer7.c b/net/netfilter/xt_layer7.c
+--- a/net/netfilter/xt_layer7.c
++++ b/net/netfilter/xt_layer7.c
+@@ -363,56 +363,6 @@ static int my_atoi(const char *s)
+ 	}
+ }
+ 
+-/* write out num_packets to userland. */
+-static int layer7_read_proc(char* page, char ** start, off_t off, int count,
+-                            int* eof, void * data)
+-{
+-	if(num_packets > 99 && net_ratelimit())
+-		printk(KERN_ERR "layer7: NOT REACHED. num_packets too big\n");
+-
+-	page[0] = num_packets/10 + '0';
+-	page[1] = num_packets%10 + '0';
+-	page[2] = '\n';
+-	page[3] = '\0';
+-
+-	*eof=1;
+-
+-	return 3;
+-}
+-
+-/* Read in num_packets from userland */
+-static int layer7_write_proc(struct file* file, const char* buffer,
+-                             unsigned long count, void *data)
+-{
+-	char * foo = kmalloc(count, GFP_ATOMIC);
+-
+-	if(!foo){
+-		if (net_ratelimit())
+-			printk(KERN_ERR "layer7: out of memory, bailing. "
+-					"num_packets unchanged.\n");
+-		return count;
+-	}
+-
+-	if(copy_from_user(foo, buffer, count)) {
+-		return -EFAULT;
+-	}
+-
+-
+-	num_packets = my_atoi(foo);
+-	kfree (foo);
+-
+-	/* This has an arbitrary limit to make the math easier. I'm lazy.
+-	But anyway, 99 is a LOT! If you want more, you're doing it wrong! */
+-	if(num_packets > 99) {
+-		printk(KERN_WARNING "layer7: num_packets can't be > 99.\n");
+-		num_packets = 99;
+-	} else if(num_packets < 1) {
+-		printk(KERN_WARNING "layer7: num_packets can't be < 1.\n");
+-		num_packets = 1;
+-	}
+-
+-	return count;
+-}
+ 
+ static bool
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35)
+@@ -643,6 +593,65 @@ check(const char *tablename, const void 
+ 	}
+ #endif
+ 
++/* write out num_packets to userland. */
++static int layer7_read_proc(struct seq_file *s, void *v)
++{
++	if(num_packets > 99 && net_ratelimit())
++		printk(KERN_ERR "layer7: NOT REACHED. num_packets too big\n");
++  	seq_printf(s,"%d\n", num_packets);
++  	return 0;
++}
++
++static int layer7_proc_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, layer7_read_proc, NULL);
++}
++
++
++/* Read in num_packets from userland */
++static ssize_t layer7_file_write(struct file *file, const char __user *buf,
++			     size_t count, loff_t *ppos)
++{
++	if (count) {
++		char * foo = kmalloc(count, GFP_ATOMIC);
++
++		if(!foo){
++			if (net_ratelimit())
++				printk(KERN_ERR "layer7: out of memory, bailing. "
++						"num_packets unchanged.\n");
++			return count;
++		}
++
++		if(copy_from_user(foo, buf, count)) {
++			return -EFAULT;
++		}
++
++
++		num_packets = my_atoi(foo);
++		kfree (foo);
++
++		/* This has an arbitrary limit to make the math easier. I'm lazy.
++		But anyway, 99 is a LOT! If you want more, you're doing it wrong! */
++		if(num_packets > 99) {
++			printk(KERN_WARNING "layer7: num_packets can't be > 99.\n");
++			num_packets = 99;
++		} else if(num_packets < 1) {
++			printk(KERN_WARNING "layer7: num_packets can't be < 1.\n");
++			num_packets = 1;
++		}
++	}
++	return count;
++}
++
++static const struct file_operations layer7_proc_fops = {
++	.open           = layer7_proc_open,
++	.read           = seq_read,
++	.write	 	= layer7_file_write,
++	.llseek         = seq_lseek,
++	.release        = single_release,
++};
++
++
+ static struct xt_match xt_layer7_match[] __read_mostly = {
+ {
+ 	.name		= "layer7",
+@@ -655,6 +664,9 @@ static struct xt_match xt_layer7_match[]
+ }
+ };
+ 
++
++
++
+ static void layer7_cleanup_proc(void)
+ {
+ 	remove_proc_entry("layer7_numpackets", init_net.proc_net);
+@@ -664,9 +676,7 @@ static void layer7_cleanup_proc(void)
+ static void layer7_init_proc(void)
+ {
+ 	struct proc_dir_entry* entry;
+-	entry = create_proc_entry("layer7_numpackets", 0644, init_net.proc_net);
+-	entry->read_proc = layer7_read_proc;
+-	entry->write_proc = layer7_write_proc;
++	entry = proc_create("layer7_numpackets", 0644, init_net.proc_net, &layer7_proc_fops);
+ }
+ 
+ static int __init xt_layer7_init(void)

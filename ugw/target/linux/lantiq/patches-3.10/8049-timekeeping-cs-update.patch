@@ -1,0 +1,61 @@
+# HG changeset patch
+# Parent cb31dce16b84378082e4ad1edf6e6eaf6b69f0e3
+add new function to the timekeeping module to update corresponding clocksource seetings
+
+diff --git a/include/linux/time.h b/include/linux/time.h
+--- a/include/linux/time.h
++++ b/include/linux/time.h
+@@ -7,6 +7,7 @@
+ #include <uapi/linux/time.h>
+ 
+ extern struct timezone sys_tz;
++struct clocksource;
+ 
+ /* Parameters used to convert the timespec values: */
+ #define MSEC_PER_SEC	1000L
+@@ -122,6 +123,8 @@ static inline bool has_persistent_clock(
+ 	return persistent_clock_exist;
+ }
+ 
++extern void timekeeping_clocksource_update(struct clocksource *cs, 
++					struct clocksource *cs_old);
+ extern void read_persistent_clock(struct timespec *ts);
+ extern void read_boot_clock(struct timespec *ts);
+ extern int persistent_clock_is_local;
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -764,6 +764,33 @@ void __attribute__((weak)) read_boot_clo
+ 	ts->tv_nsec = 0;
+ }
+ 
++/**
++ * This function may used in systems where the clock rate of the
++ * current clocksource is changed during runtime. Before this function
++ * is called the cs must be already updated with the new clock rate.
++ * cs_old = clocksource before changing clock rate
++ * cs     = clocksource after updating clock rate
++ */
++ void timekeeping_clocksource_update(struct clocksource *cs, 
++					struct clocksource *cs_old)
++{
++	struct timekeeper *tk = &timekeeper;
++	unsigned long flags;
++	int shift_change;
++	
++	raw_spin_lock_irqsave(&timekeeper_lock, flags);
++	tk_setup_internals(tk, cs);
++	shift_change = cs->shift - cs_old->shift;
++	if (shift_change < 0){
++		tk->xtime_nsec >>= -shift_change;
++	} else {
++		tk->xtime_nsec <<= shift_change;
++	}
++	memcpy(&shadow_timekeeper, &timekeeper, sizeof(timekeeper));
++	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
++}
++EXPORT_SYMBOL_GPL(timekeeping_clocksource_update);
++
+ /*
+  * timekeeping_init - Initializes the clocksource and common timekeeping values
+  */

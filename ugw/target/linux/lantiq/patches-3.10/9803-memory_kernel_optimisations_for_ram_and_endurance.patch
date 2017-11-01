@@ -1,0 +1,110 @@
+Kernel Optimizations for ,
+RAM usage
+	- Reduced allocation of FTP and H323 buffers during init from 64K to 32K.
+
+Multi-Endurance 
+	- Issue description :
+		- During QA multi endurance tests we observed that in heavy load kernel reclaim logic was not able to recover 32 pages and thus lead to                       continous OOM Killer dumps
+	- So reduced the recovery of pages from 32 to 8 pages and increased the possiblity of getting 8 pages by freeing cache and thus avoiding OOM memory 
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -1746,6 +1746,11 @@ config LTQ_SYS_OPT
+ 	Enbaling this feature improves the networking performance
+ 	due to LTQ enhancements to IRQ scheduling.
+ 
++config LTQ_OPTIMIZATION
++	bool "Kernel LTQ optimizations"
++	help
++	Kernel LTQ optimizations
++
+ choice
+ 	prompt "Kernel code model"
+ 	help
+diff --git a/fs/drop_caches.c b/fs/drop_caches.c
+--- a/fs/drop_caches.c
++++ b/fs/drop_caches.c
+@@ -37,7 +37,11 @@ static void drop_pagecache_sb(struct sup
+ 	iput(toput_inode);
+ }
+ 
++#ifdef CONFIG_LTQ_OPTIMIZATION
++void drop_slab(void)
++#else
+ static void drop_slab(void)
++#endif
+ {
+ 	int nr_objects;
+ 	struct shrink_control shrink = {
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -156,7 +156,12 @@ enum {
+ 	SWP_SCANNING	= (1 << 8),	/* refcount in scan_swap_map */
+ };
+ 
++#ifdef CONFIG_LTQ_OPTIMIZATION
++#define SWAP_CLUSTER_MAX 8UL
++#else
+ #define SWAP_CLUSTER_MAX 32UL
++#endif
++
+ #define COMPACT_CLUSTER_MAX SWAP_CLUSTER_MAX
+ 
+ /*
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -156,6 +156,10 @@ int pageblock_order __read_mostly;
+ 
+ static void __free_pages_ok(struct page *page, unsigned int order);
+ 
++#ifdef CONFIG_LTQ_OPTIMIZATION
++extern void drop_slab(void);
++#endif
++
+ /*
+  * results with 256, 32 in the lowmem_reserve sysctl:
+  *	1G machine -> (16M dma, 800M-16M normal, 1G-800M high)
+@@ -2248,6 +2252,10 @@ static int
+ 	reclaim_state.reclaimed_slab = 0;
+ 	current->reclaim_state = &reclaim_state;
+ 
++#ifdef CONFIG_LTQ_OPTIMIZATION
++	drop_slab (); /* same as echo 3 > /proc/sys/vm/drop_caches */
++#endif
++ 
+ 	progress = try_to_free_pages(zonelist, order, gfp_mask, nodemask);
+ 
+ 	current->reclaim_state = NULL;
+diff --git a/net/netfilter/nf_conntrack_ftp.c b/net/netfilter/nf_conntrack_ftp.c
+--- a/net/netfilter/nf_conntrack_ftp.c
++++ b/net/netfilter/nf_conntrack_ftp.c
+@@ -565,7 +565,11 @@ static int __init nf_conntrack_ftp_init(
+ {
+ 	int i, j = -1, ret = 0;
+ 
++#ifdef CONFIG_LTQ_OPTIMIZATION
++	ftp_buffer = kmalloc(32768, GFP_KERNEL);
++#else
+ 	ftp_buffer = kmalloc(65536, GFP_KERNEL);
++#endif
+ 	if (!ftp_buffer)
+ 		return -ENOMEM;
+ 
+diff --git a/net/netfilter/nf_conntrack_h323_main.c b/net/netfilter/nf_conntrack_h323_main.c
+--- a/net/netfilter/nf_conntrack_h323_main.c
++++ b/net/netfilter/nf_conntrack_h323_main.c
+@@ -1846,7 +1846,11 @@ static int __init nf_conntrack_h323_init
+ {
+ 	int ret;
+ 
++#ifdef CONFIG_LTQ_OPTIMIZATION
++	h323_buffer = kmalloc(32768, GFP_KERNEL);
++#else
+ 	h323_buffer = kmalloc(65536, GFP_KERNEL);
++#endif
+ 	if (!h323_buffer)
+ 		return -ENOMEM;
+ 	ret = nf_conntrack_helper_register(&nf_conntrack_helper_h245);

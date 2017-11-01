@@ -1,0 +1,1585 @@
+# HG changeset patch
+# Parent 348d8b16802a213f2d73af59663b3d86c9ae2f77
+imported patch 8026-get-xhci-running-on-usb3.patch
+
+diff --git a/drivers/usb/dwc3/Makefile b/drivers/usb/dwc3/Makefile
+old mode 100644
+new mode 100755
+--- a/drivers/usb/dwc3/Makefile
++++ b/drivers/usb/dwc3/Makefile
+@@ -17,6 +17,8 @@ ifneq ($(CONFIG_DEBUG_FS),)
+ 	dwc3-y				+= debugfs.o
+ endif
+ 
++
++
+ ##
+ # Platform-specific glue layers go here
+ #
+@@ -33,6 +35,9 @@ endif
+ ##
+ 
+ obj-$(CONFIG_USB_DWC3)		+= dwc3-omap.o
++obj-$(CONFIG_USB_DWC3)		+= dwc3-ltq.o
++#obj-$(CONFIG_LTQ_CPUFREQ)	+= ltq_usb0_coc_drv.o
++#obj-$(CONFIG_LTQ_CPUFREQ)	+= ltq_usb1_coc_drv.o
+ obj-$(CONFIG_USB_DWC3)		+= dwc3-exynos.o
+ 
+ ifneq ($(CONFIG_PCI),)
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+old mode 100644
+new mode 100755
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+old mode 100644
+new mode 100755
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -161,6 +161,9 @@
+ /* Bit fields */
+ 
+ /* Global Configuration Register */
++#define DWC3_GSBUSCFG0_DATBIGEND (1 << 11)
++#define DWC3_GSBUSCFG0_DESCBIGEND (1 << 10)
++
+ #define DWC3_GCTL_PWRDNSCALE(n)	((n) << 19)
+ #define DWC3_GCTL_U2RSTECN	(1 << 16)
+ #define DWC3_GCTL_RAMCLKSEL(x)	(((x) & DWC3_GCTL_CLK_MASK) << 6)
+@@ -189,6 +192,7 @@
+ /* Global USB3 PIPE Control Register */
+ #define DWC3_GUSB3PIPECTL_PHYSOFTRST	(1 << 31)
+ #define DWC3_GUSB3PIPECTL_SUSPHY	(1 << 17)
++#define DWC3_GUSB3PIPECTL_DISRXDETP3	(1 << 28)
+ 
+ /* Global TX Fifo Size Register */
+ #define DWC3_GTXFIFOSIZ_TXFDEF(n)	((n) & 0xffff)
+@@ -751,6 +755,7 @@ struct dwc3 {
+ 
+ 	u8			test_mode;
+ 	u8			test_mode_nr;
++	int			vbus_pin;
+ };
+ 
+ /* -------------------------------------------------------------------------- */
+diff --git a/drivers/usb/dwc3/dwc3-ltq.c b/drivers/usb/dwc3/dwc3-ltq.c
+new file mode 100755
+--- /dev/null
++++ b/drivers/usb/dwc3/dwc3-ltq.c
+@@ -0,0 +1,699 @@
++/*
++ * Copyright (C) 2015 LANTIQ Semiconductor Co., Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ */
++ 
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/interrupt.h>
++#include <linux/ioport.h>
++#include <linux/io.h>
++#include <linux/list.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/of.h>
++#include <linux/of_gpio.h>
++#include <linux/gpio.h>
++#include <linux/clk.h>
++
++#include <linux/usb/otg.h>
++#include <linux/usb/ch9.h>
++#include <linux/usb/gadget.h>
++
++#include "core.h"
++#include "gadget.h"
++#include "io.h"
++
++#include "debug.h"
++
++static u64 dwc3_otg_dmamask = 0xffffffff;
++
++#include <lantiq_soc.h>
++
++#define LTQ_GRX500_RCU_USB_PHY0 BIT(4) /* 0:NO_REST, 1:REST*/
++#define LTQ_GRX500_RCU_USB_PHY1 BIT(5)
++
++#define LTQ_GRX500_CHIP_TOP_AXI_DEV_END BIT(9) /* 0: Little, 1: Big Endian */
++#define LTQ_GRX500_CHIP_TOP_AXI_HOST_END BIT(10)
++
++
++/* -------------------------------------------------------------------------- */
++
++int ltq_vbus_gpio_init(struct dwc3 *dwc)
++{
++	int err;
++	int vbus_pin = dwc->vbus_pin;
++
++	if (vbus_pin < 0)
++		return -EINVAL;
++
++	err = gpio_is_valid(vbus_pin);
++	if (!err)
++	{
++		printk("?%s: gpio pin %d is invalid\n", __func__, vbus_pin);
++		return -EINVAL;
++	}
++
++	err = gpio_request(vbus_pin, "dwc3_vbus");
++	if (err)
++	{
++		printk("?%s: can't request gpio %d\n", __func__, vbus_pin);
++		return -EINVAL;
++	}
++
++	gpio_direction_output(vbus_pin, 1);
++
++	return 0;
++}
++
++void ltq_vbus_gpio_free(struct dwc3 *dwc)
++{
++	int vbus_pin = dwc->vbus_pin;
++
++	if (vbus_pin)
++		gpio_free(vbus_pin);
++}
++
++int ltq_usb_release_phy_reset(int usb_id)
++{
++
++	if (usb_id > 1)
++		return -EINVAL;
++
++	ltq_usb_phy_reset(usb_id == 0 ? LTQ_GRX500_RCU_USB_PHY0 : 
++		LTQ_GRX500_RCU_USB_PHY1);
++
++	return 0;
++}
++
++int ltq_usb_set_axi_host_to_be(int usb_id)
++{
++
++	if (usb_id > 1)
++		return -EINVAL;
++
++	/*
++	 * Select AXI Host Port Endian Mode.
++	 * 0: Little 1: Big
++	 */
++
++	if (usb_id == 0)
++		ltq_usb0_port_endian_set(LTQ_GRX500_CHIP_TOP_AXI_DEV_END,
++			LTQ_GRX500_CHIP_TOP_AXI_HOST_END);
++	else
++		ltq_usb1_port_endian_set(LTQ_GRX500_CHIP_TOP_AXI_DEV_END,
++			LTQ_GRX500_CHIP_TOP_AXI_HOST_END);
++
++	return 0;
++}
++
++
++void dwc3_ltq_set_mode(struct dwc3 *dwc, u32 mode)
++{
++	u32 reg;
++
++	reg = dwc3_readl(dwc->regs, DWC3_GCTL);
++	reg &= ~(DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG));
++	reg |= DWC3_GCTL_PRTCAPDIR(mode);
++	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
++}
++
++/**
++ * dwc3_ltq_core_soft_reset - Issues core soft reset and PHY reset
++ * @dwc: pointer to our context structure
++ */
++static void dwc3_ltq_core_soft_reset(struct dwc3 *dwc)
++{
++	u32		reg;
++
++	/* Before Resetting PHY, put Core in Reset */
++	reg = dwc3_readl(dwc->regs, DWC3_GCTL);
++	reg |= DWC3_GCTL_CORESOFTRESET;
++	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
++
++	/* Assert USB3 PHY reset */
++	reg = dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0));
++	reg |= DWC3_GUSB3PIPECTL_PHYSOFTRST;
++	dwc3_writel(dwc->regs, DWC3_GUSB3PIPECTL(0), reg);
++
++	/* Assert USB2 PHY reset */
++	reg = dwc3_readl(dwc->regs, DWC3_GUSB2PHYCFG(0));
++	reg |= DWC3_GUSB2PHYCFG_PHYSOFTRST;
++	dwc3_writel(dwc->regs, DWC3_GUSB2PHYCFG(0), reg);
++
++	/* Arec: Change core power state to P2 and then perform receiver detection */
++	reg = dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0));
++	reg |= DWC3_GUSB3PIPECTL_DISRXDETP3;
++	dwc3_writel(dwc->regs, DWC3_GUSB3PIPECTL(0), reg);
++
++	mdelay(100);
++
++	usb_phy_init(dwc->usb3_phy);
++	mdelay(100);
++	/* Clear USB3 PHY reset */
++	reg = dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0));
++	reg &= ~DWC3_GUSB3PIPECTL_PHYSOFTRST;
++	dwc3_writel(dwc->regs, DWC3_GUSB3PIPECTL(0), reg);
++
++	/* Clear USB2 PHY reset */
++	reg = dwc3_readl(dwc->regs, DWC3_GUSB2PHYCFG(0));
++	reg &= ~DWC3_GUSB2PHYCFG_PHYSOFTRST;
++	dwc3_writel(dwc->regs, DWC3_GUSB2PHYCFG(0), reg);
++
++	mdelay(100);
++
++	/* After PHYs are stable we can take Core out of reset state */
++	reg = dwc3_readl(dwc->regs, DWC3_GCTL);
++	reg &= ~DWC3_GCTL_CORESOFTRESET;
++	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
++}
++
++/**
++ * dwc3_ltq_free_one_event_buffer - Frees one event buffer
++ * @dwc: Pointer to our controller context structure
++ * @evt: Pointer to event buffer to be freed
++ */
++static void dwc3_ltq_free_one_event_buffer(struct dwc3 *dwc,
++		struct dwc3_event_buffer *evt)
++{
++	dma_free_coherent(dwc->dev, evt->length, evt->buf, evt->dma);
++}
++
++/**
++ * dwc3_ltq_alloc_one_event_buffer - Allocates one event buffer structure
++ * @dwc: Pointer to our controller context structure
++ * @length: size of the event buffer
++ *
++ * Returns a pointer to the allocated event buffer structure on success
++ * otherwise ERR_PTR(errno).
++ */
++static struct dwc3_event_buffer *dwc3_ltq_alloc_one_event_buffer(struct dwc3 *dwc,
++		unsigned length)
++{
++	struct dwc3_event_buffer	*evt;
++
++	evt = devm_kzalloc(dwc->dev, sizeof(*evt), GFP_KERNEL);
++	if (!evt)
++		return ERR_PTR(-ENOMEM);
++
++	evt->dwc	= dwc;
++	evt->length	= length;
++	evt->buf	= dma_alloc_coherent(dwc->dev, length,
++			&evt->dma, GFP_KERNEL);
++	if (!evt->buf)
++		return ERR_PTR(-ENOMEM);
++
++	return evt;
++}
++
++/**
++ * dwc3_ltq_free_event_buffers - frees all allocated event buffers
++ * @dwc: Pointer to our controller context structure
++ */
++static void dwc3_ltq_free_event_buffers(struct dwc3 *dwc)
++{
++	struct dwc3_event_buffer	*evt;
++	int i;
++
++	for (i = 0; i < dwc->num_event_buffers; i++) {
++		evt = dwc->ev_buffs[i];
++		if (evt)
++			dwc3_ltq_free_one_event_buffer(dwc, evt);
++	}
++}
++
++/**
++ * dwc3_ltq_alloc_event_buffers - Allocates @num event buffers of size @length
++ * @dwc: pointer to our controller context structure
++ * @length: size of event buffer
++ *
++ * Returns 0 on success otherwise negative errno. In the error case, dwc
++ * may contain some buffers allocated but not all which were requested.
++ */
++static int dwc3_ltq_alloc_event_buffers(struct dwc3 *dwc, unsigned length)
++{
++	int			num;
++	int			i;
++
++	num = DWC3_NUM_INT(dwc->hwparams.hwparams1);
++	dwc->num_event_buffers = num;
++
++	dwc->ev_buffs = devm_kzalloc(dwc->dev, sizeof(*dwc->ev_buffs) * num,
++			GFP_KERNEL);
++	if (!dwc->ev_buffs) {
++		dev_err(dwc->dev, "can't allocate event buffers array\n");
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < num; i++) {
++		struct dwc3_event_buffer	*evt;
++
++		evt = dwc3_ltq_alloc_one_event_buffer(dwc, length);
++		if (IS_ERR(evt)) {
++			dev_err(dwc->dev, "can't allocate event buffer\n");
++			return PTR_ERR(evt);
++		}
++		dwc->ev_buffs[i] = evt;
++	}
++
++	return 0;
++}
++
++/**
++ * dwc3_ltq_event_buffers_setup - setup our allocated event buffers
++ * @dwc: pointer to our controller context structure
++ *
++ * Returns 0 on success otherwise negative errno.
++ */
++static int dwc3_ltq_event_buffers_setup(struct dwc3 *dwc)
++{
++	struct dwc3_event_buffer	*evt;
++	int				n;
++
++	for (n = 0; n < dwc->num_event_buffers; n++) {
++		evt = dwc->ev_buffs[n];
++		dev_dbg(dwc->dev, "Event buf %p dma %08llx length %d\n",
++				evt->buf, (unsigned long long) evt->dma,
++				evt->length);
++
++		evt->lpos = 0;
++
++		dwc3_writel(dwc->regs, DWC3_GEVNTADRLO(n),
++				lower_32_bits(evt->dma));
++		dwc3_writel(dwc->regs, DWC3_GEVNTADRHI(n),
++				upper_32_bits(evt->dma));
++		dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(n),
++				evt->length & 0xffff);
++		dwc3_writel(dwc->regs, DWC3_GEVNTCOUNT(n), 0);
++	}
++
++	return 0;
++}
++
++static void dwc3_ltq_event_buffers_cleanup(struct dwc3 *dwc)
++{
++	struct dwc3_event_buffer	*evt;
++	int				n;
++
++	for (n = 0; n < dwc->num_event_buffers; n++) {
++		evt = dwc->ev_buffs[n];
++
++		evt->lpos = 0;
++
++		dwc3_writel(dwc->regs, DWC3_GEVNTADRLO(n), 0);
++		dwc3_writel(dwc->regs, DWC3_GEVNTADRHI(n), 0);
++		dwc3_writel(dwc->regs, DWC3_GEVNTSIZ(n), 0);
++		dwc3_writel(dwc->regs, DWC3_GEVNTCOUNT(n), 0);
++	}
++}
++
++static void dwc3_ltq_core_num_eps(struct dwc3 *dwc)
++{
++	struct dwc3_hwparams	*parms = &dwc->hwparams;
++
++	dwc->num_in_eps = DWC3_NUM_IN_EPS(parms);
++	dwc->num_out_eps = DWC3_NUM_EPS(parms) - dwc->num_in_eps;
++
++	dev_vdbg(dwc->dev, "found %d IN and %d OUT endpoints\n",
++			dwc->num_in_eps, dwc->num_out_eps);
++}
++
++static void dwc3_ltq_cache_hwparams(struct dwc3 *dwc)
++{
++	struct dwc3_hwparams	*parms = &dwc->hwparams;
++
++	parms->hwparams1 = dwc3_readl(dwc->regs, DWC3_GHWPARAMS1);
++}
++
++/**
++ * dwc3_ltq_core_init - Low-level initialization of DWC3 Core
++ * @dwc: Pointer to our controller context structure
++ *
++ * Returns 0 on success otherwise negative errno.
++ */
++static int dwc3_ltq_core_init(struct dwc3 *dwc)
++{
++	unsigned long		timeout;
++	u32			reg;
++	int			ret;
++
++	reg = dwc3_readl(dwc->regs, DWC3_GSNPSID);
++	/* This should read as U3 followed by revision number */
++	if ((reg & DWC3_GSNPSID_MASK) != 0x55330000) {
++		dev_err(dwc->dev, "this is not a DesignWare USB3 DRD Core\n");
++		ret = -ENODEV;
++		goto err0;
++	}
++	dwc->revision = reg;
++
++	/* issue device SoftReset too */
++	timeout = jiffies + msecs_to_jiffies(500);
++	dwc3_writel(dwc->regs, DWC3_DCTL, DWC3_DCTL_CSFTRST);
++	do {
++		reg = dwc3_readl(dwc->regs, DWC3_DCTL);
++		if (!(reg & DWC3_DCTL_CSFTRST))
++			break;
++
++		if (time_after(jiffies, timeout)) {
++			dev_err(dwc->dev, "Reset Timed Out\n");
++			ret = -ETIMEDOUT;
++			goto err0;
++		}
++
++		cpu_relax();
++	} while (true);
++
++	dwc3_ltq_core_soft_reset(dwc);
++
++	reg = dwc3_readl(dwc->regs, DWC3_GCTL);
++	reg &= ~DWC3_GCTL_SCALEDOWN_MASK;
++	reg &= ~DWC3_GCTL_DISSCRAMBLE;
++
++	switch (DWC3_GHWPARAMS1_EN_PWROPT(dwc->hwparams.hwparams1)) {
++	case DWC3_GHWPARAMS1_EN_PWROPT_CLK:
++		reg &= ~DWC3_GCTL_DSBLCLKGTNG;
++		break;
++	default:
++		dev_dbg(dwc->dev, "No power optimization available\n");
++	}
++
++	/*
++	 * WORKAROUND: DWC3 revisions <1.90a have a bug
++	 * where the device can fail to connect at SuperSpeed
++	 * and falls back to high-speed mode which causes
++	 * the device to enter a Connect/Disconnect loop
++	 */
++	if (dwc->revision < DWC3_REVISION_190A)
++		reg |= DWC3_GCTL_U2RSTECN;
++
++	dwc3_ltq_core_num_eps(dwc);
++
++	dwc3_writel(dwc->regs, DWC3_GCTL, reg);
++
++	return 0;
++
++err0:
++	return ret;
++}
++
++#define DWC3_ALIGN_MASK		(16 - 1)
++
++static int dwc3_ltq_probe(struct platform_device *pdev)
++{
++	struct device_node	*node = pdev->dev.of_node;
++	struct resource		*res;
++	struct dwc3		*dwc;
++	struct device		*dev = &pdev->dev;
++
++	int			ret = -ENOMEM;
++
++	void __iomem		*regs;
++	void			*mem;
++
++	int usb_id;
++	int vbus_pin;
++	struct clk *clk;
++
++	if (!node) {
++		dev_err(dev, "device node not found\n");
++		return -EINVAL;
++	}
++
++	usb_id = of_alias_get_id(node, "usb");
++	if (usb_id < 0)
++	{
++		dev_err(dev, "Failed to get alias id, errno %d\n", usb_id);
++		return -ENODEV;
++	}
++
++	clk = clk_get(dev, NULL);
++	if (IS_ERR(clk))
++	{
++		dev_err(dev, "Failed to get clk\n");
++		return PTR_ERR(clk);
++	}
++
++	mem = devm_kzalloc(dev, sizeof(*dwc) + DWC3_ALIGN_MASK, GFP_KERNEL);
++	if (!mem) {
++		dev_err(dev, "not enough memory\n");
++		return -ENOMEM;
++	}
++	dwc = PTR_ALIGN(mem, DWC3_ALIGN_MASK + 1);
++	dwc->mem = mem;
++
++	vbus_pin = of_get_named_gpio(node, "vbus-gpio", 0);
++	if (vbus_pin < 0)
++	{
++		dev_err(dev, "Failed to get vbus-gpio, errno %d\n", vbus_pin);
++		return -ENODEV;
++	}
++
++	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++	if (!res) {
++		dev_err(dev, "missing IRQ\n");
++		return -ENODEV;
++	}
++	dwc->xhci_resources[1].start = res->start;
++	dwc->xhci_resources[1].end = res->end;
++	dwc->xhci_resources[1].flags = res->flags;
++	dwc->xhci_resources[1].name = res->name;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(dev, "missing memory resource\n");
++		return -ENODEV;
++	}
++	dwc->xhci_resources[0].start = res->start;
++	dwc->xhci_resources[0].end = dwc->xhci_resources[0].start +
++					DWC3_XHCI_REGS_END;
++	dwc->xhci_resources[0].flags = res->flags;
++	dwc->xhci_resources[0].name = res->name;
++
++
++	 /*
++	  * Request memory region but exclude xHCI regs,
++	  * since it will be requested by the xhci-plat driver.
++	  */
++	res = devm_request_mem_region(dev, res->start + DWC3_GLOBALS_REGS_START,
++			resource_size(res) - DWC3_GLOBALS_REGS_START,
++			dev_name(dev));
++	if (!res) {
++		dev_err(dev, "can't request mem region\n");
++		return -ENOMEM;
++	}
++
++	regs = devm_ioremap_nocache(dev, res->start, resource_size(res));
++	if (!regs) {
++		dev_err(dev, "ioremap failed\n");
++		return -ENOMEM;
++	}
++
++	if (node)
++		dwc->usb3_phy = devm_usb_get_phy_by_phandle(dev, "phys", 0);
++	if (IS_ERR(dwc->usb3_phy)) {
++		ret = PTR_ERR(dwc->usb3_phy);
++
++		/*
++		 * if -ENXIO is returned, it means PHY layer wasn't
++		 * enabled, so it makes no sense to return -EPROBE_DEFER
++		 * in that case, since no PHY driver will ever probe.
++		 */
++		if (ret == -ENXIO)
++			return ret;
++
++		dev_err(dev, "no usb3 phy configured\n");
++		return -EPROBE_DEFER;
++	}
++	spin_lock_init(&dwc->lock);
++	platform_set_drvdata(pdev, dwc);
++
++	dwc->regs	= regs;
++	dwc->regs_size	= resource_size(res);
++	dwc->dev	= dev;
++	dwc->vbus_pin = vbus_pin;
++
++	dev->dma_mask	= &dwc3_otg_dmamask;
++	dev->coherent_dma_mask = DMA_BIT_MASK(32);
++
++	/*
++	 *Request Clock Enable
++	 */
++	clk_enable(clk);
++	mdelay(100);
++
++	ret = ltq_vbus_gpio_init(dwc);
++	if (ret) {
++		dev_err(dwc->dev, "?%s: can't init usb%d vbus gpio %d\n", __func__, usb_id, dwc->vbus_pin);
++		return -EINVAL;
++	}
++
++	/*
++	 * CHIP_TOP Set AXI to Big Endian Mode
++	 */
++	ret = ltq_usb_set_axi_host_to_be(usb_id);
++	if (ret) {
++		dev_err(dwc->dev, "?%s: can't set usb%d host port endian\n", __func__, usb_id);
++		return -EINVAL;
++	}
++	mdelay(100);
++
++	dwc3_ltq_cache_hwparams(dwc);
++
++	ret = dwc3_ltq_alloc_event_buffers(dwc, DWC3_EVENT_BUFFERS_SIZE);
++	if (ret) {
++		dev_err(dwc->dev, "failed to allocate event buffers\n");
++		ret = -ENOMEM;
++		goto err0;
++	}
++
++	/*
++	 * RCU RST_REQ2 - USB PHY0/1 released from reset;
++	 */
++	ltq_usb_release_phy_reset(usb_id);
++	mdelay(100);
++
++	ret = dwc3_ltq_core_init(dwc);
++	if (ret) {
++		dev_err(dev, "failed to initialize core\n");
++		goto err0;
++	}
++
++	ret = dwc3_ltq_event_buffers_setup(dwc);
++	if (ret) {
++		dev_err(dwc->dev, "failed to setup event buffers\n");
++		goto err1;
++	}
++
++	dwc3_ltq_set_mode(dwc, DWC3_GCTL_PRTCAP_HOST);
++	ret = dwc3_host_init(dwc);
++	if (ret) {
++		dev_err(dev, "failed to initialize host\n");
++		goto err1;
++	}
++
++	ret = dwc3_debugfs_init(dwc);
++	if (ret) {
++		dev_err(dev, "failed to initialize debugfs\n");
++		goto err2;
++	}
++
++	return 0;
++
++err2:
++	dwc3_host_exit(dwc);
++err1:
++	dwc3_ltq_event_buffers_cleanup(dwc);
++err0:
++	dwc3_ltq_free_event_buffers(dwc);
++
++	return ret;
++}
++
++static int dwc3_ltq_remove(struct platform_device *pdev)
++{
++	struct dwc3	*dwc = platform_get_drvdata(pdev);
++
++	dwc3_debugfs_exit(dwc);
++	dwc3_host_exit(dwc);
++
++	dwc3_ltq_event_buffers_cleanup(dwc);
++	dwc3_ltq_free_event_buffers(dwc);
++	ltq_vbus_gpio_free(dwc);
++	usb_phy_shutdown(dwc->usb3_phy);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int dwc3_ltq_prepare(struct device *dev)
++{
++	struct dwc3	*dwc = dev_get_drvdata(dev);
++	unsigned long	flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	dwc3_ltq_event_buffers_cleanup(dwc);
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++}
++
++static void dwc3_ltq_complete(struct device *dev)
++{
++	struct dwc3	*dwc = dev_get_drvdata(dev);
++	unsigned long	flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	dwc3_ltq_event_buffers_setup(dwc);
++	spin_unlock_irqrestore(&dwc->lock, flags);
++}
++
++static int dwc3_ltq_suspend(struct device *dev)
++{
++	struct dwc3	*dwc = dev_get_drvdata(dev);
++	unsigned long	flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	dwc->gctl = dwc3_readl(dwc->regs, DWC3_GCTL);
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++}
++
++static int dwc3_ltq_resume(struct device *dev)
++{
++	struct dwc3	*dwc = dev_get_drvdata(dev);
++	unsigned long	flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	dwc3_writel(dwc->regs, DWC3_GCTL, dwc->gctl);
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++}
++
++static const struct dev_pm_ops dwc3_ltq_dev_pm_ops = {
++	.prepare	= dwc3_ltq_prepare,
++	.complete	= dwc3_ltq_complete,
++
++	SET_SYSTEM_SLEEP_PM_OPS(dwc3_ltq_suspend, dwc3_ltq_resume)
++};
++
++#define DWC3_PM_OPS	&(dwc3_ltq_dev_pm_ops)
++#else
++#define DWC3_PM_OPS	NULL
++#endif
++
++#ifdef CONFIG_OF
++static const struct of_device_id of_dwc3_core_ltq_match[] = {
++	{
++		.compatible = "lantiq,dwc3-core"
++	},
++	{ },
++};
++
++MODULE_DEVICE_TABLE(of, of_dwc3_core_ltq_match);
++#endif
++
++static struct platform_driver dwc3_core_driver = {
++	.probe		= dwc3_ltq_probe,
++	.remove		= dwc3_ltq_remove,
++	.driver		= {
++		.name	= "ltq-dwc3-core",
++		.of_match_table	= of_match_ptr(of_dwc3_core_ltq_match),
++		.pm	= DWC3_PM_OPS,
++	},
++};
++
++module_platform_driver(dwc3_core_driver);
++
++MODULE_ALIAS("platform:ltq-dwc3");
++MODULE_AUTHOR("Arec Kao <arec.kao@lantiq.com>");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("DesignWare USB3 Lantiq Glue Layer");
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+old mode 100644
+new mode 100755
+diff --git a/drivers/usb/dwc3/ltq_usb0_coc_drv.c b/drivers/usb/dwc3/ltq_usb0_coc_drv.c
+new file mode 100755
+--- /dev/null
++++ b/drivers/usb/dwc3/ltq_usb0_coc_drv.c
+@@ -0,0 +1,292 @@
++/*
++ *
++ *			 Copyright (c) 2012, 2014, 2015
++ *       		Lantiq Beteiligungs-GmbH & Co. KG
++ *
++ *  For licensing information, see the file 'LICENSE' in the root folder of
++ *  this software module.
++ */
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/timer.h>
++#include <linux/cpufreq.h>
++#include <cpufreq/ltq_cpufreq.h>
++
++#include <linux/gpio.h>
++#include <linux/delay.h>
++
++#define LTQ_USB0COCDRV_BUSY	1
++#define LTQ_USB0COCDRV_IDLE	0
++
++/* this ID represent the USB interface No. (0, 1, 2, 3, ...) */
++#define LTQ_USB_ID		0
++
++/* threshold data for D0:D3 */
++static struct ltq_cpufreq_threshold *th_data = NULL;
++
++/* driver is busy and needs highest performance */
++int usb0_cocdrv_busy = LTQ_USB0COCDRV_IDLE;
++
++/* current power state of the driver */
++enum ltq_cpufreq_state usb0_cocdrv_ps = LTQ_CPUFREQ_PS_D0;
++
++#define PORT_CONNECT  (1 << 0)
++#define PORT_PE		  (1 << 1)
++
++#define PORT_PLS_MASK (0xf << 5)
++#define XDEV_U0       (0x0 << 5)
++#define XDEV_U2       (0x2 << 5)
++#define XDEV_U3       (0x3 << 5)
++#define XDEV_DISABLED (0x4 << 5)
++#define XDEV_RXDETECT (0x5 << 5)
++
++#define PORT_POWER	  (1 << 9)
++/* Port Link State Write Strobe - set this when changing link state */
++#define PORT_LINK_STROBE	(1 << 16)
++
++static u32 __iomem *port_array[] = {0xba300420, 0xba300430};
++
++static int
++ltq_usb0_cocdrv_stateget(enum ltq_cpufreq_state *state)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	*state = usb0_cocdrv_ps;
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb0_cocdrv_fss_ena(int ena)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	if (ena) {
++		pr_debug("enable frequency scaling\n");
++	} else {
++		pr_debug("disable frequency scaling\n");
++	}
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb0_cocdrv_prechange(enum ltq_cpufreq_module module,
++			enum ltq_cpufreq_state new_state,
++			enum ltq_cpufreq_state old_state,
++		        u8 flags)
++{
++	u32 value;
++	int usb3_index = 1;
++
++	/*pr_info("%s is called\n", __func__);*/
++	if (usb0_cocdrv_busy == LTQ_USB0COCDRV_IDLE) {
++		/* do what ever is necessary to prepare the drv
++		for a frequency change. */
++		if(new_state == LTQ_CPUFREQ_PS_D3) {
++			value = readl(port_array[usb3_index]);
++			if (value & PORT_CONNECT)
++				return LTQ_CPUFREQ_RETURN_DENIED;
++		}
++		return LTQ_CPUFREQ_RETURN_SUCCESS;
++	} else if (flags & CPUFREQ_PM_NO_DENY) {
++		/* this flag is set if we need thermal reduction and
++		   frequency down scaling is a must to avoid thermal problems.*/
++		return LTQ_CPUFREQ_RETURN_SUCCESS;
++	} else {
++		return LTQ_CPUFREQ_RETURN_DENIED; /*avoid scaling*/
++	}
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb0_cocdrv_statechange(enum ltq_cpufreq_state new_state)
++{
++	/*pr_info("%s is called\n",__func__);*/
++	/* do what ever is necessary to make changes in the drv
++	to support the new frequency. */
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb0_cocdrv_postchange(enum ltq_cpufreq_module module,
++			enum ltq_cpufreq_state new_state,
++			enum ltq_cpufreq_state old_state,
++			u8 flags)
++{
++	u32 value;
++	int usb2_index = 0, usb3_index = 1;
++
++	/*pr_info("%s is called\n", __func__);*/
++	/* do what ever is necessary to cleanup things in the drv
++	after a frequency change. */
++
++	if (new_state == LTQ_CPUFREQ_PS_D0) {
++		value = readl(port_array[usb3_index]);
++		if ((value & PORT_PLS_MASK) == XDEV_DISABLED) {
++			/*Power-off USB2 PORT*/
++			value = readl(port_array[usb2_index]);
++			value &= ~PORT_POWER;
++			writel(value, port_array[usb2_index]);
++
++			/*Transition USB3 PORT state to RXDETECT*/
++			value = readl(port_array[usb3_index]);
++			value &= ~PORT_PLS_MASK;
++			value |= XDEV_RXDETECT | PORT_LINK_STROBE;
++			writel(value, port_array[usb3_index]);
++
++			/*Power-on USB2 PORT*/
++			value = readl(port_array[usb2_index]);
++			value |= PORT_POWER;
++			writel(value, port_array[usb2_index]);
++		}
++	}
++	else if(new_state == LTQ_CPUFREQ_PS_D3) {
++		value = readl(port_array[usb3_index]);
++		if ((value & PORT_PLS_MASK) != XDEV_DISABLED) {
++			/*Disable USB3 PORT*/
++			value |= PORT_PE;
++			writel(value, port_array[usb3_index]);
++		}
++	}
++	usb0_cocdrv_ps = new_state;
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++/* This function should be called if the driver becomes BUSY */
++void
++ltq_usb0_cocdrv_busy(void)
++{
++	int ret = LTQ_CPUFREQ_RETURN_SUCCESS;
++
++	usb0_cocdrv_busy = LTQ_USB0COCDRV_BUSY;
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_USB, LTQ_USB_ID,
++							LTQ_CPUFREQ_PS_D0);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_debug("Power state request D0 failed");
++}
++
++/* This function should be called if the driver becomes IDLE */
++void
++ltq_usb0_cocdrv_idle(void)
++{
++	int ret = LTQ_CPUFREQ_RETURN_SUCCESS;
++
++	usb0_cocdrv_busy = LTQ_USB0COCDRV_IDLE;
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_USB, LTQ_USB_ID,
++							LTQ_CPUFREQ_PS_D0D3);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_err("Power state request D0D3 failed");
++}
++
++/* keep track of frequency transitions */
++static int
++usb0_cocdrv_cpufreq_notifier(struct notifier_block *nb, unsigned long val,
++							void *data)
++{
++	struct cpufreq_freqs *freq = data;
++	enum ltq_cpufreq_state new_state, old_state;
++	int ret;
++	pr_debug("%s is called\n", __func__);
++
++	new_state = ltq_cpufreq_get_ps_from_khz(freq->new);
++	if (new_state == LTQ_CPUFREQ_PS_UNDEF)
++		return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	old_state = ltq_cpufreq_get_ps_from_khz(freq->old);
++	if (old_state == LTQ_CPUFREQ_PS_UNDEF)
++		return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	if (val == CPUFREQ_PRECHANGE) {
++		ret = ltq_usb0_cocdrv_prechange(LTQ_CPUFREQ_MODULE_USB,
++					new_state, old_state, freq->flags);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_USB<<4);
++		ret = ltq_usb0_cocdrv_statechange(new_state);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_USB<<4);
++	} else if (val == CPUFREQ_POSTCHANGE) {
++		ret = ltq_usb0_cocdrv_postchange(LTQ_CPUFREQ_MODULE_USB,
++					new_state, old_state, freq->flags);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_USB<<4);
++	} else {
++		return NOTIFY_OK | (LTQ_CPUFREQ_MODULE_USB<<4);
++	}
++	return NOTIFY_OK | (LTQ_CPUFREQ_MODULE_USB<<4);
++}
++
++static struct notifier_block usb0_cocdrv_cpufreq_notifier_block = {
++	.notifier_call = usb0_cocdrv_cpufreq_notifier
++};
++
++static struct ltq_cpufreq_module_info usb0_cocdrv_feature_fss = {
++.name                           = "USB0 frequency scaling support",
++.pmcuModule                     = LTQ_CPUFREQ_MODULE_USB,
++.pmcuModuleNr                   = LTQ_USB_ID,
++.powerFeatureStat               = 1,
++.ltq_cpufreq_state_get          = ltq_usb0_cocdrv_stateget,
++.ltq_cpufreq_pwr_feature_switch = ltq_usb0_cocdrv_fss_ena,
++};
++
++static int
++ltq_usb0_cocdrv_cpufreq_init(void)
++{
++        int ret;
++                
++	pr_debug("%s is called\n", __func__);
++	if (cpufreq_register_notifier(&usb0_cocdrv_cpufreq_notifier_block,
++						CPUFREQ_TRANSITION_NOTIFIER)) {
++		pr_err("Fail in registering USB0_COCDRV to CPUFreq\n");
++		return -1;
++	}
++	ltq_cpufreq_mod_list(&usb0_cocdrv_feature_fss.list, LTQ_CPUFREQ_LIST_ADD);
++
++	th_data = ltq_cpufreq_get_threshold(LTQ_CPUFREQ_MODULE_USB,
++							LTQ_USB_ID);
++	if (th_data == NULL)
++		pr_debug("No PS related threshold values are defined ");
++
++
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_USB, LTQ_USB_ID,
++							LTQ_CPUFREQ_PS_D0);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_debug("Power state request D0 failed");
++
++	pr_debug("Register USB0_COCDRV to CPUFREQ.\n");
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb0_cocdrv_cpufreq_exit(void)
++{
++
++	/* set status of usb0_cocdrv inside CPUFreq to don't care */
++	ltq_usb0_cocdrv_idle();
++
++	if (cpufreq_unregister_notifier(&usb0_cocdrv_cpufreq_notifier_block,
++						CPUFREQ_TRANSITION_NOTIFIER)) {
++		pr_err("CPUFREQ unregistration failed.");
++		return -1;
++	}
++	ltq_cpufreq_mod_list(&usb0_cocdrv_feature_fss.list, LTQ_CPUFREQ_LIST_DEL);
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++__init ltq_usb0_cocdrv_init(void)
++{
++	ltq_usb0_cocdrv_cpufreq_init();
++	return 0;
++}
++
++static void
++__exit ltq_usb0_cocdrv_exit(void)
++{
++	ltq_usb0_cocdrv_cpufreq_exit();
++	return;
++}
++
++module_init(ltq_usb0_cocdrv_init);
++module_exit(ltq_usb0_cocdrv_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Thomas Bartholomae, t.bartholomae@lantiq.com");
++MODULE_DESCRIPTION("LANTIQ USB0_COCDRV driver");
++MODULE_SUPPORTED_DEVICE("LANTIQ in general ;-)");
++
+diff --git a/drivers/usb/dwc3/ltq_usb1_coc_drv.c b/drivers/usb/dwc3/ltq_usb1_coc_drv.c
+new file mode 100755
+--- /dev/null
++++ b/drivers/usb/dwc3/ltq_usb1_coc_drv.c
+@@ -0,0 +1,294 @@
++/*
++ *
++ *			 Copyright (c) 2012, 2014, 2015
++ *       		Lantiq Beteiligungs-GmbH & Co. KG
++ *
++ *  For licensing information, see the file 'LICENSE' in the root folder of
++ *  this software module.
++ */
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/timer.h>
++#include <linux/cpufreq.h>
++#include <cpufreq/ltq_cpufreq.h>
++
++#include <linux/gpio.h>
++#include <linux/delay.h>
++
++#define LTQ_USB1COCDRV_BUSY	1
++#define LTQ_USB1COCDRV_IDLE	0
++
++/* this ID represent the USB interface No. (0, 1, 2, 3, ...) */
++#define LTQ_USB_ID		1
++
++/* threshold data for D0:D3 */
++static struct ltq_cpufreq_threshold *th_data = NULL;
++
++/* driver is busy and needs highest performance */
++int usb1_cocdrv_busy = LTQ_USB1COCDRV_IDLE;
++
++/* current power state of the driver */
++enum ltq_cpufreq_state usb1_cocdrv_ps = LTQ_CPUFREQ_PS_D0;
++
++#define PORT_CONNECT  (1 << 0)
++#define PORT_PE		  (1 << 1)
++
++#define PORT_PLS_MASK (0xf << 5)
++#define XDEV_U0       (0x0 << 5)
++#define XDEV_U2       (0x2 << 5)
++#define XDEV_U3       (0x3 << 5)
++#define XDEV_DISABLED (0x4 << 5)
++#define XDEV_RXDETECT (0x5 << 5)
++
++#define PORT_POWER	  (1 << 9)
++/* Port Link State Write Strobe - set this when changing link state */
++#define PORT_LINK_STROBE	(1 << 16)
++
++static u32 __iomem *port_array[] = {0xba500420, 0xba500430};
++
++static int
++ltq_usb1_cocdrv_stateget(enum ltq_cpufreq_state *state)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	*state = usb1_cocdrv_ps;
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb1_cocdrv_fss_ena(int ena)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	if (ena) {
++		pr_debug("enable frequency scaling\n");
++	} else {
++		pr_debug("disable frequency scaling\n");
++	}
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb1_cocdrv_prechange(enum ltq_cpufreq_module module,
++			enum ltq_cpufreq_state new_state,
++			enum ltq_cpufreq_state old_state,
++		        u8 flags)
++{
++	u32 value;
++	int usb3_index = 1;
++
++	/*pr_info("%s is called\n", __func__);*/
++	if (usb1_cocdrv_busy == LTQ_USB1COCDRV_IDLE) {
++		/* do what ever is necessary to prepare the drv
++		for a frequency change. */
++		if(new_state == LTQ_CPUFREQ_PS_D3) {
++			value = readl(port_array[usb3_index]);
++			if (value & PORT_CONNECT)
++				return LTQ_CPUFREQ_RETURN_DENIED;
++		}
++		return LTQ_CPUFREQ_RETURN_SUCCESS;
++	} else if (flags & CPUFREQ_PM_NO_DENY) {
++		/* this flag is set if we need thermal reduction and
++		   frequency down scaling is a must to avoid thermal problems.*/
++		return LTQ_CPUFREQ_RETURN_SUCCESS;
++	} else {
++		if (new_state != LTQ_CPUFREQ_PS_D0)
++			return LTQ_CPUFREQ_RETURN_DENIED; /*avoid down scaling*/
++	}
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb1_cocdrv_statechange(enum ltq_cpufreq_state new_state)
++{
++	/*pr_info("%s is called\n",__func__);*/
++	/* do what ever is necessary to make changes in the drv
++	to support the new frequency. */
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb1_cocdrv_postchange(enum ltq_cpufreq_module module,
++			enum ltq_cpufreq_state new_state,
++			enum ltq_cpufreq_state old_state,
++			u8 flags)
++{
++	u32 value;
++	int usb2_index = 0, usb3_index = 1;
++
++	/*pr_info("%s is called\n", __func__);*/
++	/* do what ever is necessary to cleanup things in the drv
++	after a frequency change. */
++
++	if (new_state == LTQ_CPUFREQ_PS_D0) {
++		value = readl(port_array[usb3_index]);
++		if ((value & PORT_PLS_MASK) == XDEV_DISABLED) {
++			/*Power-off USB2 PORT*/
++			value = readl(port_array[usb2_index]);
++			value &= ~PORT_POWER;
++			writel(value, port_array[usb2_index]);
++
++			/*Transition USB3 PORT state to RXDETECT*/
++			value = readl(port_array[usb3_index]);
++			value &= ~PORT_PLS_MASK;
++			value |= XDEV_RXDETECT | PORT_LINK_STROBE;
++			writel(value, port_array[usb3_index]);
++
++			/*Power-on USB2 PORT*/
++			value = readl(port_array[usb2_index]);
++			value |= PORT_POWER;
++			writel(value, port_array[usb2_index]);
++		}
++	}
++	else if(new_state == LTQ_CPUFREQ_PS_D3) {
++		value = readl(port_array[usb3_index]);
++		if((value & PORT_PLS_MASK) != XDEV_DISABLED) {
++			/*Disable USB3 PORT*/
++			value |= PORT_PE;
++			writel(value, port_array[usb3_index]);
++		}
++	}
++
++	usb1_cocdrv_ps = new_state;
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++/* This function should be called if the driver becomes BUSY */
++void
++ltq_usb1_cocdrv_busy(void)
++{
++	int ret = LTQ_CPUFREQ_RETURN_SUCCESS;
++
++	usb1_cocdrv_busy = LTQ_USB1COCDRV_BUSY;
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_USB, LTQ_USB_ID,
++							LTQ_CPUFREQ_PS_D0);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_debug("Power state request D0 failed");
++}
++
++/* This function should be called if the driver becomes IDLE */
++void
++ltq_usb1_cocdrv_idle(void)
++{
++	int ret = LTQ_CPUFREQ_RETURN_SUCCESS;
++
++	usb1_cocdrv_busy = LTQ_USB1COCDRV_IDLE;
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_USB, LTQ_USB_ID,
++							LTQ_CPUFREQ_PS_D0D3);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_err("Power state request D0D3 failed");
++}
++
++/* keep track of frequency transitions */
++static int
++usb1_cocdrv_cpufreq_notifier(struct notifier_block *nb, unsigned long val,
++							void *data)
++{
++	struct cpufreq_freqs *freq = data;
++	enum ltq_cpufreq_state new_state, old_state;
++	int ret;
++	pr_debug("%s is called\n", __func__);
++
++	new_state = ltq_cpufreq_get_ps_from_khz(freq->new);
++	if (new_state == LTQ_CPUFREQ_PS_UNDEF)
++		return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	old_state = ltq_cpufreq_get_ps_from_khz(freq->old);
++	if (old_state == LTQ_CPUFREQ_PS_UNDEF)
++		return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	if (val == CPUFREQ_PRECHANGE) {
++		ret = ltq_usb1_cocdrv_prechange(LTQ_CPUFREQ_MODULE_USB,
++					new_state, old_state, freq->flags);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_USB<<4);
++		ret = ltq_usb1_cocdrv_statechange(new_state);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_USB<<4);
++	} else if (val == CPUFREQ_POSTCHANGE) {
++		ret = ltq_usb1_cocdrv_postchange(LTQ_CPUFREQ_MODULE_USB,
++					new_state, old_state, freq->flags);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_USB<<4);
++	} else {
++		return NOTIFY_OK | (LTQ_CPUFREQ_MODULE_USB<<4);
++	}
++	return NOTIFY_OK | (LTQ_CPUFREQ_MODULE_USB<<4);
++}
++
++static struct notifier_block usb1_cocdrv_cpufreq_notifier_block = {
++	.notifier_call = usb1_cocdrv_cpufreq_notifier
++};
++
++static struct ltq_cpufreq_module_info usb1_cocdrv_feature_fss = {
++.name                           = "USB1 frequency scaling support",
++.pmcuModule                     = LTQ_CPUFREQ_MODULE_USB,
++.pmcuModuleNr                   = LTQ_USB_ID,
++.powerFeatureStat               = 1,
++.ltq_cpufreq_state_get          = ltq_usb1_cocdrv_stateget,
++.ltq_cpufreq_pwr_feature_switch = ltq_usb1_cocdrv_fss_ena,
++};
++
++static int
++ltq_usb1_cocdrv_cpufreq_init(void)
++{
++        int ret;
++                
++	pr_debug("%s is called\n", __func__);
++	if (cpufreq_register_notifier(&usb1_cocdrv_cpufreq_notifier_block,
++						CPUFREQ_TRANSITION_NOTIFIER)) {
++		pr_err("Fail in registering USB1_COCDRV to CPUFreq\n");
++		return -1;
++	}
++	ltq_cpufreq_mod_list(&usb1_cocdrv_feature_fss.list, LTQ_CPUFREQ_LIST_ADD);
++
++	th_data = ltq_cpufreq_get_threshold(LTQ_CPUFREQ_MODULE_USB,
++							LTQ_USB_ID);
++	if (th_data == NULL)
++		pr_debug("No PS related threshold values are defined ");
++
++
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_USB, LTQ_USB_ID,
++							LTQ_CPUFREQ_PS_D0);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_debug("Power state request D0 failed");
++
++	pr_debug("Register USB1_COCDRV to CPUFREQ.\n");
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_usb1_cocdrv_cpufreq_exit(void)
++{
++
++	/* set status of usb1_cocdrv inside CPUFreq to don't care */
++	ltq_usb1_cocdrv_idle();
++
++	if (cpufreq_unregister_notifier(&usb1_cocdrv_cpufreq_notifier_block,
++						CPUFREQ_TRANSITION_NOTIFIER)) {
++		pr_err("CPUFREQ unregistration failed.");
++		return -1;
++	}
++	ltq_cpufreq_mod_list(&usb1_cocdrv_feature_fss.list, LTQ_CPUFREQ_LIST_DEL);
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++__init ltq_usb1_cocdrv_init(void)
++{
++	ltq_usb1_cocdrv_cpufreq_init();
++	return 0;
++}
++
++static void
++__exit ltq_usb1_cocdrv_exit(void)
++{
++	ltq_usb1_cocdrv_cpufreq_exit();
++	return;
++}
++
++module_init(ltq_usb1_cocdrv_init);
++module_exit(ltq_usb1_cocdrv_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Thomas Bartholomae, t.bartholomae@lantiq.com");
++MODULE_DESCRIPTION("LANTIQ USB1_COCDRV driver");
++MODULE_SUPPORTED_DEVICE("LANTIQ in general ;-)");
++
+diff --git a/drivers/usb/host/xhci-plat.c b/drivers/usb/host/xhci-plat.c
+old mode 100644
+new mode 100755
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@ -14,6 +14,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/dma-mapping.h>
+ 
+ #include "xhci.h"
+ 
+@@ -104,6 +105,15 @@ static int xhci_plat_probe(struct platfo
+ 	if (!res)
+ 		return -ENODEV;
+ 
++	/* Initialize dma_mask and coherent_dma_mask to 32-bits */
++	ret = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++	if (!pdev->dev.dma_mask)
++		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
++	else
++		dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
++
+ 	hcd = usb_create_hcd(driver, &pdev->dev, dev_name(&pdev->dev));
+ 	if (!hcd)
+ 		return -ENOMEM;
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+old mode 100644
+new mode 100755
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -319,6 +319,9 @@ static void xhci_cleanup_msix(struct xhc
+ 	if (xhci->quirks & XHCI_PLAT)
+ 		return;
+ 
++	if (xhci->quirks & XHCI_PLAT)
++		return;
++
+ 	xhci_free_irq(xhci);
+ 
+ 	if (xhci->msix_entries) {
+@@ -4724,14 +4727,17 @@ int xhci_gen_setup(struct usb_hcd *hcd, 
+ 		/* xHCI private pointer was set in xhci_pci_probe for the second
+ 		 * registered roothub.
+ 		 */
++		/*
+ 		xhci = hcd_to_xhci(hcd);
+ 		temp = xhci_readl(xhci, &xhci->cap_regs->hcc_params);
+ 		if (HCC_64BIT_ADDR(temp)) {
+ 			xhci_dbg(xhci, "Enabling 64-bit DMA addresses.\n");
+-			dma_set_mask(hcd->self.controller, DMA_BIT_MASK(64));
++			ret = dma_set_mask(hcd->self.controller, DMA_BIT_MASK(64));
+ 		} else {
+-			dma_set_mask(hcd->self.controller, DMA_BIT_MASK(32));
++			ret = dma_set_mask(hcd->self.controller, DMA_BIT_MASK(32));
+ 		}
++		hcd->self.uses_dma = 1;
++		*/
+ 		return 0;
+ 	}
+ 
+diff --git a/drivers/usb/phy/Kconfig b/drivers/usb/phy/Kconfig
+old mode 100644
+new mode 100755
+--- a/drivers/usb/phy/Kconfig
++++ b/drivers/usb/phy/Kconfig
+@@ -210,4 +210,9 @@ config USB_ULPI_VIEWPORT
+ 	  Provides read/write operations to the ULPI phy register set for
+ 	  controllers with a viewport register (e.g. Chipidea/ARC controllers).
+ 
++config LTQ_DWC3_PHY
++        tristate "Lantiq DWC3 PHY support"
++        help
++          Enable this to support the Lantiq DWC3 PHY.
++
+ endif # USB_PHY
+diff --git a/drivers/usb/phy/Makefile b/drivers/usb/phy/Makefile
+old mode 100644
+new mode 100755
+--- a/drivers/usb/phy/Makefile
++++ b/drivers/usb/phy/Makefile
+@@ -31,3 +31,4 @@ obj-$(CONFIG_USB_MXS_PHY)		+= phy-mxs-us
+ obj-$(CONFIG_USB_RCAR_PHY)		+= phy-rcar-usb.o
+ obj-$(CONFIG_USB_ULPI)			+= phy-ulpi.o
+ obj-$(CONFIG_USB_ULPI_VIEWPORT)		+= phy-ulpi-viewport.o
++obj-$(CONFIG_LTQ_DWC3_PHY)		+= phy-ltq-dwc3.o
+diff --git a/drivers/usb/phy/phy-ltq-dwc3.c b/drivers/usb/phy/phy-ltq-dwc3.c
+new file mode 100755
+--- /dev/null
++++ b/drivers/usb/phy/phy-ltq-dwc3.c
+@@ -0,0 +1,126 @@
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/dma-mapping.h>
++#include <linux/usb/otg.h>
++#include <linux/slab.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++
++#define LANE0_TX_OVRD_IN_LO 0x4000
++#define LANE0_RX_OVRD_IN_LO 0x4014
++
++#define DWC3_PHY_TX_INVERT_OVRD (1<<3)
++#define DWC3_PHY_RX_INVERT_OVRD (1<<1)
++
++struct ltq_dwc3_phy {
++
++	struct usb_phy	phy;
++	spinlock_t		lock;
++	struct device	*dev;
++	void __iomem	*base;
++	bool is_tx_pol_inv;
++	bool is_rx_pol_inv;
++		
++};
++
++static inline void ltq_dwc3_writel(void __iomem *base, u32 offset, u32 value)
++{
++	writel(value, base + offset);
++}
++
++static int ltq_dwc3_phy_init(struct usb_phy *phy)
++{
++	struct ltq_dwc3_phy *dwc3_phy = dev_get_drvdata(phy->dev);
++	u32 reg;
++
++	if (dwc3_phy->is_tx_pol_inv) {
++		reg = readl(dwc3_phy->base + LANE0_TX_OVRD_IN_LO);
++		reg |= DWC3_PHY_TX_INVERT_OVRD;
++		ltq_dwc3_writel(dwc3_phy->base, LANE0_TX_OVRD_IN_LO, reg);
++	}
++	if (dwc3_phy->is_rx_pol_inv) {
++		reg = readl(dwc3_phy->base + LANE0_RX_OVRD_IN_LO);
++		reg |= DWC3_PHY_RX_INVERT_OVRD;;
++		ltq_dwc3_writel(dwc3_phy->base, LANE0_RX_OVRD_IN_LO, reg);
++	}
++
++	return 0;
++}
++
++static void ltq_dwc3_phy_shutdown(struct usb_phy *phy)
++{
++	/*struct ltq_dwc3_phy *dwc3_phy = dev_get_drvdata(phy->dev);*/
++}
++
++static int ltq_dwc3_phy_probe(struct platform_device *pdev)
++{
++	struct ltq_dwc3_phy *dwc3_phy;
++	struct device *dev = &pdev->dev;
++	struct resource		*res;
++	void __iomem		*base;
++
++	dwc3_phy = devm_kzalloc(dev, sizeof(*dwc3_phy), GFP_KERNEL);
++	if (!dwc3_phy)
++		return -ENOMEM;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(dev, "missing memory base resource\n");
++		return -EINVAL;
++	}
++
++	base = devm_ioremap_nocache(dev, res->start, resource_size(res));
++	if (!base) {
++		dev_err(dev, "devm_ioremap_nocache failed\n");
++		return -ENOMEM;
++	}
++
++	dwc3_phy->is_rx_pol_inv = of_property_read_bool(dev->of_node, "invert-rx-polarity");
++	dwc3_phy->is_tx_pol_inv = of_property_read_bool(dev->of_node, "invert-tx-polarity");
++	dwc3_phy->base = base;
++	dwc3_phy->dev = dev;
++
++	dwc3_phy->phy.dev = dev;
++	dwc3_phy->phy.label = "ltq-dwc3-phy";
++	dwc3_phy->phy.init = ltq_dwc3_phy_init;
++	dwc3_phy->phy.shutdown = ltq_dwc3_phy_shutdown;
++	dwc3_phy->phy.type = USB_PHY_TYPE_USB3;
++
++	spin_lock_init(&dwc3_phy->lock);
++	platform_set_drvdata(pdev, dwc3_phy);
++	usb_add_phy_dev(&dwc3_phy->phy);
++
++	return 0;
++}
++
++static int ltq_dwc3_phy_remove(struct platform_device *pdev)
++{
++	struct ltq_dwc3_phy *dwc3_phy = platform_get_drvdata(pdev);
++
++	usb_remove_phy(&dwc3_phy->phy);
++	return 0;
++}
++
++#ifdef CONFIG_OF
++static const struct of_device_id of_ltq_dwc3_phy_match[] = {
++	{
++		.compatible = "lantiq,dwc3-phy"
++	},
++	{ },
++};
++MODULE_DEVICE_TABLE(of, of_ltq_dwc3_phy_match);
++#endif
++
++static struct platform_driver ltq_dwc3_phy_driver = {
++	.probe          = ltq_dwc3_phy_probe,
++	.remove         = ltq_dwc3_phy_remove,
++	.driver         = {
++		.name   = "ltq-dwc3-phy",
++		.owner  = THIS_MODULE,
++		.pm = NULL,
++		.of_match_table	= of_match_ptr(of_ltq_dwc3_phy_match),
++	},
++};
++
++module_platform_driver(ltq_dwc3_phy_driver);
++MODULE_LICENSE("GPL v2");

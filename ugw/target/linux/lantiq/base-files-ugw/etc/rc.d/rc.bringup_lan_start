@@ -1,0 +1,321 @@
+#!/bin/sh
+# 000001:tc.chen 2005/06/07 add 802.1p and ip ptos support. rewrite all of the qos scirpts
+#509143:linmars remove unnecessary script
+#060906:sharontseng add to support Atheros driver into bridge mode.
+
+echo "Env $ENVLOADED" > /dev/null
+if [ ! "$ENVLOADED" ]; then
+	if [ -r /etc/rc.conf ]; then
+		 . /etc/rc.conf 2> /dev/null
+		ENVLOADED="1"
+	fi
+fi
+
+if [ ! "$CONFIGLOADED" ]; then
+	if [ -r /etc/rc.d/config.sh ]; then
+		. /etc/rc.d/config.sh 2>/dev/null
+		CONFIGLOADED="1"
+	fi
+fi
+
+platform=${CONFIG_IFX_MODEL_NAME%%_*}
+if [ "$platform" = "DANUBE" -o "$platform" = "AMAZON" -o "$platform" = "TP-VE" -o "$platform" = "GW188" ]; then
+	target=$platform
+else
+	target=`echo $platform | cut -c -4`
+fi
+
+	
+#if [ -r /etc/rc.d/model_config.sh ]; then
+#	. /etc/rc.d/model_config.sh 2>/dev/null
+#fi
+
+#start(){
+#509143:linmars
+#	if  [ "$CONFIG_FEATURE_VLAN" = "1" ]; then
+#		/etc/rc.d/init.d/vlan start
+#	fi
+
+	echo "UTC0" > /etc/TZ
+if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" ]; then
+	# store board mac address
+	/usr/sbin/status_oper SET dev_info mac_addr "`/usr/sbin/upgrade mac_get 0`"
+	[ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth1 down
+	[ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth1 hw ether `/usr/sbin/upgrade mac_get 0`
+	[ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth1 0.0.0.0 up
+elif [ -n "$CONFIG_TARGET_LANTIQ_XRX500" ]; then
+	/usr/sbin/status_oper SET dev_info mac_addr "`/usr/sbin/upgrade mac_get 0`"
+	[ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth0_1 down
+        [ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth0_1 hw ether `/usr/sbin/upgrade mac_get 0`
+        [ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth0_1 0.0.0.0 up	
+
+	ifconfig eth1 down
+        ifconfig eth1 hw ether 00:20:DA:86:23:75
+        ifconfig eth1 0.0.0.0 up
+else
+        # store board mac address
+        /usr/sbin/status_oper SET dev_info mac_addr "`/usr/sbin/upgrade	mac_get 0`"
+        [ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth0 down
+        [ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth0	hw ether `/usr/sbin/upgrade mac_get 0`
+        [ `mount|grep -q nfs;echo $?` -eq  0 ] || ifconfig eth0 0.0.0.0 up
+
+fi
+
+	eval g_wan_phy_mode='$'wanphy_phymode
+	eval g_wan_tc_mode='$'wanphy_tc
+	
+	if [ "$g_wan_phy_mode" = "0" -a "$g_wan_tc_mode" = "0" ]; then # ADSL and ATM
+		startFlag=1
+	elif [ "$g_wan_phy_mode" = "0" -o "$g_wan_phy_mode" = "3" ]; then # ADSL/VDSL and PTM
+		if [ "$g_wan_tc_mode" = "1" ]; then # ADSL/VDSL and PTM
+			startFlag=1
+		fi
+	elif [ "$g_wan_phy_mode" = "2" ]; then # Eth on MII1
+		startFlag=1
+	fi
+	
+	if [ -n "$startFlag" -a "$startFlag" = "1" ]; then
+		if [ "$STP_Bridge_ENABLE" = "1" ]; then
+			/usr/sbin/brctl stp br0 on
+		else
+			/usr/sbin/brctl stp br0 off
+		fi
+	fi
+
+	if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -o -n "$CONFIG_TARGET_LANTIQ_VBG500_VBG500" ]; then
+		# EPHY configuration
+		i=0
+		while [ $i -lt $eth_phy_if_Count ]
+		do
+			eval ephyIfName='$'ephy_${i}_ifName
+			eval ephyFlowCtrl='$'ephy_${i}_flowCntrl
+			if [ "$ephyFlowCtrl" = "1" ]; then #enable flow control
+				/usr/sbin/ethtool -A $ephyIfName autoneg on rx on tx on
+			else
+				/usr/sbin/ethtool -A $ephyIfName rx off tx off
+			fi
+
+			eval ephySpeed='$'ephy_${i}_speed
+			if [ "$ephySpeed" = "2" ]; then #advertise PHY rate 1GBit
+				/usr/sbin/ethtool -s $ephyIfName advertise 0x3f
+			elif [ "$ephySpeed" = "1" ]; then #advertise PHY rate 100MBit
+				/usr/sbin/ethtool -s $ephyIfName advertise 0xf
+			else
+				/usr/sbin/ethtool -s $ephyIfName advertise 0xf
+			fi
+
+			i=$(( $i + 1 ))
+		done
+	elif [ -n "$CONFIG_TARGET_LANTIQ_XRX500" ]; then
+	#for grx500 no need to do call the ltq_switch_config.sh do_switch_config
+		echo 	
+	else
+	# Disable execution of this script if NFS is enabled
+		cat /proc/mounts | grep nfs > /dev/null
+		if [ $? = 1 ]; then	
+			#NFS is disabled
+			. /etc/init.d/ltq_switch_config.sh do_switch_config
+		fi
+	fi		
+
+	i=0
+	while [ $i -lt $lan_main_Count ]
+	do
+	   eval fenable='$'lan_main_${i}_fEnable
+	   if [ "$fenable" = "1" ]; then
+		if [ -n "$CONFIG_PACKAGE_AVAHI_AUTOIPD" -a "$CONFIG_PACKAGE_AVAHI_AUTOIPD" = "1" ]; then
+			# start avahi-autoipd to assign zeroconf ip
+			if [ -f /etc/avahi/avahi-autoipd.action ]; then
+				. /etc/rc.d/init.d/avahi-autoipd start $i
+			fi
+		fi
+		eval addr_type='$'lan_main_${i}_ipAddrType
+		if [ "$addr_type" = "2" ]; then
+			eval ip='$'lan_main_${i}_ipAddr
+			eval netmask='$'lan_main_${i}_netmask
+			eval iface='$'lan_main_${i}_interface
+			if [ "$iface" = "br0" ]; then
+				/sbin/ifconfig $iface $ip netmask $netmask up
+				/usr/sbin/status_oper SET Lan1_IF_Info STATUS "UP" IP "$ip" MASK "$netmask"
+			elif [ "$iface" = "br0:1" ]; then
+				eval global_subnet='$'lan_main_${i}_VIPEnable
+				if [ "$global_subnet" = "1" ]; then
+					/sbin/ifconfig $iface $ip netmask $netmask up
+					/usr/sbin/iptables -t nat -I POSTROUTING --source $ip/$netmask -j RETURN 2>/dev/null
+				fi
+			fi
+			if [ -n "$CONFIG_FEATURE_LTQ_HNX_CONFIG" -a "$CONFIG_FEATURE_LTQ_HNX_CONFIG" = "1" -o -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" = "1" ]; then
+				eval gw='$'lan_main_${i}_gw
+				eval domain=${hostname#*.}
+				eval dnsserver='$'lan_main_${i}_DNSServers
+				eval dnsserver1=${dnsserver%,*}
+				eval dnsserver2=${dnsserver##*,}
+				# add default route with gateway
+				if [ "$gw" != "0.0.0.0" -a "$gw" != "$ip" ]; then
+					/sbin/route add default gw $gw
+				fi
+				# set dnsservers in /etc/resolv.conf
+				echo -n > /etc/resolv.conf
+				if [ "$domain" != "" ]; then
+					echo "domain $domain" >> /etc/resolv.conf
+					echo "search $domain" >> /etc/resolv.conf
+				fi
+				if [ "$dnsserver1" != "0.0.0.0" -a "$dnsserver1" != "$ip" ]; then
+					echo "nameserver $dnsserver1" >> /etc/resolv.conf
+				fi
+				if [ "$dnsserver2" != "0.0.0.0" -a "$dnsserver2" != "$ip" -a "$dnsserver2" != "$dnsserver1" ]; then
+					echo "nameserver $dnsserver2" >> /etc/resolv.conf
+				fi
+			fi
+			if [ "$ipv6_status" = "1" ]; then #bootup run ipv6 related stuff
+				. /etc/rc.d/rc.bringup_lan v6start
+			fi
+		elif [ -f /etc/rc.d/udhcpc_lan.script -a "$addr_type" = "1" ]; then
+			. /etc/rc.d/init.d/udhcpc lan_start $i
+		fi
+	   fi
+		i=$(( $i + 1 ))
+	done
+
+	# Video Bridge Auto-Detection of AP/STA mode
+	if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" ]; then
+		if [ "$gbc_mode" = "2" ]; then
+			if [ "$addr_type" = "1" ]; then # dynamic IP
+				echo timer > /sys/class/leds/apmode:green/trigger
+				echo 100 > /sys/class/leds/apmode:green/delay_off
+				echo 100 > /sys/class/leds/apmode:green/delay_on
+				/usr/sbin/status_oper SET global_bridge_config bridge_status "UNCONFIGURED"
+			elif [ "$addr_type" = "2" ]; then # static IP
+				# Force STA mode, as auto-detection is only working in DHCP client mode.
+				/usr/sbin/status_oper -u -f /flash/rc.conf SET gen_bd_cfg gbc_mode "0"
+#				/usr/sbin/status_oper SET global_bridge_config bridge_status "CONFIGURED" bridge_mode "STA"
+			fi
+		fi
+	fi
+
+	# Setup Static Route
+	. /etc/rc.d/rc.bringup_staticRoutes
+
+	if [ -f /usr/sbin/naptcfg ]; then
+		i=0
+		while [ $i -lt $lan_main_Count ]
+		do
+		   eval fenable='$'lan_main_${i}_fEnable
+		   if [ "$fenable" = "1" ]; then
+			eval iface='$'lan_main_${i}_interface
+			if [ "$iface" = "br0" ]; then
+				/usr/sbin/naptcfg --ADDLAN $iface
+		 		/usr/sbin/naptcfg --Servicesinit
+			fi
+		   fi
+			i=$(( $i + 1 ))
+		done
+
+	fi
+
+	# Start DHCP Server
+	if  [ "$CONFIG_FEATURE_DHCP_SERVER" = "1" ]; then
+		i=0
+		while [ $i -lt $lan_main_Count ]
+		do
+		    eval fenable='$'lan_main_${i}_fEnable
+		    if [ "$fenable" = "1" ]; then
+			eval dhcp_mode='$'lan_main_${i}_dhcpMode
+			eval dhcp_enable='$'lan_dhcps_dhcpMode
+			if [ "$dhcp_mode" = "server" -o  "$dhcp_mode" = "relay" -a "$dhcp_enable" = "1" ]; then
+				#echo "configuring dhcpd !!"
+				# Fix: SMS00449773
+				#if [ -f /etc/udhcpd.conf ]; then
+				/etc/rc.d/init.d/udhcpd start > /dev/null
+				#fi
+			fi
+		    fi
+			i=$(( $i + 1 ))
+		done
+	fi
+
+	# Start Avahi Daemon
+	if [ -n "$CONFIG_PACKAGE_AVAHI_DAEMON" -a "$CONFIG_PACKAGE_AVAHI_DAEMON" = "1" ]; then
+		. /etc/rc.d/init.d/avahi-daemon start > /dev/null
+	fi
+
+	if [ -f /etc/rc.d/udhcpc_lan.script -a "$addr_type" = "1" ]; then
+		if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" ]; then
+			IP=`/sbin/ifconfig br0 | grep inet`
+			if [ -z "$IP" ]; then
+				# as a backdoor assign fixed IP address
+				/sbin/ifconfig br0:backdoor 192.168.1.227 netmask 255.255.255.0
+			fi
+		fi
+	fi
+
+	#i=0
+	#while [ $i -lt $lan_main_Count ]
+	#do
+	#	eval dhcp_mode='$'lan_main_${i}_dhcpMode
+	#	if [ "$dhcp_mode" = "relay" ]; then
+	#		eval relay_ip='$'lan_dhcp_relay_server
+	#		eval relay_iface='$'lan_dhcp_relay_serverIf
+	#		eval lan_iface='$'lan_main_${i}_interface
+	#		echo "configuring dhcp relay !!"
+	#		if [ -z $relay_iface ]; then
+	#			eval def_iface='$'default_wan_conn_iface
+	#			/sbin/udhcpr -i $lan_iface -s $relay_ip:$def_iface > /dev/null & 
+	#		else
+	#			/sbin/udhcpr -i $lan_iface -s $relay_ip:$relay_iface > /dev/null & 
+	#		fi
+	#	fi
+	#	i=$(( $i + 1 ))
+	#done
+
+
+#if  [ "1$CONFIG_FEATURE_IFX_MULTICASE_UPGRADE" = "1" ]; then
+#805291:<IFTW-Henry>:Add 
+#eval upgrading_ip='$'lan_main_0_ipAddr
+#killall -9 multicase_upgrade 2>/dev/null
+#sleep 1
+#multicase_upgrade $upgrading_ip &
+#fi
+	# PPA 
+	if [ "A$CONFIG_FEATURE_PPA_SUPPORT" = "A1" ]; then
+		. /etc/rc.d/get_lan_if
+	eval fenable='$'lan_main_0_fEnable
+	if [ "$fenable" = "1" ]; then
+		/etc/rc.d/ppa_config.sh addlan $LAN_IFNAME
+	fi
+		if [ "$g_wan_phy_mode" = "1" ]; then # Eth on MII0
+#			/etc/rc.d/ppa_config.sh addlan eth0.$lan_vid_all
+			/etc/rc.d/ppa_config.sh addlan eth0.501 #hardcoding because lan_vid_all is not available in this script
+		else
+			if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" ]; then
+				/etc/rc.d/ppa_config.sh addlan eth1
+			elif [ -n "$CONFIG_PACKAGE_KMOD_LANTIQ_PPA_GRX500" ]; then
+				ifconfig br0 down
+				/etc/rc.d/ppa_config.sh addlan eth0_1
+				/etc/rc.d/ppa_config.sh addlan eth0_2
+				/etc/rc.d/ppa_config.sh addlan eth0_3
+				/etc/rc.d/ppa_config.sh addlan eth0_4
+				ifconfig br0 up
+			else
+				/etc/rc.d/ppa_config.sh addlan eth0
+			fi
+		fi
+	fi
+
+#fix for br0 down/up above
+if [ -n "$CONFIG_PACKAGE_KMOD_LANTIQ_PPA_GRX500" -a "$ipv6_status" = "1" ]; then
+	/etc/rc.d/rc.bringup_lan v6restart
+fi
+
+# Re-Start Media Server if enabled and running.
+if [ "$ms_0_ena" = "1" ]; then
+	if [ -f /var/run/minidlna.pid ]; then
+		/etc/init.d/ltq_mediaserver_ctl.sh restart && >&- || >&-
+	fi
+fi
+
+# Re-Start Samba Server if enabled and running.
+if [ "$smb_ena" -eq 1 ]; then
+	/etc/init.d/samba restart & >&- || >&-
+fi
+

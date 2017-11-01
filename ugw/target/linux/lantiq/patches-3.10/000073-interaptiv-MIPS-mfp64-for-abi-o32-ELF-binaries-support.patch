@@ -1,0 +1,1065 @@
+From 6442e3516c84e13d1134e455f2f07bc3aab299d2 Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Thu, 12 Sep 2013 13:24:33 -0500
+Subject: [PATCH 073/105] MIPS:  -mfp64 for abi=o32 ELF binaries support.
+
+CP0_Status.FR bit allows 32reg*64bit FPU and gcc -mfp64
+gives that capability for o32 ABI (n32 has is by design).
+This patch allows mix of 32x32 with 32x64 modes in kernel.
+It is controlled by 0x200 ELF flag in o32 ABI execs header.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+---
+ arch/mips/Kconfig                   |   10 +++
+ arch/mips/include/asm/asmmacro-32.h |  120 ++++++++++++++++++++++++++++++++++-
+ arch/mips/include/asm/asmmacro-64.h |    4 +-
+ arch/mips/include/asm/compat.h      |    6 ++
+ arch/mips/include/asm/elf.h         |   45 ++++++++++++-
+ arch/mips/include/asm/fpu.h         |   88 ++++++++++++++++----------
+ arch/mips/include/asm/mipsregs.h    |    1 +
+ arch/mips/kernel/process.c          |    3 -
+ arch/mips/kernel/r4k_fpu.S          |  115 +++++++++++++++++++++++++++++++++-
+ arch/mips/kernel/r4k_switch.S       |  101 +++++++++++++++++++++++++++---
+ arch/mips/kernel/signal.c           |   10 ++-
+ arch/mips/kernel/signal32.c         |   32 ++++++++-
+ arch/mips/kernel/traps.c            |   22 +++++--
+ arch/mips/math-emu/cp1emu.c         |    6 --
+ arch/mips/math-emu/kernel_linkage.c |   25 +++++++-
+ fs/binfmt_elf.c                     |    2 +
+ include/linux/elf.h                 |    4 +
+ 17 files changed, 517 insertions(+), 77 deletions(-)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index b537fb1..27c154f 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -1958,6 +1958,16 @@ config MIPS_MT_FPAFF
+ 	default y
+ 	depends on MIPS_MT_SMP || MIPS_MT_SMTC
+ 
++config MIPS_INCOMPATIBLE_FPU_EMULATION
++	bool "Emulation of incompatible FPU"
++	default n
++	depends on !CPU_MIPS32_R2 && !CPU_MIPS64_R1 && !CPU_MIPS64_R2
++	help
++	  Emulation of 32x32bit or 32x64bit FPU ELFs on incompatible FPU.
++	  CP0_Status.FR bit controls switch between both models but
++	  some CPU may not have this capability.
++	  If unsure, leave N here.
++
+ config MIPS_VPE_LOADER
+ 	bool "VPE loader support."
+ 	depends on SYS_SUPPORTS_MULTITHREADING && MODULES
+diff --git a/arch/mips/include/asm/asmmacro-32.h b/arch/mips/include/asm/asmmacro-32.h
+index 2413afe..c0d49e6 100644
+--- a/arch/mips/include/asm/asmmacro-32.h
++++ b/arch/mips/include/asm/asmmacro-32.h
+@@ -12,7 +12,123 @@
+ #include <asm/fpregdef.h>
+ #include <asm/mipsregs.h>
+ 
+-	.macro	fpu_save_double thread status tmp1=t0
++#ifdef CONFIG_CPU_MIPS32_R2
++
++	/* copy stuff from MIPS64 */
++
++	.macro  fpu_save_16even thread tmp=t0
++	cfc1    \tmp, fcr31
++	sdc1    $f0,  THREAD_FPR0(\thread)
++	sdc1    $f2,  THREAD_FPR2(\thread)
++	sdc1    $f4,  THREAD_FPR4(\thread)
++	sdc1    $f6,  THREAD_FPR6(\thread)
++	sdc1    $f8,  THREAD_FPR8(\thread)
++	sdc1    $f10, THREAD_FPR10(\thread)
++	sdc1    $f12, THREAD_FPR12(\thread)
++	sdc1    $f14, THREAD_FPR14(\thread)
++	sdc1    $f16, THREAD_FPR16(\thread)
++	sdc1    $f18, THREAD_FPR18(\thread)
++	sdc1    $f20, THREAD_FPR20(\thread)
++	sdc1    $f22, THREAD_FPR22(\thread)
++	sdc1    $f24, THREAD_FPR24(\thread)
++	sdc1    $f26, THREAD_FPR26(\thread)
++	sdc1    $f28, THREAD_FPR28(\thread)
++	sdc1    $f30, THREAD_FPR30(\thread)
++	sw  \tmp, THREAD_FCR31(\thread)
++	.endm
++
++	.macro  fpu_save_16odd thread
++	.set    push
++	.set    mips64r2
++	sdc1    $f1,  THREAD_FPR1(\thread)
++	sdc1    $f3,  THREAD_FPR3(\thread)
++	sdc1    $f5,  THREAD_FPR5(\thread)
++	sdc1    $f7,  THREAD_FPR7(\thread)
++	sdc1    $f9,  THREAD_FPR9(\thread)
++	sdc1    $f11, THREAD_FPR11(\thread)
++	sdc1    $f13, THREAD_FPR13(\thread)
++	sdc1    $f15, THREAD_FPR15(\thread)
++	sdc1    $f17, THREAD_FPR17(\thread)
++	sdc1    $f19, THREAD_FPR19(\thread)
++	sdc1    $f21, THREAD_FPR21(\thread)
++	sdc1    $f23, THREAD_FPR23(\thread)
++	sdc1    $f25, THREAD_FPR25(\thread)
++	sdc1    $f27, THREAD_FPR27(\thread)
++	sdc1    $f29, THREAD_FPR29(\thread)
++	sdc1    $f31, THREAD_FPR31(\thread)
++	.set    pop
++	.endm
++
++	.macro  fpu_save_double thread status tmp
++	.set    push
++	.set    noreorder
++	sll     \tmp, \status, 31 - _ST0_FR
++	bgez    \tmp, 2f
++	 nop
++	fpu_save_16odd \thread
++2:
++	fpu_save_16even \thread \tmp
++	.set    pop
++	.endm
++
++	.macro  fpu_restore_16even thread tmp=t0
++	lw  \tmp, THREAD_FCR31(\thread)
++	ldc1    $f0,  THREAD_FPR0(\thread)
++	ldc1    $f2,  THREAD_FPR2(\thread)
++	ldc1    $f4,  THREAD_FPR4(\thread)
++	ldc1    $f6,  THREAD_FPR6(\thread)
++	ldc1    $f8,  THREAD_FPR8(\thread)
++	ldc1    $f10, THREAD_FPR10(\thread)
++	ldc1    $f12, THREAD_FPR12(\thread)
++	ldc1    $f14, THREAD_FPR14(\thread)
++	ldc1    $f16, THREAD_FPR16(\thread)
++	ldc1    $f18, THREAD_FPR18(\thread)
++	ldc1    $f20, THREAD_FPR20(\thread)
++	ldc1    $f22, THREAD_FPR22(\thread)
++	ldc1    $f24, THREAD_FPR24(\thread)
++	ldc1    $f26, THREAD_FPR26(\thread)
++	ldc1    $f28, THREAD_FPR28(\thread)
++	ldc1    $f30, THREAD_FPR30(\thread)
++	ctc1    \tmp, fcr31
++	.endm
++
++	.macro  fpu_restore_16odd thread
++	.set    push
++	.set    mips64r2
++	ldc1    $f1,  THREAD_FPR1(\thread)
++	ldc1    $f3,  THREAD_FPR3(\thread)
++	ldc1    $f5,  THREAD_FPR5(\thread)
++	ldc1    $f7,  THREAD_FPR7(\thread)
++	ldc1    $f9,  THREAD_FPR9(\thread)
++	ldc1    $f11, THREAD_FPR11(\thread)
++	ldc1    $f13, THREAD_FPR13(\thread)
++	ldc1    $f15, THREAD_FPR15(\thread)
++	ldc1    $f17, THREAD_FPR17(\thread)
++	ldc1    $f19, THREAD_FPR19(\thread)
++	ldc1    $f21, THREAD_FPR21(\thread)
++	ldc1    $f23, THREAD_FPR23(\thread)
++	ldc1    $f25, THREAD_FPR25(\thread)
++	ldc1    $f27, THREAD_FPR27(\thread)
++	ldc1    $f29, THREAD_FPR29(\thread)
++	ldc1    $f31, THREAD_FPR31(\thread)
++	.set    pop
++	.endm
++
++	.macro  fpu_restore_double thread status tmp
++	.set    push
++	.set    noreorder
++	sll     \tmp, \status, 31 - _ST0_FR
++	bgez    \tmp, 1f                # 16 register mode?
++	 nop
++
++	fpu_restore_16odd \thread
++1:      fpu_restore_16even \thread \tmp
++	.set    pop
++	.endm
++
++#else
++
++	.macro  fpu_save_double thread status tmp1=t0
+ 	cfc1	\tmp1,  fcr31
+ 	sdc1	$f0,  THREAD_FPR0(\thread)
+ 	sdc1	$f2,  THREAD_FPR2(\thread)
+@@ -128,6 +244,8 @@
+ 	ctc1	\tmp, fcr31
+ 	.endm
+ 
++#endif  // CONFIG_CPU_MIPS32_R2
++
+ 	.macro	cpu_save_nonscratch thread
+ 	LONG_S	s0, THREAD_REG16(\thread)
+ 	LONG_S	s1, THREAD_REG17(\thread)
+diff --git a/arch/mips/include/asm/asmmacro-64.h b/arch/mips/include/asm/asmmacro-64.h
+index 08a527d..922209d 100644
+--- a/arch/mips/include/asm/asmmacro-64.h
++++ b/arch/mips/include/asm/asmmacro-64.h
+@@ -54,7 +54,7 @@
+ 	.endm
+ 
+ 	.macro	fpu_save_double thread status tmp
+-	sll	\tmp, \status, 5
++	sll     \tmp, \status, 31 - _ST0_FR
+ 	bgez	\tmp, 2f
+ 	fpu_save_16odd \thread
+ 2:
+@@ -102,7 +102,7 @@
+ 	.endm
+ 
+ 	.macro	fpu_restore_double thread status tmp
+-	sll	\tmp, \status, 5
++	sll     \tmp, \status, 31 - _ST0_FR
+ 	bgez	\tmp, 1f				# 16 register mode?
+ 
+ 	fpu_restore_16odd \thread
+diff --git a/arch/mips/include/asm/compat.h b/arch/mips/include/asm/compat.h
+index c4bd54a..b6e254a 100644
+--- a/arch/mips/include/asm/compat.h
++++ b/arch/mips/include/asm/compat.h
+@@ -298,7 +298,13 @@ typedef struct compat_sigaltstack {
+ 
+ static inline int is_compat_task(void)
+ {
++#ifdef CONFIG_MIPS32_O32
++	return test_thread_flag(TIF_32BIT_REGS);
++#elif defined(CONFIG_MIPS32_N32)
+ 	return test_thread_flag(TIF_32BIT_ADDR);
++#else
++#error No MIPS32 compatibility mode defined
++#endif /* CONFIG_MIPS32_O32 */
+ }
+ 
+ #endif /* _ASM_COMPAT_H */
+diff --git a/arch/mips/include/asm/elf.h b/arch/mips/include/asm/elf.h
+index cf3ae24..38c9a7d 100644
+--- a/arch/mips/include/asm/elf.h
++++ b/arch/mips/include/asm/elf.h
+@@ -36,6 +36,7 @@
+ #define EF_MIPS_ABI2		0x00000020
+ #define EF_MIPS_OPTIONS_FIRST	0x00000080
+ #define EF_MIPS_32BITMODE	0x00000100
++#define EF_MIPS_32BITMODE_FP64  0x00000200
+ #define EF_MIPS_ABI		0x0000f000
+ #define EF_MIPS_ARCH		0xf0000000
+ 
+@@ -228,6 +229,32 @@ typedef elf_fpreg_t elf_fpregset_t[ELF_NFPREG];
+ #endif /* CONFIG_64BIT */
+ 
+ /*
++ * Ensure we don't load the incompatible architecture lib via uselib() -
++ * - verify FPU model.
++ */
++#define elf_lib_check_arch(hdr)                                         \
++({									\
++	int __res = 1;							\
++	struct elfhdr *__h = (hdr);					\
++									\
++	if (test_thread_flag(TIF_32BIT_REGS)) {                         \
++		if ((__h->e_flags & EF_MIPS_ABI2) != 0)                 \
++			__res = 0;                                      \
++		if (((__h->e_flags & EF_MIPS_ABI) != 0) &&              \
++		    ((__h->e_flags & EF_MIPS_ABI) != EF_MIPS_ABI_O32))  \
++			__res = 0;                                      \
++		if (__h->e_flags & EF_MIPS_32BITMODE_FP64)             \
++			__res = 0;                                  \
++	} else {                                                        \
++		if (((__h->e_flags & EF_MIPS_ABI) == 0) ||              \
++		    ((__h->e_flags & EF_MIPS_ABI) == EF_MIPS_ABI_O32))  \
++			if (!(__h->e_flags & EF_MIPS_32BITMODE_FP64))  \
++				__res = 0;                          \
++	}                                                               \
++	__res;								\
++})
++
++/*
+  * These are used to set parameters in the core dumps.
+  */
+ #ifdef __MIPSEB__
+@@ -249,6 +276,11 @@ extern struct mips_abi mips_abi_n32;
+ 
+ #define SET_PERSONALITY(ex)						\
+ do {									\
++	if ((ex).e_flags & EF_MIPS_32BITMODE_FP64)                      \
++	    clear_thread_flag(TIF_32BIT_REGS);                          \
++	else                                                            \
++	    set_thread_flag(TIF_32BIT_REGS);                            \
++									\
+ 	if (personality(current->personality) != PER_LINUX)		\
+ 		set_personality(PER_LINUX);				\
+ 									\
+@@ -262,6 +294,7 @@ do {									\
+ #ifdef CONFIG_MIPS32_N32
+ #define __SET_PERSONALITY32_N32()					\
+ 	do {								\
++		clear_thread_flag(TIF_32BIT_REGS);                      \
+ 		set_thread_flag(TIF_32BIT_ADDR);			\
+ 		current->thread.abi = &mips_abi_n32;			\
+ 	} while (0)
+@@ -271,14 +304,18 @@ do {									\
+ #endif
+ 
+ #ifdef CONFIG_MIPS32_O32
+-#define __SET_PERSONALITY32_O32()					\
++#define __SET_PERSONALITY32_O32(ex)                                     \
+ 	do {								\
+-		set_thread_flag(TIF_32BIT_REGS);			\
++		if ((ex).e_flags & EF_MIPS_32BITMODE_FP64)              \
++		    clear_thread_flag(TIF_32BIT_REGS);                  \
++		else                                                    \
++		    set_thread_flag(TIF_32BIT_REGS);                    \
++									\
+ 		set_thread_flag(TIF_32BIT_ADDR);			\
+ 		current->thread.abi = &mips_abi_32;			\
+ 	} while (0)
+ #else
+-#define __SET_PERSONALITY32_O32()					\
++#define __SET_PERSONALITY32_O32(ex)                                     \
+ 	do { } while (0)
+ #endif
+ 
+@@ -289,7 +326,7 @@ do {									\
+ 	     ((ex).e_flags & EF_MIPS_ABI) == 0)				\
+ 		__SET_PERSONALITY32_N32();				\
+ 	else								\
+-		__SET_PERSONALITY32_O32();				\
++		__SET_PERSONALITY32_O32(ex);                            \
+ } while (0)
+ #else
+ #define __SET_PERSONALITY32(ex) do { } while (0)
+diff --git a/arch/mips/include/asm/fpu.h b/arch/mips/include/asm/fpu.h
+index d088e5d..560204c 100644
+--- a/arch/mips/include/asm/fpu.h
++++ b/arch/mips/include/asm/fpu.h
+@@ -29,35 +29,20 @@ struct sigcontext;
+ struct sigcontext32;
+ 
+ extern void fpu_emulator_init_fpu(void);
+-extern void _init_fpu(void);
++extern int _init_fpu(void);
+ extern void _save_fp(struct task_struct *);
+ extern void _restore_fp(struct task_struct *);
+ 
+-#define __enable_fpu()							\
++/*
++ * This macro is used only to obtain FIR from FPU and it seems
++ * like a BUG in 34K with single FPU affinity to VPE0.
++ */
++#define __enable_fpu()                                                  \
+ do {									\
+ 	set_c0_status(ST0_CU1);						\
+ 	enable_fpu_hazard();						\
+ } while (0)
+ 
+-#define __disable_fpu()							\
+-do {									\
+-	clear_c0_status(ST0_CU1);					\
+-	disable_fpu_hazard();						\
+-} while (0)
+-
+-#define enable_fpu()							\
+-do {									\
+-	if (cpu_has_fpu)						\
+-		__enable_fpu();						\
+-} while (0)
+-
+-#define disable_fpu()							\
+-do {									\
+-	if (cpu_has_fpu)						\
+-		__disable_fpu();					\
+-} while (0)
+-
+-
+ #define clear_fpu_owner()	clear_thread_flag(TIF_USEDFPU)
+ 
+ static inline int __is_fpu_owner(void)
+@@ -70,27 +55,58 @@ static inline int is_fpu_owner(void)
+ 	return cpu_has_fpu && __is_fpu_owner();
+ }
+ 
+-static inline void __own_fpu(void)
++static inline int __own_fpu(void)
+ {
+-	__enable_fpu();
++	int ret = 0;
++
++#if defined(CONFIG_CPU_MIPS32_R2) || defined(CONFIG_MIPS64)
++	if (test_thread_flag(TIF_32BIT_REGS)) {
++		change_c0_status(ST0_CU1|ST0_FR,ST0_CU1);
++		KSTK_STATUS(current) |= ST0_CU1;
++		KSTK_STATUS(current) &= ~ST0_FR;
++		enable_fpu_hazard();
++		if (read_c0_status() & ST0_FR)
++		    ret = SIGFPE;
++	} else {
++		set_c0_status(ST0_CU1|ST0_FR);
++		KSTK_STATUS(current) |= ST0_CU1|ST0_FR;
++		enable_fpu_hazard();
++		if (!(read_c0_status() & ST0_FR))
++		    ret = SIGFPE;
++	}
++#else
++	if (!test_thread_flag(TIF_32BIT_REGS))
++		return SIGFPE;  /* core has no 64bit FPU, so ... */
++
++	set_c0_status(ST0_CU1);
+ 	KSTK_STATUS(current) |= ST0_CU1;
++	enable_fpu_hazard();
++#endif
+ 	set_thread_flag(TIF_USEDFPU);
++	return ret;
+ }
+ 
+-static inline void own_fpu_inatomic(int restore)
++static inline int own_fpu_inatomic(int restore)
+ {
++	int ret = 0;
++
+ 	if (cpu_has_fpu && !__is_fpu_owner()) {
+-		__own_fpu();
+-		if (restore)
++		ret =__own_fpu();
++		if (restore && !ret)
+ 			_restore_fp(current);
+ 	}
++	return ret;
+ }
+ 
+-static inline void own_fpu(int restore)
++static inline int own_fpu(int restore)
+ {
++	int ret;
++
+ 	preempt_disable();
+-	own_fpu_inatomic(restore);
++	ret = own_fpu_inatomic(restore);
+ 	preempt_enable();
++
++	return ret;
+ }
+ 
+ static inline void lose_fpu(int save)
+@@ -101,21 +117,25 @@ static inline void lose_fpu(int save)
+ 			_save_fp(current);
+ 		KSTK_STATUS(current) &= ~ST0_CU1;
+ 		clear_thread_flag(TIF_USEDFPU);
+-		__disable_fpu();
++		clear_c0_status(ST0_CU1);
++		disable_fpu_hazard();
+ 	}
+ 	preempt_enable();
+ }
+ 
+-static inline void init_fpu(void)
++static inline int init_fpu(void)
+ {
++	int ret = 0;
++
+ 	preempt_disable();
+-	if (cpu_has_fpu) {
+-		__own_fpu();
++	if (cpu_has_fpu && !(ret = __own_fpu()))
+ 		_init_fpu();
+-	} else {
++	else
+ 		fpu_emulator_init_fpu();
+-	}
++
+ 	preempt_enable();
++
++	return ret;
+ }
+ 
+ static inline void save_fp(struct task_struct *tsk)
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+index fed1c3e..c00bf3f 100644
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -414,6 +414,7 @@
+ #define ST0_BEV			0x00400000
+ #define ST0_RE			0x02000000
+ #define ST0_FR			0x04000000
++#define _ST0_FR                 (26)
+ #define ST0_CU			0xf0000000
+ #define ST0_CU0			0x10000000
+ #define ST0_CU1			0x20000000
+diff --git a/arch/mips/kernel/process.c b/arch/mips/kernel/process.c
+index c6a041d..44f15d4 100644
+--- a/arch/mips/kernel/process.c
++++ b/arch/mips/kernel/process.c
+@@ -60,9 +60,6 @@ void start_thread(struct pt_regs * regs, unsigned long pc, unsigned long sp)
+ 
+ 	/* New thread loses kernel privileges. */
+ 	status = regs->cp0_status & ~(ST0_CU0|ST0_CU1|ST0_FR|KU_MASK);
+-#ifdef CONFIG_64BIT
+-	status |= test_thread_flag(TIF_32BIT_REGS) ? 0 : ST0_FR;
+-#endif
+ 	status |= KU_USER;
+ 	regs->cp0_status = status;
+ 	clear_used_math();
+diff --git a/arch/mips/kernel/r4k_fpu.S b/arch/mips/kernel/r4k_fpu.S
+index 55ffe14..1b7a0e9 100644
+--- a/arch/mips/kernel/r4k_fpu.S
++++ b/arch/mips/kernel/r4k_fpu.S
+@@ -53,6 +53,36 @@ LEAF(_save_fp_context)
+ 	EX	sdc1 $f27, SC_FPREGS+216(a0)
+ 	EX	sdc1 $f29, SC_FPREGS+232(a0)
+ 	EX	sdc1 $f31, SC_FPREGS+248(a0)
++#else
++#ifdef CONFIG_MIPS32_R2
++	.set    push
++	.set    mips64r2
++	.set    noreorder
++	mfc0    t0, CP0_STATUS
++	sll     t0, t0, 31 - _ST0_FR
++	bgez    t0, 1f              # 16 / 32 register mode?
++	 nop
++
++	/* Store the 16 odd double precision registers */
++	EX      sdc1 $f1, SC_FPREGS+8(a0)
++	EX      sdc1 $f3, SC_FPREGS+24(a0)
++	EX      sdc1 $f5, SC_FPREGS+40(a0)
++	EX      sdc1 $f7, SC_FPREGS+56(a0)
++	EX      sdc1 $f9, SC_FPREGS+72(a0)
++	EX      sdc1 $f11, SC_FPREGS+88(a0)
++	EX      sdc1 $f13, SC_FPREGS+104(a0)
++	EX      sdc1 $f15, SC_FPREGS+120(a0)
++	EX      sdc1 $f17, SC_FPREGS+136(a0)
++	EX      sdc1 $f19, SC_FPREGS+152(a0)
++	EX      sdc1 $f21, SC_FPREGS+168(a0)
++	EX      sdc1 $f23, SC_FPREGS+184(a0)
++	EX      sdc1 $f25, SC_FPREGS+200(a0)
++	EX      sdc1 $f27, SC_FPREGS+216(a0)
++	EX      sdc1 $f29, SC_FPREGS+232(a0)
++	EX      sdc1 $f31, SC_FPREGS+248(a0)
++	.set    pop
++1:
++#endif
+ #endif
+ 
+ 	/* Store the 16 even double precision registers */
+@@ -82,6 +112,30 @@ LEAF(_save_fp_context)
+ LEAF(_save_fp_context32)
+ 	cfc1	t1, fcr31
+ 
++	mfc0    t0, CP0_STATUS
++	sll     t0, t0, 31 - _ST0_FR
++	bgez    t0, 1f              # 16 / 32 register mode?
++	 nop
++
++	/* Store the 16 odd double precision registers */
++	EX      sdc1 $f1, SC_FPREGS+8(a0)
++	EX      sdc1 $f3, SC_FPREGS+24(a0)
++	EX      sdc1 $f5, SC_FPREGS+40(a0)
++	EX      sdc1 $f7, SC_FPREGS+56(a0)
++	EX      sdc1 $f9, SC_FPREGS+72(a0)
++	EX      sdc1 $f11, SC_FPREGS+88(a0)
++	EX      sdc1 $f13, SC_FPREGS+104(a0)
++	EX      sdc1 $f15, SC_FPREGS+120(a0)
++	EX      sdc1 $f17, SC_FPREGS+136(a0)
++	EX      sdc1 $f19, SC_FPREGS+152(a0)
++	EX      sdc1 $f21, SC_FPREGS+168(a0)
++	EX      sdc1 $f23, SC_FPREGS+184(a0)
++	EX      sdc1 $f25, SC_FPREGS+200(a0)
++	EX      sdc1 $f27, SC_FPREGS+216(a0)
++	EX      sdc1 $f29, SC_FPREGS+232(a0)
++	EX      sdc1 $f31, SC_FPREGS+248(a0)
++1:
++
+ 	EX	sdc1 $f0, SC32_FPREGS+0(a0)
+ 	EX	sdc1 $f2, SC32_FPREGS+16(a0)
+ 	EX	sdc1 $f4, SC32_FPREGS+32(a0)
+@@ -131,6 +185,36 @@ LEAF(_restore_fp_context)
+ 	EX	ldc1 $f27, SC_FPREGS+216(a0)
+ 	EX	ldc1 $f29, SC_FPREGS+232(a0)
+ 	EX	ldc1 $f31, SC_FPREGS+248(a0)
++
++#else
++#ifdef CONFIG_MIPS32_R2
++	.set    push
++	.set    mips64r2
++	.set    noreorder
++	mfc0    t1, CP0_STATUS
++	sll     t1, t1, 31 - _ST0_FR
++	bgez    t1, 1f                          # 16 / 32 register mode?
++	 nop
++
++	EX      ldc1 $f1, SC_FPREGS+8(a0)
++	EX      ldc1 $f3, SC_FPREGS+24(a0)
++	EX      ldc1 $f5, SC_FPREGS+40(a0)
++	EX      ldc1 $f7, SC_FPREGS+56(a0)
++	EX      ldc1 $f9, SC_FPREGS+72(a0)
++	EX      ldc1 $f11, SC_FPREGS+88(a0)
++	EX      ldc1 $f13, SC_FPREGS+104(a0)
++	EX      ldc1 $f15, SC_FPREGS+120(a0)
++	EX      ldc1 $f17, SC_FPREGS+136(a0)
++	EX      ldc1 $f19, SC_FPREGS+152(a0)
++	EX      ldc1 $f21, SC_FPREGS+168(a0)
++	EX      ldc1 $f23, SC_FPREGS+184(a0)
++	EX      ldc1 $f25, SC_FPREGS+200(a0)
++	EX      ldc1 $f27, SC_FPREGS+216(a0)
++	EX      ldc1 $f29, SC_FPREGS+232(a0)
++	EX      ldc1 $f31, SC_FPREGS+248(a0)
++	.set    pop
++1:
++#endif
+ #endif
+ 	EX	ldc1 $f0, SC_FPREGS+0(a0)
+ 	EX	ldc1 $f2, SC_FPREGS+16(a0)
+@@ -155,9 +239,37 @@ LEAF(_restore_fp_context)
+ 
+ #ifdef CONFIG_MIPS32_COMPAT
+ LEAF(_restore_fp_context32)
++	.set    push
++	.set    mips64r2
++	.set    noreorder
++
+ 	/* Restore an o32 sigcontext.  */
+ 	EX	lw t0, SC32_FPC_CSR(a0)
+-	EX	ldc1 $f0, SC32_FPREGS+0(a0)
++
++	mfc0    t1, CP0_STATUS
++	sll     t1, t1, 31 - _ST0_FR
++	bgez    t1, 1f                          # 16 / 32 register mode?
++	 nop
++
++	EX      ldc1 $f1, SC_FPREGS+8(a0)
++	EX      ldc1 $f3, SC_FPREGS+24(a0)
++	EX      ldc1 $f5, SC_FPREGS+40(a0)
++	EX      ldc1 $f7, SC_FPREGS+56(a0)
++	EX      ldc1 $f9, SC_FPREGS+72(a0)
++	EX      ldc1 $f11, SC_FPREGS+88(a0)
++	EX      ldc1 $f13, SC_FPREGS+104(a0)
++	EX      ldc1 $f15, SC_FPREGS+120(a0)
++	EX      ldc1 $f17, SC_FPREGS+136(a0)
++	EX      ldc1 $f19, SC_FPREGS+152(a0)
++	EX      ldc1 $f21, SC_FPREGS+168(a0)
++	EX      ldc1 $f23, SC_FPREGS+184(a0)
++	EX      ldc1 $f25, SC_FPREGS+200(a0)
++	EX      ldc1 $f27, SC_FPREGS+216(a0)
++	EX      ldc1 $f29, SC_FPREGS+232(a0)
++	EX      ldc1 $f31, SC_FPREGS+248(a0)
++1:
++
++	EX      ldc1 $f0, SC32_FPREGS+0(a0)
+ 	EX	ldc1 $f2, SC32_FPREGS+16(a0)
+ 	EX	ldc1 $f4, SC32_FPREGS+32(a0)
+ 	EX	ldc1 $f6, SC32_FPREGS+48(a0)
+@@ -177,6 +289,7 @@ LEAF(_restore_fp_context32)
+ 	jr	ra
+ 	 li	v0, 0					# success
+ 	END(_restore_fp_context32)
++	.set    pop
+ #endif
+ 
+ 	.set	reorder
+diff --git a/arch/mips/kernel/r4k_switch.S b/arch/mips/kernel/r4k_switch.S
+index 5e51219..23670e1 100644
+--- a/arch/mips/kernel/r4k_switch.S
++++ b/arch/mips/kernel/r4k_switch.S
+@@ -64,10 +64,45 @@
+ 	and	t0, t0, t1
+ 	LONG_S	t0, ST_OFF(t3)
+ 
++	/* Now copy FR from it */
++
++#if defined(CONFIG_CPU_MIPS32_R2) || defined(CONFIG_64BIT)
++#ifdef CONFIG_MIPS_MT_SMTC
++
++	li      t3, ST0_FR
++	mfc0    t2, CP0_TCSTATUS
++	nor     t1, $0, t3
++	and     t0, t0, t3                      # extract FR from prev
++	and     t3, t2, t1
++	or      t0, t0, t3
++	mtc0    t0, CP0_TCSTATUS
++	enable_fpu_hazard
++
++	fpu_save_double a0 t0 t1                # c0_status passed in t0
++						# clobbers t1
++	mtc0    t2, CP0_TCSTATUS
++#else
++	li      t3, ST0_FR
++	mfc0    t2, CP0_STATUS
++	nor     t1, $0, t3
++	and     t0, t0, t3                      # extract FR from prev
++	and     t3, t2, t1
++	or      t0, t0, t3
++	mtc0    t0, CP0_STATUS
++	enable_fpu_hazard
++
++	fpu_save_double a0 t0 t1                # c0_status passed in t0
++						# clobbers t1
++	mtc0    t2, CP0_STATUS
++
++#endif /* CONFIG_MIPS_MT_SMTC */
++#else
++
+ 	fpu_save_double a0 t0 t1		# c0_status passed in t0
+ 						# clobbers t1
+-1:
++#endif
+ 
++1:
+ 	/*
+ 	 * The order of restoring the registers takes care of the race
+ 	 * updating $28, $29 and kernelsp without disabling ints.
+@@ -107,17 +142,21 @@
+ 	xori	t1, t1, TCSTATUS_IXMT
+ 	or	t1, t1, t2
+ 	mtc0	t1, CP0_TCSTATUS
+-	_ehb
+ #endif /* CONFIG_MIPS_MT_SMTC */
+ 	move	v0, a0
+-	jr	ra
++#ifdef CPU_MIPSR2
++	jr.hb   ra
++#else
++	_ehb
++	jr      ra
++#endif
+ 	END(resume)
+ 
+ /*
+  * Save a thread's fp context.
+  */
+ LEAF(_save_fp)
+-#ifdef CONFIG_64BIT
++#if defined(CONFIG_CPU_MIPS32_R2) || defined(CONFIG_64BIT)
+ 	mfc0	t0, CP0_STATUS
+ #endif
+ 	fpu_save_double a0 t0 t1		# clobbers t1
+@@ -128,7 +167,7 @@ LEAF(_save_fp)
+  * Restore a thread's fp context.
+  */
+ LEAF(_restore_fp)
+-#ifdef CONFIG_64BIT
++#if defined(CONFIG_CPU_MIPS32_R2) || defined(CONFIG_64BIT)
+ 	mfc0	t0, CP0_STATUS
+ #endif
+ 	fpu_restore_double a0 t0 t1		# clobbers t1
+@@ -167,7 +206,7 @@ LEAF(_init_fpu)
+ 	li	t1, -1				# SNaN
+ 
+ #ifdef CONFIG_64BIT
+-	sll	t0, t0, 5
++	sll     t0, t0, 31 - _ST0_FR
+ 	bgez	t0, 1f				# 16 / 32 register mode?
+ 
+ 	dmtc1	t1, $f1
+@@ -187,7 +226,7 @@ LEAF(_init_fpu)
+ 	dmtc1	t1, $f29
+ 	dmtc1	t1, $f31
+ 1:
+-#endif
++#endif /* CONFIG_64BIT */
+ 
+ #ifdef CONFIG_CPU_MIPS32
+ 	mtc1	t1, $f0
+@@ -222,7 +261,51 @@ LEAF(_init_fpu)
+ 	mtc1	t1, $f29
+ 	mtc1	t1, $f30
+ 	mtc1	t1, $f31
+-#else
++
++#ifdef CONFIG_CPU_MIPS32_R2
++	.set    push
++	.set    mips64r2
++	.set    noreorder
++	sll     t0, t0, 31 - _ST0_FR
++	bgez    t0, 1f                       # 16 / 32 register mode?
++	 nop
++
++	mthc1   t1, $f0
++	mthc1   t1, $f1
++	mthc1   t1, $f2
++	mthc1   t1, $f3
++	mthc1   t1, $f4
++	mthc1   t1, $f5
++	mthc1   t1, $f6
++	mthc1   t1, $f7
++	mthc1   t1, $f8
++	mthc1   t1, $f9
++	mthc1   t1, $f10
++	mthc1   t1, $f11
++	mthc1   t1, $f12
++	mthc1   t1, $f13
++	mthc1   t1, $f14
++	mthc1   t1, $f15
++	mthc1   t1, $f16
++	mthc1   t1, $f17
++	mthc1   t1, $f18
++	mthc1   t1, $f19
++	mthc1   t1, $f20
++	mthc1   t1, $f21
++	mthc1   t1, $f22
++	mthc1   t1, $f23
++	mthc1   t1, $f24
++	mthc1   t1, $f25
++	mthc1   t1, $f26
++	mthc1   t1, $f27
++	mthc1   t1, $f28
++	mthc1   t1, $f29
++	mthc1   t1, $f30
++	mthc1   t1, $f31
++	.set    pop
++1:
++#endif /* CONFIG_CPU_MIPS32_R2 */
++#else  /* CONFIG_CPU_MIPS32 */
+ 	.set	mips3
+ 	dmtc1	t1, $f0
+ 	dmtc1	t1, $f2
+@@ -240,6 +323,6 @@ LEAF(_init_fpu)
+ 	dmtc1	t1, $f26
+ 	dmtc1	t1, $f28
+ 	dmtc1	t1, $f30
+-#endif
++#endif /* CONFIG_CPU_MIPS32 */
+ 	jr	ra
+ 	END(_init_fpu)
+diff --git a/arch/mips/kernel/signal.c b/arch/mips/kernel/signal.c
+index fd3ef2c..af94abc 100644
+--- a/arch/mips/kernel/signal.c
++++ b/arch/mips/kernel/signal.c
+@@ -70,8 +70,9 @@ static int protected_save_fp_context(struct sigcontext __user *sc)
+ 	int err;
+ 	while (1) {
+ 		lock_fpu_owner();
+-		own_fpu_inatomic(1);
+-		err = save_fp_context(sc); /* this might fail */
++		err = own_fpu_inatomic(1);
++		if (!err)
++			err = save_fp_context(sc); /* this might fail */
+ 		unlock_fpu_owner();
+ 		if (likely(!err))
+ 			break;
+@@ -90,8 +91,9 @@ static int protected_restore_fp_context(struct sigcontext __user *sc)
+ 	int err, tmp __maybe_unused;
+ 	while (1) {
+ 		lock_fpu_owner();
+-		own_fpu_inatomic(0);
+-		err = restore_fp_context(sc); /* this might fail */
++		err = own_fpu_inatomic(0);
++		if (!err)
++			err = restore_fp_context(sc); /* this might fail */
+ 		unlock_fpu_owner();
+ 		if (likely(!err))
+ 			break;
+diff --git a/arch/mips/kernel/signal32.c b/arch/mips/kernel/signal32.c
+index 57de8b7..5ef5a4d 100644
+--- a/arch/mips/kernel/signal32.c
++++ b/arch/mips/kernel/signal32.c
+@@ -85,8 +85,9 @@ static int protected_save_fp_context32(struct sigcontext32 __user *sc)
+ 	int err;
+ 	while (1) {
+ 		lock_fpu_owner();
+-		own_fpu_inatomic(1);
+-		err = save_fp_context32(sc); /* this might fail */
++		err = own_fpu_inatomic(1);
++		if (!err)
++			err = save_fp_context32(sc); /* this might fail */
+ 		unlock_fpu_owner();
+ 		if (likely(!err))
+ 			break;
+@@ -105,8 +106,9 @@ static int protected_restore_fp_context32(struct sigcontext32 __user *sc)
+ 	int err, tmp __maybe_unused;
+ 	while (1) {
+ 		lock_fpu_owner();
+-		own_fpu_inatomic(0);
+-		err = restore_fp_context32(sc); /* this might fail */
++		err = own_fpu_inatomic(0);
++		if (!err)
++			err = restore_fp_context32(sc); /* this might fail */
+ 		unlock_fpu_owner();
+ 		if (likely(!err))
+ 			break;
+@@ -558,8 +560,29 @@ struct mips_abi mips_abi_32 = {
+ 	.restart	= __NR_O32_restart_syscall
+ };
+ 
++#ifdef CONFIG_SMP
++static int smp_save_fp_context32(struct sigcontext32 __user *sc)
++{
++	return raw_cpu_has_fpu
++	       ? _save_fp_context32(sc)
++	       : fpu_emulator_save_context32(sc);
++}
++
++static int smp_restore_fp_context32(struct sigcontext32 __user *sc)
++{
++	return raw_cpu_has_fpu
++	       ? _restore_fp_context32(sc)
++	       : fpu_emulator_restore_context32(sc);
++}
++#endif
++
+ static int signal32_init(void)
+ {
++#ifdef CONFIG_SMP
++	/* For now just do the cpu_has_fpu check when the functions are invoked */
++	save_fp_context32 = smp_save_fp_context32;
++	restore_fp_context32 = smp_restore_fp_context32;
++#else
+ 	if (cpu_has_fpu) {
+ 		save_fp_context32 = _save_fp_context32;
+ 		restore_fp_context32 = _restore_fp_context32;
+@@ -567,6 +590,7 @@ static int signal32_init(void)
+ 		save_fp_context32 = fpu_emulator_save_context32;
+ 		restore_fp_context32 = fpu_emulator_restore_context32;
+ 	}
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index 370d0ff..d6c95d1 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -1118,20 +1118,28 @@ asmlinkage void do_cpu(struct pt_regs *regs)
+ 		/* Fall through.  */
+ 
+ 	case 1:
+-		if (used_math())	/* Using the FPU again.	 */
+-			own_fpu(1);
+-		else {			/* First time FPU user.	 */
+-			init_fpu();
++		status = 0;
++		if (used_math())	/* Using the FPU again.  */
++			status = own_fpu(1);
++		else {			/* First time FPU user.  */
++			status = init_fpu();
++#ifndef CONFIG_MIPS_INCOMPATIBLE_FPU_EMULATION
++			if (status) {
++				force_sig(SIGFPE, current);
++				return;
++			}
++#endif
++
+ 			set_used_math();
+ 		}
+ 
+-		if (!raw_cpu_has_fpu) {
++		if ((!raw_cpu_has_fpu) || status) {
+ 			int sig;
+ 			void __user *fault_addr = NULL;
+ 			sig = fpu_emulator_cop1Handler(regs,
+ 						       &current->thread.fpu,
+ 						       0, &fault_addr);
+-			if (!process_fpemu_return(sig, fault_addr))
++			if ((!process_fpemu_return(sig, fault_addr)) && !status)
+ 				mt_ase_fp_affinity();
+ 		}
+ 
+@@ -1697,7 +1705,7 @@ void __cpuinit per_cpu_trap_init(bool is_boot_cpu)
+ 	if (cpu_has_dsp)
+ 		status_set |= ST0_MX;
+ 
+-	change_c0_status(ST0_CU|ST0_MX|ST0_RE|ST0_FR|ST0_BEV|ST0_TS|ST0_KX|ST0_SX|ST0_UX,
++	change_c0_status(ST0_CU|ST0_MX|ST0_RE|ST0_BEV|ST0_TS|ST0_KX|ST0_SX|ST0_UX,
+ 			 status_set);
+ 
+ 	if (cpu_has_mips_r2)
+diff --git a/arch/mips/math-emu/cp1emu.c b/arch/mips/math-emu/cp1emu.c
+index 7aaae63..7175d49 100644
+--- a/arch/mips/math-emu/cp1emu.c
++++ b/arch/mips/math-emu/cp1emu.c
+@@ -862,13 +862,7 @@ static int isBranchInstr(struct pt_regs *regs, struct mm_decoded_insn dec_insn,
+  */
+ static inline int cop1_64bit(struct pt_regs *xcp)
+ {
+-#if defined(CONFIG_64BIT) && !defined(CONFIG_MIPS32_O32)
+-	return 1;
+-#elif defined(CONFIG_64BIT) && defined(CONFIG_MIPS32_O32)
+ 	return !test_thread_flag(TIF_32BIT_REGS);
+-#else
+-	return 0;
+-#endif
+ }
+ 
+ #define SIFROMREG(si, x) ((si) = cop1_64bit(xcp) || !(x & 1) ? \
+diff --git a/arch/mips/math-emu/kernel_linkage.c b/arch/mips/math-emu/kernel_linkage.c
+index 1c58657..994a728 100644
+--- a/arch/mips/math-emu/kernel_linkage.c
++++ b/arch/mips/math-emu/kernel_linkage.c
+@@ -52,7 +52,7 @@ void fpu_emulator_init_fpu(void)
+  * with appropriate macros from uaccess.h
+  */
+ 
+-int fpu_emulator_save_context(struct sigcontext __user *sc)
++inline int fpu_emulator_save_context(struct sigcontext __user *sc)
+ {
+ 	int i;
+ 	int err = 0;
+@@ -66,7 +66,7 @@ int fpu_emulator_save_context(struct sigcontext __user *sc)
+ 	return err;
+ }
+ 
+-int fpu_emulator_restore_context(struct sigcontext __user *sc)
++inline int fpu_emulator_restore_context(struct sigcontext __user *sc)
+ {
+ 	int i;
+ 	int err = 0;
+@@ -90,6 +90,17 @@ int fpu_emulator_save_context32(struct sigcontext32 __user *sc)
+ 	int i;
+ 	int err = 0;
+ 
++	if (!test_thread_flag(TIF_32BIT_REGS)) {
++		for (i = 0; i < 32; i++) {
++			err |=
++			    __put_user(current->thread.fpu.fpr[i], &sc->sc_fpregs[i]);
++		}
++		err |= __put_user(current->thread.fpu.fcr31, &sc->sc_fpc_csr);
++
++		return err;
++
++	}
++
+ 	for (i = 0; i < 32; i+=2) {
+ 		err |=
+ 		    __put_user(current->thread.fpu.fpr[i], &sc->sc_fpregs[i]);
+@@ -104,6 +115,16 @@ int fpu_emulator_restore_context32(struct sigcontext32 __user *sc)
+ 	int i;
+ 	int err = 0;
+ 
++	if (!test_thread_flag(TIF_32BIT_REGS)) {
++		for (i = 0; i < 32; i++) {
++			err |=
++			    __get_user(current->thread.fpu.fpr[i], &sc->sc_fpregs[i]);
++		}
++		err |= __get_user(current->thread.fpu.fcr31, &sc->sc_fpc_csr);
++
++		return err;
++	}
++
+ 	for (i = 0; i < 32; i+=2) {
+ 		err |=
+ 		    __get_user(current->thread.fpu.fpr[i], &sc->sc_fpregs[i]);
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index f8a0b0e..4d731ae 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -1032,6 +1032,8 @@ static int load_elf_library(struct file *file)
+ 	if (elf_ex.e_type != ET_EXEC || elf_ex.e_phnum > 2 ||
+ 	    !elf_check_arch(&elf_ex) || !file->f_op || !file->f_op->mmap)
+ 		goto out;
++	if (!elf_lib_check_arch(&elf_ex))
++		goto out;
+ 
+ 	/* Now read in all of the header information */
+ 
+diff --git a/include/linux/elf.h b/include/linux/elf.h
+index 40a3c0e..b07ae0a 100644
+--- a/include/linux/elf.h
++++ b/include/linux/elf.h
+@@ -37,6 +37,10 @@ extern Elf64_Dyn _DYNAMIC [];
+ 
+ #endif
+ 
++#ifndef elf_lib_check_arch
++#define elf_lib_check_arch(a)   (1)
++#endif
++
+ /* Optional callbacks to write extra ELF notes. */
+ struct file;
+ 
+-- 
+1.7.1
+

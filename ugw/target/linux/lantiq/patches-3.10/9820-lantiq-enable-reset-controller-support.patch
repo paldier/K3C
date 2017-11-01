@@ -1,0 +1,636 @@
+# HG changeset patch
+# Parent fe41333c3c33594d0143d4d3da2b8470201002ef
+
+diff --git a/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h
+old mode 100755
+new mode 100644
+--- a/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h
++++ b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_soc.h
+@@ -7,17 +7,30 @@
+  *  Copyright (C) 2014 Lei Chuanhua <Chuanhua.lei@lantiq.com>
+  */
+ 
+-#ifndef _LTQ_XWAY_H__
+-#define _LTQ_XWAY_H__
++#ifndef _LTQ_SOC_H
++#define _LTQ_SOC_H
+ 
+ #include <lantiq.h>
+ #include <linux/pinctrl/pinctrl.h>
+ 
++/* GCR_CUS are 64 bit register which needs special handling */
++#ifdef CONFIG_CPU_BIG_ENDIAN
++#define ltq_wk_r32(reg)		__raw_readl((void *)(((u32)reg)^4))
++#define ltq_wk_w32(val, reg)	__raw_writel((val), (void *)(((u32)reg)^4))
++#else
++#define ltq_wk_r32(reg)		ltq_r32((reg))
++#define ltq_wk_w32(val, reg)	ltq_w32((val), (reg))
++#endif /* CONFIG_CPU_BIG_ENDIAN */
++
+ /* Chip IDs */
+ #define SOC_ID_GRX562		0x020
+ #define SOC_ID_GRX582		0x021
+ #define SOC_ID_GRX583		0x022
+ #define SOC_ID_GRX580		0x023
++#define SOC_ID_GRX584		0x024
++#define SOC_ID_GRX585		0x025
++#define SOC_ID_GRX3506		0x026
++#define SOC_ID_GRX3508		0x028
+ 
+ /* SoC Types */
+ #define SOC_TYPE_GRX500		0x09
+@@ -47,29 +60,36 @@ void ltq_rcu_w32(uint32_t val, uint32_t 
+ uint32_t ltq_rcu_r32(uint32_t reg_off);
+ void ltq_rcu_w32_mask(uint32_t clr, uint32_t set, uint32_t reg_off);
+ 
++void ltq_endian_set(int bitn);
++void ltq_endian_clr(int bitn);
++void ltq_pcie_clk_out(int bitn);
++
++void ltq_usb_phy_reset(unsigned int bit);
++void ltq_usb0_port_endian_set(unsigned int clr, unsigned int set);
++void ltq_usb1_port_endian_set(unsigned int clr, unsigned int set);
+ /*
+  * GCMP Specific definitions
+  */
+-#define GCMP_BASE_ADDR                  0x12300000
+-#define GCMP_ADDRSPACE_SZ               (256 * 1024)
++#define GCMP_BASE_ADDR			0x12300000
++#define GCMP_ADDRSPACE_SZ		(256 * 1024)
+ 
+ /*
+  * GIC Specific definitions
+  */
+-#define GIC_BASE_ADDR                   (0x12320000)
+-#define GIC_ADDRSPACE_SZ                (128 * 1024)
++#define GIC_BASE_ADDR			(0x12320000)
++#define GIC_ADDRSPACE_SZ		(128 * 1024)
+ 
+-/*      
++/*
+  * CPC Specific definitions
+- */     
+-#define CPC_BASE_ADDR                   0x12310000
++ */
++#define CPC_BASE_ADDR			0x12310000
+ 
+ /*
+  * during early_printk no ioremap is possible
+  * lets use KSEG1 instead
+  */
+-#define LTQ_ASC1_BASE_ADDR     0x16600000
+-#define LTQ_EARLY_ASC          KSEG1ADDR(LTQ_ASC1_BASE_ADDR) /* 0xb6600000 */
++#define LTQ_ASC0_BASE_ADDR	0x16600000
++#define LTQ_EARLY_ASC		KSEG1ADDR(LTQ_ASC0_BASE_ADDR)
+ 
+ /* EBU - external bus unit */
+ #define LTQ_EBU_BUSCON0		0x0060
+@@ -85,16 +105,16 @@ void ltq_rcu_w32_mask(uint32_t clr, uint
+ 
+ /* MPS - multi processor unit (voice) */
+ #define LTQ_MPS_BASE_ADDR	(KSEG1 + 0x1F107000)
+-#define LTQ_MPS_CHIPID		((u32 *)(LTQ_MPS_BASE_ADDR + 0x0344))
+-#define LTQ_FUSE_ID_CFG 	((u32 *)(LTQ_MPS_BASE_ADDR + 0x0350))
++#define LTQ_MPS_CHIPID		((u32 __iomem *)(LTQ_MPS_BASE_ADDR + 0x0344))
++#define LTQ_FUSE_ID_CFG 	((u32 __iomem *)(LTQ_MPS_BASE_ADDR + 0x0350))
+ 
+ /* allow the ethernet driver to load a flash mapped mac addr */
+-const u8* ltq_get_eth_mac(void);
++const u8 *ltq_get_eth_mac(void);
+ 
+-int ltq_reset_get_status (void);
++int ltq_reset_get_status(void);
+ 
+ /* allow the gpio and pinctrl drivers to talk to eachother */
+ extern int pinctrl_xrx500_get_range_size(int id);
+ extern void pinctrl_xrx500_add_gpio_range(struct pinctrl_gpio_range *range);
+ 
+-#endif /* _LTQ_XWAY_H__ */
++#endif /* _LTQ_SOC_H */
+diff --git a/arch/mips/include/asm/mach-lantiq/lantiq.h b/arch/mips/include/asm/mach-lantiq/lantiq.h
+old mode 100755
+new mode 100644
+--- a/arch/mips/include/asm/mach-lantiq/lantiq.h
++++ b/arch/mips/include/asm/mach-lantiq/lantiq.h
+@@ -45,9 +45,11 @@ extern int ltq_eiu_get_irq(int exin);
+ extern int clk_activate(struct clk *clk);
+ extern void clk_deactivate(struct clk *clk);
+ extern struct clk *clk_get_cpu(void);
++extern struct clk *clk_get_ddr(void);
+ extern struct clk *clk_get_fpi(void);
+ extern struct clk *clk_get_io(void);
+ extern struct clk *clk_get_ppe(void);
++extern struct clk *clk_get_xbar(void);
+ 
+ /* find out what bootsource we have */
+ extern unsigned char ltq_boot_select(void);
+@@ -55,7 +57,7 @@ extern unsigned char ltq_boot_select(voi
+ extern int ltq_reset_cause(void);
+ extern void ltq_reset_once(unsigned int module, ulong u);
+ extern void ltq_hw_reset(unsigned int module);
+-
++extern void ltq_rst_init(void);
+ extern unsigned int ltq_get_cpu_id(void);
+ extern unsigned int ltq_get_soc_type(void);
+ extern unsigned int ltq_get_soc_rev(void);
+diff --git a/arch/mips/include/asm/mach-lantiq/xway/lantiq_soc.h b/arch/mips/include/asm/mach-lantiq/xway/lantiq_soc.h
+--- a/arch/mips/include/asm/mach-lantiq/xway/lantiq_soc.h
++++ b/arch/mips/include/asm/mach-lantiq/xway/lantiq_soc.h
+@@ -112,6 +112,9 @@ extern __iomem void *ltq_cgu_membase;
+ void ltq_rcu_w32(uint32_t val, uint32_t reg_off);
+ uint32_t ltq_rcu_r32(uint32_t reg_off);
+ void ltq_rcu_w32_mask(uint32_t clr, uint32_t set, uint32_t reg_off);
++void ltq_endian_set(int bitn);
++void ltq_endian_clr(int bitn);
++static inline void ltq_pcie_clk_out(int bitn) {};
+ 
+ 
+ /*
+diff --git a/arch/mips/lantiq/Kconfig b/arch/mips/lantiq/Kconfig
+--- a/arch/mips/lantiq/Kconfig
++++ b/arch/mips/lantiq/Kconfig
+@@ -19,6 +19,8 @@ config SOC_XWAY
+ 	select SOC_TYPE_XWAY
+ 	select HW_HAS_PCI
+ 	select ARCH_SUPPORTS_MSI
++	select ARCH_HAS_RESET_CONTROLLER
++	select RESET_CONTROLLER
+ 
+ config SOC_FALCON
+ 	bool "FALCON"
+diff --git a/arch/mips/lantiq/grx500/reset.c b/arch/mips/lantiq/grx500/reset.c
+--- a/arch/mips/lantiq/grx500/reset.c
++++ b/arch/mips/lantiq/grx500/reset.c
+@@ -21,45 +21,28 @@
+ 
+ #include <lantiq_soc.h>
+ 
++#ifdef CONFIG_LTQ_ETHSW_API
++#include <xway/switch-api/lantiq_gsw_api.h>
++#endif
++
+ #include "prom.h"
+ 
+ /* reset request register */
+ #define RCU_RST_REQ		0x0010
+ /* reset status register */
+ #define RCU_RST_STAT		0x0014
+-/* vr9 gphy registers */
+-#define RCU_GFS_ADD0_XRX200	0x0020
+-#define RCU_GFS_ADD1_XRX200	0x0068
+ 
+-#define RCU_AHB_ENDIAN		0x004C
+-#define RCU_VR9_BE_AHB1S	0x00000008
++#define RCU_RST_STAT2		0x0024
++#define RCU_RST_REQ2		0x0048
++
++#define RCU_AHB_ENDIAN		0x8004C
++#define RCU_IFMUX_CFG		0x80120
++
++#define RCU_USB0_CFG		0x80018
++#define RCU_USB1_CFG		0x80034
+ 
+ /* reboot bit */
+-#define RCU_RD_GPHY0_XRX200	BIT(31)
+ #define RCU_RD_SRST		BIT(30)
+-#define RCU_RD_GPHY1_XRX200	BIT(29)
+-
+-/* xRX300 bits */
+-#define RCU_RD_GPHY0_XRX300	BIT(31)
+-#define RCU_RD_GPHY1_XRX300	BIT(29)
+-#define RCU_RD_GPHY2_XRX300	BIT(28)
+-
+-/* xRX330 bits */
+-#define RCU_RD_GPHY0_XRX330	BIT(31)
+-#define RCU_RD_GPHY1_XRX330	BIT(29)
+-#define RCU_RD_GPHY2_XRX330	BIT(28)
+-#define RCU_RD_GPHY3_XRX330	BIT(10)
+-
+-/* xRX300 gphy registers */
+-#define RCU_GFS_ADD0_XRX300	0x0020
+-#define RCU_GFS_ADD1_XRX300	0x0058
+-#define RCU_GFS_ADD2_XRX300	0x00AC
+-
+-/* xRX330 gphy registers */
+-#define RCU_GFS_ADD0_XRX330	0x0020
+-#define RCU_GFS_ADD1_XRX330	0x0058
+-#define RCU_GFS_ADD2_XRX330	0x00AC
+-#define RCU_GFS_ADD3_XRX330	0x0264
+ 
+ /* reset cause */
+ #define RCU_STAT_SHIFT		26
+@@ -68,6 +51,22 @@
+ #define RCU_BOOT_SEL_XRX200(x)	(((x >> 17) & 0xf) | ((x >> 8) & 0x10))
+ 
+ /* remapped base addr of the reset control unit */
++
++/* Status */
++static u32 rcu_stat[] = {
++	RCU_RST_STAT,
++	RCU_RST_STAT2,
++};
++
++/* request */
++static u32 rcu_req[] = {
++	RCU_RST_REQ,
++	RCU_RST_REQ2,
++};
++
++#define RCU_STAT_REG(x)		(rcu_stat[(x)])
++#define RCU_REQ_REG(x)		(rcu_req[(x)])
++
+ static void __iomem *ltq_rcu_membase;
+ static struct device_node *ltq_rcu_np;
+ static DEFINE_SPINLOCK(ltq_rcu_lock);
+@@ -99,82 +98,6 @@ unsigned char ltq_boot_select(void)
+ 	return RCU_BOOT_SEL(val);
+ }
+ 
+-/* reset / boot a gphy */
+-static struct ltq_xrx200_gphy_reset {
+-	u32 rd;
+-	u32 addr;
+-} xrx200_gphy[] = {
+-	{RCU_RD_GPHY0_XRX200, RCU_GFS_ADD0_XRX200},
+-	{RCU_RD_GPHY1_XRX200, RCU_GFS_ADD1_XRX200},
+-};
+-
+-/* reset / boot a gphy */
+-static struct ltq_xrx300_gphy_reset {
+-	u32 rd;
+-	u32 addr;
+-} xrx300_gphy[] = {
+-	{RCU_RD_GPHY0_XRX300, RCU_GFS_ADD0_XRX300},
+-	{RCU_RD_GPHY1_XRX300, RCU_GFS_ADD1_XRX300},
+-	{RCU_RD_GPHY2_XRX300, RCU_GFS_ADD2_XRX300},
+-};
+-
+-/* reset / boot a gphy */
+-static struct ltq_xrx330_gphy_reset {
+-	u32 rd;
+-	u32 addr;
+-} xrx330_gphy[] = {
+-	{RCU_RD_GPHY0_XRX330, RCU_GFS_ADD0_XRX330},
+-	{RCU_RD_GPHY1_XRX330, RCU_GFS_ADD1_XRX330},
+-	{RCU_RD_GPHY2_XRX330, RCU_GFS_ADD2_XRX330},
+-	{RCU_RD_GPHY3_XRX330, RCU_GFS_ADD3_XRX330},
+-};
+-
+-/* reset and boot a gphy. these phys only exist on xrx200 SoC */
+-int xrx200_gphy_boot(struct device *dev, unsigned int id, dma_addr_t dev_addr)
+-{
+-
+-	if (!of_device_is_compatible(ltq_rcu_np, "lantiq,rcu-xrx200")) {
+-		dev_err(dev, "this SoC has no GPHY\n");
+-		return -EINVAL;
+-	}
+-
+-	if (of_machine_is_compatible("lantiq,vr9")) {
+-		struct clk *clk;
+-		clk = clk_get_sys("1f203000.rcu", "gphy");
+-		if (IS_ERR(clk))
+-			return PTR_ERR(clk);
+-		clk_enable(clk);
+-	}
+-
+-	dev_info(dev, "booting GPHY%u firmware at %X\n", id, dev_addr);
+-
+-	if (of_machine_is_compatible("lantiq,vr9")) {
+-		if (id > 1) {
+-			dev_err(dev, "%u is an invalid gphy id\n", id);
+-			return -EINVAL;
+-		}
+-		ltq_rcu_w32_mask(0, xrx200_gphy[id].rd, RCU_RST_REQ);
+-		ltq_rcu_w32(dev_addr, xrx200_gphy[id].addr);
+-		ltq_rcu_w32_mask(xrx200_gphy[id].rd, 0,  RCU_RST_REQ);
+-	} else if (of_machine_is_compatible("lantiq,ar10")) {
+-		if (id > 2) {
+-			dev_err(dev, "%u is an invalid gphy id\n", id);
+-			return -EINVAL;
+-		}
+-		ltq_rcu_w32_mask(0, xrx300_gphy[id].rd, RCU_RST_REQ);
+-		ltq_rcu_w32(dev_addr, xrx300_gphy[id].addr);
+-		ltq_rcu_w32_mask(xrx300_gphy[id].rd, 0,  RCU_RST_REQ);
+-	} else if (of_machine_is_compatible("lantiq,grx390")) {
+-		if (id > 3) {
+-			dev_err(dev, "%u is an invalid gphy id\n", id);
+-			return -EINVAL;
+-		}
+-		ltq_rcu_w32_mask(0, xrx330_gphy[id].rd, RCU_RST_REQ);
+-		ltq_rcu_w32(dev_addr, xrx330_gphy[id].addr);
+-		ltq_rcu_w32_mask(xrx330_gphy[id].rd, 0,  RCU_RST_REQ);
+-	}
+-	return 0;
+-}
+ 
+ /* reset a io domain for u micro seconds */
+ void ltq_reset_once(unsigned int module, ulong u)
+@@ -216,24 +139,52 @@ void ltq_rcu_w32_mask(uint32_t clr, uint
+ }
+ EXPORT_SYMBOL_GPL(ltq_rcu_w32_mask);
+ 
+-#if 0
+-static void ltq_xbar_ahb1s_big_endian(void)
++void ltq_endian_set(int bitn)
+ {
+-	ltq_rcu_w32_mask(0, RCU_VR9_BE_AHB1S, RCU_AHB_ENDIAN);
++	ltq_rcu_w32_mask(0, BIT(bitn), RCU_AHB_ENDIAN);
+ }
+-#endif
++EXPORT_SYMBOL_GPL(ltq_endian_set);
++
++void ltq_pcie_clk_out(int bitn)
++{
++	ltq_rcu_w32_mask(BIT(bitn), 0, RCU_IFMUX_CFG);
++}
++EXPORT_SYMBOL_GPL(ltq_pcie_clk_out);
++
++void ltq_endian_clr(int bitn)
++{
++	ltq_rcu_w32_mask(BIT(bitn), 0, RCU_AHB_ENDIAN);
++}
++EXPORT_SYMBOL_GPL(ltq_endian_clr);
++
++void ltq_usb_phy_reset(unsigned int nbit)
++{
++	ltq_rcu_w32_mask(nbit, 0, RCU_RST_REQ2);
++}
++EXPORT_SYMBOL_GPL(ltq_usb_phy_reset);
++
++void ltq_usb0_port_endian_set(unsigned int clr, unsigned int set)
++{
++	ltq_rcu_w32_mask(clr, set, RCU_USB0_CFG);
++}
++EXPORT_SYMBOL_GPL(ltq_usb0_port_endian_set);
++
++void ltq_usb1_port_endian_set(unsigned int clr, unsigned int set)
++{
++	ltq_rcu_w32_mask(clr, set, RCU_USB1_CFG);
++}
++EXPORT_SYMBOL_GPL(ltq_usb1_port_endian_set);
+ 
+ static int ltq_assert_device(struct reset_controller_dev *rcdev,
+ 				unsigned long id)
+ {
+ 	u32 val;
++	int regidx = id >> 5;
++	int regbit = id & 0x1F;
+ 
+-	if (id < 8)
+-		return -1;
+-
+-	val = ltq_rcu_r32(RCU_RST_REQ);
+-	val |= BIT(id);
+-	ltq_rcu_w32(val, RCU_RST_REQ);
++	val = ltq_rcu_r32(RCU_REQ_REG(regidx));
++	val |= BIT(regbit);
++	ltq_rcu_w32(val, RCU_REQ_REG(regidx));
+ 
+ 	return 0;
+ }
+@@ -242,13 +193,12 @@ static int ltq_deassert_device(struct re
+ 				  unsigned long id)
+ {
+ 	u32 val;
++	int regidx = id >> 5;
++	int regbit = id & 0x1F;
+ 
+-	if (id < 8)
+-		return -1;
+-
+-	val = ltq_rcu_r32(RCU_RST_REQ);
+-	val &= ~BIT(id);
+-	ltq_rcu_w32(val, RCU_RST_REQ);
++	val = ltq_rcu_r32(RCU_REQ_REG(regidx));
++	val &= ~BIT(regbit);
++	ltq_rcu_w32(val, RCU_REQ_REG(regidx));
+ 
+ 	return 0;
+ }
+@@ -256,8 +206,13 @@ static int ltq_deassert_device(struct re
+ static int ltq_reset_device(struct reset_controller_dev *rcdev,
+ 			       unsigned long id)
+ {
+-	ltq_assert_device(rcdev, id);
+-	return ltq_deassert_device(rcdev, id);
++	int regidx = id >> 5;
++	int regbit = id & 0x1F;
++	
++	ltq_rcu_w32(BIT(regbit), RCU_REQ_REG(regidx));
++	while (!(ltq_rcu_r32(RCU_STAT_REG(regidx)) & (BIT(regbit))))
++		;
++	return 0;
+ }
+ 
+ static struct reset_control_ops reset_ops = {
+@@ -269,17 +224,31 @@ static struct reset_control_ops reset_op
+ static struct reset_controller_dev reset_dev = {
+ 	.ops			= &reset_ops,
+ 	.owner			= THIS_MODULE,
+-	.nr_resets		= 32,
++	.nr_resets		= 64,
+ 	.of_reset_n_cells	= 1,
+ };
+ 
++#if 0
++/* NB, put it into reset state until GPHY take it out of reset 
++ * it tries to fix half-way packet issues
++ */
++static void gphy_rst_assert(void)
++{
++	ltq_rcu_w32_mask(0, BIT(31), RCU_RST_REQ); /* GPHY6F */
++	ltq_rcu_w32_mask(0, BIT(29), RCU_RST_REQ); /* GPHY2 */
++	ltq_rcu_w32_mask(0, BIT(28), RCU_RST_REQ); /* GPHY3 */
++	ltq_rcu_w32_mask(0, BIT(26), RCU_RST_REQ); /* GPHY4 */
++	ltq_rcu_w32_mask(0, BIT(25), RCU_RST_REQ); /* GPHY5 */
++}
++#endif
++
+ void ltq_rst_init(void)
+ {
+ 	reset_dev.of_node = of_find_compatible_node(NULL, NULL,
+-						"lantiq,xway-reset");
++				"lantiq,rcu-grx500");
+ 	if (!reset_dev.of_node)
+ 		pr_err("Failed to find reset controller node");
+-	else
++	if (IS_ENABLED(CONFIG_RESET_CONTROLLER))
+ 		reset_controller_register(&reset_dev);
+ }
+ 
+@@ -306,7 +275,9 @@ static int __init mips_reboot_setup(void
+ {
+ 	struct resource res;
+ 
+-	ltq_rcu_np = of_find_compatible_node(NULL, NULL, "lantiq,rcu-grx500");
++
++	ltq_rcu_np = of_find_compatible_node(NULL, NULL,
++				"lantiq,rcu-grx500");
+ 
+ 	/* check if all the reset register range is available */
+ 	if (!ltq_rcu_np)
+@@ -315,7 +286,7 @@ static int __init mips_reboot_setup(void
+ 	if (of_address_to_resource(ltq_rcu_np, 0, &res))
+ 		panic("Failed to get rcu memory range");
+ 
+-	if (request_mem_region(res.start, resource_size(&res), res.name) < 0)
++	if (!request_mem_region(res.start, resource_size(&res), res.name))
+ 		pr_err("Failed to request rcu memory");
+ 
+ 	ltq_rcu_membase = ioremap_nocache(res.start, resource_size(&res));
+@@ -325,6 +296,11 @@ static int __init mips_reboot_setup(void
+ 	_machine_restart = ltq_machine_restart;
+ 	_machine_halt = ltq_machine_halt;
+ 	pm_power_off = ltq_machine_power_off;
++
++	/*gphy_rst_assert();*/
++#ifdef CONFIG_LTQ_ETHSW_API
++	gsw_api_disable_switch_ports();
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/arch/mips/lantiq/xway/reset.c b/arch/mips/lantiq/xway/reset.c
+--- a/arch/mips/lantiq/xway/reset.c
++++ b/arch/mips/lantiq/xway/reset.c
+@@ -27,12 +27,16 @@
+ #define RCU_RST_REQ		0x0010
+ /* reset status register */
+ #define RCU_RST_STAT		0x0014
++
++#define RCU_RST_STAT2		0x0024
++#define RCU_RST_REQ2		0x0048
++
+ /* vr9 gphy registers */
+ #define RCU_GFS_ADD0_XRX200	0x0020
+ #define RCU_GFS_ADD1_XRX200	0x0068
+ 
+ #define RCU_AHB_ENDIAN		0x004C
+-#define RCU_VR9_BE_AHB1S	0x00000008
++#define RCU_VR9_BE_AHB1S	3
+ 
+ /* reboot bit */
+ #define RCU_RD_GPHY0_XRX200	BIT(31)
+@@ -68,6 +72,22 @@
+ #define RCU_BOOT_SEL_XRX200(x)	(((x >> 17) & 0xf) | ((x >> 8) & 0x10))
+ 
+ /* remapped base addr of the reset control unit */
++
++/* Status */
++static u32 rcu_stat[] = {
++	RCU_RST_STAT,
++	RCU_RST_STAT2,
++};
++
++/* request */
++static u32 rcu_req[] = {
++	RCU_RST_REQ,
++	RCU_RST_REQ2,
++};
++
++#define RCU_STAT_REG(x)		(rcu_stat[(x)])
++#define RCU_REQ_REG(x)		(rcu_req[(x)])
++
+ static void __iomem *ltq_rcu_membase;
+ static struct device_node *ltq_rcu_np;
+ static DEFINE_SPINLOCK(ltq_rcu_lock);
+@@ -216,22 +236,33 @@ void ltq_rcu_w32_mask(uint32_t clr, uint
+ }
+ EXPORT_SYMBOL_GPL(ltq_rcu_w32_mask);
+ 
++void ltq_endian_set(int bitn)
++{
++	ltq_rcu_w32_mask(0, BIT(bitn), RCU_AHB_ENDIAN);
++}
++EXPORT_SYMBOL_GPL(ltq_endian_set);
++
++void ltq_endian_clr(int bitn)
++{
++	ltq_rcu_w32_mask(BIT(bitn), 0, RCU_AHB_ENDIAN);
++}
++EXPORT_SYMBOL_GPL(ltq_endian_clr);
++
+ static void ltq_xbar_ahb1s_big_endian(void)
+ {
+-	ltq_rcu_w32_mask(0, RCU_VR9_BE_AHB1S, RCU_AHB_ENDIAN);
++	ltq_endian_set(RCU_VR9_BE_AHB1S);
+ }
+ 
+ static int ltq_assert_device(struct reset_controller_dev *rcdev,
+ 				unsigned long id)
+ {
+ 	u32 val;
++	int regidx = id >> 5;
++	int regbit = id & 0x1F;
+ 
+-	if (id < 8)
+-		return -1;
+-
+-	val = ltq_rcu_r32(RCU_RST_REQ);
+-	val |= BIT(id);
+-	ltq_rcu_w32(val, RCU_RST_REQ);
++	val = ltq_rcu_r32(RCU_REQ_REG(regidx));
++	val |= BIT(regbit);
++	ltq_rcu_w32(val, RCU_REQ_REG(regidx));
+ 
+ 	return 0;
+ }
+@@ -240,13 +271,12 @@ static int ltq_deassert_device(struct re
+ 				  unsigned long id)
+ {
+ 	u32 val;
++	int regidx = id >> 5;
++	int regbit = id & 0x1F;
+ 
+-	if (id < 8)
+-		return -1;
+-
+-	val = ltq_rcu_r32(RCU_RST_REQ);
+-	val &= ~BIT(id);
+-	ltq_rcu_w32(val, RCU_RST_REQ);
++	val = ltq_rcu_r32(RCU_REQ_REG(regidx));
++	val &= ~BIT(regbit);
++	ltq_rcu_w32(val, RCU_REQ_REG(regidx));
+ 
+ 	return 0;
+ }
+@@ -254,8 +284,13 @@ static int ltq_deassert_device(struct re
+ static int ltq_reset_device(struct reset_controller_dev *rcdev,
+ 			       unsigned long id)
+ {
+-	ltq_assert_device(rcdev, id);
+-	return ltq_deassert_device(rcdev, id);
++	int regidx = id >> 5;
++	int regbit = id & 0x1F;
++	
++	ltq_rcu_w32(BIT(regbit), RCU_REQ_REG(regidx));
++	while (!(ltq_rcu_r32(RCU_STAT_REG(regidx)) & (BIT(regbit))))
++		;
++	return 0;
+ }
+ 
+ static struct reset_control_ops reset_ops = {
+@@ -267,17 +302,20 @@ static struct reset_control_ops reset_op
+ static struct reset_controller_dev reset_dev = {
+ 	.ops			= &reset_ops,
+ 	.owner			= THIS_MODULE,
+-	.nr_resets		= 32,
++	.nr_resets		= 64,
+ 	.of_reset_n_cells	= 1,
+ };
+ 
+ void ltq_rst_init(void)
+ {
+ 	reset_dev.of_node = of_find_compatible_node(NULL, NULL,
+-						"lantiq,xway-reset");
++				"lantiq,rcu-xway");
++	if (!reset_dev.of_node)
++		reset_dev.of_node = of_find_compatible_node(NULL, NULL,
++					"lantiq,rcu-xrx200");
+ 	if (!reset_dev.of_node)
+ 		pr_err("Failed to find reset controller node");
+-	else
++	if (IS_ENABLED(CONFIG_RESET_CONTROLLER))
+ 		reset_controller_register(&reset_dev);
+ }
+ 

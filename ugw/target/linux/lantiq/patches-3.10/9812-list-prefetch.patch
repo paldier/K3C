@@ -1,0 +1,262 @@
+It adds prefetch instruction in some mostfrequently macros operating on list. Experiments show 
+around 7-10% increase in throughput for cpu bound routing traffic.
+
+diff --git a/include/linux/list.h b/include/linux/list.h
+--- a/include/linux/list.h
++++ b/include/linux/list.h
+@@ -377,8 +377,14 @@ static inline void list_splice_tail_init
+  * @pos:	the &struct list_head to use as a loop cursor.
+  * @head:	the head for your list.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++#define list_for_each(pos, head) \
++	for (pos = (head)->next; prefetch(pos->next), pos != (head); \
++        	pos = pos->next)
++#else
+ #define list_for_each(pos, head) \
+ 	for (pos = (head)->next; pos != (head); pos = pos->next)
++#endif
+ 
+ /**
+  * __list_for_each	-	iterate over a list
+@@ -388,16 +394,28 @@ static inline void list_splice_tail_init
+  * This variant doesn't differ from list_for_each() any more.
+  * We don't do prefetching in either case.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++#define __list_for_each(pos, head) \
++	for (pos = (head)->next; prefetch(pos->next), pos != (head); pos = pos->next)
++#else
+ #define __list_for_each(pos, head) \
+ 	for (pos = (head)->next; pos != (head); pos = pos->next)
++#endif
+ 
+ /**
+  * list_for_each_prev	-	iterate over a list backwards
+  * @pos:	the &struct list_head to use as a loop cursor.
+  * @head:	the head for your list.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++#define list_for_each_prev(pos, head) \
++	for (pos = (head)->prev; prefetch(pos->prev), pos != (head); \
++        	pos = pos->prev)
++#else
+ #define list_for_each_prev(pos, head) \
+ 	for (pos = (head)->prev; pos != (head); pos = pos->prev)
++#endif
++
+ 
+ /**
+  * list_for_each_safe - iterate over a list safe against removal of list entry
+@@ -405,20 +423,35 @@ static inline void list_splice_tail_init
+  * @n:		another &struct list_head to use as temporary storage
+  * @head:	the head for your list.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++#define list_for_each_safe(pos, n, head) \
++	for (pos = (head)->next, n = pos->next; prefetch(pos->next), pos != (head); \
++		pos = n, n = pos->next)
++#else
+ #define list_for_each_safe(pos, n, head) \
+ 	for (pos = (head)->next, n = pos->next; pos != (head); \
+ 		pos = n, n = pos->next)
+ 
++#endif
++
+ /**
+  * list_for_each_prev_safe - iterate over a list backwards safe against removal of list entry
+  * @pos:	the &struct list_head to use as a loop cursor.
+  * @n:		another &struct list_head to use as temporary storage
+  * @head:	the head for your list.
+  */
++
++#ifdef CONFIG_LTQ_LIST_PREFETCH 
++#define list_for_each_prev_safe(pos, n, head) \
++	for (pos = (head)->prev, n = pos->prev; \
++	     prefetch(pos->prev), pos != (head); \
++	     pos = n, n = pos->prev)
++#else
+ #define list_for_each_prev_safe(pos, n, head) \
+ 	for (pos = (head)->prev, n = pos->prev; \
+ 	     pos != (head); \
+ 	     pos = n, n = pos->prev)
++#endif
+ 
+ /**
+  * list_for_each_entry	-	iterate over list of given type
+@@ -426,10 +459,17 @@ static inline void list_splice_tail_init
+  * @head:	the head for your list.
+  * @member:	the name of the list_struct within the struct.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH 
++#define list_for_each_entry(pos, head, member)				\
++	for (pos = list_entry((head)->next, typeof(*pos), member);	\
++	     prefetch(pos->member.next), &pos->member != (head); 	\
++	     pos = list_entry(pos->member.next, typeof(*pos), member))
++#else
+ #define list_for_each_entry(pos, head, member)				\
+ 	for (pos = list_entry((head)->next, typeof(*pos), member);	\
+ 	     &pos->member != (head); 	\
+ 	     pos = list_entry(pos->member.next, typeof(*pos), member))
++#endif
+ 
+ /**
+  * list_for_each_entry_reverse - iterate backwards over list of given type.
+@@ -437,10 +477,17 @@ static inline void list_splice_tail_init
+  * @head:	the head for your list.
+  * @member:	the name of the list_struct within the struct.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH 
++#define list_for_each_entry_reverse(pos, head, member)			\
++	for (pos = list_entry((head)->prev, typeof(*pos), member);	\
++	     prefetch(pos->member.prev), &pos->member != (head); 	\
++	     pos = list_entry(pos->member.prev, typeof(*pos), member))
++#else
+ #define list_for_each_entry_reverse(pos, head, member)			\
+ 	for (pos = list_entry((head)->prev, typeof(*pos), member);	\
+ 	     &pos->member != (head); 	\
+ 	     pos = list_entry(pos->member.prev, typeof(*pos), member))
++#endif
+ 
+ /**
+  * list_prepare_entry - prepare a pos entry for use in list_for_each_entry_continue()
+@@ -462,10 +509,17 @@ static inline void list_splice_tail_init
+  * Continue to iterate over list of given type, continuing after
+  * the current position.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++#define list_for_each_entry_continue(pos, head, member) 		\
++	for (pos = list_entry(pos->member.next, typeof(*pos), member);	\
++	     prefetch(pos->member.next), &pos->member != (head);	\
++	     pos = list_entry(pos->member.next, typeof(*pos), member))
++#else
+ #define list_for_each_entry_continue(pos, head, member) 		\
+ 	for (pos = list_entry(pos->member.next, typeof(*pos), member);	\
+ 	     &pos->member != (head);	\
+ 	     pos = list_entry(pos->member.next, typeof(*pos), member))
++#endif
+ 
+ /**
+  * list_for_each_entry_continue_reverse - iterate backwards from the given point
+@@ -476,10 +530,17 @@ static inline void list_splice_tail_init
+  * Start to iterate over list of given type backwards, continuing after
+  * the current position.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH 
++#define list_for_each_entry_continue_reverse(pos, head, member)		\
++	for (pos = list_entry(pos->member.prev, typeof(*pos), member);	\
++	     prefetch(pos->member.prev), &pos->member != (head);	\
++	     pos = list_entry(pos->member.prev, typeof(*pos), member))
++#else
+ #define list_for_each_entry_continue_reverse(pos, head, member)		\
+ 	for (pos = list_entry(pos->member.prev, typeof(*pos), member);	\
+ 	     &pos->member != (head);	\
+ 	     pos = list_entry(pos->member.prev, typeof(*pos), member))
++#endif
+ 
+ /**
+  * list_for_each_entry_from - iterate over list of given type from the current point
+@@ -489,9 +550,15 @@ static inline void list_splice_tail_init
+  *
+  * Iterate over list of given type, continuing from current position.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++#define list_for_each_entry_from(pos, head, member) 			\
++	for (; prefetch(pos->member.next), &pos->member != (head);	\
++	     pos = list_entry(pos->member.next, typeof(*pos), member))
++#else
+ #define list_for_each_entry_from(pos, head, member) 			\
+ 	for (; &pos->member != (head);	\
+ 	     pos = list_entry(pos->member.next, typeof(*pos), member))
++#endif
+ 
+ /**
+  * list_for_each_entry_safe - iterate over list of given type safe against removal of list entry
+@@ -500,11 +567,19 @@ static inline void list_splice_tail_init
+  * @head:	the head for your list.
+  * @member:	the name of the list_struct within the struct.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++#define list_for_each_entry_safe(pos, n, head, member)			\
++	for (pos = list_entry((head)->next, typeof(*pos), member),	\
++		n = list_entry(pos->member.next, typeof(*pos), member);	\
++	     prefetch(n->member.next), &pos->member != (head); 					\
++	     pos = n, n = list_entry(n->member.next, typeof(*n), member))
++#else
+ #define list_for_each_entry_safe(pos, n, head, member)			\
+ 	for (pos = list_entry((head)->next, typeof(*pos), member),	\
+ 		n = list_entry(pos->member.next, typeof(*pos), member);	\
+ 	     &pos->member != (head); 					\
+ 	     pos = n, n = list_entry(n->member.next, typeof(*n), member))
++#endif
+ 
+ /**
+  * list_for_each_entry_safe_continue - continue list iteration safe against removal
+@@ -670,18 +745,32 @@ static inline void hlist_move_list(struc
+ 
+ #define hlist_entry(ptr, type, member) container_of(ptr,type,member)
+ 
++#ifdef CONFIG_LTQ_LIST_PREFETCH
++
++#define hlist_for_each(pos, head) \
++	for (pos = (head)->first; pos && ({ prefetch(pos->next); 1; }); \
++	     pos = pos->next)
++
++#define hlist_for_each_safe(pos, n, head) \
++	for (pos = (head)->first; pos && ({ n = pos->next; 1; }); \
++	     pos = n)
++
++#else
++
+ #define hlist_for_each(pos, head) \
+ 	for (pos = (head)->first; pos ; pos = pos->next)
+ 
+ #define hlist_for_each_safe(pos, n, head) \
+ 	for (pos = (head)->first; pos && ({ n = pos->next; 1; }); \
+ 	     pos = n)
++#endif
+ 
+ #define hlist_entry_safe(ptr, type, member) \
+ 	({ typeof(ptr) ____ptr = (ptr); \
+ 	   ____ptr ? hlist_entry(____ptr, type, member) : NULL; \
+ 	})
+ 
++
+ /**
+  * hlist_for_each_entry	- iterate over list of given type
+  * @pos:	the type * to use as a loop cursor.
+@@ -698,10 +787,18 @@ static inline void hlist_move_list(struc
+  * @pos:	the type * to use as a loop cursor.
+  * @member:	the name of the hlist_node within the struct.
+  */
++#ifdef CONFIG_LTQ_LIST_PREFETCH 
++#define hlist_for_each_entry_continue(tpos, pos, member)		 \
++	for (pos = (pos)->next;						 \
++	     pos && ({ prefetch(pos->next); 1;}) &&			 \
++		({ tpos = hlist_entry(pos, typeof(*tpos), member); 1;}); \
++	     pos = pos->next)
++#else
+ #define hlist_for_each_entry_continue(pos, member)			\
+ 	for (pos = hlist_entry_safe((pos)->member.next, typeof(*(pos)), member);\
+ 	     pos;							\
+ 	     pos = hlist_entry_safe((pos)->member.next, typeof(*(pos)), member))
++#endif
+ 
+ /**
+  * hlist_for_each_entry_from - iterate over a hlist continuing from current point
+diff --git a/init/Kconfig b/init/Kconfig
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1829,3 +1829,12 @@ config ASN1
+ 	  functions to call on what tags.
+ 
+ source "kernel/Kconfig.locks"
++
++config LTQ_LIST_PREFETCH
++	bool
++	default y
++	help
++	  This macro adds prefetch instruction in some frequently used 
++	  list manipulating macros. Experiment shows around 7-10% 
++	  increase in network throughput for cpu bound routing traffic.
++

@@ -1,0 +1,123 @@
+XWAY Platform specific changes to enable interrupts during initialization
+
+diff --git a/arch/mips/kernel/irq_cpu.c b/arch/mips/kernel/irq_cpu.c
+--- a/arch/mips/kernel/irq_cpu.c
++++ b/arch/mips/kernel/irq_cpu.c
+@@ -37,6 +37,11 @@
+ #include <asm/mipsregs.h>
+ #include <asm/mipsmtregs.h>
+ 
++#ifdef CONFIG_SOC_XWAY
++#include <xway/irq.h>
++#endif
++
++
+ static inline void unmask_mips_irq(struct irq_data *d)
+ {
+ 	set_c0_status(0x100 << (d->irq - MIPS_CPU_IRQ_BASE));
+@@ -69,8 +74,15 @@ static unsigned int mips_mt_cpu_irq_star
+ 	unsigned int vpflags = dvpe();
+ 
+ 	clear_c0_cause(0x100 << (d->irq - MIPS_CPU_IRQ_BASE));
++#ifndef CONFIG_SOC_XWAY
+ 	evpe(vpflags);
++#endif
+ 	unmask_mips_irq(d);
++
++#ifdef CONFIG_SOC_XWAY
++       evpe(vpflags);
++#endif
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/mips/kernel/rtlx.c b/arch/mips/kernel/rtlx.c
+--- a/arch/mips/kernel/rtlx.c
++++ b/arch/mips/kernel/rtlx.c
+@@ -35,6 +35,7 @@
+ #include <asm/mipsmtregs.h>
+ #include <asm/mips_mt.h>
+ #include <asm/cacheflush.h>
++#include <asm/setup.h>
+ #include <linux/atomic.h>
+ #include <asm/cpu.h>
+ #include <asm/processor.h>
+diff --git a/arch/mips/kernel/smp-mt.c b/arch/mips/kernel/smp-mt.c
+--- a/arch/mips/kernel/smp-mt.c
++++ b/arch/mips/kernel/smp-mt.c
+@@ -187,13 +187,24 @@ static void __cpuinit vsmp_init_secondar
+ {
+ #ifdef CONFIG_IRQ_GIC
+ 	/* This is Malta specific: IPI,performance and timer interrupts */
+-	if (gic_present)
++	if (gic_present) {
++#ifdef CONFIG_SOC_XWAY
++               set_c0_status(ST0_IM); //enable all the interrupt lines.
++#else
+ 		change_c0_status(ST0_IM, STATUSF_IP3 | STATUSF_IP4 |
+ 					 STATUSF_IP6 | STATUSF_IP7);
+-	else
+ #endif
++	} else {
++#endif
++#ifdef CONFIG_SOC_XWAY
++               set_c0_status(ST0_IM); //enable all the interrupt lines.
++#else
+ 		change_c0_status(ST0_IM, STATUSF_IP0 | STATUSF_IP1 |
+ 					 STATUSF_IP6 | STATUSF_IP7);
++#endif
++#ifdef CONFIG_IRQ_GIC
++	}
++#endif
+ }
+ 
+ static void __cpuinit vsmp_smp_finish(void)
+diff --git a/arch/mips/kernel/smtc.c b/arch/mips/kernel/smtc.c
+--- a/arch/mips/kernel/smtc.c
++++ b/arch/mips/kernel/smtc.c
+@@ -566,10 +566,18 @@ void smtc_prepare_cpus(int cpus)
+ 			 * Clear ERL/EXL of VPEs other than 0
+ 			 * and set restricted interrupt enable/mask.
+ 			 */
++
++#ifdef CONFIG_SOC_XWAY // Enable IE and IM bits for all the intr lines.
++                        write_vpe_c0_status((read_vpe_c0_status()
++                                & ~(ST0_BEV | ST0_ERL | ST0_EXL))
++                                | (ST0_IM | ST0_IE));
++#else
++
+ 			write_vpe_c0_status((read_vpe_c0_status()
+ 				& ~(ST0_BEV | ST0_ERL | ST0_EXL | ST0_IM))
+ 				| (STATUSF_IP0 | STATUSF_IP1 | STATUSF_IP7
+ 				| ST0_IE));
++#endif
+ 			/*
+ 			 * set config to be the same as vpe0,
+ 			 *  particularly kseg0 coherency alg
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -1556,7 +1556,11 @@ void __noreturn nmi_exception_handler(st
+ 	regs->cp0_epc = epc;
+ }
+ 
++#if defined(CONFIG_SOC_XWAY) || defined(CONFIG_SOC_GRX500)
++#define VECTORSPACING 0x200     /* for EI/VI mode */
++#else
+ #define VECTORSPACING 0x100	/* for EI/VI mode */
++#endif
+ 
+ unsigned long ebase;
+ unsigned long exception_handlers[32];
+diff --git a/arch/mips/kernel/vpe.c b/arch/mips/kernel/vpe.c
+--- a/arch/mips/kernel/vpe.c
++++ b/arch/mips/kernel/vpe.c
+@@ -1840,6 +1840,8 @@ static int __init vpe_module_init(void)
+ 
+ 			v->ntcs = hw_tcs - tclimit;
+ 
++                       write_tc_c0_tcbind((read_tc_c0_tcbind() & ~TCBIND_CURVPE) | 1);
++
+ 			/* add the tc to the list of this vpe's tc's. */
+ 			list_add(&t->tc, &v->tc);
+ 

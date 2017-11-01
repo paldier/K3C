@@ -1,0 +1,74 @@
+# HG changeset patch
+# Parent 8a2783d97957fdb1ce116edb52e1f6c62ff65f14
+
+diff --git a/arch/mips/include/asm/cacheflush.h b/arch/mips/include/asm/cacheflush.h
+--- a/arch/mips/include/asm/cacheflush.h
++++ b/arch/mips/include/asm/cacheflush.h
+@@ -115,6 +115,12 @@ unsigned long run_uncached(void *func);
+ 
+ extern void *kmap_coherent(struct page *page, unsigned long addr);
+ extern void kunmap_coherent(void);
++extern void *kmap_noncoherent(struct page *page, unsigned long addr);
++
++static inline void kunmap_noncoherent(void)
++{
++	kunmap_coherent();
++}
+ 
+ #define ARCH_HAS_FLUSH_KERNEL_DCACHE_PAGE
+ static inline void flush_kernel_dcache_page(struct page *page)
+diff --git a/arch/mips/include/asm/pgtable.h b/arch/mips/include/asm/pgtable.h
+--- a/arch/mips/include/asm/pgtable.h
++++ b/arch/mips/include/asm/pgtable.h
+@@ -32,6 +32,8 @@ struct vm_area_struct;
+ 				 _page_cachable_default)
+ #define PAGE_KERNEL	__pgprot(_PAGE_PRESENT | __READABLE | __WRITEABLE | \
+ 				 _PAGE_GLOBAL | _page_cachable_default)
++#define PAGE_KERNEL_NC	__pgprot(_PAGE_PRESENT | __READABLE | __WRITEABLE | \
++				 _PAGE_GLOBAL | _CACHE_CACHABLE_NONCOHERENT)
+ #define PAGE_USERIO	__pgprot(_PAGE_PRESENT | (cpu_has_rixi ? 0 : _PAGE_READ) | _PAGE_WRITE | \
+ 				 _page_cachable_default)
+ #define PAGE_KERNEL_UNCACHED __pgprot(_PAGE_PRESENT | __READABLE | \
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -114,11 +114,11 @@ static void __init kmap_coherent_init(vo
+ static inline void kmap_coherent_init(void) {}
+ #endif
+ 
+-void *kmap_coherent(struct page *page, unsigned long addr)
++static void *__kmap_pgprot(struct page *page, unsigned long addr, pgprot_t prot)
+ {
+ #ifdef CONFIG_EVA
+ 	dump_stack();
+-	panic("kmap_coherent");
++	panic("__kmap_pgprot");
+ #else
+ 
+ 	enum fixed_addresses idx;
+@@ -137,7 +137,7 @@ void *kmap_coherent(struct page *page, u
+ 	idx += in_interrupt() ? FIX_N_COLOURS : 0;
+ #endif
+ 	vaddr = __fix_to_virt(FIX_CMAP_END - idx);
+-	pte = mk_pte(page, PAGE_KERNEL);
++	pte = mk_pte(page, prot);
+ #if defined(CONFIG_64BIT_PHYS_ADDR) && defined(CONFIG_CPU_MIPS32)
+ 	entrylo = pte.pte_high;
+ #else
+@@ -176,6 +176,16 @@ void *kmap_coherent(struct page *page, u
+ #endif /* CONFIG_EVA */
+ }
+ 
++void *kmap_coherent(struct page *page, unsigned long addr)
++{
++	return __kmap_pgprot(page, addr, PAGE_KERNEL);
++}
++
++void *kmap_noncoherent(struct page *page, unsigned long addr)
++{
++	return __kmap_pgprot(page, addr, PAGE_KERNEL_NC);
++}
++
+ #define UNIQUE_ENTRYHI(idx) (cpu_has_tlbinv ? ((CKSEG0 + ((idx) << (PAGE_SHIFT + 1))) | MIPS_EHINV) : \
+ 			     (CKSEG0 + ((idx) << (PAGE_SHIFT + 1))))
+ 

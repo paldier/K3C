@@ -1,0 +1,86 @@
+UGW: add a kernel_menuconfig method CONFIG_TARGET=local which builds kernel from local changes (set as default). This also shows .config.override changes
+and will be overridden with local/kernel-config file. Also reconfigures kernel with target configs by forcing default values which was not defined or not set in configs.
+
+diff --git a/include/kernel-build.mk b/include/kernel-build.mk
+--- a/include/kernel-build.mk
++++ b/include/kernel-build.mk
+@@ -115,8 +115,13 @@ define BuildKernel
+ 
+   oldconfig menuconfig nconfig: $(STAMP_PREPARED) $(STAMP_CHECKED) FORCE
+ 	rm -f $(STAMP_CONFIGURED)
++ifeq ($(CONFIG_TARGET),local)
++	$(call Kernel/Configure/Default)
++else
+ 	$(LINUX_RECONF_CMD) > $(LINUX_DIR)/.config
++endif
+ 	$(_SINGLE)$(MAKE) -C $(LINUX_DIR) $(KERNEL_MAKEOPTS) $$@
++	mkdir -p `dirname $(LINUX_RECONFIG_TARGET)`
+ 	$(LINUX_RECONF_DIFF) $(LINUX_DIR)/.config > $(LINUX_RECONFIG_TARGET)
+ 
+   install: $(LINUX_DIR)/.image
+diff --git a/include/kernel-defaults.mk b/include/kernel-defaults.mk
+--- a/include/kernel-defaults.mk
++++ b/include/kernel-defaults.mk
+@@ -109,8 +109,15 @@
+ 	echo "# CONFIG_KALLSYMS_ALL is not set" >> $(LINUX_DIR)/.config.target
+ 	echo "# CONFIG_KALLSYMS_UNCOMPRESSED is not set" >> $(LINUX_DIR)/.config.target
+ 	$(SCRIPT_DIR)/metadata.pl kconfig $(TMP_DIR)/.packageinfo $(TOPDIR)/.config $(KERNEL_PATCHVER) > $(LINUX_DIR)/.config.override
+-	$(SCRIPT_DIR)/kconfig.pl 'm+' '+' $(LINUX_DIR)/.config.target /dev/null $(LINUX_DIR)/.config.override > $(LINUX_DIR)/.config
+-	$(call Kernel/SetNoInitramfs)
++	$(if $(wildcard $(TOPDIR)/local/kernel-config),
++		$(if $(wildcard $(LINUX_DIR)/.config),,
++			$(SCRIPT_DIR)/kconfig.pl '+' 'm+' '+' $(LINUX_DIR)/.config.target /dev/null $(LINUX_DIR)/.config.override $(TOPDIR)/local/kernel-config > $(LINUX_DIR)/.config
++		)
++	,
++		$(SCRIPT_DIR)/kconfig.pl 'm+' '+' $(LINUX_DIR)/.config.target /dev/null $(LINUX_DIR)/.config.override > $(LINUX_DIR)/.config
++		$(call Kernel/SetInitramfs)
++	)
++	-$(_SINGLE)yes ""|$(MAKE) $(KERNEL_MAKEOPTS) oldconfig prepare scripts 	
+ 	rm -rf $(KERNEL_BUILD_DIR)/modules
+ 	$(_SINGLE) [ -d $(LINUX_DIR)/user_headers ] || $(MAKE) $(KERNEL_MAKEOPTS) INSTALL_HDR_PATH=$(LINUX_DIR)/user_headers headers_install
+ 	$(SH_FUNC) grep '=[ym]' $(LINUX_DIR)/.config | LC_ALL=C sort | md5s > $(LINUX_DIR)/.vermagic
+diff --git a/include/target.mk b/include/target.mk
+--- a/include/target.mk
++++ b/include/target.mk
+@@ -123,7 +123,11 @@ ifneq ($(PLATFORM_DIR),$(PLATFORM_SUBDIR
+ endif
+ 
+ # config file list used for compiling
++ifeq ($(CONFIG_TARGET),local)
++LINUX_KCONFIG_LIST = $(wildcard $(GENERIC_LINUX_CONFIG) $(LINUX_TARGET_CONFIG) $(LINUX_SUBTARGET_CONFIG) $(TOPDIR)/local/kernel-config)
++else
+ LINUX_KCONFIG_LIST = $(wildcard $(GENERIC_LINUX_CONFIG) $(LINUX_TARGET_CONFIG) $(LINUX_SUBTARGET_CONFIG) $(TOPDIR)/env/kernel-config)
++endif
+ 
+ # default config list for reconfiguring
+ # defaults to subtarget if subtarget exists and target does not
+@@ -134,6 +138,7 @@ LINUX_RECONFIG_LIST = $(wildcard $(GENER
+ LINUX_RECONFIG_TARGET = $(if $(USE_SUBTARGET_CONFIG),$(LINUX_SUBTARGET_CONFIG),$(LINUX_TARGET_CONFIG))
+ 
+ # select the config file to be changed by kernel_menuconfig/kernel_oldconfig
++CONFIG_TARGET ?= local
+ ifeq ($(CONFIG_TARGET),platform)
+   LINUX_RECONFIG_LIST = $(wildcard $(GENERIC_LINUX_CONFIG) $(LINUX_TARGET_CONFIG))
+   LINUX_RECONFIG_TARGET = $(LINUX_TARGET_CONFIG)
+@@ -146,12 +151,20 @@ ifeq ($(CONFIG_TARGET),env)
+   LINUX_RECONFIG_LIST = $(LINUX_KCONFIG_LIST)
+   LINUX_RECONFIG_TARGET = $(TOPDIR)/env/kernel-config
+ endif
++ifeq ($(CONFIG_TARGET),local)
++  LINUX_RECONFIG_LIST = $(LINUX_KCONFIG_LIST)
++  LINUX_RECONFIG_TARGET = $(TOPDIR)/local/kernel-config
++endif
+ 
+ __linux_confcmd = $(SCRIPT_DIR)/kconfig.pl $(2) $(patsubst %,+,$(wordlist 2,9999,$(1))) $(1)
+ 
+ LINUX_CONF_CMD = $(call __linux_confcmd,$(LINUX_KCONFIG_LIST),)
+ LINUX_RECONF_CMD = $(call __linux_confcmd,$(LINUX_RECONFIG_LIST),)
+-LINUX_RECONF_DIFF = $(call __linux_confcmd,$(filter-out $(LINUX_RECONFIG_TARGET),$(LINUX_RECONFIG_LIST)),'>')
++ifeq ($(CONFIG_TARGET),local)
++  LINUX_RECONF_DIFF = $(call __linux_confcmd,$(filter-out $(LINUX_RECONFIG_TARGET),$(LINUX_RECONFIG_LIST)),'>' '-') $(LINUX_DIR)/.config.override
++else
++  LINUX_RECONF_DIFF = $(call __linux_confcmd,$(filter-out $(LINUX_RECONFIG_TARGET),$(LINUX_RECONFIG_LIST)),'>')
++endif
+ 
+ ifeq ($(DUMP),1)
+   BuildTarget=$(BuildTargets/DumpCurrent)

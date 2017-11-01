@@ -1,0 +1,79 @@
+# HG changeset patch
+# Parent c0c8870bf086325db220907342a76bf7c009ae74
+
+diff --git a/drivers/mtd/nand/xway_dmanand.c b/drivers/mtd/nand/xway_dmanand.c
+--- a/drivers/mtd/nand/xway_dmanand.c
++++ b/drivers/mtd/nand/xway_dmanand.c
+@@ -639,7 +639,53 @@ static int ltq_dmanand_read_oob(struct m
+  * /return 1 if not empty and 0 if page is empty
+  */
+ 
+-static int check_empty_page(const u8 *buf, int len)
++/* [Work around] - Check whether the page is empty
++ * because when fs erase nand eraseblock,
++ * there will be no HW ECC data in OOB area causing subsequent
++ * H/W reads to fail
++ *
++ * /return 1 if not empty and 0 if page is empty
++ */
++
++static int check_empty_page_read(struct nand_chip *chip,
++								u8 *buf, int len)
++{
++	int i, j = 0;
++	int err_flag = 0;
++	int err_cnt = 0;
++	int ecc_size = chip->ecc.size;
++
++	for (i = 0; i < len; i++, j++) {
++		if (buf[i] != 0xff)
++			err_cnt++;
++		
++		/* if err is larger than threshold, we return bad */
++		if (err_cnt > 3)
++			return -1;
++		
++		/* Keep track of bitflips for 
++		 * every ecc quantum which is in this
++		 * case 128-byte in RS hardware module
++		 */
++		if ((j >= ecc_size - 1)) {
++			if (err_cnt)
++				err_flag = 1;
++				
++			err_cnt = 0;
++			j = 0;
++		}
++	}
++
++	/* If bitflip found on a page read, we set the empty 
++	 * page to all 0xff 
++	 */
++	if (err_flag)
++		memset(buf, 0xff, len);
++
++	return 0;
++}
++
++static int check_empty_page_write(const u8 *buf, int len)
+ {
+ 	int i;
+ 
+@@ -705,7 +751,7 @@ static int ltq_dmanand_read_page_hwecc(s
+ 	/* if intr has occured, let mtd layer handle the badblock */
+ 	if ((mlc->ecc_status) && (mlc->dma_ecc_mode == 1)) {
+ 		if (mlc->empty_page_check == 0) {
+-			ret = check_empty_page((const u8 *) buf, writesize);
++			ret = check_empty_page_read(chip, buf, writesize);
+ 			if (!ret) {
+ 				mlc->ecc_status = 0;
+ 				return 0;
+@@ -776,7 +822,7 @@ static int ltq_dmanand_write_page_hwecc(
+ {
+ 	struct dma_nand_priv *mlc = chip->priv;
+ 	int i, writesize = mtd->writesize;
+-	int pagestatus = check_empty_page(buf, writesize);
++	int pagestatus = check_empty_page_write(buf, writesize);
+ 	int eccbytes = chip->ecc.bytes;
+ 	int eccsteps = chip->ecc.steps;
+ 	int eccsize = chip->ecc.size;

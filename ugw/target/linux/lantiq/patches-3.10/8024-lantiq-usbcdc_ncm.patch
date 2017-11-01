@@ -1,0 +1,222 @@
+cdc_ncm update to support Intel LTE CAT4/CAT6 module.
+
+diff --git a/drivers/net/usb/cdc_ncm.c b/drivers/net/usb/cdc_ncm.c
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@ -67,6 +67,35 @@ static void cdc_ncm_txpath_bh(unsigned l
+ static void cdc_ncm_tx_timeout_start(struct cdc_ncm_ctx *ctx);
+ static enum hrtimer_restart cdc_ncm_tx_timer_cb(struct hrtimer *hr_timer);
+ static struct usb_driver cdc_ncm_driver;
++/* use cdc_ncm.dstmac=00:20:30:40:50:60 from boot command or module load */
++static int destMacSet = 0;
++static char *dstmac = "FF:FF:FF:FF:FF:FF";
++static unsigned char destMac[6];
++module_param (dstmac, charp, 0);
++MODULE_PARM_DESC (dstmac, "Forced MAC in Downlink");
++MODULE_DEVICE_TABLE(usb, cdc_devs);
++
++#define MEMCPY_FOR_ZERO_GAP 1
++//#define USLEEP_DELAY 1
++
++static void
++cdc_ncm_init_dstmac(void)
++{
++	unsigned int iMac[6];
++	int i;
++	if ( 'F' != *dstmac) {
++		/* we got a parameter */
++		printk(KERN_INFO KBUILD_MODNAME ": Ethernet address for downlink dstmac=%s\n", dstmac);
++		sscanf(dstmac, "%x:%x:%x:%x:%x:%x", &iMac[0], &iMac[1], &iMac[2], &iMac[3], &iMac[4], &iMac[5]);
++		for(i=0;i<6;i++)
++			destMac[i] = (unsigned char)iMac[i];
++		destMacSet=1;
++	} else {
++		printk(KERN_INFO KBUILD_MODNAME ": Default Ethernet address for downlink\n");
++	}
++	return;
++}
++
+ 
+ static void
+ cdc_ncm_get_drvinfo(struct net_device *net, struct ethtool_drvinfo *info)
+@@ -104,6 +133,20 @@ static u8 cdc_ncm_setup(struct cdc_ncm_c
+ 		return 1;
+ 	}
+ 
++printk(KERN_INFO "NCM PARM:\n");
++printk(KERN_INFO "     wLength                :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wLength),le16_to_cpu(ctx->ncm_parm.wLength));
++printk(KERN_INFO "     bmNtbFormatsSupported  :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.bmNtbFormatsSupported),le16_to_cpu(ctx->ncm_parm.bmNtbFormatsSupported));
++printk(KERN_INFO "     dwNtbInMaxSize         :0x%08x %d\n",le32_to_cpu(ctx->ncm_parm.dwNtbInMaxSize),le32_to_cpu(ctx->ncm_parm.dwNtbInMaxSize));
++printk(KERN_INFO "     wNdpInDivisor          :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wNdpInDivisor),le16_to_cpu(ctx->ncm_parm.wNdpInDivisor));
++printk(KERN_INFO "     wNdpInPayloadRemainder :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wNdpInPayloadRemainder),le16_to_cpu(ctx->ncm_parm.wNdpInPayloadRemainder));
++printk(KERN_INFO "     wNdpInAlignment        :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wNdpInAlignment),le16_to_cpu(ctx->ncm_parm.wNdpInAlignment));
++printk(KERN_INFO "     wPadding1              :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wPadding1),le16_to_cpu(ctx->ncm_parm.wPadding1));
++printk(KERN_INFO "     dwNtbOutMaxSize        :0x%08x %d\n",le32_to_cpu(ctx->ncm_parm.dwNtbOutMaxSize),le32_to_cpu(ctx->ncm_parm.dwNtbOutMaxSize));
++printk(KERN_INFO "     wNdpOutDivisor         :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wNdpOutDivisor),le16_to_cpu(ctx->ncm_parm.wNdpOutDivisor));
++printk(KERN_INFO "     wNdpOutPayloadRemainder:0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wNdpOutPayloadRemainder),le16_to_cpu(ctx->ncm_parm.wNdpOutPayloadRemainder));
++printk(KERN_INFO "     wNdpOutAlignment       :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wNdpOutAlignment),le16_to_cpu(ctx->ncm_parm.wNdpOutAlignment));
++printk(KERN_INFO "     wNtbOutMaxDatagrams    :0x%04x %d\n",le16_to_cpu(ctx->ncm_parm.wNtbOutMaxDatagrams),le16_to_cpu(ctx->ncm_parm.wNtbOutMaxDatagrams));
++
+ 	/* read correct set of parameters according to device mode */
+ 	ctx->rx_max = le32_to_cpu(ctx->ncm_parm.dwNtbInMaxSize);
+ 	ctx->tx_max = le32_to_cpu(ctx->ncm_parm.dwNtbOutMaxSize);
+@@ -236,7 +279,7 @@ static u8 cdc_ncm_setup(struct cdc_ncm_c
+ 	}
+ 
+ 	ctx->max_datagram_size = min_dgram_size;
+-
++printk("[SH] min_dgram_size = %d\n", ctx->max_datagram_size);
+ 	/* set Max Datagram Size (MTU) */
+ 	if (flags & USB_CDC_NCM_NCAP_MAX_DATAGRAM_SIZE) {
+ 		__le16 max_datagram_size;
+@@ -255,6 +298,8 @@ static u8 cdc_ncm_setup(struct cdc_ncm_c
+ 		if (err < 0) {
+ 			pr_debug("GET_MAX_DATAGRAM_SIZE failed, use size=%u\n",
+ 				 min_dgram_size);
++printk("[SH] GET_MAX_DATAGRAM_SIZE failed, use size=%u\n", min_dgram_size);
++
+ 		} else {
+ 			ctx->max_datagram_size =
+ 				le16_to_cpu(max_datagram_size);
+@@ -281,13 +326,16 @@ static u8 cdc_ncm_setup(struct cdc_ncm_c
+ 				if (err < 0)
+ 					pr_debug("SET_MAX_DGRAM_SIZE failed\n");
+ 			}
++
+ 		}
+ 	}
+-
+ max_dgram_err:
+ 	if (ctx->netdev->mtu != (ctx->max_datagram_size - eth_hlen))
+ 		ctx->netdev->mtu = ctx->max_datagram_size - eth_hlen;
+ 
++printk("[SH] finally set ctx->max_datagram_size as %d\n, ctx->netdev->mtu=%d",
++ctx->max_datagram_size, ctx->netdev->mtu);
++
+ 	return 0;
+ }
+ 
+@@ -875,6 +923,26 @@ cdc_ncm_tx_fixup(struct usbnet *dev, str
+ 		goto error;
+ 
+ 	spin_lock_bh(&ctx->mtx);
++
++if(skb)
++{
++memcpy(skb->data,dev->net->dev_addr,6);
++(*(((unsigned char *)(skb->data))+5))++;
++
++#if 0
++{
++	unsigned char *base;
++	base=skb->data;
++	printk(KERN_INFO "cdc_ncm_tx_fixup() T S[%03d.%03d.%03d.%03d/%02X:%02X:%02X:%02X:%02X:%02X] D[%03d.%03d.%03d.%03d/%02X:%02X:%02X:%02X:%02X:%02X]\n"
++			,*(base+26 + 0),*(base+26 + 1),*(base+26 + 2),*(base+26 + 3)
++			,*(base+6 + 0),*(base+6 + 1),*(base+6 + 2),*(base+6 + 3),*(base+6 + 4),*(base+6 + 5)
++			,*(base+30 + 0),*(base+30 + 1),*(base+30 + 2),*(base+30 + 3)
++			,*(base+0 + 0),*(base+0 + 1),*(base+0 + 2),*(base+0 + 3),*(base+0 + 4),*(base+0 + 5)
++	);
++}
++#endif
++}
++
+ 	skb_out = cdc_ncm_fill_tx_frame(ctx, skb, cpu_to_le32(USB_CDC_NCM_NDP16_NOCRC_SIGN));
+ 	spin_unlock_bh(&ctx->mtx);
+ 	return skb_out;
+@@ -996,6 +1064,9 @@ next_ndp:
+ 	}
+ 	dpe16 = ndp16->dpe16;
+ 
++
++//printk(KERN_EMERG "SKB_FIXUP : %p:  ",skb_in->data);
++
+ 	for (x = 0; x < nframes; x++, dpe16++) {
+ 		offset = le16_to_cpu(dpe16->wDatagramIndex);
+ 		len = le16_to_cpu(dpe16->wDatagramLength);
+@@ -1021,15 +1092,48 @@ next_ndp:
+ 			break;
+ 
+ 		} else {
+-			skb = skb_clone(skb_in, GFP_ATOMIC);
+-			if (!skb)
+-				goto error;
+-			skb->len = len;
+-			skb->data = ((u8 *)skb_in->data) + offset;
+-			skb_set_tail_pointer(skb, len);
++			
++#if defined(MEMCPY_FOR_ZERO_GAP)
++			
++#define PPA_ALIGN			8
++			if(x%2==1)
++			{
++				//printk(KERN_INFO "[SH] x=%d, alloc_skb and memcpy\n",x);
++				skb = alloc_skb (len + PPA_ALIGN, GFP_ATOMIC);
++				if(!skb)
++					goto error;
++				skb_reserve (skb, PPA_ALIGN);
++				skb->len = len;
++				memcpy(skb->data, skb_in->data + offset, len);
++				if (destMacSet && skb->data) {
++					memcpy(skb->data, destMac, 6);
++				}		
++				
++			}
++			else{
++#endif		//MEMCPY_FOR_ZERO_GAP		
++				skb = skb_clone(skb_in, GFP_ATOMIC);
++				if (!skb)
++					goto error;
++				skb->len = len;
++				skb->data = ((u8 *)skb_in->data) + offset;
++				if (destMacSet && skb->data) {
++					memcpy(skb->data, destMac, 6);
++				}
++				skb_set_tail_pointer(skb, len);
++//				printk(KERN_EMERG " %08x/%08x/%04x",(uint32_t)(skb->data),(uint32_t)(skb->data)+(uint32_t)(skb->len),skb->len);
++#if defined(MEMCPY_FOR_ZERO_GAP)
++    	}
++#endif    //MEMCPY_FOR_ZERO_GAP
++
++#if defined(USLEEP_DELAY)
++			//printk(KERN_INFO "usleep 1\n");
++			udelay(15); //to avoid the overwritten in checksum 
++#endif //			USLEEP_DELAY
+ 			usbnet_skb_return(dev, skb);
+ 		}
+ 	}
++//printk(KERN_EMERG "\n");
+ err_ndp:
+ 	/* are there more NDPs to process? */
+ 	ndpoffset = le16_to_cpu(ndp16->wNextNdpIndex);
+@@ -1093,7 +1197,8 @@ static void cdc_ncm_status(struct usbnet
+ 
+ 	event = urb->transfer_buffer;
+ 
+-	switch (event->bNotificationType) {
++//	switch (event->bNotificationType) {
++	switch (le16_to_cpu(event->bNotificationType)) {
+ 	case USB_CDC_NOTIFY_NETWORK_CONNECTION:
+ 		/*
+ 		 * According to the CDC NCM specification ch.7.1
+@@ -1142,6 +1247,7 @@ static int cdc_ncm_check_connect(struct 
+ static int
+ cdc_ncm_probe(struct usb_interface *udev, const struct usb_device_id *prod)
+ {
++	cdc_ncm_init_dstmac();
+ 	return usbnet_probe(udev, prod);
+ }
+ 
+@@ -1252,6 +1358,13 @@ static const struct usb_device_id cdc_de
+ 	  .driver_info = (unsigned long)&wwan_noarp_info,
+ 	},
+ 
++	/* Infineon(now Intel) HSPA Modem platform */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x1519, 0x0331,
++		USB_CLASS_COMM,
++		USB_CDC_SUBCLASS_NCM, USB_CDC_PROTO_NONE),
++	  .driver_info = (unsigned long)&wwan_noarp_info,
++	},
++
+ 	/* Generic CDC-NCM devices */
+ 	{ USB_INTERFACE_INFO(USB_CLASS_COMM,
+ 		USB_CDC_SUBCLASS_NCM, USB_CDC_PROTO_NONE),

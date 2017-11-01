@@ -1,0 +1,98 @@
+From 7857385d19c7b41fd78c6d1ce3368e0b6acbcb44 Mon Sep 17 00:00:00 2001
+From: Aaro Koskinen <aaro.koskinen@iki.fi>
+Date: Thu, 25 Jul 2013 20:26:48 +0300
+Subject: [PATCH 063/105] MIPS: cavium-octeon: fix I/O space setup on non-PCI systems
+
+Fix I/O space setup, so that on non-PCI systems using inb()/outb()
+won't crash the system. Some drivers may try to probe I/O space and for
+that purpose we can just allocate some normal memory initially. Drivers
+trying to reserve a region will fail early as we set the size to 0. If
+a real I/O space is present, the PCI/PCIe support code will re-adjust
+the values accordingly.
+
+Tested with EdgeRouter Lite by enabling CONFIG_SERIO_I8042 that caused
+the originally reported crash.
+
+Reported-by: Faidon Liambotis <paravoid@debian.org>
+Signed-off-by: Aaro Koskinen <aaro.koskinen@iki.fi>
+Acked-by: David Daney <david.daney@cavium.com>
+Cc: linux-mips@linux-mips.org
+Patchwork: https://patchwork.linux-mips.org/patch/5626/
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+(cherry picked from commit d8b74276f5488d64ebb28d77631b536f1c5de6d2)
+---
+ arch/mips/cavium-octeon/setup.c |   28 ++++++++++++++++++++++++++++
+ arch/mips/pci/pci-octeon.c      |    9 +++++----
+ 2 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/arch/mips/cavium-octeon/setup.c b/arch/mips/cavium-octeon/setup.c
+index 2a75ff2..8ede5ff 100644
+--- a/arch/mips/cavium-octeon/setup.c
++++ b/arch/mips/cavium-octeon/setup.c
+@@ -8,6 +8,7 @@
+  *   written by Ralf Baechle <ralf@linux-mips.org>
+  */
+ #include <linux/compiler.h>
++#include <linux/vmalloc.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/console.h>
+@@ -1166,3 +1167,30 @@ static int __init edac_devinit(void)
+ 	return err;
+ }
+ device_initcall(edac_devinit);
++
++static void __initdata *octeon_dummy_iospace;
++
++static int __init octeon_no_pci_init(void)
++{
++	/*
++	 * Initially assume there is no PCI. The PCI/PCIe platform code will
++	 * later re-initialize these to correct values if they are present.
++	 */
++	octeon_dummy_iospace = vzalloc(IO_SPACE_LIMIT);
++	set_io_port_base((unsigned long)octeon_dummy_iospace);
++	ioport_resource.start = MAX_RESOURCE;
++	ioport_resource.end = 0;
++	return 0;
++}
++core_initcall(octeon_no_pci_init);
++
++static int __init octeon_no_pci_release(void)
++{
++	/*
++	 * Release the allocated memory if a real IO space is there.
++	 */
++	if ((unsigned long)octeon_dummy_iospace != mips_io_port_base)
++		vfree(octeon_dummy_iospace);
++	return 0;
++}
++late_initcall(octeon_no_pci_release);
+diff --git a/arch/mips/pci/pci-octeon.c b/arch/mips/pci/pci-octeon.c
+index 95c2ea8..59cccd9 100644
+--- a/arch/mips/pci/pci-octeon.c
++++ b/arch/mips/pci/pci-octeon.c
+@@ -586,15 +586,16 @@ static int __init octeon_pci_setup(void)
+ 	else
+ 		octeon_dma_bar_type = OCTEON_DMA_BAR_TYPE_BIG;
+ 
+-	/* PCI I/O and PCI MEM values */
+-	set_io_port_base(OCTEON_PCI_IOSPACE_BASE);
+-	ioport_resource.start = 0;
+-	ioport_resource.end = OCTEON_PCI_IOSPACE_SIZE - 1;
+ 	if (!octeon_is_pci_host()) {
+ 		pr_notice("Not in host mode, PCI Controller not initialized\n");
+ 		return 0;
+ 	}
+ 
++	/* PCI I/O and PCI MEM values */
++	set_io_port_base(OCTEON_PCI_IOSPACE_BASE);
++	ioport_resource.start = 0;
++	ioport_resource.end = OCTEON_PCI_IOSPACE_SIZE - 1;
++
+ 	pr_notice("%s Octeon big bar support\n",
+ 		  (octeon_dma_bar_type ==
+ 		  OCTEON_DMA_BAR_TYPE_BIG) ? "Enabling" : "Disabling");
+-- 
+1.7.1
+

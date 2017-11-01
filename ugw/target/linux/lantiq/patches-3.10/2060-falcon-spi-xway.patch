@@ -1,0 +1,140 @@
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -497,8 +497,8 @@ config SPI_NUC900
+ 	  SPI driver for Nuvoton NUC900 series ARM SoCs
+ 
+ config SPI_XWAY
+-	tristate "Lantiq XWAY SPI controller"
+-	depends on LANTIQ && SOC_TYPE_XWAY
++	tristate "Lantiq SPI controller"
++	depends on LANTIQ && (SOC_TYPE_XWAY || SOC_FALCON)
+ 	select SPI_BITBANG
+ 	help
+ 	  This driver supports the Lantiq SoC SPI controller in master
+--- a/drivers/spi/spi-xway.c
++++ b/drivers/spi/spi-xway.c
+@@ -139,8 +139,10 @@
+ 
+ #define LTQ_SPI_IRNEN_F		BIT(3)	/* Frame end interrupt request */
+ #define LTQ_SPI_IRNEN_E		BIT(2)	/* Error end interrupt request */
+-#define LTQ_SPI_IRNEN_T		BIT(1)	/* Transmit end interrupt request */
+-#define LTQ_SPI_IRNEN_R		BIT(0)	/* Receive end interrupt request */
++#define LTQ_SPI_IRNEN_T		BIT(0)	/* Transmit end interrupt request */
++#define LTQ_SPI_IRNEN_R		BIT(1)	/* Receive end interrupt request */
++#define LTQ_SPI_IRNEN_T_XWAY	BIT(1)	/* Transmit end interrupt request */
++#define LTQ_SPI_IRNEN_R_XWAY	BIT(0)	/* Receive end interrupt request */
+ #define LTQ_SPI_IRNEN_ALL	0xF
+ 
+ struct ltq_spi {
+@@ -169,6 +171,9 @@ struct ltq_spi {
+ 	u16			rxfs;
+ 	unsigned		dma_support:1;
+ 	unsigned		cfg_mode:1;
++
++	u32			irnen_t;
++	u32			irnen_r;
+ };
+ 
+ static inline struct ltq_spi *ltq_spi_to_hw(struct spi_device *spi)
+@@ -472,6 +477,9 @@ static void ltq_spi_chipselect(struct sp
+ {
+ 	struct ltq_spi *hw = ltq_spi_to_hw(spi);
+ 
++	if (ltq_spi_wait_ready(hw))
++		dev_err(&spi->dev, "wait failed\n");
++
+ 	switch (cs) {
+ 	case BITBANG_CS_ACTIVE:
+ 		ltq_spi_bits_per_word_set(spi);
+@@ -502,8 +510,6 @@ static int ltq_spi_setup_transfer(struct
+ 	if (bits_per_word > 32)
+ 		return -EINVAL;
+ 
+-	ltq_spi_config_mode_set(hw);
+-
+ 	return 0;
+ }
+ 
+@@ -735,17 +741,18 @@ static int ltq_spi_txrx_bufs(struct spi_
+ 	if (hw->tx) {
+ 		/* Initially fill TX FIFO with as much data as possible */
+ 		ltq_spi_txfifo_write(hw);
+-		irq_flags |= LTQ_SPI_IRNEN_T;
++
++		irq_flags |= hw->irnen_t;
+ 
+ 		/* Always enable RX interrupt in Full Duplex mode */
+ 		if (hw->rx)
+-			irq_flags |= LTQ_SPI_IRNEN_R;
++			irq_flags |= hw->irnen_r;
+ 	} else if (hw->rx) {
+ 		/* Start RX clock */
+ 		ltq_spi_rxreq_set(hw);
+ 
+ 		/* Enable RX interrupt to receive data from RX FIFOs */
+-		irq_flags |= LTQ_SPI_IRNEN_R;
++		irq_flags |= hw->irnen_r;
+ 	}
+ 
+ 	/* Enable TX or RX interrupts */
+@@ -850,10 +857,18 @@ static int ltq_spi_probe(struct platform
+ 	hw->bitbang.setup_transfer = ltq_spi_setup_transfer;
+ 	hw->bitbang.txrx_bufs = ltq_spi_txrx_bufs;
+ 
+-	if (of_machine_is_compatible("lantiq,ase"))
++	if (of_machine_is_compatible("lantiq,ase")) {
+ 		master->num_chipselect = 3;
+-	else
++
++		hw->irnen_t = LTQ_SPI_IRNEN_T_XWAY;
++		hw->irnen_r = LTQ_SPI_IRNEN_R_XWAY;
++	} else {
+ 		master->num_chipselect = 6;
++
++		hw->irnen_t = LTQ_SPI_IRNEN_T;
++		hw->irnen_r = LTQ_SPI_IRNEN_R;
++	}
++
+ 	master->bus_num = pdev->id;
+ 	master->setup = ltq_spi_setup;
+ 	master->cleanup = ltq_spi_cleanup;
+@@ -955,6 +970,7 @@ static int ltq_spi_remove(struct platfor
+ 
+ static const struct of_device_id ltq_spi_match[] = {
+ 	{ .compatible = "lantiq,spi-xway" },
++	{ .compatible = "lantiq,spi-lantiq-ssc" },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, ltq_spi_match);
+@@ -963,7 +979,7 @@ static struct platform_driver ltq_spi_dr
+ 	.probe = ltq_spi_probe,
+ 	.remove = ltq_spi_remove,
+ 	.driver = {
+-		.name = "spi-xway",
++		.name = "spi-lantiq-ssc",
+ 		.owner = THIS_MODULE,
+ 		.of_match_table = ltq_spi_match,
+ 	},
+@@ -975,3 +991,4 @@ MODULE_DESCRIPTION("Lantiq SoC SPI contr
+ MODULE_AUTHOR("Daniel Schwierzeck <daniel.schwierzeck@googlemail.com>");
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS("platform:spi-xway");
++MODULE_ALIAS("platform:spi-lantiq-ssc");
+--- a/arch/mips/lantiq/falcon/sysctrl.c
++++ b/arch/mips/lantiq/falcon/sysctrl.c
+@@ -69,6 +69,7 @@
+ #define ACTS_PADCTRL2	0x00200000
+ #define ACTS_PADCTRL3	0x00200000
+ #define ACTS_PADCTRL4	0x00400000
++#define ACTS_SSC0	0x00002000
+ 
+ #define sysctl_w32(m, x, y)	ltq_w32((x), sysctl_membase[m] + (y))
+ #define sysctl_r32(m, x)	ltq_r32(sysctl_membase[m] + (x))
+@@ -269,6 +270,7 @@ void __init ltq_soc_init(void)
+ 	clkdev_add_sys("1e100b00.serial", SYSCTL_SYS1, ACTS_ASC1_ACT);
+ 	clkdev_add_sys("1e100c00.serial", SYSCTL_SYS1, ACTS_ASC0_ACT);
+ 	clkdev_add_sys("1e200000.i2c", SYSCTL_SYS1, ACTS_I2C_ACT);
++	clkdev_add_sys("1e100d00.spi", SYSCTL_SYS1, ACTS_SSC0);
+ }
+ 
+ 

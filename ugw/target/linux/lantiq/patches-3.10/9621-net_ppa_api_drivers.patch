@@ -1,0 +1,430 @@
+# HG changeset patch
+# Parent bf72e45cce4b05e4e79190db06e20bddf1c73039
+
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -2982,6 +2982,92 @@ static void *unit_find(struct idr *p, in
+ 	return idr_find(p, n);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++#if (defined(CONFIG_PPPOE) || defined(CONFIG_PPPOE_MODULE))
++extern int32_t ppa_get_pppoe_info(struct net_device *dev, void *po, uint32_t pppoe_id, void *value);
++#endif
++#if (defined(CONFIG_PPPOATM) || defined(CONFIG_PPPOATM_MODULE))
++struct pppoatm_vcc;
++extern int32_t ppa_get_pppoa_info(struct net_device *dev, void *pvcc, uint32_t pppoa_id, void *value);
++#endif
++
++/*it's very unlikely we need lock_kernel here to prevent the device being destroyed*/
++int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value)
++{
++	struct ppp *ppp;
++	struct channel *pch;
++	struct list_head *list;
++	int32_t ret = -EFAULT;
++    struct ppp_net *pn;
++	
++	if(unlikely(!ppp_dev || !value)){
++		printk("PPP arg error\n");
++		return ret;
++	}
++
++    ppp = netdev_priv(ppp_dev);
++
++	if (unlikely(!(ppp_dev->flags & IFF_POINTOPOINT) || !ppp)){
++		printk("PPP device in abnormal status!\n");
++		return ret;
++	}
++
++	/*check ppp validity */
++
++	ppp_lock(ppp);
++	if(unlikely(ppp->file.dead || atomic_read(&ppp->file.refcnt) == 0 || !ppp->dev || ppp->n_channels == 0)){
++		printk("PPP device is dead, being destroyed!\n");
++		goto err_unlockppp;
++	}
++
++	/*don't support multipul link*/
++	if(unlikely(ppp->flags & SC_MULTILINK)){
++		printk("Don't support multiple link\n");
++		goto err_unlockppp;
++	}
++
++	list = &ppp->channels;
++	if(unlikely(list_empty(list))){
++		printk("PPP channel list empty!\n");
++		goto err_unlockppp;
++	}
++
++	list = list->next;
++	pch = list_entry(list, struct channel, clist);
++
++	if(unlikely(!pch->chan)){
++		printk("PPP cannot get channel!\n");
++		goto err_unlockppp;
++	}
++
++    pn = ppp_pernet(pch->chan_net);
++
++	spin_lock_bh(&pn->all_channels_lock); /* we only need to guarantee the channel won't be destroyed, release ppp's lock to increase speed */
++	ppp_unlock(ppp);
++	
++	if((ppp_info_id & PPA_PPP_MASK) == PPA_PPPOE_ID){
++#if (defined(CONFIG_PPPOE) || defined(CONFIG_PPPOE_MODULE))
++		ret = ppa_get_pppoe_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
++#endif
++	}else{
++#if (defined(CONFIG_PPPOATM) || defined(CONFIG_PPPOATM_MODULE))
++		ret = ppa_get_pppoa_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
++#endif
++	}
++	spin_unlock_bh(&pn->all_channels_lock);
++
++	return ret;
++
++
++err_unlockppp:
++	ppp_unlock(ppp);
++
++	return ret;
++}
++EXPORT_SYMBOL(ppa_ppp_get_info);
++
++#endif
+ /* Module/initialization stuff */
+ 
+ module_init(ppp_init);
+diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -1195,6 +1195,118 @@ static void __exit pppoe_exit(void)
+ 	unregister_pernet_device(&pppoe_net_ops);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++extern int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value);
++enum{
++	PPPOE_GET_ADDR = 1,
++	PPPOE_GET_SESSION_ID,
++	PPPOE_GET_ETH_ADDR,
++};
++
++int32_t ppa_check_pppoe_addr_valid(struct net_device *dev, struct pppoe_addr *pa)
++{
++	struct pppox_sock *po=NULL;
++	struct pppoe_net *pn;
++    struct net_device *pppoe_netdev;
++	int32_t ret = -EFAULT;
++
++    pn = pppoe_pernet(dev_net(dev));
++    if (pppoe_netdev = dev_get_by_name(dev_net(dev), pa->dev)) {
++	    dev_put (pppoe_netdev);
++    }
++	po = get_item(pn, pa->sid, pa->remote, pppoe_netdev->ifindex);
++	if (!po){
++		printk("Cannot find the pppoe addr in hash table \n");
++		goto err;
++	}	
++
++	if (!po->pppoe_dev || 
++		(po->pppoe_pa.remote[0] | po->pppoe_pa.remote[1] | po->pppoe_pa.remote[2] |
++		 po->pppoe_pa.remote[3] | po->pppoe_pa.remote[4] | po->pppoe_pa.remote[5]) == 0){
++		 printk("no pppoe device or remote address is zero\n");
++		goto err;
++	}
++
++	ret = 0;
++
++err:
++	if (po)
++		sock_put(sk_pppox(po));
++
++	return ret;
++}
++
++int32_t ppa_pppoe_get_pppoe_addr(struct net_device *dev, struct pppoe_addr *pa)
++{
++	uint32_t id = (PPPOE_GET_ADDR << PPA_PPP_MASK_LEN) | PPA_PPPOE_ID;
++
++	return ppa_ppp_get_info(dev, id, pa);
++}
++
++__u16 ppa_pppoe_get_pppoe_session_id(struct net_device *dev)
++{
++	uint16_t seid = 0;
++	uint32_t id = (PPPOE_GET_SESSION_ID << PPA_PPP_MASK_LEN) | PPA_PPPOE_ID;
++
++	ppa_ppp_get_info(dev, id, &seid);
++
++	return seid;
++}
++
++__u16 ppa_get_pkt_pppoe_session_id(struct sk_buff *skb)
++{
++	if(!skb)
++		return 0;
++	
++	return ppa_pppoe_get_pppoe_session_id(skb->dev);
++}
++
++int32_t ppa_pppoe_get_eth_netif(struct net_device *dev, char pppoe_eth_ifname[IFNAMSIZ])
++{
++	uint32_t id = (PPPOE_GET_ETH_ADDR << PPA_PPP_MASK_LEN) | PPA_PPPOE_ID;
++
++	return ppa_ppp_get_info(dev, id, pppoe_eth_ifname);
++}
++
++int32_t ppa_get_pppoe_info(struct net_device *dev, void *po, uint32_t pppoe_id, void *value)
++{
++	struct pppoe_addr pa;
++
++	if(!po){
++		printk("No pppoe sock \n");
++		return -1;
++	}
++
++	if((pppox_sk(po)->chan.private != po)){
++		return -1;
++	}
++
++	pa = pppox_sk(po)->pppoe_pa;
++
++	if(ppa_check_pppoe_addr_valid(dev, &pa) < 0)
++		return -1;
++
++	switch(pppoe_id){
++		case PPPOE_GET_ADDR:
++			*(struct pppoe_addr *)value = pa; break;
++		case PPPOE_GET_SESSION_ID:
++			*(u_int16_t *)value = pa.sid; break;
++		case PPPOE_GET_ETH_ADDR:
++			memcpy(value, pa.dev, sizeof(pa.dev));  break;
++		default:
++			return -1;
++	}
++
++	return 0;
++		
++}
++
++EXPORT_SYMBOL(ppa_pppoe_get_pppoe_addr);
++EXPORT_SYMBOL(ppa_pppoe_get_pppoe_session_id);
++EXPORT_SYMBOL(ppa_get_pkt_pppoe_session_id);
++EXPORT_SYMBOL(ppa_pppoe_get_eth_netif);
++EXPORT_SYMBOL(ppa_get_pppoe_info);
++#endif
+ module_init(pppoe_init);
+ module_exit(pppoe_exit);
+ 
+diff --git a/fs/proc/root.c b/fs/proc/root.c
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -269,3 +269,6 @@ void pid_ns_release_proc(struct pid_name
+ {
+ 	kern_unmount(ns->proc_mnt);
+ }
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++EXPORT_SYMBOL(proc_root);
++#endif
+diff --git a/include/linux/ppp_channel.h b/include/linux/ppp_channel.h
+--- a/include/linux/ppp_channel.h
++++ b/include/linux/ppp_channel.h
+@@ -75,6 +75,11 @@ extern int ppp_unit_number(struct ppp_ch
+ /* Get the device name associated with a channel, or NULL if none */
+ extern char *ppp_dev_name(struct ppp_channel *);
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++extern int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value);
++#endif
++
++
+ /*
+  * SMP locking notes:
+  * The channel code must ensure that when it calls ppp_unregister_channel,
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -46,6 +46,12 @@
+ #define NEXTHDR_MAX		255
+ 
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++static inline void ipv6_addr_copy(struct in6_addr *a1, const struct in6_addr *a2)
++{
++   memcpy(a1, a2, sizeof(struct in6_addr));
++}
++#endif
+ 
+ #define IPV6_DEFAULT_HOPLIMIT   64
+ #define IPV6_DEFAULT_MCASTHOPS	1
+diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -308,6 +308,15 @@ extern unsigned int nf_conntrack_max;
+ extern unsigned int nf_conntrack_hash_rnd;
+ void init_nf_conntrack_hash_rnd(void);
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++uint32_t get_hash_from_ct(const struct nf_conn *ct, uint8_t dir, struct nf_conntrack_tuple* tuple);
++int get_hash_from_skb(struct sk_buff *skb, 
++                      unsigned char pf, 
++                      uint32_t *u32_hash, 
++                      struct nf_conntrack_tuple* tuple );
++#endif
++
++
+ #define NF_CT_STAT_INC(net, count)	  __this_cpu_inc((net)->ct.stat->count)
+ #define NF_CT_STAT_INC_ATOMIC(net, count) this_cpu_inc((net)->ct.stat->count)
+ 
+diff --git a/include/uapi/linux/ppp-ioctl.h b/include/uapi/linux/ppp-ioctl.h
+--- a/include/uapi/linux/ppp-ioctl.h
++++ b/include/uapi/linux/ppp-ioctl.h
+@@ -116,4 +116,11 @@ struct pppol2tp_ioc_stats {
+ #define SIOCGPPPVER     (SIOCDEVPRIVATE + 1)	/* NEVER change this!! */
+ #define SIOCGPPPCSTATS  (SIOCDEVPRIVATE + 2)
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#define PPA_PPP_MASK_LEN   2
++#define PPA_PPP_MASK    3
++#define PPA_PPPOE_ID       0x00000001
++#define PPA_PPPOA_ID    0x00000002
++#endif
++
+ #endif /* _PPP_IOCTL_H */
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -21,6 +21,10 @@
+ #include <linux/netfilter_bridge.h>
+ #include "br_private.h"
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
++
+ static int deliver_clone(const struct net_bridge_port *prev,
+ 			 struct sk_buff *skb,
+ 			 void (*__packet_hook)(const struct net_bridge_port *p,
+@@ -49,6 +53,15 @@ int br_dev_queue_push_xmit(struct sk_buf
+ 	} else {
+ 		skb_push(skb, ETH_HLEN);
+ 		br_drop_fake_rtable(skb);
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)) && (defined( CONFIG_LTQ_BRIDGE_LEARNING))
++		if ( ppa_hook_session_add_fn != NULL )
++		{
++			ppa_hook_session_add_fn(skb, 
++					NULL, 
++					PPA_F_BRIDGED_SESSION);
++		}
++#endif
+ 		dev_queue_xmit(skb);
+ 	}
+ 
+diff --git a/net/bridge/br_netfilter.c b/net/bridge/br_netfilter.c
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@ -41,6 +41,9 @@
+ #ifdef CONFIG_SYSCTL
+ #include <linux/sysctl.h>
+ #endif
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
+ 
+ #define skb_origaddr(skb)	 (((struct bridge_skb_cb *) \
+ 				 (skb->nf_bridge->data))->daddr.ipv4)
+@@ -695,6 +698,14 @@ static unsigned int br_nf_pre_routing(un
+ 		return NF_DROP;
+ 	br = p->br;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)) && (defined( CONFIG_LTQ_BRIDGE_LEARNING))
++	if ( ppa_hook_session_add_fn != NULL )
++	{
++		ppa_hook_session_add_fn(skb, 
++				NULL, PPA_F_BRIDGED_SESSION|PPA_F_BEFORE_NAT_TRANSFORM);
++	}
++#endif
++
+ 	if (IS_IPV6(skb) || IS_VLAN_IPV6(skb) || IS_PPPOE_IPV6(skb)) {
+ 		if (!brnf_call_ip6tables && !br->nf_call_ip6tables)
+ 			return NF_ACCEPT;
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -1703,3 +1703,72 @@ s16 (*nf_ct_nat_offset)(const struct nf_
+ 			enum ip_conntrack_dir dir,
+ 			u32 seq);
+ EXPORT_SYMBOL_GPL(nf_ct_nat_offset);
++
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++uint32_t get_hash_from_ct(const struct nf_conn *ct, uint8_t dir, struct nf_conntrack_tuple* tuple)
++{
++  *tuple = ct->tuplehash[dir].tuple;
++  return hash_conntrack_raw(tuple, nf_ct_zone(ct));
++}
++EXPORT_SYMBOL(get_hash_from_ct);
++
++int get_hash_from_skb(struct sk_buff *skb, 
++                      unsigned char pf, 
++                      uint32_t * u32_hash, 
++                      struct nf_conntrack_tuple *tuple)
++{
++	u_int8_t protonum;
++	unsigned int dataoff;
++	enum ip_conntrack_info ctinfo;
++  struct nf_conn *tmpl = NULL; 
++  struct nf_conntrack_l3proto *l3proto;
++	struct nf_conntrack_l4proto *l4proto;
++  struct net_device *netdev=skb->dev;
++  u16 zone;
++	int ret;
++ 
++	if (skb->nfct) {
++		tmpl = (struct nf_conn *)skb->nfct;
++	}
++	zone = tmpl ? nf_ct_zone(tmpl) : NF_CT_DEFAULT_ZONE;
++
++ if( pf == 0 ) {  
++	if (skb->protocol == htons(ETH_P_IP)) {
++		  pf = PF_INET;
++	} else if (skb->protocol == htons(ETH_P_IPV6)) {
++		  pf = PF_INET6;
++	} //else - hanlde PPPoE 
++	
++  if( pf == 0 ) return -1;
++ }
++
++	l3proto = __nf_ct_l3proto_find(pf);
++	ret = l3proto->get_l4proto(skb, skb_network_offset(skb), &dataoff, &protonum);
++	if (ret <= 0) {
++		return -1;
++  }
++
++	l4proto = __nf_ct_l4proto_find(pf, protonum);
++	if (l4proto->error != NULL) { 
++    //TODO: Pass pre routing/post routing hooknum
++		//ret = l4proto->error(dev_net(netdev), tmpl, skb, dataoff, &ctinfo, pf, NF_INET_PRE_ROUTING); 
++		ret = l4proto->error(dev_net(netdev), tmpl, skb, dataoff, &ctinfo, pf, NF_INET_POST_ROUTING); 
++		if (ret <= 0) {
++			return -1;
++		}
++	}
++
++	if (!nf_ct_get_tuple(skb, skb_network_offset(skb),
++			     dataoff, pf, protonum, tuple, l3proto,
++			     l4proto)) {
++		pr_debug("Can't get tuple\n");
++		return -1;
++	}
++
++  *u32_hash = hash_conntrack_raw(tuple, zone);
++
++  return 0;
++}
++EXPORT_SYMBOL(get_hash_from_skb);
++#endif
++

@@ -1,0 +1,659 @@
+# HG changeset patch
+# Parent 0fe867e04b70e5984f27a8bbc42c329be3d65c53
+
+diff --git a/net/8021q/vlan_dev.c b/net/8021q/vlan_dev.c
+--- a/net/8021q/vlan_dev.c
++++ b/net/8021q/vlan_dev.c
+@@ -22,6 +22,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/skbuff.h>
+@@ -67,9 +68,12 @@ static int vlan_dev_rebuild_header(struc
+ 
+ 	return 0;
+ }
+-
++#if defined(CONFIG_LTQ_PPA_API_MODULE) || defined(CONFIG_LTQ_PPA_API)
++u16 vlan_dev_get_egress_qos_mask(struct net_device *dev, struct sk_buff *skb)
++#else
+ static inline u16
+ vlan_dev_get_egress_qos_mask(struct net_device *dev, struct sk_buff *skb)
++#endif
+ {
+ 	struct vlan_priority_tci_mapping *mp;
+ 
+@@ -363,6 +367,32 @@ static int vlan_dev_stop(struct net_devi
+ 	netif_carrier_off(dev);
+ 	return 0;
+ }
++#if defined(CONFIG_LTQ_PPA_API_MODULE) || defined(CONFIG_LTQ_PPA_API)
++int vlan_dev_get_vid(const char *dev_name, unsigned short* result)
++{
++	struct net_device *dev = dev_get_by_name(&init_net, dev_name);
++    
++	int rv = 0;
++	if (dev) {
++		if (dev->priv_flags & IFF_802_1Q_VLAN) {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 10)
++			*result = vlan_dev_info(dev)->vlan_id;
++#else
++		   *result = vlan_dev_priv(dev)->vlan_id;
++#endif
++			rv = 0;
++		} else {
++			rv = -EINVAL;
++		}
++		dev_put(dev);
++	} else {
++		rv = -ENODEV;
++	}
++	return rv;
++}
++#endif
++
++
+ 
+ static int vlan_dev_set_mac_address(struct net_device *dev, void *p)
+ {
+@@ -795,3 +825,8 @@ void vlan_setup(struct net_device *dev)
+ 
+ 	memset(dev->broadcast, 0, ETH_ALEN);
+ }
++#if defined(CONFIG_LTQ_PPA_API_MODULE) || defined(CONFIG_LTQ_PPA_API)
++EXPORT_SYMBOL(vlan_dev_get_vid);
++EXPORT_SYMBOL(vlan_dev_get_egress_qos_mask);
++#endif
++
+diff --git a/net/atm/br2684.c b/net/atm/br2684.c
+--- a/net/atm/br2684.c
++++ b/net/atm/br2684.c
+@@ -587,6 +587,10 @@ free_skb:
+ 	dev_kfree_skb(skb);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int);
++#endif
++
+ /*
+  * Assign a vcc to a dev
+  * Note: we do not have explicit unassign, but look at _push()
+@@ -658,7 +662,11 @@ static int br2684_regvcc(struct atm_vcc 
+ 	barrier();
+ 	atmvcc->push = br2684_push;
+ 	atmvcc->pop = br2684_pop;
+-	atmvcc->release_cb = br2684_release_cb;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++   if ( ppa_hook_mpoa_setup )
++		ppa_hook_mpoa_setup(atmvcc, brdev->payload == p_routed ? 3 : 0, brvcc->encaps == BR2684_ENCAPS_LLC ? 1 : 0);     //  IPoA or EoA w/o FCS
++#endif
++   atmvcc->release_cb = br2684_release_cb;
+ 	atmvcc->owner = THIS_MODULE;
+ 
+ 	/* initialize netdev carrier state */
+@@ -981,9 +989,109 @@ static void __exit br2684_exit(void)
+ 	}
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++int ppa_br2684_get_vcc(struct net_device *netdev, struct atm_vcc **pvcc)
++{
++    if ( netdev && (uint32_t)br2684_start_xmit == (uint32_t)netdev->netdev_ops->ndo_start_xmit)
++    {
++        struct br2684_dev *brdev;
++        struct br2684_vcc *brvcc;
++
++  
++        brdev = (struct br2684_dev *)BRPRIV(netdev);
++        brvcc = list_empty(&brdev->brvccs) ? NULL : list_entry(brdev->brvccs.next, struct br2684_vcc, brvccs);
++
++        if ( brvcc )
++        {
++            *pvcc = brvcc->atmvcc;
++            return 0;
++        }
++    }
++
++    return -1;
++}
++
++int32_t ppa_if_is_br2684(struct net_device *netdev, char *ifname)
++{
++    if ( !netdev )
++    {
++        netdev = dev_get_by_name(&init_net,ifname);
++        if ( !netdev )
++            return 0;   //  can not get
++        else
++            dev_put(netdev);
++    }
++
++    return (uint32_t)br2684_start_xmit == (uint32_t)netdev->netdev_ops->ndo_start_xmit ? 1 : 0;
++}
++
++int32_t ppa_if_is_ipoa(struct net_device *netdev, char *ifname)
++{
++    if ( !netdev )
++    {
++        netdev = dev_get_by_name(&init_net,ifname);
++        if ( !netdev )
++            return 0;
++        else
++            dev_put(netdev);
++    }
++
++    if ( ppa_if_is_br2684(netdev, ifname) )
++    {
++        struct br2684_dev *brdev;
++        //struct br2684_vcc *brvcc;
++
++//  #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
++        //brdev = (struct br2684_dev *)netif->priv;
++        brdev = BRPRIV(netdev);
++//  #else
++//        brdev = (struct br2684_dev *)((char *)(netif) - (unsigned long)(&((struct br2684_dev *)0)->net_dev));
++//  #endif
++        //brvcc = list_empty(&brdev->brvccs) ? NULL : list_entry(brdev->brvccs.next, struct br2684_vcc, brvccs);
++
++        //return brvcc && brvcc->payload == p_routed ? 1 : 0;
++        return brdev && brdev->payload == p_routed ? 1 : 0;
++    }
++
++    return 0;
++}
++#endif
++
++#ifdef CONFIG_WAN_VLAN_SUPPORT
++int br2684_vlan_dev_get_vid(struct net_device *dev, uint16_t *vid)
++{
++	int ret=0;
++	struct br2684_dev *brdev;
++
++	if (!dev || !vid)
++		return -EINVAL;
++
++	dev_hold(dev);
++	brdev = BRPRIV(dev);
++
++	if (brdev->vlan.tag_vlan_enable) {
++		*vid = brdev->vlan.vlan_vci;
++	} else {
++		ret=-EINVAL;
++	}
++
++	pr_debug("(%s) Returning VLAN Id [%d]; VLAN enable [%d] for [%s]\n",
++		__func__, *vid, brdev->vlan.tag_vlan_enable, dev->name);
++
++	dev_put(dev);
++	return ret;
++}
++EXPORT_SYMBOL(br2684_vlan_dev_get_vid);
++#endif
++
+ module_init(br2684_init);
+ module_exit(br2684_exit);
+ 
+ MODULE_AUTHOR("Marcell GAL");
+ MODULE_DESCRIPTION("RFC2684 bridged protocols over ATM/AAL5");
+ MODULE_LICENSE("GPL");
++#if defined(CONFIG_LTQ_PPA_API_MODULE)
++  EXPORT_SYMBOL(ppa_if_is_ipoa);
++  EXPORT_SYMBOL(ppa_if_is_br2684);
++  EXPORT_SYMBOL(ppa_br2684_get_vcc);
++#endif
+diff --git a/net/atm/common.c b/net/atm/common.c
+--- a/net/atm/common.c
++++ b/net/atm/common.c
+@@ -62,17 +62,20 @@ static void vcc_remove_socket(struct soc
+ 	write_unlock_irq(&vcc_sklist_lock);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
+ struct sk_buff* (*ifx_atm_alloc_tx)(struct atm_vcc *, unsigned int) = NULL;
+ EXPORT_SYMBOL(ifx_atm_alloc_tx);
++#endif
+ 
+ static struct sk_buff *alloc_tx(struct atm_vcc *vcc, unsigned int size)
+ {
+ 	struct sk_buff *skb;
+ 	struct sock *sk = sk_atm(vcc);
+ 
+-	if (ifx_atm_alloc_tx != NULL)
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++   if ( ifx_atm_alloc_tx != NULL )
+ 		return ifx_atm_alloc_tx(vcc, size);
+-
++#endif
+ 	if (sk_wmem_alloc_get(sk) && !atm_may_send(vcc, size)) {
+ 		pr_debug("Sorry: wmem_alloc = %d, size = %d, sndbuf = %d\n",
+ 			 sk_wmem_alloc_get(sk), size, sk->sk_sndbuf);
+@@ -932,3 +935,7 @@ module_exit(atm_exit);
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS_NETPROTO(PF_ATMPVC);
+ MODULE_ALIAS_NETPROTO(PF_ATMSVC);
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int) = NULL;
++EXPORT_SYMBOL(ppa_hook_mpoa_setup);
++#endif
+diff --git a/net/atm/mpc.c b/net/atm/mpc.c
+--- a/net/atm/mpc.c
++++ b/net/atm/mpc.c
+@@ -602,6 +602,10 @@ non_ip:
+ 	return mpc->old_ops->ndo_start_xmit(skb, dev);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int);
++#endif
++
+ static int atm_mpoa_vcc_attach(struct atm_vcc *vcc, void __user *arg)
+ {
+ 	int bytes_left;
+@@ -644,7 +648,10 @@ static int atm_mpoa_vcc_attach(struct at
+ 
+ 	vcc->proto_data = mpc->dev;
+ 	vcc->push = mpc_push;
+-
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_mpoa_setup )
++		ppa_hook_mpoa_setup(vcc, 3, 1);	//  IPoA, LLC
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/net/atm/pppoatm.c b/net/atm/pppoatm.c
+--- a/net/atm/pppoatm.c
++++ b/net/atm/pppoatm.c
+@@ -390,6 +390,9 @@ static const struct ppp_channel_ops pppo
+ 	.ioctl = pppoatm_devppp_ioctl,
+ };
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int);
++#endif
+ static int pppoatm_assign_vcc(struct atm_vcc *atmvcc, void __user *arg)
+ {
+ 	struct atm_backend_ppp be;
+@@ -431,7 +434,11 @@ static int pppoatm_assign_vcc(struct atm
+ 	atmvcc->user_back = pvcc;
+ 	atmvcc->push = pppoatm_push;
+ 	atmvcc->pop = pppoatm_pop;
+-	atmvcc->release_cb = pppoatm_release_cb;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_mpoa_setup )
++        ppa_hook_mpoa_setup(atmvcc, 2, pvcc->encaps == e_llc ? 1 : 0);  //  PPPoA
++#endif
++   atmvcc->release_cb = pppoatm_release_cb;
+ 	__module_get(THIS_MODULE);
+ 	atmvcc->owner = THIS_MODULE;
+ 
+@@ -492,6 +499,76 @@ static void __exit pppoatm_exit(void)
+ 	deregister_atm_ioctl(&pppoatm_ioctl_ops);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++
++extern int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value);
++
++enum{
++	PPA_PPPOA_GET_VCC = 1,
++	PPA_PPPOA_CHECK_IFACE,
++};
++
++int32_t ppa_get_pppoa_info(struct net_device *dev, void *pvcc, uint32_t pppoa_id, void *value)
++{
++	struct atm_vcc **patmvcc = (struct atm_vcc **)value;
++    struct pppoatm_vcc *p_atm_vcc = (struct pppoatm_vcc *)pvcc;
++
++	if(!p_atm_vcc){
++		return -1;
++	}
++
++	if(p_atm_vcc->chan.private != pvcc){
++		return -1;
++	}
++	
++	switch(pppoa_id){
++		case PPA_PPPOA_GET_VCC:
++			* patmvcc = p_atm_vcc->atmvcc;
++			break;
++
++		case PPA_PPPOA_CHECK_IFACE:
++			break;
++
++		default:
++			break;
++	}
++
++	return 0;
++}
++
++int32_t ppa_pppoa_get_vcc(struct net_device *dev, struct atm_vcc **patmvcc)
++{
++    uint32_t id = (PPA_PPPOA_GET_VCC << PPA_PPP_MASK_LEN) | PPA_PPPOA_ID;
++
++	return ppa_ppp_get_info(dev, id, (void *) patmvcc);
++
++}
++
++int32_t ppa_if_is_pppoa(struct net_device *dev, char *ifname)
++{
++    uint32_t id = (PPA_PPPOA_CHECK_IFACE << PPA_PPP_MASK_LEN) | PPA_PPPOA_ID;
++
++    if ( !dev )
++    {
++        dev = dev_get_by_name(&init_net,ifname);
++        if ( dev )
++            dev_put(dev);
++        else{
++            return 0;   //  can not get
++        }
++    }
++
++    if(ppa_ppp_get_info(dev, id, &id) >= 0){
++		return 1;
++    }
++
++	return 0;
++}
++
++EXPORT_SYMBOL(ppa_get_pppoa_info);
++EXPORT_SYMBOL(ppa_pppoa_get_vcc);
++EXPORT_SYMBOL(ppa_if_is_pppoa);
++#endif
+ module_init(pppoatm_init);
+ module_exit(pppoatm_exit);
+ 
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -11,6 +11,7 @@
+  *	2 of the License, or (at your option) any later version.
+  */
+ 
++#include <linux/version.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+ #include <linux/rculist.h>
+@@ -26,6 +27,9 @@
+ #include <linux/if_vlan.h>
+ #include "br_private.h"
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
+ static struct kmem_cache *br_fdb_cache __read_mostly;
+ static int fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
+ 		      const unsigned char *addr, u16 vid);
+@@ -84,6 +88,10 @@ static void fdb_rcu_free(struct rcu_head
+ 
+ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f)
+ {
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_bridge_entry_delete_fn != NULL )
++        ppa_hook_bridge_entry_delete_fn(f->addr.addr, br->dev, 0);
++#endif
+ 	hlist_del_rcu(&f->hlist);
+ 	fdb_notify(br, f, RTM_DELNEIGH);
+ 	call_rcu(&f->rcu, fdb_rcu_free);
+@@ -183,6 +191,19 @@ void br_fdb_cleanup(unsigned long _data)
+ 
+ 		hlist_for_each_entry_safe(f, n, &br->hash[i], hlist) {
+ 			unsigned long this_timer;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++            if ( ppa_hook_bridge_entry_hit_time_fn != NULL && !f->is_local )
++            {
++                uint32_t last_hit_time;
++
++                if ( ppa_hook_bridge_entry_hit_time_fn(f->addr.addr, br->dev,  &last_hit_time) == PPA_HIT )
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 36)
++                f->ageing_timer = last_hit_time * HZ;
++#else
++                f->updated = last_hit_time * HZ;
++#endif
++            }
++#endif
+ 			if (f->is_static)
+ 				continue;
+ 			this_timer = f->updated + delay;
+@@ -473,6 +494,11 @@ void br_fdb_update(struct net_bridge *br
+ 			/* fastpath: update of existing entry */
+ 			fdb->dst = source;
+ 			fdb->updated = jiffies;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++	//update an existing bridge entry used from xrx500
++        if ( ppa_hook_bridge_entry_add_fn != NULL && source->dev )
++            ppa_hook_bridge_entry_add_fn((unsigned char *)addr, br->dev, source->dev, PPA_F_BRIDGE_ACCEL_MODE);
++#endif
+ 		}
+ 	} else {
+ 		spin_lock(&br->hash_lock);
+@@ -484,6 +510,10 @@ void br_fdb_update(struct net_bridge *br
+ 		/* else  we lose race and someone else inserts
+ 		 * it first, don't bother updating
+ 		 */
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ppa_hook_bridge_entry_add_fn != NULL && source->dev )
++            ppa_hook_bridge_entry_add_fn((unsigned char *)addr, br->dev, source->dev, 0);
++#endif
+ 		spin_unlock(&br->hash_lock);
+ 	}
+ }
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -79,6 +79,10 @@
+ #include <linux/mroute.h>
+ #include <linux/netlink.h>
+ #include <linux/tcp.h>
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
++
+ 
+ int sysctl_ip_default_ttl __read_mostly = IPDEFTTL;
+ EXPORT_SYMBOL(sysctl_ip_default_ttl);
+@@ -192,6 +196,23 @@ static inline int ip_finish_output2(stru
+ 		skb = skb2;
+ 	}
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ppa_hook_session_add_fn != NULL )
++        {
++            struct nf_conn *ct;
++
++            enum ip_conntrack_info ctinfo;
++            uint32_t flags;
++    
++            ct = nf_ct_get(skb, &ctinfo);
++    
++            flags = 0;  //  post routing
++            flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ? PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
++    
++            ppa_hook_session_add_fn(skb, ct, flags);
++        }
++#endif
++
+ 	rcu_read_lock_bh();
+ 	nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);
+ 	neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
+diff --git a/net/netfilter/core.c b/net/netfilter/core.c
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -26,6 +26,11 @@
+ 
+ #include "nf_internals.h"
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
++
++
+ static DEFINE_MUTEX(afinfo_mutex);
+ 
+ const struct nf_afinfo __rcu *nf_afinfo[NFPROTO_NUMPROTO] __read_mostly;
+@@ -187,7 +192,17 @@ next_hook:
+ 	if (verdict == NF_ACCEPT || verdict == NF_STOP) {
+ 		ret = 1;
+ 	} else if ((verdict & NF_VERDICT_MASK) == NF_DROP) {
+-		kfree_skb(skb);
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ppa_hook_session_del_fn != NULL )
++        {
++            struct nf_conn *ct = NULL;
++            enum ip_conntrack_info ctinfo;
++        
++            ct = nf_ct_get(skb, &ctinfo);
++            ppa_hook_session_del_fn(ct, PPA_F_SESSION_ORG_DIR | PPA_F_SESSION_REPLY_DIR);
++        }
++#endif
++      kfree_skb(skb);
+ 		ret = NF_DROP_GETERR(verdict);
+ 		if (ret == 0)
+ 			ret = -EPERM;
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -51,6 +51,11 @@
+ #include <net/netfilter/nf_nat_core.h>
+ #include <net/netfilter/nf_nat_helper.h>
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++  static atomic_t g_ppa_force_timeout = {0};
++#endif
++
+ #define NF_CONNTRACK_VERSION	"0.5.0"
+ 
+ int (*nfnetlink_parse_nat_setup_hook)(struct nf_conn *ct,
+@@ -189,6 +194,12 @@ static void
+ clean_from_lists(struct nf_conn *ct)
+ {
+ 	pr_debug("clean_from_lists(%p)\n", ct);
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_session_del_fn != NULL )
++    {
++        ppa_hook_session_del_fn(ct, PPA_F_SESSION_ORG_DIR | PPA_F_SESSION_REPLY_DIR);
++    }
++#endif
+ 	hlist_nulls_del_rcu(&ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode);
+ 	hlist_nulls_del_rcu(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode);
+ 
+@@ -207,6 +218,12 @@ destroy_conntrack(struct nf_conntrack *n
+ 	NF_CT_ASSERT(atomic_read(&nfct->use) == 0);
+ 	NF_CT_ASSERT(!timer_pending(&ct->timeout));
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_session_del_fn != NULL )
++    {
++        ppa_hook_session_del_fn(ct, PPA_F_SESSION_ORG_DIR | PPA_F_SESSION_REPLY_DIR);
++    }
++#endif
+ 	/* To make sure we don't get any weird locking issues here:
+ 	 * destroy_conntrack() MUST NOT be called with a write lock
+ 	 * to nf_conntrack_lock!!! -HW */
+@@ -302,6 +319,29 @@ static void death_by_timeout(unsigned lo
+ 	struct nf_conn *ct = (void *)ul_conntrack;
+ 	struct nf_conn_tstamp *tstamp;
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++      /* if this function is called from within a timer interrupt then the timer
++         has actually expired. We need to make this distinction since this function 
++         is also called to remove conntrack's for various reasons other than inactivity
++         timeout */
++         
++    if ( !atomic_read(&g_ppa_force_timeout) && ppa_hook_inactivity_status_fn != NULL)
++    {
++        if ( ppa_hook_inactivity_status_fn((PPA_U_SESSION *)ct) == PPA_HIT )
++        {
++            nf_ct_refresh(ct, 0, 60 * HZ); //to check again after default seconds
++
++            if( !timer_pending(&ct->timeout) )
++            {
++                ct->timeout.expires = jiffies + 60 * HZ;
++                add_timer(&ct->timeout);
++            }
++            return;
++        }
++    }
++#endif
++
++
+ 	tstamp = nf_conn_tstamp_find(ct);
+ 	if (tstamp && tstamp->stop == 0)
+ 		tstamp->stop = ktime_to_ns(ktime_get_real());
+@@ -650,7 +690,13 @@ static noinline int early_drop(struct ne
+ 		return dropped;
+ 
+ 	if (del_timer(&ct->timeout)) {
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        atomic_inc(&g_ppa_force_timeout);
++#endif
+ 		death_by_timeout((unsigned long)ct);
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++      atomic_dec(&g_ppa_force_timeout);
++#endif
+ 		/* Check if we indeed killed this entry. Reliable event
+ 		   delivery may have inserted it into the dying list. */
+ 		if (test_bit(IPS_DYING_BIT, &ct->status)) {
+@@ -1025,6 +1071,19 @@ nf_conntrack_in(struct net *net, u_int8_
+ 
+ 	if (set_reply && !test_and_set_bit(IPS_SEEN_REPLY_BIT, &ct->status))
+ 		nf_conntrack_event_cache(IPCT_REPLY, ct);
++
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ret == NF_ACCEPT && ct != NULL && ppa_hook_session_add_fn != NULL )
++        {
++            uint32_t flags;
++    
++            flags = PPA_F_BEFORE_NAT_TRANSFORM;
++            flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ? PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
++    
++            ppa_hook_session_add_fn(skb, ct, flags);
++        }
++#endif
++
+ out:
+ 	if (tmpl) {
+ 		/* Special case: we have to repeat this hook, assign the
+@@ -1115,6 +1174,14 @@ acct:
+ 			atomic64_add(skb->len, &acct[CTINFO2DIR(ctinfo)].bytes);
+ 		}
+ 	}
++
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_set_inactivity_fn != NULL )
++    {
++        ppa_hook_set_inactivity_fn((PPA_U_SESSION *)ct, extra_jiffies / HZ);
++    }
++#endif
++
+ }
+ EXPORT_SYMBOL_GPL(__nf_ct_refresh_acct);
+ 
+@@ -1256,6 +1323,10 @@ void nf_ct_iterate_cleanup(struct net *n
+ 	struct nf_conn *ct;
+ 	unsigned int bucket = 0;
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        atomic_inc(&g_ppa_force_timeout);
++#endif
++
+ 	while ((ct = get_next_corpse(net, iter, data, &bucket)) != NULL) {
+ 		/* Time to push up daises... */
+ 		if (del_timer(&ct->timeout))
+@@ -1264,6 +1335,10 @@ void nf_ct_iterate_cleanup(struct net *n
+ 
+ 		nf_ct_put(ct);
+ 	}
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        atomic_dec(&g_ppa_force_timeout);
++#endif
++
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_iterate_cleanup);
+ 

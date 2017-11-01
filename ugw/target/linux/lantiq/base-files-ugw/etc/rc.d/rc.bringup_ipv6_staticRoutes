@@ -1,0 +1,149 @@
+#!/bin/sh
+
+if [ ! "$ENVLOADED" ]; then
+        if [ -r /etc/rc.conf ]; then
+                 . /etc/rc.conf 2> /dev/null
+                ENVLOADED="1"
+        fi
+fi
+#sleep 5
+
+get_wan_type()
+{
+        echo $1 | grep -i ppp 2>&1 > /dev/null
+	if [ $? -eq 0 ]; then
+ 		route6_wan_type="ppp"
+     		route6_wan_idx=$(echo "$1" | sed 's/WANPPP//')
+	else
+       		route6_wan_idx=$(echo "$1" | sed 's/WANIP//')
+		route6_wan_type="ip"
+	fi
+}
+			
+
+if [ "$1" = "add" -o "$1" = "delete" ]; then
+       case "$1" in
+               add)
+                       #add
+                       #/etc/rc.d/rc.staticRoutes_add $2 $3 $4 $5 $6 $7
+                       sr6_status="UP"
+                       ;;
+               delete)
+                       #del
+                       #/etc/rc.d/rc.staticRoutes_delete $2
+                       sr6_status="DOWN"
+                       ;;
+               *)
+                       echo $"Usage $0 {add|delete}"
+                       exit 1
+       esac
+       tag6="route6_${2}"
+       tag6_value="route6_${2}_status"
+       /usr/sbin/status_oper SET $tag6 $tag6_value "$sr6_status"
+       echo "0"
+elif [ "$5" = "add" -o "$5" = "del" ]; then
+       if [ "$4" = "1" ]; then
+               if [ ! -z "$7" -a "$7" != "ALL" ]; then
+		       get_wan_type $7
+                       if [ -n "$7" -a $route6_wan_idx -ge 0 ]; then
+                               . /etc/rc.d/get_wan_if $route6_wan_idx $route6_wan_type
+                               route6_WAN_intf=$WAN_IFNAME
+                               staticRoute6="default dev $route6_WAN_intf"
+                       else
+                               staticRoute6="default gw $3"
+                       fi
+               else
+                       staticRoute6="default gw $3"
+               fi
+       else
+               staticRoute6="$1/$2"
+               if [ -n "$3" ]; then
+                       staticRoute6="$staticRoute6 gw $3"
+               fi
+               if [ -n "$7" -a "$7" != "ALL" ]; then
+		       get_wan_type $7
+                       . /etc/rc.d/get_wan_if $route6_wan_idx $route6_wan_type
+                       route6_WAN_intf=$WAN_IFNAME
+                       staticRoute6="$staticRoute6 dev $route6_WAN_intf"
+               fi
+       fi
+       if [ "$5" = "add" ]; then
+               /sbin/route -A inet6 add ${staticRoute6} 2> /dev/null
+       elif [ "$5" = "del" ]; then
+               /sbin/route -A inet6 del ${staticRoute6} 2> /dev/null
+       fi
+       if [ $? -ne 0 ]; then
+               exit 1
+       fi
+else
+
+
+
+if [ -n "$routing6_Count" -a "$routing6_Count" -gt 0 -a "$ipv6_status" = "1" ]; then
+       i=0
+       while [ "$i" -ge 0 -a "$i" -lt $routing6_Count ]
+       do
+               eval staticRoute6_prefix='$'route6_${i}_dstIp
+               eval staticRoute6_prefixlen='$'route6_${i}_dstprefixlen
+               eval staticRoute6_iface='$'route6_${i}_routeIf
+               eval cpeId6='$'route6_${i}_cpeId
+               status6_tag="route6_${cpeId6}"
+               status6_tag_value="route6_${cpeId6}_status"
+               eval staticRoute6_gw='$'route6_${i}_gw
+               eval staticRoute6_type='$'route6_${i}_type
+	       get_wan_type $staticRoute6_iface
+               . /etc/rc.d/get_wan_if $route6_wan_idx $route6_wan_type
+               route6_WAN_intf=$WAN_IFNAME
+
+               if [ "$staticRoute6_type" = "1" ]; then
+                       if [ -z "$staticRoute6_iface" -o "$staticRoute6_iface" = "ALL" ]; then
+                               if [ -n "$staticRoute6_gw" ]; then
+                                       staticRoute6="default gw $staticRoute6_gw"
+                               else
+                                       /usr/sbin/status_oper SET $status6_tag $status6_tag_value ERROR
+                                       i=$(( $i + 1 ))
+                                       continue
+                               fi
+                       else
+                               staticRoute6="default dev $route6_WAN_intf"
+                               Interface=$route6_WAN_intf
+                       fi
+               elif [ "$staticRoute6_type" = "2" -o "$staticRoute6_type" = "3" ]; then
+                       staticRoute6="$staticRoute6_prefix/$staticRoute6_prefixlen"
+                       if [ -n "$staticRoute6_gw" ]; then
+                               staticRoute6="$staticRoute6 gw $staticRoute6_gw"
+                       fi
+                       if [ -n "$staticRoute6_iface" ]; then
+                               staticRoute6="$staticRoute6 dev $route6_WAN_intf"
+                       fi
+               fi
+
+               if [ -n "$Interface" ]; then
+                       iface_stat6=`ifconfig $Interface`
+                       case $iface_stat6 in
+                               *UP\ *) /usr/sbin/status_oper SET $status6_tag $status6_tag_value UP
+                                       ;;
+                               *)      /usr/sbin/status_oper SET $status6_tag $status6_tag_value DOWN
+                                       i=$(( $i + 1 ))
+                                       continue
+                                       ;;
+                       esac
+               fi
+
+               /sbin/route -A inet6 add ${staticRoute6} 2> /tmp/ipv6_static_route
+               if [ $? -ne 0 ]; then
+                       var=$(cat /tmp/ipv6_static_route | grep "File exists")
+                       if [ -z "$var" -o "$var" = "" ]; then
+                               /usr/sbin/status_oper SET $status6_tag $status6_tag_value ERROR
+                       fi
+               fi
+               i=$(( $i + 1 ))
+       done
+fi
+
+fi
+
+
+
+
+

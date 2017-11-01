@@ -1,0 +1,318 @@
+diff --git a/include/linux/fast_skb.h b/include/linux/fast_skb.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/fast_skb.h
+@@ -0,0 +1,99 @@
++#ifndef __FAST_SKB_H_
++#define __FAST_SKB_H_
++
++#ifdef CONFIG_LTQ_SKB_RECYCLE 
++#include <linux/percpu.h>
++#include <linux/smp.h>
++#include <linux/netdevice.h>
++
++#define FAST_DMA_PACKET_SIZE 1664
++#define SKB_RECYCLE_LEN 1600
++#define NET_SKB_PAD_ALLOC 64
++	extern struct sk_buff *alloc_recycled_skb(uint32_t len, gfp_t gfp_mask); 
++	#define FAST_ALLOC_SKB()  fast_alloc_skb()
++	#define SKB_POOL_ENQUEUE(skb)	fast_free_skb(skb)
++	#define skb_recycle_free(skb)	SKB_POOL_ENQUEUE(skb)
++void __init_skb(struct sk_buff *skb);
++inline static struct sk_buff* fast_alloc_skb(void)
++{
++	struct sk_buff *skb=NULL;
++	unsigned long flags;
++	uint32_t c1;
++	local_irq_save(flags);
++	c1 = per_cpu(pool_handler,get_cpu()).count;
++	put_cpu();
++
++	if (c1) {
++			skb = per_cpu(pool_handler,get_cpu()).skb_dma_pool[c1-1];
++			put_cpu();
++	        per_cpu(pool_handler,get_cpu()).count--;	
++			put_cpu();
++			}
++	local_irq_restore(flags);
++	return skb;
++}
++
++inline static int fast_free_skb(struct sk_buff *skb)
++{  
++	int ret = -1;
++	unsigned long flags;
++	
++	uint32_t c2;
++
++	if ((skb->end - skb->head) < SKB_RECYCLE_LEN + 128) {		
++    	goto lbl_devfree_ret;
++   		 }
++	
++	local_irq_save(flags);
++	c2 = per_cpu(pool_handler,get_cpu()).count;
++	put_cpu();
++
++	local_irq_restore(flags);
++	if( (c2) >= MAX_SKB_DMA_POOL_LEN ) 
++	{
++	goto lbl_devfree_ret;
++	} else {
++			if(likely(skb))
++			{
++		    __init_skb(skb); /*XXX: The reset of skb happens */
++			}
++
++			local_irq_save(flags);
++            per_cpu(pool_handler,get_cpu()).skb_dma_pool[per_cpu(pool_handler,get_cpu()).count] = skb;
++  			put_cpu();
++ 			per_cpu(pool_handler,get_cpu()).count++;
++			put_cpu();
++		    local_irq_restore(flags);
++			skb->recycle = 1; // XXX:added back because of init_skb
++			}
++    goto lbl_free_ret;
++
++lbl_devfree_ret:
++	skb->recycle = 0;
++	kfree(skb->head);
++	
++lbl_free_ret:
++	return ret;
++}
++
++
++#define DMA_ALLOC_SKB(skb, len,mask)	do {\
++ 				uint32_t c3; \
++				unsigned long flags;\
++				local_irq_save(flags);\
++				c3 = per_cpu(pool_handler,get_cpu()).count; \
++					local_irq_restore(flags);\
++					if((len == (FAST_DMA_PACKET_SIZE + NET_SKB_PAD_ALLOC))  && (c3)){\
++					skb = FAST_ALLOC_SKB();\
++					}\
++					if(!skb){\
++					skb = alloc_skb(len,mask);\
++					if(skb){\
++					skb->recycle=1; }	}\
++					}while(0)
++	
++								  
++
++#endif
++#endif /* __FAST_SKB_H_ */
++
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1832,6 +1832,15 @@ static inline void input_queue_tail_incr
+ 	*qtail = ++sd->input_queue_tail;
+ #endif
+ }
++#ifdef CONFIG_LTQ_SKB_RECYCLE                                                  
++#define MAX_SKB_DMA_POOL_LEN 700 /* max array size */                                             
++struct skb_pool_handler                                                         
++{                                                                               
++  struct sk_buff *skb_dma_pool[MAX_SKB_DMA_POOL_LEN];                         
++  uint32_t count;                                                               
++};                                                                              
++ DECLARE_PER_CPU(struct skb_pool_handler,pool_handler);                          
++#endif                            
+ 
+ DECLARE_PER_CPU_ALIGNED(struct softnet_data, softnet_data);
+ 
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -519,6 +519,9 @@ struct sk_buff {
+ #ifdef CONFIG_IPV6_NDISC_NODETYPE
+ 	__u8			ndisc_nodetype:2;
+ #endif
++#ifdef CONFIG_LTQ_SKB_RECYCLE
++	__u8 			recycle:1;
++#endif
+ 	__u8			pfmemalloc:1;
+ 	__u8			ooo_okay:1;
+ 	__u8			l4_rxhash:1;
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -93,6 +93,11 @@ config LTQ_UDP_REDIRECT
+           You can say Y here if you want to use hooks from kernel for
+           UDP re-direction (KPI2UDP redirection)
+ 
++config LTQ_SKB_RECYCLE
++        bool "RECYCLE support"
++        help
++            Lantiq SKB recycling support
++
+ config LANTIQ_IPQOS
+ 	bool "IPQOS support"
+ 	help
+diff --git a/net/core/Makefile b/net/core/Makefile
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -23,3 +23,4 @@ obj-$(CONFIG_TRACEPOINTS) += net-traces.
+ obj-$(CONFIG_NET_DROP_MONITOR) += drop_monitor.o
+ obj-$(CONFIG_NETWORK_PHY_TIMESTAMPING) += timestamping.o
+ obj-$(CONFIG_NETPRIO_CGROUP) += netprio_cgroup.o
++obj-$(CONFIG_LTQ_SKB_RECYCLE) += fask_skb.o
+diff --git a/net/core/fast_skb.c b/net/core/fast_skb.c
+new file mode 100644
+--- /dev/null
++++ b/net/core/fast_skb.c
+@@ -0,0 +1,31 @@
++#include <linux/skbuff.h>
++#include <linux/fast_skb.h>
++
++#ifdef CONFIG_LTQ_SKB_RECYCLE
++DEFINE_PER_CPU(struct skb_pool_handler,pool_handler)={{NULL,0}};
++#define LEN_MODIFIED 1664
++
++struct sk_buff *alloc_recycled_skb(uint32_t len , gfp_t gfp_mask)
++{
++	struct sk_buff *skb = NULL;
++	
++	if (len <= LEN_MODIFIED && len > 64) {
++		len = LEN_MODIFIED;
++	}
++	else {
++    	len = len; /* If len more than LEN_MODIFIED,cant allocate from pool*/
++	}
++
++	DMA_ALLOC_SKB(skb, len + NET_SKB_PAD_ALLOC, gfp_mask);
++
++	if (likely(skb)) {
++		skb->recycle=1;
++		skb_reserve(skb, NET_SKB_PAD_ALLOC);
++		}	
++	
++	return skb;
++}
++EXPORT_SYMBOL(alloc_recycled_skb);
++#endif
++
++
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -71,6 +71,9 @@
+ #include <asm/uaccess.h>
+ #include <trace/events/skb.h>
+ #include <linux/highmem.h>
++#ifdef CONFIG_LTQ_SKB_RECYCLE
++#include <linux/fast_skb.h>
++#endif
+ 
+ #ifdef CONFIG_LTQ_CBM
+ #include <net/lantiq_cbm.h>
+@@ -538,6 +541,63 @@ void *netdev_alloc_frag(unsigned int fra
+ 	return __netdev_alloc_frag(fragsz, GFP_ATOMIC | __GFP_COLD);
+ }
+ EXPORT_SYMBOL(netdev_alloc_frag);
++#ifdef CONFIG_LTQ_SKB_RECYCLE
++
++void __init_skb(struct sk_buff *skb)
++{
++    struct skb_shared_info *shinfo;
++	 /*
++	* Only clear those fields we need to clear, not those that we will
++	* actually initialise below. Hence, don't put any more fields after
++	  * the tail pointer in struct sk_buff!
++	  */
++	  memset(skb, 0, offsetof(struct sk_buff, tail));
++	  atomic_set(&skb->users, 1);
++	  #if 0 /* XXX: Need to check ? */
++	  skb->truesize = size + sizeof(struct sk_buff);
++	  atomic_set(&skb->users, 1); /* XXX:Simple assignment fine */
++	  #endif
++	  #if 0
++	  skb->head = data;
++	  #endif
++	  skb->data = skb->head;
++	  #if 0
++	  skb_reset_tail_pointer(skb);
++	  skb->end = skb->tail + size; /* XXX: today exact size, else we may need
++	  change ?*/
++	  #else
++	  skb->tail=0;
++	  #endif	
++	  kmemcheck_annotate_bitfield(skb, flags1);
++	  kmemcheck_annotate_bitfield(skb, flags2);
++	  #ifdef NET_SKBUFF_DATA_USES_OFFSET
++	  #warning i am compiling skb->mac  
++	  skb->mac_header = ~0U;
++	  #endif
++	  /* make sure we initialize shinfo sequentially */
++	  #if 0 /* XXX: should be able to skip most of the below due to free logic ?
++    */
++	  shinfo = skb_shinfo(skb);
++	  atomic_set(&shinfo->dataref, 1);
++	  shinfo->nr_frags  = 0;
++	  shinfo->gso_size = 0;
++	  shinfo->gso_segs = 0;
++	  shinfo->gso_type = 0;
++	  shinfo->ip6_frag_id = 0;
++	  shinfo->tx_flags.flags = 0;
++	  skb_frag_list_init(skb);
++	  
++	  #if 0
++	  memset(&shinfo->hwtstamps, 0, sizeof(shinfo->hwtstamps));
++	  #endif
++	  #else
++      shinfo = skb_shinfo(skb);
++	  atomic_set(&shinfo->dataref, 1);
++	  memset(&shinfo->nr_frags, 0x0, (unsigned char *)&shinfo->hwtstamps - &shinfo->nr_frags + sizeof(shinfo->hwtstamps));
++	  #endif
++	  }
++	  EXPORT_SYMBOL(__init_skb);
++#endif 
+ 
+ /**
+  *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
+@@ -659,6 +719,9 @@ static void skb_release_data(struct sk_b
+ 			       &skb_shinfo(skb)->dataref)) {
+ 		if (skb_shinfo(skb)->nr_frags) {
+ 			int i;
++			#ifdef CONFIG_LTQ_SKB_RECYCLE
++			skb->recycle=0;
++			#endif
+ 			for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
+ 				skb_frag_unref(skb, i);
+ 		}
+@@ -677,9 +740,21 @@ static void skb_release_data(struct sk_b
+ 
+ 		if (skb_has_frag_list(skb))
+ 			skb_drop_fraglist(skb);
+-
++		#ifdef CONFIG_LTQ_SKB_RECYCLE
++		if(skb->recycle)
++		{
++		skb_recycle_free(skb);
++		}
++		else
++		#endif
+ 		skb_free_head(skb);
+ 	}
++	#ifdef CONFIG_LTQ_SKB_RECYCLE
++	else
++	{
++	skb->recycle=0;
++	}
++	#endif
+ }
+ 
+ /*
+@@ -792,7 +867,12 @@ static void skb_release_all(struct sk_bu
+ void __kfree_skb(struct sk_buff *skb)
+ {
+ 	skb_release_all(skb);
++	#ifdef CONFIG_LTQ_SKB_RECYCLE
++	if(!skb->recycle)
+ 	kfree_skbmem(skb);
++	#else 
++	kfree_skbmem(skb);
++	#endif
+ }
+ EXPORT_SYMBOL(__kfree_skb);
+ 

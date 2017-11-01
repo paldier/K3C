@@ -1,0 +1,341 @@
+Support Inter Thread Communication (ITC) used to Synchronise Multiple TCs.
+Currently ITC cells are used as binary Semaphores.
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -2095,6 +2095,13 @@ config LTQ_VMB
+ 	help
+ 	 Lantiq VPE Management Block support to launch Secondary FW/Linux
+ 
++config LTQ_ITC
++	bool "Inter Thread Communication support (ITC)"
++	depends on MIPS_CMP && SOC_GRX500
++	default n
++	help
++	 Used to Synchronise Multiple TCs. Currently ITC cells are used a Semaphores.
++
+ config LTQ_DYN_CPU_ALLOC
+ 	bool "Dynamic CPU allocation in vmb_cpu_alloc"
+ 	depends on LTQ_VMB
+diff --git a/arch/mips/include/asm/ltq_itc.h b/arch/mips/include/asm/ltq_itc.h
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/include/asm/ltq_itc.h
+@@ -0,0 +1,37 @@
++/******************************************************************************
++
++                         Copyright (c) 2012, 2014, 2015
++                            Lantiq Deutschland GmbH
++
++  For licensing information, see the file 'LICENSE' in the root folder of
++  this software module.
++
++******************************************************************************/
++
++#ifndef _LTQ_ITC_H
++#define _LTQ_ITC_H
++
++
++#define ITC_Block					0x1c300000
++#define ERRCTL_ITC					(1 << 26)
++#define ITC_BypassView					0x00000000
++#define ITC_ControlView                                 0x00000008
++#define ITC_EmptyFullSyncView                           0x00000010
++#define ITC_EmptyFullTryView                            0x00000018
++#define ITC_PVSyncView                                  0x00000020
++#define ITC_PVTryView                                   0x00000028
++#define ITC_En                                          0x00000001
++#define ITC_E                                           0x00000001
++#define ITC_NumEntries                                  18
++#define ITC_FIFO_Entries				2
++#define ITC_SEM_Entries					16 
++#define ITC_AddrMask                                    0x3f            // 128K ITC address space
++#define ITC_EntryGrain                                  0               // 128 bytes between Entries (Cells)
++
++#define 	DEBUG_ITC
++
++int32_t itc_init(void);
++void itc_sem_wait(uint8_t semId);
++void itc_sem_post(uint8_t semId);
++uint32_t itc_sem_addr(uint8_t semId);
++#endif
+diff --git a/arch/mips/kernel/smp-cmp.c b/arch/mips/kernel/smp-cmp.c
+--- a/arch/mips/kernel/smp-cmp.c
++++ b/arch/mips/kernel/smp-cmp.c
+@@ -44,6 +44,10 @@
+ #include <asm/ltq_vmb.h>
+ #endif
+ 
++#ifdef CONFIG_LTQ_ITC
++#include <asm/ltq_itc.h>
++#endif
++
+ static void ipi_call_function(unsigned int cpu)
+ {
+ 	pr_debug("CPU%d: %s cpu %d status %08x\n",
+@@ -214,6 +218,10 @@ static void cmp_init_secondary(void)
+ #ifdef CONFIG_EVA
+ 	if (gcmp_present)
+ 		BEV_overlay_segment();
++
++#ifdef CONFIG_LTQ_ITC
++		itc_init();
++#endif
+ #endif
+ }
+ 
+diff --git a/arch/mips/lantiq/Makefile b/arch/mips/lantiq/Makefile
+--- a/arch/mips/lantiq/Makefile
++++ b/arch/mips/lantiq/Makefile
+@@ -12,3 +12,4 @@ obj-$(CONFIG_SOC_TYPE_XWAY) += xway/
+ obj-$(CONFIG_SOC_FALCON) += falcon/
+ obj-$(CONFIG_MIPS_CMP)+=lantiq-amon.o
+ obj-$(CONFIG_LTQ_VMB)+=lantiq-vmb.o
++obj-$(CONFIG_LTQ_ITC)+=lantiq-itc.o
+diff --git a/arch/mips/lantiq/lantiq-itc.c b/arch/mips/lantiq/lantiq-itc.c
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/lantiq/lantiq-itc.c
+@@ -0,0 +1,241 @@
++/******************************************************************************
++
++                         Copyright (c) 2012, 2014, 2015
++                            Lantiq Deutschland GmbH
++
++  For licensing information, see the file 'LICENSE' in the root folder of
++  this software module.
++
++******************************************************************************/
++
++#include <linux/init.h>
++#include <linux/string.h>
++#include <linux/kernel.h>
++#include <linux/cpu.h>
++#include <linux/sched.h>
++#include <asm/mipsregs.h>
++#include <asm/ltq_itc.h>
++
++
++uint32_t        *ITC_base;
++uint32_t        *ITC_Sem_base;
++uint32_t        *ITC_FIFO_base;
++uint32_t 	 itcn;
++
++int32_t itc_init(void) {
++	uint32_t 	errctlreg, Config_ITC;
++	uint32_t 	ITCAddressMap0, ITCAddressMap1;
++	uint32_t	*ITC_BlockNC;
++	uint32_t        *ITC_Cell_Sem;
++	uint32_t        *ITC_Cell_FIFO;
++	uint32_t        ITC_Cell_Sem_off;
++	uint32_t 	i;
++
++/* Configure ITC Tags using Cache opts .*/
++/* Set ITC bit in ErrCtl register to enable Cache mode for ITC Tags */
++
++	errctlreg = read_c0_ecc();
++	Config_ITC = errctlreg | ERRCTL_ITC ;	 
++	write_c0_ecc(Config_ITC);
++	mips_ihb();
++
++        //Read reset-value ITC_Address_Map0
++    __asm__ volatile
++        (   "\
++            cache 5, 0($0);  \
++            ehb; \
++            "
++        ) ;
++        printk("\nInitial ITC_Address_Map0 %08x \n",read_c0_dtaglo());
++
++	if (read_c0_dtaglo() & ITC_En) {
++		printk ("ITC Memory is already initialised for Core %d at address %x !!!", (smp_processor_id()/2), (read_c0_dtaglo() & 0xffff0000));
++
++		/* return ErrCtl to it previous state */
++	        write_c0_ecc(errctlreg);
++		mips_ihb();
++
++		return 0;
++	}
++
++#ifdef DEBUG_ITC
++        //Read reset-value ITC_Address_Map1
++    __asm__ volatile
++        (   "\
++            cache 5, 8($0);  \
++            ehb; \
++            "
++        ) ;
++        printk("\ndef ITC_Address_Map1 %08x",read_c0_dtaglo());
++#endif
++
++/* configure Number of entries Address mask bits and Entry Grain in ITC tag index 8 */
++	ITCAddressMap1 = ((ITC_AddrMask << 10) | ITC_EntryGrain);
++
++	write_c0_dtaglo(ITCAddressMap1);
++
++	__asm__ volatile
++        (   "\
++            cache 9, 8($0);  \
++            ehb; \
++            "
++        ) ;
++
++#ifdef DEBUG_ITC
++        //Read new-value ITC_Address_Map1
++    __asm__ volatile
++        (   "\
++            cache 5, 8($0);  \
++            ehb; \
++            "
++        ) ;
++        printk("\nnew ITC_Address_Map1 %08x",read_c0_dtaglo());
++#endif
++
++/* configure Base address and ITC_En (enable bit) in ITC tag index 0 and Use physical address */
++	ITC_BlockNC = (unsigned int *)((unsigned int)ITC_Block & 0x7fffffff);
++
++#ifdef DEBUG_ITC
++        //Read reset-value ITC_Address_Map0
++    __asm__ volatile
++        (   "\
++            cache 5, 0($0);  \
++            ehb; \
++            "
++        ) ;
++        printk("\ndef ITC_Address_Map0 %08x",read_c0_dtaglo());
++#endif
++
++	ITCAddressMap0 = ((unsigned int)ITC_BlockNC | ITC_En);
++	write_c0_dtaglo(ITCAddressMap0);
++
++	__asm__ volatile
++        (   "\
++            cache 9, 0($0); \
++            ehb; \
++            "
++        ) ;
++
++#ifdef DEBUG_ITC
++        //Read new-value ITC_Address_Map0
++    __asm__ volatile
++        (   "\
++            cache 5, 0($0);  \
++            ehb; \
++            "
++        ) ;
++        printk("\nnew ITC_Address_Map0 %08x", read_c0_dtaglo());
++#endif
++
++/* return ErrCtl to it previous state */
++	write_c0_ecc(errctlreg); 
++	mips_ihb();
++
++/* Enable ITC Entry :  Use unmapped address */
++    ITC_BlockNC = (unsigned int *)((unsigned int)ITC_Block);
++
++/* Change to unmapped memory */
++        ITC_BlockNC = (unsigned int *)CKSEG1ADDR(ITC_BlockNC);
++
++	ITC_base = (unsigned int *)((unsigned int)ITC_BlockNC);
++	ITC_FIFO_base = (unsigned int *)((unsigned int)ITC_BlockNC);
++ 
++	ITC_Cell_Sem_off = 0;
++
++/*
++ Use Control View to access Entry Tag
++*/
++	
++	for (i=0; i< ITC_FIFO_Entries; i++) {
++
++		ITC_Cell_FIFO =(unsigned int *)(((unsigned int)ITC_BlockNC + ITC_Cell_Sem_off) | ITC_BypassView);
++    		*ITC_Cell_FIFO = 0;
++
++		ITC_Cell_FIFO =(unsigned int *)(((unsigned int)ITC_BlockNC + ITC_Cell_Sem_off) | ITC_ControlView);
++    		*ITC_Cell_FIFO = ITC_E;
++		
++		ITC_Cell_Sem_off = ITC_Cell_Sem_off + (128 * (0x1 << ITC_EntryGrain));
++	}
++
++	ITC_Sem_base = (unsigned int *)((unsigned int)ITC_BlockNC + ITC_Cell_Sem_off) ;
++ 
++/* 
++   For each SEM entries clear the content of Cell using ITC_BypassView otherwise default value seen in cell is 5.
++   Set the ITC_ControlView to set ITC_E.
++   Use ITC_PVSyncView to initialise the Sem Cell to 1 to unblock the first access
++*/
++
++	for (i=0; i<ITC_SEM_Entries; i++) {
++		ITC_Cell_Sem = (unsigned int *)(((unsigned int)ITC_BlockNC + ITC_Cell_Sem_off) | ITC_BypassView);
++		*ITC_Cell_Sem = 0;
++		
++		ITC_Cell_Sem = (unsigned int *)(((unsigned int)ITC_BlockNC + ITC_Cell_Sem_off) | ITC_ControlView);
++                *ITC_Cell_Sem = ITC_E;
++
++		ITC_Cell_Sem =(unsigned int *)(((unsigned int)ITC_BlockNC + ITC_Cell_Sem_off) | ITC_PVSyncView);
++		*ITC_Cell_Sem = 1;
++
++		ITC_Cell_Sem_off = ITC_Cell_Sem_off + (128 * (0x1 << ITC_EntryGrain));
++	}
++
++	printk ("\n ITC Init done on Core %d on CPU %d !!! \n", (smp_processor_id() / 2), smp_processor_id());
++
++return 0; 
++}
++
++early_initcall(itc_init);
++
++
++/* 
++   Read the ITC cell using P/V Sync View,
++   If the Cell Contains 0, this will block
++*/
++
++void itc_sem_wait(uint8_t semId)
++{
++    uint32_t *ITC_Cell;
++    uint32_t Sem_off = 0;
++  
++    Sem_off = semId * (128 * (0x1 << ITC_EntryGrain)); 
++    
++    ITC_Cell =(uint32_t *)(((uint32_t)ITC_Sem_base + Sem_off) | ITC_PVSyncView);
++
++    itcn = *ITC_Cell;
++
++    return;
++
++}
++
++/* 
++   Write to the ITC cell, to increment its value,
++   This will unblock the lock.
++*/
++
++void itc_sem_post(uint8_t semId)
++{
++    uint32_t *ITC_Cell;
++    uint32_t Sem_off = 0;
++
++    Sem_off = semId * (128 * (0x1 << ITC_EntryGrain));
++
++    ITC_Cell =(uint32_t *)(((uint32_t)ITC_Sem_base + Sem_off) | ITC_PVSyncView);
++
++    *ITC_Cell = 1;
++
++    return;
++}
++
++uint32_t itc_sem_addr(uint8_t semId)
++{ /*copy from itc_sem_wait */
++    uint32_t Sem_off = 0;
++  
++    Sem_off = semId * (128 * (0x1 << ITC_EntryGrain)); 
++    
++    return (((uint32_t)ITC_Sem_base + Sem_off) | ITC_PVSyncView);
++}
++
++
++EXPORT_SYMBOL(itc_sem_wait);
++EXPORT_SYMBOL(itc_sem_post);
++EXPORT_SYMBOL(itc_sem_addr);
++

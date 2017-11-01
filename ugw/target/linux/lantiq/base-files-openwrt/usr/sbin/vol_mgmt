@@ -1,0 +1,552 @@
+#!/bin/sh
+#
+# UBI volume management functions for CPE
+# Configurations based on /sys/class/ubi/ubi0
+#
+# Copyright Lantiq.
+# alexander.abraham@lantiq.com
+#
+
+# create_ubi_nodes: Creates ubi device nodes (/dev/ubi* and corresponding /dev/mtd*)
+# create_ubi_nodes: Call in startup (No arguments)
+create_ubi_nodes ()
+{
+	local udv
+	rm -f /dev/ubi* >&- 2>&-
+	for udv in `ls /sys/class/ubi/ubi*/dev /sys/class/misc/ubi_ctrl/dev 2>&-`; do
+		mknod /dev/`echo $udv|cut -d'/' -f5` c $(sed 's/:/ /g' $udv);
+	done
+	rm -f /dev/mtd* >&- 2>&-
+	for udv in `ls /sys/class/mtd/mtd[0-9]/dev /sys/class/mtd/mtd[0-9][0-9]/dev 2>&-`; do
+		mknod /dev/`echo $udv|cut -d'/' -f5` c $(sed 's/:/ /g' $udv);
+	done
+	for udv in `ls /sys/block/mtdblock*/dev 2>&-`; do
+		mknod /dev/`echo $udv|cut -d'/' -f4` b $(sed 's/:/ /g' $udv);
+	done
+}
+
+# remove_vol: Removes a volume
+# remove_vol: arguments: Volume name
+remove_vol ()
+{
+	ubirmvol /dev/ubi0 -N "$1"
+}
+
+# create_vol: Creates a volume
+# create_vol: arguments: Volume name, size(in KiB/MiB), [id]
+create_vol ()
+{
+	local vol_id
+	[ -n "$3" ] && vol_id="--vol_id $3" || >&-
+	ubimkvol /dev/ubi0 -s $2 -N "$1" $vol_id && {
+		create_ubi_nodes >&- 2>&- || >&-
+	}
+}
+
+# write_vol: Creates or re-use the provided volume and writes the file.
+# write_vol: It also increases the volume size if not sufficient to fit the file.
+# write_vol: arguments: Volume name, file
+write_vol ()
+{
+	[ -n "$1" -a -n "$2" ] && {
+		local file_size vol_node
+		[ -f "$2" ] && {
+			file_size=`ls -l $2|awk '{ print $5 }'`
+			vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w "$1"|cut -d'/' -f5`
+			[ -n "$vol_node" ] && {
+				ubiupdatevol /dev/$vol_node "$2" 2>&-
+				[ $? -ne 0 ] && {
+					remove_vol "$1" 2>&-
+					create_vol "$1" "$file_size"
+					vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w "$1"|cut -d'/' -f5`
+					ubiupdatevol /dev/$vol_node "$2"
+					return $?
+				} || >&-
+			} || {
+				remove_vol "$1" 2>&-
+				create_vol "$1" "$file_size"
+				vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w "$1"|cut -d'/' -f5`
+				ubiupdatevol /dev/$vol_node "$2"
+			}
+		}
+	}
+}
+
+# write_vol_fit: Always tries to remove existing volume if any and re-create exactly
+# write_vol_fit: based on the size and writes the file.
+# write_vol_fit: arguments: Volume name, file
+write_vol_fit ()
+{
+	[ -n "$1" -a -n "$2" ] && {
+		local file_size vol_node
+		[ -f "$2" ] && {
+			file_size=`ls -l $2|awk '{ print $5 }'`
+			remove_vol "$1" 2>&-
+			create_vol "$1" "$file_size"
+			vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w "$1"|cut -d'/' -f5`
+			ubiupdatevol /dev/$vol_node "$2"
+		}
+	}
+}
+
+# write_vol_stdin: Always tries to remove existing volume if any and re-create exactly based on the size
+# write_vol_stdin: stdin: input data to write from stdin
+# write_vol_stdin: arguments: Volume name, file size
+write_vol_stdin ()
+{
+	[ -n "$1" -a -n "$2" ] && {
+		local vol_node
+		remove_vol "$1" 2>&-
+		create_vol "$1" "$2"
+		vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w "$1"|cut -d'/' -f5`
+		ubiupdatevol /dev/$vol_node -s "$2" -
+	}
+}
+
+# dump_vol: Call from utilities (read_env sysconfig)
+# dump_vol: Read volume and write to output file with dd
+# dump_vol: arguments: Volume name, output file, [blocksize], [count]
+dump_vol ()
+{
+	[ -n "$1" -a -n "$2" ] && {
+		local vol_mtd=$(grep -w "$1" /proc/mtd|cut -d: -f1)
+		[ -n "$vol_mtd" ] && {
+			local dd_str
+			[ -n "$3" ] && dd_str="bs=$3" || dd_str="bs=64k"
+			[ -n "$4" ] && dd_str="$dd_str count=$4" || >&-
+			dd if=/dev/mtd${vol_mtd:3} of="$2" $dd_str 2>&-
+		} || exit 1;
+	} || exit 1;
+}
+
+# read_cfg_gz: Call from utilities (read_env sysconfig)
+# read_cfg_gz: Read compressed(gz) config file from a volume and write to output file
+# read_cfg_gz: arguments: Volume name, output file (with .gz)
+read_cfg_gz ()
+{
+	[ -n "$1" -a -n "$2" ] && {
+		local vol_mtd=$(grep -w "$1" /proc/mtd|cut -d: -f1)
+		[ -n "$vol_mtd" ] && {
+			gunzip -t /dev/$vol_mtd && {
+				gunzip /dev/$vol_mtd -c | gzip > "$2" || exit 1;
+			} || exit 1;
+		} || exit 1;
+	} || exit 1;
+}
+
+# upgrade_mtd_uboot: Call from upgrade_vol_stdin or upgrade_dualvol_stdin
+# upgrade_mtd_uboot: stdin: uboot binary file via stdin. No arguments
+upgrade_mtd_uboot ()
+{
+	nandwrite -e -p /dev/$(grep -w uboot /proc/mtd | cut -d: -f1) -;
+}
+
+# upgrade_mtd_ubootconfig: Call from upgrade_vol_stdin or upgrade_dualvol_stdin
+# upgrade_mtd_ubootconfig: stdin: uboot config file with CRC via stdin. No arguments
+upgrade_mtd_ubootconfig ()
+{
+	grep -q -w ubootconfigA /proc/mtd && {
+		nandwrite -q -e /dev/$(grep -w ubootconfigA /proc/mtd | cut -d: -f1) -;
+		flash_eraseall /dev/$(grep -w ubootconfigB /proc/mtd | cut -d: -f1);
+	} || {
+		nandwrite -q -e /dev/$(grep -w ubootconfig /proc/mtd | cut -d: -f1) -;
+	}
+}
+
+# upgrade_mtd_gphyfw: Call from upgrade_vol_stdin or upgrade_dualvol_stdin
+# upgrade_mtd_gphyfw: stdin: gphy firmware image via stdin. No arguments
+upgrade_mtd_gphyfw ()
+{
+	grep -qw "gphyfirmware" /proc/mtd && {
+		nandwrite -e -p /dev/$(grep -w "gphyfirmware" /proc/mtd | cut -d: -f1) -;
+	} || {
+		grep -qw "uboot+gphyfw" /proc/mtd && {
+			local mtdb=`grep -w "uboot+gphyfw" /proc/mtd | cut -d: -f1`;
+			dd of=/dev/mtdblock${mtdb:3} bs=1M seek=1
+		} || true
+	}
+}
+
+# upgrade_mtd_systemsw: Call from upgrade_vol_stdin or upgrade_dualvol_stdin
+# upgrade_mtd_systemsw: stdin: system_sw volume based image via stdin. No arguments
+upgrade_mtd_systemsw ()
+{
+	umount /mnt/data 2>/dev/null;
+	nandwrite -q -e /dev/$(grep -w system_sw /proc/mtd | cut -d: -f1) -;
+}
+
+# upgrade_vol_kernel: Call from upgrade_vol_stdin
+# upgrade_vol_kernel: stdin: kernel image file via stdin
+# upgrade_vol_kernel: arguments: total size from stdin to write
+upgrade_vol_kernel ()
+{
+	remove_vol kernel
+	create_vol kernel "$1"
+	local vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w kernel|cut -d'/' -f5`
+	ubiupdatevol /dev/$vol_node -s "$1" -
+	[ $? -ne 0 ] && exit 1
+	local hex_size=`echo "$1"|awk '{ printf "%X\n", $1 }'`
+	uboot_env --set --name f_kernel_size --value "$hex_size"
+}
+
+# upgrade_vol_bootcore: Call from upgrade_vol_stdin
+# upgrade_vol_bootcore: stdin: kernel image file via stdin
+# upgrade_vol_bootcore: arguments: total size from stdin to write
+upgrade_vol_bootcore ()
+{
+	remove_vol bootcore
+	create_vol bootcore "$1"
+	local vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w bootcore|cut -d'/' -f5`
+	ubiupdatevol /dev/$vol_node -s "$1" -
+	[ $? -ne 0 ] && exit 1
+}
+
+# upgrade_vol_rootfs: Call from upgrade_vol_stdin
+# upgrade_vol_rootfs: stdin: rootfs image file via stdin
+# upgrade_vol_rootfs: arguments: total size from stdin to write
+upgrade_vol_rootfs ()
+{
+	local vol_path=`ls /sys/class/ubi/ubi0*/name|xargs grep rootfs`
+	local vol_i vol_name vol_node vol_mtd active_vol vol_id
+	for vol_i in $vol_path; do
+		vol_name=`echo $vol_i|cut -d: -f2`
+		if [ "$vol_name" = "rootfs" ]; then
+			active_vol="rootfsB";
+			vol_id=""
+		elif [ "$vol_name" = "rootfsB" ]; then
+			active_vol="rootfs"
+			# default rootfs volume id is 1.
+			vol_id="1"
+		fi
+		remove_vol $active_vol
+		create_vol $active_vol "$1" $vol_id
+		if [ $? -eq 0 ]; then
+			vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w $active_vol|cut -d'/' -f5`
+			ubiupdatevol /dev/$vol_node -s "$1" -
+			[ $? -ne 0 ] && exit 1
+			break;
+		fi
+	done
+	vol_mtd=$(grep -w $active_vol /proc/mtd|cut -d: -f1)
+	uboot_env --set --name rootfsmtd --value /dev/mtdblock${vol_mtd:3}
+}
+
+# upgrade_vol_firmware: Call from upgrade_vol_stdin
+# upgrade_vol_firmware: stdin: firmware image file via stdin
+# upgrade_vol_firmware: arguments: total size from stdin to write
+upgrade_vol_firmware ()
+{
+	umount /firmware
+	remove_vol firmware
+	create_vol firmware "$1"
+	local vol_node=`ls /sys/class/ubi/ubi0*/name|xargs grep -w "firmware"|cut -d'/' -f5`
+	ubiupdatevol /dev/$vol_node -s "$1" -
+	[ $? -ne 0 ] && exit 1
+}
+
+# upgrade_vol_stdin: Call from utilites (upgrade fullimage)
+# upgrade_vol_stdin: stdin: image file via stdin
+# upgrade_vol_stdin: arguments: kernel/firmware/rootfs, file size
+upgrade_vol_stdin ()
+{
+	[ -n "$1" -a -n "$2" ] && {
+		if [ -n "$3" ]; then
+			case "$3" in
+				"U-Boot") upgrade_mtd_uboot;;
+				"ubootenv") upgrade_mtd_ubootconfig;;
+				"gphyfw") upgrade_mtd_gphyfw;;
+				"systemsw") upgrade_mtd_systemsw;;
+				*) upgrade_vol_$1 "$2";;
+			esac
+		else
+			upgrade_vol_$1 "$2"
+		fi
+	}
+}
+
+# upgrade_dualvol_kernel: Call to update kernel (dual image update option)
+# upgrade_dualvol_kernel: stdin: Pass kernel file via stdio
+# upgrade_dualvol_kernel: arguments: total size of kernel.
+upgrade_dualvol_kernel ()
+{
+	[ -n "$1" ] && {
+
+		local active_bank=$(sed -e 's/.*active_bank=\(.*\)/\1/' -e 's/\(\([^ ]*\) \)\{1\}.*/\2/' /proc/cmdline)
+		[ -n "$active_bank" -a "$active_bank" = "A" ] && active_bank=A || active_bank=B
+                
+		local hex_size=`echo "$1"|awk '{ printf "%X\n", $1 }'`
+                #local active_bank=`uboot_env --get --name active_bank`
+                [ -n "$active_bank" ] && {
+                        [ "$active_bank" = "A" ] && new_active="B" || new_active="A"
+			write_vol_stdin kernel$new_active $1
+			[ $? -eq 0 ] && {
+
+                                eval uboot_env --set --name f_kernel_size$new_active --value "$hex_size"
+                                uboot_env --set --name active_bank --value $new_active
+
+                                if [ "$new_active" = "B" ]; then
+                                        uboot_env --set --name update_chk --value 1
+                                else
+                                        uboot_env --set --name update_chk --value 3
+                                fi
+
+			}
+		}
+	}
+}
+
+# upgrade_dualvol_bootcore: Call to update kernel (dual image update option)
+# upgrade_dualvol_bootcore: stdin: Pass kernel file via stdio
+# upgrade_dualvol_bootcore: arguments: total size of kernel.
+upgrade_dualvol_bootcore ()
+{
+	[ -n "$1" ] && {
+
+		local active_bank=$(sed -e 's/.*active_bank=\(.*\)/\1/' -e 's/\(\([^ ]*\) \)\{1\}.*/\2/' /proc/cmdline)
+		[ -n "$active_bank" -a "$active_bank" = "A" ] && active_bank=A || active_bank=B
+                
+                [ -n "$active_bank" ] && {
+                        [ "$active_bank" = "A" ] && new_active="B" || new_active="A"
+			write_vol_stdin bootcore$new_active $1
+			[ $? -eq 0 ] && {
+
+                                uboot_env --set --name active_bank --value $new_active
+
+                                if [ "$new_active" = "B" ]; then
+                                        uboot_env --set --name update_chk --value 1
+                                else
+                                        uboot_env --set --name update_chk --value 3
+                                fi
+
+			}
+		}
+	}
+}
+
+
+# upgrade_dualvol_rootfs: Call to update rootfs (dual image update option)
+# upgrade_dualvol_rootfs: Pre-requisite: update kernel first
+# upgrade_dualvol_rootfs: stdin: Pass rootfs file via stdin
+# upgrade_dualvol_rootfs: arguments: total size of rootfs.
+upgrade_dualvol_rootfs ()
+{
+	[ -n "$1" ] && {
+		local active_bank=$(sed -e 's/.*active_bank=\(.*\)/\1/' -e 's/\(\([^ ]*\) \)\{1\}.*/\2/' /proc/cmdline)
+		[ -n "$active_bank" -a "$active_bank" = "A" ] && active_bank=A || active_bank=B
+                #local active_bank=`uboot_env --get --name active_bank`
+                [ -n "$active_bank" ] && {
+                        ([  "$active_bank" = "A" ] || [  "$active_bank" = "B" ]) && {
+                                [ $active_bank = "A" ] && new_active="B" || new_active="A"
+				write_vol_stdin rootfs$new_active $1
+			}
+		}
+	}
+}
+
+# upgrade_dualvol_firmware: Call from upgrade_dualvol_stdin for firmware upgrade (dual image update option)
+# upgrade_dualvol_firmware: Pre-requisite: update kernel first
+# upgrade_dualvol_firmware: stdin: Pass firmware file via stdin.
+# upgrade_dualvol_firmware: arguments: total size of firmware.
+upgrade_dualvol_firmware ()
+{
+	[ -n "$1" ] && {
+		local active_bank=$(sed -e 's/.*active_bank=\(.*\)/\1/' -e 's/\(\([^ ]*\) \)\{1\}.*/\2/' /proc/cmdline)
+		[ -n "$active_bank" -a "$active_bank" = "A" ] && active_bank=A || active_bank=B
+		#local active_bank=`uboot_env --get --name active_bank`
+                [ -n "$active_bank" ] && {
+                        ([  "$active_bank" = "A" ] || [  $active_bank = "B" ]) && {
+                                [ "$active_bank" = "A" ] && new_active="B" || new_active="A"
+				write_vol_stdin firmware$new_active $1
+			}
+		}
+	}
+}
+
+# upgrade_dualvol_stdin: Call from utilites (upgrade fullimage or totalimage - dual image update option)
+# upgrade_dualvol_stdin: stdin: pass image via stdin.
+# upgrade_dualvol_stdin: arguments: U-Boot/ubootenv/gphyfw/systemsw/kernel/rootfs/firmware, total size
+upgrade_dualvol_stdin ()
+{
+	[ -n "$1" -a -n "$2" ] && {
+		if [ -n "$3" ]; then
+			case "$3" in
+				"U-Boot") upgrade_mtd_uboot;;
+				"ubootenv") upgrade_mtd_ubootconfig;;
+				"gphyfw") upgrade_mtd_gphyfw;;
+				"systemsw") upgrade_mtd_systemsw;;
+				*) upgrade_dualvol_$1 "$2";;
+			esac
+		else
+			upgrade_dualvol_$1 "$2"
+		fi
+	}
+}
+
+# ubootcfg_dump: Call from utilites (uboot_env --get)
+# ubootcfg_dump: arguments: Output file, Size to get (in hex), uboot mtd name (Optional)
+ubootcfg_dump ()
+{
+	[ -n "$1" ] && {
+		local dev_size="$2";
+		local mtd_line=$(cat /proc/mtd|grep -w \
+			`[ -n "$3" ]&&echo "$3"||echo "ubootconfig"`)
+		local dev_mtd=$(echo $mtd_line|cut -d: -f1)
+		[ -z "$dev_size" ] && dev_size=0x$(echo $mtd_line|awk '{ print $2 }')
+		nanddump -q -f "$1" -l $dev_size /dev/$dev_mtd
+	}
+}
+
+# ubootcfg_write: Call from utilites (uboot_env --write)
+# ubootcfg_write: arguments: Input file, uboot mtd name (Optional)
+ubootcfg_write ()
+{
+	[ -n "$1" -a -f "$1" ] && {
+		local dev_mtd=$(cat /proc/mtd|grep -w \
+			`[ -n "$2" ]&&echo "$2"||echo "ubootconfig"` \
+			|cut -d: -f1)
+		flash_erase /dev/$dev_mtd 0 0
+		nandwrite -q /dev/$dev_mtd "$1"; sync
+	}
+}
+
+# create_vol_init: Call from preinit_create_vol
+# create_vol_init: arguments: volume name, [volume id]
+create_vol_init ()
+{
+	local vol_id
+	if [ -n "$1" ]; then
+		[ -n "$2" ] && vol_id="--vol_id $2" || >&-
+		check_vol=$(cat /proc/mtd|grep -w "$1")
+		if [ $? -ne 0 ]; then
+			ubimkvol /dev/ubi0 -N "$1" -s 1 $vol_id
+		fi
+	fi
+}
+
+# preinit_create_vol: Call from preinit script (optional)
+# preinit_create_vol: Creates pre-defined volumes in start
+# preinit_create_vol: No arguments
+preinit_create_vol ()
+{
+	local volume_start_id=1
+	local default_volumes="rootfs rootfsB sysconfig fwdiag wlan_cfg dect_cfg"
+	local vols
+	for vols in $default_volumes; do
+		create_vol_init $vols $volume_start_id
+		volume_start_id=$((volume_start_id+1))
+	done
+	create_ubi_nodes >&- 2>&- || >&-
+}
+
+# mount_datavol: Call from mount_ubi_data_vol
+# mount_datavol: arguments: filesystem name, /dev/mtdblockX, mount point(dir)
+mount_datavol()
+{
+	if [ -n "$1" -a -n "$2" -a -n "$3" ]; then
+		if [ "$1" = "ubifs" ]; then
+			mount -t ubifs ubi0:data_vol "$3" && {
+				# Clean interrupted firmware download file.
+				rm -f $3/fwimg >&- 2>&-
+				# Clean when cpe was in overlay mode.
+				rm -f $3/mnt/data/fwimg >&- 2>&-
+				return 0
+			} || return 1
+		elif [ -n "$2" -a "$1" = "jffs2" ]; then
+			mount -t jffs2 $2 "$3" && {
+				# Clean interrupted firmware download file.
+				rm -f $3/fwimg >&- 2>&-
+				# Clean when cpe was in overlay mode.
+				rm -f $3/mnt/data/fwimg >&- 2>&-
+				return 0
+			} || return 1
+		fi
+	fi
+}
+
+# mount_ubi_data_vol: Call from /etc/preinit script
+# mount_ubi_data_vol: arguments: data volume mount point (eg: /mnt/data)
+mount_ubi_data_vol ()
+{
+	[ -d "$1" ] && {
+		local data_fs=$(cat /mnt/data/fs|cut -d: -f1)
+		local data_size=$(cat /mnt/data/fs|cut -d: -f2)
+		local ubi_data_mtd="$(grep data_vol /proc/mtd|cut -d: -f1)"
+		[ -n "$ubi_data_mtd" ] || {
+			create_vol data_vol $data_size
+			ubi_data_mtd="$(grep data_vol /proc/mtd|cut -d: -f1)"
+		}
+		data_mtdblock="/dev/mtdblock${ubi_data_mtd:3}"
+		[ -n "$ubi_data_mtd" ] && {
+			mount_datavol $data_fs $data_mtdblock "$1"
+		} || {
+			umount "$1" >&- 2>&-
+			remove_vol data_vol
+			create_vol data_vol $data_size
+			ubi_data_mtd="$(grep data_vol /proc/mtd|cut -d: -f1)"
+			data_mtdblock="/dev/mtdblock${ubi_data_mtd:3}"
+			mount_datavol $data_fs $data_mtdblock "$1"
+		}
+	}
+}
+
+# read_calibration: Call from upgrade util to read calibration file from NAND partition
+# read_calibration: arguments: calibration name, output file (gz format)
+read_calibration ()
+{
+	local cal_mtd=`grep -w calibration /proc/mtd|cut -d: -f1`;
+	if [ -n "$1" -a -n "$2" -a -n "$cal_mtd" ]; then
+		cd /tmp && {
+			nanddump -q /dev/$cal_mtd | tar -xz $1.gz \
+				&& mv -f $1.gz "$2";
+			cd - >&-;
+		}
+	elif [ -n "$1" -a -n "$2" ]; then
+		read_cfg_gz "$1" "$2";
+	fi
+}
+
+# update_calibration: Call from upgrade util to update/write calibration file into NAND partition
+# update_calibration: arguments: calibration name, input file (gz format)
+update_calibration ()
+{
+	local cal_mtd=`grep -w calibration /proc/mtd|cut -d: -f1`;
+	if [ -n "$1" -a -n "$2" -a -n "$cal_mtd" ]; then
+		rm -rf /tmp/_calibration;
+		mkdir -p /tmp/_calibration;
+		cd /tmp/_calibration/ && {
+			nanddump -q /dev/$cal_mtd | tar -xz 2>&-;
+			cd - >&-;
+		}
+		cp -f "$2" /tmp/_calibration/$1.gz
+		cd /tmp/_calibration/ && {
+			tar -cz *.gz | nandwrite -e -q -p /dev/$cal_mtd && {
+				echo "$0: Written calibration file to '$1'.";
+			} || echo "$0: Writing calibration file to '$1' failed!!";
+			cd - >&-;
+		};
+		rm -rf /tmp/_calibration;
+	elif [ -n "$1" -a -n "$2" ]; then
+		write_vol "$1" "$2";
+	fi
+}
+
+# help: Give 'vol_mgmt help <function>' for more details.
+help ()
+{
+	[ -z "$1" ] && {
+		echo "Usage: vol_mgmt <function> [args1...n]"
+		echo "Example: vol_mgmt write_vol sysconfig /etc/rc.conf.gz"
+		echo "Available functions:-"
+		cat $0 | grep \(\) | cut -d'(' -f1 | awk '{ print "\t"$1 }'
+		echo "Give 'vol_mgmt help <function>' for more details."
+	} || {
+		cat $0 | grep -w $1: | cut -d':' -f2-
+	}
+}
+
+[ -n "$1" ] && {
+	volcmd="$1"
+	shift
+	$volcmd $@ || >&-
+} || help
+

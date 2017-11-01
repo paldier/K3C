@@ -1,0 +1,2179 @@
+# HG changeset patch
+# Parent d1426562c0fae47c558fb7e7453de0539023f097
+
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -53,7 +53,7 @@ obj-$(CONFIG_LEDS_RENESAS_TPU)		+= leds-
+ obj-$(CONFIG_LEDS_MAX8997)		+= leds-max8997.o
+ obj-$(CONFIG_LEDS_LM355x)		+= leds-lm355x.o
+ obj-$(CONFIG_LEDS_BLINKM)		+= leds-blinkm.o
+-obj-$(CONFIG_LEDS_XRX500)		+= leds-xrx500.o
++obj-$(CONFIG_LEDS_XRX500)		+= leds-xrx500.o leds-xrx500-proc.o
+ 
+ # LED SPI Drivers
+ obj-$(CONFIG_LEDS_DAC124S085)		+= leds-dac124s085.o
+diff --git a/drivers/leds/led-class.c b/drivers/leds/led-class.c
+--- a/drivers/leds/led-class.c
++++ b/drivers/leds/led-class.c
+@@ -22,7 +22,44 @@
+ #include "leds.h"
+ 
+ static struct class *leds_class;
++#ifdef CONFIG_SOC_GRX500
++#if 1
++static ssize_t blink_src_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	char *source;
++	/* no lock needed for this */
++	if (led_cdev->blink_src_get) {
++		source = led_cdev->blink_src_get(led_cdev);
++		return sprintf(buf, "%s\n", source);
++	} else {
++		return -EINVAL;
++	}
++}
+ 
++static ssize_t blink_src_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	ssize_t ret = -EINVAL;
++
++	if (sysfs_streq(buf, "FPID")) {
++		if (led_cdev->blink_src_set)
++			led_cdev->blink_src_set(led_cdev, "FPID");
++	} else if (sysfs_streq(buf, "GPTD")) {
++		if (led_cdev->blink_src_set)
++			led_cdev->blink_src_set(led_cdev, "GPTD");
++	} else if (sysfs_streq(buf, "V1M")) {
++		if (led_cdev->blink_src_set)
++			led_cdev->blink_src_set(led_cdev, "V1M");
++	} else {
++		return ret;
++	}
++	return size;
++}
++#endif
++#endif
+ static void led_update_brightness(struct led_classdev *led_cdev)
+ {
+ 	if (led_cdev->brightness_get)
+@@ -68,6 +105,9 @@ static ssize_t led_max_brightness_show(s
+ 
+ static struct device_attribute led_class_attrs[] = {
+ 	__ATTR(brightness, 0644, led_brightness_show, led_brightness_store),
++#ifdef CONFIG_SOC_GRX500
++	__ATTR(blink_src, 0644, blink_src_show, blink_src_store),
++#endif
+ 	__ATTR(max_brightness, 0444, led_max_brightness_show, NULL),
+ #ifdef CONFIG_LEDS_TRIGGERS
+ 	__ATTR(trigger, 0644, led_trigger_show, led_trigger_store),
+@@ -184,7 +224,7 @@ static int led_resume(struct device *dev
+ int led_classdev_register(struct device *parent, struct led_classdev *led_cdev)
+ {
+ 	led_cdev->dev = device_create(leds_class, parent, 0, led_cdev,
+-				      "%s", led_cdev->name);
++				"%s", led_cdev->name);
+ 	if (IS_ERR(led_cdev->dev))
+ 		return PTR_ERR(led_cdev->dev);
+ 
+diff --git a/drivers/leds/leds-xrx500-config.h b/drivers/leds/leds-xrx500-config.h
+--- a/drivers/leds/leds-xrx500-config.h
++++ b/drivers/leds/leds-xrx500-config.h
+@@ -1,6 +1,22 @@
+ #ifndef __LEDS_XRX500_CONFIG_H
+ #define __LEDS_XRX500_CONFIG_H
+ 
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/of_platform.h>
++#include <linux/of_gpio.h>
++#include <linux/mutex.h>
++#include <linux/gpio.h>
++#include <linux/leds.h>
++#include <linux/io.h>
++#include <linux/clk.h>
++#include <linux/err.h>
++#include <lantiq_soc.h>
++#include <lantiq_timer.h>
++#include <linux/of_gpio.h>
++#include <linux/klogging.h>
+ 
+ #define NUM_LEDS 32
+ 
+@@ -52,7 +68,150 @@
+   \brief field "operation_mask" of struct "xrx500_sso_config_param" - Blink rate for leds 0-23, if the blink rate has to be different from update rate
+  */
+ #define XRX500_SSO_CFG_OP_BLINK_SOURCE_0_23             0x0100
++/*
++* The Serial Shift Output (SSO) is found on MIPS based Lantiq xrx500 socs.
++*It is a peripheral controller used to drive external shift register
++*cascades. At most 4 groups of 8 bits can be driven.
++*/
+ 
++/* control register 0 */
++#define XRX500_SSO_CON0		0x2B0
++/* control register 1 */
++#define XRX500_SSO_CON1		0x2B4
++/* data register 0 */
++#define XRX500_SSO_CPU0		0x2B8
++/* data register 1 */
++#define XRX500_SSO_CPU1		0x2BC
++/* access register */
++#define XRX500_SSO_AR		0x2C0
++/* control register 2 */
++#define XRX500_SSO_CON2		0x2C4
++/* control register 3 */
++#define XRX500_SSO_CON3		0x2C8
++
++/*blink control*/
++#define XRX500_SSO_BLINK_H8_0    0x0
++#define XRX500_SSO_BLINK_H8_1    0x4
++#define XRX500_SSO_BLINK_SOURCE_SHIFT 22
++/*Dutycycle register*/
++#define XRX500_SSO_DUTYCYCLE_BASE      0x8
++#define XRX500_SSO_DUTYCYCLE_OFFSET    0x4
++
++/* software or hardware update select bit */
++#define XRX500_SSO_CON_SWU	BIT(31)
++
++/* Blink rate select bit */
++#define XRX500_SSO_BLINK_RATE_SHIFT	30
++#define XRX500_SSO_BLINK_RATE_MASK	0x1
++
++/* clock source for update */
++#define XRX500_SSO_UPD_SHIFT	30
++#define XRX500_SSO_UPD_MASK	0x3
++
++
++/* FPID */
++#define XRX500_SSO_FPID_SHIFT	23
++#define XRX500_SSO_FPID_MASK	0x3
++
++/* FCDSE */
++#define XRX500_SSO_FCDSC_SHIFT	20
++#define XRX500_SSO_FCDSC_MASK	0x3
++
++/* GPTD */
++#define XRX500_SSO_GPTD_SHIFT	25
++#define XRX500_SSO_GPTD_MASK	0x3
++
++/*PHY control*/
++#define XRX500_SSO_PHY_MASK     0x7
++#define XRX500_SSO_LD0_MASK	0x1F
++#define XRX500_SSO_LD1_MASK     0x1F00
++#define XRX500_SSO_LD2_MASK     0x1F0000
++
++#define XRX500_SSO_LD0_SHIFT	0
++#define XRX500_SSO_LD1_SHIFT	8
++#define XRX500_SSO_LD2_SHIFT	16
++
++#define XRX500_SSO_PHY6_SHIFT_FACTOR	0
++#define XRX500_SSO_PHY2_SHIFT_FACTOR	1
++#define XRX500_SSO_PHY3_SHIFT_FACTOR	2
++#define XRX500_SSO_PHY4_SHIFT_FACTOR    3
++#define XRX500_SSO_PHY5_SHIFT_FACTOR    4
++
++#define XRX500_SSO_LD0_PATTERN(phy6, phy2, phy3, phy4, phy5) \
++						(((phy6 & BIT(0))\
++						| ((phy2 & BIT(0)) << 1)\
++						| ((phy3 & BIT(0)) << 2)\
++						|((phy4 & BIT(0)) << 3)\
++						|((phy5 & BIT(0)) << 4)\
++						) << XRX500_SSO_LD0_SHIFT)
++#define XRX500_SSO_LD1_PATTERN(phy6, phy2, phy3, phy4, phy5) \
++					((((phy6 & BIT(1)) >> 1)\
++					| (((phy2 & BIT(1)) >> 1) << 1)\
++					| (((phy3 & BIT(1)) >> 1) << 2)\
++					| (((phy4 & BIT(1)) >> 1) << 3)\
++					| (((phy5 & BIT(1)) >> 1) << 4)\
++					) << XRX500_SSO_LD1_SHIFT)
++#define XRX500_SSO_LD2_PATTERN(phy6, phy2, phy3, phy4, phy5) \
++					((((phy6 & BIT(2)) >> 2)\
++					| (((phy2 & BIT(2)) >> 2) << 1)\
++					| (((phy3 & BIT(2)) >> 2) << 2)\
++					| (((phy4 & BIT(2)) >> 2) << 3)\
++					| (((phy5 & BIT(2)) >> 2) << 4)\
++					) << XRX500_SSO_LD2_SHIFT)
++
++/*WLAN control*/
++#define XRX500_SSO_WLAN_MASK	0x7
++#define XRX500_SSO_W1_W2_W3_MASK	0xE0
++#define XRX500_SSO_W4_W5_W6_MASK	0xE000
++
++#define XRX500_SSO_W1_W2_W3_SHIFT	5
++#define XRX500_SSO_W4_W5_W6_SHIFT	13
++
++#define XRX500_SSO_W1_W2_W3_PATTERN(wlan)	\
++	((wlan & 0x7) << XRX500_SSO_W1_W2_W3_SHIFT)
++#define XRX500_SSO_W4_W5_W6_PATTERN(wlan)	\
++	(((wlan & 0x38) >> 7) << XRX500_SSO_W4_W5_W6_SHIFT)
++
++/*SSO has 3 groups of 8 bits */
++#define XRX500_SSO_GROUP0		BIT(0)
++#define XRX500_SSO_GROUP1		BIT(1)
++#define XRX500_SSO_GROUP2		BIT(2)
++#define XRX500_SSO_GROUP3		BIT(3)
++#define XRX500_SSO_GROUP_MASK		(0xF)
++
++/* Edge configuration bits */
++#define XRX500_SSO_FALLING	BIT(26)
++#define XRX500_SSO_EDGE_MASK	BIT(26)
++#define XRX500_SSO_EDGE_SHIFT 26
++
++/*Dutycycle configuration bit*/
++#define XRX500_SSO_DUTYCYCLE(led)	\
++	(XRX500_SSO_DUTYCYCLE_BASE + (led * XRX500_SSO_DUTYCYCLE_OFFSET))
++
++/*Auto Dimming function*/
++#define XRX500_SSO_DIMM_ENABLE_MASK 0x1 
++#define XRX500_SSO_DIMM_ENABLE_SHIFT 27
++#define XRX500_SSO_LUX_INTERVAL_MASK 0xF
++#define XRX500_SSO_LUX_INTERVAL_SHIFT 8
++#define XRX500_SSO_LUX_DISCHARGE_MASK 0x3F
++#define XRX500_SSO_LUX_DISCHARGE_SHIFT 12
++#define XRX500_SSO_LUX_LEVEL_MASK 0xFF
++#define XRX500_SSO_LUX_LEVEL_SHIFT 0
++
++/*Data offset*/
++#define XRX500_SSO_DATA_OFFSET_MASK 0x3
++#define XRX500_SSO_DATA_OFFSET_SHIFT 18
++
++/*Store Mode*/
++#define XRX500_SSO_STORE_MODE_MASK 0x1
++#define XRX500_SSO_STORE_MODE_SHIFT 28
++
++#define xrx500_sso_r32(m, reg)		__raw_readl(m + reg)
++#define xrx500_sso_w32(m, val, reg)	__raw_writel(val, m + reg)
++#define xrx500_sso_w32_mask(m, clear, set, reg) \
++		ltq_w32((ltq_r32(m + reg) & ~(clear)) | (set), \
++		m + reg)
++		
+ enum xrx500_sso_CON1_us
+ {
+ 	LED_CON1_UPDATE_SRC_SW = 0,
+@@ -100,28 +259,46 @@ struct xrx500_sso_config_param
+ 	enum xrx500_sso_H8_us blink_rate_source_0[8];   /*!<blink rate source for LEDS 24-31*/
+ 	enum xrx500_sso_H8_us blink_rate_source_1;   /*!<blink rate source for LEDS 0-23*/
+ };
++struct xrx500_sso_freq_table {
++	u32 value;
++	u32 range_start;
++	u32 range_end;
++};
+ 
+-static struct xrx500_sso_config_param g_board_xrx500_sso_hw_config = {
+-	.operation_mask         = XRX500_SSO_CFG_OP_UPDATE_SHADOW | XRX500_SSO_CFG_OP_BLINK_MASK 
+-				| XRX500_SSO_CFG_OP_UPDATE_CLOCK | XRX500_SSO_CFG_OP_UPDATE_FPID | XRX500_SSO_CFG_OP_UPDATE_FCDSC | XRX500_SSO_CFG_OP_UPDATE_GPTD
+-				| XRX500_SSO_CFG_OP_BLINK_RATE | XRX500_SSO_CFG_OP_INDIVIDUAL_BLINK_SOURCE | XRX500_SSO_CFG_OP_BLINK_SOURCE_0_23 ,
+-	.shadow		    = 0x0,
+-	.blink_mask             = 0xff002000,
+-	.update_clock           = LED_CON1_UPDATE_SRC_GPTD2,
+-	.fpid                   = 3,
+-	.fcdsc                  = 2,
+-	.gptd					= 0,
+-	.is_blink_rate_diff     = 0,
+-	.blink_rate_source_0     = {
+-				LED_H8_UPDATE_SRC_GPTD,
+-				LED_H8_UPDATE_SRC_GPTD,
+-					LED_H8_UPDATE_SRC_GPTD,
+-					LED_H8_UPDATE_SRC_GPTD,
+-					LED_H8_UPDATE_SRC_GPTD,
+-					LED_H8_UPDATE_SRC_GPTD,
+-					LED_H8_UPDATE_SRC_GPTD,
+-					LED_H8_UPDATE_SRC_GPTD,
+-			      },
+-	.blink_rate_source_1 = LED_H8_UPDATE_SRC_FPID
++struct xrx500_sso {
++	struct gpio_chip gc;
++	void __iomem *virt;
++	u32 edge;	/* rising or falling edge triggered shift register */
++	u32 shadow;	/* shadow the shift registers state */
++	u8 groups;	/* we can drive 1 groups of 8bit each */
++	u8 phy2;	/* 3 bits can be driven by phy2 */
++	u8 phy3;	/* 3 bits can be driven by phy3 */
++	u8 phy4;	/* 3 bits can be driven by phy4 */
++	u8 phy5;	/* 3 bits can be driven by phy5 */
++	u8 phy6;	/* 3 bits can be driven by phy6 */
++	u8 upd;	/* 2 bits for update source*/
++	u32 blink_mask;
++	u32 blink_rate;
++	u32 blink_source_24_31[8];
++	u32 blink_source_0_23;
++	u8 wlan;	/*6 bits for WLAN*/
++	u8 reserved;	/* mask out the hw driven bits in gpio_request */
+ };
++
++struct xrx500_sso_led {
++	struct led_classdev     device;             /*!< LED device */
++	const char *name;
++	const char *default_trigger;
++	unsigned	phys_id;
++	unsigned	active_low:1;
++	unsigned	retain_state_suspended:1;
++	unsigned	default_state:2;
++	struct work_struct work;
++	u8 new_level;
++	u8 can_sleep;
++	u8 blinking;
++};
++
++int get_cpu_select(void);
++int grx500_register_sysfs(struct platform_device *pdev);
+ #endif
+diff --git a/drivers/leds/leds-xrx500-proc.c b/drivers/leds/leds-xrx500-proc.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/leds/leds-xrx500-proc.c
+@@ -0,0 +1,827 @@
++
++#include "leds-xrx500-config.h"
++
++#ifdef CONFIG_LEDS_CLASS
++struct led_sysfs_help {
++	char *cmd;		
++	char *help;	
++	char *usage;	
++};
++static struct led_sysfs_help help_entries[] = {
++{"hw_blink_en",
++ "\r\nA mask to enable or disable the HW blink for all the individual LEDs\r\n",
++ "\r\ncat hw_blink_en -> prints the HW blink mask\r\n \
++      echo 0x2A0 > hw_blink_en -> e.g)To enable HW blink for leds 5, 7, 9"},
++{"auto_dimming_en",
++ "\r\nEnable/Disable HW dimming function\r\n",
++ "\r\ncat auto_dimming_en -> prints the current status of HW dimming feature\r\n \
++      echo 0x1 > auto_dimming_en -> e.g)To enable HW dimming\r\n \
++	  echo 0x0 > auto_dimming_en -> e.g)To disable HW dimming"},
++{"blink_rate",
++"\r\nSet this bit to have a blink rate different from update rate for LEDs[0-23]\r\n",
++"\r\ncat blink_rate -> prints the Blink rate Update control\r\n \
++echo 0x1 > blink_rate -> e.g)Blink rate is different from Update rate\r\n \
++echo 0x0 > blink_rate -> e.g)Blink rate is same as Update rate" },
++{"cpu_select",
++"\r\nselect cpu for data source\r\n",
++"\r\ncat cpu_select -> prints the data source \r\n \
++echo 0 > cpu_select -> sets cpu 0 as the source\r\n \
++echo 1 > cpu_select -> sets cpu 1 as the source\r\n"},
++{"data_offset",
++"\r\nset the offset of the LED shift clock before data out\r\n",
++"\r\ncat data_offset -> prints the data_offset setting\r\n \
++echo  0 > data_offset ->possible input values are 0,1,2,3"},
++{"fpi_shift",
++"\r\nFixed Divider Shift Clock\r\n",
++"\r\ncat fpi_shift -> prints the current fpi_shift setting\r\n \
++echo  0 > fpi_shift ->possible input values are 0,1,2,3"},
++{"fpi_update",
++"\r\nFSC Divider for LED [23:0]\r\n",
++"\r\ncat fpi_update -> prints the current fpi_update setting\r\n \
++echo  0 > fpi_update ->possible input values are 0,1,2,3"},
++{"gptc_divider",
++"\r\nGPT Divider for LED[23:0]\r\n",
++"\r\ncat gptc_divider -> prints the current gptc_divider setting\r\n \
++echo  0 > gptc_divider ->possible input values are 0,1,2,3"},
++{"number_of_leds",
++"\r\nLED group information (Read Only)\r\n",
++"\r\ncat number_of_leds -> prints one of the following values 0, 8, 16, 24, 32\r\n"},
++{"lux_dis", 
++"\r\ndischarge time is this programmed 6 bitvalue x LUX_CNV_INT period programmed\r\n",
++"\r\ncat lux_dis -> prints the current value\r\n \
++echo 10 > lux_dis -> sets the current value to 10\r\n"},
++{"lux_cnv_interval", 
++"\r\nProgrammable divider for intervals used by LUX conversion\r\n",
++"\r\ncat lux_cnv_interval ->prints the current LUX interval value\r\n \
++echo 0 > lux_cnv_interval -> writes 0 to lux_cnv_interval, possible values are the following \
++0  DO no division of 2560Hz\r\n \
++1  D1 division of 2, equals to 1280Hz\r\n \
++2  D2 Division of 4, equals to 640Hz\r\n \
++3  D3 Division of 8, equals to 320Hz\r\n \
++4  D4 Division of 16, equals to 160Hz\r\n \
++5  D5 Division of 32, equals to 80Hz\r\n \
++6  D6 Division of 64, equals to 40HZ\r\n \
++7  D7 Division of 128, equals to 20Hz\r\n \
++8  D8 Division of 256, equals to 10 Hz\r\n \
++9  D9 Division of 512, equals to 5Hz\r\n \
++A  D10 Division of 1024, equals to 2.5Hz\r\n \
++B  D11 Division of 2048, equals to 1.25Hz\r\n \
++"},
++{"lux_lvl",
++"\r\nLUX Level Converted by Hardware (Read Only)\r\n",
++"\r\ncat lux_lvl -> prints the current calculated value of LUX level\r\n"},
++{"store_mode",
++"\r\nSetting to switch between LED single pulse mode or inverted shift clock during update",
++"\r\ncat store_mode -> prints the current store _mode\r\n \
++echo 1 > store_mode ->sets the value to 1, possible values are the following \
++0 Single\r\n \
++1 Clock \r\n"},
++{"update_clock_source",
++"\r\nUpdate Source for LEDS\r\n",
++"\r\ncat update_clock_source -> prints the current update source\r\n \
++echo SW > update_clock_source, possible values are the following \
++SW\r\n\
++GPT\r\n\
++FPI\r\n \
++"},
++{"update_edge",
++"\r\nData Clocking Edge\r\n",
++"\r\ncat update_edge ->prints the data clocking edge\r\n \
++echo 0 > update_edge -> to define if the data output is clocked at rising edge\r\n \
++echo 1 > update_edge -> to define if the data output is clocked at falling edge\r\n"},
++/*{"update_src",
++"\r\nSwitch the LED source between LEDc and External hardware\r\n",
++"\r\ncat update_src -> prints the current setting\r\n \
++echo ledc > update_src ->LED to be controlled by LEDc\r\n\
++echo ext > update_src ->LED to be controlled by the External HW"},*/
++{"blink_src",
++"\r\nselect the blink source corresponding to each LED in the range of 24 - 31\r\n",
++"\r\ncat blink_src -> prints the current blink source for that LED\r\n \
++echo FPID > blink_src ->sets the blink source to FPID, possible values are\r\n \
++FPID ->blink at FPID output rate\r\n \
++GPTD ->blink at GPT output rate\r\n \
++V1M ->blink at GPT high speed output rate\r\n \
++LEDS[24-31] have individual setting for blink source"},
++{"blink_src_0_23",
++"\r\nselect the blink source for LEDs in the range of LEDs 0 - 23\r\n",
++"\r\ncat blink_src -> prints the current blink source for LEDs 0 - 23\r\n \
++echo FPID > blink_src ->sets the blink source to FPID, possible values are\r\n \
++FPID ->blink at FPID output rate\r\n \
++GPTD ->blink at GPT output rate\r\n \
++V1M ->blink at GPT high speed output rate\r\n \
++LEDS[0-23] have a common setting for blink source which is only valid if blink_rate is set to 1"}
++};
++static struct xrx500_sso *g_chip;
++static int cpu_select = 0;
++static ssize_t grx500_blink_src_0_23_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf);	
++static ssize_t grx500_blink_src_0_23_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len);
++static DEVICE_ATTR(blink_src_0_23, S_IRUGO | S_IWUSR,
++		grx500_blink_src_0_23_show, grx500_blink_src_0_23_store);
++	
++int get_cpu_select() {
++	return cpu_select;
++}
++
++static ssize_t grx500_led_usage_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	ssize_t status = 0, temp = 0;
++	int i, n;
++	char *str = buf;
++	n = sprintf(str, "%s         %s\r\n","Command", "Description");	
++	str += n;
++	status += n;
++
++	for (i = 0; i < sizeof(help_entries) / sizeof(help_entries[0]);
++	     i++) {
++		temp = sprintf(str, "%s  %s\r\n", help_entries[i].cmd, help_entries[i].help);
++		str += temp;
++		status += temp;
++		
++	}
++	return status;
++}
++
++static ssize_t grx500_led_usage_store(struct device *dev,
++	struct device_attribute *attr,
++	const char *buf, size_t len)
++{
++	ssize_t   status = 0;
++	int i;
++	char *buff = (char *)buf;
++	char *token = NULL;
++	token = strsep(&buff, " "); 
++	if (token != 0) {
++		for (i = 0; i < sizeof(help_entries) / sizeof(help_entries[0]);
++	     i++) {
++			//if(strncmp(help_entries[i].cmd, token, strlen(help_entries[i].cmd)) == 0) {
++			if(strncmp(help_entries[i].cmd, token, strlen(token) - 1) == 0) {
++
++				printk("%s\r\n", help_entries[i].usage);	
++				break;
++			}				
++		}
++	} else {
++		status = -EINVAL;
++		LOGF_KLOG_ERROR("Invalid Command\r\n");
++	
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(led_usage, S_IRUGO | S_IWUSR,
++		grx500_led_usage_show, grx500_led_usage_store);
++			
++static ssize_t grx500_blink_rate_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	ssize_t status = 0;
++	status = sprintf(buf, "0x%x\n", g_chip->blink_rate);
++	return status;
++}
++
++static ssize_t grx500_blink_rate_store(struct device *dev,
++	struct device_attribute *attr,
++	const char *buf, size_t len)
++{
++	ssize_t   status = 0;
++	int rc;
++	long value;
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 1)) {
++			g_chip->blink_rate = value;
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_BLINK_RATE_MASK << XRX500_SSO_BLINK_RATE_SHIFT,
++			g_chip->blink_rate << XRX500_SSO_BLINK_RATE_SHIFT,
++			XRX500_SSO_CON0);
++			if(value) {
++				rc = device_create_file(dev, &dev_attr_blink_src_0_23);
++				if (rc)
++					LOGF_KLOG_ERROR("Error creating attribute blink_src_0_23");
++			} else {
++				device_remove_file(dev, &dev_attr_blink_src_0_23);
++			}
++		} else {
++			status = -EINVAL;
++			LOGF_KLOG_ERROR("Valid input is 0 or 1\r\n");
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(blink_rate, S_IRUGO | S_IWUSR,
++		grx500_blink_rate_show, grx500_blink_rate_store);
++		
++static ssize_t grx500_blink_en_show(struct device *dev,
++	struct device_attribute *attr,
++	char *buf)
++{
++	ssize_t status = 0;
++	status = sprintf(buf, "0x%x\n", g_chip->blink_mask);
++	return status;
++}
++
++static ssize_t grx500_blink_en_store(struct device *dev,
++	struct device_attribute *attr,
++	const char *buf, size_t len)
++{
++	ssize_t   status = 0;
++	unsigned long value;
++	status = kstrtoul(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 0xffffffff)) {
++			g_chip->blink_mask = value;
++		} else {
++			status = -EINVAL;
++			LOGF_KLOG_ERROR("Valid input is from 0x0 - 0xffffffff\r\n");
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(hw_blink_en, S_IRUGO | S_IWUSR,
++		grx500_blink_en_show, grx500_blink_en_store);
++		
++static ssize_t grx500_cpu_select_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	ssize_t status = 0;
++	status = sprintf(buf, "%d\n", cpu_select);
++	return status;
++}
++
++static ssize_t grx500_cpu_select_store(struct device *dev,
++	struct device_attribute *attr,
++	const char *buf, size_t len)
++{
++	ssize_t   status = 0;
++	long value;
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 1)) {
++			cpu_select = value;
++		} else {
++			status = -EINVAL;
++			LOGF_KLOG_ERROR("Valid input is 0 or 1\r\n");
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(cpu_select, S_IRUGO | S_IWUSR,
++		grx500_cpu_select_show, grx500_cpu_select_store);
++		
++static ssize_t grx500_gptc_divider_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON1);
++	status = sprintf(buf, "%d\n",
++	(reg >> XRX500_SSO_GPTD_SHIFT) & XRX500_SSO_GPTD_MASK);
++	return status;
++}
++
++static ssize_t grx500_gptc_divider_store(struct device *dev,
++	struct device_attribute *attr,
++	const char *buf, size_t len)
++{
++	ssize_t   status = 0;
++	long value;
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 3)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_GPTD_MASK << XRX500_SSO_GPTD_SHIFT,
++			value << XRX500_SSO_GPTD_SHIFT, XRX500_SSO_CON1);
++		} else {
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++
++}
++
++static DEVICE_ATTR(gptc_divider, S_IRUGO | S_IWUSR,
++		grx500_gptc_divider_show, grx500_gptc_divider_store);
++
++static ssize_t grx500_fpi_shift_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON1);
++	status = sprintf(buf, "%d\n",
++	(reg >> XRX500_SSO_FCDSC_SHIFT) & XRX500_SSO_FCDSC_MASK);
++	return status;
++}
++
++static ssize_t grx500_fpi_shift_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 3)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_FCDSC_MASK << XRX500_SSO_FCDSC_SHIFT,
++			value << XRX500_SSO_FCDSC_SHIFT, XRX500_SSO_CON1);
++		} else {
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++
++}
++
++static DEVICE_ATTR(fpi_shift, S_IRUGO | S_IWUSR,
++		grx500_fpi_shift_show, grx500_fpi_shift_store);
++
++static ssize_t grx500_fpi_update_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON1);
++	status = sprintf(buf, "%d\n",
++	(reg >> XRX500_SSO_FPID_SHIFT) & XRX500_SSO_FPID_MASK);
++	return status;
++}
++
++static ssize_t grx500_fpi_update_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++	status = kstrtol(buf, 0, &value);
++
++
++	if (status == 0) {
++		if ((value >= 0) && (value <= 3)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_FPID_MASK << XRX500_SSO_FPID_SHIFT,
++			value << XRX500_SSO_FPID_SHIFT, XRX500_SSO_CON1);
++		} else {
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(fpi_update, S_IRUGO | S_IWUSR,
++		grx500_fpi_update_show, grx500_fpi_update_store);
++
++static ssize_t grx500_update_edge_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON0);
++	status = sprintf(buf, "%lu\n",
++	(reg & XRX500_SSO_EDGE_MASK) >> XRX500_SSO_EDGE_SHIFT);
++	return status;
++}
++
++static ssize_t grx500_update_edge_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 1)) {
++			xrx500_sso_w32_mask(g_chip->virt, XRX500_SSO_EDGE_MASK,
++			value << XRX500_SSO_EDGE_SHIFT, XRX500_SSO_CON0);
++		} else {
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(update_edge, S_IRUGO | S_IWUSR,
++		grx500_update_edge_show, grx500_update_edge_store);
++
++static ssize_t grx500_led_number_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t   status = 0;
++
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON1);
++	if ((reg & 0xF) == 0xF)
++		reg = 32;
++	if ((reg & 0x7) == 0x7)
++		reg = 24;
++	if ((reg & 0x3) == 0x3)
++		reg = 16;
++	if ((reg & 0x1) == 0x1)
++		reg = 8;
++	status = sprintf(buf, "%d\n", reg);
++	return status;
++}
++#if 0
++static ssize_t grx500_led_number_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t   status = 0;
++	u32 bits = 0, i = 0;
++	long value;
++	status = kstrtol(buf, 0, &value);
++
++
++	if (status == 0) {
++		if (!(((value%8) == 0) && ((value >= 0) && (value <= 32))))
++			return -EINVAL;
++		if (value) {
++			while (value/8) {
++				bits |= BIT(i);
++				i++;
++				value -= 8;
++			}
++			xrx500_sso_w32_mask(g_chip->virt, bits,
++				bits, XRX500_SSO_CON1);
++		} else {
++			xrx500_sso_w32_mask(g_chip->virt, XRX500_SSO_GROUP_MASK,
++				0, XRX500_SSO_CON1);
++		}
++	}
++	return status ? : len;
++
++}
++#endif
++static DEVICE_ATTR(number_of_leds, S_IRUGO | S_IWUSR,
++		grx500_led_number_show, NULL);
++
++static ssize_t grx500_update_clock_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON1);
++	reg = reg >> XRX500_SSO_UPD_SHIFT;
++	if (reg == 0)
++		status = sprintf(buf, "%s\n", "SW");
++	else if (reg == 1)
++		status = sprintf(buf, "%s\n", "GPT");
++	else if (reg == 2)
++		status = sprintf(buf, "%s\n", "FPI");
++	else
++		status = sprintf(buf, "%s\n", "INVALID");
++	return status;
++}
++
++static ssize_t grx500_update_clock_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	u32 value;
++	if (sysfs_streq(buf, "SW"))
++		value = 0;
++	else if (sysfs_streq(buf, "GPT"))
++		value = 1;
++	else if (sysfs_streq(buf, "FPI"))
++		value = 2;
++	else
++		status = -EINVAL;
++
++
++	if (status == 0) {
++		xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_UPD_MASK << XRX500_SSO_UPD_SHIFT,
++			value << XRX500_SSO_UPD_SHIFT, XRX500_SSO_CON1);
++		g_chip->upd = value;
++	}
++	return status ? : len;
++}
++static DEVICE_ATTR(update_clock_source, S_IRUGO | S_IWUSR,
++		grx500_update_clock_show, grx500_update_clock_store);
++
++static ssize_t grx500_store_mode_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON1);
++	reg = (reg >> XRX500_SSO_STORE_MODE_SHIFT) & XRX500_SSO_STORE_MODE_MASK;
++	status = sprintf(buf, "%d\n", reg);
++	return status;
++}
++
++static ssize_t grx500_store_mode_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 0x1)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_STORE_MODE_MASK << XRX500_SSO_STORE_MODE_SHIFT,
++			value << XRX500_SSO_STORE_MODE_SHIFT, XRX500_SSO_CON1);
++		} else {
++			LOGF_KLOG_ERROR("Valid input is 0 or 1\r\n");
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(store_mode, S_IRUGO | S_IWUSR,
++		grx500_store_mode_show, grx500_store_mode_store);
++		
++static ssize_t grx500_data_offset_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON1);
++	reg = (reg >> XRX500_SSO_DATA_OFFSET_SHIFT) & XRX500_SSO_DATA_OFFSET_MASK;
++	status = sprintf(buf, "%d\n", reg);
++	return status;
++}
++
++static ssize_t grx500_data_offset_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 0x3)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_DATA_OFFSET_MASK << XRX500_SSO_DATA_OFFSET_SHIFT,
++			value << XRX500_SSO_DATA_OFFSET_SHIFT, XRX500_SSO_CON1);
++		} else {
++			LOGF_KLOG_ERROR("Valid input range is 0x0 - 0x3\r\n");
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(data_offset, S_IRUGO | S_IWUSR,
++		grx500_data_offset_show, grx500_data_offset_store);
++
++
++static ssize_t grx500_lux_level_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON0);
++	reg = (reg >> XRX500_SSO_LUX_LEVEL_SHIFT)  & XRX500_SSO_LUX_LEVEL_MASK;
++	status = sprintf(buf, "%d\n", reg);
++	return status;
++}
++
++static DEVICE_ATTR(lux_lvl, S_IRUGO | S_IWUSR,
++		grx500_lux_level_show, NULL);
++
++static ssize_t grx500_lux_discharge_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON0);
++	reg = (reg >> XRX500_SSO_LUX_DISCHARGE_SHIFT) & XRX500_SSO_LUX_DISCHARGE_MASK;
++	status = sprintf(buf, "%d\n", reg);
++	return status;
++}
++
++static ssize_t grx500_lux_discharge_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 0x3F)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_LUX_DISCHARGE_MASK << XRX500_SSO_LUX_DISCHARGE_SHIFT,
++			value << XRX500_SSO_LUX_DISCHARGE_SHIFT, XRX500_SSO_CON0);
++		} else {
++			LOGF_KLOG_ERROR("Valid input range is 0x0 - 0x3F\r\n");
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(lux_dis, S_IRUGO | S_IWUSR,
++		grx500_lux_discharge_show, grx500_lux_discharge_store);
++
++static ssize_t grx500_lux_interval_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON0);
++	reg = (reg >> XRX500_SSO_LUX_INTERVAL_SHIFT) & XRX500_SSO_LUX_INTERVAL_MASK;
++	status = sprintf(buf, "%d\n", reg);
++	return status;
++}
++
++static ssize_t grx500_lux_interval_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 0xB)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_LUX_INTERVAL_MASK << XRX500_SSO_LUX_INTERVAL_SHIFT,
++			value << XRX500_SSO_LUX_INTERVAL_SHIFT, XRX500_SSO_CON0);
++		} else {
++			status = -EINVAL;
++			LOGF_KLOG_ERROR("Valid input range is 0x0 - 0xB\r\n");
++
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(lux_cnv_interval, S_IRUGO | S_IWUSR,
++		grx500_lux_interval_show, grx500_lux_interval_store);
++
++static ssize_t grx500_dimm_enable_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_CON0);
++	reg = (reg  >> XRX500_SSO_DIMM_ENABLE_SHIFT) & XRX500_SSO_DIMM_ENABLE_MASK;
++	status = sprintf(buf, "%d\n", reg);
++	return status;
++}
++
++static ssize_t grx500_dimm_enable_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	long value;
++
++	status = kstrtol(buf, 0, &value);
++	if (status == 0) {
++		if ((value >= 0) && (value <= 0x1)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			XRX500_SSO_DIMM_ENABLE_MASK << XRX500_SSO_DIMM_ENABLE_SHIFT,
++			value << XRX500_SSO_DIMM_ENABLE_SHIFT, XRX500_SSO_CON0);
++		} else {
++			LOGF_KLOG_ERROR("Valid input is 0 or 1\r\n");
++			status = -EINVAL;
++		}
++	}
++	return status ? : len;
++}
++
++static DEVICE_ATTR(auto_dimming_en, S_IRUGO | S_IWUSR,
++		grx500_dimm_enable_show, grx500_dimm_enable_store);
++
++#if 0
++
++static DEVICE_ATTR(blink_src, S_IRUGO | S_IWUSR,
++		grx500_blink_src_show, grx500_blink_src_store);
++#endif		
++static ssize_t grx500_blink_src_0_23_store(struct device *dev,
++			struct device_attribute *attr,
++			const char *buf, size_t len)
++{
++	ssize_t status = 0;
++	u32 value;
++	int i;
++	struct xrx500_sso_led *led = (struct xrx500_sso_led *) dev;
++	
++	if (sysfs_streq(buf, "FPID"))
++		value = 0;
++	else if (sysfs_streq(buf, "GPTD"))
++		value = 1;
++	else if (sysfs_streq(buf, "V1M"))
++		value = 2;
++	else
++		status = -EINVAL;
++
++
++	if (status == 0) {
++		if((led->phys_id >= 0) && (led->phys_id <= 23)) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			0x3 << XRX500_SSO_BLINK_SOURCE_SHIFT,
++			value << XRX500_SSO_BLINK_SOURCE_SHIFT,
++			XRX500_SSO_BLINK_H8_1);
++		} else {
++			i = led->phys_id % 24;
++			xrx500_sso_w32_mask(g_chip->virt,
++			0x3 << (((i%5) * 6) + 4),
++			value << (((i%5) * 6) + 4),
++			((i < 5) ?
++			XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));	
++		}
++	}
++	return status ? : len;
++}
++
++static ssize_t grx500_blink_src_0_23_show(struct device *dev,
++			struct device_attribute *attr,
++			char *buf)
++{
++	u32 reg;
++	ssize_t status = 0;
++	int i;
++
++	struct xrx500_sso_led *led = (struct xrx500_sso_led *) dev;
++	if((led->phys_id >= 0) && (led->phys_id <= 23)) {
++		reg = xrx500_sso_r32(g_chip->virt, XRX500_SSO_BLINK_H8_1);
++		reg = (reg >> XRX500_SSO_BLINK_SOURCE_SHIFT) & 0x3;
++	} else {
++		i = led->phys_id % 24;
++		reg = xrx500_sso_r32(g_chip->virt, ((i < 5) ? XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
++		reg = (reg >> (((i%5) * 6) + 4)) & 0x3;
++	}
++	switch (reg) {
++		case 0:
++			status = sprintf(buf, "%s\n", "FPID");
++		break;
++		case 1:
++			status = sprintf(buf, "%s\n", "GPTD");
++		break;
++		case 2:
++			status = sprintf(buf, "%s\n", "V1M");
++		break;
++	}
++	return status;
++}
++
++
++static struct attribute *grx500_led_attributes[] = {
++	&dev_attr_update_clock_source.attr,
++	&dev_attr_number_of_leds.attr,
++	&dev_attr_update_edge.attr,
++	&dev_attr_fpi_update.attr,
++	&dev_attr_fpi_shift.attr,
++	&dev_attr_gptc_divider.attr,
++	&dev_attr_auto_dimming_en.attr,
++	&dev_attr_lux_cnv_interval.attr,
++	&dev_attr_lux_dis.attr,
++	&dev_attr_lux_lvl.attr,
++	&dev_attr_data_offset.attr,
++	&dev_attr_store_mode.attr,
++	&dev_attr_cpu_select.attr,
++	&dev_attr_hw_blink_en.attr,
++	&dev_attr_blink_rate.attr,
++	&dev_attr_led_usage.attr,
++	NULL,
++};
++
++static const struct attribute_group grx500_attr_group = {
++	.attrs = grx500_led_attributes,
++};
++
++int grx500_register_sysfs(struct platform_device *pdev)
++{
++	int ret = 0;
++	struct device *dev;
++	g_chip = (struct xrx500_sso *)platform_get_drvdata(pdev);
++	dev = g_chip->gc.dev;
++	ret = sysfs_create_group(&dev->kobj, &grx500_attr_group);
++	return ret;
++
++}
++#endif
++
+diff --git a/drivers/leds/leds-xrx500.c b/drivers/leds/leds-xrx500.c
+--- a/drivers/leds/leds-xrx500.c
++++ b/drivers/leds/leds-xrx500.c
+@@ -7,184 +7,9 @@
+  *
+  */
+ 
+-#include <linux/slab.h>
+-#include <linux/init.h>
+-#include <linux/module.h>
+-#include <linux/types.h>
+-#include <linux/of_platform.h>
+-#include <linux/of_gpio.h>
+-#include <linux/mutex.h>
+-#include <linux/gpio.h>
+-#include <linux/leds.h>
+-#include <linux/io.h>
+-#include <linux/clk.h>
+-#include <linux/err.h>
+-#include <lantiq_soc.h>
++
+ #include "leds-xrx500-config.h"
+ 
+-/*
+-* The Serial Shift Output (SSO) is found on MIPS based Lantiq xrx500 socs.
+-*It is a peripheral controller used to drive external shift register
+-*cascades. At most 4 groups of 8 bits can be driven.
+-*/
+-
+-/* control register 0 */
+-#define XRX500_SSO_CON0		0x2B0
+-/* control register 1 */
+-#define XRX500_SSO_CON1		0x2B4
+-/* data register 0 */
+-#define XRX500_SSO_CPU0		0x2B8
+-/* data register 1 */
+-#define XRX500_SSO_CPU1		0x2BC
+-/* access register */
+-#define XRX500_SSO_AR		0x2C0
+-/* control register 2 */
+-#define XRX500_SSO_CON2		0x2C4
+-/* control register 3 */
+-#define XRX500_SSO_CON3		0x2C8
+-
+-/*blink control*/
+-#define XRX500_SSO_BLINK_H8_0    0x0
+-#define XRX500_SSO_BLINK_H8_1    0x4
+-#define XRX500_SSO_BLINK_SOURCE_SHIFT 22
+-/*Dutycycle register*/
+-#define XRX500_SSO_DUTYCYCLE_BASE      0x8
+-#define XRX500_SSO_DUTYCYCLE_OFFSET    0x4
+-
+-/* software or hardware update select bit */
+-#define XRX500_SSO_CON_SWU	BIT(31)
+-
+-/* Blink rate select bit */
+-#define XRX500_SSO_BLINK_RATE	BIT(30)
+-
+-/* clock source for update */
+-#define XRX500_SSO_UPD_SHIFT	30
+-#define XRX500_SSO_UPD_MASK	0x3
+-
+-
+-/* FPID */
+-#define XRX500_SSO_FPID_SHIFT	23
+-#define XRX500_SSO_FPID_MASK	0x3
+-
+-/* FCDSE */
+-#define XRX500_SSO_FCDSC_SHIFT	20
+-#define XRX500_SSO_FCDSC_MASK	0x3
+-
+-/* GPTD */
+-#define XRX500_SSO_GPTD_SHIFT	25
+-#define XRX500_SSO_GPTD_MASK	0x3
+-
+-/*PHY control*/
+-#define XRX500_SSO_PHY_MASK     0x7
+-#define XRX500_SSO_LD0_MASK	0x1F
+-#define XRX500_SSO_LD1_MASK     0x1F00
+-#define XRX500_SSO_LD2_MASK     0x1F0000
+-
+-#define XRX500_SSO_LD0_SHIFT	0
+-#define XRX500_SSO_LD1_SHIFT	8
+-#define XRX500_SSO_LD2_SHIFT	16
+-
+-#define XRX500_SSO_PHY6_SHIFT_FACTOR	0
+-#define XRX500_SSO_PHY2_SHIFT_FACTOR	1
+-#define XRX500_SSO_PHY3_SHIFT_FACTOR	2
+-#define XRX500_SSO_PHY4_SHIFT_FACTOR    3
+-#define XRX500_SSO_PHY5_SHIFT_FACTOR    4
+-
+-#define XRX500_SSO_LD0_PATTERN(phy6, phy2, phy3, phy4, phy5) \
+-						(((phy6 & BIT(0))\
+-						| ((phy2 & BIT(0)) << 1)\
+-						| ((phy3 & BIT(0)) << 2)\
+-						|((phy4 & BIT(0)) << 3)\
+-						|((phy5 & BIT(0)) << 4)\
+-						) << XRX500_SSO_LD0_SHIFT)
+-#define XRX500_SSO_LD1_PATTERN(phy6, phy2, phy3, phy4, phy5) \
+-					(((phy6 & BIT(1))\
+-					| ((phy2 & BIT(1)) << 1)\
+-					| ((phy3 & BIT(1)) << 2)\
+-					| ((phy4 & BIT(1)) << 3)\
+-					| ((phy5 & BIT(1)) << 4)\
+-					) << XRX500_SSO_LD1_SHIFT)
+-#define XRX500_SSO_LD2_PATTERN(phy6, phy2, phy3, phy4, phy5) \
+-					(((phy6 & BIT(2))\
+-					| ((phy2 & BIT(2)) << 1)\
+-					| ((phy3 & BIT(2)) << 2)\
+-					| ((phy4 & BIT(2)) << 3)\
+-					| ((phy5 & BIT(2)) << 4)\
+-					) << XRX500_SSO_LD2_SHIFT)
+-
+-/*WLAN control*/
+-#define XRX500_SSO_WLAN_MASK	0x3F
+-#define XRX500_SSO_W1_W2_W3_MASK	0xE0
+-#define XRX500_SSO_W4_W5_W6_MASK	0xE000
+-
+-#define XRX500_SSO_W1_W2_W3_SHIFT	5
+-#define XRX500_SSO_W4_W5_W6_SHIFT	13
+-
+-#define XRX500_SSO_W1_W2_W3_PATTERN(wlan)	\
+-	((wlan & 0x3) << XRX500_SSO_W1_W2_W3_SHIFT)
+-#define XRX500_SSO_W4_W5_W6_PATTERN(wlan)	\
+-	((wlan & 0x38) << XRX500_SSO_W4_W5_W6_SHIFT)
+-
+-/*SSO has 3 groups of 8 bits */
+-#define XRX500_SSO_GROUP0		BIT(0)
+-#define XRX500_SSO_GROUP1		BIT(1)
+-#define XRX500_SSO_GROUP2		BIT(2)
+-#define XRX500_SSO_GROUP3		BIT(3)
+-#define XRX500_SSO_GROUP_MASK		(0xF)
+-
+-/* Edge configuration bits */
+-#define XRX500_SSO_FALLING	BIT(26)
+-#define XRX500_SSO_EDGE_MASK	BIT(26)
+-
+-/*Dutycycle configuration bit*/
+-#define XRX500_SSO_DUTYCYCLE(led)	\
+-	(XRX500_SSO_DUTYCYCLE_BASE + (led * XRX500_SSO_DUTYCYCLE_OFFSET))
+-
+-#define xrx500_sso_r32(m, reg)		__raw_readl(m + reg)
+-#define xrx500_sso_w32(m, val, reg)	__raw_writel(val, m + reg)
+-#define xrx500_sso_w32_mask(m, clear, set, reg) \
+-		ltq_w32((ltq_r32(m + reg) & ~(clear)) | (set), \
+-		m + reg)
+-struct xrx500_sso_freq_table {
+-	u32 value;
+-	u32 range_start;
+-	u32 range_end;
+-};
+-
+-struct xrx500_sso {
+-	struct gpio_chip gc;
+-	void __iomem *virt;
+-	u32 edge;	/* rising or falling edge triggered shift register */
+-	u32 shadow;	/* shadow the shift registers state */
+-	u8 groups;	/* we can drive 1 groups of 8bit each */
+-	u8 phy2;	/* 3 bits can be driven by phy2 */
+-	u8 phy3;	/* 3 bits can be driven by phy3 */
+-	u8 phy4;	/* 3 bits can be driven by phy4 */
+-	u8 phy5;	/* 3 bits can be driven by phy5 */
+-	u8 phy6;	/* 3 bits can be driven by phy6 */
+-	u8 upd;	/* 2 bits for update source*/
+-	u32 blink_mask;
+-	u32 blink_rate;
+-	u32 blink_source_24_31[8];
+-	u32 blink_source_0_23;
+-	u8 wlan;	/*6 bits for WLAN*/
+-	u8 reserved;	/* mask out the hw driven bits in gpio_request */
+-};
+-
+-struct xrx500_sso_led {
+-	struct led_classdev     device;             /*!< LED device */
+-	const char *name;
+-	const char *default_trigger;
+-	unsigned	phys_id;
+-	unsigned	active_low:1;
+-	unsigned	retain_state_suspended:1;
+-	unsigned	default_state:2;
+-	struct work_struct work;
+-	u8 new_level;
+-	u8 can_sleep;
+-	u8 blinking;
+-};
+-
+ static struct xrx500_sso_freq_table fpid_table[] = {
+ 	{0, 251, 500},
+ 	{1, 126, 250},
+@@ -198,6 +23,31 @@ static struct xrx500_sso_freq_table gptd
+ 	{2, 5, 5},
+ 	{3, 1, 4}
+ };
++static struct xrx500_sso_config_param g_board_xrx500_sso_hw_config = {
++	.operation_mask         = /*XRX500_SSO_CFG_OP_UPDATE_SHADOW | XRX500_SSO_CFG_OP_BLINK_MASK 
++				| XRX500_SSO_CFG_OP_UPDATE_CLOCK | XRX500_SSO_CFG_OP_UPDATE_FPID | XRX500_SSO_CFG_OP_UPDATE_FCDSC | XRX500_SSO_CFG_OP_UPDATE_GPTD
++				| XRX500_SSO_CFG_OP_BLINK_RATE | XRX500_SSO_CFG_OP_INDIVIDUAL_BLINK_SOURCE | XRX500_SSO_CFG_OP_BLINK_SOURCE_0_23*/ 0,
++	.shadow		    = 0x0,
++	.blink_mask             = 0x0,
++	.update_clock           = LED_CON1_UPDATE_SRC_GPTD2,
++	.fpid                   = 0,
++	.fcdsc                  = 1,
++	.gptd					= 0,
++	.is_blink_rate_diff     = 1,
++	.blink_rate_source_0     = {
++				LED_H8_UPDATE_SRC_FPID,
++				LED_H8_UPDATE_SRC_FPID,
++					LED_H8_UPDATE_SRC_FPID,
++					LED_H8_UPDATE_SRC_FPID,
++					LED_H8_UPDATE_SRC_FPID,
++					LED_H8_UPDATE_SRC_FPID,
++					LED_H8_UPDATE_SRC_FPID,
++					LED_H8_UPDATE_SRC_FPID,
++			      },
++	.blink_rate_source_1 = LED_H8_UPDATE_SRC_FPID
++};
++
++
+ 
+ static struct xrx500_sso *g_chip;
+ static struct xrx500_sso_led g_xrx500_sso_led_config[NUM_LEDS];
+@@ -215,13 +65,13 @@ static void xrx500_sso_set(struct gpio_c
+ 	struct xrx500_sso *chip =
+ 		container_of(gc, struct xrx500_sso, gc);
+ 	/*normal LED ON/OFF*/
+-	pr_debug(" %s shadow 0x%x gpio %d val %d\r\n", __func__,
++	LOGF_KLOG_DEBUG(" %s shadow 0x%x gpio %d val %d\r\n", __func__,
+ 		chip->shadow, gpio, val);
+ 	if (val)
+ 		chip->shadow |= BIT(gpio);
+ 	else
+ 		chip->shadow &= ~BIT(gpio);
+-	xrx500_sso_w32(chip->virt, chip->shadow, XRX500_SSO_CPU0);
++	xrx500_sso_w32(chip->virt, chip->shadow, (get_cpu_select()? XRX500_SSO_CPU1:XRX500_SSO_CPU0));
+ 	xrx500_sso_w32(chip->virt, val, XRX500_SSO_DUTYCYCLE(gpio));
+ 	xrx500_sso_w32_mask(chip->virt, 0, XRX500_SSO_CON_SWU, XRX500_SSO_CON0);
+ 
+@@ -253,14 +103,14 @@ static int xrx500_sso_request(struct gpi
+ 		container_of(gc, struct xrx500_sso, gc);
+ 
+ 	if (/*(gpio < 15) && */(chip->reserved & BIT(gpio))) {
+-		dev_err(gc->dev, "GPIO %d is driven by hardware\n", gpio);
++		LOGF_KLOG_DEV_ERROR(gc->dev, "GPIO %d is driven by hardware\n", gpio);
+ 		return -ENODEV;
+ 	}
+ 	if ((BIT(gpio) & chip->blink_mask) == BIT(gpio)) {
+ 		/*Its a blink masked gpio, so check the US*/
+ 		if (chip->upd == LED_CON1_UPDATE_SRC_SW) {
+ 			/*throw a warning, the update source is sw*/
+-			dev_err(gc->dev,
++			LOGF_KLOG_DEV_ERROR(gc->dev,
+ 			"GPIO %d configure the update source to be FPID or GPTD\n",
+ 			gpio);
+ 		}
+@@ -271,9 +121,11 @@ static int xrx500_sso_request(struct gpi
+ #define find_range(delay_on, delay_off, table, value) \
+ for (j = 0; j < 4; j++) { \
+ 	if ( \
+-	(delay_on >= table[j].range_start && delay_on <= table[j].range_end) \
++	(delay_on >= table[j].range_start \
++	&& delay_on <= table[j].range_end) \
+ 	|| \
+-	(delay_off >= table[j].range_start && delay_off <= table[j].range_end)) { \
++	(delay_off >= table[j].range_start \
++	&& delay_off <= table[j].range_end)) { \
+ 		value = j; \
+ 		break;\
+ 	} \
+@@ -292,7 +144,7 @@ static void xrx500_sso_program_delay(
+ 	if (!g_chip->blink_rate) {
+ 		if (g_chip->upd == LED_CON1_UPDATE_SRC_FPID) {
+ 			find_range(delay_on, delay_off, fpid_table, value);
+-			pr_debug("delay %d %d value from table %d %d\r\n",
++			LOGF_KLOG_DEBUG("delay %lu %lu value from table %d %d\r\n",
+ 			delay_on, delay_off, value, fpid_table[value].value);
+ 			xrx500_sso_w32_mask(g_chip->virt,
+ 			XRX500_SSO_FPID_MASK << XRX500_SSO_FPID_SHIFT,
+@@ -300,7 +152,7 @@ static void xrx500_sso_program_delay(
+ 			XRX500_SSO_CON1);
+ 		} else if (g_chip->upd == LED_CON1_UPDATE_SRC_GPTD2) {
+ 			find_range(delay_on, delay_off, gptd_table, value);
+-			pr_debug("delay %d %d value from table %d %d\r\n",
++			LOGF_KLOG_DEBUG("delay %lu %lu value from table %d %d\r\n",
+ 			delay_on, delay_off,
+ 			value, gptd_table[value].value);
+ 			xrx500_sso_w32_mask(g_chip->virt,
+@@ -314,23 +166,35 @@ static void xrx500_sso_program_delay(
+ 		k = phys_id - 24;
+ 		if (g_chip->blink_source_24_31[k] == LED_H8_UPDATE_SRC_FPID) {
+ 			find_range(delay_on, delay_off, fpid_table, value);
+-			xrx500_sso_w32_mask(g_chip->virt, 0x3 << ((k%5) * 6),
++			xrx500_sso_w32_mask(g_chip->virt,
++			0x3 << ((k%5) * 6),
+ 			fpid_table[value].value << ((k%5) * 6),
+-			((phys_id < 29) ? XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
+-		} else if (g_chip->blink_source_24_31[k] == LED_H8_UPDATE_SRC_GPTD) {
++			((phys_id < 29) ?
++			XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
++		} else if (g_chip->blink_source_24_31[k]
++			== LED_H8_UPDATE_SRC_GPTD) {
+ 			find_range(delay_on, delay_off, gptd_table, value);
+-			xrx500_sso_w32_mask(g_chip->virt, 0x3 << (((k%5) * 6) + 2),
++			xrx500_sso_w32_mask(g_chip->virt,
++			0x3 << (((k%5) * 6) + 2),
+ 			gptd_table[value].value << (((k%5) * 6) + 2),
+-			((phys_id < 29) ? XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
++			((phys_id < 29) ?
++			XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
+ 		}
+ 	} else if ((phys_id >= 0) && (phys_id <= 23)) {
+ 		k = 3;
+ 		if (g_chip->blink_source_0_23 == LED_H8_UPDATE_SRC_FPID) {
+ 			find_range(delay_on, delay_off, fpid_table, value);
+-			xrx500_sso_w32_mask(g_chip->virt, 0x3 << (k * 6), fpid_table[value].value << (k * 6), XRX500_SSO_BLINK_H8_1);
+-		} else if (g_chip->blink_source_0_23 == LED_H8_UPDATE_SRC_GPTD) {
++			xrx500_sso_w32_mask(g_chip->virt,
++			0x3 << (k * 6),
++			fpid_table[value].value << (k * 6),
++			XRX500_SSO_BLINK_H8_1);
++		} else if (g_chip->blink_source_0_23
++			== LED_H8_UPDATE_SRC_GPTD) {
+ 			find_range(delay_on, delay_off, gptd_table, value);
+-			xrx500_sso_w32_mask(g_chip->virt, 0x3 << ((k * 6) + 2), gptd_table[value].value << ((k * 6) + 2), XRX500_SSO_BLINK_H8_1);
++			xrx500_sso_w32_mask(g_chip->virt,
++			0x3 << ((k * 6) + 2),
++			gptd_table[value].value << ((k * 6) + 2),
++			XRX500_SSO_BLINK_H8_1);
+ 		}
+ 	}
+ }
+@@ -349,12 +213,13 @@ static int xrx500_sso_led_blink_set(stru
+ 		led->blinking = 1;
+ 		return 0;
+ 	} else{
+-		pr_err("blink mask not enable\r\n");
++		LOGF_KLOG_ERROR("blink mask not enable\r\n");
+ 		return -1;
+ 	}
+ }
+ 
+-static void ledc_brightness_set(struct led_classdev *device, enum led_brightness value)
++static void ledc_brightness_set(struct led_classdev *device,
++	enum led_brightness value)
+ {
+ 	u32 reg;
+ 	struct xrx500_sso_led *led = (struct xrx500_sso_led *) device;
+@@ -372,17 +237,73 @@ static void ledc_brightness_set(struct l
+ 			g_chip->shadow |= BIT(led->phys_id);
+ 		else
+ 			g_chip->shadow &= ~BIT(led->phys_id);
+-		xrx500_sso_w32(g_chip->virt, g_chip->shadow, XRX500_SSO_CPU0);
++
++		xrx500_sso_w32(g_chip->virt, g_chip->shadow, (get_cpu_select()? XRX500_SSO_CPU1:XRX500_SSO_CPU0));
+ 		if (g_chip->upd == LED_CON1_UPDATE_SRC_SW)
+-			xrx500_sso_w32_mask(g_chip->virt, 0, XRX500_SSO_CON_SWU, XRX500_SSO_CON0);
++			xrx500_sso_w32_mask(g_chip->virt,
++			0, XRX500_SSO_CON_SWU, XRX500_SSO_CON0);
+ 	}
+ }
++static char* blink_src_get_24_31(int phys_id) {
++	int i = phys_id % 24;
++	u32 reg;
++	reg = xrx500_sso_r32(g_chip->virt, ((i < 5) ?	XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
++	reg = (reg >> (((i%5) * 6) + 4)) & 0x3;
++	switch (reg) {
++		case 0:
++			return "FPID";
++		break;
++		case 1:
++			return "GPTD";
++		break;
++		case 2:
++			return "V1M";
++		break;
++		default:
++			return "Error";
++	}
++}
++static void blink_src_set_24_31(char *source, int phys_id) {
++	int i = phys_id % 24;
++	int src = 0;
++	if (!strcmp(source, "FPID")) {
++		src = 0;
++	} else if (!strcmp(source, "GPTD")) {
++		src = 1;
++	} else if (!strcmp(source, "V1M")) {
++		src = 2;
++	}
++	xrx500_sso_w32_mask(g_chip->virt,
++	0x3 << (((i%5) * 6) + 4),
++	src << (((i%5) * 6) + 4),
++	((i < 5) ?
++	XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));		
++
++}
++static void blink_src_set(struct led_classdev *device, char *source)
++{
++	struct xrx500_sso_led *led = (struct xrx500_sso_led *) device;
++	if(led->phys_id <= 23) {
++		LOGF_KLOG_ERROR("blink_src is not supported for LEDS 0-23 instead use blink_src_0_23 in the top directory\r\n");
++	} else {
++		blink_src_set_24_31(source, led->phys_id);
++	}
++	
++}
++static char *blink_src_get(struct led_classdev *device)
++{
++	struct xrx500_sso_led *led = (struct xrx500_sso_led *) device;
++	if(led->phys_id <= 23)
++		return "blink_src is not supported for LEDS 0-23 instead use blink_src_0_23 in the top directory\r\n";
++	else
++		return blink_src_get_24_31(led->phys_id);
++}
+ 
+ /* Code to create from OpenFirmware platform devices */
+ static int gpio_leds_create_of(struct platform_device *pdev)
+ {
+ 	struct device_node *np = pdev->dev.of_node, *child;
+-	int count, ret, i = 0;
++	int count, i = 0;
+ 
+ 	/* count LEDs in this device, so we know how much to allocate */
+ 	count = of_get_child_count(np);
+@@ -393,22 +314,27 @@ static int gpio_leds_create_of(struct pl
+ 		struct xrx500_sso_led *led_dat = &g_xrx500_sso_led_config[i];
+ 		led_dat->device.name = of_get_property(child, "label",
+ 						     NULL) ? : child->name;
+-		pr_debug("name %s\r\n", led_dat->device.name);
++		LOGF_KLOG_DEBUG("name %s\r\n", led_dat->device.name);
+ 		led_dat->device.default_trigger = of_get_property(child,
+ 						"linux,default-trigger", NULL);
+ 		of_property_read_u32(child, "max-brightness",
+-				     &led_dat->device.max_brightness);
++				&led_dat->device.max_brightness);
+ 
+ 		of_property_read_u32(child, "reg", &led_dat->phys_id);
+ 		led_dat->device.brightness_set = ledc_brightness_set;
++		/*led_dat->device.led_source_set = ledc_source_set;
++		led_dat->device.led_source_get = ledc_source_get;*/
++		led_dat->device.blink_src_set = blink_src_set;
++		led_dat->device.blink_src_get = blink_src_get;
++		
+ 		led_dat->device.blink_set = xrx500_sso_led_blink_set;
+ 		led_dat->device.brightness = LED_OFF;
+ 		led_dat->device.flags |= LED_CORE_SUSPENDRESUME;
+ 		if ((led_classdev_register(&pdev->dev, &led_dat->device)) != 0)
+ 			return -ENODEV;
+ 		else
+-			pr_debug("classdev registered successfully\r\n");
+-
++			LOGF_KLOG_DEBUG("classdev registered successfully\r\n");
++		
+ 		i++;
+ 	}
+ 
+@@ -421,9 +347,8 @@ static int sso_led_init(struct platform_
+ 
+ 	pinctrl = devm_pinctrl_get_select_default(&pdev->dev);
+ 	if (IS_ERR(pinctrl))
+-		dev_warn(&pdev->dev,
++		LOGF_KLOG_DEV_WARNING(&pdev->dev,
+ 			"pins are not configured from the driver\n");
+-
+ 	gpio_leds_create_of(pdev);
+ 
+ 	return 0;
+@@ -433,7 +358,8 @@ static int sso_led_init(struct platform_
+  * xrx500_sso_hw_init() - Configure the SSO unit and enable the clock gate
+  * @virt: pointer to the remapped register range
+  */
+-static int xrx500_sso_hw_init(struct xrx500_sso *chip, struct xrx500_sso_config_param *param)
++static int xrx500_sso_hw_init(struct xrx500_sso *chip,
++struct xrx500_sso_config_param *param)
+ {
+ 	u32 i  = 0;
+ 	struct clk *test_clk;
+@@ -454,32 +380,39 @@ static int xrx500_sso_hw_init(struct xrx
+ 
+ 	/* tell the hardware which pins are controlled by the PHY*/
+ 	xrx500_sso_w32_mask(chip->virt,
+-		XRX500_SSO_LD0_MASK << XRX500_SSO_LD0_SHIFT,
+-		XRX500_SSO_LD0_PATTERN(chip->phy6, chip->phy2, chip->phy3, chip->phy4, chip->phy5),
+-		XRX500_SSO_CON3);
+-	 xrx500_sso_w32_mask(chip->virt,
+-		XRX500_SSO_LD1_MASK << XRX500_SSO_LD1_SHIFT,
+-		XRX500_SSO_LD1_PATTERN(chip->phy6, chip->phy2, chip->phy3, chip->phy4, chip->phy5),
+-		XRX500_SSO_CON3);
+-	 xrx500_sso_w32_mask(chip->virt,
+-		XRX500_SSO_LD2_MASK << XRX500_SSO_LD2_SHIFT,
+-		XRX500_SSO_LD2_PATTERN(chip->phy6, chip->phy2, chip->phy3, chip->phy4, chip->phy5),
+-		XRX500_SSO_CON3);
++	XRX500_SSO_LD0_MASK,
++	XRX500_SSO_LD0_PATTERN(chip->phy6, chip->phy2,
++	chip->phy3, chip->phy4, chip->phy5),
++	XRX500_SSO_CON3);
++	xrx500_sso_w32_mask(chip->virt,
++	XRX500_SSO_LD1_MASK,
++	XRX500_SSO_LD1_PATTERN(chip->phy6, chip->phy2,
++	chip->phy3, chip->phy4, chip->phy5),
++	XRX500_SSO_CON3);
++	xrx500_sso_w32_mask(chip->virt,
++	XRX500_SSO_LD2_MASK,
++	XRX500_SSO_LD2_PATTERN(chip->phy6, chip->phy2,
++	chip->phy3, chip->phy4, chip->phy5),
++	XRX500_SSO_CON3);
+ 	/* tell the hardware which pins are controlled by the WLAN*/
+ 	xrx500_sso_w32_mask(chip->virt,
+-		XRX500_SSO_W1_W2_W3_MASK << XRX500_SSO_W1_W2_W3_SHIFT,
+-		XRX500_SSO_W1_W2_W3_PATTERN(chip->wlan),
+-		XRX500_SSO_CON3);
+-	 xrx500_sso_w32_mask(chip->virt,
+-		XRX500_SSO_W4_W5_W6_MASK << XRX500_SSO_W4_W5_W6_SHIFT,
+-		XRX500_SSO_W4_W5_W6_PATTERN(chip->wlan),
+-		XRX500_SSO_CON3);
++	XRX500_SSO_W1_W2_W3_MASK,
++	XRX500_SSO_W1_W2_W3_PATTERN(chip->wlan),
++	XRX500_SSO_CON3);
++	xrx500_sso_w32_mask(chip->virt,
++	XRX500_SSO_W4_W5_W6_MASK,
++	XRX500_SSO_W4_W5_W6_PATTERN(chip->wlan),
++	XRX500_SSO_CON3);
+ 
+ 
+ 	/* mask out the hw driven bits in gpio_request */
+-	chip->reserved  = XRX500_SSO_LD0_PATTERN(chip->phy6, chip->phy2, chip->phy3, chip->phy4, chip->phy5)
+-			| XRX500_SSO_LD1_PATTERN(chip->phy6, chip->phy2, chip->phy3, chip->phy4, chip->phy5)
+-			| XRX500_SSO_LD2_PATTERN(chip->phy6, chip->phy2, chip->phy3, chip->phy4, chip->phy5);
++	chip->reserved =
++	XRX500_SSO_LD0_PATTERN(chip->phy6, chip->phy2,
++	chip->phy3, chip->phy4, chip->phy5)
++	| XRX500_SSO_LD1_PATTERN(chip->phy6, chip->phy2,
++	chip->phy3, chip->phy4, chip->phy5)
++	| XRX500_SSO_LD2_PATTERN(chip->phy6, chip->phy2,
++	chip->phy3, chip->phy4, chip->phy5);
+ 	/*WLAN pins are mapped to SOUT4 as per the registers specification*/
+ 	if (chip->wlan)
+ 		chip->reserved |= (1 << 4);
+@@ -518,38 +451,57 @@ static int xrx500_sso_hw_init(struct xrx
+ 	if (param->operation_mask & XRX500_SSO_CFG_OP_BLINK_RATE) {
+ 		chip->blink_rate = param->is_blink_rate_diff;
+ 		xrx500_sso_w32_mask(chip->virt,
+-		XRX500_SSO_BLINK_RATE, XRX500_SSO_BLINK_RATE, XRX500_SSO_CON0);
++		XRX500_SSO_BLINK_RATE_MASK << XRX500_SSO_BLINK_RATE_SHIFT, chip->blink_rate << XRX500_SSO_BLINK_RATE_SHIFT, XRX500_SSO_CON0);
+ 	}
+ 	/*program the individual blinking source for leds 24:31*/
+ 	if (param->operation_mask & XRX500_SSO_CFG_OP_INDIVIDUAL_BLINK_SOURCE) {
+ 		for (i = 0; i < 8; i++) {
+-			chip->blink_source_24_31[i] = param->blink_rate_source_0[i];
++			chip->blink_source_24_31[i] =
++			param->blink_rate_source_0[i];
+ 			xrx500_sso_w32_mask(chip->virt,
+ 			0x3 << (((i%5) * 6) + 4),
+ 			chip->blink_source_24_31[i] << (((i%5) * 6) + 4),
+-			((i < 5) ? XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
++			((i < 5) ?
++			XRX500_SSO_BLINK_H8_0 : XRX500_SSO_BLINK_H8_1));
+ 		}
+ 	}
+ 	/*program the blinking source for leds 0:23*/
+ 	if (param->operation_mask & XRX500_SSO_CFG_OP_BLINK_SOURCE_0_23) {
+-			chip->blink_source_0_23 = param->blink_rate_source_1;
++			chip->blink_source_0_23 =
++			param->blink_rate_source_1;
+ 			xrx500_sso_w32_mask(chip->virt,
+ 			0x3 << XRX500_SSO_BLINK_SOURCE_SHIFT,
+-			chip->blink_source_0_23 << XRX500_SSO_BLINK_SOURCE_SHIFT,
++			chip->blink_source_0_23
++			<< XRX500_SSO_BLINK_SOURCE_SHIFT,
+ 			XRX500_SSO_BLINK_H8_1);
+ 	}
++	#if 1
+ 	test_clk = clk_get_sys("16b00000.gptu", "timer2a");
+ 	if (IS_ERR(test_clk)) {
+-		pr_err("Failed to get clock timer2a\r\n");
++		LOGF_KLOG_ERROR("Failed to get clock timer2a\r\n");
+ 		return -ENOENT;
+ 	} else {
++#ifdef CONFIG_USE_EMULATOR
+ 			clk_set_rate(test_clk, 32258);
++#else
++			clk_set_rate(test_clk, 200000000);
++#endif
+ 			ret = clk_enable(test_clk);
+ 			if (ret) {
+-				pr_err("%s enable failed\r\n", __func__);
++				LOGF_KLOG_ERROR("%s enable failed\r\n", __func__);
+ 				clk_set_rate(test_clk, 0);
+ 			}
+ 	}
++	#else
++	ret = lq_request_timer(TIMER2A,
++	TIMER_FLAG_16BIT|TIMER_FLAG_TIMER|TIMER_FLAG_CYCLIC|TIMER_FLAG_DOWN,
++	32258, 0, 0);
++	if (!ret) {
++		LOGF_KLOG_INFO("timer request successful\r\n");
++		if (!lq_start_timer(TIMER2A, 1))
++			LOGF_KLOG_INFO("timer started successfully\r\n");
++	}
++	#endif
+ 	return 0;
+ }
+ static int xrx500_sso_probe(struct platform_device *pdev)
+@@ -557,11 +509,12 @@ static int xrx500_sso_probe(struct platf
+ 	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	const __be32 *groups, *phy, *wlan;
+ 	struct clk *clk;
++
+ 	int ret = 0;
+ 	struct xrx500_sso_config_param config = g_board_xrx500_sso_hw_config;
+ 
+ 	if (!res) {
+-		dev_err(&pdev->dev, "failed to request SSO resource\n");
++		LOGF_KLOG_DEV_ERROR(&pdev->dev, "failed to request SSO resource\n");
+ 		return -ENOENT;
+ 	}
+ 
+@@ -590,40 +543,37 @@ static int xrx500_sso_probe(struct platf
+ 	else
+ 		g_chip->groups = XRX500_SSO_GROUP0;
+ 	g_chip->gc.ngpio = fls(g_chip->groups) * 8;
+-	if (of_machine_is_compatible("lantiq,gpio-sso-xrx500")) {
+ 		phy = of_get_property(pdev->dev.of_node, "lantiq,phy2", NULL);
+ 		if (phy)
+ 			g_chip->phy2 = be32_to_cpu(*phy) & XRX500_SSO_PHY_MASK;
+ 		phy = of_get_property(pdev->dev.of_node, "lantiq,phy3", NULL);
+ 		if (phy)
+ 			g_chip->phy3 = be32_to_cpu(*phy) & XRX500_SSO_PHY_MASK;
+-
+ 		phy = of_get_property(pdev->dev.of_node, "lantiq,phy4", NULL);
+ 		if (phy)
+ 			g_chip->phy4 = be32_to_cpu(*phy) & XRX500_SSO_PHY_MASK;
+-
+ 		phy = of_get_property(pdev->dev.of_node, "lantiq,phy5", NULL);
+ 		if (phy)
+ 			g_chip->phy5 = be32_to_cpu(*phy) & XRX500_SSO_PHY_MASK;
+-
+ 		phy = of_get_property(pdev->dev.of_node, "lantiq,phy6", NULL);
+ 		if (phy)
+ 			g_chip->phy6 = be32_to_cpu(*phy) & XRX500_SSO_PHY_MASK;
+ 		wlan = of_get_property(pdev->dev.of_node, "lantiq,wlan", NULL);
+ 		if (wlan)
+-			g_chip->wlan = be32_to_cpu(*wlan) & XRX500_SSO_WLAN_MASK;
+-	}
++			g_chip->wlan = be32_to_cpu(*wlan)
++			& XRX500_SSO_WLAN_MASK;
+ 
+ 	/* check which edge trigger we should use, default to a falling edge */
+ 	if (!of_find_property(pdev->dev.of_node, "lantiq,rising", NULL))
+ 		g_chip->edge = XRX500_SSO_FALLING;
+-
++#ifndef CONFIG_USE_EMULATOR
+ 	clk = clk_get(&pdev->dev, NULL);
+ 	if (IS_ERR(clk)) {
+-		dev_err(&pdev->dev, "Failed to get clock\n");
++		LOGF_KLOG_DEV_ERROR(&pdev->dev, "Failed to get clock\n");
+ 		return PTR_ERR(clk);
+ 	}
+ 	clk_enable(clk);
++#endif
+ 
+ 	ret = xrx500_sso_hw_init(g_chip, &config);
+ 	if (!ret)
+@@ -631,9 +581,15 @@ static int xrx500_sso_probe(struct platf
+ 
+ 	sso_led_init(pdev);
+ 	platform_set_drvdata(pdev, g_chip);
+-	if (!ret)
+-		dev_info(&pdev->dev, "Init done\n");
++	if (!ret) {
++		ret = grx500_register_sysfs(pdev);
++	if (ret) {
++			LOGF_KLOG_DEV_ERROR(&pdev->dev, "registering config sysfs failed\n");
++			return ret;
++	}
+ 
++		LOGF_KLOG_DEV_INFO(&pdev->dev, "Init done\n");
++	}
+ 	return ret;
+ }
+ 
+@@ -650,6 +606,12 @@ static struct platform_driver xrx500_sso
+ 		.of_match_table = xrx500_sso_match,
+ 	},
+ };
++
++int __init xrx500_sso_init(void)
++{
++	return platform_driver_register(&xrx500_sso_driver);
++}
++
+ #if 0
+ int __init xrx500_sso_init(void)
+ {
+diff --git a/drivers/leds/trigger/Kconfig b/drivers/leds/trigger/Kconfig
+--- a/drivers/leds/trigger/Kconfig
++++ b/drivers/leds/trigger/Kconfig
+@@ -125,5 +125,11 @@ config LEDS_TRIGGER_USBDEV
+ 	help
+ 	  This allows LEDs to be controlled by the presence/activity of
+ 	  an USB device. If unsure, say N.
+-
++	  
++config LEDS_TRIGGER_SEQUENCE
++	tristate "LED Sequence Trigger"
++	depends on LEDS_TRIGGERS
++	help
++	  This allows LEDs to flash in a determined sequence 
++	  If unsure, say Y.
+ endif # LEDS_TRIGGERS
+diff --git a/drivers/leds/trigger/Makefile b/drivers/leds/trigger/Makefile
+--- a/drivers/leds/trigger/Makefile
++++ b/drivers/leds/trigger/Makefile
+@@ -8,3 +8,4 @@ obj-$(CONFIG_LEDS_TRIGGER_CPU)		+= ledtr
+ obj-$(CONFIG_LEDS_TRIGGER_DEFAULT_ON)	+= ledtrig-default-on.o
+ obj-$(CONFIG_LEDS_TRIGGER_TRANSIENT)	+= ledtrig-transient.o
+ obj-$(CONFIG_LEDS_TRIGGER_CAMERA)	+= ledtrig-camera.o
++obj-$(CONFIG_LEDS_TRIGGER_SEQUENCE)	+= ledtrig-sequence.o
+diff --git a/drivers/leds/trigger/ledtrig-sequence.c b/drivers/leds/trigger/ledtrig-sequence.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/leds/trigger/ledtrig-sequence.c
+@@ -0,0 +1,282 @@
++/*
++ * LED Kernel Sequence Trigger
++ *
++ * Copyright 2011-2012 
++ *
++ * Author: Ralf Janssen
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/device.h>
++//#include <linux/sysdev.h>
++#include <linux/timer.h>
++#include <linux/ctype.h>
++#include <linux/leds.h>
++#include <linux/slab.h>
++#include "../leds.h"
++#include <linux/klogging.h>
++
++struct sequence_setting {
++	unsigned long brightness;
++	unsigned long delay;
++};
++
++struct sequence_trig_data {
++	int final_brightness;		/* LED brightness after sequence finished. */
++	int repeat;			/* repeat sequence n times (-1 for infinite) */
++	int current_iteration;		/* current repetition */
++	struct sequence_setting setting[100];
++	int num_settings;
++	int cur_setting;
++	struct timer_list timer;
++};
++
++static void led_sequence_function(unsigned long data)
++{
++	struct led_classdev *led_cdev = (struct led_classdev *) data;
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++	unsigned long brightness = sequence_data->final_brightness;
++	unsigned long delay = 0;
++
++	if (sequence_data->cur_setting < sequence_data->num_settings) {
++		brightness = sequence_data->setting[sequence_data->cur_setting].brightness;
++		delay = sequence_data->setting[sequence_data->cur_setting].delay;
++
++		/* repeat sequence ? */
++		if (++sequence_data->cur_setting >= sequence_data->num_settings) {
++			if ((sequence_data->repeat == -1) || 
++			    (++sequence_data->current_iteration < sequence_data->repeat)) {
++				sequence_data->cur_setting = 0;
++			}
++		}
++	}
++
++	led_set_brightness(led_cdev, brightness);
++
++	if (delay > 0)
++		mod_timer(&sequence_data->timer, jiffies + msecs_to_jiffies(delay));
++
++}
++
++static ssize_t led_final_brightness_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++
++	return sprintf(buf, "%i\n", sequence_data->final_brightness);
++}
++
++static ssize_t led_final_brightness_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++	int ret = -EINVAL;
++	char *after;
++	unsigned long state = simple_strtoul(buf, &after, 10);
++	size_t count = after - buf;
++
++	if (*after && isspace(*after))
++		count++;
++
++	if (count == size) {
++		sequence_data->final_brightness = state;
++		ret = count;
++	}
++
++	return ret;
++}
++
++static ssize_t led_repeat_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++
++	return sprintf(buf, "%i/%i\n", 
++		sequence_data->current_iteration, sequence_data->repeat);
++}
++
++static ssize_t led_repeat_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++	int ret = -EINVAL;
++	char *after;
++	unsigned long state = simple_strtol(buf, &after, 10);
++	size_t count = after - buf;
++
++	if (*after && isspace(*after))
++		count++;
++
++	if (count == size) {
++		sequence_data->repeat = state;
++		ret = count;
++	}
++
++	return ret;
++}
++
++static ssize_t led_sequence_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++
++	ssize_t count = 0;
++	int i;
++	/*check the sequence setting*/
++	for (i = 0; i < sequence_data->num_settings; i++)
++	  count += sprintf(buf + count, "(brightness,delay): %lu,%lu \n", 
++			   sequence_data->setting[i].brightness, 
++			   sequence_data->setting[i].delay);
++
++	return count;
++}
++
++static ssize_t led_sequence_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	struct led_classdev *led_cdev = dev_get_drvdata(dev);
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++	char *copybuf;
++	char *p, *token;
++	char *pt;
++	unsigned long brightness, delay;
++	char *after;
++	int ret = -EINVAL;
++	int num_settings = 0;
++
++	copybuf = kmalloc(1024, GFP_KERNEL);
++	if(!copybuf) {
++		LOGF_KLOG_ERROR("mem Alloc failed\r\n");
++		return ret;
++	}
++	/* take a copy since we don't want to trash the inbound buffer when using strsep */
++	strncpy(copybuf, buf, 1024);
++	copybuf[1023] = 0;
++	p = copybuf;
++	pt = p;
++	
++	del_timer_sync(&sequence_data->timer);
++	/* TODO: lock accesses to data structure */
++	sequence_data->current_iteration = 0;
++	sequence_data->num_settings = 0;
++	sequence_data->cur_setting = 0;
++
++	/*Debug on sequence*/
++	LOGF_KLOG_CONT("Start to read sequence setting: %s \r\n", pt);
++	while (p != NULL) {
++		while((char)*p==' ')p++;
++		token = strsep(&p, ",");
++		brightness = simple_strtoul(token, &after, 10);
++		while((char)*p==' ')p++;
++		token = strsep(&p, ",");
++		delay = simple_strtoul(token, &after, 10);
++
++		LOGF_KLOG_CONT("setting%d brightness = %d delay = %d \r\n",num_settings, brightness, delay);
++		sequence_data->setting[num_settings].brightness = brightness;
++		sequence_data->setting[num_settings].delay = delay;
++	
++		if (++num_settings >= (sizeof(sequence_data->setting) / sizeof(sequence_data->setting[0])))
++			break;
++		}
++	if ((p == NULL) && (num_settings <= (sizeof(sequence_data->setting) / sizeof(sequence_data->setting[0])))) {
++
++		LOGF_KLOG_CONT("End of sequence setting, num = %d!\r\n",num_settings);		
++		ret = size;
++		sequence_data->num_settings = num_settings;
++		led_sequence_function((unsigned long)led_cdev);
++		
++	}
++	return ret;
++}
++
++static DEVICE_ATTR(final_brightness, 0644, led_final_brightness_show, led_final_brightness_store);
++static DEVICE_ATTR(repeat, 0644, led_repeat_show, led_repeat_store);
++static DEVICE_ATTR(sequence, 0644, led_sequence_show, led_sequence_store);
++
++static void sequence_trig_activate(struct led_classdev *led_cdev)
++{
++	struct sequence_trig_data *sequence_data;
++	int rc;
++
++	sequence_data = kzalloc(sizeof(struct sequence_trig_data), GFP_KERNEL);
++	if (!sequence_data)
++		return;
++
++	sequence_data->final_brightness = led_get_brightness(led_cdev);
++	led_cdev->trigger_data = sequence_data;
++
++	init_timer(&sequence_data->timer);
++	sequence_data->timer.function = led_sequence_function;
++	sequence_data->timer.data = (unsigned long) led_cdev;
++
++	rc = device_create_file(led_cdev->dev, &dev_attr_final_brightness);
++	if (rc)
++		goto err_out;
++	rc = device_create_file(led_cdev->dev, &dev_attr_repeat);
++	if (rc)
++		goto err_out_finalbrightness;
++	rc = device_create_file(led_cdev->dev, &dev_attr_sequence);
++	if (rc)
++		goto err_out_repeat;
++
++	return;
++
++err_out_repeat:
++	device_remove_file(led_cdev->dev, &dev_attr_repeat);
++err_out_finalbrightness:
++	device_remove_file(led_cdev->dev, &dev_attr_final_brightness);
++err_out:
++	led_cdev->trigger_data = NULL;
++	kfree(sequence_data);
++}
++
++static void sequence_trig_deactivate(struct led_classdev *led_cdev)
++{
++	struct sequence_trig_data *sequence_data = led_cdev->trigger_data;
++
++	if (sequence_data) {
++		device_remove_file(led_cdev->dev, &dev_attr_sequence);
++		device_remove_file(led_cdev->dev, &dev_attr_repeat);
++		device_remove_file(led_cdev->dev, &dev_attr_final_brightness);
++		del_timer_sync(&sequence_data->timer);
++		kfree(sequence_data);
++	}
++}
++
++static struct led_trigger sequence_led_trigger = {
++	.name     = "sequence",
++	.activate = sequence_trig_activate,
++	.deactivate = sequence_trig_deactivate,
++};
++
++static int __init sequence_trig_init(void)
++{
++	return led_trigger_register(&sequence_led_trigger);
++}
++
++static void __exit sequence_trig_exit(void)
++{
++	led_trigger_unregister(&sequence_led_trigger);
++}
++
++module_init(sequence_trig_init);
++module_exit(sequence_trig_exit);
++
++MODULE_AUTHOR("Ralf Janssen");
++MODULE_DESCRIPTION("Sequence LED trigger");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/leds.h b/include/linux/leds.h
+--- a/include/linux/leds.h
++++ b/include/linux/leds.h
+@@ -83,6 +83,11 @@ struct led_classdev {
+ 	/* true if activated - deactivate routine uses it to do cleanup */
+ 	bool			activated;
+ #endif
++#ifdef CONFIG_SOC_GRX500
++	void (*blink_src_set)(struct led_classdev *led_cdev,
++	char *);
++	char* (*blink_src_get)(struct led_classdev *led_cdev);
++#endif
+ };
+ 
+ extern int led_classdev_register(struct device *parent,

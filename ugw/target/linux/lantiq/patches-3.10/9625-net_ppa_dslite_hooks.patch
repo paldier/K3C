@@ -1,0 +1,248 @@
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -20,6 +20,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/capability.h>
+ #include <linux/errno.h>
+@@ -58,6 +59,9 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#include <net/ppa_stack_al.h>
++#endif
+ MODULE_AUTHOR("Ville Nuorvala");
+ MODULE_DESCRIPTION("IPv6 tunneling device");
+ MODULE_LICENSE("GPL");
+@@ -90,6 +94,22 @@ static int ip6_tnl_dev_init(struct net_d
+ static void ip6_tnl_dev_setup(struct net_device *dev);
+ static struct rtnl_link_ops ip6_link_ops __read_mostly;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    extern int (*ppa_get_ip4ip6_dmac_fn)(struct net_device *, uint8_t *mac);
++#else
++    extern int (*ppa_get_ip4ip6_dmac_fn)(struct net_device *, struct sk_buff *skb, uint8_t *mac);
++#endif
++    extern struct net_device * (*ppa_get_ip4ip6_phyif_fn)(struct net_device *);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    static int ppa_get_ip4ip6_dmac(struct net_device *dev, uint8_t *mac);
++#else
++    static int ppa_get_ip4ip6_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac);
++#endif
++    static  struct net_device *ppa_get_ip4ip6_phyif(struct net_device *dev);
++#endif
++
++
+ static int ip6_tnl_net_id __read_mostly;
+ struct ip6_tnl_net {
+ 	/* the IPv6 tunnel fallback device */
+@@ -1797,6 +1817,11 @@ static int __init ip6_tunnel_init(void)
+ 	if (err < 0)
+ 		goto rtnl_link_failed;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++    ppa_get_ip4ip6_dmac_fn = ppa_get_ip4ip6_dmac;
++    ppa_get_ip4ip6_phyif_fn = ppa_get_ip4ip6_phyif;
++#endif
++
+ 	return 0;
+ 
+ rtnl_link_failed:
+@@ -1822,8 +1847,191 @@ static void __exit ip6_tunnel_cleanup(vo
+ 	if (xfrm6_tunnel_deregister(&ip6ip6_handler, AF_INET6))
+ 		pr_info("%s: can't deregister ip6ip6\n", __func__);
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++    ppa_get_ip4ip6_dmac_fn = NULL;
++    ppa_get_ip4ip6_phyif_fn = NULL;
++#endif
++
++
+ 	unregister_pernet_device(&ip6_tnl_net_ops);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++static struct net_device *ppa_get_ip4ip6_phyif(struct net_device *dev)
++{
++    struct ip6_tnl *t = netdev_priv(dev);
++    struct dst_entry *dst;
++    
++#if 1
++	struct flowi6 fl6;
++	__u8 dsfield;
++	int err;
++	struct dst_entry *ndst = NULL;
++	struct net *net = dev_net(dev);
++
++	memcpy(&fl6, &t->fl.u.ip6, sizeof (fl6));
++	fl6.flowi6_proto = IPPROTO_IPIP;
++
++	if ((dst = ip6_tnl_dst_check(t)) != NULL){
++        	if(dst->dev != dev)
++            		return dst->dev;
++    	} else { 
++		ndst = ip6_route_output(net, NULL, &fl6);
++
++		if (ndst->error) {
++			goto tx_err_link_failure;
++		}
++		ndst = xfrm_lookup(net, ndst, flowi6_to_flowi(&fl6), NULL, 0);
++		if (IS_ERR(ndst)) {
++			err = PTR_ERR(ndst);
++			ndst = NULL;
++			goto tx_err_link_failure;
++		}
++		dst = ndst;
++
++        	if(dst->dev != dev) {
++            		return dst->dev;
++		}
++	}
++tx_err_link_failure:
++	return NULL;
++
++#else 
++    if ((dst = ip6_tnl_dst_check(t)) != NULL){
++        if(dst->dev != dev)
++            return dst->dev;
++    }
++#endif
++
++    return NULL;
++}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++static int ppa_get_ip4ip6_dmac(struct net_device *dev,uint8_t *mac)
++#else
++int ppa_get_ip4ip6_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac)
++#endif
++{
++    struct ip6_tnl *t = netdev_priv(dev);
++    struct dst_entry *dst = NULL;
++    struct hh_cache *hh;
++
++    
++	if(!mac){
++        return -1;
++    }
++
++#if 1	
++	struct flowi6 fl6;
++	__u8 dsfield;
++	int err;
++	struct dst_entry *ndst = NULL;
++	struct net *net = dev_net(dev);
++
++	memcpy(&fl6, &t->fl.u.ip6, sizeof (fl6));
++	fl6.flowi6_proto = IPPROTO_IPIP;
++
++	if ((dst = ip6_tnl_dst_check(t)) == NULL || dst->dev == dev){
++    		
++		ndst = ip6_route_output(net, NULL, &fl6);
++
++		if (ndst->error) {
++			//goto tx_err_link_failure;
++                        return -1;
++		}
++		ndst = xfrm_lookup(net, ndst, flowi6_to_flowi(&fl6), NULL, 0);
++		if (IS_ERR(ndst)) {
++			err = PTR_ERR(ndst);
++			ndst = NULL;
++			//goto tx_err_link_failure;
++                        return -1;
++		}
++		dst = ndst;
++
++        	if(dst->dev == dev) {
++            		return -1;
++		}
++	}
++        dst_hold(dst);
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    hh = dst->hh;
++    if(!hh){
++       if ( dst->neighbour 
++                && (dst->neighbour->ha[0] != 0
++                || dst->neighbour->ha[1] != 0
++                || dst->neighbour->ha[2] != 0
++                || dst->neighbour->ha[3] != 0
++                || dst->neighbour->ha[4] != 0
++                || dst->neighbour->ha[5] != 0) ){
++                
++            memcpy(mac, (uint8_t *)dst->neighbour->ha, ETH_ALEN);
++        }else{
++            goto MAC_ERROR;
++        }
++#else
++    struct neighbour *neigh;
++    //neigh = dst_neigh_lookup_skb(dst,skb);
++    neigh = dst_neigh_lookup(dst,&(t->parms.raddr));
++    if(neigh == NULL)
++    {
++       return -1;
++    }
++
++    if(dst->dev->header_ops->cache == NULL)
++    {
++       ppa_neigh_hh_init(neigh,dst);   
++       ppa_neigh_update_hhs(neigh);
++    }
++
++    hh = &neigh->hh;
++    if ( !hh )
++    {
++        if ( neigh
++            && (neigh->ha[0] != 0
++                || neigh->ha[1] != 0
++                || neigh->ha[2] != 0
++                || neigh->ha[3] != 0
++                || neigh->ha[4] != 0
++                || neigh->ha[5] != 0) )
++        {
++            memcpy(mac, (uint8_t *)neigh->ha, ETH_ALEN);
++        }else{
++            goto MAC_ERROR;
++        }
++
++#endif
++    }else{
++        unsigned int seq;
++
++        do {
++            seq = read_seqbegin(&hh->hh_lock);
++            if ( hh->hh_len != ETH_HLEN )
++            {
++                //printk("head length is not correct: hh->hh_len = %d, ETH_HLEN = %d\n", (int)hh->hh_len, ETH_HLEN);
++                goto MAC_ERROR;
++            }
++            else
++            {
++                memcpy(mac, (uint8_t *)hh->hh_data + HH_DATA_ALIGN(hh->hh_len) - hh->hh_len, ETH_ALEN);
++            }
++        } while ( read_seqretry(&hh->hh_lock, seq) );
++    }
++
++    dst_release(dst);
++
++    return 0;
++    
++MAC_ERROR:
++
++    dst_release(dst);
++    return -1;
++    
++}
++
++#endif
++
+ module_init(ip6_tunnel_init);
+ module_exit(ip6_tunnel_cleanup);

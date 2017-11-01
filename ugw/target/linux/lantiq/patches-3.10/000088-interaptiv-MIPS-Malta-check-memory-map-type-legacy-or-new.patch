@@ -1,0 +1,95 @@
+From f76f3e89d18577ad19c41a099fd696ff15bc0da5 Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Tue, 2 Apr 2013 13:30:42 -0700
+Subject: [PATCH 088/105] MIPS: Malta: check memory map type - legacy or new
+
+Malta board has two memory map variants - legacy and new and
+there are a couple of possible and impossible variants between
+kernel configuration and system controller configuration.
+That stuff really troubles!
+
+So - read a secret sysctrl register, check and do decision:
+continue or not or continue with memory restiction to 256MB.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+(cherry picked from commit fd39fde59fdb471ca41ade5678c31ef7d060f333)
+---
+ arch/mips/mti-malta/malta-init.c   |    7 ++++++-
+ arch/mips/mti-malta/malta-memory.c |   19 +++++++++++++++++++
+ 2 files changed, 25 insertions(+), 1 deletions(-)
+
+diff --git a/arch/mips/mti-malta/malta-init.c b/arch/mips/mti-malta/malta-init.c
+index ba88fb4..2ccd53c 100644
+--- a/arch/mips/mti-malta/malta-init.c
++++ b/arch/mips/mti-malta/malta-init.c
+@@ -112,6 +112,7 @@ static void __init mips_ejtag_setup(void)
+ 	local_flush_icache_range((unsigned long)base, (unsigned long)base + 0x80);
+ }
+ 
++void __init prom_mem_check(int niocu);
+ extern struct plat_smp_ops msmtc_smp_ops;
+ 
+ void __init prom_init(void)
+@@ -306,9 +307,13 @@ mips_pci_controller:
+ 	console_config();
+ #endif
+ 	/* Early detection of CMP support */
+-	if (gcmp_probe(GCMP_BASE_ADDR, GCMP_ADDRSPACE_SZ))
++	if (gcmp_probe(GCMP_BASE_ADDR, GCMP_ADDRSPACE_SZ)) {
++#if defined(CONFIG_EVA) && !defined(CONFIG_EVA_OLD_MALTA_MAP)
++		prom_mem_check(gcmp_niocu());
++#endif
+ 		if (!register_cmp_smp_ops())
+ 			return;
++	}
+ 
+ 	if (!register_vsmp_smp_ops())
+ 		return;
+diff --git a/arch/mips/mti-malta/malta-memory.c b/arch/mips/mti-malta/malta-memory.c
+index 7243d0d..702fe81 100644
+--- a/arch/mips/mti-malta/malta-memory.c
++++ b/arch/mips/mti-malta/malta-memory.c
+@@ -104,6 +104,8 @@ static inline fw_memblock_t * __init prom_getmdesc(void)
+ 
+ #else
+ 
++static unsigned newMapType;
++
+ static inline fw_memblock_t * __init prom_getevamdesc(void)
+ {
+ 	char *memsize_str;
+@@ -169,7 +171,12 @@ static inline fw_memblock_t * __init prom_getevamdesc(void)
+ 			printk("YAMON reports memsize=256M but doesn't report ememsize option\n");
+ 			printk("If you install > 256MB memory, upgrade YAMON or use boot option memsize=XXXM\n");
+ 		}
++	newMapType = *((unsigned int *)CKSEG1ADDR(0xbf403004));
++	printk("System Controller register = %0x\n",newMapType);
++	newMapType &= 0x100;    /* extract map type bit */
+ #ifdef CONFIG_EVA_OLD_MALTA_MAP
++	if (newMapType)
++		panic("Malta board has new memory map layout but kernel is configured for legacy map\n");
+ 	/* Don't use last 64KB - it is just for macros arithmetics overflow */
+ 	if (memsize > 0x7fff0000)
+ 		memsize = 0x7fff0000;
+@@ -228,6 +235,18 @@ static inline fw_memblock_t * __init prom_getevamdesc(void)
+ #endif
+ 	return &mdesc[0];
+ }
++
++#ifndef CONFIG_EVA_OLD_MALTA_MAP
++void __init prom_mem_check(int niocu)
++{
++	if (!newMapType) {
++		if (niocu && mdesc[5].size) {
++			printk(KERN_WARNING "Malta board has legacy memory map + IOCU, but kernel is configured for new map layout, restrict memsize to 256MB\n");
++			boot_mem_map.nr_map--;
++		}
++	}
++}
++#endif /* !CONFIG_EVA_OLD_MALTA_MAP */
+ #endif /* CONFIG_EVA */
+ 
+ static int __init fw_memtype_classify(unsigned int type)
+-- 
+1.7.1
+

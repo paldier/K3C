@@ -1,0 +1,150 @@
+# HG changeset patch
+# Parent 86793cc5f7baf7f1820f81e9603488c34ac9af52
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+old mode 100644
+new mode 100755
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -28,7 +28,8 @@
+ #include <linux/textsearch.h>
+ #include <net/checksum.h>
+ #include <linux/rcupdate.h>
+-#include <linux/dmaengine.h>
++/* FIXME: */
++/*#include <linux/dmaengine.h>*/
+ #include <linux/hrtimer.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/netdev_features.h>
+@@ -402,6 +403,9 @@ struct sk_buff {
+ 	struct sk_buff		*next;
+ 	struct sk_buff		*prev;
+ 
++#ifdef CONFIG_LTQ_CBM
++	__u32 DW0, DW1, DW2, DW3;
++#endif
+ 	ktime_t			tstamp;
+ 
+ 	struct sock		*sk;
+@@ -2945,5 +2949,10 @@ static inline unsigned int skb_gso_netwo
+ 			       skb_network_header(skb);
+ 	return hdr_len + skb_gso_transport_seglen(skb);
+ }
++
++#ifdef CONFIG_LTQ_CBM
++void ltq_copy_skb_header(struct sk_buff *n, const struct sk_buff *skb);
++#endif
++
+ #endif	/* __KERNEL__ */
+ #endif	/* _LINUX_SKBUFF_H */
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+old mode 100644
+new mode 100755
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -74,6 +74,12 @@
+ #include <trace/events/skb.h>
+ #include <linux/highmem.h>
+ 
++#ifdef CONFIG_LTQ_CBM
++#include <net/lantiq_cbm.h>
++#include <net/lantiq_cbm_api.h>
++#endif
++
++
+ struct kmem_cache *skbuff_head_cache __read_mostly;
+ static struct kmem_cache *skbuff_fclone_cache __read_mostly;
+ 
+@@ -224,6 +230,7 @@ struct sk_buff *__alloc_skb(unsigned int
+ 	 */
+ 	size = SKB_DATA_ALIGN(size);
+ 	size += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++
+ 	data = kmalloc_reserve(size, gfp_mask, node, &pfmemalloc);
+ 	if (!data)
+ 		goto nodata;
+@@ -234,6 +241,7 @@ struct sk_buff *__alloc_skb(unsigned int
+ 	size = SKB_WITH_OVERHEAD(ksize(data));
+ 	prefetchw(data + size);
+ 
++
+ 	/*
+ 	 * Only clear those fields we need to clear, not those that we will
+ 	 * actually initialise below. Hence, don't put any more fields after
+@@ -303,6 +311,7 @@ struct sk_buff *build_skb(void *data, un
+ 	struct sk_buff *skb;
+ 	unsigned int size = frag_size ? : ksize(data);
+ 
++	/*printk("%s data 0x%x size %d\r\n",__func__, data, frag_size);*/
+ 	skb = kmem_cache_alloc(skbuff_head_cache, GFP_ATOMIC);
+ 	if (!skb)
+ 		return NULL;
+@@ -312,6 +321,7 @@ struct sk_buff *build_skb(void *data, un
+ 	memset(skb, 0, offsetof(struct sk_buff, tail));
+ 	skb->truesize = SKB_TRUESIZE(size);
+ 	skb->head_frag = frag_size != 0;
++
+ 	atomic_set(&skb->users, 1);
+ 	skb->head = data;
+ 	skb->data = data;
+@@ -491,10 +501,20 @@ static void skb_clone_fraglist(struct sk
+ 
+ static void skb_free_head(struct sk_buff *skb)
+ {
+-	if (skb->head_frag)
++	if (skb->head_frag) {
+ 		put_page(virt_to_head_page(skb->head));
+-	else
++	}
++	else {
++#ifdef CONFIG_LTQ_CBM
++		if (!check_ptr_validation((u32)(skb->head))) {
++			kfree(skb->head);
++		} else {
++			cbm_buffer_free(smp_processor_id(),(uint32_t) skb->head, 0);
++		}
++#else
+ 		kfree(skb->head);
++#endif
++	}
+ }
+ 
+ static void skb_release_data(struct sk_buff *skb)
+@@ -760,7 +780,6 @@ static struct sk_buff *__skb_clone(struc
+ 
+ 	atomic_inc(&(skb_shinfo(skb)->dataref));
+ 	skb->cloned = 1;
+-
+ 	return n;
+ #undef C
+ }
+@@ -918,6 +937,13 @@ static void copy_skb_header(struct sk_bu
+ 	skb_shinfo(new)->gso_type = skb_shinfo(old)->gso_type;
+ }
+ 
++#ifdef CONFIG_LTQ_CBM
++void ltq_copy_skb_header(struct sk_buff *n, const struct sk_buff *skb)
++{
++	copy_skb_header(n, skb);
++}
++#endif
++
+ static inline int skb_alloc_rx_flag(const struct sk_buff *skb)
+ {
+ 	if (skb_pfmemalloc(skb))
+@@ -1064,6 +1090,7 @@ int pskb_expand_head(struct sk_buff *skb
+ 		goto nodata;
+ 	size = SKB_WITH_OVERHEAD(ksize(data));
+ 
++
+ 	/* Copy only real data... and, alas, header. This should be
+ 	 * optimized for the cases when header is void.
+ 	 */
+@@ -1111,6 +1138,7 @@ int pskb_expand_head(struct sk_buff *skb
+ 	skb->cloned   = 0;
+ 	skb->hdr_len  = 0;
+ 	skb->nohdr    = 0;
++
+ 	atomic_set(&skb_shinfo(skb)->dataref, 1);
+ 	return 0;
+ 

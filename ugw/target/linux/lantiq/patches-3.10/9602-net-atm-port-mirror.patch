@@ -1,0 +1,70 @@
+Patch for Port mirror support in ATM mode
+diff --git a/net/atm/br2684.c b/net/atm/br2684.c
+--- a/net/atm/br2684.c
++++ b/net/atm/br2684.c
+@@ -29,6 +29,11 @@
+ 
+ #include "common.h"
+ 
++#ifdef CONFIG_LTQ_PORT_MIRROR
++extern struct net_device* (*ifx_get_mirror_netdev)(void);
++extern uint32_t (*ifx_is_device_type_wireless) (void);
++#endif
++
+ static void skb_debug(const struct sk_buff *skb)
+ {
+ #ifdef SKB_DEBUG
+@@ -425,6 +430,9 @@ static void br2684_push(struct atm_vcc *
+ 	struct br2684_vcc *brvcc = BR2684_VCC(atmvcc);
+ 	struct net_device *net_dev = brvcc->device;
+ 	struct br2684_dev *brdev = BRPRIV(net_dev);
++#ifdef CONFIG_LTQ_PORT_MIRROR
++	struct net_device *mirror_netdev = NULL;
++#endif
+ 
+ 	pr_debug("\n");
+ 
+@@ -512,6 +520,43 @@ static void br2684_push(struct atm_vcc *
+ 	net_dev->stats.rx_packets++;
+ 	net_dev->stats.rx_bytes += skb->len;
+ 	memset(ATM_SKB(skb), 0, sizeof(struct atm_skb_data));
++
++#ifdef CONFIG_LTQ_PORT_MIRROR
++    if (ifx_get_mirror_netdev)
++    {
++        mirror_netdev = ifx_get_mirror_netdev();
++        if (mirror_netdev != NULL)
++        {
++            struct sk_buff *new_skb = skb_copy(skb, GFP_ATOMIC);
++	    struct ethhdr *eth = NULL;
++	    int i = 0;
++
++            if ( new_skb != NULL )
++            {
++                new_skb->dev = mirror_netdev;
++                skb_push(new_skb, ETH_HLEN);
++                eth = (struct ethhdr *)new_skb->data;
++                memset(eth->h_source, 0x0, ETH_ALEN);
++
++		/*
++		 * for mirroring LAN <-> WAN traffic to a given SSID
++		 * the WLAN STA need to work in promiscuous transmitter mode, but most
++		 * standard WLAN STAs do not support this. Hence we are broacasting
++		 * mirrored packets to all SSIDs. This code path is active only when Port
++		 * mirroring is enabled in /proc/mirror.
++		 */
++
++	        if (ifx_is_device_type_wireless())
++	        {
++                    for ( i = 0; i < 6; i++ )
++                        eth->h_dest[i] = 0xFF;
++	        }
++                dev_queue_xmit(new_skb);
++            }
++        }
++    }
++#endif
++
+ 	netif_rx(skb);
+ 	return;
+ 

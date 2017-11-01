@@ -1,0 +1,55 @@
+#!/bin/sh /etc/rc.common
+
+START=02
+
+start() {
+
+	# Added to support dual image in UBI
+	if [ -n "$CONFIG_UBOOT_CONFIG_DUAL_IMAGE" ]; then
+		local cmd_line t_active_bank active_bank t_update_chk update_chk
+		cmd_line="`cat /proc/cmdline`";
+		[ -z "${cmd_line##*active_bank=[AB]*}" ] && {
+			t_active_bank=${cmd_line##*active_bank=};
+			active_bank=${t_active_bank::1};
+		} || active_bank=A;
+
+		[ -z "${cmd_line##*update_chk=[0-4]*}" ] && {
+			t_update_chk=${cmd_line##*update_chk=};
+			update_chk=${t_update_chk::1};
+		} || update_chk=0;
+	fi
+
+	# Mount DSL Firmware
+	if ! [ "$CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS" = "1" ]; then
+		if [ -n "$CONFIG_UBOOT_CONFIG_DUAL_IMAGE" ]; then
+			local fw_mtd=$(grep -w firmware${active_bank} /proc/mtd|cut -d: -f1)
+		else
+			local fw_mtd=$(grep -w firmware /proc/mtd|cut -d: -f1)
+		fi
+		local fw_mtd_hdr=`/bin/dd if=/dev/$fw_mtd bs=4 count=1 2>/dev/null`;
+		if [ "$fw_mtd_hdr" = "sqlz" ] || [ "$fw_mtd_hdr" = "qshs" ] || [ "$fw_mtd_hdr" = "hsqs" ]; then
+			echo "Mounting ADSL firmware.."
+			/bin/mount -t squashfs /dev/mtdblock${fw_mtd:3} /firmware
+		else
+			echo "ADSL firmware not found..!"
+		fi
+	fi
+
+	# Switch bank concept of dual image in UBI
+	if [ -n "$CONFIG_UBOOT_CONFIG_DUAL_IMAGE" ]; then
+		if [ "$active_bank" = "B" -a "$update_chk" = "0" ]; then
+			/usr/sbin/uboot_env --set --name update_chk --value  2
+		elif [ "$active_bank" = "A" -a "$update_chk" != "0" ]; then
+			/usr/sbin/uboot_env --set --name update_chk --value 0
+		fi
+	fi
+
+	# Reset Sierra HL7548 LTE chip
+	plat_form=${CONFIG_BUILD_SUFFIX%%_*}
+	platform=`echo $plat_form |tr '[:lower:]' '[:upper:]'`
+	if [ "$platform" = "GRX220" ]; then
+		if [ -f /lib/modules/*/sierra_lte_reset.ko ]; then
+			insmod /lib/modules/*/sierra_lte_reset.ko
+		fi
+	fi
+}

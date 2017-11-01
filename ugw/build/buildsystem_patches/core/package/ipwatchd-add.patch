@@ -1,0 +1,307 @@
+add ipwatchd package
+
+diff --git a/package/network/services/ipwatchd/Makefile b/package/network/services/ipwatchd/Makefile
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/ipwatchd/Makefile
+@@ -0,0 +1,47 @@
++# Copyright (C) 2009-2010 OpenWrt.org
++# All rights reserved.
++
++include $(TOPDIR)/rules.mk
++
++PKG_NAME:=ipwatchd
++PKG_VERSION:=1.2
++PKG_RELEASE:=1
++
++PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
++PKG_SOURCE_URL:=http://ipwatchd.sourceforge.net
++PKG_MD5SUM:=8485c98d7539b2f8b5bad370d523fdc3
++
++include $(INCLUDE_DIR)/package.mk
++
++define Package/$(PKG_NAME)
++  SECTION:=utils
++  CATEGORY:=Utilities
++  TITLE:=IP conflict detection tool for Linux
++  DEPENDS:=+libnet1
++  URL:=http://ipwatchd.sourceforge.net
++endef
++
++define Package/$(PKG_NAME)/description
++  IP conflict detection tool for Linux
++endef
++
++define Package/$(PKG_NAME)/conffiles
++/etc/$(PKG_NAME).conf
++endef
++
++define Build/Compile
++	CC="$(TARGET_CROSS)gcc" \
++	CFLAGS="$(TARGET_CPPFLAGS) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -I$(STAGING_DIR)/usr/lib/libnet-1.1.x/include -L$(STAGING_DIR)/usr/lib/libnet-1.1.x/lib" \
++	$(MAKE) -C $(PKG_BUILD_DIR)/src
++endef
++
++define Package/$(PKG_NAME)/install
++	$(INSTALL_DIR) $(1)/usr/sbin/ $(1)/etc/ $(1)/etc/init.d
++	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/$(PKG_NAME) $(1)/usr/sbin/
++	$(INSTALL_DATA) ./files/$(PKG_NAME).conf $(1)/etc/
++	$(INSTALL_BIN) ./files/$(PKG_NAME).init $(1)/etc/init.d/$(PKG_NAME)
++	$(INSTALL_DIR) $(1)/usr/share/$(PKG_NAME)
++	$(INSTALL_BIN) ./files/$(PKG_NAME).script $(1)/usr/share/$(PKG_NAME)/
++endef
++
++$(eval $(call BuildPackage,$(PKG_NAME)))
+diff --git a/package/network/services/ipwatchd/files/ipwatchd.conf b/package/network/services/ipwatchd/files/ipwatchd.conf
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/ipwatchd/files/ipwatchd.conf
+@@ -0,0 +1,110 @@
++################################################################
++#
++# IPwatchD configuration file
++#
++# Lines beginning with # sign and empty lines are ignored.
++#
++# For more information please visit project website:
++#
++#                               http://ipwatchd.sourceforge.net
++#
++
++
++#
++# Name:         iface_configuration
++#
++# Description:  Specifies configuration mode for network interfaces.
++#
++#               In automatic configuration mode IPwatchD detects all
++#               network interfaces automatically and sets passive
++#               protection mode for them.
++#
++#               In manual mode it is up to administrator to specify
++#               list of interfaces and protection modes.
++#
++# Required:     No. Default mode is automatic.
++#
++# Sane value:   automatic
++#
++# Restriction:  automatic, manual
++#
++
++iface_configuration automatic
++
++
++#
++# Name:         iface
++#
++# Description:  Specifies network interface and its protection mode.
++#
++#               Value is accepted only in manual configuration mode.
++#
++#               In active protection mode IPwatchD protects your host
++#               before IP takeover by answering Gratuitous ARP requests
++#               received from conflicting system.
++#
++#               In passive protection mode it just records information
++#               about IP conflict through standard syslog interface.
++#
++# Required:     No.
++#
++# Example:      iface eth0 active
++#
++# Restriction:  Interface must exist and protection mode must be
++#               passive or active.
++#
++
++#iface eth0 active
++#iface eth0:0 passive
++
++
++#
++# Name:         defend_interval
++#
++# Description:  Minimum interval between defensive ARPs in seconds.
++#
++# Required:     No. Default value is 0.
++#
++# Sane value:   10
++#
++# Restriction:  0 - 600
++#
++
++defend_interval 10
++
++
++#
++# Name:         user_script
++#
++# Description:  Absolute path to user-defined script called by
++#               IPwatchD when IP conflict occurs.
++#
++#               When there is no script specified IPwatchD just
++#               generates syslog event for every IP conflict.
++#
++# Required:     No. There is no default value.
++#
++# Sane value:   /usr/sbin/ipwatchd-script
++#
++# Restriction:  File must exist.
++#
++
++user_script /usr/share/ipwatchd/ipwatchd.script
++
++
++#
++# Name:         syslog_facility
++#
++# Description:  Specifies facility for logging.
++#
++# Required:     No. Default facility is daemon.
++#
++# Sane value:	daemon
++#
++# Restriction:  auth, authpriv, cron, daemon, kern, lpr, mail,
++#               news, syslog, user, uucp, local0, local, local2,
++#               local3, local4, local5, local6, local7
++#
++
++syslog_facility daemon
++
+diff --git a/package/network/services/ipwatchd/files/ipwatchd.init b/package/network/services/ipwatchd/files/ipwatchd.init
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/ipwatchd/files/ipwatchd.init
+@@ -0,0 +1,17 @@
++#!/bin/sh /etc/rc.common
++
++START=80
++
++start() {
++	conf="/etc/ipwatchd.conf"
++
++	if [ -f "$conf" ]; then
++		ipwatchd -c $conf
++	else
++		logger -t ipwatchd "Invalid configuration $conf"
++	fi
++}
++
++stop() {
++	killall ipwatchd
++}
+\ No newline at end of file
+diff --git a/package/network/services/ipwatchd/files/ipwatchd.script b/package/network/services/ipwatchd/files/ipwatchd.script
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/ipwatchd/files/ipwatchd.script
+@@ -0,0 +1,31 @@
++#!/bin/sh
++
++. /lib/functions.sh
++
++# This user-defined script is called by IPwatchD daemon when IP conflict occurs.
++
++# Name of network device in conflict ("." is not allowed for uci)
++dev=$(echo $1 | sed 's/\./_/g')
++# IP address in conflict
++ip=$2
++# MAC address of conflicting system
++mac=$3
++
++path=""
++ip_conflicts=
++
++config_load omci
++config_get path "default" "status_file"
++[ ! -f "$path" ] && exit 0
++
++config_load $path
++config_get ip_conflicts "ip_conflicts" "$dev"
++
++if [ "$ip_conflicts" = "" ]; then
++	uci set $path.ip_conflicts.$dev=1
++else
++	ip_conflicts=`expr $ip_conflicts + 1`
++	uci set $path.ip_conflicts.$dev=$ip_conflicts
++fi
++
++exit 0
+diff --git a/package/network/services/ipwatchd/patches/100-makefile.patch b/package/network/services/ipwatchd/patches/100-makefile.patch
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/ipwatchd/patches/100-makefile.patch
+@@ -0,0 +1,13 @@
++diff -Naur a/Makefile b/Makefile
++--- a/src/Makefile	2010-01-05 18:55:55.000000000 +0300
+++++ b/src/Makefile	2011-04-20 11:56:56.000000000 +0400
++@@ -1,8 +1,7 @@
++ # IPwatchD - IP conflict detection tool for Linux
++ # Copyright (C) 2007-2010 Jaroslav Imrich <jariq(at)jariq(dot)sk>
++ 
++-CC= gcc
++-CFLAGS= -Wall -O2
+++
++ LIBS= -lpcap -lnet
++ 
++ all: analyse.o config.o daemonize.o devinfo.o genarp.o ipwatchd.o message.o signal.o
+diff --git a/package/network/services/ipwatchd/patches/200-fix_unaligned_access.patch b/package/network/services/ipwatchd/patches/200-fix_unaligned_access.patch
+new file mode 100644
+--- /dev/null
++++ b/package/network/services/ipwatchd/patches/200-fix_unaligned_access.patch
+@@ -0,0 +1,56 @@
++--- a/src/analyse.c
+++++ b/src/analyse.c
++@@ -52,9 +52,11 @@ void ipwd_analyse (u_char * args, const 
++ 	char *p_rcv_sip = NULL;
++ 
++ 	/* Following variable was added because gcc 4.4.1 displayed warning: dereferencing type-punned pointer will break strict-aliasing rules */
++-	struct in_addr * p_arp_spa = (struct in_addr *) &arpaddr->arp_spa;
+++	struct in_addr arp_spa;
++ 
++-	if ((p_rcv_sip = inet_ntoa (*(p_arp_spa))) == NULL)
+++	memcpy(&arp_spa, &arpaddr->arp_spa, sizeof(arpaddr->arp_spa));
+++
+++	if ((p_rcv_sip = inet_ntoa (arp_spa)) == NULL)
++ 	{
++ 		ipwd_message (IPWD_MSG_ERROR, "Could not get source IP address from packet");
++ 		return;
++@@ -65,8 +67,11 @@ void ipwd_analyse (u_char * args, const 
++ 	/* Source MAC address */
++ 	char rcv_smac[18];
++ 	char *p_rcv_smac = NULL;
+++	struct ether_addr arp_sha;
+++
+++	memcpy(&arp_sha, &arpaddr->arp_sha, sizeof(arpaddr->arp_sha));
++ 
++-	if ((p_rcv_smac = ether_ntoa ((const struct ether_addr *) &arpaddr->arp_sha)) == NULL)
+++	if ((p_rcv_smac = ether_ntoa ((const struct ether_addr *) &arp_sha)) == NULL)
++ 	{
++ 		ipwd_message (IPWD_MSG_ERROR, "Could not get source MAC address from packet");
++ 		return;
++@@ -79,9 +84,11 @@ void ipwd_analyse (u_char * args, const 
++ 	char *p_rcv_dip = NULL;
++ 
++ 	/* Following variable was added because gcc 4.4.1 displayed warning: dereferencing type-punned pointer will break strict-aliasing rules */
++-	struct in_addr * p_arp_tpa = (struct in_addr *) &arpaddr->arp_tpa;
+++	struct in_addr arp_tpa;
+++
+++	memcpy(&arp_tpa, &arpaddr->arp_tpa, sizeof(arpaddr->arp_tpa));
++ 
++-	if ((p_rcv_dip = inet_ntoa (*(p_arp_tpa))) == NULL)
+++	if ((p_rcv_dip = inet_ntoa (arp_tpa)) == NULL)
++ 	{
++ 		ipwd_message (IPWD_MSG_ERROR, "Could not get destination IP address from packet");
++ 		return;
++@@ -92,8 +99,11 @@ void ipwd_analyse (u_char * args, const 
++ 	/* Destination MAC address */
++ 	char rcv_dmac[18];
++ 	char *p_rcv_dmac = NULL;
+++	struct ether_addr arp_tha;
+++
+++	memcpy(&arp_tha, &arpaddr->arp_tha, sizeof(arpaddr->arp_tha));
++ 
++-	if ((p_rcv_dmac = ether_ntoa ((const struct ether_addr *) &arpaddr->arp_tha)) == NULL)
+++	if ((p_rcv_dmac = ether_ntoa ((const struct ether_addr *) &arp_tha)) == NULL)
++ 	{
++ 		ipwd_message (IPWD_MSG_ERROR, "Could not get destination MAC address from packet");
++ 		return;

@@ -1,0 +1,104 @@
+Add optional commandline argument to override dtb max size. Used for platforms which uses large amount of device tree source codes.
+
+diff --git a/tools/patch-image/src/patch-cmdline.c b/tools/patch-image/src/patch-cmdline.c
+--- a/tools/patch-image/src/patch-cmdline.c
++++ b/tools/patch-image/src/patch-cmdline.c
+@@ -35,11 +35,18 @@ int main(int argc, char **argv)
+ {
+ 	int fd, found = 0, len, ret = -1;
+ 	char *ptr, *p;
++	unsigned int search_space;
+ 
+-	if (argc != 3) {
+-		fprintf(stderr, "Usage: %s <file> <cmdline>\n", argv[0]);
++	if (argc <= 2 || argc > 4) {
++		fprintf(stderr, "Usage: %s <file> <cmdline> [dtb max size]\n", argv[0]);
+ 		goto err1;
++	} else if (argc == 3) {
++		fprintf(stdout, "DTB max size set to defaults (16KB). You can also override it by passing a size (in bytes) as an additional argument.\n");
++		search_space =  SEARCH_SPACE;
++	} else {
++		search_space = atoi(argv[3]);
+ 	}
++
+ 	len = strlen(argv[2]);
+ 	if (len + 9 > CMDLINE_MAX) {
+ 		fprintf(stderr, "Command line string too long\n");
+@@ -47,12 +54,12 @@ int main(int argc, char **argv)
+ 	}
+ 	
+ 	if (((fd = open(argv[1], O_RDWR)) < 0) ||
+-		(ptr = (char *) mmap(0, SEARCH_SPACE + CMDLINE_MAX, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)) == (void *) (-1)) {
++		(ptr = (char *) mmap(0, search_space + CMDLINE_MAX, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)) == (void *) (-1)) {
+ 		fprintf(stderr, "Could not open kernel image");
+ 		goto err2;
+ 	}
+ 	
+-	for (p = ptr; p < (ptr + SEARCH_SPACE); p += 4) {
++	for (p = ptr; p < (ptr + search_space); p += 4) {
+ 		if (memcmp(p, "CMDLINE:", 8) == 0) {
+ 			found = 1;
+ 			p += 8;
+diff --git a/tools/patch-image/src/patch-dtb.c b/tools/patch-image/src/patch-dtb.c
+--- a/tools/patch-image/src/patch-dtb.c
++++ b/tools/patch-image/src/patch-dtb.c
+@@ -38,11 +38,19 @@ int main(int argc, char **argv)
+ 	int fd, fddtb, found = 0, len, ret = -1;
+ 	char *ptr, *ptrdtb, *p;
+ 	struct stat s;
++	unsigned int search_space, dtb_max_size;
+ 
+-	if (argc != 3) {
+-		fprintf(stderr, "Usage: %s <file> <dtb>\n", argv[0]);
++	if (argc <= 2 || argc > 4) {
++		fprintf(stderr, "Usage: %s <file> <dtb> [dtb max size]\n", argv[0]);
+ 		goto err1;
++	} else if (argc == 3) {
++		fprintf(stdout, "DTB max size set to defaults (16KB). You can also override it by passing a size (in bytes) as an additional argument.\n");
++		search_space = SEARCH_SPACE;
++		dtb_max_size = DTB_MAX;
++	} else {
++		search_space = dtb_max_size = atoi(argv[3]);
+ 	}
++
+ 	fddtb = open(argv[1], O_RDONLY);
+ 	if (!fddtb)
+ 		goto err1;
+@@ -53,24 +61,24 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	len = s.st_size;
+-	if (len + 8 > DTB_MAX) {
++	if (len + 8 > dtb_max_size) {
+ 		fprintf(stderr, "DTB too big\n");
+ 		goto err1;
+ 	}
+ 
+         if (((fddtb = open(argv[2], O_RDONLY)) < 0) ||
+-		(ptrdtb = (char *) mmap(0, DTB_MAX, PROT_READ, MAP_SHARED, fddtb, 0)) == (void *) (-1)) {
++		(ptrdtb = (char *) mmap(0, dtb_max_size, PROT_READ, MAP_SHARED, fddtb, 0)) == (void *) (-1)) {
+ 		fprintf(stderr, "Could not open DTB");
+ 		goto err2;
+ 	}
+ 
+ 	if (((fd = open(argv[1], O_RDWR)) < 0) ||
+-		(ptr = (char *) mmap(0, SEARCH_SPACE + DTB_MAX, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)) == (void *) (-1)) {
++		(ptr = (char *) mmap(0, search_space + dtb_max_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)) == (void *) (-1)) {
+ 		fprintf(stderr, "Could not open kernel image");
+ 		goto err3;
+ 	}
+ 
+-	for (p = ptr; p < (ptr + SEARCH_SPACE); p += 4) {
++	for (p = ptr; p < (ptr + search_space); p += 4) {
+ 		if (memcmp(p, "OWRTDTB:", 8) == 0) {
+ 			found = 1;
+ 			p += 8;
+@@ -82,7 +90,7 @@ int main(int argc, char **argv)
+ 		goto err4;
+ 	}
+ 
+-	memset(p, 0, DTB_MAX - 8);
++	memset(p, 0, dtb_max_size - 8);
+ 	memcpy(p, ptrdtb, len);
+ 	msync(p, len, MS_SYNC|MS_INVALIDATE);
+ 	ret = 0;

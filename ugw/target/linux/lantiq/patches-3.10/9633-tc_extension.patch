@@ -1,0 +1,101 @@
+# HG changeset patch
+# Parent 0713f3dd275e9c3705f21064759ab61d5c9466d0
+tc extension
+
+diff --git a/include/uapi/linux/pkt_cls.h b/include/uapi/linux/pkt_cls.h
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -188,6 +188,9 @@ enum {
+ 	TCA_U32_INDEV,
+ 	TCA_U32_PCNT,
+ 	TCA_U32_MARK,
++#ifdef CONFIG_CLS_U32_EXTMARK
++	TCA_U32_EXTMARK,
++#endif
+ 	__TCA_U32_MAX
+ };
+ 
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -410,6 +410,12 @@ config CLS_U32_MARK
+ 	---help---
+ 	  Say Y here to be able to use netfilter marks as u32 key.
+ 
++config CLS_U32_EXTMARK
++	bool "Netfilter extended marks support"
++	depends on NET_CLS_U32
++	---help---
++	  Say Y here to be able to use netfilter marks as u32 key.
++
+ config NET_CLS_RSVP
+ 	tristate "IPv4 Resource Reservation Protocol (RSVP)"
+ 	select NET_CLS
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -59,6 +59,10 @@ struct tc_u_knode {
+ #ifdef CONFIG_CLS_U32_MARK
+ 	struct tc_u32_mark	mark;
+ #endif
++#ifdef CONFIG_CLS_U32_EXTMARK
++	struct tc_u32_mark	extmark;
++#endif
++
+ 	struct tc_u32_sel	sel;
+ };
+ 
+@@ -132,6 +136,14 @@ next_knode:
+ 		}
+ #endif
+ 
++#ifdef CONFIG_CLS_U32_EXTMARK
++		if ((skb->extmark & n->extmark.mask) != n->extmark.val) {
++			n = n->next;
++			goto next_knode;
++		} else {
++			n->extmark.success++;
++		}
++#endif
+ 		for (i = n->sel.nkeys; i > 0; i--, key++) {
+ 			int toff = off + key->off + (off2 & key->offmask);
+ 			__be32 *data, hdata;
+@@ -486,6 +498,9 @@ static const struct nla_policy u32_polic
+ 	[TCA_U32_SEL]		= { .len = sizeof(struct tc_u32_sel) },
+ 	[TCA_U32_INDEV]		= { .type = NLA_STRING, .len = IFNAMSIZ },
+ 	[TCA_U32_MARK]		= { .len = sizeof(struct tc_u32_mark) },
++#ifdef CONFIG_CLS_U32_EXTMARK
++	[TCA_U32_EXTMARK]		= { .len = sizeof(struct tc_u32_mark) },
++#endif
+ };
+ 
+ static int u32_set_parms(struct net *net, struct tcf_proto *tp,
+@@ -657,6 +672,16 @@ static int u32_change(struct net *net, s
+ 	}
+ #endif
+ 
++#ifdef CONFIG_CLS_U32_EXTMARK
++	if (tb[TCA_U32_EXTMARK]) {
++		struct tc_u32_mark *extmark;
++
++		extmark = nla_data(tb[TCA_U32_EXTMARK]);
++		memcpy(&n->extmark, extmark, sizeof(struct tc_u32_mark));
++		n->extmark.success = 0;
++	}
++#endif
++
+ 	err = u32_set_parms(net, tp, base, ht, n, tb, tca[TCA_RATE]);
+ 	if (err == 0) {
+ 		struct tc_u_knode **ins;
+@@ -758,6 +783,11 @@ static int u32_dump(struct tcf_proto *tp
+ 		    nla_put(skb, TCA_U32_MARK, sizeof(n->mark), &n->mark))
+ 			goto nla_put_failure;
+ #endif
++#ifdef CONFIG_CLS_U32_EXTMARK
++		if ((n->extmark.val || n->extmark.mask) &&
++		    nla_put(skb, TCA_U32_EXTMARK, sizeof(n->extmark), &n->extmark))
++			goto nla_put_failure;
++#endif
+ 
+ 		if (tcf_exts_dump(skb, &n->exts, &u32_ext_map) < 0)
+ 			goto nla_put_failure;

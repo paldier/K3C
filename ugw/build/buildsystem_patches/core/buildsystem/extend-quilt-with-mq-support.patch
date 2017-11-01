@@ -1,0 +1,191 @@
+add support for "make package/<name>/prepare MQ=1", similar to "QUILT=1"
+this allows to work on patches with help of mercurial queues instead of quilt
+
+- only for target package builds, no support for host packages or kernel
+
+diff --git a/include/package.mk b/include/package.mk
+--- a/include/package.mk
++++ b/include/package.mk
+@@ -100,7 +100,7 @@ ifneq ($(PREV_STAMP_PREPARED),)
+   STAMP_PREPARED:=$(PREV_STAMP_PREPARED)
+   CONFIG_AUTOREBUILD:=
+ else
+-  STAMP_PREPARED=$(PKG_BUILD_DIR)/.prepared$(if $(QUILT)$(DUMP),,_$(shell $(call find_md5,${CURDIR} $(PKG_FILE_DEPENDS),))$(call confvar,$(PKG_PREPARED_DEPENDS)))
++  STAMP_PREPARED=$(PKG_BUILD_DIR)/.prepared$(if $(QUILT)$(MQ)$(DUMP),,_$(shell $(call find_md5,${CURDIR} $(PKG_FILE_DEPENDS),))$(call confvar,$(PKG_PREPARED_DEPENDS)))
+ endif
+ STAMP_CONFIGURED=$(PKG_BUILD_DIR)/.configured$(if $(DUMP),,_$(call confvar,$(PKG_CONFIG_DEPENDS)))
+ STAMP_CONFIGURED_WILDCARD=$(patsubst %_$(call confvar,$(PKG_CONFIG_DEPENDS)),%_*,$(STAMP_CONFIGURED))
+@@ -138,7 +138,7 @@ PKG_CONFIG_PATH=$(STAGING_DIR)/usr/lib/p
+ unexport QUIET CONFIG_SITE
+ 
+ ifeq ($(DUMP)$(filter prereq clean refresh update,$(MAKECMDGOALS)),)
+-  ifneq ($(if $(QUILT),,$(CONFIG_AUTOREBUILD)),)
++  ifneq ($(if $(QUILT)$(MQ),,$(CONFIG_AUTOREBUILD)),)
+     define Build/Autoclean
+       $(PKG_BUILD_DIR)/.dep_files: $(STAMP_PREPARED)
+       $(call rdep,${CURDIR} $(PKG_FILE_DEPENDS),$(STAMP_PREPARED),$(PKG_BUILD_DIR)/.dep_files,-x "*/.dep_*")
+@@ -200,7 +200,7 @@ endef
+ Build/Exports=$(Build/Exports/Default)
+ 
+ define Build/DefaultTargets
+-  $(if $(QUILT),$(Build/Quilt))
++  $(if $(QUILT),$(Build/Quilt),$(if $(MQ),$(Build/HgMq)))
+   $(if $(USE_SOURCE_DIR)$(USE_GIT_TREE),,$(if $(strip $(PKG_SOURCE_URL)),$(call Download,default)))
+   $(call Build/Autoclean)
+ 
+diff --git a/include/quilt.mk b/include/quilt.mk
+--- a/include/quilt.mk
++++ b/include/quilt.mk
+@@ -20,6 +20,7 @@ ifeq ($(MAKECMDGOALS),refresh)
+ endif
+ 
+ QUILT_CMD:=quilt --quiltrc=-
++HG_CMD:=hg #-v
+ 
+ define filter_series
+ sed -e s,\\\#.*,, $(1) | grep -E \[a-zA-Z0-9\]
+@@ -38,6 +39,26 @@ define PatchDir/Quilt
+ 	$(if $(3),@echo $(3) >> "$(1)/patches/.subdirs")
+ endef
+ 
++HG_IGNORE_FILES:=.hgignore *.o *.d *.a *.s *.mo *.gz \
++	.quilt* .mq* .config* .prepared* .built ipkg*
++
++define PatchDir/HgMq
++	@$(HG_CMD) --cwd $(1) init
++	@echo "syntax:glob" > $(1)/.hgignore;
++	@$(foreach igfls,$(HG_IGNORE_FILES),echo "$(igfls)" >> $(1)/.hgignore;)
++	@$(HG_CMD) -q --cwd $(1) addremove
++	@$(HG_CMD) --cwd $(1) ci -m "initial"
++	@mkdir -p "$(1)/.hg/patches$(if $(3),/$(patsubst %/,%,$(3)))"
++	@if [ -s "$(2)/series" ]; then \
++		mkdir -p "$(1)/.hg/patches/$(3)"; \
++	fi
++	@for patch in $$$$( (cd "$(2)" && if [ -f series ]; then $(call filter_series,series); else ls | sort; fi; ) 2>/dev/null ); do ( \
++		cp "$(2)/$$$$patch" "$(1)/.hg/patches/$(3)"; \
++		echo "$(3)$$$$patch" >> "$(1)/.hg/patches/series"; \
++	); done
++	@$(HG_CMD) --cwd $(1) qpush -a
++endef
++
+ define PatchDir/Default
+ 	@if [ -d "$(2)" ] && [ "$$$$(ls $(2) | wc -l)" -gt 0 ]; then \
+ 		export PATCH="$(PATCH)"; \
+@@ -51,7 +72,7 @@ define PatchDir/Default
+ endef
+ 
+ define PatchDir
+-$(call PatchDir/$(if $(strip $(QUILT)),Quilt,Default),$(strip $(1)),$(strip $(2)),$(strip $(3)))
++$(call PatchDir/$(if $(strip $(QUILT)),Quilt,$(if $(strip $(MQ)),HgMq,Default)),$(strip $(1)),$(strip $(2)),$(strip $(3)))
+ endef
+ 
+ define HostPatchDir
+@@ -60,11 +81,17 @@ endef
+ 
+ ifneq ($(PKG_BUILD_DIR),)
+   QUILT?=$(if $(wildcard $(PKG_BUILD_DIR)/.quilt_used),y)
++  MQ?=$(if $(wildcard $(PKG_BUILD_DIR)/.mq_used),y)
+   ifneq ($(QUILT),)
+     STAMP_CHECKED:=$(PKG_BUILD_DIR)/.quilt_checked
+     override CONFIG_AUTOREBUILD=
+     quilt-check: $(STAMP_CHECKED)
+   endif
++  ifneq ($(MQ),)
++    STAMP_CHECKED:=$(PKG_BUILD_DIR)/.mq_checked
++    override CONFIG_AUTOREBUILD=
++    hgmq-check: $(STAMP_CHECKED)
++  endif
+ endif
+ 
+ ifneq ($(HOST_BUILD_DIR),)
+@@ -86,6 +113,7 @@ define Build/Patch/Default
+ 	$(if $(QUILT),rm -rf $(PKG_BUILD_DIR)/patches; mkdir -p $(PKG_BUILD_DIR)/patches)
+ 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR),)
+ 	$(if $(QUILT),touch $(PKG_BUILD_DIR)/.quilt_used)
++	$(if $(MQ),touch $(PKG_BUILD_DIR)/.mq_used)
+ endef
+ 
+ kernel_files=$(foreach fdir,$(GENERIC_FILES_DIR) $(FILES_DIR),$(fdir)/.)
+@@ -171,7 +199,65 @@ define Quilt/Template
+ 	$(Quilt/Refresh/$(4))
+ endef
+ 
++define HgMq/RefreshDir
++	@mkdir -p $(2)
++	@[ -e $(2)/series ] && S='$(CP) $(1)/.hg/patches/series $(2)/'; rm -f $(2)/* 2>/dev/null >/dev/null; $$$$S
++	@( \
++		for patch in $$$$($(if $(3),grep "^$(3)",cat) $(1)/.hg/patches/series | awk '{print $$$$1}'); do \
++			$(CP) -v "$(1)/.hg/patches/$$$$patch" $(2); \
++		done; \
++	)
++endef
++
++define HgMq/Refresh/Package
++	$(call HgMq/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR))
++endef
++
++define HgMq/Template
++  $($(2)STAMP_CONFIGURED): $($(2)STAMP_CHECKED)
++  $(if $(NO_RECONFIGURE),$($(2)STAMP_BUILT),$($(2)STAMP_CONFIGURED)): FORCE
++  $($(2)STAMP_CHECKED): $($(2)STAMP_PREPARED)
++	@if [ -s "$(1)/.hg/patches/series" ]; then \
++		(cd "$(1)"; \
++			if $(HG_CMD) qnext >/dev/null 2>&1; then \
++				$(HG_CMD) qpush -a; \
++			else \
++				$(HG_CMD) qtop >/dev/null 2>&1; \
++			fi \
++		); \
++		if [ "$(BUILD_LOG)" = "1" ]; then \
++			log_dir=$(BUILD_LOG_DIR)/patches; \
++			package=$$$$(basename $(1)); \
++			mkdir -p $$$$log_dir; \
++			log=$$$$log_dir/$$$$package.txt; \
++			cat $(1)/.hg/patches/series > $$$$log; \
++		fi \
++	fi
++	touch "$$@"
++
++  $(3)hgmq-check: $($(2)STAMP_PREPARED) FORCE
++	@[ -e "$(1)/.mq_used" ] || { \
++		echo "The source directory was not unpacked using mercurial queues. Please rebuild with MQ=1"; \
++		false; \
++	}
++	@[ -f "$(1)/.hg/patches/series" ] || { \
++		echo "The source directory contains no mercurial queue patches."; \
++		false; \
++	}
++	@[ -n "$$$$(ls $(1)/.hg/patches/series)" -a "$$$$(cat $(1)/.hg/patches/series | md5sum)" = "$$$$(sort $(1)/.hg/patches/series | md5sum)" ] || { \
++		echo "The patches are not sorted in the right order. Please fix."; \
++		false; \
++	}
++
++  $(3)update: $(3)hgmq-check
++	$(HgMq/Refresh/$(4))
++
++endef
++
+ Build/Quilt=$(call Quilt/Template,$(PKG_BUILD_DIR),,,$(if $(TARGET_BUILD),Kernel,Package))
+ Host/Quilt=$(call Quilt/Template,$(HOST_BUILD_DIR),HOST_,host-,Host)
+ 
++Build/HgMq=$(call HgMq/Template,$(PKG_BUILD_DIR),,,$(if $(TARGET_BUILD),Kernel,Package))
++##Host/HgMq=$(call HgMq/Template,$(HOST_BUILD_DIR),HOST_,host-,Host)
++
+ endif
+diff --git a/include/subdir.mk b/include/subdir.mk
+--- a/include/subdir.mk
++++ b/include/subdir.mk
+@@ -36,11 +36,11 @@ define subdir
+     $(call warn,$(1),d,BD $(1)/$(bd))
+     $(foreach target,$(SUBTARGETS),
+       $(foreach btype,$(buildtypes-$(bd)),
+-        $(call warn_eval,$(1)/$(bd),t,T,$(1)/$(bd)/$(btype)/$(target): $(if $(QUILT),,$($(1)/$(bd)/$(btype)/$(target)) $(call $(1)//$(btype)/$(target),$(1)/$(bd)/$(btype))))
++        $(call warn_eval,$(1)/$(bd),t,T,$(1)/$(bd)/$(btype)/$(target): $(if $(QUILT)$(MQ),,$($(1)/$(bd)/$(btype)/$(target)) $(call $(1)//$(btype)/$(target),$(1)/$(bd)/$(btype))))
+ 		  $(if $(call debug,$(1)/$(bd),v),,@)+$$(SUBMAKE) -r -C $(1)/$(bd) $(btype)-$(target) $(if $(findstring $(bd),$($(1)/builddirs-ignore-$(btype)-$(target))), || $(call ERROR,$(1),   ERROR: $(1)/$(bd) [$(btype)] failed to build.))
+         $(if $(call diralias,$(bd)),$(call warn_eval,$(1)/$(bd),l,T,$(1)/$(call diralias,$(bd))/$(btype)/$(target): $(1)/$(bd)/$(btype)/$(target)))
+       )
+-      $(call warn_eval,$(1)/$(bd),t,T,$(1)/$(bd)/$(target): $(if $(QUILT),,$($(1)/$(bd)/$(target)) $(call $(1)//$(target),$(1)/$(bd))))
++      $(call warn_eval,$(1)/$(bd),t,T,$(1)/$(bd)/$(target): $(if $(QUILT)$(MQ),,$($(1)/$(bd)/$(target)) $(call $(1)//$(target),$(1)/$(bd))))
+ 	  	$(if $(BUILD_LOG),@mkdir -p $(BUILD_LOG_DIR)/$(1)/$(bd))
+         $(foreach variant,$(if $(BUILD_VARIANT),$(BUILD_VARIANT),$(if $(strip $($(1)/$(bd)/variants)),$($(1)/$(bd)/variants),$(if $($(1)/$(bd)/default-variant),$($(1)/$(bd)/default-variant),__default))),
+ 			$(if $(call debug,$(1)/$(bd),v),,@)+$(if $(BUILD_LOG),set -o pipefail;) $$(SUBMAKE) -r -C $(1)/$(bd) $(target) BUILD_VARIANT="$(filter-out __default,$(variant))" $(if $(BUILD_LOG),SILENT= 2>&1 | tee $(BUILD_LOG_DIR)/$(1)/$(bd)/$(if $(filter-out __default,$(variant)),$(variant)-)$(target).txt) $(if $(findstring $(bd),$($(1)/builddirs-ignore-$(target))), || $(call ERROR,$(1),   ERROR: $(1)/$(bd) failed to build$(if $(filter-out __default,$(variant)), (build variant: $(variant))).))

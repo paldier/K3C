@@ -1,0 +1,688 @@
+# HG changeset patch
+# Parent bc077854b73518c9e17c9b556dee57ddd1d6f86d
+
+diff --git a/arch/mips/include/asm/addrspace.h b/arch/mips/include/asm/addrspace.h
+--- a/arch/mips/include/asm/addrspace.h
++++ b/arch/mips/include/asm/addrspace.h
+@@ -45,12 +45,16 @@
+ /*
+  * Returns the kernel segment base of a given address
+  */
++#ifndef KSEGX
+ #define KSEGX(a)		((_ACAST32_ (a)) & 0xe0000000)
++#endif
+ 
+ /*
+  * Returns the physical address of a CKSEGx / XKPHYS address
+  */
++#ifndef CPHYSADDR
+ #define CPHYSADDR(a)		((_ACAST32_(a)) & 0x1fffffff)
++#endif
+ #define XPHYSADDR(a)		((_ACAST64_(a)) &			\
+ 				 _CONST64_(0x000000ffffffffff))
+ 
+@@ -77,18 +81,34 @@
+ 
+ #else
+ 
++#ifndef CKSEG0ADDR
+ #define CKSEG0ADDR(a)		(CPHYSADDR(a) | KSEG0)
++#endif
++#ifndef CKSEG1ADDR
+ #define CKSEG1ADDR(a)		(CPHYSADDR(a) | KSEG1)
++#endif
++#ifndef CKSEG2ADDR
+ #define CKSEG2ADDR(a)		(CPHYSADDR(a) | KSEG2)
++#endif
++#ifndef CKSEG3ADDR
+ #define CKSEG3ADDR(a)		(CPHYSADDR(a) | KSEG3)
++#endif
+ 
+ /*
+  * Map an address to a certain kernel segment
+  */
++#ifndef KSEG0ADDR
+ #define KSEG0ADDR(a)		(CPHYSADDR(a) | KSEG0)
++#endif
++#ifndef KSEG1ADDR
+ #define KSEG1ADDR(a)		(CPHYSADDR(a) | KSEG1)
++#endif
++#ifndef KSEG2ADDR
+ #define KSEG2ADDR(a)		(CPHYSADDR(a) | KSEG2)
++#endif
++#ifndef KSEG3ADDR
+ #define KSEG3ADDR(a)		(CPHYSADDR(a) | KSEG3)
++#endif
+ 
+ /*
+  * Memory segments (32bit kernel mode addresses)
+diff --git a/arch/mips/include/asm/mach-lantiq/kernel-entry-init.h b/arch/mips/include/asm/mach-lantiq/kernel-entry-init.h
+--- a/arch/mips/include/asm/mach-lantiq/kernel-entry-init.h
++++ b/arch/mips/include/asm/mach-lantiq/kernel-entry-init.h
+@@ -10,104 +10,200 @@
+ #ifndef __ASM_MACH_LANTIQ_KERNEL_ENTRY_INIT_H
+ #define __ASM_MACH_LANTIQ_KERNEL_ENTRY_INIT_H
+ 
+-	.macro  eva_entry   t1  t2  t0
+-	andi    \t1, 0x7    /* Config.K0 == CCA */
+-	move    \t2, \t1
+-	ins     \t2, \t1, 16, 3
+-	li      \t0, ((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |            \
+-		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+-		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+-		(((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |                \
+-		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
++	/*
++	 * Prepare segments for EVA boot:
++	 *
++	 * This is in case the processor boots in legacy configuration
++	 * (SI_EVAReset is de-asserted and CONFIG5.K == 0)
++	 *
++	 * On entry, t1 is loaded with CP0_CONFIG
++	 *
++	 * ========================= Mappings =============================
++	 * Virtual memory           Physical memory           Mapping
++	 * 0x20000000 - 0x9fffffff  0x20000000 - 0x9ffffffff   MUSUK (kuseg)
++	 *                          Flat 2GB physical memory
++	 *
++	 * 0x80000000 - 0x9fffffff  0x80000000 - 0x9ffffffff   MUSUK (kseg0)
++	 * 0xa0000000 - 0xbf000000  0x00000000 - 0x1ffffffff   MUSUK (kseg1)
++	 * 0xc0000000 - 0xdfffffff             -                 MK  (kseg2)
++	 * 0xe0000000 - 0xffffffff  0xa0000000 - 0xbfffffff    UK    (kseg3)
++	 *
++	 *
++	 * Lowmem is expanded to 2GB
++	 * The last 64KB of physical memory are reserved for correct HIGHMEM
++	 * macros arithmetics.
++	 */
++#ifdef CONFIG_EVA
++#ifdef CONFIG_EVA_2GB
++	.macro  eva_entry
++
++	.set    push
++	.set    reorder
++	/*
++	 * Get Config.K0 value and use it to program
++	 * the segmentation registers
++	 */
++	mfc0    t1, CP0_CONFIG
++	andi    t1, 0x7 /* CCA */
++	move    t2, t1
++	ins     t2, t1, 16, 3
++	/* SegCtl0 */
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(5 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |   \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                               \
++		(((MIPS_SEGCFG_MSK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                                \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+-	or      \t0, \t2
+-	mtc0    \t0, $5, 2
+-	li      \t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |            \
+-		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
+-		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+-		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                \
+-		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 2
++
++	/* SegCtl1 */
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |            \
++		(1 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) | \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                             \
++		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |               \
++		(4 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+-	ins     \t0, \t1, 16, 3
+-	mtc0    \t0, $5, 3
+-	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 3
++
++	/* SegCtl2 */
++	li      t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |          \
+ 		(2 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+ 		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+-	or      \t0, \t2
+-	mtc0    \t0, $5, 4
++	or      t0, t2
++	mtc0    t0, $5, 4
++
++	jal     mips_ihb
++	mfc0    t0, $16, 5
++	li      t2, 0x40000000      /* K bit */
++	or      t0, t0, t2
++	mtc0    t0, $16, 5
++	sync
++	jal     mips_ihb
++	.set    pop
++	.endm
++
++#elif defined(CONFIG_EVA_1GB)
++
++	.macro  eva_entry
++
++	.set    push
++	.set    reorder
++	/*
++	 * Get Config.K0 value and use it to program
++	 * the segmentation registers
++	 */
++	mfc0    t1, CP0_CONFIG
++	andi    t1, 0x7 /* CCA */
++	move    t2, t1
++	ins     t2, t1, 16, 3
++	/* SegCtl0 */
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |              \
++		(5 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |   \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                               \
++		(((MIPS_SEGCFG_MSK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                                 \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 2
++
++	/* SegCtl1 */
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |              \
++		(1 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |   \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                               \
++		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                 \
++		(2 << MIPS_SEGCFG_PA_SHIFT) |                                \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 3
++
++	/* SegCtl2 */
++	li      t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |              \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                                \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                               \
++		(((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |               \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                                \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     t0, t1, 0, 3
++	mtc0    t0, $5, 4
++
++	jal     mips_ihb
++	mfc0    t0, $16, 5
++	li      t2, 0x40000000      /* K bit */
++	or      t0, t0, t2
++	mtc0    t0, $16, 5
++	sync
+ 	jal     mips_ihb
+ 
+-	mfc0    \t0, $16, 5
+-	li      \t2, 0x40000000      /* K bit */
+-	or      \t0, \t0, \t2
+-	mtc0    \t0, $16, 5
++	.set    pop
++	.endm
++#else
++	.macro  eva_entry
++	.set    push
++	.set    reorder
++	/*
++	 * Get Config.K0 value and use it to program
++	 * the segmentation registers
++	 */
++	mfc0    t1, CP0_CONFIG
++	andi    t1, 0x7 /* CCA */
++	move    t2, t1
++	ins     t2, t1, 16, 3
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |         \
++		(5 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MSK << MIPS_SEGCFG_AM_SHIFT) |              \
++		(0 << MIPS_SEGCFG_PA_SHIFT)/* | (5 << MIPS_SEGCFG_C_SHIFT)*/|\
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 2
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |         \
++		(1 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(1 << MIPS_SEGCFG_PA_SHIFT)/* | (5 << MIPS_SEGCFG_C_SHIFT) */|\
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 3
++	li      t0, ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |          \
++		(0 << MIPS_SEGCFG_PA_SHIFT)/* | (5 << MIPS_SEGCFG_C_SHIFT) */|\
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |              \
++		(0 << MIPS_SEGCFG_PA_SHIFT)/* | (5 << MIPS_SEGCFG_C_SHIFT) */|\
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	or      t0, t2
++	mtc0    t0, $5, 4
++	jal     mips_ihb
++
++	mfc0    t0, $16, 5
++	li      t2, 0x40000000      /* K bit */
++	or      t0, t0, t2
++	mtc0    t0, $16, 5
+ 	sync
+ 	jal	mips_ihb
++	.set    pop
+ 	.endm
+-
+-
++#endif
++#endif /* CONFIG_EVA */
+ 	.macro	kernel_entry_setup
+ #ifdef CONFIG_EVA
+ 	sync
+ 	ehb
+-
+-	mfc0    t1, CP0_CONFIG
+-	bgez    t1, 9f
+-	mfc0	t0, CP0_CONFIG, 1
+-	bgez	t0, 9f
+-	mfc0	t0, CP0_CONFIG, 2
+-	bgez	t0, 9f
+-	mfc0	t0, CP0_CONFIG, 3
+-	sll     t0, t0, 6   /* SC bit */
+-	bgez    t0, 9f
+-
+-	eva_entry t1 t2 t0
+-	PTR_LA  t0, mips_cca
+-	sw      t1, 0(t0)
+-	b       0f
+-
+-9:
+-#if 0
+-	/* Assume we came from YAMON... */
+-	PTR_LA	v0, 0x9fc00534	/* YAMON print */
+-	lw	v0, (v0)
+-	move	a0, zero
+-	PTR_LA  a1, nonsc_processor
+-	jal	v0
+-
+-	PTR_LA	v0, 0x9fc00520	/* YAMON exit */
+-	lw	v0, (v0)
+-	li	a0, 1
+-	jal	v0
+-#else
+-/*Actual configuration of EVA for each processor has to go here...kept above code for reference*/
+-#endif
+-1:	b	1b
+-	nop
+-
+-	__INITDATA
+-nonsc_processor:
+-	.asciz  "Kernel requires the Segment/EVA to run\n"
+-	__FINIT
++	eva_entry
+ #endif /* CONFIG_EVA */
+-
+-0:
+ 	.endm
+-
+ /*
+  * Do SMP slave processor setup necessary before we can safely execute C code.
+  */
+ 	.macro	smp_slave_setup
+-
+ #ifdef CONFIG_EVA
+-
+ 	sync
+ 	ehb
+-	mfc0    t1, CP0_CONFIG
+-	eva_entry   t1 t2 t0
++	eva_entry
+ #endif /* CONFIG_EVA */
+ 
+ 	.endm
+diff --git a/arch/mips/include/asm/mach-lantiq/spaces.h b/arch/mips/include/asm/mach-lantiq/spaces.h
+--- a/arch/mips/include/asm/mach-lantiq/spaces.h
++++ b/arch/mips/include/asm/mach-lantiq/spaces.h
+@@ -5,6 +5,7 @@
+  *
+  * Author: Leonid Yegoshin (yegoshin@mips.com)
+  * Copyright (C) 2012 MIPS Technologies, Inc.
++ * Copyright (C) 2014 Lei Chuanhua <Chuanhua.lei@lantiq.com>
+  */
+ 
+ #ifndef _ASM_LANTIQ_SPACES_H
+@@ -12,42 +13,181 @@
+ 
+ #ifdef CONFIG_EVA
+ 
+-#define PAGE_OFFSET             _AC(0x0, UL)
++#ifdef CONFIG_EVA_2GB
++
++#define PAGE_OFFSET		_AC(0x20000000, UL)
+ /* skip first 512MB */
+-#define PHYS_OFFSET             _AC(0x20000000, UL)
+-#define HIGHMEM_START           _AC(0xffff0000, UL)
++#define PHYS_OFFSET		_AC(0x20000000, UL)
++/* No Highmem Support */
++#define HIGHMEM_START		_AC(0xffff0000, UL)
+ 
+-/*  I put INDEX_BASE here to underline the fact that in EVA mode kernel
+-    may be located somethere and not in CKSEG0, so CKSEG0 may have
+-    a "surprise" location and index-based CACHE may give unexpected result */
+-#define INDEX_BASE      CKSEG0
+ 
+-#define UNCAC_BASE              _AC(0xa0000000, UL)
+-#define CAC_BASE	             _AC(0x0, UL)
+-#define IO_BASE                 UNCAC_BASE
++#define UNCAC_BASE		_AC(0xa0000000, UL)
++#define CAC_BASE		_AC(0x20000000, UL)
++#define IO_BASE			UNCAC_BASE
+ 
+ #define KSEG
+-#define KUSEG                   0x00000000
+-#define KSEG0                   0x80000000
+-#define KSEG3                   0xa0000000
+-#define KSEG2                   0xc0000000
+-#define KSEG1                   0xe0000000
++#define KUSEG			0x00000000
++#define KSEG0			0x20000000
++#define KSEG1			0xa0000000
++#define KSEG2			0xc0000000
++#define KSEG3			0xe0000000
+ 
+-#define CKUSEG                  0x00000000
+-#define CKSEG0                  0x80000000
+-#define CKSEG3                  0xa0000000
+-#define CKSEG2                  _AC(0xc0000000, UL)
+-#define CKSEG1                  0xe0000000
++#define CKUSEG			0x00000000
++#define CKSEG0			0x20000000
++#define CKSEG1			0xa0000000
++#define CKSEG2			_AC(0xc0000000, UL)
++#define CKSEG3			0xe0000000
+ 
+-#define MAP_BASE                CKSEG2
+-#define VMALLOC_START 					MAP_BASE
+-#define VMALLOC_END             (MAP_BASE + _AC(0x20000000, UL) - 2*PAGE_SIZE)
++/* Range from 0x2000.0000 ~ 0x9FFF.FFFF for KSEG0 */
++#define KSEGX(a)		(((_ACAST32_(a)) < 0xA0000000) ?	\
++					KSEG0 : ((_ACAST32_(a)) & 0xE0000000))
+ 
++#define INDEX_BASE		CKSEG0
++#define MAP_BASE		CKSEG2
++#define VMALLOC_START		MAP_BASE
++#define VMALLOC_END		(MAP_BASE + _AC(0x20000000, UL) - 2 * PAGE_SIZE)
+ 
+-#define IO_SIZE                 _AC(0x10000000, UL)
+-#define IO_SHIFT                _AC(0x10000000, UL)
++#define IO_SIZE			_AC(0x10000000, UL)
++#define IO_SHIFT		_AC(0x10000000, UL)
+ 
+-#endif  /* CONFIG_EVA */
++#define CPHYSADDR(a)		((_ACAST32_(a)) - PAGE_OFFSET + PHYS_OFFSET)
++#define RPHYSADDR(a)		((_ACAST32_(a)) & 0x1fffffff)
++
++#define LEGACY_KSEC0(a)		(RPHYSADDR(a) | 0x80000000)
++
++/* DRAM one */
++#define CKSEG0ADDR(a)		((_ACAST32_(a)))
++
++/* IO space one */
++#define CKSEG1ADDR(a)		(RPHYSADDR(a) | KSEG1)
++
++/*
++ * Map an address to a certain kernel segment
++ */
++/* DRAM one */
++#define KSEG0ADDR(a)		(CKSEG0ADDR(a))
++
++/* IO space one */
++#define KSEG1ADDR(a)		(RPHYSADDR(a) | KSEG1)
++#define __pa_symbol(x)		__pa(x)
++
++#elif defined(CONFIG_EVA_1GB)
++
++#define PAGE_OFFSET		_AC(0x60000000, UL)
++#define PHYS_OFFSET		_AC(0x20000000, UL)
++
++/* No Highmem Support */
++#define HIGHMEM_START		_AC(0xffff0000, UL)
++
++#define UNCAC_BASE		(_AC(0xa0000000, UL))
++#define CAC_BASE		(_AC(0x60000000, UL))
++#define IO_BASE			UNCAC_BASE /* Must be the same */
++
++#define KSEG
++#define KUSEG			0x00000000
++#define KSEG0			0x60000000
++#define KSEG1			0xa0000000
++#define KSEG2			0xc0000000
++#define KSEG3			0xe0000000
++
++#define CKUSEG			0x00000000
++#define CKSEG0			0x60000000
++#define CKSEG1			0xa0000000
++#define CKSEG2			_AC(0xc0000000, UL)
++#define CKSEG3			0xe0000000
++
++/* Range from 0x6000.0000 ~ 0x9FFF.FFFF for KSEG0 */
++#define KSEGX(a)		(((_ACAST32_(a)) < 0xA0000000) ?	\
++					KSEG0 : ((_ACAST32_(a)) & 0xE0000000))
++
++#define INDEX_BASE		CKSEG0
++#define MAP_BASE		CKSEG2
++#define VMALLOC_START		MAP_BASE
++#define VMALLOC_END		(MAP_BASE + _AC(0x20000000, UL) - 2 * PAGE_SIZE)
++
++#define IO_SIZE			_AC(0x10000000, UL)
++#define IO_SHIFT		_AC(0x10000000, UL)
++
++#define CPHYSADDR(a)		((_ACAST32_(a)) - PAGE_OFFSET + PHYS_OFFSET)
++
++#define RPHYSADDR(a)		((_ACAST32_(a)) & 0x1fffffff)
++
++#define LEGACY_KSEC0(a)		(RPHYSADDR(a) | 0x80000000)
++
++/* DRAM one */
++#define CKSEG0ADDR(a)		((_ACAST32_(a)))
++
++/* IO space one */
++#define CKSEG1ADDR(a)		(RPHYSADDR(a) | KSEG1)
++
++/*
++ * Map an address to a certain kernel segment
++ */
++/* DRAM one */
++#define KSEG0ADDR(a)		(CKSEG0ADDR(a))
++
++/* IO space one */
++#define KSEG1ADDR(a)		(RPHYSADDR(a) | KSEG1)
++#define __pa_symbol(x)		__pa(x)
++
++#else /* EVA legacy */
++
++#define PAGE_OFFSET		_AC(0x80000000, UL)
++/* skip first 512MB */
++#define PHYS_OFFSET		_AC(0x20000000, UL)
++/* No Highmem Support */
++#define HIGHMEM_START		_AC(0xffff0000, UL)
++
++
++#define UNCAC_BASE		_AC(0xa0000000, UL)
++#define CAC_BASE		_AC(0x80000000, UL)
++#define IO_BASE			UNCAC_BASE
++
++#define KSEG
++#define KUSEG			0x00000000
++#define KSEG0			0x80000000
++#define KSEG1			0xa0000000
++#define KSEG2			0xc0000000
++#define KSEG3			0xe0000000
++
++#define CKUSEG			0x00000000
++#define CKSEG0			0x80000000
++#define CKSEG1			0xa0000000
++#define CKSEG2			_AC(0xc0000000, UL)
++#define CKSEG3			0xe0000000
++
++#define KSEGX(a)		((_ACAST32_ (a)) & 0xe0000000)
++
++#define INDEX_BASE		CKSEG0
++#define MAP_BASE		CKSEG2
++#define VMALLOC_START		MAP_BASE
++#define VMALLOC_END		(MAP_BASE + _AC(0x20000000, UL) - 2 * PAGE_SIZE)
++
++#define IO_SIZE			_AC(0x10000000, UL)
++#define IO_SHIFT		_AC(0x10000000, UL)
++#define CPHYSADDR(a)		((_ACAST32_(a)) - PAGE_OFFSET + PHYS_OFFSET)
++#define RPHYSADDR(a)		((_ACAST32_(a)) & 0x1fffffff)
++#define LEGACY_KSEC0(a)		(RPHYSADDR(a) | KSEG0)
++
++/* DRAM one */
++#define CKSEG0ADDR(a)		((_ACAST32_(a)))
++
++/* IO space one */
++#define CKSEG1ADDR(a)		(RPHYSADDR(a) | KSEG1)
++
++/*
++ * Map an address to a certain kernel segment
++ */
++/* DRAM one */
++#define KSEG0ADDR(a)		(CKSEG0ADDR(a))
++
++/* IO space one */
++#define KSEG1ADDR(a)		(RPHYSADDR(a) | KSEG1)
++#define __pa_symbol(x)		__pa(x)
++
++#endif
++#endif /* CONFIG_EVA */
+ 
+ #include <asm/mach-generic/spaces.h>
+ 
+diff --git a/arch/mips/kernel/head.S b/arch/mips/kernel/head.S
+old mode 100644
+new mode 100755
+--- a/arch/mips/kernel/head.S
++++ b/arch/mips/kernel/head.S
+@@ -255,10 +255,13 @@ NESTED(smp_bootstrap, 16, sp)
+ 	EMT		# emt
+ 2:
+ #endif /* CONFIG_MIPS_MT_SMTC */
++#ifdef CONFIG_EVA
++	PTR_LA  t9, start_secondary
++	jr      t9
++	.align  8
++#else
+ 	j	start_secondary
+-#ifdef CONFIG_EVA
+-	.align  8
+-#endif
++#endif /* CONFIG_EVA */
+ 	END(smp_bootstrap)
+ #endif /* CONFIG_SMP */
+ 
+diff --git a/arch/mips/kernel/segment.c b/arch/mips/kernel/segment.c
+--- a/arch/mips/kernel/segment.c
++++ b/arch/mips/kernel/segment.c
+@@ -7,6 +7,7 @@
+  */
+ #include <linux/kernel.h>
+ #include <linux/proc_fs.h>
++#include <linux/seq_file.h>
+ #include <asm/mipsregs.h>
+ 
+ #ifdef CONFIG_PROC_FS
+@@ -49,50 +50,58 @@ static void proc_build_segment_config(ch
+ 		((cfg & MIPS_SEGCFG_EU) >> MIPS_SEGCFG_EU_SHIFT));
+ }
+ 
+-static int proc_read_segments(char *page, char **start, off_t off,
+-			  int count, int *eof, void *data)
++static int proc_read_segments(struct seq_file *m, void *v)
+ {
+-	int len = 0;
+ 	unsigned int segcfg;
+ 	char str[42];
+ 
+-	len += sprintf(page + len, "\nSegment   Virtual    Size   Access Mode    Physical    Caching     EU\n");
++	seq_printf(m, "\nSegment   Virtual    Size   Access Mode    Physical    Caching     EU\n");
+ 
+-	len += sprintf(page + len, "-------   --------   ----   -----------   ----------   -------   ------\n");
++	seq_printf(m, "-------   --------   ----   -----------   ----------   -------   ------\n");
+ 
+ 	segcfg = read_c0_segctl0();
+ 	proc_build_segment_config(str, segcfg);
+-	len += sprintf(page + len, "   0      e0000000   512M      %s", str);
++	seq_printf(m, "   0      e0000000   512M      %s", str);
+ 
+ 	segcfg >>= 16;
+ 	proc_build_segment_config(str, segcfg);
+-	len += sprintf(page + len, "   1      c0000000   512M      %s", str);
++	seq_printf(m, "   1      c0000000   512M      %s", str);
+ 
+ 	segcfg = read_c0_segctl1();
+ 	proc_build_segment_config(str, segcfg);
+-	len += sprintf(page + len, "   2      a0000000   512M      %s", str);
++	seq_printf(m, "   2      a0000000   512M      %s", str);
+ 
+ 	segcfg >>= 16;
+ 	proc_build_segment_config(str, segcfg);
+-	len += sprintf(page + len, "   3      80000000   512M      %s", str);
++	seq_printf(m, "   3      80000000   512M      %s", str);
+ 
+ 	segcfg = read_c0_segctl2();
+ 	proc_build_segment_config(str, segcfg);
+-	len += sprintf(page + len, "   4      40000000    1G       %s", str);
++	seq_printf(m, "   4      40000000    1G       %s", str);
+ 
+ 	segcfg >>= 16;
+ 	proc_build_segment_config(str, segcfg);
+-	len += sprintf(page + len, "   5      00000000    1G       %s\n", str);
++	seq_printf(m, "   5      00000000    1G       %s\n", str);
+ 
+-	page += len;
+-	return len;
++	return 0;
+ }
+ 
++static int segment_proc_open(struct inode *inode, struct file *file)
++{
++        return single_open(file, proc_read_segments, NULL);
++}
++
++static const struct file_operations segments_proc_fops = {
++        .open           = segment_proc_open,
++        .read           = seq_read,
++        .llseek         = seq_lseek,
++        .release        = single_release,
++};
++
+ static int __init segments_info(void)
+ {
+ 	if (cpu_has_segments) {
+-		segments = create_proc_read_entry("segments", 0444, NULL,
+-				proc_read_segments, NULL);
++		segments = proc_create("segments", 0444, NULL, &segments_proc_fops);
+ 		if (!segments)
+ 			return -ENOMEM;
+ 	}
+diff --git a/arch/mips/lantiq/Platform b/arch/mips/lantiq/Platform
+--- a/arch/mips/lantiq/Platform
++++ b/arch/mips/lantiq/Platform
+@@ -5,13 +5,17 @@
+ platform-$(CONFIG_LANTIQ)	+= lantiq/
+ cflags-$(CONFIG_LANTIQ)		+= -I$(srctree)/arch/mips/include/asm/mach-lantiq
+ ifndef CONFIG_EVA
+-load-$(CONFIG_LANTIQ)		= 0xffffffff80002000
++	ifdef CONFIG_SOC_GRX500_BOOTCORE
++		load-$(CONFIG_LANTIQ)		= 0xffffffff8E000000
++	else
++		load-$(CONFIG_LANTIQ)   = 0xffffffff80002000
++	endif
+ else
+-ifdef CONFIG_USE_EMULATOR
+-load-$(CONFIG_LANTIQ)   = 0xffffffff80002000
+-else
+-load-$(CONFIG_LANTIQ)   = 0xffffffff00002000
+-endif
++	ifdef CONFIG_EVA_2GB
++    load-$(CONFIG_LANTIQ)   = 0xffffffff20020000
++	else
++    load-$(CONFIG_LANTIQ)   = 0xffffffff80020000
++	endif
+ endif
+ cflags-$(CONFIG_SOC_TYPE_XWAY)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/xway
+ cflags-$(CONFIG_SOC_FALCON)	+= -I$(srctree)/arch/mips/include/asm/mach-lantiq/falcon

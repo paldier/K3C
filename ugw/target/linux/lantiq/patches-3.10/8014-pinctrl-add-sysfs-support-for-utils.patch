@@ -1,0 +1,651 @@
+# HG changeset patch
+# Parent be246fee0f0966714c72ba69a77621e5b8d6daab
+
+diff --git a/drivers/pinctrl/Kconfig b/drivers/pinctrl/Kconfig
+--- a/drivers/pinctrl/Kconfig
++++ b/drivers/pinctrl/Kconfig
+@@ -26,6 +26,8 @@ config DEBUG_PINCTRL
+ 	help
+ 	  Say Y here to add some extra checks and diagnostics to PINCTRL calls.
+ 
++
++
+ config PINCTRL_ABX500
+ 	bool "ST-Ericsson ABx500 family Mixed Signal Circuit gpio functions"
+ 	depends on AB8500_CORE
+@@ -231,6 +233,14 @@ config PINCTRL_XWAY
+ 	depends on SOC_TYPE_XWAY
+ 	depends on PINCTRL_LANTIQ
+ 
++config PINCTRL_SYSFS
++	bool "/sys/class/pinctrl/... (sysfs interface)"
++	depends on SYSFS && (PINCTRL_XWAY || PINCTRL_XRX500)
++    default n
++	help
++	  Say Y here to add a sysfs interface for pinctrl for Lantiq SoCs.
++
++
+ endmenu
+ 
+ endif
+diff --git a/drivers/pinctrl/pinctrl-xway.c b/drivers/pinctrl/pinctrl-xway.c
+--- a/drivers/pinctrl/pinctrl-xway.c
++++ b/drivers/pinctrl/pinctrl-xway.c
+@@ -20,6 +20,11 @@
+ #include <linux/device.h>
+ #include <linux/platform_device.h>
+ 
++#ifdef CONFIG_PINCTRL_SYSFS
++#include <linux/device.h>
++#include <linux/kdev_t.h>
++#endif
++
+ #include "pinctrl-lantiq.h"
+ 
+ #include <lantiq_soc.h>
+@@ -483,6 +488,32 @@ static const struct ltq_pmx_func ase_fun
+ 	{"dfe",		ARRAY_AND_SIZE(ase_dfe_grps)},
+ };
+ 
++#ifdef CONFIG_PINCTRL_SYSFS
++#define NUM_PORTS 4
++static struct platform_device *pinctrl_platform_dev;
++
++struct sys_lantiq_pin_desc {
++		unsigned long		flags;
++			/* flag symbols are bit numbers */
++#define FLAG_REQUESTED	0
++#define FLAG_IS_OUT	1
++#define FLAG_EXPORT	2	/* protected by sysfs_lock */
++#define FLAG_SYSFS	3	/* exported via /sys/class/gpio/control */
++#define FLAG_TRIG_FALL	4	/* trigger on falling edge */
++#define FLAG_PULL_DOWN	5	
++#define FLAG_PULL_UP	6	
++#define FLAG_OPEN_DRAIN	7	/* Gpio is open drain type */
++#define FLAG_OPEN_SOURCE 8	/* Gpio is open source type */
++
++#define ID_SHIFT	16	/* add new flags before this one */
++
++#define GPIO_FLAGS_MASK		((1 << ID_SHIFT) - 1)
++#define GPIO_TRIGGER_MASK	(BIT(FLAG_TRIG_FALL) | BIT(FLAG_TRIG_RISE))
++
++};
++static struct sys_lantiq_pin_desc pin_desc_array[NUM_PORTS * PINS];
++#endif
++
+ /* ---------  pinconf related code --------- */
+ static int xway_pinconf_get(struct pinctrl_dev *pctldev,
+ 				unsigned pin,
+@@ -792,6 +823,557 @@ static const struct of_device_id xway_ma
+ };
+ MODULE_DEVICE_TABLE(of, xway_match);
+ 
++#ifdef CONFIG_PINCTRL_SYSFS
++/* lock protects against unexport_pin() being called while
++ * sysfs files are active.
++ */
++static DEFINE_MUTEX(sysfs_lock);
++
++static ssize_t export_store(struct class *class,
++				struct class_attribute *attr,
++				const char *buf, size_t len);
++static ssize_t unexport_store(struct class *class,
++				struct class_attribute *attr,
++				const char *buf, size_t len);
++static struct class_attribute pinctrl_class_attrs[] = {
++        __ATTR(export, 0200, NULL, export_store),
++        __ATTR(unexport, 0200, NULL, unexport_store),
++        __ATTR_NULL,
++};
++
++static struct class pinctrl_class = {
++        .name =         "pinctrl",
++        .owner =        THIS_MODULE,
++
++        .class_attrs =  pinctrl_class_attrs,
++};
++
++static ssize_t pad_ctrl_avail_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	ssize_t			status;
++	u32 pin;
++    unsigned long value = 0xFFFFFFFF;
++	pin = desc - pin_desc_array;
++	mutex_lock(&sysfs_lock);
++	if (!test_bit((FLAG_EXPORT), &(desc->flags)))
++		status = -EIO;
++	else
++		status = sprintf(buf, "%d\n",
++				test_bit(pin, &value));
++
++	mutex_unlock(&sysfs_lock);
++
++	return status;
++}
++
++
++static const DEVICE_ATTR(padctrl_availability, 0644,
++		pad_ctrl_avail_show, NULL);
++
++static ssize_t pin_pullup_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t status = 0;
++	u32 pin;
++	int port;
++	u32 reg;
++
++	pin = desc - pin_desc_array;
++	port  = PORT(pin);
++	
++	mutex_lock(&sysfs_lock);
++	if (!test_bit((FLAG_EXPORT), &(desc->flags))) {
++		status = -EIO;
++	} else {
++		if (port == PORT3)
++			reg = GPIO3_PUDSEL;
++		else
++			reg = GPIO_PUDSEL(pin);
++			
++		if(gpio_getbit(info->membase[0], reg, PORT_PIN(pin))) {
++			if (port == PORT3)
++				reg = GPIO3_PUDEN;
++			else
++				reg = GPIO_PUDEN(pin);
++			if(gpio_getbit(info->membase[0], reg, PORT_PIN(pin)))
++				status = sprintf(buf, "%s\n", "EN");
++			else 
++				status = sprintf(buf, "%s\n", "DIS");
++		} else {
++		}
++
++	}
++	mutex_unlock(&sysfs_lock);
++
++	return status;
++}
++
++static ssize_t pin_pullup_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t			status = 0;
++	u32 pin;
++	int port;
++	u32 reg;
++	long value;
++	pin = desc - pin_desc_array;
++	port  = PORT(pin); 
++	mutex_lock(&sysfs_lock);
++
++	if (!test_bit(FLAG_EXPORT, &desc->flags))
++		status = -EIO;
++		
++	
++	if (sysfs_streq(buf, "DIS")) {
++		value = 0;
++	} else if (sysfs_streq(buf, "EN")) {
++		value = 1;
++	}else
++		status = -EINVAL;
++	
++	if (status == 0) {
++		if (port == PORT3)
++			reg = GPIO3_PUDSEL;
++		else
++			reg = GPIO_PUDSEL(pin);
++		gpio_setbit(info->membase[0], reg, PORT_PIN(pin));
++		
++		if (port == PORT3)
++			reg = GPIO3_PUDEN;
++		else
++			reg = GPIO_PUDEN(pin);
++			
++		if (value == 0) {
++			gpio_clearbit(info->membase[0], reg, PORT_PIN(pin));
++		} else {
++			gpio_setbit(info->membase[0], reg, PORT_PIN(pin));
++		}
++	}
++	mutex_unlock(&sysfs_lock);
++	return status ? : size;
++}
++
++static const DEVICE_ATTR(pullup, 0644,
++		pin_pullup_show, pin_pullup_store);
++		
++static ssize_t pin_pulldown_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t status = 0;
++	u32 pin;
++	int port;
++	u32 reg;
++
++	pin = desc - pin_desc_array;
++	port  = PORT(pin);
++	
++	mutex_lock(&sysfs_lock);
++	if (!test_bit((FLAG_EXPORT), &(desc->flags))) {
++		status = -EIO;
++	} else {
++		if (port == PORT3)
++			reg = GPIO3_PUDSEL;
++		else
++			reg = GPIO_PUDSEL(pin);
++			
++		if(!(gpio_getbit(info->membase[0], reg, PORT_PIN(pin)))){
++			if (port == PORT3)
++				reg = GPIO3_PUDEN;
++			else
++				reg = GPIO_PUDEN(pin);
++			if(gpio_getbit(info->membase[0], reg, PORT_PIN(pin)))
++				status = sprintf(buf, "%s\n", "EN");
++			else 
++				status = sprintf(buf, "%s\n", "DIS");
++		} else {
++		}
++
++	}
++	mutex_unlock(&sysfs_lock);
++
++	return status;
++}
++
++static ssize_t pin_pulldown_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t			status = 0;
++	u32 pin;
++	int port;
++	u32 reg;
++	long value;
++	pin = desc - pin_desc_array;
++	port  = PORT(pin); 
++	mutex_lock(&sysfs_lock);
++
++	if (!test_bit(FLAG_EXPORT, &desc->flags))
++		status = -EIO;
++		
++	
++	if (sysfs_streq(buf, "DIS")) {
++		value = 0;
++	} else if (sysfs_streq(buf, "EN")) {
++		value = 1;
++	}else
++		status = -EINVAL;
++	
++	if (status == 0) {
++		if (port == PORT3)
++			reg = GPIO3_PUDSEL;
++		else
++			reg = GPIO_PUDSEL(pin);
++		gpio_clearbit(info->membase[0], reg, PORT_PIN(pin));
++		
++		if (port == PORT3)
++			reg = GPIO3_PUDEN;
++		else
++			reg = GPIO_PUDEN(pin);
++			
++		if (value == 0) {
++			gpio_clearbit(info->membase[0], reg, PORT_PIN(pin));
++		} else {
++			gpio_setbit(info->membase[0], reg, PORT_PIN(pin));
++		}
++	}
++	mutex_unlock(&sysfs_lock);
++	return status ? : size;
++}
++
++static const DEVICE_ATTR(pulldown, 0644,
++		pin_pulldown_show, pin_pulldown_store);
++
++static ssize_t pin_opendrain_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t status = 0;
++	u32 pin;
++	int port;
++	u32 reg;
++
++	pin = desc - pin_desc_array;
++	port  = PORT(pin);
++	
++	mutex_lock(&sysfs_lock);
++	if (!test_bit((FLAG_EXPORT), &(desc->flags))) {
++		status = -EIO;
++	} else {
++		if (port == PORT3)
++			reg = GPIO3_OD;
++		else
++			reg = GPIO_OD(pin);
++			
++		if((gpio_getbit(info->membase[0], reg, PORT_PIN(pin)))){
++			status = sprintf(buf, "%s\n", "NOP");
++		} else { 
++				status = sprintf(buf, "%s\n", "EN");
++		} 
++	}
++	mutex_unlock(&sysfs_lock);
++	return status;
++}
++
++static ssize_t pin_opendrain_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t			status = 0;
++	u32 pin;
++	int port;
++	u32 reg;
++	long value;
++	pin = desc - pin_desc_array;
++	port  = PORT(pin); 
++	mutex_lock(&sysfs_lock);
++
++	if (!test_bit(FLAG_EXPORT, &desc->flags))
++		status = -EIO;
++		
++	
++	if (sysfs_streq(buf, "NOP")) {
++		value = 1;
++	} else if (sysfs_streq(buf, "EN")) {
++		value = 0;
++	}else
++		status = -EINVAL;
++	
++	if (status == 0) {
++		if (port == PORT3)
++			reg = GPIO3_OD;
++		else
++			reg = GPIO_OD(pin);
++			
++		if (value == 0)
++			gpio_clearbit(info->membase[0], reg, PORT_PIN(pin));
++		else
++			gpio_setbit(info->membase[0], reg, PORT_PIN(pin));
++	}
++	mutex_unlock(&sysfs_lock);
++	return status ? : size;
++}
++
++static const DEVICE_ATTR(opendrain, 0644,
++		pin_opendrain_show, pin_opendrain_store);
++
++static ssize_t pinmux_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t status = 0;
++	u32 pin;
++	int port;
++	u32 mux;
++
++	pin = desc - pin_desc_array;
++	port  = PORT(pin);
++	
++	mutex_lock(&sysfs_lock);
++	if (!test_bit((FLAG_EXPORT), &(desc->flags))) {
++		status = -EIO;
++	} else {
++		u32 alt1_reg = GPIO_ALT1(pin);
++		if (port == PORT3)
++			alt1_reg = GPIO3_ALT1;
++		mux = gpio_getbit(info->membase[0], GPIO_ALT0(pin), PORT_PIN(pin));
++		mux |= gpio_getbit(info->membase[0], alt1_reg, PORT_PIN(pin)) << 1;
++		status = sprintf(buf, "%d\n", mux);
++	}
++
++	
++	mutex_unlock(&sysfs_lock);
++
++	return status;
++}
++
++static ssize_t pinmux_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t size)
++{
++	const struct sys_lantiq_pin_desc *desc = dev_get_drvdata(dev);
++	struct ltq_pinmux_info *info = platform_get_drvdata(pinctrl_platform_dev);
++	ssize_t			status = 0;
++	u32 pin;
++	int port;
++	u32 reg;
++	long value;
++	pin = desc - pin_desc_array;
++	port  = PORT(pin); 
++	mutex_lock(&sysfs_lock);
++
++	if (!test_bit(FLAG_EXPORT, &desc->flags)) {
++		status = -EIO;
++	} else {
++		status = strict_strtol(buf, 0, &value);
++		if (status == 0) {
++			u32 alt1_reg = GPIO_ALT1(pin);
++
++			if (port == PORT3)
++				alt1_reg = GPIO3_ALT1;
++
++			if (value & MUX_ALT0)
++				gpio_setbit(info->membase[0], GPIO_ALT0(pin), PORT_PIN(pin));
++			else
++				gpio_clearbit(info->membase[0], GPIO_ALT0(pin), PORT_PIN(pin));
++
++			if (value & MUX_ALT1)
++				gpio_setbit(info->membase[0], alt1_reg, PORT_PIN(pin));
++			else
++				gpio_clearbit(info->membase[0], alt1_reg, PORT_PIN(pin));
++		}
++	}
++
++
++	mutex_unlock(&sysfs_lock);
++	return status ? : size;
++}
++
++static const DEVICE_ATTR(pinmux, 0644,
++		pinmux_show, pinmux_store);
++
++
++static const struct attribute *pin_attrs[] = {
++
++	&dev_attr_pullup.attr,
++	&dev_attr_pulldown.attr,
++	&dev_attr_opendrain.attr,
++	&dev_attr_pinmux.attr,
++#if 0
++	&dev_attr_slewrate.attr,
++	&dev_attr_currentcontrol.attr,
++	&dev_attr_padctrl_availability.attr,
++#endif
++	NULL,
++};
++
++static const struct attribute_group pin_attr_group = {
++	.attrs = (struct attribute **) pin_attrs,
++};
++
++static int pin_export(unsigned int pin)
++{
++	int		status;
++	struct device	*dev;
++
++	/* Many systems register gpio chips for SOC support very early,
++	 * before driver model support is available.  In those cases we
++	 * export this later, in gpiolib_sysfs_init() ... here we just
++	 * verify that _some_ field of gpio_class got initialized.
++	 */
++	if (!pinctrl_class.p)
++		return 0;
++
++	/* use chip->base for the ID; it's already known to be unique */
++	mutex_lock(&sysfs_lock);
++	//if((pin_desc_array[pin].flags & FLAG_EXPORT) == FLAG_EXPORT){
++	if (pin >= (NUM_PORTS*PINS)) {
++		pr_warn("%s: invalid pin\n", __func__);
++		status = -ENODEV;
++		goto fail_unlock;
++	}
++	
++	if(test_bit((FLAG_EXPORT), &pin_desc_array[pin].flags)){
++		pr_err("Pin %d already exported\r\n", pin);
++		status = -EPERM;
++		goto fail_unlock;
++	}
++	dev = device_create(&pinctrl_class, &pinctrl_platform_dev->dev, MKDEV(0, 0), &pin_desc_array[pin], "pin_%d", pin);
++    if (IS_ERR(dev)) {
++		status = PTR_ERR(dev);
++		goto fail_unlock;
++	}
++    set_bit((FLAG_EXPORT), &pin_desc_array[pin].flags);
++	//pin_desc_array[pin].flags |= FLAG_EXPORT;
++    status = sysfs_create_group(&dev->kobj, &pin_attr_group);
++	if (status)
++		goto fail_unregister_device;
++	mutex_unlock(&sysfs_lock);
++	return 0;
++
++fail_unregister_device:
++	device_unregister(dev);
++fail_unlock:
++	mutex_unlock(&sysfs_lock);
++	pr_debug("%s:  status %d\n", __func__, status);
++	return status;
++}
++static int match_export(struct device *dev, const void *data)
++{   
++	    return dev_get_drvdata(dev) == data;
++}
++
++static int pin_unexport(unsigned int pin)
++{
++	int			status = 0;
++	struct device		*dev = NULL;
++
++	if (pin >= (NUM_PORTS*PINS)) {
++		pr_warn("%s: invalid pin\n", __func__);
++		status = -ENODEV;
++		goto fail_unlock;
++	}
++
++	mutex_lock(&sysfs_lock);
++	if(!(test_bit((FLAG_EXPORT), &pin_desc_array[pin].flags))){
++		status = -ENODEV;
++		goto fail_unlock;
++	}
++
++
++		dev = class_find_device(&pinctrl_class, NULL, &pin_desc_array[pin], match_export);
++		if (dev) {
++            clear_bit((FLAG_EXPORT), &pin_desc_array[pin].flags);
++			//pin_desc_array[pin].flags &= ~FLAG_EXPORT;	
++		} else {
++			status = -ENODEV;
++			goto fail_unlock;
++		}	
++	if (dev) {
++		device_unregister(dev);
++		put_device(dev);
++	}
++	mutex_unlock(&sysfs_lock);
++	return 0;
++fail_unlock:
++	mutex_unlock(&sysfs_lock);
++	pr_debug("%s:  status %d\n", __func__, status);
++	return status;
++}
++
++static ssize_t export_store(struct class *class,
++				struct class_attribute *attr,
++				const char *buf, size_t len)
++{
++	long			pin;
++	int			status;
++
++	status = strict_strtol(buf, 0, &pin);
++	if (status < 0)
++		goto done;
++
++	
++	/* No extra locking here; FLAG_SYSFS just signifies that the
++	 * request and export were done by on behalf of userspace, so
++	 * they may be undone on its behalf too.
++	 */
++
++	status = pin_export((unsigned int)pin);
++	if (status < 0) {
++		if (status == -EPROBE_DEFER)
++			status = -ENODEV;
++		goto done;
++	}
++	
++	
++
++done:
++	if (status)
++		pr_debug("%s: status %d\n", __func__, status);
++	return status ? : len;
++}
++
++static ssize_t unexport_store(struct class *class,
++				struct class_attribute *attr,
++				const char *buf, size_t len)
++{
++	long	pin;
++	int			status;
++
++	status = strict_strtol(buf, 0, &pin);
++	if (status < 0)
++		goto done;
++	status = pin_unexport(pin);
++	/* No extra locking here; FLAG_SYSFS just signifies that the
++	 * request and export were done by on behalf of userspace, so
++	 * they may be undone on its behalf too.
++	 */
++done:
++	if (status)
++		pr_debug("%s: status %d\n", __func__, status);
++	return status ? : len;
++}
++
++
++static int pinctrl_sysfs_init(struct device *dev)
++{
++	int	status;
++	status = class_register(&pinctrl_class);
++	return status;
++
++}
++#endif
++
+ static int pinmux_xway_probe(struct platform_device *pdev)
+ {
+ 	const struct of_device_id *match;
+@@ -871,6 +1453,14 @@ static int pinmux_xway_probe(struct plat
+ 	xway_gpio_range.base = xway_chip.base;
+ 	pinctrl_add_gpio_range(xway_info.pctrl, &xway_gpio_range);
+ 	dev_info(&pdev->dev, "Init done\n");
++
++	if (!ret) {
++#ifdef CONFIG_PINCTRL_SYSFS
++	    pinctrl_platform_dev = pdev;
++		pinctrl_sysfs_init(&pdev->dev);	
++#endif
++		pr_info("Init done\n");
++	}
+ 	return 0;
+ }
+ 

@@ -1,0 +1,409 @@
+# HG changeset patch
+# Parent 653ef1e6d8fefd5e3283d9fd613825b049af18b6
+
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -2984,6 +2984,16 @@ static void *unit_find(struct idr *p, in
+ 
+ #if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
+ 
++#if (defined(CONFIG_PPPOL2TP) || defined(CONFIG_PPPOL2TP_MODULE))
++enum{
++PPPOL2TP_GET_SESSION_ID=1,
++PPPOL2TP_GET_TUNNEL_ID,
++PPPOL2TP_GET_BASEIF,
++PPPOL2TP_GET_ADDR,
++PPPOL2TP_GET_DMAC,
++};
++#endif
++
+ #if (defined(CONFIG_PPPOE) || defined(CONFIG_PPPOE_MODULE))
+ extern int32_t ppa_get_pppoe_info(struct net_device *dev, void *po, uint32_t pppoe_id, void *value);
+ #endif
+@@ -2991,6 +3001,9 @@ extern int32_t ppa_get_pppoe_info(struct
+ struct pppoatm_vcc;
+ extern int32_t ppa_get_pppoa_info(struct net_device *dev, void *pvcc, uint32_t pppoa_id, void *value);
+ #endif
++#if (defined(CONFIG_PPPOL2TP) || defined(CONFIG_PPPOL2TP_MODULE))
++extern int32_t ppa_get_pppol2tp_info(struct net_device *dev, void *po, uint32_t pppol2tp_id, void *value);
++#endif
+ 
+ /*it's very unlikely we need lock_kernel here to prevent the device being destroyed*/
+ int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value)
+@@ -3002,34 +3015,34 @@ int32_t ppa_ppp_get_info(struct net_devi
+     struct ppp_net *pn;
+ 	
+ 	if(unlikely(!ppp_dev || !value)){
+-		printk("PPP arg error\n");
++		/* printk("PPP arg error\n"); */
+ 		return ret;
+ 	}
+ 
+     ppp = netdev_priv(ppp_dev);
+ 
+ 	if (unlikely(!(ppp_dev->flags & IFF_POINTOPOINT) || !ppp)){
+-		printk("PPP device in abnormal status!\n");
++		/* printk("PPP device in abnormal status!\n"); */
+ 		return ret;
+ 	}
+ 
+ 	/*check ppp validity */
+ 
+-	ppp_lock(ppp);
++	//ppp_lock(ppp);
+ 	if(unlikely(ppp->file.dead || atomic_read(&ppp->file.refcnt) == 0 || !ppp->dev || ppp->n_channels == 0)){
+-		printk("PPP device is dead, being destroyed!\n");
++		/* printk("PPP device is dead, being destroyed!\n"); */
+ 		goto err_unlockppp;
+ 	}
+ 
+ 	/*don't support multipul link*/
+ 	if(unlikely(ppp->flags & SC_MULTILINK)){
+-		printk("Don't support multiple link\n");
++		/* printk("Don't support multiple link\n"); */
+ 		goto err_unlockppp;
+ 	}
+ 
+ 	list = &ppp->channels;
+ 	if(unlikely(list_empty(list))){
+-		printk("PPP channel list empty!\n");
++		/* printk("PPP channel list empty!\n"); */
+ 		goto err_unlockppp;
+ 	}
+ 
+@@ -3037,31 +3050,42 @@ int32_t ppa_ppp_get_info(struct net_devi
+ 	pch = list_entry(list, struct channel, clist);
+ 
+ 	if(unlikely(!pch->chan)){
+-		printk("PPP cannot get channel!\n");
++		/* printk("PPP cannot get channel!\n"); */
+ 		goto err_unlockppp;
+ 	}
+ 
+     pn = ppp_pernet(pch->chan_net);
+ 
+-	spin_lock_bh(&pn->all_channels_lock); /* we only need to guarantee the channel won't be destroyed, release ppp's lock to increase speed */
+-	ppp_unlock(ppp);
++	//ppp_unlock(ppp);
++	//spin_lock_bh(&pn->all_channels_lock); /* we only need to guarantee the channel won't be destroyed, release ppp's lock to increase speed */
+ 	
+ 	if((ppp_info_id & PPA_PPP_MASK) == PPA_PPPOE_ID){
+ #if (defined(CONFIG_PPPOE) || defined(CONFIG_PPPOE_MODULE))
+ 		ret = ppa_get_pppoe_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
+ #endif
++	}else if((ppp_info_id & PPA_PPP_MASK) == PPA_PPPOL2TP_ID){
++#if (defined(CONFIG_PPPOL2TP) || defined(CONFIG_PPPOL2TP_MODULE))
++		if((ppp_info_id >>PPA_PPP_MASK_LEN) == PPPOL2TP_GET_DMAC)
++		{
++			ret = ppa_get_pppol2tp_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, (uint8_t *)value);
++		}
++		else
++		{
++			ret = ppa_get_pppol2tp_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
++		}
++#endif
+ 	}else{
+ #if (defined(CONFIG_PPPOATM) || defined(CONFIG_PPPOATM_MODULE))
+ 		ret = ppa_get_pppoa_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
+ #endif
+ 	}
+-	spin_unlock_bh(&pn->all_channels_lock);
++	//spin_unlock_bh(&pn->all_channels_lock);
+ 
+ 	return ret;
+ 
+ 
+ err_unlockppp:
+-	ppp_unlock(ppp);
++	//ppp_unlock(ppp);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -1210,6 +1210,9 @@ int32_t ppa_check_pppoe_addr_valid(struc
+     struct net_device *pppoe_netdev;
+ 	int32_t ret = -EFAULT;
+ 
++	if((pa->dev == NULL) || (pa->remote == NULL) || (pa->sid == NULL))
++		return ret;
++
+     pn = pppoe_pernet(dev_net(dev));
+     if (pppoe_netdev = dev_get_by_name(dev_net(dev), pa->dev)) {
+ 	    dev_put (pppoe_netdev);
+diff --git a/include/uapi/linux/ppp-ioctl.h b/include/uapi/linux/ppp-ioctl.h
+--- a/include/uapi/linux/ppp-ioctl.h
++++ b/include/uapi/linux/ppp-ioctl.h
+@@ -121,6 +121,7 @@ struct pppol2tp_ioc_stats {
+ #define PPA_PPP_MASK    3
+ #define PPA_PPPOE_ID       0x00000001
+ #define PPA_PPPOA_ID    0x00000002
++#define PPA_PPPOL2TP_ID 0x00000003
+ #endif
+ 
+ #endif /* _PPP_IOCTL_H */
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -98,6 +98,7 @@
+ #include <net/udp.h>
+ #include <net/xfrm.h>
+ #include <net/inet_common.h>
++#include <net/flow.h>
+ 
+ #include <asm/byteorder.h>
+ #include <linux/atomic.h>
+@@ -1854,6 +1855,251 @@ static void __exit pppol2tp_exit(void)
+ 	unregister_pernet_device(&pppol2tp_net_ops);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++enum{
++PPPOL2TP_GET_SESSION_ID=1,
++PPPOL2TP_GET_TUNNEL_ID,
++PPPOL2TP_GET_BASEIF,
++PPPOL2TP_GET_ADDR,
++PPPOL2TP_GET_DMAC,
++PPPOL2TP_GET_SADDR,
++PPPOL2TP_GET_DADDR,
++};
++
++__u16 ppa_pppol2tp_get_l2tp_session_id(struct net_device *dev)
++{
++	uint16_t seid=0;
++	uint32_t id = (PPPOL2TP_GET_SESSION_ID << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++
++	ppa_ppp_get_info(dev, id, &seid);
++
++	return seid;
++}
++
++__u16 ppa_pppol2tp_get_l2tp_tunnel_id(struct net_device *dev)
++{
++	uint16_t tuid=0;
++	uint32_t id = (PPPOL2TP_GET_TUNNEL_ID << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++
++	ppa_ppp_get_info(dev, id, &tuid);
++
++	return tuid;
++}
++
++int32_t ppa_pppol2tp_get_base_netif(struct net_device *dev, char pppol2tp_eth_ifname[IFNAMSIZ])
++{
++	uint32_t id = (PPPOL2TP_GET_BASEIF << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++
++	return ppa_ppp_get_info(dev, id, pppol2tp_eth_ifname);
++}
++
++int32_t ppa_pppol2tp_get_l2tp_addr(struct net_device *dev, struct pppol2tp_addr *pa)
++{
++	uint32_t id = (PPPOL2TP_GET_ADDR << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, pa);
++}
++
++int32_t ppa_pppol2tp_get_l2tp_dmac(struct net_device *dev, uint8_t *mac)
++{
++	uint32_t id = (PPPOL2TP_GET_DMAC << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, mac);
++}
++int32_t ppa_pppol2tp_get_src_addr(struct net_device *dev, uint32_t *outer_srcip)
++{
++	uint32_t id = (PPPOL2TP_GET_SADDR << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, outer_srcip);
++}
++int32_t ppa_pppol2tp_get_dst_addr(struct net_device *dev, uint32_t *outer_dstip)
++{
++	uint32_t id = (PPPOL2TP_GET_DADDR << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, outer_dstip);
++}
++
++void ppa_pppol2tp_get_saddr( struct net_device *dev, struct sock *sk_tun, uint32_t *outer_srcip )
++{
++	struct inet_sock *inet;
++	uint32_t src_ip;
++
++	inet = inet_sk(sk_tun);
++	src_ip = inet->inet_saddr;
++
++	*outer_srcip = src_ip;
++}
++
++void ppa_pppol2tp_get_daddr( struct net_device *dev, struct sock *sk_tun, uint32_t *outer_dstip )
++{
++	struct inet_sock *inet;
++	uint32_t dst_ip;
++
++	inet = inet_sk(sk_tun);
++	dst_ip = inet->inet_daddr;
++
++	*outer_dstip = dst_ip;
++}
++
++void ppa_pppol2tp_get_eth( struct net_device *dev, struct sock *sk_tun, void *devname)
++{
++	struct inet_sock *inet;
++	struct net_device *phydev = NULL;
++
++	inet = inet_sk(sk_tun);
++
++	if (inet->inet_daddr) {
++		struct flowi fl = { .u.ip4 = { .daddr = inet->inet_daddr,
++									   .saddr = inet->inet_saddr,
++									   .flowi4_tos = RT_TOS(inet->tos),
++									   .flowi4_oif = sk_tun->sk_bound_dev_if,
++									   .flowi4_proto = sk_tun->sk_protocol } };
++		struct rtable *rt;
++		if ((rt = ip_route_output_key(dev_net(dev), (struct flowi4 *)&fl))) {
++			phydev = rt->dst.dev;
++			memcpy(devname, (phydev->name), sizeof(phydev->name));
++		}
++	}
++}
++
++int32_t ppa_pppol2tp_get_dmac( struct net_device *dev, struct sock *sk_tun, uint8_t *mac)
++{
++	struct rtable *rt = NULL;
++	struct dst_entry *dst = NULL;
++	struct neighbour *neighbour = NULL;
++	struct inet_sock *inet;
++
++	inet = inet_sk(sk_tun);
++	dst = sk_tun->sk_dst_cache;
++	rt = (struct rtable *)__sk_dst_check(sk_tun, 0);
++	if ( rt == NULL )
++	{
++		if ( inet->inet_daddr ) {
++
++			struct flowi f1 = { .u.ip4 = { .daddr = inet->inet_daddr,
++										   .saddr = inet->inet_saddr,
++										   .flowi4_tos = RT_TOS(inet->tos),
++										   .flowi4_proto = sk_tun->sk_protocol,
++										   .flowi4_flags = inet_sk_flowi_flags(sk_tun),
++										   .flowi4_oif = sk_tun->sk_bound_dev_if } };
++
++			if ((rt = ip_route_output_key(dev_net(dev), (struct flowi4 *)&f1)))
++			{
++				dst = &rt->dst;
++			}
++		}
++	}
++	dst = &rt->dst;
++	if(!dst)
++	{
++		goto MAC_ERROR;
++	}
++	neighbour = dst_neigh_lookup(dst, &inet->inet_daddr);
++	if ( neighbour
++			&& (neighbour->ha[0] != 0
++			|| neighbour->ha[1] != 0
++			|| neighbour->ha[2] != 0
++			|| neighbour->ha[3] != 0
++			|| neighbour->ha[4] != 0
++			|| neighbour->ha[5] != 0) ){
++		 memcpy(mac, (uint8_t *)(neighbour->ha), ETH_ALEN);
++	}else{
++		goto MAC_ERROR;
++	}
++
++	return 0;
++
++MAC_ERROR:
++
++return -1;
++}
++
++int32_t ppa_get_pppol2tp_info(struct net_device *dev, void *po, uint32_t pppol2tp_id, void *value)
++{
++	struct pppol2tp_addr *pa;
++	struct pppol2tp_session *pls;
++	struct l2tp_session *session;
++	struct l2tp_tunnel *tunnel;
++	char devname[IFNAMSIZ];
++	struct net_device *pppol2tp_dev;
++	struct sock *sk_tun;
++	struct sock *sk;
++	struct inet_sock *inet;
++	int32_t ret = 0;
++
++	if(!po)
++	{
++		/* printk("No pppol2tp sock \n"); */
++		return -1;
++	}
++
++	sk = (struct sock *)po;
++
++	session = pppol2tp_sock_to_session(sk);
++	if(!session)
++	{
++		/* printk("No pppol2tp sock \n"); */
++		return -1;
++	}
++	pls = l2tp_session_priv(session);
++	sk_tun = pls->tunnel_sock;
++	tunnel = l2tp_sock_to_tunnel(sk_tun);
++	if(!tunnel)
++	{
++		/* printk("No pppol2tp sock \n"); */
++		return -1;
++	}
++
++	inet = inet_sk(sk_tun);
++
++	if((pppol2tp_dev = dev_get_by_name(dev_net(dev),devname)))
++		dev_put(pppol2tp_dev);
++
++	switch(pppol2tp_id){
++	case PPPOL2TP_GET_SESSION_ID:
++		*(u_int16_t *)value = session->peer_session_id;
++			break;
++	case PPPOL2TP_GET_TUNNEL_ID:
++		*(u_int16_t *)value = tunnel->peer_tunnel_id;
++			break;
++	case PPPOL2TP_GET_ADDR:
++		pa = (struct pppol2tp_addr *)value;
++		pa->fd  = tunnel->fd;
++		pa->pid = pls->owner;
++		pa->s_tunnel = tunnel->tunnel_id;
++		pa->d_tunnel = tunnel->peer_tunnel_id;
++		pa->s_session = session->session_id;
++		pa->d_session = session->peer_session_id;
++		pa->addr.sin_family = AF_INET;
++		pa->addr.sin_port = inet->inet_dport;
++		pa->addr.sin_addr.s_addr = inet->inet_daddr;
++			break;
++	case PPPOL2TP_GET_BASEIF:
++		ppa_pppol2tp_get_eth(dev,sk_tun,value);
++			break;
++	case PPPOL2TP_GET_DMAC:
++		ret = ppa_pppol2tp_get_dmac(dev,sk_tun,(uint8_t *)value);
++			break;
++	case PPPOL2TP_GET_SADDR:
++		ppa_pppol2tp_get_saddr(dev,sk_tun,(uint32_t *)value);
++			break;
++	case PPPOL2TP_GET_DADDR:
++		ppa_pppol2tp_get_daddr(dev,sk_tun,(uint32_t *)value);
++			break;
++	default:
++		return -1;
++	}
++
++	return 0;
++}
++
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_session_id);
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_tunnel_id);
++EXPORT_SYMBOL(ppa_pppol2tp_get_base_netif);
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_addr);
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_dmac);
++EXPORT_SYMBOL(ppa_pppol2tp_get_src_addr);
++EXPORT_SYMBOL(ppa_pppol2tp_get_dst_addr);
++EXPORT_SYMBOL(ppa_get_pppol2tp_info);
++#endif
++
+ module_init(pppol2tp_init);
+ module_exit(pppol2tp_exit);
+ 

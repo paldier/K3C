@@ -1,0 +1,478 @@
+initial support of "CONFIG_COMMON_CLK" for falcon
+
+diff --git a/target/linux/lantiq/patches-3.10/9200-lantiq-add-common-clk-support.patch b/target/linux/lantiq/patches-3.10/9200-lantiq-add-common-clk-support.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/lantiq/patches-3.10/9200-lantiq-add-common-clk-support.patch
+@@ -0,0 +1,118 @@
++extend lantiq clock code for optional support of CONFIG_COMMON_CLK
++
++diff --git a/arch/mips/lantiq/clk.c b/arch/mips/lantiq/clk.c
++--- a/arch/mips/lantiq/clk.c
+++++ b/arch/mips/lantiq/clk.c
++@@ -25,6 +25,73 @@
++ #include "clk.h"
++ #include "prom.h"
++ 
+++#ifdef CONFIG_COMMON_CLK
+++
+++/* to be backward compatible */
+++struct clk *clk_get_cpu(void)
+++{
+++	return clk_get_sys("cpu", "cpu");
+++}
+++struct clk *clk_get_fpi(void)
+++{
+++	return clk_get_sys("fpi", "fpi");
+++}
+++EXPORT_SYMBOL_GPL(clk_get_fpi);
+++struct clk *clk_get_io(void)
+++{
+++	return clk_get_sys("io", "io");
+++}
+++struct clk *clk_get_ppe(void)
+++{
+++	return clk_get_sys("ppe", "ppe");
+++}
+++EXPORT_SYMBOL_GPL(clk_get_ppe);
+++
+++/* TODO: remove usage of these two functions from drivers */
+++int clk_activate(struct clk *clk)
+++{
+++	return clk_enable(clk);
+++}
+++EXPORT_SYMBOL(clk_activate);
+++void clk_deactivate(struct clk *clk)
+++{
+++	clk_disable(clk);
+++}
+++EXPORT_SYMBOL(clk_deactivate);
+++
+++void clkdev_add_static(unsigned long cpu, unsigned long fpi,
+++			unsigned long io, unsigned long ppe)
+++{
+++	struct clk *clk;
+++
+++	/* only register clocks with a rate != 0 */
+++	if (cpu) {
+++		clk = clk_register_fixed_rate(NULL, "cpu", NULL, CLK_IS_ROOT, cpu);
+++		if (IS_ERR(clk))
+++			pr_err("cpu not registered\n");
+++		clk_register_clkdev(clk, "cpu", NULL);
+++	}
+++	if (fpi) {
+++		clk = clk_register_fixed_rate(NULL, "fpi", NULL, CLK_IS_ROOT, fpi);
+++		if (IS_ERR(clk))
+++			pr_err("fpi not registered\n");
+++		clk_register_clkdev(clk, "fpi", NULL);
+++	}
+++	if (io) {
+++		clk = clk_register_fixed_rate(NULL, "io", NULL, CLK_IS_ROOT, io);
+++		if (IS_ERR(clk))
+++			pr_err("io not registered\n");
+++		clk_register_clkdev(clk, "io", NULL);
+++	}
+++	if (ppe) {
+++		clk = clk_register_fixed_rate(NULL, "ppe", NULL, CLK_IS_ROOT, ppe);
+++		if (IS_ERR(clk))
+++			pr_err("ppe not registered\n");
+++	}
+++}
+++
+++#else
+++
++ /* lantiq socs have 3 static clocks */
++ static struct clk cpu_clk_generic[4];
++ 
++@@ -147,6 +214,7 @@ struct clk *of_clk_get_from_provider(str
++ {
++ 	return NULL;
++ }
+++#endif /* CONFIG_COMMON_CLK */
++ 
++ static inline u32 get_counter_resolution(void)
++ {
++@@ -171,6 +239,9 @@ void __init plat_time_init(void)
++ 	ltq_soc_init();
++ 
++ 	clk = clk_get_cpu();
+++	if (IS_ERR(clk))
+++		panic("failed to get cpu clock");
+++
++ 	mips_hpt_frequency = clk_get_rate(clk) / get_counter_resolution();
++ 	write_c0_compare(read_c0_count());
++ 	pr_info("CPU Clock: %ldMHz\n", clk_get_rate(clk) / 1000000);
++diff --git a/arch/mips/lantiq/clk.h b/arch/mips/lantiq/clk.h
++--- a/arch/mips/lantiq/clk.h
+++++ b/arch/mips/lantiq/clk.h
++@@ -52,6 +52,9 @@
++ #define CLOCK_50M	50000000
++ #define CLOCK_60M	60000000
++ 
+++#ifdef CONFIG_COMMON_CLK
+++#include <linux/clk-provider.h>
+++#else
++ struct clk {
++ 	struct clk_lookup cl;
++ 	unsigned long rate;
++@@ -65,6 +68,7 @@ struct clk {
++ 	void (*deactivate) (struct clk *clk);
++ 	void (*reboot) (struct clk *clk);
++ };
+++#endif
++ 
++ extern void clkdev_add_static(unsigned long cpu, unsigned long fpi,
++ 				unsigned long io, unsigned long ppe);
+diff --git a/target/linux/lantiq/patches-3.10/9201-clk-fixed-rate-register-clkdev.patch b/target/linux/lantiq/patches-3.10/9201-clk-fixed-rate-register-clkdev.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/lantiq/patches-3.10/9201-clk-fixed-rate-register-clkdev.patch
+@@ -0,0 +1,23 @@
++register a clkdev alias for fixed-rate clocks
++
++diff --git a/drivers/clk/clk-fixed-rate.c b/drivers/clk/clk-fixed-rate.c
++--- a/drivers/clk/clk-fixed-rate.c
+++++ b/drivers/clk/clk-fixed-rate.c
++@@ -15,6 +15,7 @@
++ #include <linux/io.h>
++ #include <linux/err.h>
++ #include <linux/of.h>
+++#include <linux/clkdev.h>
++ 
++ /*
++  * DOC: basic fixed-rate clock that cannot gate
++@@ -78,6 +79,9 @@ struct clk *clk_register_fixed_rate(stru
++ 	if (IS_ERR(clk))
++ 		kfree(fixed);
++ 
+++	if (clk_register_clkdev(clk, name, NULL))
+++		pr_err("%s: failed to register lookup for %s", __func__, name);
+++
++ 	return clk;
++ }
++ 
+diff --git a/target/linux/lantiq/patches-3.10/9220-falcon-common-clock.patch b/target/linux/lantiq/patches-3.10/9220-falcon-common-clock.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/lantiq/patches-3.10/9220-falcon-common-clock.patch
+@@ -0,0 +1,320 @@
++change falcon clock implementation to CONFIG_COMMON_CLK
++
++diff --git a/arch/mips/lantiq/Kconfig b/arch/mips/lantiq/Kconfig
++--- a/arch/mips/lantiq/Kconfig
+++++ b/arch/mips/lantiq/Kconfig
++@@ -23,6 +23,7 @@ config SOC_XWAY
++ config SOC_FALCON
++ 	bool "FALCON"
++ 	select PINCTRL_FALCON
+++	select COMMON_CLK
++ 
++ endchoice
++ 
++diff --git a/arch/mips/lantiq/falcon/sysctrl.c b/arch/mips/lantiq/falcon/sysctrl.c
++--- a/arch/mips/lantiq/falcon/sysctrl.c
+++++ b/arch/mips/lantiq/falcon/sysctrl.c
++@@ -7,6 +7,8 @@
++  * Copyright (C) 2011 John Crispin <blogic@openwrt.org>
++  */
++ 
+++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+++
++ #include <linux/ioport.h>
++ #include <linux/export.h>
++ #include <linux/clkdev.h>
++@@ -127,70 +129,51 @@ static const char *sysctrl_compatible[] 
++ static void __iomem *sysctl_membase[ARRAY_SIZE(sysctrl_compatible)];
++ void __iomem *ltq_sys1_membase, *ltq_ebu_membase;
++ 
+++static DEFINE_SPINLOCK(sysctrl_lock);
++ 
++-static DEFINE_SPINLOCK(sysctrl_lock);
+++struct falcon_gate_clk {
+++	const char *name;
+++	const char *parent_name;
+++	const char *alias; /* for old device-trees */
+++	unsigned int bits;
+++};
+++static __initdata struct falcon_gate_clk sys1_clk_init_data[] = {
+++	{"gpio1", NULL, "1e800100.gpio", SYSCTRL_SYS1_P1},
+++	{"gpio3", NULL, "1e800200.gpio", SYSCTRL_SYS1_P3},
+++	{"gpio4", NULL, "1e800300.gpio", SYSCTRL_SYS1_P4},
+++	{"pad1", NULL, "1e800400.pad", SYSCTRL_SYS1_PADCTRL1},
+++	{"pad3", NULL, "1e800500.pad", SYSCTRL_SYS1_PADCTRL3},
+++	{"pad4", NULL, "1e800600.pad", SYSCTRL_SYS1_PADCTRL4},
+++	{"serial0", "fpi", "1e100c00.serial", SYSCTRL_SYS1_ASC0},
+++	{"serial1", "fpi", "1e100b00.serial", SYSCTRL_SYS1_ASC1},
+++	{"i2c", "fpi", "1e200000.i2c", SYSCTRL_SYS1_I2C},
+++	{"gptc", "fpi", "1e100e00.gptc", SYSCTRL_SYS1_GPTC},
+++	{"spi", "fpi", "1e100d00.spi", SYSCTRL_SYS1_SSC0}
+++};
+++static __initdata struct falcon_gate_clk syseth_clk_init_data[] = {
+++	{"gpio0", NULL, "1d810000.gpio", SYSCTRL_SYS_ETH_P0},
+++	{"gpio2", NULL, "1d810100.gpio", SYSCTRL_SYS_ETH_P2},
+++	{"pad0", NULL, "1db01000.pad", SYSCTRL_SYS_ETH_PADCTRL0},
+++	{"pad2", NULL, "1db02000.pad", SYSCTRL_SYS_ETH_PADCTRL2},
+++};
+++
+++static struct clk_onecell_data clk_data[3];
++ 
++ void falcon_trigger_hrst(int level)
++ {
++ 	sysctl_w32(SYSCTL_SYS1, level & 1, SYS1_HRSTOUTC);
++ }
++ 
++-static inline void sysctl_wait(struct clk *clk,
+++static inline void sysctl_wait(unsigned int module, unsigned int bits,
++ 		unsigned int test, unsigned int reg)
++ {
++ 	int err = 1000000;
++ 
++-	do {} while (--err && ((sysctl_r32(clk->module, reg)
++-					& clk->bits) != test));
+++	do {} while (--err && ((sysctl_r32(module, reg)
+++					& bits) != test));
++ 	if (!err)
++ 		pr_err("module de/activation failed %d %08X %08X %08X\n",
++-			clk->module, clk->bits, test,
++-			sysctl_r32(clk->module, reg) & clk->bits);
++-}
++-
++-static int sysctl_activate(struct clk *clk)
++-{
++-	sysctl_w32(clk->module, clk->bits, SYSCTL_CLKEN);
++-	sysctl_w32(clk->module, clk->bits, SYSCTL_ACT);
++-	sysctl_wait(clk, clk->bits, SYSCTL_ACTS);
++-	return 0;
++-}
++-
++-static void sysctl_deactivate(struct clk *clk)
++-{
++-	sysctl_w32(clk->module, clk->bits, SYSCTL_CLKCLR);
++-	sysctl_w32(clk->module, clk->bits, SYSCTL_DEACT);
++-	sysctl_wait(clk, 0, SYSCTL_ACTS);
++-}
++-
++-static int sysctl_clken(struct clk *clk)
++-{
++-	sysctl_w32(clk->module, clk->bits, SYSCTL_CLKEN);
++-	sysctl_w32(clk->module, clk->bits, SYSCTL_ACT);
++-	sysctl_wait(clk, clk->bits, SYSCTL_CLKS);
++-	return 0;
++-}
++-
++-static void sysctl_clkdis(struct clk *clk)
++-{
++-	sysctl_w32(clk->module, clk->bits, SYSCTL_CLKCLR);
++-	sysctl_wait(clk, 0, SYSCTL_CLKS);
++-}
++-
++-static void sysctl_reboot(struct clk *clk)
++-{
++-	unsigned int act;
++-	unsigned int bits;
++-
++-	act = sysctl_r32(clk->module, SYSCTL_ACT);
++-	bits = ~act & clk->bits;
++-	if (bits != 0) {
++-		sysctl_w32(clk->module, bits, SYSCTL_CLKEN);
++-		sysctl_w32(clk->module, bits, SYSCTL_ACT);
++-		sysctl_wait(clk, bits, SYSCTL_ACTS);
++-	}
++-	sysctl_w32(clk->module, act & clk->bits, SYSCTL_RBT);
++-	sysctl_wait(clk, clk->bits, SYSCTL_ACTS);
+++			module, bits, test, sysctl_r32(module, reg) & bits);
++ }
++ 
++ /* enable the ONU core (without locking, as only called once during init) */
++@@ -220,22 +203,92 @@ static void falcon_gpe_enable(void)
++ 	udelay(1);
++ }
++ 
++-static inline void clkdev_add_sys(const char *dev, unsigned int module,
++-					unsigned int bits)
+++struct clk_gate_sys {
+++	struct clk_hw hw;
+++	u8	module;
+++	u32	bits;
+++};
+++#define to_clk_gate_sys(_hw) container_of(_hw, struct clk_gate_sys, hw)
+++
+++static int sysctl_clken(struct clk_hw *hw)
++ {
++-	struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
+++	struct clk_gate_sys *clk = to_clk_gate_sys(hw);
++ 
++-	clk->cl.dev_id = dev;
++-	clk->cl.con_id = NULL;
++-	clk->cl.clk = clk;
++-	clk->module = module;
++-	clk->bits = bits;
++-	clk->activate = sysctl_activate;
++-	clk->deactivate = sysctl_deactivate;
++-	clk->enable = sysctl_clken;
++-	clk->disable = sysctl_clkdis;
++-	clk->reboot = sysctl_reboot;
++-	clkdev_add(&clk->cl);
+++	pr_debug("*** sysctl_clken mod=%d bits=%X\n", clk->module, clk->bits);
+++	sysctl_w32(clk->module, clk->bits, SYSCTL_CLKEN);
+++	sysctl_w32(clk->module, clk->bits, SYSCTL_ACT);
+++	sysctl_wait(clk->module, clk->bits, clk->bits, SYSCTL_CLKS);
+++	return 0;
+++}
+++
+++static void sysctl_clkdis(struct clk_hw *hw)
+++{
+++	struct clk_gate_sys *clk = to_clk_gate_sys(hw);
+++
+++	pr_debug("*** sysctl_clkdis mod=%d bits=%X\n", clk->module, clk->bits);
+++	dump_stack();
+++	sysctl_w32(clk->module, clk->bits, SYSCTL_CLKCLR);
+++	sysctl_wait(clk->module, clk->bits, 0, SYSCTL_CLKS);
+++}
+++
+++static int sysctl_clk_is_enabled(struct clk_hw *hw)
+++{
+++	struct clk_gate_sys *clk = to_clk_gate_sys(hw);
+++	u32 reg;
+++
+++	reg = (sysctl_r32(clk->module, SYSCTL_CLKS) & clk->bits);
+++	return reg ? 1 : 0;
+++}
+++
+++const struct clk_ops clk_gate_sys_ops = {
+++	.enable = sysctl_clken,
+++	.disable = sysctl_clkdis,
+++	.is_enabled = sysctl_clk_is_enabled,
+++};
+++
+++#define clkdev_add_sys_old(n,p,m,b) clkdev_add_sys(n,p,n,m,b)
+++
+++static inline struct clk * clkdev_add_sys(const char *name, const char *parent_name,
+++	const char *alias,
+++	unsigned int module, unsigned int bits)
+++{
+++	struct clk_gate_sys *gate_sys;
+++	struct clk *clk;
+++	struct clk_init_data init;
+++	int ret = 0;
+++
+++	/* allocate the gate */
+++	gate_sys = kzalloc(sizeof(struct clk_gate_sys), GFP_KERNEL);
+++	if (!gate_sys) {
+++		pr_err("%s: could not allocate gate_sys clk %s\n", __func__, name);
+++		return NULL;
+++	}
+++
+++	init.name = name;
+++	init.ops = &clk_gate_sys_ops;
+++	init.flags = CLK_IS_BASIC | (parent_name ? CLK_IS_ROOT : 0);
+++	init.parent_names = (parent_name ? &parent_name: NULL);
+++	init.num_parents = (parent_name ? 1 : 0);
+++
+++	/* struct clk_gate_sys assignments */
+++	gate_sys->module = module;
+++	gate_sys->bits = bits;
+++	gate_sys->hw.init = &init;
+++
+++	clk = clk_register(NULL, &gate_sys->hw);
+++
+++	if (IS_ERR(clk)) {
+++		kfree(gate_sys);
+++		pr_err("%s: registering clk %s failed\n", __func__, name);
+++		return NULL;
+++	}
+++	clk_prepare(clk);
+++
+++	ret = clk_register_clkdev(clk, NULL, alias);
+++	if (ret)
+++		pr_err("%s: registering clkdev alias %s failed\n", __func__, alias);
+++
+++	return clk;
++ }
++ 
++ void __iomem * __init sysctrl_init(const char *compatible)
++@@ -271,38 +324,53 @@ void __init ltq_soc_init(void)
++ 	ltq_sys1_membase = sysctl_membase[0];
++ 	ltq_ebu_membase = sysctl_membase[4];
++ 
+++	of_clk_init(NULL);
++ 	falcon_gpe_enable();
++-
++-	/* get our 3 static rates for cpu, fpi and io clocks */
++-	if (ltq_sys1_r32(SYS1_CPU0CC) & CPU0CC_CPUDIV)
++-		clkdev_add_static(CLOCK_200M, CLOCK_100M, CLOCK_200M, 0);
++-	else
++-		clkdev_add_static(CLOCK_400M, CLOCK_100M, CLOCK_200M, 0);
++-
++-	/* add our clock domains */
++-	clkdev_add_sys("1d810000.gpio", SYSCTL_SYSETH, SYSCTRL_SYS_ETH_P0);
++-	clkdev_add_sys("1d810100.gpio", SYSCTL_SYSETH, SYSCTRL_SYS_ETH_P2);
++-	clkdev_add_sys("1e800100.gpio", SYSCTL_SYS1, SYSCTRL_SYS1_P1);
++-	clkdev_add_sys("1e800200.gpio", SYSCTL_SYS1, SYSCTRL_SYS1_P3);
++-	clkdev_add_sys("1e800300.gpio", SYSCTL_SYS1, SYSCTRL_SYS1_P4);
++-	clkdev_add_sys("1db01000.pad", SYSCTL_SYSETH, SYSCTRL_SYS_ETH_PADCTRL0);
++-	clkdev_add_sys("1db02000.pad", SYSCTL_SYSETH, SYSCTRL_SYS_ETH_PADCTRL2);
++-	clkdev_add_sys("1e800400.pad", SYSCTL_SYS1, SYSCTRL_SYS1_PADCTRL1);
++-	clkdev_add_sys("1e800500.pad", SYSCTL_SYS1, SYSCTRL_SYS1_PADCTRL3);
++-	clkdev_add_sys("1e800600.pad", SYSCTL_SYS1, SYSCTRL_SYS1_PADCTRL4);
++-	clkdev_add_sys("1e100b00.serial", SYSCTL_SYS1, SYSCTRL_SYS1_ASC1);
++-	clkdev_add_sys("1e100c00.serial", SYSCTL_SYS1, SYSCTRL_SYS1_ASC0);
++-	clkdev_add_sys("1e200000.i2c", SYSCTL_SYS1, SYSCTRL_SYS1_I2C);
++-	clkdev_add_sys("1e100e00.gptc", SYSCTL_SYS1, SYSCTRL_SYS1_GPTC);
++-	clkdev_add_sys("1e100d00.spi", SYSCTL_SYS1, SYSCTRL_SYS1_SSC0);
++ }
++ 
+++static void __init falcon_sysclk_init(struct device_node *np, 
+++	struct falcon_gate_clk *list, unsigned int nr_clk, unsigned int module)
+++{
+++	unsigned int idx;
+++	struct clk **clk_table;
+++
+++	if (!clk_data[module].clks) {
+++		clk_data[module].clks = kzalloc(sizeof(struct clk *) * 32, GFP_KERNEL);
+++		clk_data[module].clk_num = 32;
+++	}
+++
+++	clk_table = clk_data[module].clks;
+++
+++	for (idx = 0; idx < nr_clk; idx++, list++) {
+++		pr_debug("falcon_sysclk_init for '%s': %2d (0x%08X)\n",
+++			list->name, fls(list->bits)-1, list->bits);
+++
+++		clk_table[fls(list->bits)-1] = clkdev_add_sys(list->name, 
+++			list->parent_name, list->alias, module, list->bits);
+++	}
+++	of_clk_add_provider(np, of_clk_src_onecell_get, &clk_data[module]);
+++}
+++
+++static void __init falcon_sys1_clk_init(struct device_node *np)
+++{
+++	falcon_sysclk_init(np, sys1_clk_init_data,
+++		ARRAY_SIZE(sys1_clk_init_data), SYSCTL_SYS1);
+++}
+++CLK_OF_DECLARE(falcon_sys1_clk, "lantiq,sys1-falcon", falcon_sys1_clk_init);
+++
+++static void __init falcon_syseth_clk_init(struct device_node *np)
+++{
+++	falcon_sysclk_init(np, syseth_clk_init_data,
+++		ARRAY_SIZE(syseth_clk_init_data), SYSCTL_SYSETH);
+++}
+++CLK_OF_DECLARE(falcon_syseth_clk, "lantiq,syseth-falcon", falcon_syseth_clk_init);
++ 
++ /*
++  * for compatibility to external drivers from Lantiq
++  * see arch/mips/include/asm/mach-lantiq/falcon/sysctrl.h
++  */
++ 
+++#if 0
++ unsigned int ltq_sysctl_sys_gpe_hw_is_activated(unsigned int mask)
++ {
++ 	if (!ltq_sysctl_sys_gpe_is_clocked(mask))
++@@ -370,6 +438,7 @@ void ltq_sysctl_reboot(int module, unsig
++ 	sysctl_reboot(&clk);
++ }
++ EXPORT_SYMBOL(ltq_sysctl_reboot);
+++#endif
++ 
++ void ltq_sysctl_sleep_enable(int cpu0, int xbar)
++ {

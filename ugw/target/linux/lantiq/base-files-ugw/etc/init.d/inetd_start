@@ -1,0 +1,124 @@
+#!/bin/sh
+
+# Nirav.
+# The new inetd service entry is as given below.
+# service stream/dgram protocol wait/nowait user service_name service_class interface_to_listen socket_options path arguments
+#	service_name : This is the unique name of the service. When inetd.conf contains mulitiple service entries with the same service_name,
+#					it spawns only one of them when the request is received for any one of the service. The other service socket are closed 
+#					by inetd and it is the responsibility of the spawned process to open the remaining socket. e.g. http (service_name) 
+#					with httpd(service_port) and cli(service_port)
+#	serive_class : This is the unique class of the service. When inetd.conf contains mulitiple service entries with the same service_class,
+#					it spawns only one of them when the request is received for any one of the service. For the other service request, inetd 
+#					declines the access saying "Similar services are currently running". e.g. tftp and ftp.
+
+if [ ! "$ENVLOADED" ]; then
+	if [ -r /etc/rc.conf ]; then
+		 . /etc/rc.conf 2> /dev/null
+		ENVLOADED="1"
+	fi
+fi
+
+if [ ! "$CONFIGLOADED" ]; then
+	if [ -r /etc/rc.d/config.sh ]; then
+		. /etc/rc.d/config.sh 2>/dev/null
+		CONFIGLOADED="1"
+	fi
+fi
+
+	INETD_START_FLAG="0"
+	echo -n > /ramdisk/etc/inetd.conf
+	if  [ "$CONFIG_FEATURE_TFTP_SERVER" = "1" ]; then
+		if [ "$TFTP_WAN_ENABLE" = "1" -o "$TFTP_LAN_ENABLE" = "1" ]; then 
+			#echo "tftp	dgram	udp	wait	root	/usr/sbin/tftpd	/usr/sbin/tftpd -p -c -u root -s /ramdisk/tftp_upload" >> /ramdisk/etc/inetd.conf
+			#echo "tftp	dgram	udp	wait	root	tftp	ifxftp	-	-	/usr/sbin/tftpd	/usr/sbin/tftpd -p -c -u root -s /ramdisk/tftp_upload" >> /ramdisk/etc/inetd.conf
+			echo "tftp	dgram	udp	wait	root	tftp	ifxftp	-	-	/usr/bin/tftpd	/usr/bin/tftpd -c /ramdisk/tftp_upload" >> /ramdisk/etc/inetd.conf
+			INETD_START_FLAG="1"
+		fi
+	fi
+	if  [ "$CONFIG_FEATURE_TELNET_SERVER" = "1" ]; then
+		if [ "$TELNET_WAN_ENABLE" = "1" -o "$TELNET_LAN_ENABLE" = "1" ]; then
+			#echo "telnet	stream	tcp	nowait	root	/usr/sbin/telnetd	telnetd" >> /ramdisk/etc/inetd.conf
+			echo "telnet	stream	tcp	wait	root	telnet	ifxrcon	-	-	/usr/sbin/telnetd	telnetd -l /bin/login  -w 1" >> /ramdisk/etc/inetd.conf
+			INETD_START_FLAG="1"
+		fi
+	fi
+	if  [ "$CONFIG_FEATURE_SSH_SERVER" = "1" ]; then
+		if [ "$SSH_WAN_ENABLE" = "1" -o "$SSH_LAN_ENABLE" = 1 ]; then
+			if [ ! -s /tmp/rsa_key ]; then
+				/usr/bin/dropbearkey -t rsa -f /tmp/rsa_key 
+			fi
+			#echo "ssh	stream	tcp	nowait	root	/usr/sbin/dropbear	dropbear -i -r /tmp/rsa_key" >> /ramdisk/etc/inetd.conf
+			echo "ssh	stream	tcp	nowait	root	sshd	ifxrcon	-	-	/usr/sbin/dropbear	dropbear -i -r /tmp/rsa_key" >> /ramdisk/etc/inetd.conf
+			INETD_START_FLAG="1"
+		fi
+	fi
+
+	if  [ "$CONFIG_PACKAGE_LINUX_FTPD" = "1" ]; then
+		if [ "$FTP_WAN_ENABLE" = "1" -o "$FTP_LAN_ENABLE" = "1" ]; then
+			#echo "ftp	stream	tcp	nowait	root	/usr/sbin/ftpd /usr/sbin/ftpd" >> /ramdisk/etc/inetd.conf
+			# Set ftpd priority to least favorable scheduling
+			echo -en "#!/bin/sh\n/bin/nice -n 19 /usr/sbin/ftpd\n" > /tmp/ftpd.sh
+			chmod +x /tmp/ftpd.sh
+			echo "ftp	stream	tcp	nowait	root	ftpd	ifxftp	-	-	/tmp/ftpd.sh /usr/sbin/ftpd" >> /ramdisk/etc/inetd.conf
+			INETD_START_FLAG="1"
+		fi
+	elif [ "$CONFIG_PACKAGE_VSFTPD" = "1" ]; then
+		if [ "$FTP_WAN_ENABLE" = "1" -o "$FTP_LAN_ENABLE" = "1" ]; then
+			mkdir -p /var/run/vsftpd
+			echo "ftp	stream	tcp	nowait	root	vsftpd 	vsftpd	-	-	/bin/nice /bin/nice -n 19 /usr/sbin/vsftpd" >> /ramdisk/etc/inetd.conf
+			INETD_START_FLAG="1"
+		fi
+	fi
+
+	#if  [ "$CONFIG_PACKAGE_IFX_HTTPD" = "1" ]; then
+		#if [ "$WEB_WAN_ENABLE" = "1" -o "$WEB_LAN_ENABLE" = "1" ]; then
+			#if [ "$CONFIG_PACKAGE_IFX_CLI" = "1" ]; then
+				#echo "httpd	stream tcp wait	root httpd ifxhttpd - - /usr/sbin/httpd httpd -h /usr/web -H /usr/cli -A httpd" >> /ramdisk/etc/inetd.conf
+				#echo "/tmp/cli_be_socket stream unix wait root httpd ifxhttpd - - /usr/sbin/httpd httpd -h /usr/web -H /usr/cli -A cli" >> /ramdisk/etc/inetd.conf
+			#else
+				#echo "httpd	stream tcp wait	root httpd ifxhttpd - - /usr/sbin/httpd httpd -h /usr/web -A httpd" >> /ramdisk/etc/inetd.conf
+			#fi
+			#INETD_START_FLAG="1"
+		#fi
+	#fi
+	
+	if [ "$CONFIG_PACKAGE_IFX_CLI" = "1" ]; then
+			echo "/tmp/cli_fe_socket stream unix wait root cli ifxcli - - /usr/sbin/cli_be" >> /ramdisk/etc/inetd.conf
+			INETD_START_FLAG="1"
+	fi
+	# now we run udhcpd from dwatch
+	#if  [ "$CONFIG_FEATURE_DHCP_SERVER" = "1" ]; then
+	#	if [ "$lan_main_0_dhcpMode" = "server" -o "$lan_main_0_dhcpMode" = "relay" ]; then
+	#		if [ -f /etc/udhcpd.conf ]; then
+	#			echo "udhcpd dgram udp wait root udhcpd ifxudhcpd - BROADCAST /usr/sbin/udhcpd udhcpd" >> /ramdisk/etc/inetd.conf
+	#			INETD_START_FLAG="1"
+	#		fi
+	#	fi
+	#fi
+
+	#if  [ "$CONFIG_FEATURE_DHCP_SERVER" = "1" ]; then
+	#	if [ "$lan_main_0_dhcpMode" = "relay" ]; then
+	#		if [ -f /tmp/udhcprconfig.txt ]; then
+	#			cat /tmp/udhcprconfig.txt >> /ramdisk/etc/inetd.conf
+	#			INETD_START_FLAG="1"
+	#		fi
+	#	fi
+	#fi
+
+	#start inetd superserver
+	if [ "$INETD_START_FLAG" = "1" ]; then
+		if [ -f /var/run/inetd.pid ]; then
+			#The server is already running and so just send HUP singal
+			inetdpid=`cat /var/run/inetd.pid`
+			if [ -d /proc/$inetdpid ];then
+				kill -HUP $inetdpid
+			else
+				rm -f /var/run/inetd.pid
+				/usr/sbin/inetd /etc/inetd.conf 2>/dev/null
+			fi
+		else
+			#The server is not running and so start it
+			/usr/sbin/inetd /etc/inetd.conf 2> /dev/null
+		fi
+	fi
+
