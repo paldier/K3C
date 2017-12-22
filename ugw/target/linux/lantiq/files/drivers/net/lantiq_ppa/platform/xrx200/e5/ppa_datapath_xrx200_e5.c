@@ -296,7 +296,7 @@ MODULE_PARM_DESC(qos_queue_len, "QoS queue's length for each QoS queue");
 
 #define DEBUG_FW_PROC                           1
 
-#define DEBUG_MIRROR_PROC                       0
+#define DEBUG_MIRROR_PROC                       1
 
 #define DEBUG_BONDING_PROC                      1
 
@@ -1990,11 +1990,6 @@ static int ptm_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
     else
         qid = g_ptm_prio_queue_map[skb->priority >= NUM_ENTITY(g_ptm_prio_queue_map) ? NUM_ENTITY(g_ptm_prio_queue_map) - 1 : skb->priority];
 
-    if(skb_is_nonlinear(skb)){
-        printk(KERN_CRIT"SKB is non-linear!!!\n");
-        goto PTM_HARD_START_XMIT_FAIL;
-    }
-
     byteoff = (unsigned int)skb->data & (DMA_ALIGNMENT - 1);
     if ( byteoff || skb_headroom(skb) < sizeof(struct sk_buff *) + byteoff 
         || (unsigned int)skb->end - (unsigned int)skb->data < DMA_PACKET_SIZE  
@@ -2975,7 +2970,7 @@ static struct sk_buff* skb_break_away_from_protocol(struct sk_buff *skb)
     nf_conntrack_put(new_skb->nfct);
     new_skb->nfct = NULL;
   #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
-  #if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 102)))
+  #if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 104)))
     nf_conntrack_put_reasm(new_skb->nfct_reasm);
     new_skb->nfct_reasm = NULL;
   #endif

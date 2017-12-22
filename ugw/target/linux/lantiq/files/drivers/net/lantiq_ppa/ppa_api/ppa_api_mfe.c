@@ -296,7 +296,7 @@ static int32_t ppa_auto_learn_multifield_flow( PPA_MULTIFIELD_FLOW_INFO *p_multi
     if ( (tx_ifinfo->flags & NETIF_PHY_ATM) )  //for auto and manual
     {
         int qid, old_qid;
-        PPA_BUF fake_skb;
+        PPA_SKBUF fake_skb;
         
         old_qid = p_multifield_info->cfg0.queue_id;
         fake_skb.priority = p_multifield_info->cfg0.queue_id;

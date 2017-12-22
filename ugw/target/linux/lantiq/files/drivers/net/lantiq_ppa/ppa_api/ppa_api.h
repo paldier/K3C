@@ -672,6 +672,7 @@
 #define SESSION_FLAG2_VALID_IPSEC_INBOUND      0x00000080 
 #define SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA  0x00000100
 #define SESSION_FLAG2_VALID_IPSEC_OUTBOUND_LAN 0x00000200
+#define SESSION_FLAG2_VALID_L2_SNAT            0x00000400
 /* Other flags */
 #if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
 #define FLG_PPA_PROCESSED 			0x100	// this used to mark ecah packets which are processed by ppa datapath driver
@@ -717,7 +718,10 @@ struct variable_info
 
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
 
-
+struct ipsec_tunnel_intf {                                                        
+        PPA_IPADDR         src_ip;                                                   
+        PPA_NETIF          *tx_if;                                  
+};                            
 
 typedef enum {
     OUTBOUND=0,
@@ -772,6 +776,7 @@ typedef enum {
   QOS_UNINIT,
   QOS_CLASSIFY,
   QOS_QUEUE,
+  QOS_INGGRP,
   Q_SCH_WFQ,
   Q_SCH_SP,
   Q_DROP_DT,
@@ -797,10 +802,20 @@ typedef enum {
 // tunnel table datastructures
 #endif //defined(CONFIG_LTQ_PPA_HAL_SELECTOR)
 
+typedef enum {
+  PPA_SESS_DEL_USING_IPv4,
+  PPA_SESS_DEL_USING_IPv6,
+  PPA_SESS_DEL_USING_MAC
+} PPA_SESS_DEL_TYPE;
+
 
 /* PPA default values */
 #define PPA_IPV4_HDR_LEN    20
 #define PPA_IPV6_HDR_LEN    40
+
+#define PPA_VLAN_PROTO_8021Q  0x8100
+#define PPA_VLAN_PROTO_8021AD 0x88A8
+
 #endif //NO_DOXY
 
 /*
@@ -815,6 +830,21 @@ typedef enum {
 
 /** \addtogroup  PPA_HOOK_API */
 /*@{*/
+
+/*!
+    \brief  ppa_ct_counter  holds the connection statistics.
+*/
+typedef struct {
+     uint32_t txPackets;  /*!< Tx Packets - Packets from LAN to WAN. Currently not available */
+     uint64_t txBytes;    /*!< Tx bytes   - Bytes from LAN to WAN */
+     uint32_t rxPackets;  /*!< Rx Packets - Packets from WAN to LAN. Currently not available */
+     uint64_t rxBytes;    /*!< Rx Bytes   - Bytes from WAN to LAN */
+     uint32_t lastHitTime; /*!< Last hit time in secs. It is approximate 
+                       time in seconds when a packet is seen on this 
+                       connection. Note that seconds calculation is 
+                       based on jiffies */
+} PPA_CT_COUNTER;
+
 
 /*!
     \brief This is the data structure for PPA Interface Info specification.
@@ -903,6 +933,14 @@ typedef struct {
                                             
     uint16_t    accel_enable:1;        /*!<   to enable/disable acceleartion for one specified routing session. It will be used only in PPA API level, not HAL and PPE FW level */                                 
 } PPA_SESSION_EXTRA;
+
+/*!
+    \brief This is the data structure which is used to return the session statistics.
+*/
+typedef struct {
+    uint64_t mips_bytes; /*!< Number of bytes transmitted through CPU path */
+    uint64_t acc_bytes; /*!< Number of bytes accelerated by hardware engines */
+} PPA_SESSION_STATS;
 
 /*!
     \brief This is the data structure which specifies an interface and its TTL value as applicable for multicast routing.
@@ -1589,6 +1627,7 @@ typedef struct {
     PPA_VERSION ppa_api_ver;               /*!< PPA API verion */
     PPA_VERSION ppa_stack_al_ver;          /*!< PPA stack verion */  
     PPA_VERSION ppe_hal_ver;               /*!< PPA HAL verion */ 
+    PPA_VERSION mpe_hal_ver;               /*!< PPA HAL verion */ 
     PPA_VERSION ppe_fw_ver[2];                /*!< PPA FW verion */
     PPA_VERSION ppa_subsys_ver;            /*!< PPA Subsystem verion */
     PPA_WAN_INFO ppa_wan_info;            /*!< PPA WAN INFO */
@@ -2236,6 +2275,7 @@ typedef struct {
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
     uint16_t port_id;
     uint16_t subif_id;
+    uint16_t vlan_type;
     uint8_t  ctag_rem;
     uint8_t  ctag_ins;
     uint8_t  stag_rem;
@@ -2318,14 +2358,14 @@ typedef struct {
     uint8_t  collision_flag; // 1 mean the entry is in collsion table or no hashed table, like ASE/Danube
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
     int32_t hash_val;
-    uint32_t f_tc_remark_enable;
-    uint32_t tc_remark;
     uint16_t dest_subif_id;
     uint16_t flags;
     uint8_t hi_prio;
     uint32_t   sessionAction; /* Pointer to session action */
-    uint8_t     nFlowId; /* FlowId */
 #endif
+    uint32_t f_tc_remark_enable;
+    uint32_t tc_remark;
+    uint8_t     nFlowId; /* FlowId */
 } PPE_ROUTING_INFO;
 
 
@@ -2483,6 +2523,10 @@ typedef struct {
 typedef struct {
     uint16_t brid;
     uint32_t port;
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+    uint16_t subif_en;
+    uint16_t subif;
+#endif 
     uint16_t vid;
     uint16_t index;
 } PPA_BR_PORT_INFO;
@@ -2641,6 +2685,17 @@ typedef struct PPA_CMD_VARIABLE_VALUE_INFO
 } PPA_CMD_VARIABLE_VALUE_INFO;
 
 #endif  //end of NO_DOXY
+
+/*!
+    \brief This is the data structure for PPA Session remove based on IP address / MAC address
+*/
+typedef struct {
+    uint8_t type;                          /*!< MAC address = 0, IPv4 = 1 and IPv6=2 */
+    union {
+      PPA_IPADDR ip;                       /*!< IPv4 or IPv6 address information */
+      uint8_t    mac_addr[PPA_ETH_ALEN];   /*!< MAC address learned */
+    } u;
+} PPA_CMD_DEL_SESSION_INFO;
 
 /*!
     \brief This is the data structure for PPA Session Summary
@@ -3032,6 +3087,56 @@ typedef struct ppa_qos_mod_queue_cfg {
 	PPA_QOS_DROP_CFG	drop; /*!< Queue Drop Properties */
 } PPA_QOS_MOD_QUEUE_CFG;
 
+typedef enum{
+    PPA_QOS_INGGRP0,
+    PPA_QOS_INGGRP1,
+    PPA_QOS_INGGRP2,
+    PPA_QOS_INGGRP3,
+    PPA_QOS_INGGRP4,
+    PPA_QOS_INGGRP5,
+    PPA_QOS_INGGRP_MAX
+} PPA_QOS_INGGRP;
+
+#define PPA_QOS_MAX_IF_PER_INGGRP   20
+#define PPA_NUM_INGRESS_GROUPS 		PPA_QOS_INGGRP_MAX
+#define PPA_INGGRP_INVALID(g) 		((g < PPA_QOS_INGGRP0) ||(g >= PPA_QOS_INGGRP_MAX))
+#define PPA_INGGRP_VALID(g) 		(!PPA_INGGRP_INVALID(g))
+
+/*!
+    \brief This is the data structure for PPA QOS to get the status
+*/
+typedef struct {
+    PPA_IFNAME ifname[PPA_IF_NAME_SIZE];
+    PPA_QOS_INGGRP ingress_group;
+    uint32_t flowId:2;
+    uint32_t flowId_en:1;
+    uint32_t enc:1;
+    uint32_t dec:1;
+    uint32_t mpe1:1;
+    uint32_t mpe2:1;
+    uint32_t tc:4;
+    uint32_t ep:4;
+    uint32_t res:17;
+    uint32_t flags;
+} PPA_CMD_QOS_INGGRP_INFO;
+
+/*!
+    \brief PPA API QoS Ingress Group structure
+*/
+typedef struct ppa_qos_inggrp_cfg {
+    PPA_IFNAME ifname[PPA_IF_NAME_SIZE];/*!< Ingress Interface name corresponding to a Ingress QoS group*/
+    PPA_QOS_INGGRP ingress_group;/*!< Ingress QoS Group*/
+    uint16_t flowId;/*!< FlowId value for a particular ingress group*/
+    uint8_t flowId_en;/*!< FlowId enable/disable*/
+    uint8_t enc;/*!< Encrytption bit used to select particular ingress group*/
+    uint8_t dec;/*!< Decrytption bit used to select particular ingress group*/
+    uint8_t mpe1;/*!< MPE1 bit used to select particular ingress group*/
+    uint8_t mpe2;/*!< MPe2 bit used to select particular ingress group*/
+    uint16_t tc;/*!< Traffic class used to select queue in a particular ingress group*/
+    uint32_t ep;/*!< Egress port corresponding to a particular ingress flow*/
+    uint32_t flags;/*!< Flags for Future use*/
+}PPA_QOS_INGGRP_CFG;
+
 /*!
     \brief PPA API Common QoS Queue Configuration structure for ADD/MODIFY/DEL operations
 */
@@ -3092,6 +3197,7 @@ typedef enum {
 typedef enum {
 	CAT_NONE=0,		/*!< PPA category none */
 	CAT_FILTER,		/*!< PPA category filter */
+	CAT_INGQOS,		/*!< PPA category Ingress QOS */
 	CAT_VLAN,		/*!< PPA category VLAN */
 	CAT_FWD,		/*!< PPA category forward */
 	CAT_USQOS,		/*!< PPA category US QOS */
@@ -3271,6 +3377,7 @@ typedef struct {
 	ppa_class_action_iftype_t iftype;		/*!< PPA Interface type actions */
 	uint8_t rmon_action;				/*!< PPA RMON actions */
 	uint8_t rmon_id;				/*!< PPA RMON id to be used */
+    uint32_t flags;/*!< Flags for future use*/
 } ppa_class_action_t;
 
 typedef struct ppa_class_rule_t {
@@ -3308,6 +3415,7 @@ typedef union
     PPA_CMD_SESSIONS_INFO           session_info; /*!< PPA unicast session parameter */
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
     PPA_CMD_CLASSIFIER_INFO	    class_info; /*!<PPA engine info parameter */
+    PPA_CMD_QOS_INGGRP_INFO         qos_inggrp_info; /*!<PPA engine ingress qos info parameter */
 #endif
     /* If not required ADD/MOD/DEL Queue info structures can be removed later.*/
     PPA_CMD_QOS_ADD_QUEUE_INFO	    qos_add_queue_info; /*!<PPA engine info parameter */ 
@@ -3376,6 +3484,7 @@ typedef union
 #endif
 
     PPA_CMD_VARIABLE_VALUE_INFO          var_value_info; /*!<  PPA VARABILE value.  */ 
+    PPA_CMD_DEL_SESSION_INFO            del_session; /*!< PPA session delete info. */
 } PPA_CMD_DATA;
 
 #if defined(CONFIG_LTQ_PPA_HAL_SELECTOR)
@@ -3403,6 +3512,12 @@ typedef struct {
     PPA_XFRM_STATE * outbound;
     sa_direction dir;
     uint32_t  routeindex;
+#if 1
+    uint32_t  inbound_pkt_cnt;
+    uint32_t  inbound_byte_cnt;
+    uint32_t  outbound_pkt_cnt;
+    uint32_t  outbound_byte_cnt;
+#endif
 } PPA_IPSEC_INFO;
 #endif
 
@@ -3525,7 +3640,9 @@ PPA_CMD_RESET_QOS_RATE_NR,                /*!< NR for PPA_CMD_RESET_QOS_RATE  */
 PPA_CMD_ADD_CLASSIFIER_NR,              /*NR for PPA_CMD_ADD_CLASSIFIER*/
 PPA_CMD_DEL_CLASSIFIER_NR,              /*NR for PPA_CMD_DEL_CLASSIFIER*/
 PPA_CMD_GET_CLASSIFIER_NR,              /*NR for PPA_CMD_GET_CLASSIFIER*/
-PPA_CMD_MOD_CLASSIFIER_NR,              /*NR for PPA_CMD_MOD_CLASSIFIER*/ 
+PPA_CMD_MOD_CLASSIFIER_NR,              /*NR for PPA_CMD_MOD_CLASSIFIER*/
+PPA_CMD_SET_QOS_INGGRP_NR,              /*NR for PPA_CMD_SET_QOS_INGGRP*/
+PPA_CMD_GET_QOS_INGGRP_NR,              /*NR for PPA_CMD_GET_QOS_INGGRP*/
 #endif
 PPA_CMD_ADD_QOS_QUEUE_NR, 			/*! NR for PPA_CMD_ADD_QOS_QUEUE */
 PPA_CMD_MOD_QOS_QUEUE_NR, 			/*! NR for PPA_CMD_MOD_QOS_QUEUE */
@@ -4002,6 +4119,18 @@ PPA_IOC_MAXNR                            /*!< NR for PPA_IOC_MAXNR  */
 */      
 #define PPA_CMD_GET_CLASSIFIER _IOWR(PPA_IOC_MAGIC, PPA_CMD_GET_CLASSIFIER_NR, PPA_CMD_CLASSIFIER_INFO)
 // Classification End
+/**
+ * PPA Get QoS Ingress Group. Value is manipulated by _IOW() macro for final value
+ * \param [in,out] PPA_CMD_QOS_INGGRP_INFO The parameter points to a
+ * \ref PPA_CMD_QOS_INGGRP_INFO structure
+ */
+#define PPA_CMD_GET_QOS_INGGRP _IOWR(PPA_IOC_MAGIC, PPA_CMD_GET_QOS_INGGRP_NR, PPA_CMD_QOS_INGGRP_INFO)
+/**
+ * PPA Set QoS Ingress Group. Value is manipulated by _IOW() macro for final value
+ * \param [in,out] PPA_CMD_QOS_INGGRP_INFO The parameter points to a
+ * \ref PPA_CMD_QOS_INGGRP_INFO structure
+ */
+#define PPA_CMD_SET_QOS_INGGRP _IOWR(PPA_IOC_MAGIC, PPA_CMD_SET_QOS_INGGRP_NR, PPA_CMD_QOS_INGGRP_INFO)
 #endif
 
 #ifdef CONFIG_LTQ_PPA_QOS
@@ -4410,6 +4539,8 @@ PPA_IOC_MAXNR                            /*!< NR for PPA_IOC_MAXNR  */
   int32_t ppa_set_mib_mode(uint8_t );
   int32_t ppa_get_mib_mode(uint8_t* );
 #endif
+  int32_t ppa_get_ct_stats(PPA_SESSION *p_session, PPA_CT_COUNTER *pCtCounter);
+
   int32_t ppa_session_add(PPA_BUF *, PPA_SESSION *, uint32_t);
   int32_t ppa_session_modify(PPA_SESSION *, PPA_SESSION_EXTRA *, uint32_t);
   int32_t ppa_session_get(PPA_SESSION ***, PPA_SESSION_EXTRA **, int32_t *, uint32_t);
@@ -4448,6 +4579,7 @@ int32_t ppa_session_ipsec_delete(PPA_XFRM_STATE *ppa_x);
 
   int32_t ppa_bridge_entry_add(uint8_t *, PPA_NETIF *, PPA_NETIF *, uint32_t);
   int32_t ppa_bridge_entry_delete(uint8_t *, PPA_NETIF *, uint32_t);
+  int32_t ppa_bridge_entry_delete_all(uint32_t f_enable);
   int32_t ppa_bridge_entry_hit_time(uint8_t *, PPA_NETIF *, uint32_t *);
   int32_t ppa_bridge_entry_inactivity_status(uint8_t *, PPA_NETIF *);
   int32_t ppa_set_bridge_entry_timeout(uint8_t *, PPA_NETIF *, uint32_t);

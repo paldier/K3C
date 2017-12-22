@@ -181,8 +181,15 @@ foreach my $mirror (@ARGV) {
 			push @extra, "$extra[0]/longterm/v$1";
 		}		
 		foreach my $dir (@extra) {
-			push @mirrors, "ftp://ftp.all.kernel.org/pub/$dir";
-			push @mirrors, "http://ftp.all.kernel.org/pub/$dir";
+			push @mirrors, "https://www.kernel.org/pub/$dir";
+			push @mirrors, "https://cdn.kernel.org/pub/$dir";
+			push @mirrors, "https://mirror.rackspace.com/kernel.org/$dir";
+			push @mirrors, "http://download.xs4all.nl/ftp.kernel.org/pub/$dir";
+			push @mirrors, "http://mirrors.mit.edu/kernel/$dir";
+			push @mirrors, "http://ftp.nara.wide.ad.jp/pub/kernel.org/$dir";
+			push @mirrors, "http://www.ring.gr.jp/archives/linux/kernel.org/$dir";
+			push @mirrors, "ftp://ftp.riken.jp/Linux/kernel.org/$dir";
+			push @mirrors, "ftp://www.mirrorservice.org/sites/ftp.kernel.org/pub/$dir";
 		}
     } elsif ($mirror =~ /^\@GNOME\/(.+)$/) {
 		push @mirrors, "http://ftp.gnome.org/pub/GNOME/sources/$1";

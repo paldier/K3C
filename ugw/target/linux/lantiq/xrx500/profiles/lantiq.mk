@@ -45,6 +45,20 @@ define Profile/easy350_anywan_800m/Description
 endef
 $(eval $(call Profile,easy350_anywan_800m))
 
+
+
+define Profile/easy350_anywan_ire
+  NAME:=IRX200 ANYWAN 800Mhz Board
+endef
+
+define Profile/easy350_anywan_ire/Description
+        IRX200 ANYWAN 800Mhz DT
+endef
+$(eval $(call Profile,easy350_anywan_ire))
+
+
+
+
 define Profile/easy350_anywan_router_800m
   NAME:=EASY350 ANYWAN 800Mhz Router Board
 endef
@@ -90,4 +104,22 @@ define Profile/easy550_anywan_router/Description
         EASY550 ANYWAN Router DT
 endef
 $(eval $(call Profile,easy550_anywan_router))
+
+define Profile/easy550v2_anywan_gw
+  NAME:=EASY550 2000V2 ANYWAN Gateway Board
+endef
+
+define Profile/easy550v2_anywan_gw/Description
+        EASY550 2000V2 ANYWAN Gateway Board
+endef
+$(eval $(call Profile,easy550v2_anywan_gw))
+
+define Profile/easy350_hgu
+  NAME:=EASY350 HGU Board
+endef
+
+define Profile/easy350_hgu/Description
+        EASY350 HGU
+endef
+$(eval $(call Profile,easy350_hgu))
 

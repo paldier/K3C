@@ -1827,6 +1827,15 @@ EXPORT_SYMBOL(g_smartphy_port_num);
 int (*g_smartphy_push_fn)(struct sk_buff *, struct flag_header *, unsigned int) = NULL;
 EXPORT_SYMBOL(g_smartphy_push_fn);
 
+/* Get pointers from PPA for rebootless switchover */
+int32_t (*ppa_hook_ppa_phys_port_add_fn)(PPA_IFNAME *ifname, uint32_t port) = NULL;
+EXPORT_SYMBOL(ppa_hook_ppa_phys_port_add_fn);
+void (*ppa_hook_ppa_phys_port_remove_fn)(uint32_t port) = NULL;
+EXPORT_SYMBOL(ppa_hook_ppa_phys_port_remove_fn);
+uint32_t *g_phys_port_atm_wan_get = NULL;
+EXPORT_SYMBOL(g_phys_port_atm_wan_get);
+uint32_t *g_phys_port_atm_wan_vlan_get = NULL;
+EXPORT_SYMBOL(g_phys_port_atm_wan_vlan_get);
 
 #if defined(CONFIG_ACCL_11AC) || defined(CONFIG_ACCL_11AC_MODULE)
 
@@ -2652,8 +2661,10 @@ static struct sk_buff* skb_break_away_from_protocol(struct sk_buff *skb)
     nf_conntrack_put(new_skb->nfct);
     new_skb->nfct = NULL;
   #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
-    nf_conntrack_put_reasm(new_skb->nfct_reasm);
-    new_skb->nfct_reasm = NULL;
+  	#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,12)
+    	nf_conntrack_put_reasm(new_skb->nfct_reasm);
+    	new_skb->nfct_reasm = NULL;
+		#endif
   #endif
   #ifdef CONFIG_BRIDGE_NETFILTER
     nf_bridge_put(new_skb->nf_bridge);

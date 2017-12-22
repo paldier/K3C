@@ -107,7 +107,7 @@ define ModuleAutoLoad
 		shift 3; \
 		for mod in $$$$$$$$mods; do \
 			mkdir -p $(2)/etc/modules.d; \
-			echo "$$$$$$$$mod" >> $(2)/etc/modules.d/$$$$$$$$priority-$(1); \
+			echo "$$$$$$$$mod"|sed 's/\// /g' >> $(2)/etc/modules.d/$$$$$$$$priority-$(1); \
 		done; \
 		if [ -e $(2)/etc/modules.d/$$$$$$$$priority-$(1) ]; then \
 			if [ "$$$$$$$$boot" = "1" ]; then \

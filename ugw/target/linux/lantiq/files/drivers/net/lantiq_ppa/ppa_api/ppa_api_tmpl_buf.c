@@ -22,10 +22,59 @@
 /*
  *  Common Head File
  */
-#include "ppa_api_common.h"
-#include "swa_stack_al.h"
-#include "swa_ipproto.h"
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
+#include <linux/autoconf.h>
+#else
+#include <generated/autoconf.h>
+#endif
+
+#include <linux/ip.h>
+#include <linux/swap.h>
+#include <linux/ipv6.h>
+#include <linux/if_vlan.h>
+#include <net/ip.h>
+#include <net/route.h>
+#include <net/protocol.h>
+#include <net/netfilter/nf_conntrack.h>
+#include <net/ipv6.h>
+#include <net/ip6_tunnel.h>
+#include <net/ip_tunnels.h>
+#include <net/xfrm.h>
+
+/*
+ *  PPA Specific Head File
+ */
+#include "ppa_ss.h"
+#include <net/ppa_api_common.h>
+#include <net/ppa_api.h>
+#include <net/ppa_ppe_hal.h>
+#include "ppa_api_misc.h"
+#include "ppa_api_netif.h"
+#include "ppa_api_session.h"
+#if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
+#include "ppa_api_session_limit.h"
+#endif
+#include <net/ppa_hook.h>
+#include "ppe_drv_wrapper.h"
+#include "ppa_datapath_wrapper.h"
+#include "ppa_hal_wrapper.h"
+#include "ppa_api_hal_selector.h"
+#include "ppa_api_core.h"
+#include "ppa_api_tools.h"
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
 #include "../platform/xrx500/ltq_mpe_api.h"
+#if defined(CONFIG_LTQ_PPA_COC_SUPPORT)
+#include "ppa_api_cpu_freq.h"
+#endif
+#else
+#if defined(CONFIG_LTQ_CPU_FREQ) || defined(CONFIG_LTQ_PMCU) || defined(CONFIG_LTQ_PMCU_MODULE)
+#include "ppa_api_pwm.h"
+#endif
+#endif
+
+
+
 
 #define UDP_HDR_LEN        8
 #define IPV4_HDR_LEN      20  //assuming no option fields are present
@@ -48,6 +97,7 @@
 #define PPPOE_IPV4_TAG    0x0021
 #define PPPOE_IPV6_TAG    0x0057
 //#define DEBUG_TMPL_BUFFER 1
+#define FLAG_TC_REMARK    0x40000000
 
 
 #undef NIPQUAD
@@ -69,9 +119,6 @@
 *
 * \return void No Value
 */
-#include <linux/module.h>
-#include <linux/kernel.h>
-
 #define dbg_print printk
 static inline void dump_data(uint32_t len, char *pData)
 {
@@ -173,7 +220,7 @@ void form_IPv4_header(struct iphdr *iph,
                      uint16_t dataLen )
 {
 
-  swa_memset((void *)iph, 0, sizeof(struct iphdr));
+  ppa_memset((void *)iph, 0, sizeof(struct iphdr));
 
   iph->version  = 4;
   iph->protocol  = protocol_type ;
@@ -184,7 +231,7 @@ void form_IPv4_header(struct iphdr *iph,
 
   iph->tot_len  = dataLen;
   
-  iph->check = swa_ip_fast_csum((unsigned char *)iph, iph->ihl);
+  iph->check = ppa_ip_fast_csum((unsigned char *)iph, iph->ihl);
 }
 
 static
@@ -193,17 +240,45 @@ void form_UDP_header(struct udphdr *udph,
                     uint16_t dport,
                     uint16_t len )
 {
-  swa_memset((void *)udph, 0, sizeof(struct udphdr)); 
+  ppa_memset((void *)udph, 0, sizeof(struct udphdr)); 
   udph->source   = sport ;
   udph->dest     = dport ;
   udph->len      = len;
 
-  udph->check = swa_ip_fast_csum((unsigned char *)udph, udph->len);
+  udph->check = ppa_ip_fast_csum((unsigned char *)udph, udph->len);
 }
 
-  
+int32_t ppa_tmpl_get_underlying_vlan_interface_if_eogre(PPA_NETIF *netif, PPA_NETIF **base_netif, int32_t *isEoGre)
+{
+        uint8_t isIPv4Gre = 0;
+        PPA_IFNAME underlying_intname[PPA_IF_NAME_SIZE];
 
-static uint16_t ppa_out_header_len( struct swa_session_list_item *p_item,  
+        *base_netif = NULL;
+
+        if( ppa_if_is_vlan_if(netif, NULL))
+        {
+                //printk("<%s> %s VLAN device found!!!!!\n",__func__, netif->name);
+                if(ppa_vlan_get_underlying_if(netif, NULL, underlying_intname) == PPA_SUCCESS)
+                {
+                        netif = ppa_get_netif(underlying_intname); //Get underling layer net dev
+                        //printk("<%s> Underlying interface %s device found!!!!!\n",__func__, netif->name);
+                } else {
+                        return PPA_FAILURE;
+                }
+        }
+
+        if( ppa_is_gre_netif_type(netif, &isIPv4Gre, isEoGre) )
+        {
+                //printk("<%s> %s is a GRE interface!!!!!\n",__func__, netif->name);
+                *base_netif = netif;
+                return PPA_SUCCESS;
+        }
+
+        return PPA_FAILURE;
+
+}
+
+static uint16_t ppa_out_header_len( struct session_list_item *p_item,  
                                    uint32_t *delta) 
 {
   uint16_t headerlength=0;
@@ -234,11 +309,22 @@ static uint16_t ppa_out_header_len( struct swa_session_list_item *p_item,
     } 
   }
     
-  if( swa_is_GreSession(p_item)) {
+  if( ppa_is_GreSession(p_item)) {
     //Both IPoGRE and EoGRE get tunnel hdr length
     if( is_lan) {
       uint16_t hdrlen=0;
-      swa_get_gre_hdrlen(p_item->tx_if, &hdrlen);
+	PPA_NETIF *base_netif;
+	PPA_NETIF *temp_netif;
+	int32_t is_eogre;
+	temp_netif = p_item->tx_if;
+	if(ppa_tmpl_get_underlying_vlan_interface_if_eogre(p_item->tx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+        {
+                printk("<%s> Get GRE Header length for %s!!!\n",__func__,base_netif->name);
+                ppa_get_gre_hdrlen(base_netif, &hdrlen);
+        }
+	p_item->tx_if = temp_netif;
+
+      //ppa_get_gre_hdrlen(p_item->tx_if, &hdrlen);
       headerlength += hdrlen;  
       *delta += hdrlen;
     }
@@ -265,27 +351,35 @@ static uint16_t ppa_out_header_len( struct swa_session_list_item *p_item,
     headerlength += VLAN_HLEN;
   }
 
-
-  if ( !(p_item->flags & SESSION_TX_ITF_IPOA_PPPOA_MASK) ) {
+    /* No special handling required for PPPOA */
     headerlength += ETH_HLEN;  /* mac header offset */
-  }
   
   return headerlength;   
 }
 
       
 
-static uint32_t ppa_form_ipsec_tunnel_hdr(const struct swa_session_list_item* p_item, 
-                                     uint8_t* hdr, unsigned isIPv6)
+static uint32_t ppa_form_ipsec_tunnel_hdr(const struct session_list_item* p_item, void *s_pkt, uint8_t* hdr, unsigned isIPv6)
 {
 
   struct iphdr iph;
-  form_IPv4_header(&iph, p_item->src_ip.ip, p_item->dst_ip.ip, 50,20); // need to check from where can i get protocol
-  swa_memcpy(hdr , &iph, sizeof(struct iphdr));
+
+  PPA_IPADDR                  src_ip;
+  PPA_IPADDR                  dst_ip;
+
+  //src_ip        = *(SWA_IPADDR*)swa_get_pkt_src_ip(s_pkt);
+  //dst_ip        = *(SWA_IPADDR*)swa_get_pkt_dst_ip(s_pkt);
+  ppa_get_pkt_src_ip(&src_ip,s_pkt);
+  ppa_get_pkt_dst_ip(&dst_ip,s_pkt);
+
+  //form_IPv4_header(&iph, p_item->src_ip.ip, p_item->dst_ip.ip, 50,20); // need to check from where can i get protocol
+  form_IPv4_header(&iph,src_ip.ip,dst_ip.ip, 50,20); // need to check from where can i get protocol
+  ppa_memcpy(hdr , &iph, sizeof(struct iphdr));
   hdr += IPV4_HDR_LEN;
+  return PPA_SUCCESS;
 }
 
-static uint32_t ppa_form_l2tp_tunnel(const struct swa_session_list_item* p_item, 
+static uint32_t ppa_form_l2tp_tunnel(const struct session_list_item* p_item, 
                                      uint8_t* hdr, unsigned isIPv6)
 {
   struct iphdr iph;
@@ -293,15 +387,15 @@ static uint32_t ppa_form_l2tp_tunnel(const struct swa_session_list_item* p_item,
   uint32_t outer_srcip, outer_dstip;
 
   // adding IP header to templet buffer
-  swa_pppol2tp_get_src_addr(p_item->tx_if,&outer_srcip);
-  swa_pppol2tp_get_dst_addr(p_item->tx_if,&outer_dstip);
+  ppa_pppol2tp_get_src_addr(p_item->tx_if,&outer_srcip);
+  ppa_pppol2tp_get_dst_addr(p_item->tx_if,&outer_dstip);
   form_IPv4_header(&iph, outer_srcip, outer_dstip, 17,38); // need to check from where can i get protocol
-  swa_memcpy(hdr , &iph, sizeof(struct iphdr));
+  ppa_memcpy(hdr , &iph, sizeof(struct iphdr));
   hdr += IPV4_HDR_LEN;
 
   // adding UDP header to templet buffer
   form_UDP_header(&udph, 0x06a5, 0x06a5,18);
-  swa_memcpy(hdr , &udph, sizeof(struct udphdr));
+  ppa_memcpy(hdr , &udph, sizeof(struct udphdr));
   hdr += UDP_HDR_LEN;
 
   //adding L2TP header to templet buffer
@@ -323,16 +417,15 @@ static uint32_t ppa_form_l2tp_tunnel(const struct swa_session_list_item* p_item,
 /* 
  * This function reads the necessary information for software acceleation from  packet and updates the p_item 
  */
-int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
+int32_t ppa_form_session_tmpl(PPA_BUF *s_pkt, struct session_list_item *p_item, struct netif_info *tx_ifinfo)
 {
-  int ret = SWA_SUCCESS;
+  int ret = PPA_SUCCESS;
   uint32_t delta = 0;
   uint16_t tlen = 0;
   uint16_t proto_type = ETH_P_IP;
   unsigned isIPv6 = 0;
   uint8_t* hdr;
 
-  struct swa_session_list_item *p_item;
   struct session_action  swaHdr;
   struct session_action  *p_swaHdr;
         
@@ -340,14 +433,13 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
   uint8_t  isGreTap = 0;  //Valid if sessions is GRE
 
   uint32_t mtu = 0;
-  p_item = (struct swa_session_list_item *)pitem;
 
   /** comment to support full processing */
-#if 1
+#if 0
   if( !IsLanSession(p_item->flags)) {
     return ret;
   }
-  if (!(IsL2TPSession(p_item->flags) || swa_is_GreSession(p_item))) {
+  if (!(IsL2TPSession(p_item->flags) || ppa_is_GreSession(p_item) || IsIpsecSession(p_item) )) {
     return ret;
   }
 #endif
@@ -357,8 +449,7 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
   }
   mtu = p_item->mtu;
 
-  swa_memset(&swaHdr,0,sizeof(struct session_action));  
-  
+  ppa_memset(&swaHdr,0,sizeof(struct session_action));  
   
   if( IsIpv6Session(p_item->flags) ) {
     isIPv6 = 1;
@@ -367,29 +458,50 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
   
   //get the actual txif
   swaHdr.dst_pmac_port_num=1;
-  swaHdr.dst_pmac_port_list[0] = swa_get_phy_port(tx_ifinfo); // dp_subif.port_id;
+  swaHdr.dst_pmac_port_list[0] = tx_ifinfo ? tx_ifinfo->phys_port : 0; // dp_subif.port_id;
+
+#if 1
+  if(swaHdr.dst_pmac_port_list[0] < MAX_PMAC_PORT)
+  	swaHdr.uc_vap_list[0] = p_item->dest_subifid ;
+#endif
 
   /* 
    * Find the length of template buffer 
    */
   tlen =  ppa_out_header_len(p_item, &delta);
         
-  if( swa_is_GreSession(p_item) ) { //EoGRE
-    swa_is_gre_netif_type(p_item->tx_if, &isIPv4Gre, &isGreTap);
+  if( ppa_is_GreSession(p_item) ) { //EoGRE
+    ppa_is_gre_netif_type(p_item->tx_if, &isIPv4Gre, &isGreTap);
   }
   
   if( IsBridgedSession(p_item) || isGreTap) {
     if( IsLanSession(p_item->flags) ) {
       /* UP stream handling */
-      if( swa_is_GreSession(p_item) ) { //EoGRE
+      if( ppa_is_GreSession(p_item) ) { //EoGRE
         uint16_t hdrlen;
-
+	PPA_NETIF *base_netif;
+	PPA_NETIF *temp_netif;
+	int32_t is_eogre;
+	
+	temp_netif = p_item->tx_if;
         swaHdr.tunnel_type = TUNL_EOGRE;
-       
-        swa_get_gre_hdrlen(p_item->tx_if, &hdrlen);
+        if(ppa_tmpl_get_underlying_vlan_interface_if_eogre(p_item->tx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+	{
+        	ppa_get_gre_hdrlen(base_netif, &hdrlen);
+	}
+  
+        //ppa_get_gre_hdrlen(p_item->tx_if, &hdrlen);
+	p_item->tx_if = temp_netif;
         swaHdr.tunnel_ip_offset_en = 1;
         swaHdr.tunnel_ip_offset = tlen - hdrlen;
       
+#if 1
+	printk("GRE SESSION for %s!!!\n",p_item->tx_if->name);
+	if(ppa_if_is_vlan_if(p_item->tx_if, p_item->tx_if->name)) {
+		printk("GRE SESSION!!!\n");
+        	tlen += VLAN_HLEN; 
+	}
+#endif
         delta = tlen;  /* Needs ETH header for EoGRE */
         tlen += ETH_HLEN; 
         swaHdr.in_eth_iphdr_offset_en = 1;  
@@ -406,7 +518,7 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
         }
       } 
     } // else  Down stream
-  } else if( IsTunneledSession(p_item->flags) | swa_is_GreSession(p_item) | IsIpsecSession(p_item)) {
+  } else if( IsTunneledSession(p_item->flags) | ppa_is_GreSession(p_item) | IsIpsecSession(p_item)) {
 
     if( IsLanSession(p_item->flags) ) {
         
@@ -428,7 +540,7 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
              mtu += 40;
 
 
-      } else if (swa_is_GreSession(p_item)) {
+      } else if (ppa_is_GreSession(p_item)) {
 
         /*
          * Required fields for gre tunnel -
@@ -442,7 +554,7 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
         swaHdr.in_eth_iphdr_offset_en = 1;  
         swaHdr.in_eth_iphdr_offset = tlen;  
         
-        swa_get_gre_hdrlen(p_item->tx_if, &hdrlen);
+        ppa_get_gre_hdrlen(p_item->tx_if, &hdrlen);
         swaHdr.tunnel_ip_offset_en = 1;
         swaHdr.tunnel_ip_offset = tlen - hdrlen;
 
@@ -468,7 +580,7 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
       swaHdr.tunnel_rm_en = 1;
       if( IsL2TPSession(p_item->flags)) {
         swaHdr.tunnel_type = TUNL_L2TP;
-      } else if (swa_is_GreSession(p_item)) {
+      } else if (ppa_is_GreSession(p_item)) {
         swaHdr.tunnel_type = TUNL_IPOGRE ;
       }
     }
@@ -478,6 +590,7 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
     swaHdr.new_dst_ip_en = 1;
     swaHdr.new_src_ip_en = 1;
 
+    mtu += 1;
     if( IsLanSession(p_item->flags) ) {
       if( IsPppoeSession(p_item->flags) ) {
         swaHdr.pppoe_offset_en = 1;
@@ -495,14 +608,6 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
 	swaHdr.new_src_ip.ip6.ip[1] = p_item->src_ip.ip6[2];
 	swaHdr.new_src_ip.ip6.ip[0] = p_item->src_ip.ip6[3];
 
-#if 0
-        swa_ipv6_addr_copy( (struct ip6_addr *)swaHdr.new_src_ip.ip6.ip, 
-                        (struct ip6_addr *)p_item->nat_ip.ip6);
-        //swa_ipv6_addr_copy( (struct ip6_addr *)swaHdr.new_dst_ip.ip6.ip, 
-          //              (struct ip6_addr *)p_item->dst_ip.ip6);
-        swa_ipv6_addr_copy( (struct ip6_addr *)swaHdr.new_dst_ip.ip6.ip, 
-                        (struct ip6_addr *)l_ip6_dst.ip);
-#endif
       } else {
         swaHdr.new_src_ip.ip4.ip = p_item->nat_ip.ip;
         swaHdr.new_dst_ip.ip4.ip = p_item->dst_ip.ip;
@@ -510,7 +615,6 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
     } else {
 
       if( isIPv6 ) {
-#if 1
 	/** Right now MPE requires the DW in this format */
 	swaHdr.new_dst_ip.ip6.ip[3] = p_item->dst_ip.ip6[0];
 	swaHdr.new_dst_ip.ip6.ip[2] = p_item->dst_ip.ip6[1];
@@ -521,13 +625,6 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
 	swaHdr.new_src_ip.ip6.ip[2] = p_item->src_ip.ip6[1];
 	swaHdr.new_src_ip.ip6.ip[1] = p_item->src_ip.ip6[2];
 	swaHdr.new_src_ip.ip6.ip[0] = p_item->src_ip.ip6[3];
-#else
-
-        swa_ipv6_addr_copy( (struct ip6_addr *)swaHdr.new_src_ip.ip6.ip, 
-                        (struct ip6_addr *)p_item->src_ip.ip6);
-        swa_ipv6_addr_copy( (struct ip6_addr *)swaHdr.new_dst_ip.ip6.ip, 
-                        (struct ip6_addr *)p_item->nat_ip.ip6);
-#endif
       } else {
         swaHdr.new_src_ip.ip4.ip = p_item->src_ip.ip;
         swaHdr.new_dst_ip.ip4.ip = p_item->nat_ip.ip;
@@ -541,19 +638,21 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
   //swaHdr.mtu = p_item->mtu;
   swaHdr.mtu = mtu;
   swaHdr.pkt_len_delta = delta;
-
-  //p_swaHdr = ( struct session_action *)swa_malloc(sizeof(struct session_action));
-  p_swaHdr = ( struct session_action *)swa_dma(sizeof(struct session_action));
-  if(p_swaHdr == NULL) {
-    return SWA_ENOMEM; 
+  if(p_item->extmark & FLAG_TC_REMARK) {
+  	swaHdr.new_traffic_class_en = 1;
+  	swaHdr.traffic_class = (p_item->priority >= 15) ? 15 : p_item->priority;
   }
-  swa_memset(p_swaHdr, 0, sizeof(struct session_action));
-  swa_memcpy(p_swaHdr, &swaHdr,sizeof(struct session_action));
+
+  p_swaHdr = ( struct session_action *)ppa_alloc_dma(sizeof(struct session_action));
+  if(p_swaHdr == NULL) {
+    return PPA_ENOMEM; 
+  }
+  ppa_memset(p_swaHdr, 0, sizeof(struct session_action));
+  ppa_memcpy(p_swaHdr, &swaHdr,sizeof(struct session_action));
 
   if( swaHdr.templ_len ) {
-    //p_swaHdr->templ_buf = swa_malloc(swaHdr.templ_len);
-    p_swaHdr->templ_buf = swa_dma(swaHdr.templ_len);
-    swa_memset(p_swaHdr->templ_buf, 0, swaHdr.templ_len);
+    p_swaHdr->templ_buf = ppa_alloc_dma(swaHdr.templ_len);
+    ppa_memset(p_swaHdr->templ_buf, 0, swaHdr.templ_len);
   } 
   /* else  TODO: Handle when no buffer need to be inserted. 
              Required mainly for downstream */
@@ -564,17 +663,33 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
   {
     if( IsBridgedSession(p_item) || isGreTap ) {
       if( TUNL_EOGRE == swaHdr.tunnel_type ) {
-        swa_memcpy(hdr, p_item->dst_mac, ETH_ALEN);
-        swa_get_netif_hwaddr(p_item->tx_if, hdr + ETH_ALEN, 1);
+        PPA_NETIF *base_netif;
+        PPA_NETIF *temp_netif;
+        int32_t is_eogre;
+
+        ppa_memcpy(hdr, p_item->dst_mac, ETH_ALEN);
+
+#if 1
+	temp_netif = p_item->tx_if;
+	if(ppa_tmpl_get_underlying_vlan_interface_if_eogre(p_item->tx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+        {
+       		//ppa_form_gre_hdr(base_netif, isIPv6, ETH_HLEN+4, hdr, &tlen);
+        	ppa_get_netif_hwaddr(base_netif, hdr + ETH_ALEN, 1);
+        }
+	p_item->tx_if = temp_netif;
+
+#endif
+
+       // ppa_get_netif_hwaddr(p_item->tx_if, hdr + ETH_ALEN, 1);
       } else
-        swa_memcpy_data(hdr, s_pkt, ETH_ALEN*2);
+        ppa_copy_skb_data(hdr, s_pkt, ETH_ALEN*2);
     } else {
       //get the MAC address of txif
-      ret =  swa_get_netif_hwaddr(p_item->tx_if, hdr + ETH_ALEN, 1);
-      if (ret == SWA_FAILURE){
+      ret =  ppa_get_netif_hwaddr(p_item->tx_if, hdr + ETH_ALEN, 1);
+      if (ret == PPA_FAILURE){
         return ret;
       }
-      swa_memcpy(hdr, p_item->dst_mac, ETH_ALEN);
+      ppa_memcpy(hdr, p_item->dst_mac, ETH_ALEN);
     }
     hdr += ETH_ALEN*2;
     /* If the destination interface is a LAN VLAN interface under bridge the 
@@ -616,15 +731,63 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
       hdr += 2; /* Two bytes for ETH protocol field */
     }
   }
+  else if (p_item->flags & SESSION_TX_ITF_IPOA_PPPOA_MASK)
+  {
+	/* Set dummy Ethernet header */
+        ppa_memset(hdr, 0, ETH_ALEN*2);
+    	hdr += ETH_ALEN*2;
+    	/* If the destination interface is a LAN VLAN interface under bridge the 
+    	   below steps header is not needed */
+    	if( IsValidOutVlanIns(p_item->flags) && IsLanSession(p_item->flags) ) {
+	
+	      ppa_htonl((uint32_t*)hdr, p_item->out_vlan_tag);
+	      hdr +=VLAN_HLEN;
+	}
+
+	if( IsValidVlanIns(p_item->flags) ) {
+	
+	      ppa_htons((uint16_t*)hdr, ETH_P_8021Q);
+	      ppa_htons((uint16_t*)(hdr+2), p_item->new_vci);
+	      hdr +=VLAN_HLEN;
+	}
+      	ppa_htons((uint16_t*)hdr, proto_type);
+        hdr += 2; /* Two bytes for ETH protocol field */
+  }
   
   if( IsBridgedSession(p_item) || isGreTap) {
-     if(swa_is_GreSession(p_item)) {
+     if(ppa_is_GreSession(p_item)) {
        // Add GRE Header to buffer for EoGre
-       tlen=100;
-       swa_form_gre_hdr(p_item->tx_if, isIPv6, ETH_HLEN,hdr,&tlen);
-       hdr += tlen;
-       /* Inner MAC hdr. In future CVLAN handle CVLANs here */
-       swa_memcpy_data(hdr, s_pkt, ETH_HLEN); 
+	PPA_NETIF *base_netif;
+	PPA_NETIF *temp_netif;
+	int32_t is_eogre;
+	uint16_t a;
+	tlen=100;
+	temp_netif = p_item->tx_if;
+	if(ppa_tmpl_get_underlying_vlan_interface_if_eogre(p_item->tx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+        {
+		if(ppa_if_is_vlan_if(temp_netif, NULL))
+       			ppa_form_gre_hdr(base_netif, isIPv6, ETH_HLEN+4, hdr, &tlen);
+		else
+       			ppa_form_gre_hdr(base_netif, isIPv6, ETH_HLEN, hdr, &tlen);
+                //printk("<%s> Get GRE Header length for %s  --> %d!!!\n",__func__,base_netif->name,tlen);
+        }
+	p_item->tx_if = temp_netif;
+	//ppa_form_gre_hdr(p_item->tx_if, isIPv6, ETH_HLEN,hdr,&tlen);
+	hdr += tlen;
+	/* Inner MAC hdr. In future CVLAN handle CVLANs here */
+	ppa_copy_skb_data(hdr, s_pkt, ETH_HLEN); 
+	if(ppa_if_is_vlan_if(p_item->tx_if, p_item->tx_if->name)) {
+		//printk("Add VLAN header\n");
+		ppa_htons(&a, *((uint16_t*)(hdr+12)));
+
+		ppa_htons((uint16_t*)(hdr+12), ETH_P_8021Q);
+		ppa_htons((uint16_t*)(hdr+14), ppa_get_vlan_id(p_item->tx_if));
+		//hdr +=VLAN_HLEN;
+		//ppa_htons((uint16_t*)(hdr+16), ETH_P_IP);
+		ppa_htons((uint16_t*)(hdr+16), a);
+	}
+	
+       //ppa_copy_skb_data(hdr, s_pkt, ETH_HLEN); 
      }
     goto hdr_done;
   }
@@ -633,12 +796,30 @@ int32_t ppa_form_session_tmpl(void *s_pkt, void *pitem, void *tx_ifinfo)
     /* Add Tunnel header here */
     if ( IsL2TPSession(p_item->flags)) {
       ppa_form_l2tp_tunnel(p_item, hdr,isIPv6);
-    } else if(swa_is_GreSession(p_item)) {
+    } else if(ppa_is_GreSession(p_item)) {
       //Add GRE Header to templet buffer
-      tlen=100;
-      swa_form_gre_hdr(p_item->tx_if, isIPv6,0,hdr,&tlen);
+	PPA_NETIF *base_netif;
+	PPA_NETIF *temp_netif;
+	int32_t is_eogre;
+	tlen=100;
+	temp_netif = p_item->tx_if;
+	if(ppa_tmpl_get_underlying_vlan_interface_if_eogre(p_item->tx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+        {
+                printk("<%s> -->  Get GRE Header length for %s!!!\n",__func__,base_netif->name);
+       		//ppa_form_gre_hdr(base_netif, isIPv6, ETH_HLddEN,hdr,&tlen);
+
+		if(ppa_if_is_vlan_if(temp_netif, NULL))
+       			ppa_form_gre_hdr(base_netif, isIPv6, 4, hdr, &tlen);
+		else
+       			ppa_form_gre_hdr(base_netif, isIPv6, 0, hdr, &tlen);
+
+        }
+	p_item->tx_if = temp_netif;
+
+      //ppa_form_gre_hdr(p_item->tx_if, isIPv6,0,hdr,&tlen);
     } else if(IsIpsecSession(p_item)) {
-	ppa_form_ipsec_tunnel_hdr(p_item, hdr,isIPv6);
+	//ppa_form_ipsec_tunnel_hdr(p_item, hdr,isIPv6);
+	ppa_form_ipsec_tunnel_hdr(p_item, s_pkt, hdr,isIPv6);
     }
   }
 
@@ -648,45 +829,38 @@ hdr_done:
   return ret;
 }
 
-void ppa_remove_session_tmpl(void *p_item)
+void ppa_remove_session_tmpl(struct session_list_item *p_item)
 {
   struct session_action *s_act = 
-    (struct session_action*)((struct swa_session_list_item*)p_item)->sessionAction;
+    (struct session_action*)p_item->sessionAction;
   
   if(s_act) {
-    swa_free(s_act->templ_buf); // free templ_buf
-    swa_free(s_act); // free complete session_action
+    ppa_free(s_act->templ_buf); // free templ_buf
+    ppa_free(s_act); // free complete session_action
   }
 }
 
-void ppa_remove_session_mc_tmplbuf(void *sessionAction)
+void ppa_remove_session_mc_tmplbuf(struct session_action *s_act)
 {
-  struct session_action *s_act = 
-    (struct session_action*)sessionAction;
-  
   if(s_act) {
-    //swa_free(s_act->templ_buf); // free templ_buf
-    swa_free(s_act); // free complete session_action
+    ppa_free(s_act); // free complete session_action
   }
 }
 
-
-void * ppa_form_mc_tmplbuf( void *pitem, uint32_t dest_list)
+void * ppa_form_mc_tmplbuf(struct mc_group_list_item *p_item, uint32_t dest_list)
 {
-	struct swa_mc_group_list_item *p_item;
 	struct session_action *sessionAction;
 	uint32_t i, k=0;
 	uint8_t* Hdr;
         uint8_t mc_dst_mac[ETH_ALEN] = { 0x01, 0x00, 0x5E, 0x00, 0x00, 0x01 }; 
 
-	p_item = (struct swa_mc_group_list_item *)pitem; 
 	if (!p_item){
 		dbg_print("pitem = NULL\n");
-		return -1;
+		return NULL;
 	}
 	// filling of session Action
-	sessionAction = (struct session_action *) swa_malloc(sizeof(struct session_action)); 
-	swa_memset(sessionAction, 0, sizeof(struct session_action));
+	sessionAction = (struct session_action *) ppa_malloc(sizeof(struct session_action)); 
+	ppa_memset(sessionAction, 0, sizeof(struct session_action));
 	for (i = 0; i < MAX_PMAC_PORT; i++)
 	{
 		if (dest_list & (1 << i)) {
@@ -702,24 +876,24 @@ void * ppa_form_mc_tmplbuf( void *pitem, uint32_t dest_list)
 	sessionAction->mc_index = 1;
 	sessionAction->mc_way = 1; //Need to enable with new firmware for workaround for VAP level multicast.
 
-	sessionAction->templ_buf = swa_dma(sessionAction->templ_len);
-    	swa_memset(sessionAction->templ_buf, 0, sessionAction->templ_len);
+	sessionAction->templ_buf = ppa_alloc_dma(sessionAction->templ_len);
+    	ppa_memset(sessionAction->templ_buf, 0, sessionAction->templ_len);
 	// filling of templet buffer
 	Hdr = sessionAction->templ_buf;
-	swa_memcpy(Hdr, mc_dst_mac, ETH_ALEN);
-	swa_memcpy(Hdr + ETH_ALEN, p_item->s_mac, ETH_ALEN);
-	 Hdr += ETH_ALEN*2;
+	ppa_memcpy(Hdr, mc_dst_mac, ETH_ALEN);
+	ppa_memcpy(Hdr + ETH_ALEN, p_item->s_mac, ETH_ALEN);
+	Hdr += ETH_ALEN*2;
 	ppa_htons((uint16_t*)Hdr, ETH_P_IP);
 
 	dbg_print("Ifid=%d group_id=%d dest_subifid=%d src_port=%d dst_port=%d  dst_ip=%d.%d.%d.%d src_ip=%d.%d.%d.%d\n", p_item->dest_ifid,
 	 p_item->group_id, p_item->dest_subifid, p_item->src_port, p_item->dst_port, NIPQUAD(p_item->ip_mc_group.ip), NIPQUAD(p_item->source_ip.ip));
 	return sessionAction;
 }
-//EXPORT_SYMBOL(ppa_session_construct_mc_tmplbuf);
-extern struct session_action * (*ppa_construct_mc_template_buf_hook)( void *pitem, uint32_t dest_list);
-extern int32_t (*ppa_construct_template_buf_hook)(void *skb, 
-                                                  void *p_item,
-                                                  void *tx_ifinfo);
+
+extern struct session_action * (*ppa_construct_mc_template_buf_hook)(struct mc_group_list_item *p_item, uint32_t dest_list);
+extern int32_t (*ppa_construct_template_buf_hook)(PPA_BUF *skb,
+                                            struct session_list_item *p_item,
+                                            struct netif_info *tx_ifinfo);
 extern void (*ppa_destroy_template_buf_hook)(void* tmpl_buf);
 extern void (*ppa_session_mc_destroy_tmplbuf_hook)(void* sessionAction);
 
@@ -729,7 +903,7 @@ int32_t ppa_tmplbuf_register_hooks(void)
   ppa_construct_mc_template_buf_hook = ppa_form_mc_tmplbuf;
   ppa_destroy_template_buf_hook = ppa_remove_session_tmpl;
   ppa_session_mc_destroy_tmplbuf_hook = ppa_remove_session_mc_tmplbuf;
-  return SWA_SUCCESS;
+  return PPA_SUCCESS;
 }
 
 void ppa_tmplbuf_unregister_hooks(void)

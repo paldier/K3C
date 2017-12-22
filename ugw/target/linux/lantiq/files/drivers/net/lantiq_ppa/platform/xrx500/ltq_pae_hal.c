@@ -296,6 +296,7 @@ spinlock_t  g_class_lock;
 const static struct pce_cat_conf g_gswr_cat_conf[] = { 
 							{ 1, 0},  
 							{ GSWR_CAT_FILTER_MAX, GSWR_CAT_FILTER_START } , 
+							{ GSWR_CAT_INGQOS_MAX, GSWR_CAT_INGQOS_START } , 
 							{ GSWR_CAT_VLAN_MAX, GSWR_CAT_VLAN_START }, 
 							{ GSWR_CAT_FWD_MAX, GSWR_CAT_FWD_START}, 
 							{ GSWR_CAT_USQOS_MAX, GSWR_CAT_USQOS_START }, 
@@ -307,6 +308,7 @@ const static struct pce_cat_conf g_gswr_cat_conf[] = {
 
 const static struct pce_cat_conf g_gswl_cat_conf[] = {	{ 1, 0},
 							{ GSWL_CAT_FILTER_MAX, GSWL_CAT_FILTER_START } ,
+							{ 0, 0},
 							{ GSWL_CAT_VLAN_MAX, GSWL_CAT_VLAN_START },
 							{ GSWL_CAT_FWD_MAX, GSWL_CAT_FWD_START},
 							{ GSWL_CAT_USQOS_MAX, GSWL_CAT_USQOS_START },
@@ -2593,45 +2595,6 @@ static int32_t init_pae_flows(void)
 	return PPA_FAILURE;
     }
  
-   // GRE traffic - UDP
-    ppa_memset(&rule,0,sizeof(PPA_CLASS_RULE));
-
-    rule.in_dev = GSWR_INGRESS;
-    rule.category = CAT_TUN; 
-
-    rule.pattern.bEnable=1;    
-    rule.pattern.bParserFlagMSB_Enable = 1;
-    rule.pattern.nParserFlagMSB = PCE_PARSER_MSB_UDP_HDR_AFTR_SEC_IP_HDR;
-    rule.pattern.nParserFlagMSB_Mask = ~(PCE_PARSER_MSB_IP_FRAGMT | 
-                                         PCE_PARSER_MSB_OUTR_IPV6_WITH_EXTN_HDR | 
-                                         PCE_PARSER_MSB_IPV4_OPTNS |
-                                         PCE_PARSER_MSB_RT_EXCEP |
-                                         PCE_PARSER_MSB_UDP_HDR_AFTR_SEC_IP_HDR );
-    
-    rule.pattern.bParserFlagLSB_Enable = 1;
-    rule.pattern.nParserFlagLSB = PCE_PARSER_LSB_GRE;
-    rule.pattern.nParserFlagLSB_Mask = ~(PCE_PARSER_LSB_GRE|PCE_PARSER_LSB_CAPWAP);
-
-    rule.action.fwd_action.rtinneripaskey = 1;
-    
-    rule.action.fwd_action.rtdestportmaskcmp = 1;
-    rule.action.fwd_action.rtsrcportmaskcmp = 1;
-    rule.action.fwd_action.rtdstipmaskcmp = 1;
-    rule.action.fwd_action.rtsrcipmaskcmp = 1; 
-    
-    rule.action.fwd_action.routextid_enable = 1;
-    rule.action.fwd_action.routextid = RT_EXTID_UDP;
-    rule.action.fwd_action.rtaccelenable = 1;
-    rule.action.fwd_action.rtctrlenable = 1;
-    
-    rule.action.rmon_action = 1;
-    rule.action.rmon_id = RMON_GRE_CNTR; 
-    
-    if(pae_hal_add_class_rule(&rule)!=PPA_SUCCESS) {
-      dbg( "add udp gre rule returned failure %d\n",ret);
-      return PPA_FAILURE;
-    }
-
     // GRE traffic - TCP
     ppa_memset(&rule,0,sizeof(PPA_CLASS_RULE));
 
@@ -2671,6 +2634,91 @@ static int32_t init_pae_flows(void)
       return PPA_FAILURE;
     }
 
+ // GRE Downstream Multicast
+    ppa_memset(&rule,0,sizeof(PPA_CLASS_RULE));
+
+    rule.in_dev = GSWR_INGRESS;
+    rule.category = CAT_TUN; 
+
+    rule.pattern.bEnable=1;    
+    rule.pattern.bParserFlagMSB_Enable = 1;
+    rule.pattern.nParserFlagMSB = PCE_PARSER_MSB_UDP_HDR_AFTR_SEC_IP_HDR;
+    rule.pattern.nParserFlagMSB_Mask = ~(PCE_PARSER_MSB_IP_FRAGMT | 
+                                         PCE_PARSER_MSB_OUTR_IPV6_WITH_EXTN_HDR | 
+                                         PCE_PARSER_MSB_IPV4_OPTNS |
+                                         PCE_PARSER_MSB_RT_EXCEP |
+                                         PCE_PARSER_MSB_UDP_HDR_AFTR_SEC_IP_HDR );
+    
+    rule.pattern.bParserFlagLSB_Enable = 1;
+    rule.pattern.nParserFlagLSB = PCE_PARSER_LSB_GRE;
+    rule.pattern.nParserFlagLSB_Mask = ~(PCE_PARSER_LSB_GRE|PCE_PARSER_LSB_CAPWAP);
+
+
+    rule.pattern.eInnerDstIP_Select= 1;
+    rule.pattern.nInnerDstIP.nIPv4 = in_aton("224.0.0.0");
+    rule.pattern.nInnerDstIP_Mask= PCE_IPV4_MCAST_MASK; 
+   
+
+    rule.action.fwd_action.rtinneripaskey = 1;
+ 
+    rule.action.fwd_action.rtdestportmaskcmp = 0;
+    rule.action.fwd_action.rtsrcportmaskcmp = 0;
+    rule.action.fwd_action.rtdstipmaskcmp = 1;
+    rule.action.fwd_action.rtsrcipmaskcmp = 1; 
+    
+    rule.action.fwd_action.routextid_enable = 1;
+    rule.action.fwd_action.routextid = RT_EXTID_UDP;
+    rule.action.fwd_action.rtaccelenable = 1;
+    rule.action.fwd_action.rtctrlenable = 1;
+    
+    rule.action.rmon_action = 1;
+    rule.action.rmon_id = RMON_GRE_CNTR; 
+    
+    if(pae_hal_add_class_rule(&rule)!=PPA_SUCCESS) {
+      dbg( "add multicast gre rule returned failure %d\n",ret);
+      return PPA_FAILURE;
+    }
+
+
+   // GRE traffic - UDP
+    ppa_memset(&rule,0,sizeof(PPA_CLASS_RULE));
+
+    rule.in_dev = GSWR_INGRESS;
+    rule.category = CAT_TUN; 
+
+    rule.pattern.bEnable=1;    
+    rule.pattern.bParserFlagMSB_Enable = 1;
+    rule.pattern.nParserFlagMSB = PCE_PARSER_MSB_UDP_HDR_AFTR_SEC_IP_HDR;
+    rule.pattern.nParserFlagMSB_Mask = ~(PCE_PARSER_MSB_IP_FRAGMT | 
+                                         PCE_PARSER_MSB_OUTR_IPV6_WITH_EXTN_HDR | 
+                                         PCE_PARSER_MSB_IPV4_OPTNS |
+                                         PCE_PARSER_MSB_RT_EXCEP |
+                                         PCE_PARSER_MSB_UDP_HDR_AFTR_SEC_IP_HDR );
+    
+    rule.pattern.bParserFlagLSB_Enable = 1;
+    rule.pattern.nParserFlagLSB = PCE_PARSER_LSB_GRE;
+    rule.pattern.nParserFlagLSB_Mask = ~(PCE_PARSER_LSB_GRE|PCE_PARSER_LSB_CAPWAP);
+
+    rule.action.fwd_action.rtinneripaskey = 1;
+    
+    rule.action.fwd_action.rtdestportmaskcmp = 1;
+    rule.action.fwd_action.rtsrcportmaskcmp = 1;
+    rule.action.fwd_action.rtdstipmaskcmp = 1;
+    rule.action.fwd_action.rtsrcipmaskcmp = 1; 
+    
+    rule.action.fwd_action.routextid_enable = 1;
+    rule.action.fwd_action.routextid = RT_EXTID_UDP;
+    rule.action.fwd_action.rtaccelenable = 1;
+    rule.action.fwd_action.rtctrlenable = 1;
+    
+    rule.action.rmon_action = 1;
+    rule.action.rmon_id = RMON_GRE_CNTR; 
+    
+    if(pae_hal_add_class_rule(&rule)!=PPA_SUCCESS) {
+      dbg( "add udp gre rule returned failure %d\n",ret);
+      return PPA_FAILURE;
+    }
+
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
 //IPSec Downstream
     ppa_memset(&rule,0,sizeof(PPA_CLASS_RULE));
@@ -2681,7 +2729,10 @@ static int32_t init_pae_flows(void)
     rule.pattern.bEnable=1;    
     rule.pattern.bProtocolEnable=1;    
     rule.pattern.nProtocol = PCE_PROTO_ESP;
-    rule.pattern.nProtocolMask = ~(0xFF);
+    rule.pattern.nProtocolMask =(u8) ~(0xFF);
+
+    rule.pattern.bParserFlagMSB_Enable = 1;
+    rule.pattern.nParserFlagMSB_Mask = ~(PCE_PARSER_MSB_IP_FRAGMT | PCE_PARSER_MSB_RT_EXCEP);
 
     rule.action.fwd_action.rtctrlenable = 1;
     rule.action.fwd_action.rtaccelenable = 1;
@@ -3781,6 +3832,11 @@ int32_t add_routing_entry(PPE_ROUTING_INFO *route)
 	rt_entry.routeEntry.action.eIpType = GSW_RT_IP_V4;
     }
 
+#if defined(CONFIG_LTQ_PPA_MPE_IP97) 
+    if(( route->tnnl_info.tunnel_type == TUNNEL_TYPE_IPSEC) && (route->f_is_lan)) 
+	route->route_type  = 0x0;
+#endif
+
     if(route->route_type > GSW_ROUTE_MODE_ROUTING ) {
     	if(route->new_ip.f_ipv6) {
 	    rt_entry.routeEntry.action.eIpType = GSW_RT_IP_V6;
@@ -4124,14 +4180,58 @@ int32_t add_wan_mc_entry(PPE_MC_INFO *mc_route)
     // RTP paramters
     //rt_entry.routeEntry.action.bRTPMeasEna = mc_route->sample_en;
     rt_entry.routeEntry.action.bRTPMeasEna = 1; //always enabled
+    rt_entry.routeEntry.action.nRTPSeqNumber = mc_route->group_id; //PAE RTP counter table index
 
     // TUNNEL handling
     //TBD: tunnel information needs to be passed down from the hal selector
+#if 0
     if(mc_route->f_tunnel_rm_enable) {
 	rt_entry.routeEntry.action.bTunnel_Enable=1;
 	rt_entry.routeEntry.action.eTunType = mc_route->tnnl_info.tunnel_type; 
 	rt_entry.routeEntry.action.nTunnelIndex = mc_route->tnnl_info.tunnel_idx;
     }
+#endif
+
+    if( mc_route->tnnl_info.tunnel_type != TUNNEL_TYPE_NULL) {
+
+      rt_entry.routeEntry.action.bTunnel_Enable=1;
+      switch (mc_route->tnnl_info.tunnel_type) {
+
+      case TUNNEL_TYPE_6RD:
+              //rt_entry.routeEntry.action.eIpType = GSW_RT_IP_V6;
+          rt_entry.routeEntry.action.eTunType = GSW_ROUTE_TUNL_6RD;
+          break;
+      case TUNNEL_TYPE_DSLITE:
+              //rt_entry.routeEntry.action.eIpType = GSW_RT_IP_V4;
+          rt_entry.routeEntry.action.eTunType = GSW_ROUTE_TUNL_DSLITE;
+          break;
+#if defined(L2TP_CONFIG) && L2TP_CONFIG
+      case TUNNEL_TYPE_L2TP:
+          	rt_entry.routeEntry.action.eTunType = GSW_ROUTE_TUNL_L2TP; 
+          break;
+#endif
+      case TUNNEL_TYPE_CAPWAP:
+          rt_entry.routeEntry.action.eTunType = GSW_ROUTE_TUNL_NULL;
+          break;
+      case TUNNEL_TYPE_EOGRE:
+      case TUNNEL_TYPE_IPOGRE:
+      case TUNNEL_TYPE_IP6OGRE:
+      case TUNNEL_TYPE_6EOGRE:
+    	    if(mc_route->f_ipv6) 
+	    {
+              	rt_entry.routeEntry.action.eTunType = GSW_ROUTE_TUNL_6RD;
+	    }
+            else
+	    {
+            	rt_entry.routeEntry.action.eTunType = GSW_ROUTE_TUNL_DSLITE;
+	    }
+          break;
+
+      default:
+          break;
+      }
+    }
+
     
     rt_entry.routeEntry.action.eSessDirection = 0; // only mc downstream traffic is supported by PPA
     rt_entry.routeEntry.action.eSessRoutingMode = 1; //no NAT for multicast GSW_ROUTE_MODE_ROUTING 
@@ -4194,6 +4294,11 @@ int32_t del_wan_mc_entry(PPE_MC_INFO *mc_route)
 
     //TBD: get_routing_extension_id() needs to take appropriate input parameters differentiate the flow rules configured
     rt_entry.routeEntry.pattern.nRoutExtId = get_routing_extension_id(IP_PROTO_UDP); //always UDP 
+
+
+    rt_entry.routeEntry.action.bRTPMeasEna = 1; //always enabled
+    rt_entry.routeEntry.action.nRTPSeqNumber = mc_route->group_id; //PAE RTP counter table index
+
 
     if(mc_route->f_ipv6) {
 	ppa_memcpy(rt_entry.routeEntry.pattern.nSrcIP.nIPv6,mc_route->src_ipv6_info.ip.ip6,sizeof(uint16_t)*8);
@@ -4316,15 +4421,51 @@ EXPORT_SYMBOL(del_bridging_entry);
 uint32_t add_br_port(PPA_BR_PORT_INFO *br_info)
 {
 
-    PPA_CLASS_RULE class_info = {0};   
+    PPA_CLASS_RULE class_info = {0};
+    GSW_VLAN_IdCreate_t vlan_info = {0}; 
+    GSW_VLAN_portMemberAdd_t vlan_member = {0};
+    
+     ppa_memset(&class_info, 0, sizeof(PPA_CLASS_RULE));   
 
     class_info.in_dev = GSWR_INGRESS;
     class_info.category = CAT_VLAN;
     class_info.pattern.bEnable=1;
     class_info.pattern.bPortIdEnable=1;
     class_info.pattern.nPortId = br_info->port;
+
+    if(br_info->subif_en) {
+	class_info.pattern.bSubIfIdEnable = 1;
+	class_info.pattern.nSubIfId = ((br_info->subif) & 0xF00) >> 8;
+//	printk("pcerule subifid = %d\n", class_info.pattern.nSubIfId);
+    }
+
+    if(br_info->vid) {    
+        class_info.pattern.bVid = 1;  // BUG in switchapi this overwrite the port information.
+        class_info.pattern.nVid = br_info->vid; 	
+
+    	//create vlan in switch
+    	vlan_info.nVId = br_info->vid;
+    	vlan_info.nFId = br_info->brid;   
+    	if((ltq_try_gswapi_kioctl( GSW_VLAN_ID_CREATE, (unsigned int)&vlan_info)) < GSW_statusOk) {
+	   dbg("ppa add vlan entry exists\n");	
+    	}
+ 
+    	//make CPU port as member of the vlan with tag egress enabled
+    	vlan_member.nVId = br_info->vid;
+    	vlan_member.nPortId = 0; //CPU port
+    	vlan_member.bVLAN_TagEgress = 1; //egress tagging enabled
+    	if((ltq_try_gswapi_kioctl( GSW_VLAN_PORT_MEMBER_ADD, (unsigned int)&vlan_member)) < GSW_statusOk) {
+		dbg("ppa adding vlan membership entry exists\n");	
+    	}
+
+    }
+
     class_info.action.vlan_action.cvlan = VLAN_ALTERNATIVE;  
+    class_info.action.vlan_action.vlan_id = br_info->vid;  
     class_info.action.vlan_action.fid = br_info->brid;
+    
+    class_info.action.rmon_action = 1;
+    class_info.action.rmon_id = RMON_BRIDGE_CNTR-br_info->brid;
     
     if(pae_hal_add_class_rule(&class_info)!=PPA_SUCCESS) {
 	dbg( "add_br_port: add class rule failed\n");
@@ -4358,7 +4499,7 @@ uint32_t del_br_port(PPA_BR_PORT_INFO *br_info)
 int32_t del_tunnel_entry(uint32_t tunnel_idx)
 {
     GSW_ROUTE_Tunnel_Entry_t t_entry={0};
-    uint32_t ret = PPA_FAILURE;
+    int32_t ret = PPA_FAILURE;
    
     ppa_memset(&t_entry,0,sizeof(t_entry));
     
@@ -4642,7 +4783,8 @@ int32_t  del_lro_entry(uint8_t sessionid)
 #endif
     sessionid-=1;
 
-    if(sessionid < 0 || sessionid >= MAX_LRO_ENTRIES) {
+    //if(sessionid < 0 || sessionid >= MAX_LRO_ENTRIES) {
+    if(sessionid >= MAX_LRO_ENTRIES) {
 	dbg("Invalid LRO rule index\n");
 	return PPA_FAILURE;
     }
@@ -4712,11 +4854,13 @@ int32_t add_vlan_entry(PPE_OUT_VLAN_INFO *vlan_entry)
 {
     int ret=0;
     GSW_PCE_EgVLAN_Entry_t egV={0};
+    GSW_SVLAN_cfg_t svlancfg={0};
 
     if(vlan_entry->port_id < MAX_PAE_PORTS) {
 	//The sub interface id 16 is always used for no vlan acion behavior on the interface
 	//will be set during the initialization of PAE HAL
-	if( (vlan_entry->subif_id < 0) && ((vlan_entry->subif_id > (vlan_tbl_size[vlan_entry->port_id] - 1)) || (vlan_entry->subif_id > (MAX_SUBIF_IDS - 1))) ) {
+	//if( (vlan_entry->subif_id < 0) && ((vlan_entry->subif_id > (vlan_tbl_size[vlan_entry->port_id] - 1)) || (vlan_entry->subif_id > (MAX_SUBIF_IDS - 1))) ) {
+	if( ((vlan_entry->subif_id > (vlan_tbl_size[vlan_entry->port_id] - 1)) || (vlan_entry->subif_id > (MAX_SUBIF_IDS - 1))) ) {
 	    // sub interfaces range <1 -15> can be used 
 	    dbg("subif_if out of range\n");
 	    return PPA_FAILURE;	
@@ -4725,6 +4869,16 @@ int32_t add_vlan_entry(PPE_OUT_VLAN_INFO *vlan_entry)
 	//will be set during the initialization of PAE HAL
 	    vlan_entry->vlan_entry = vlan_tbl_base[vlan_entry->port_id]; 
 	    return PPA_SUCCESS;    
+	}
+
+	//switch_cli dev=1 GSW_SVLAN_CFG_SET nEthertype=0x88a8
+	if(vlan_entry->vlan_type == PPA_VLAN_PROTO_8021AD){
+	    svlancfg.nEthertype = PPA_VLAN_PROTO_8021AD;		
+	    if((ret=ltq_try_gswapi_kioctl( GSW_SVLAN_CFG_SET,(unsigned int)&svlancfg)) < GSW_statusOk) {
+		dbg("GSW_SVLAN_CFG_SET returned faulure%d\n",ret);
+	    } else {
+		dbg("SVLAN type set to %x\n",PPA_VLAN_PROTO_8021AD);
+	    } 
 	}
 
 	ppa_memset (&egV, 0x00, sizeof(egV));
@@ -4769,7 +4923,8 @@ int32_t del_vlan_entry(PPE_OUT_VLAN_INFO *vlan_entry)
 	//The sub interface id 0 is used for un tagged behavior on the base interface. 
 	//and the sub interface id 16 is always used for no vlan acion behavior on the interface
 	//will be set during the initialization of PAE HAL
-	if( (vlan_entry->subif_id < 0) && ((vlan_entry->subif_id > (vlan_tbl_size[vlan_entry->port_id] - 1)) || (vlan_entry->subif_id > (MAX_SUBIF_IDS - 1))) ) {
+	//if( (vlan_entry->subif_id < 0) && ((vlan_entry->subif_id > (vlan_tbl_size[vlan_entry->port_id] - 1)) || (vlan_entry->subif_id > (MAX_SUBIF_IDS - 1))) ) {
+	if( ((vlan_entry->subif_id > (vlan_tbl_size[vlan_entry->port_id] - 1)) || (vlan_entry->subif_id > (MAX_SUBIF_IDS - 1))) ) {
 	    // sub interfaces range <1 -15> can be used 
 	    dbg("%s: Invalid Subifid !!\n", __func__ );
 	    return PPA_FAILURE;	
@@ -5336,6 +5491,9 @@ int32_t  swap_pce_rules(ppa_class_devingress_t ing_dev, ppa_class_category_t cat
 //	printk(KERN_INFO" %s %s %d t_idx=%d\n", __FILE__, __FUNCTION__, __LINE__, t_idx);
 	pce_rule_read(&gsw_handle, &pcerule, t_idx);
 //	printk(KERN_INFO" %s %s %d calling pce_rule_write\n", __FILE__, __FUNCTION__, __LINE__);
+	if(pcerule.action.nFId){
+		pcerule.action.eVLAN_Action = 2; //VLAN_ALTERNATIVE 
+	}
 	ret=pce_rule_write(&gsw_handle, &pcerule, *index);
 	class_dev[ing_dev].cat_map[cat].cat_idx_vect[ordr].index=*index;
 	class_dev[ing_dev].cat_ordr_vect[*index] = class_dev[ing_dev].cat_ordr_vect[t_idx];
@@ -5724,6 +5882,8 @@ static void init_pae_ports(void)
 	ltq_try_gswapi_kioctl( GSW_REGISTER_SET, (unsigned int)&dataCfg);
 		
     }
+    // clear the mac table
+    ltq_try_gswapi_kioctl( GSW_MAC_TABLE_CLEAR, 0);
 
 #ifdef A11_WORKAROUND
 //kamal: workaround to be removed in A21

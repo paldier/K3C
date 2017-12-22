@@ -24,7 +24,7 @@
            software fastpath wrapper function declarations
 */
 
-extern signed long sw_fastpath_send(PPA_BUF *skb);
+extern signed long sw_fastpath_send(PPA_SKBUF *skb);
 extern signed long get_sw_fastpath_status(unsigned long *f_enable, unsigned long flags);
 extern signed long sw_fastpath_enable(unsigned long f_enable, unsigned long flags);
 
@@ -34,9 +34,9 @@ extern signed long sw_update_session(PPA_BUF *skb, struct session_list_item *p_i
 
 extern int32_t (*ppa_sw_fastpath_enable_hook)(uint32_t, uint32_t);
 extern int32_t (*ppa_get_sw_fastpath_status_hook)(uint32_t *, uint32_t);
-extern int32_t (*ppa_sw_fastpath_send_hook)(PPA_BUF *);
+extern int32_t (*ppa_sw_fastpath_send_hook)(PPA_SKBUF *);
 #if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
-extern int32_t (*ppa_sw_litepath_tcp_send_hook)(PPA_BUF *);
+extern int32_t (*ppa_sw_litepath_tcp_send_hook)(PPA_SKBUF *);
 #endif
 extern int32_t (*ppa_sw_add_session_hook)(PPA_BUF *skb, struct session_list_item *p_item);
 extern int32_t (*ppa_sw_update_session_hook)(PPA_BUF *skb, struct session_list_item *p_item,struct netif_info *tx_ifinfo);

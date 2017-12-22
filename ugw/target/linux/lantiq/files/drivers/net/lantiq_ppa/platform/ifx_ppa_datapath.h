@@ -270,7 +270,7 @@ extern  int (*ifx_ppa_drv_ppe_pwm_change_hook)(unsigned int, unsigned int); //  
 
 #ifdef CONFIG_IFX_PPA_API_DIRECTPATH
 extern struct ppe_directpath_data *ifx_ppa_drv_g_ppe_directpath_data;
-extern  int (*ifx_ppa_drv_directpath_send_hook)(uint32_t, PPA_BUF *, int32_t, uint32_t);
+extern  int (*ifx_ppa_drv_directpath_send_hook)(uint32_t, PPA_SKBUF *, int32_t, uint32_t);
 extern  int (*ifx_ppa_drv_directpath_rx_stop_hook)(uint32_t, uint32_t);
 extern  int (*ifx_ppa_drv_directpath_rx_start_hook)(uint32_t, uint32_t);
 #endif

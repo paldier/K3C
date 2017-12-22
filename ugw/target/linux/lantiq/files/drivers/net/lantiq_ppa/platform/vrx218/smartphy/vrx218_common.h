@@ -305,6 +305,10 @@ extern void __put_skb_to_dbg_pool(struct sk_buff *, const char *, unsigned int);
 extern int g_smartphy_port_num;
 extern int (*g_smartphy_push_fn)(struct sk_buff *, struct flag_header *, unsigned int);
 extern void xet_phy_wan_port(uint32_t port, uint32_t *flags, uint32_t wanmode, int xmode);
+extern int32_t (*ppa_hook_ppa_phys_port_add_fn)(PPA_IFNAME *ifname, uint32_t port);
+extern void (*ppa_hook_ppa_phys_port_remove_fn)(uint32_t port);
+extern uint32_t *g_phys_port_atm_wan_get;
+extern uint32_t *g_phys_port_atm_wan_vlan_get;
 
 
 #endif  //  __VRX218_COMMON_H__

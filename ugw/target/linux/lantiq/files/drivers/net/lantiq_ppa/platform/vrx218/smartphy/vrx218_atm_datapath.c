@@ -2296,8 +2296,10 @@ static struct sk_buff* skb_break_away_from_protocol(struct sk_buff *skb)
     nf_conntrack_put(new_skb->nfct);
     new_skb->nfct = NULL;
   #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
-    nf_conntrack_put_reasm(new_skb->nfct_reasm);
-    new_skb->nfct_reasm = NULL;
+    #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,12)
+      nf_conntrack_put_reasm(new_skb->nfct_reasm);
+      new_skb->nfct_reasm = NULL;
+    #endif
   #endif
   #ifdef CONFIG_BRIDGE_NETFILTER
     nf_bridge_put(new_skb->nf_bridge);

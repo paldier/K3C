@@ -288,7 +288,7 @@ MODULE_PARM_DESC(wanqos_en, "WAN QoS support, 1 - enabled, 0 - disabled.");
 
 #define DEBUG_SEND_PROC                         1
 
-#define DEBUG_MIRROR_PROC                       0
+#define DEBUG_MIRROR_PROC                       1
 
 #define PPE_MAILBOX_IGU0_INT                    INT_NUM_IM2_IRL23
 
@@ -4164,7 +4164,7 @@ static struct sk_buff* skb_break_away_from_protocol(struct sk_buff *skb)
     nf_conntrack_put(new_skb->nfct);
     new_skb->nfct = NULL;
   #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
-  #if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 102)))
+  #if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 104)))
     nf_conntrack_put_reasm(new_skb->nfct_reasm);
     new_skb->nfct_reasm = NULL;
   #endif
@@ -6857,7 +6857,6 @@ static int proc_read_dsl_vlan_seq_open(struct inode *inode, struct file *file)
     return single_open(file, proc_read_dsl_vlan, NULL);
 }
 
-#if defined(DEBUG_MIRROR_PROC) && DEBUG_MIRROR_PROC
 static struct file_operations g_proc_file_mirror_seq_fops = {
     .owner      = THIS_MODULE,
     .open       = proc_read_mirror_seq_open,
@@ -6871,7 +6870,6 @@ static int proc_read_mirror_seq_open(struct inode *inode, struct file *file)
 {
     return single_open(file, proc_read_mirror, NULL);
 }
-#endif
 
 static struct file_operations g_proc_file_class_seq_fops = {
     .owner      = THIS_MODULE,

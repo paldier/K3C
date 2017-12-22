@@ -5,6 +5,79 @@
 
 [ -e /etc/config/network ] && exit 0
 
+gen_mac() {
+	local base_addr
+	local mac_addr=""
+	local index=$(($1 - 1))
+	base_addr=`uboot_env --get --name ethaddr`
+	mac_addr="${base_addr:0:15}`printf "%02X" $((0x${base_addr:15:2} + 0x$index))` "
+	echo $mac_addr
+}
+
+get_ipaddr() {
+	ipaddr=`uboot_env --get --name ipaddr 2>/dev/null`
+	[ -z "$ipaddr" ] && ipaddr="192.168.1.1"
+}
+
+add_eth() {
+	local index=$1
+	local interface=$2
+	local macaddr=$3
+	uci batch <<EOF
+set network.${interface}='interface'
+set network.${interface}.ifname='$index'
+set network.${interface}.macaddr='${macaddr}'
+EOF
+}
+
+add_wan() {
+	local name=$1
+	local interface=$2
+	local macaddr=$3
+	uci batch <<EOF
+set network.${interface}='interface'
+set network.${interface}.ifname='$name'
+set network.${interface}.proto='dhcp'
+set network.${interface}.macaddr='${macaddr}'
+EOF
+}
+
+add_interface_lan() {
+	local ifname=$1
+	get_ipaddr;
+
+	uci batch <<EOF
+del network.lan
+set network.lan='interface'
+set network.lan.proto='static'
+set network.lan.ipaddr='$ipaddr'
+set network.lan.netmask='255.255.255.0'
+set network.lan.defaultroute='0'
+set network.lan.type='bridge'
+set network.lan.ifname='$ifname'
+set network.lan.forward_delay='15'
+set network.lan.priority='32768'
+set network.lan.ip6assign='64'
+set network.lan.rps='0'
+set network.lan.xps='0'
+set network.lan.ip6addr='fc00::1/64'
+EOF
+}
+
+add_interface_loopback() {
+    uci batch <<EOF
+del network.loopback
+set network.loopback='interface'
+set network.loopback.proto='static'
+set network.loopback.ipaddr='127.0.0.1'
+set network.loopback.netmask='255.0.0.0'
+set network.loopback.defaultroute='0'
+set network.loopback.ifname='lo'
+set network.globals='globals'
+set network.globals.ula_prefix='fc00::/64'
+EOF
+}
+
 set_atm_wan() {
 	local vpi=$1
 	local vci=$2
@@ -35,6 +108,32 @@ set network.adsl.annex='$annex'
 EOF
 }
 
+add_switch_port() {
+	local name=$1
+	local device=$2
+	local port=$3
+	local pvid=$4
+	uci batch <<EOF
+set network.$name='switch_port'
+set network.$name.device='$device'
+set network.$name.port='$port'
+EOF
+	[ -n "$pvid" ] && {
+	uci batch <<EOF
+set network.$name.pvid='$pvid'
+EOF
+	}
+}
+
+enable_switch() {
+	local name=$1
+	local enable=$2
+	uci batch <<EOF
+set network.$name='switch'
+set network.$name.enable='$enable'
+EOF
+}
+
 . /lib/functions/uci-defaults.sh
 . /lib/lantiq.sh
 
@@ -52,6 +151,104 @@ board=$(lantiq_board_name)
 dsl=$(lantiq_soc_has_adsl)
 
 case "$board" in
+EASY330\ VDSL\ BOND)
+	enable_switch "switch0" "1"
+	ucidef_add_switch_vlan "switch0" "0" "0 1 2 3 5"
+	ucidef_add_switch_vlan "switch0" "1" "4t 5"
+	add_switch_port "eth0_1" "switch0" "2" "501"
+	add_switch_port "eth0_2" "switch0" "0" "501"
+	add_switch_port "eth0_3" "switch0" "3" "501"
+	add_switch_port "eth0_4" "switch0" "1" "501"
+	add_switch_port "eth1" "switch0" "4" "502"
+	add_switch_port "cpu" "switch0" "5" "500"
+	add_switch_port "lte" "switch0" "6" "502"
+	add_switch_port "dsl1" "switch0" "10" "502"
+	add_switch_port "dsl2" "switch0" "11" "502"
+
+	add_interface_loopback
+	add_interface_lan "eth0_1 eth0_2 eth0_3 eth0_4"
+
+	for i in 1 2 3 4; do
+		macaddr=`gen_mac $i`
+		add_eth "eth0_$i" "iface_eth0_$i" "$macaddr"
+	done
+
+	i=$((i + 1))
+	macaddr=`gen_mac $i`
+	add_wan "eth1" "eth1_wan" "$macaddr"
+	;;
+
+EASY330\ ETH\ RT)
+	enable_switch "switch0" "1"
+	ucidef_add_switch_vlan "switch0" "0" "0 1 2 3 5"
+	ucidef_add_switch_vlan "switch0" "1" "4t 5"
+	add_switch_port "eth0_1" "switch0" "2" "501"
+	add_switch_port "eth0_2" "switch0" "0" "501"
+	add_switch_port "eth0_3" "switch0" "3" "501"
+	add_switch_port "eth0_4" "switch0" "1" "501"
+	add_switch_port "eth1" "switch0" "4" "502"
+	add_switch_port "cpu" "switch0" "5" "500"
+	add_switch_port "lte" "switch0" "6" "502"
+
+	add_interface_loopback
+	add_interface_lan "eth0_1 eth0_2 eth0_3 eth0_4"
+
+	for i in 1 2 3 4; do
+		macaddr=`gen_mac $i`
+		add_eth "eth0_$i" "iface_eth0_$i" "$macaddr"
+	done
+
+	i=$((i + 1))
+	macaddr=`gen_mac $i`
+	add_wan "eth1" "eth1_wan" "$macaddr"
+	;;
+
+EASY300\ AC1200)
+	enable_switch "switch0" "1"
+	ucidef_add_switch_vlan "switch0" "0" "3 1 5"
+	ucidef_add_switch_vlan "switch0" "1" "0t 5"
+	add_switch_port "eth0_1" "switch0" "3" "501"
+	add_switch_port "eth0_2" "switch0" "1" "501"
+	add_switch_port "eth1" "switch0" "0" "502"
+	add_switch_port "cpu" "switch0" "5" "500"
+	add_switch_port "lte" "switch0" "6" "502"
+	add_switch_port "dsl1" "switch0" "10" "502"
+
+	add_interface_loopback
+	add_interface_lan "eth0_1 eth0_2"
+
+	for i in 1 2; do
+		macaddr=`gen_mac $i`
+		add_eth "eth0_$i" "iface_eth0_$i" "$macaddr"
+	done
+
+	i=$((i + 1))
+	macaddr=`gen_mac $i`
+	add_wan "eth1" "eth1_wan" "$macaddr"
+	;;
+
+EASY350*)
+	enable_switch "switch0" "1"
+	enable_switch "switch1" "1"
+	add_switch_port "eth0_1" "switch0" "1"
+	add_switch_port "eth0_2" "switch0" "2"
+	add_switch_port "eth0_3" "switch0" "3"
+	add_switch_port "eth0_4" "switch0" "4"
+	add_switch_port "eth1" "switch1" "14"
+
+	add_interface_loopback
+	add_interface_lan "eth0_1 eth0_2 eth0_3 eth0_4"
+
+	for i in 1 2 3 4; do
+		macaddr=`gen_mac $i`
+		add_eth "eth0_$i" "iface_eth0_$i" "$macaddr"
+	done
+
+	i=$((i + 1))
+	macaddr=`gen_mac $i`
+	add_wan "eth1" "eth1_wan" "$macaddr"
+	;;
+
 # annex B with adm6996
 ARV4520PW)
 	ucidef_set_interface_lan "eth0.1"
@@ -81,6 +278,7 @@ ARV7525PW|ARV4525PW|*)
 esac
 
 [ -z "$dsl" ] || set_atm_wan "$vpi" "$vci" "$encaps" "$payload"
+
 
 uci commit network
 

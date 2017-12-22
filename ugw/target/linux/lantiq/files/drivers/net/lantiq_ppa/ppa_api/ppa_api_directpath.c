@@ -141,6 +141,17 @@ static uint32_t g_start_ifid = 0, g_end_ifid = MAX_PID * MAX_VPID;
 #else
 static uint32_t g_start_ifid = ~0, g_end_ifid = ~0;
 #endif
+#if defined(CONFIG_LTQ_PPA_API_DIRECTPATH_HAS_NEW_API)
+#define PPA_LEGACY_IFID_REG_DONE_NO_SUBIF 0x00000001
+#define PPA_LEGACY_RADIO_REG_DONE         0x00000010
+typedef struct {
+        int32_t port_id;  /*!< Datapath Port Id */
+        int32_t subif; /*!< Sub-interface Id info */
+	int32_t flags;
+} PPA_LEGACY_IFID_SUBIF_MAP;
+
+PPA_LEGACY_IFID_SUBIF_MAP ifid_subif_map[7];
+#endif
 
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
 #if defined(CONFIG_LTQ_PPA_COC_SUPPORT)
@@ -167,6 +178,14 @@ PPA_TIMESPEC		g_timespent = {0};// Time spent in EWMA window
  *            Local Function
  * ####################################
  */
+static inline void get_pkt_rx_dst_mac_addr(PPA_SKBUF *ppa_buf, uint8_t mac[PPA_ETH_ALEN])
+{
+#ifdef CONFIG_MIPS
+    if ( (uint32_t)skb_mac_header(ppa_buf) >= KSEG0 )
+#endif
+        ppa_memcpy(mac, skb_mac_header(ppa_buf), PPA_ETH_ALEN);
+}
+
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
 #if defined(CONFIG_LTQ_PPA_COC_SUPPORT)
 uint32_t ppa_dp_coc_reset_ewma_stats( uint32_t flags)
@@ -176,14 +195,14 @@ uint32_t ppa_dp_coc_reset_ewma_stats( uint32_t flags)
         return PPA_SUCCESS;
 }
 
-uint32_t ppa_dp_coc_store_ewma( PPA_BUF *ppa_buf, uint32_t flags)
+uint32_t ppa_dp_coc_store_ewma( PPA_SKBUF *ppa_buf, uint32_t flags)
 {
 	g_ewma_session_bytes   += ppa_buf->len + PPA_ETH_HLEN + PPA_ETH_CRCLEN;
 	g_ewma_num_adds ++;
         return PPA_SUCCESS;
 }
 
-uint32_t  ppa_dp_coc_record_time(PPA_BUF *ppa_buf,uint32_t flags)
+uint32_t  ppa_dp_coc_record_time(PPA_SKBUF *ppa_buf,uint32_t flags)
 {
         PPA_TIMESPEC before;
         if ( g_ewma_num_adds == 1 ) { // checking for one cause for each session for first packet ppa_session_store_ewma() will get called 
@@ -198,7 +217,7 @@ uint32_t  ppa_dp_coc_record_time(PPA_BUF *ppa_buf,uint32_t flags)
 }
 
 
-uint32_t ppa_dp_coc_pass_criteria(PPA_SUBIF *subif, PPA_BUF *skb, uint32_t flags)
+uint32_t ppa_dp_coc_pass_criteria(PPA_SUBIF *subif, PPA_SKBUF *skb, uint32_t flags)
 {
 	uint64_t time_msec =0;
 	uint64_t total_bytes =0;
@@ -256,7 +275,7 @@ uint32_t ppa_dp_coc_pass_criteria(PPA_SUBIF *subif, PPA_BUF *skb, uint32_t flags
 
 }
 
-uint32_t ppa_dp_ewma_coc(PPA_SUBIF *subif, PPA_BUF *skb, uint32_t flags)
+uint32_t ppa_dp_ewma_coc(PPA_SUBIF *subif, PPA_SKBUF *skb, uint32_t flags)
 {
 	if(ppa_dp_coc_pass_criteria(subif, skb, flags) == PPA_SUCCESS)
 	{
@@ -294,13 +313,13 @@ static void update_itf_info(void)
     }
 }
 
-static PPA_BUF *__remove_directpath_dev_from_datapath(int if_id)
+static PPA_SKBUF *__remove_directpath_dev_from_datapath(int if_id)
 {
     //unsigned long sys_flag;
     uint32_t tmp_flags;
     
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_QUEUE_SIZE) || defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_QUEUE_PKTS)
-    PPA_BUF *skb_list = NULL;
+    PPA_SKBUF *skb_list = NULL;
 #endif
     
     if ( (ppa_drv_g_ppe_directpath_data[if_id].flags & PPE_DIRECTPATH_DATA_ENTRY_VALID) )
@@ -327,9 +346,9 @@ static PPA_BUF *__remove_directpath_dev_from_datapath(int if_id)
 }
 
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_QUEUE_SIZE) || defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_QUEUE_PKTS)
-static int remove_directpath_queue(PPA_BUF *skb_list)
+static int remove_directpath_queue(PPA_SKBUF *skb_list)
 {
-    PPA_BUF *skb, *skb_list_bak;
+    PPA_SKBUF *skb, *skb_list_bak;
 
     if ( skb_list )
     {
@@ -337,7 +356,7 @@ static int remove_directpath_queue(PPA_BUF *skb_list)
       do
       {
           skb = skb_list;
-          skb_list = ppa_buf_get_next(skb_list);
+          skb_list = (skb_list != NULL ? skb_list->next : NULL);
           ppa_buf_free(skb);
       } while ( skb_list != NULL && skb_list != skb_list_bak );
     }
@@ -454,11 +473,6 @@ int32_t ppa_directlink_register_dev(
 
 		return ret;
 	} else {
-		printk("%s: port %d  1 subif %d\n", __func__, subIf->port_id, subIf->subif);
-		g_DL_Init--;
-		if (g_DL_Init < 0)
-			g_DL_Init = 0;
-		printk("%s: Fix deregister for QCA %d\n", __func__, g_DL_Init);
 		if (subIf->subif != -1) {
 			/* unregister wifi device */
 			//if (ppa_directpath_register_dev(&port_id,
@@ -471,14 +485,6 @@ int32_t ppa_directlink_register_dev(
 						__func__
 				      );
 				return PPA_ENOMEM;
-			}
-			if(mpe_hal_feature_start_fn) {
-				if(g_DL_Init == 0) {
-					if(mpe_hal_feature_start_fn(DL_TX_1, subIf->port_id, NULL, F_FEATURE_STOP) != PPA_SUCCESS) {
-						printk("%s: Feature stop failed !\n");
-						goto reg_err1;
-					}
-				}
 			}
 		} else {
 			f_wifi_register = 1;
@@ -493,11 +499,12 @@ int32_t ppa_directlink_register_dev(
 				return PPA_ENOMEM;
 			}
 			if(mpe_hal_feature_start_fn) {
-				if(g_DL_Init == 0) {
+				if(g_DL_Init != 0) {
 					if(mpe_hal_feature_start_fn(DL_TX_1, subIf->port_id, NULL, F_FEATURE_STOP) != PPA_SUCCESS) {
 						printk("%s: Feature stop failed !\n");
 						goto reg_err1;
 					}
+					g_DL_Init =0;
 				}
 			}
 		}
@@ -572,13 +579,52 @@ int32_t ppa_directlink_register_dev(int32_t *p_if_id, PPA_DTLK_T *dtlk, PPA_DIRE
 #endif
 
 /* =====================  */
+#if defined(CONFIG_LTQ_PPA_API_DIRECTPATH_HAS_NEW_API)
+int32_t ppa_directpath_get_subif_legacy(int32_t portid)
+{
+	int32_t i=0, temp = -1;
+        printk("%s: get subif for port id:%d\n", __func__,portid); 
+	for(i=0; i<5 ;i++)
+	{
+		if(ifid_subif_map[i].port_id == portid) {
+			if(ifid_subif_map[i].subif == -1) {
+				break;
+			}
+        		printk("%s: last subif for port id:%d is %d\n", __func__,portid, temp); 
+			temp = ifid_subif_map[i].subif;
+		}
+	}
+	return temp + 1;
+}
+int32_t ppa_directpath_get_ifid_from_subif(int32_t portid, int32_t subif)
+{
+	int32_t i=0, temp;
+	for(i=0; i<5 ;i++)
+	{
+		//printk("<%s> i=%d port:%d subif:%d flags: %x\n",__func__,i,ifid_subif_map[i].port_id,ifid_subif_map[i].subif, ifid_subif_map[i].flags);
+		if((ifid_subif_map[i].port_id == portid) && (ifid_subif_map[i].subif == subif)) {
+			return i;
+		}
+	}
+	if(i == 4)
+		return -1;
+}
+void dump_ifid_subif_map_tbl(void)
+{
+	int32_t i=0;
+	for(i=0; i<5 ;i++)
+	{
+		printk("<%s> i=%d port:%d subif:%d flags: %x\n",__func__,i,ifid_subif_map[i].port_id,ifid_subif_map[i].subif, ifid_subif_map[i].flags);
+	}
+}
+#endif
 
 int32_t ppa_directpath_register_dev_legacy(uint32_t *p_if_id, PPA_NETIF *netif, PPA_DIRECTPATH_CB *pDirectpathCb, uint32_t flags)
 {
     int32_t ret;
     uint32_t if_id;
     uint32_t tmp_flags;
-    PPA_BUF *skb_list = NULL;
+    PPA_SKBUF *skb_list = NULL;
 
     if( !ppa_is_init() ) return PPA_EINVAL;
 
@@ -683,7 +729,7 @@ int32_t ppa_directpath_register_dev_ex(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_D
     int32_t ret;
     int32_t if_id;
     uint32_t tmp_flags;
-    PPA_BUF *skb_list = NULL;
+    PPA_SKBUF *skb_list = NULL;
 
     if( !ppa_is_init() ) return PPA_EINVAL;
 
@@ -817,6 +863,7 @@ int32_t ppa_directpath_register_dev_ex(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_D
 
 int32_t ppa_directpath_ex_register_dev(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_DIRECTPATH_CB *pDirectpathCb, uint32_t flags)
 {
+	int32_t ret;
     	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "Entry - Port id :%d\n", subif->port_id);
 	if(flags & PPE_DIRECTPATH_LEGACY)
 	{
@@ -824,10 +871,10 @@ int32_t ppa_directpath_ex_register_dev(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_D
 
         	return ppa_directpath_register_dev_ex(subif, netif, pDirectpathCb, flags);        
 #else
-		int32_t ret, if_id;
+		int32_t  if_id;
 		if_id = subif->port_id;
 		ret = ppa_directpath_register_dev_legacy(&if_id, netif, pDirectpathCb, flags);
-		if(ret != PPA_FAILURE)
+		if(ret == PPA_SUCCESS)
 			subif->port_id = if_id;
 		return ret;
 #endif
@@ -835,7 +882,72 @@ int32_t ppa_directpath_ex_register_dev(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_D
 #if (defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500) || (defined(CONFIG_PPA_PUMA7) && CONFIG_PPA_PUMA7)
     		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "For grx500 platform - Port id :%d\n", subif->port_id);
         	return ppa_directpath_register_dev_ex(subif, netif, pDirectpathCb, flags);        
-
+#else //for legacy platform but new API
+#if defined(CONFIG_LTQ_PPA_API_DIRECTPATH_HAS_NEW_API)
+		int32_t if_id;
+		if_id = subif->port_id;		 
+		printk("<%s> Entry subif =%d netif: %s\n",__FUNCTION__, subif->subif, netif->name);
+		if(subif->port_id == -1)
+		{
+			ret = ppa_directpath_register_dev_legacy(&if_id, netif, pDirectpathCb, flags);
+			//if_id = 4;
+			if(ret == PPA_SUCCESS) {
+				subif->port_id = if_id;
+				ifid_subif_map[if_id - g_start_ifid].port_id = if_id;
+				ifid_subif_map[if_id - g_start_ifid].subif = -1;
+				ifid_subif_map[if_id - g_start_ifid].flags = PPA_LEGACY_IFID_REG_DONE_NO_SUBIF;
+			}
+		} else if(subif->port_id > 0) {
+			if ( (flags & PPA_F_DIRECTPATH_REGISTER) )
+			{
+				printk("Register\n");
+				if((ifid_subif_map[if_id - g_start_ifid].flags & PPA_LEGACY_IFID_REG_DONE_NO_SUBIF) == PPA_LEGACY_IFID_REG_DONE_NO_SUBIF) {
+					printk("<%s> Subif not assigned\n", __FUNCTION__);
+					ret = ppa_phys_port_add(ppa_get_netif_name(netif), if_id);
+					if(ret == PPA_SUCCESS) {
+						ifid_subif_map[if_id - g_start_ifid].flags = PPA_LEGACY_RADIO_REG_DONE;
+						ppa_drv_g_ppe_directpath_data[if_id - g_start_ifid].netif = netif;
+					}
+				} 
+				else 
+				{
+					ret = ppa_directpath_register_dev_legacy(&if_id, netif, pDirectpathCb, flags);
+					ifid_subif_map[if_id - g_start_ifid].port_id = subif->port_id;
+				}
+				if(ret == PPA_SUCCESS) {
+					subif->subif = ppa_directpath_get_subif_legacy(subif->port_id);
+					//subif->subif = 0;
+					ifid_subif_map[if_id - g_start_ifid].port_id = subif->port_id;
+					ifid_subif_map[if_id - g_start_ifid].subif = subif->subif;
+				}
+			} else {
+				printk("Unregister\n");
+				if_id = ppa_directpath_get_ifid_from_subif(subif->port_id, subif->subif);
+				printk("<%s>ifid from subif %d \n", __FUNCTION__, if_id);
+				if_id += g_start_ifid;
+				printk("<%s>actual ifid %d \n", __FUNCTION__, if_id);
+				if((ifid_subif_map[if_id - g_start_ifid].flags & PPA_LEGACY_RADIO_REG_DONE) == PPA_LEGACY_RADIO_REG_DONE) {
+					printk("<%s> For Radio subif \n", __FUNCTION__);
+					ifid_subif_map[if_id - g_start_ifid].flags = PPA_LEGACY_IFID_REG_DONE_NO_SUBIF;
+					subif->subif = -1;
+					ifid_subif_map[if_id - g_start_ifid].subif = -1;
+					return PPA_SUCCESS;
+				} 
+				else 
+				{
+					ret = ppa_directpath_register_dev_legacy(&if_id, netif, pDirectpathCb, flags);
+				}
+				if(ret == PPA_SUCCESS) {
+					subif->subif = -1;
+					ifid_subif_map[if_id - g_start_ifid].port_id = -1;
+					ifid_subif_map[if_id - g_start_ifid].subif = -1;
+				}
+			}
+			printk("<%s> if_id: %d Port_id= %d subif=%d\n", __FUNCTION__, if_id, subif->port_id, subif->subif);
+		}
+		dump_ifid_subif_map_tbl();
+		return ret;	
+#endif
 #endif
 	}
         ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "Exit \n");
@@ -867,7 +979,7 @@ int32_t ppa_directpath_register_dev(uint32_t *p_if_id, PPA_NETIF *netif, PPA_DIR
 }
 /* =====================  */
 
-int32_t ppa_directpath_send_legacy(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32_t flags)
+int32_t ppa_directpath_send_legacy(uint32_t rx_if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags)
 {
 #if !defined(CONFIG_LTQ_PPA_API_DIRECTPATH_BRIDGING)
     uint8_t mac[PPA_ETH_ALEN] = {0};
@@ -876,7 +988,7 @@ int32_t ppa_directpath_send_legacy(uint32_t rx_if_id, PPA_BUF *skb, int32_t len,
     int32_t ret = PPA_SUCCESS;
 
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_IMQ)
-    int32_t (*tmp_imq_queue)(PPA_BUF *skb, uint32_t portID) = ppa_hook_directpath_enqueue_to_imq_fn;
+    int32_t (*tmp_imq_queue)(PPA_SKBUF *skb, uint32_t portID) = ppa_hook_directpath_enqueue_to_imq_fn;
 #endif        
     if( skb == NULL )
     {
@@ -888,8 +1000,13 @@ int32_t ppa_directpath_send_legacy(uint32_t rx_if_id, PPA_BUF *skb, int32_t len,
         PPA_SKB_FREE(skb);
         return PPA_EINVAL;
     }
-    if(flags & 3) { //directlink function call
+#if defined(CONFIG_ACCL_11AC) || defined(CONFIG_ACCL_11AC_MODULE)
+    if(flags & (PPA_F_DIRECTLINK_XMIT_TO_WIFI | PPA_F_DIRECTLINK_XMIT_FROM_WIFI)) { //directlink function call
         return ppa_drv_directpath_send(rx_if_id, skb, len, flags);
+    }
+#endif
+    if(flags & PPA_F_DIRECTPATH_XMIT_QOS) { //Litepath QoS function call
+        return PPA_EINVAL; //Litepath QoS not supported, dont free skb here
     }
     if( !ppa_drv_g_ppe_directpath_data ) 
     {
@@ -912,7 +1029,7 @@ int32_t ppa_directpath_send_legacy(uint32_t rx_if_id, PPA_BUF *skb, int32_t len,
     }
 
 #if !defined(CONFIG_LTQ_PPA_API_DIRECTPATH_BRIDGING)
-    ppa_get_pkt_rx_dst_mac_addr(skb, mac);
+    get_pkt_rx_dst_mac_addr(skb, mac);
     ppa_get_netif_hwaddr(ppa_drv_g_ppe_directpath_data[rx_if_id - g_start_ifid].netif, netif_mac, 0);
     if ( ppa_memcmp(mac, /* ppa_drv_g_ppe_directpath_data[rx_if_id - g_start_ifid].mac */ netif_mac, PPA_ETH_ALEN) != 0 )
     {
@@ -964,7 +1081,7 @@ __DIRETPATH_TX_EXIT:
 int (*datapath_dtlk_switch_parser)(void) = NULL;
 EXPORT_SYMBOL(datapath_dtlk_switch_parser);
 #endif
-int32_t ppa_directpath_send_ex(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint32_t flags)
+int32_t ppa_directpath_send_ex(PPA_SUBIF *subif, PPA_SKBUF *skb, int32_t len, uint32_t flags)
 {
 #if !defined(CONFIG_LTQ_PPA_API_DIRECTPATH_BRIDGING)
     uint8_t mac[PPA_ETH_ALEN] = {0};
@@ -973,7 +1090,7 @@ int32_t ppa_directpath_send_ex(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint
     int32_t ret = PPA_SUCCESS;
 
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_IMQ)
-    int32_t (*tmp_imq_queue)(PPA_BUF *skb, uint32_t portID) = ppa_hook_directpath_enqueue_to_imq_fn;
+    int32_t (*tmp_imq_queue)(PPA_SKBUF *skb, uint32_t portID) = ppa_hook_directpath_enqueue_to_imq_fn;
 #endif        
 	//pr_err("%s: skb[0x%x] skb->data[0x%x]\n", __func__, skb, skb->data);
     if( skb == NULL )
@@ -986,13 +1103,13 @@ int32_t ppa_directpath_send_ex(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint
         PPA_SKB_FREE(skb);
         return PPA_EINVAL;
     }
-    if(flags & 3) { //directlink function call
 #if defined(CONFIG_ACCL_11AC) || defined(CONFIG_ACCL_11AC_MODULE)
+    if(flags & (PPA_F_DIRECTLINK_XMIT_TO_WIFI | PPA_F_DIRECTLINK_XMIT_FROM_WIFI)) { //directlink function call
 		/*
 		* Special for DirectLink: DirectLink needs extra 48 bytes before read data.
 		*/
 		int bSwitchParserIsDisable = 1;
-		PPA_BUF *skb2 = NULL;
+		PPA_SKBUF *skb2 = NULL;
 		int newLen = len;
 		if (datapath_dtlk_switch_parser)
 			bSwitchParserIsDisable = datapath_dtlk_switch_parser();
@@ -1028,8 +1145,13 @@ int32_t ppa_directpath_send_ex(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint
 			}
 		}
 		return DRV_SEND(subif, skb2, newLen, DP_TX_TO_DL_MPEFW);
-#endif
     }
+#endif
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+    if(flags & PPA_F_DIRECTPATH_XMIT_QOS) { //Litepath QoS function call
+        return PPA_EINVAL; //TODO : Currently Litepath QoS not supported, dont free skb here
+    }
+#endif
     if( !ppa_drv_g_ppe_directpath_data ) 
     {
         PPA_SKB_FREE(skb);
@@ -1058,7 +1180,7 @@ int32_t ppa_directpath_send_ex(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint
         goto __DIRETPATH_TX_EXIT;
     }
 #if !defined(CONFIG_LTQ_PPA_API_DIRECTPATH_BRIDGING)
-    ppa_get_pkt_rx_dst_mac_addr(skb, mac);
+    get_pkt_rx_dst_mac_addr(skb, mac);
     ppa_get_netif_hwaddr(ppa_drv_g_ppe_directpath_data[subif->port_id - g_start_ifid].netif, netif_mac, 0);
     if ( ppa_memcmp(mac, /* ppa_drv_g_ppe_directpath_data[rx_if_id - g_start_ifid].mac */ netif_mac, PPA_ETH_ALEN) != 0 )
     {
@@ -1114,8 +1236,9 @@ __DIRETPATH_TX_EXIT:
 #endif
 
 
-int32_t ppa_directpath_ex_send(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint32_t flags)
+int32_t ppa_directpath_ex_send(PPA_SUBIF *subif, PPA_SKBUF *skb, int32_t len, uint32_t flags)
 {
+	int32_t ret;
 	//pr_err("%s\n", __func__);
 	if(flags & PPE_DIRECTPATH_LEGACY)
 	{
@@ -1123,7 +1246,6 @@ int32_t ppa_directpath_ex_send(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint
 
         	return ppa_directpath_send_ex(subif, skb, len, flags);        
 #else
-		int32_t ret;
 		ret = ppa_directpath_send_legacy(subif->port_id, skb, len, flags);
 		//if(ret != PPA_FAILURE)
 		//	subif->port_id = if_id;
@@ -1133,13 +1255,20 @@ int32_t ppa_directpath_ex_send(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint
 #if (defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500) || (defined(CONFIG_PPA_PUMA7) && CONFIG_PPA_PUMA7)
 
         	return ppa_directpath_send_ex(subif, skb, len, flags);        
-
+#else
+#if defined(CONFIG_LTQ_PPA_API_DIRECTPATH_HAS_NEW_API)
+		int32_t if_id;
+		if_id = ppa_directpath_get_ifid_from_subif(subif->port_id, subif->subif);
+		if_id += g_start_ifid;
+		//printk("<%s> if_id: %d Port_id= %d subif=%d\n", __FUNCTION__, if_id, subif->port_id, subif->subif);
+		ret = ppa_directpath_send_legacy(if_id, skb, len, flags);
+		return ret;
 #endif
-
+#endif
 	}	
 	return PPA_FAILURE;
 }
-int32_t ppa_directpath_send(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32_t flags)
+int32_t ppa_directpath_send(uint32_t rx_if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags)
 {
 	int32_t ret;
 	PPA_SUBIF sub_if;
@@ -1160,7 +1289,7 @@ int32_t ppa_directpath_send(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32
 
 
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_IMQ)
-int32_t ppa_directpath_reinject_from_imq(int32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32_t flags)
+int32_t ppa_directpath_reinject_from_imq(int32_t rx_if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags)
 {
 #if !defined(CONFIG_LTQ_PPA_API_DIRECTPATH_BRIDGING)
     uint8_t mac[PPA_ETH_ALEN] = {0};
@@ -1324,26 +1453,24 @@ int32_t ppa_directpath_ex_rx_restart(PPA_SUBIF *subif, uint32_t flags)
 #endif
 }
 
-PPA_BUF* ppa_directpath_alloc_skb(PPA_SUBIF *subif, int32_t len, uint32_t flags)
+PPA_SKBUF* ppa_directpath_alloc_skb(PPA_SUBIF *subif, int32_t len, uint32_t flags)
 {
-    PPA_BUF *ret = (void *)PPA_EINVAL;
+    PPA_SKBUF *buf = NULL;
 
 #if defined(CONFIG_PPA_PUMA7) && CONFIG_PPA_PUMA7
     ppa_lock_get(&g_directpath_port_lock);
     /* TODO: subif validation */
     if (ppa_drv_g_ppe_directpath_data[DP_DATA_INDEX(subif)].flags & PPE_DIRECTPATH_DATA_ENTRY_VALID)
     {
-        ret = DRV_ALLOC_SKB(subif, len, flags);
+        buf = DRV_ALLOC_SKB(subif, len, flags);
     }
     ppa_lock_release(&g_directpath_port_lock);
-#else
-    printk("ppa_directpath_alloc_skb not defined!!\n");
 #endif
 
-    return ret;
+    return buf;
 }
 
-int32_t ppa_directpath_recycle_skb(PPA_SUBIF *subif, PPA_BUF *skb, uint32_t flags)
+int32_t ppa_directpath_recycle_skb(PPA_SUBIF *subif, PPA_SKBUF *skb, uint32_t flags)
 {
     int32_t ret = PPA_EINVAL;
 
@@ -1520,6 +1647,14 @@ int32_t ppa_api_directpath_init(void)
             ppa_drv_g_ppe_directpath_data[i * (MAX_SUBIF + 1)].flags = tmp_flags;
 #else
             ppa_drv_g_ppe_directpath_data[i - g_start_ifid].flags = tmp_flags;
+#if defined(CONFIG_LTQ_PPA_API_DIRECTPATH_HAS_NEW_API)
+	for ( i = 0; i < last_valid_ifid; i++ )
+	{
+		ifid_subif_map[i].port_id = -1;
+		ifid_subif_map[i].subif = -1;
+		ifid_subif_map[i].flags = 0;
+	}
+#endif
 #endif
         }
     }
@@ -1534,7 +1669,7 @@ int32_t ppa_api_directpath_init(void)
 void ppa_api_directpath_exit(void)
 {
     uint32_t i;  
-    PPA_BUF *skb_list = NULL;
+    PPA_SKBUF *skb_list = NULL;
 
 
 

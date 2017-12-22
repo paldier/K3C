@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent e9f9697465372af4c6275b4fc1f8fc960b821180
+# Parent bdd1ad05fe93e46a0c49b42d450ad485d62eefae
 
 diff --git a/arch/mips/include/asm/gic.h b/arch/mips/include/asm/gic.h
 --- a/arch/mips/include/asm/gic.h
@@ -172,7 +172,12 @@ diff --git a/arch/mips/include/asm/gic.h b/arch/mips/include/asm/gic.h
  
  /* Add 2 to convert non-EIC hardware interrupt to EIC vector number. */
  #define GIC_CPU_TO_VEC_OFFSET	(2)
-@@ -382,10 +411,23 @@ extern unsigned int plat_ipi_call_int_xl
+@@ -378,14 +407,28 @@ extern cycle_t gic_read_count(void);
+ extern cycle_t gic_read_compare(void);
+ extern void gic_write_compare(cycle_t cnt);
+ extern void gic_send_ipi(unsigned int intr);
++extern void gic_clear_edge(unsigned int intr);
+ extern unsigned int plat_ipi_call_int_xlate(unsigned int);
  extern unsigned int plat_ipi_resched_int_xlate(unsigned int);
  extern void gic_bind_eic_interrupt(int irq, int set);
  extern unsigned int gic_get_timer_pending(void);
@@ -491,7 +496,19 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  }
  
  void gic_bind_eic_interrupt(int irq, int set)
-@@ -104,54 +172,6 @@ static void gic_eic_irq_dispatch(void)
+@@ -89,6 +157,11 @@ void gic_send_ipi(unsigned int intr)
+ 	GICWRITE(GIC_REG(SHARED, GIC_SH_WEDGE), 0x80000000 | intr);
+ }
+ 
++void gic_clear_edge(unsigned int intr)
++{
++	GICWRITE(GIC_REG(SHARED, GIC_SH_WEDGE), intr);
++}
++
+ static void gic_eic_irq_dispatch(void)
+ {
+ 	unsigned int cause = read_c0_cause();
+@@ -104,54 +177,6 @@ static void gic_eic_irq_dispatch(void)
  		spurious_interrupt();
  }
  
@@ -546,7 +563,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  unsigned int gic_compare_int(void)
  {
  	unsigned int pending;
-@@ -163,15 +183,57 @@ unsigned int gic_compare_int(void)
+@@ -163,21 +188,63 @@ unsigned int gic_compare_int(void)
  		return 0;
  }
  
@@ -608,20 +625,24 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
 -	intrmask = intrmask_regs[smp_processor_id()].intrmask;
  	pcpu_mask = pcpu_masks[smp_processor_id()].pcpu_mask;
  
- 	pending_abs = (unsigned long *) GIC_REG_ABS_ADDR(SHARED,
-@@ -189,33 +251,253 @@ unsigned int gic_get_int(void)
+-	pending_abs = (unsigned long *) GIC_REG_ABS_ADDR(SHARED,
+-							 GIC_SH_PEND_31_0_OFS);
+-	intrmask_abs = (unsigned long *) GIC_REG_ABS_ADDR(SHARED,
+-							  GIC_SH_MASK_31_0_OFS);
++	pending_abs = (unsigned long *)GIC_REG_ABS_ADDR(SHARED,
++							GIC_SH_PEND_31_0_OFS);
++	intrmask_abs = (unsigned long *)GIC_REG_ABS_ADDR(SHARED,
++							GIC_SH_MASK_31_0_OFS);
+ 
+ 	for (i = 0; i < BITS_TO_LONGS(GIC_NUM_INTRS); i++) {
+ 		GICREAD(*pending_abs, pending[i]);
+@@ -189,33 +256,238 @@ unsigned int gic_get_int(void)
  	bitmap_and(pending, pending, intrmask, GIC_NUM_INTRS);
  	bitmap_and(pending, pending, pcpu_mask, GIC_NUM_INTRS);
  
 -	return find_first_bit(pending, GIC_NUM_INTRS);
-+	intr = find_first_bit(pending, GIC_NUM_INTRS);
-+	while (intr != GIC_NUM_INTRS) {
++	for_each_set_bit(intr, pending, GIC_NUM_INTRS)
 +		do_IRQ(gic_irq_base + intr);
-+
-+		/* go to next pending bit */
-+		bitmap_clear(pending, intr, 1);
-+		intr = find_first_bit(pending, GIC_NUM_INTRS);
-+	}
 +}
 +
 +#define GIC_SHARED_IRQ_DISPATCH(X)					\
@@ -647,12 +668,8 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
 +	bitmap_and(pending, pending, intrmask, GIC_VI##X##_NUM_INTRS);	\
 +	bitmap_and(pending, pending, pcpu_mask				\
 +		+ (GIC_VI##X##_INTRS_BASE >> 5), GIC_VI##X##_NUM_INTRS);\
-+	intr = find_first_bit(pending, GIC_VI##X##_NUM_INTRS);		\
-+	while (intr != GIC_VI##X##_NUM_INTRS) {				\
++	for_each_set_bit(intr, pending, GIC_VI##X##_NUM_INTRS)		\
 +		do_IRQ(gic_irq_base + GIC_VI##X##_INTRS_BASE + intr);	\
-+		bitmap_clear(pending, intr, 1);				\
-+		intr = find_first_bit(pending, GIC_VI##X##_NUM_INTRS);	\
-+	}								\
 +} while (0)
 +
 +#define GIC_VIx_IRQ_DISPATCH(x)						\
@@ -678,13 +695,8 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
 +
 +	bitmap_and(&pending, &pending, &masked, GIC_NUM_LOCAL_INTRS);
 +
-+	intr = find_first_bit(&pending, GIC_NUM_LOCAL_INTRS);
-+	while (intr != GIC_NUM_LOCAL_INTRS) {
++	for_each_set_bit(intr, &pending, GIC_NUM_LOCAL_INTRS)
 +		do_IRQ(MIPS_GIC_LOCAL_IRQ_BASE + intr);
-+		/* go to next pending bit */
-+		bitmap_clear(&pending, intr, 1);
-+		intr = find_first_bit(&pending, GIC_NUM_LOCAL_INTRS);
-+	}
 +}
 +
 +static void gic_mask_local_irq(int irq)
@@ -870,7 +882,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  
  	/* Assumption : cpumask refers to a single CPU */
  	spin_lock_irqsave(&gic_lock, flags);
-@@ -224,8 +506,8 @@ static int gic_set_affinity(struct irq_d
+@@ -224,8 +496,8 @@ static int gic_set_affinity(struct irq_d
  	GIC_SH_MAP_TO_VPE_SMASK(irq, first_cpu(tmp));
  
  	/* Update the pcpu_masks */
@@ -881,7 +893,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  	set_bit(irq, pcpu_masks[first_cpu(tmp)].pcpu_mask);
  
  	cpumask_copy(d->affinity, cpumask);
-@@ -237,33 +519,71 @@ static int gic_set_affinity(struct irq_d
+@@ -237,33 +509,69 @@ static int gic_set_affinity(struct irq_d
  
  static struct irq_chip gic_irq_controller = {
  	.name			=	"MIPS GIC",
@@ -903,15 +915,12 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
 +	int cpux;
 +	int irq;
 +	unsigned long flags;
-+#define GIC_YIELD_IRQ_START	192
-+#define GIC_YIELD_IRQ_END	199
++
 +	/* Sanity check */
 +	if ((cpu >= nr_cpu_ids) || (pin > 0xF) || (intr < MIPS_GIC_IRQ_BASE))
 +		return -EINVAL;
 +
 +	irq = intr - MIPS_GIC_IRQ_BASE;
-+	if (irq < GIC_YIELD_IRQ_START || irq > GIC_YIELD_IRQ_END)
-+		return -EINVAL;
 +
 +	spin_lock_irqsave(&gic_lock, flags);
 +	GICWRITE(GIC_REG_ADDR(SHARED, GIC_SH_MAP_TO_PIN(irq)),
@@ -924,6 +933,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
 +	spin_unlock_irqrestore(&gic_lock, flags);
 +	return 0;
 +}
++EXPORT_SYMBOL_GPL(gic_yield_setup);
 +
  static void __init gic_setup_intr(unsigned int intr, unsigned int cpu,
  	unsigned int pin, unsigned int polarity, unsigned int trigtype,
@@ -954,7 +964,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  	} else {
  		GICWRITE(GIC_REG_ADDR(SHARED, GIC_SH_MAP_TO_PIN(intr)),
  			 GIC_MAP_TO_PIN_MSK | pin);
-@@ -272,7 +592,8 @@ static void __init gic_setup_intr(unsign
+@@ -272,7 +580,8 @@ static void __init gic_setup_intr(unsign
  		if (cpu_has_veic) {
  			set_vi_handler(pin + GIC_PIN_TO_VEC_OFFSET,
  				gic_eic_irq_dispatch);
@@ -964,7 +974,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  			if (map_ptr->num_shared_intr >= GIC_MAX_SHARED_INTR)
  				BUG();
  			map_ptr->intr_list[map_ptr->num_shared_intr++] = intr;
-@@ -287,15 +608,70 @@ static void __init gic_setup_intr(unsign
+@@ -287,15 +596,70 @@ static void __init gic_setup_intr(unsign
  
  	/* Init Intr Masks */
  	GIC_CLR_INTR_MASK(intr);
@@ -1037,7 +1047,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  static void __init gic_basic_init(int numintrs, int numvpes,
  			struct gic_intr_map *intrmap, int mapsize)
  {
-@@ -306,6 +682,11 @@ static void __init gic_basic_init(int nu
+@@ -306,6 +670,11 @@ static void __init gic_basic_init(int nu
  
  	/* Setup defaults */
  	for (i = 0; i < numintrs; i++) {
@@ -1049,7 +1059,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  		GIC_SET_POLARITY(i, GIC_POL_POS);
  		GIC_SET_TRIGGER(i, GIC_TRIG_LEVEL);
  		GIC_CLR_INTR_MASK(i);
-@@ -315,30 +696,29 @@ static void __init gic_basic_init(int nu
+@@ -315,30 +684,29 @@ static void __init gic_basic_init(int nu
  			gic_shared_intr_map[i].local_intr_mask = 0;
  		}
  	}
@@ -1091,7 +1101,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  }
  
  void __init gic_init(unsigned long gic_base_addr,
-@@ -347,7 +727,7 @@ void __init gic_init(unsigned long gic_b
+@@ -347,7 +715,7 @@ void __init gic_init(unsigned long gic_b
  		     unsigned int irqbase)
  {
  	unsigned int gicconfig;
@@ -1100,7 +1110,7 @@ diff --git a/arch/mips/kernel/irq-gic.c b/arch/mips/kernel/irq-gic.c
  
  	_gic_base = (unsigned long) ioremap_nocache(gic_base_addr,
  						    gic_addrspace_size);
-@@ -358,11 +738,11 @@ void __init gic_init(unsigned long gic_b
+@@ -358,11 +726,11 @@ void __init gic_init(unsigned long gic_b
  		   GIC_SH_CONFIG_NUMINTRS_SHF;
  	numintrs = ((numintrs + 1) * 8);
  
@@ -1475,10 +1485,10 @@ new file mode 100644
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI}, /* VMB */
 +#ifdef CONFIG_LTQ_PPA_MPE_IP97
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 89 */
-+	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* EIP97 */
-+	{ X, X,	   X,		X,		0 },
-+	{ X, X,	   X,		X,		0 },
-+	{ X, X,	   X,		X,		0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* Ring 0 */
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* Ring 1 */
++	{ X, X,	   X,		X,		0 }, /* MPE FW */
++	{ X, X,	   X,		X,		0 }, /* MPE FW */
 +#else
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* 89 */
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0 }, /* EIP97 */
@@ -1517,7 +1527,7 @@ new file mode 100644
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, 0},
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
-+	{ X, X,	   X,		X,		0 },
++	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_EDGE, GIC_FLAG_IPI},/* MPE DC*/
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
 +	{ 0, GIC_CPU_INT1, GIC_POL_POS, GIC_TRIG_LEVEL, 0},
 +	{ 0, GIC_CPU_INT2, GIC_POL_POS, GIC_TRIG_EDGE, 0 }, /* PCIe0 MSI */
@@ -1556,7 +1566,7 @@ new file mode 100644
 +	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
 +	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
 +	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
-+	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
++	{ 0, GIC_YQ_PIN(8), GIC_POL_POS, GIC_TRIG_EDGE, 0},
 +	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},
 +	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0}, /* GPTC2 */
 +	{ 0, GIC_CPU_INT3, GIC_POL_POS, GIC_TRIG_EDGE, 0},

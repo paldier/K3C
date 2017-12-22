@@ -321,24 +321,39 @@ typedef enum {
 */
   typedef struct xfrm_state PPA_XFRM_STATE;
 
+
+/*!
+    \brief  xfrm address union.
+*/
+  typedef xfrm_address_t PPA_XFRM_ADDR; 
+  
+/*!
+    \brief  socket address family.
+*/
+  typedef sa_family_t PPA_SA_FAMILY;
+
 /*!
     \brief  session information from xfrm state structure.
 */
-
 session_type ppa_is_ipv4_ipv6(PPA_XFRM_STATE *x);
 
 /*!
     \brief  session information from xfrm state structure.
 */
-
-bool ppa_ipsec_addr_equal(xfrm_address_t *a, xfrm_address_t *b, sa_family_t family);
-
+bool ppa_ipsec_addr_equal(PPA_XFRM_ADDR *a, PPA_XFRM_ADDR *b, PPA_SA_FAMILY family);
+//bool ppa_ipsec_addr_equal(xfrm_address_t *a, xfrm_address_t *b, sa_family_t family);
 #endif
 
 /*!
-    \brief  Packet buffer structure. For Linux OS, this is the sk_buff structure.
+    \brief  Packet buffer structure. For Linux OS, this is the sk_buff structure to be used for control path (learning).
 */
   typedef struct sk_buff        PPA_BUF;
+
+/*!
+    \brief  Packet buffer structure. For Linux OS, this is the sk_buff structure to be used in datapath.
+*/
+  typedef struct sk_buff        PPA_SKBUF;
+
 
 /*!
     \brief  Stateful Packet inspection / connection tracking session data structure.
@@ -390,6 +405,11 @@ typedef struct nf_conntrack_tuple   PPA_TUPLE;
  */
   typedef struct net_device     PPA_NETIF;
 
+/*!
+    \brief Macro that specifies PPA network interface data structure
+ */
+  typedef struct notifier_block	PPA_NOTIFIER_BLOCK;
+
 #if defined(CONFIG_LTQ_DATAPATH) && CONFIG_LTQ_DATAPATH
 /*!
     \brief Macro that specifies PPA sub-interface data structure
@@ -429,6 +449,15 @@ typedef struct nf_conntrack_tuple   PPA_TUPLE;
 
 #define PPA_TASK_RUNNING TASK_RUNNING
 #define PPA_TASK_INTERRUPTIBLE TASK_INTERRUPTIBLE
+
+
+/*!
+    \brief PPA alias for return values from the notifier calls.
+*/
+#define PPA_NOTIFY_DONE			NOTIFY_DONE
+#define PPA_NOTIFY_OK			NOTIFY_OK
+#define PPA_NOTIFY_STOP_MASK		NOTIFY_STOP_MASK
+#define PPA_NOTIFY_BAD			NOTIFY_BAD
 
 /*!
     \brief  PPA synchronization primitive for exclusion and/or synchronization
@@ -475,6 +504,12 @@ typedef struct nf_conntrack_tuple   PPA_TUPLE;
     \brief  PPA FILE PPA_FILE_OPERATIONS. For Linux OS,  it is file_operations
 */
   typedef struct file_operations   PPA_FILE_OPERATIONS;
+
+
+/*!
+    \brief  PPA SYS INFO. For Linux OS,  it is file_operations
+*/
+  typedef struct sysinfo PPA_SYSINFO;
 
 /*!
     \brief  PPA sync. For Linux OS,  it is __sync
@@ -599,7 +634,7 @@ typedef struct nf_conntrack_tuple   PPA_TUPLE;
 typedef struct rcu_head   PPA_RCU_HEAD; 
 #define ppa_call_rcu      call_rcu
 
-#if defined(CAP_WAP_CONFIG) && CAP_WAP_CONFIG
+/* #if defined(CAP_WAP_CONFIG) && CAP_WAP_CONFIG */
 
 /*!
     \brief PPA list head structure
@@ -673,7 +708,7 @@ typedef struct rcu_head   PPA_RCU_HEAD;
 */
 #define ppa_list_for_each_entry_safe_reverse list_for_each_entry_safe_reverse
 
-#endif
+/* #endif */
 
 /*!
     \brief  synchronize_rcu
@@ -717,126 +752,27 @@ typedef struct rcu_head   PPA_RCU_HEAD;
 */
 #define ppa_rcu_read_lock               rcu_read_lock
 
-
 /*!
     \brief  rcu_read_unlock
 */
 #define ppa_rcu_read_unlock             rcu_read_unlock
 
 /*!
-    \brief  skb_headroom
-*/
-#define ppa_skb_headroom 	skb_headroom
-/*!
-    \brief  skb_realloc_headroom
-*/
-#define ppa_skb_realloc_headroom 	skb_realloc_headroom
-/*!
-    \brief  nf_conntrack_put
-*/
-#define ppa_nf_conntrack_put 		nf_conntrack_put
-/*!
-    \brief  skb_set_owner_w
-*/
-#define ppa_skb_set_owner_w 	skb_set_owner_w
-/*!
-    \brief  skb_push
-*/
-#define ppa_skb_push		skb_push
-/*!
-    \brief  skb_pull
-*/
-#define ppa_skb_pull 		skb_pull
-/*!
-    \brief  skb_set_mac_header
-*/
-#define ppa_skb_set_mac_header		skb_set_mac_header
-/*!
-    \brief  skb_set_mac_header
-*/
-#define ppa_skb_reset_mac_header	skb_reset_mac_header
-/*!
-    \brief  skb_set_network_header
-*/
-#define ppa_skb_set_network_header 	skb_set_network_header
-/*!
-    \brief  skb_set_transport_header
-*/
-#define ppa_skb_set_transport_header	skb_set_transport_header
-/*!
-    \brief  skb_network_header
-*/
-#define ppa_skb_network_header 		skb_network_header
-/*!
-    \brief  skb_transport_header
-*/
-#define ppa_skb_transport_header	skb_transport_header
-/*!
-    \brief  ip_fast_csum
-*/
-#define ppa_ip_fast_csum 		ip_fast_csum
-/*!
-    \brief  inet_proto_csum_replace4
-*/
-#define ppa_inet_proto_csum_replace4(ph,skb,x,y) 	inet_proto_csum_replace4(&ph->check,skb,x,y,1)
-/*!
-    \brief  inet_proto_csum_replace2
-*/
-#define ppa_inet_proto_csum_replace2(ph,skb,x,y) 	inet_proto_csum_replace2(&ph->check,skb,x,y,0)
-/*!
-    \brief  dev_queue_xmit
-*/
-#define ppa_dev_queue_xmit 	dev_queue_xmit
-/*!
-    \brief  skb->mark
-*/
-#define ppa_skb_mark(skb)	skb->mark
-/*!
-    \brief  skb->head
-*/
-#define ppa_skb_head(skb) 	skb->head
-/*!
-    \brief  skb->data
-*/
-#define ppa_skb_data(skb)	skb->data
-/*!
-    \brief  skb->dev
-*/
-#define ppa_skb_dev(skb)	skb->dev
-/*!
-    \brief  skb->len
-*/
-#define ppa_skb_len(skb)	skb->len
-/*!
-    \brief  skb->sk
-*/
-#define ppa_skb_sk(skb)		skb->sk
-/*!
     \brief  to dereference any member of any structure
 */
 #define ppa_get_member(x,y)	x->y
 
 
+/*!
+    \brief  to calculate ip partial checksum
+*/
+#define ppa_ip_fast_csum 	ip_fast_csum
 
-static inline void ppe_lock_init(PPE_LOCK *p_lock)
-{
-    spin_lock_init(p_lock);
-}
-
-static inline void ppe_lock_get(PPE_LOCK *p_lock)
-{
-    spin_lock_bh(p_lock);
-}
-
-static inline void ppe_lock_release(PPE_LOCK *p_lock)
-{
-    spin_unlock_bh(p_lock);
-}
-
-
-#endif //#ifdef __KERNEL__
-
-
+/*!
+    \brief netdevice event registeration/unregisteration functions
+*/
+#define ppa_register_netdevice_notifier register_netdevice_notifier
+#define ppa_unregister_netdevice_notifier unregister_netdevice_notifier
 
 /*
  * ####################################
@@ -844,7 +780,283 @@ static inline void ppe_lock_release(PPE_LOCK *p_lock)
  * ####################################
  */
 
+/*!
+    \brief  skb_set_mac_header
+*/
+static inline void ppa_skb_set_mac_header(PPA_BUF *skb, const int offset)
+{
+    return skb_set_mac_header(skb, offset);
+}
+/*!
+    \brief  skb_set_mac_header
+*/
+static inline void ppa_skb_reset_mac_header(PPA_BUF *skb)
+{
+    return skb_reset_mac_header(skb);
+}
 
+/*!
+    \brief  ppa session entry criteria
+*/
+static inline int ppa_session_entry_pass(uint32_t num_adds, uint32_t min_hits)
+{
+    return (num_adds < min_hits);
+}
+
+/*!
+    \brief  skb_get_length
+*/
+static inline uint32_t ppa_skb_len(PPA_BUF *skb)
+{
+    return (skb ? skb->len : 0);	
+}
+
+/*!
+    \brief  get skb priority
+*/
+static inline uint32_t ppa_get_pkt_priority(PPA_BUF *skb)
+{
+    return (skb ? skb->priority: 0);
+}
+
+/*!
+    \brief set skb priority
+*/
+static inline uint32_t ppa_set_pkt_priority(PPA_BUF *ppa_buf, uint32_t new_pri)
+{
+    if( ppa_buf )
+    {
+        ppa_buf->priority = new_pri;
+        return ppa_buf->priority;
+    }
+    return 0;
+}
+
+/*!
+    \brief  get skb mark
+*/
+static inline uint32_t ppa_get_skb_mark(PPA_BUF *skb)
+{
+    return (skb ? skb->mark: 0);
+}
+
+#ifdef CONFIG_NETWORK_EXTMARK
+/*!
+    \brief  get skb extmark
+*/
+static inline uint32_t ppa_get_skb_extmark(PPA_BUF *skb)
+{
+    return (skb ? skb->extmark: 0);
+}
+
+/*!
+    \brief  skb_set_extmark
+*/
+static inline void ppa_set_skb_extmark(PPA_BUF *skb, uint32_t flag)
+{
+    if(skb) skb->extmark |= flag;
+}
+#endif
+
+/*!
+    \brief  ppa netif type
+*/
+static inline uint16_t ppa_netif_type(PPA_NETIF *netif)
+{
+    return netif ? netif->type : 0;
+}
+
+/*!
+    \brief  spinlock init
+*/
+static inline void ppe_lock_init(PPE_LOCK *p_lock)
+{
+    spin_lock_init(p_lock);
+}
+
+/*!
+    \brief  spinlock get
+*/
+static inline void ppe_lock_get(PPE_LOCK *p_lock)
+{
+    spin_lock_bh(p_lock);
+}
+
+/*!
+    \brief  spinlock release
+*/
+static inline void ppe_lock_release(PPE_LOCK *p_lock)
+{
+    spin_unlock_bh(p_lock);
+}
+
+/*!
+    \brief  copy data from skb
+*/
+static inline void ppa_copy_skb_data(void *dst, PPA_BUF* src, uint32_t offset)
+{
+    memcpy(dst, src->data, offset);
+}
+
+/*!
+    \brief  get netif name
+*/
+static inline char* ppa_get_netif_name(PPA_NETIF *netif)
+{
+    return netif ? netif->name : NULL;
+}
+
+/*!
+    \brief  is netif equal
+*/
+static inline uint32_t ppa_is_netif_equal(PPA_NETIF *netif1, PPA_NETIF *netif2)
+{
+    return netif1 && netif2 && netif1->ifindex == netif2->ifindex ? 1 : 0;
+}
+
+/*!
+    \brief  is netif name set
+*/
+static inline uint32_t ppa_is_netif_name(PPA_NETIF *netif, PPA_IFNAME *ifname)
+{
+    return netif && ifname && strcmp(netif->name, ifname) == 0 ? 1 : 0;
+}
+
+#ifdef CONFIG_PPA_PUMA7
+/*!
+    \brief  get session handle
+*/
+static inline uint32_t ppa_get_session_handle(PPA_BUF *skb)
+{
+    return skb->pp_packet_info->pp_session.session_handle;
+}
+#endif
+
+/*!
+    \brief  get dst entry
+*/
+static inline struct dst_entry *ppa_dst(const PPA_BUF *buf)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
+    return buf->dst;
+#else
+    return skb_dst(buf);
+#endif
+}
+
+/*!
+    \brief  get netdevice by name
+*/
+static inline struct net_device *ppa_dev_get_by_name(const PPA_IFNAME *ifname)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
+    return dev_get_by_name(ifname);
+#else
+    return dev_get_by_name(&init_net, ifname);
+#endif
+
+}
+
+/*!
+    \brief  get the nat helper function
+*/
+static inline uint32_t ppa_get_nat_helper(PPA_SESSION *p_session)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0) && defined(CONFIG_IP_NF_NAT_NEEDED)
+    return p_session ? (uint32_t)(p_session->nat.info.helper) : 0;
+#else
+    return 0;
+#endif
+}
+
+/*!
+    \brief  is tcp state established
+*/
+static inline int32_t ppa_is_tcp_established(PPA_SESSION *ppa_session)
+{
+    return ppa_session->proto.tcp.state == TCP_CONNTRACK_ESTABLISHED ? 1 : 0;
+}
+
+/*!
+    \brief  is tcp state open
+*/
+static inline int32_t ppa_is_tcp_open(PPA_SESSION *ppa_session)
+{
+    //  return nonzero if the tcp state is not TIME_WAIT or error
+    return ppa_session->proto.tcp.state < TCP_CONNTRACK_TIME_WAIT ? 1 : 0;
+}
+
+/*!
+    \brief  is packet host output 
+*/
+static inline int32_t ppa_is_pkt_host_output(PPA_BUF *ppa_buf)
+{
+    return ppa_buf->dev == NULL || ppa_buf->pkt_type == PACKET_OUTGOING ? 1 : 0;
+}
+
+/*!
+    \brief  is packet destined to host
+*/
+static inline int32_t ppa_is_pkt_host_in(PPA_BUF *ppa_buf)
+{
+    return ppa_buf->dev == NULL || ppa_buf->pkt_type == PACKET_HOST ? 1 : 0;
+}
+
+
+/*!
+    \brief  is packet broadcast 
+*/
+static inline int32_t ppa_is_pkt_broadcast(PPA_BUF *ppa_buf)
+{
+    return ppa_buf->pkt_type == PACKET_BROADCAST ? 1 : 0;
+}
+
+/*!
+    \brief  is packet loopback
+*/
+static inline int32_t ppa_is_pkt_loopback(PPA_BUF *ppa_buf)
+{
+    return ppa_buf->pkt_type == PACKET_LOOPBACK ? 1 : 0;
+}
+
+/*!
+    \brief  is compare connection tuple
+*/
+static inline int ppa_compare_connection_tuple(PPA_TUPLE* t1, 
+				uint16_t l3num, 
+				uint16_t ip_proto, 
+				uint16_t src_port, 
+				uint16_t dst_port,
+				PPA_IPADDR* src_ip,
+				PPA_IPADDR* dst_ip)
+{
+
+  if( t1->src.l3num == l3num &&
+      t1->dst.protonum == ip_proto &&
+      t1->src.u.all == src_port &&
+	  t1->dst.u.all == dst_port ) {
+#ifdef CONFIG_LTQ_PPA_IPv6_ENABLE 
+      if (t1->src.u3.all[0] == src_ip->ip6[0] &&
+			t1->src.u3.all[1] == src_ip->ip6[1] &&
+			t1->src.u3.all[2] == src_ip->ip6[2] &&
+			t1->src.u3.all[3] == src_ip->ip6[3] &&
+			t1->dst.u3.all[0] == dst_ip->ip6[0] &&
+			t1->dst.u3.all[1] == dst_ip->ip6[1] &&
+			t1->dst.u3.all[2] == dst_ip->ip6[2] &&
+			t1->dst.u3.all[3] == dst_ip->ip6[3] ) 
+#else
+	 if (t1->src.u3.all[0] == src_ip->ip &&
+			t1->dst.u3.all[0] == dst_ip->ip )	
+#endif
+	{
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+#endif //#ifdef __KERNEL__
 
 /*
  * ####################################
@@ -1099,6 +1311,14 @@ void ppa_neigh_update_hhs(struct neighbour *neigh);
   uint8_t ppa_get_pkt_ip_proto(PPA_BUF *buf);
 
 
+#ifdef CONFIG_PPA_PP_LEARNING
+/*! \brief   Get the PPA buffer ethernet type
+   \param[in]  buf Pointer to the packet buffer.
+   \return The return value can be ethernet frame type
+   \note Provide anything required to put in remark section.
+*/
+uint16_t ppa_get_pkt_protocol(PPA_BUF *buf);
+#endif
 
 /*! \brief   Get the PPA buffer IP Type of Service field.
    \param[in]  buf Pointer to the packet buffer.
@@ -1111,10 +1331,10 @@ void ppa_neigh_update_hhs(struct neighbour *neigh);
 
 /*! \brief   Returns source IP address of the packet.
    \param[in] buf Pointer to the Packet buffer.
-   \return  The Source IP address of the packet.
+   \param[in] pointer to the he Source IP address of the packet.
    \note
 */
-  PPA_IPADDR ppa_get_pkt_src_ip(PPA_BUF *buf);
+  void ppa_get_pkt_src_ip(PPA_IPADDR *ip, PPA_BUF *buf);
 
 
 
@@ -1131,10 +1351,10 @@ void ppa_neigh_update_hhs(struct neighbour *neigh);
 
 /*! \brief   Returns destination IP address of the packet.
    \param[in]  buf Pointer to the packet buffer.
-   \return  The Destination IP address of the packet..
+   \param[in]  Pointer the Destination IP address of the packet..
    \note
 */
-  PPA_IPADDR ppa_get_pkt_dst_ip(PPA_BUF *buf);
+  void ppa_get_pkt_dst_ip(PPA_IPADDR *ip, PPA_BUF *buf);
 
 
 /*! \brief   Returns source TCP/UDP port of the IP packet.
@@ -1153,6 +1373,13 @@ void ppa_neigh_update_hhs(struct neighbour *neigh);
   uint16_t ppa_get_pkt_dst_port(PPA_BUF *ppa_buf);
 
 
+/*! \brief   Get the Source MAC address pointer of the packet.
+   \param[in]  ppa_buf Pointer to the PPA packet buffer.
+   \return  Pointer to the start of the packet source MAC address.
+   \note   This API may not implemented on older PPA version.
+*/
+  uint8_t *ppa_get_pkt_src_mac_ptr(PPA_BUF *ppa_buf);
+
 /*! \brief   Get the Source MAC address of the packet as received by the router.
    \param[in]  ppa_buf Pointer to the PPA packet buffer.
    \param[out] mac  MAC address buffer in which the source MAC address is copied by the function.
@@ -1160,6 +1387,14 @@ void ppa_neigh_update_hhs(struct neighbour *neigh);
    \note   This API may not implemented on older PPA version.
 */
   void ppa_get_pkt_rx_src_mac_addr(PPA_BUF *ppa_buf, uint8_t mac[PPA_ETH_ALEN]);
+
+/*! \brief   Get the Source MAC address.
+   \param[in]  ppa_buf Pointer to the PPA packet buffer.
+   \param[out] mac  MAC address buffer in which the source MAC address is copied by the function.
+   \param[in]  offset Offest from skb data pointer to extract the mac address.
+   \return  This function does not return anything.
+*/
+  void ppa_get_src_mac_addr(PPA_BUF *ppa_buf, uint8_t mac[PPA_ETH_ALEN],const int offset);
 
 
 /*! \brief   Get the Destination MAC address of the packet as received by the router.
@@ -1189,14 +1424,6 @@ void ppa_neigh_update_hhs(struct neighbour *neigh);
    \note   This API may not implemented on older PPA version.
 */
   PPA_NETIF *ppa_get_pkt_dst_if(PPA_BUF *ppa_buf);
-
-/*! \brief   Returns skb priority of the packet at the router (for packets forwarded at IP or bridge level).
-   \param[in]  ppa_buf Pointer to the PPA packet buffer.
-   \return Pointer to the Destination /Tx Interface of the packet. The following values can be returned.\n
-                     - NULL on error
-                     - Pointer to Rx interface of the packet
-*/
-uint32_t ppa_get_pkt_priority(PPA_BUF *ppa_buf);
 
 #if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
 /*! \brief   Returns session priority based on skb
@@ -1265,24 +1492,6 @@ s64 ppa_timespec_to_ns(struct timespec *lhs);
 */
 void ppa_get_monotonic(struct timespec *lhs);
 #endif
-
-/*! \brief   Returns skb mark of the packet: for test purpose only
-   \param[in]  ppa_buf Pointer to the PPA packet buffer.
-   \return mark  if sucessful. otherwise return -1;
-*/
-
-uint32_t ppa_get_skb_mark(PPA_BUF *ppa_buf);
-uint32_t ppa_get_skb_extmark(PPA_BUF *ppa_buf);
-
-/*! \brief   set new skb priority of the packet: for test purpose only
-   \param[in]  ppa_buf Pointer to the PPA packet buffer.
-    \param[in]  new_pri new skb priority value
-   \return new priority if sucessful. otherwise return -1;
-*/
-
-
-uint32_t ppa_set_pkt_priority(PPA_BUF *ppa_buf, uint32_t new_pri);
-
 
 /*!
    \brief   get ppoe  mac address and session id
@@ -1463,6 +1672,16 @@ uint32_t ppa_check_is_lro_enabled_netif(PPA_NETIF *netif, uint8_t mac[PPA_ETH_AL
 int  ppa_get_mtu(PPA_NETIF *netif);
 #endif
 
+#if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
+/*! \brief   This function calls the ip routing function.
+   \param[in]  skb Pointer to the sk_buff structure.
+   \param[in]  netif Pointer to the netif structure.
+   \return   error if there is any proplem in routing the packet.
+   \note
+*/
+
+int ppa_do_ip_route(PPA_BUF *skb, PPA_NETIF *netif);
+#endif
 /*! \brief   This function releases the reference to a PPA_NETIF structure obtained through the function ppa_get_netif.
    \param[in]  netif Pointer to the netif structure.
    \return   No return value.
@@ -1490,43 +1709,6 @@ int  ppa_get_mtu(PPA_NETIF *netif);
 
  PPA_NETIF *ppa_get_br_dev(PPA_NETIF *netif);
 
-
- /*! \brief   Returns the pointer to the interface name for the specified netif structure.
-   \param[in]  netif  Pointer to the network interface structure.
-   \return The return value can be any one of the following: \n
-                         - Pointer to interface name, on success. \n
-                         - NULL on error.
-   \note
-*/
- PPA_IFNAME *ppa_get_netif_name(PPA_NETIF *netif);
-
-
-
-
- /*! \brief   Returns true if both the netif structure points to same physical interface.
-   \param[in]  netif1  Pointer to the first network interface structure.
-   \param[in]  netif2  Pointer to the second network interface structure.
-   \return   Valid values are below. \n
-                       - IFX_TRUE, if netif1 is same as netif2 interface \n
-                       - IFX_FALSE, if interface are not equal \n
-   \note
-*/
-uint32_t ppa_is_netif_equal(PPA_NETIF *netif1, PPA_NETIF *netif2);
-
-
-
-
- /*! \brief   This function returns if the Network interface structure pointer corresponds to the interface name specified.
-   \param[in]  netif  Pointer to the network interface structure.
-   \param[in]  ifname  Pointer to the network interface name.
-   \return   The function returns one of the following. \n
-                     - IFX_TRUE, if the netif corresponds to the ifname. \n
-                     - IFX_FALSE, if the netif is not for the ifname.
-   \note This API may not implemented on older PPA version.
-*/
- uint32_t ppa_is_netif_name(PPA_NETIF *netif, PPA_IFNAME *ifname);
-
-
 /*! \brief   This function checks if the interface name prefix specified applies for the interface name of the specified PPA_NETIF structure. For eg., eth0 and eth1 both have network prefix of eth (n=3).
    \param[in] netif  Pointer to the network interface structure.
    \param[in] ifname_prefix  Pointer to the network interface name prefix.
@@ -1552,6 +1734,17 @@ uint32_t ppa_is_netif_equal(PPA_NETIF *netif1, PPA_NETIF *netif2);
 */
   int32_t ppa_get_physical_if(PPA_NETIF *netif, PPA_IFNAME *ifname, PPA_IFNAME phy_ifname[PPA_IF_NAME_SIZE]);
 
+
+/*! \brief   Get the lower or macvlan base Interface for the interface specified by netif or ifname pointers. If netif is specified, it is used for the lookup, else ifname is used.
+   \param[in]  netif  Pointer to the network interface structure for which physical interface needs to be determined.
+   \param[in]  ifname  Pointer to the network interface name for which physical interface needs to be determined.
+   \param[in] lower_ifname  Interface name buffer in which the lower or macvlan interface name is copied by the function.
+   \return   This function returns the following values. \n
+                        - PPA_SUCCESS, on success. \n
+                        - PPA_FAILURE, on error. \n
+   \note This API may not implemented on older PPA version.
+*/
+  int32_t ppa_get_lower_if(PPA_NETIF *netif, PPA_IFNAME *ifname, PPA_IFNAME lower_ifname[PPA_IF_NAME_SIZE]);
 
 
 /*! \brief   This function gives the vlan interface name specified by netif strucutre or ifname pointers. One of the two arguments needs to be specified in the function.
@@ -1614,7 +1807,12 @@ uint32_t ppa_is_netif_equal(PPA_NETIF *netif1, PPA_NETIF *netif2);
 */
   uint32_t ppa_get_vlan_id(PPA_NETIF *netif);
 
-
+/*! \brief   This function returns the VLAN type and for a VLAN interface specified by netif. The caller will first determine if the network interface is a VLAN  interface before invoking this function.
+   \param[in]  netif  Pointer to the network interface structure for which VLANId is to be returned.
+   \return   This function returns the VLAN type (802.1q or 802.1ad)
+   \note
+*/
+  uint16_t ppa_get_vlan_type(PPA_NETIF *netif);
 
 
 /*! \brief   This function returns the TCI including priority and VLAN Id for a PPA buffer pointer by buf.
@@ -1876,38 +2074,6 @@ int32_t ppa_pppoa_get_vcc(PPA_NETIF *netif, PPA_VCC **patmvcc);
   uint32_t ppa_is_pkt_fragment(PPA_BUF *ppa_buf);
 
 
-
-/*! \brief   Returns if the packet pointed to by ppa_buf is addressed to the host (i.e. terminated inside the router).
-   \param[in] ppa_buf    Pointer to the PPA Buffer.
-   \return   This function returns the one of the following values: \n
-                      - IFX_TRUE if packet is addressed to host, i.e. for host output. \n
-                      - IFX_FALSE if the packet is to be forwarded out of the router. \n
-   \note
-*/
-  int32_t ppa_is_pkt_host_output(PPA_BUF *ppa_buf);
-
-/*! \brief   Returns if the packet pointed to by ppa_buf is addressed to the host (i.e. terminated inside the router).
-   \param[in] ppa_buf    Pointer to the PPA Buffer.
-   \return   This function returns the one of the following values: \n
-                      - IFX_TRUE if packet is addressed to host, i.e. for host output. \n
-                      - IFX_FALSE if the packet is to be forwarded out of the router. \n
-   \note
-*/
-  int32_t ppa_is_pkt_host_in(PPA_BUF *ppa_buf);
-
-
-
-/*! \brief   Returns if the packet pointed to by ppa_buf is a broadcast packet.
-   \param[in] ppa_buf    Pointer to the PPA Buffer.
-   \return   This function returns the one of the following values: \n
-                       - IFX_TRUE if packet is a broadcast packet. \n
-                       - IFX_FALSE if the packet is not a broadcast packet. \n
-  \note
-*/
-  int32_t ppa_is_pkt_broadcast(PPA_BUF *ppa_buf);
-
-
-
 /*! \brief   Returns if the packet pointed to by ppa_buf is a multicast packet.
    \param[in] ppa_buf    Pointer to the PPA Buffer.
    \return   This function returns the one of the following values: \n
@@ -1916,30 +2082,6 @@ int32_t ppa_pppoa_get_vcc(PPA_NETIF *netif, PPA_VCC **patmvcc);
   \note
 */
   int32_t ppa_is_pkt_multicast(PPA_BUF *ppa_buf);
-
-
-
-/*! \brief   Returns if the packet pointed to by ppa_buf is a loopback packet, i.e. output to a loopback interface in the router (and not transmitted out of the router external interfaces).
-   \param[in] ppa_buf    Pointer to the PPA Buffer.
-   \return   This function returns the one of the following values: \n
-                           - IFX_TRUE if packet is a loopback packet.  \n
-                           - IFX_FALSE if the packet is not a loopback packet \n
-   \note
-*/
-  int32_t ppa_is_pkt_loopback(PPA_BUF *ppa_buf);
-
-
-
-/*! \brief   Returns if the packet pointed to by ppa_buf is for local delivery, i.e. ingress packet delivered to Layer-4 and above)..
-   \param[in] ppa_buf    Pointer to the PPA Buffer.
-   \return   This function returns the one of the following values: \n
-                      - IFX_TRUE if packet is for local delivery to Layer-4 and above. \n
-                      - IFX_FALSE if the packet is not a local delivery packet. \n
-   \note
-*/
-  int32_t ppa_is_pkt_local(PPA_BUF *ppa_buf);
-
-
 
  /*! \brief   Returns if the packet pointed to by ppa_buf is routed, i.e. forwarded at IP layer.
    \param[in] ppa_buf    Pointer to the PPA Buffer.
@@ -1960,29 +2102,6 @@ int32_t ppa_pppoa_get_vcc(PPA_NETIF *netif, PPA_VCC **patmvcc);
    \note
 */
   int32_t ppa_is_pkt_mc_routing(PPA_BUF *ppa_buf);
-
-
-
- /*! \brief   Returns true if tcp connection state is established for a PPA session.
-   \param[in] p_session  Pointer to ppa connection tracking session data structure.
-   \return   This function returns the one of the following values: \n
-                      - IFX_TRUE if TCP connection state is established after SYN from server. \n
-                      - IFX_FALSE if TCP connection is not established completely. \n
-   \note
-*/
- int32_t ppa_is_tcp_established(PPA_SESSION *p_session);
-
-
- /*! \brief   check whether the TCP session is open or not.
-   \param[in] p_session  Pointer to ppa connection tracking session data structure.
-   \return   This function returns the one of the following values: \n
-                      - 1 if the tcp state is not TIME_WAIT or error
-                      - otherwise, return 0
-   \note
-*/
- int32_t ppa_is_tcp_open(PPA_SESSION *p_session);
-
-
 
 /*! \brief   Initialize a lock for synchronization.
     \param[in] p_lock  Pointer to the PPA lock variable which is allocated by the caller.
@@ -2056,6 +2175,16 @@ void ppa_enable_int(uint32_t flag);
     \note
 */
   void *ppa_malloc(uint32_t size);
+
+/*! \brief   This function dynamically allocates memory in dma zone for PPA use.
+    \param[in]  size   Specifies the number of bytes to be allocated.
+    \return  The return value is one of the following: \n
+                    - Non-NULL value, if memory allocation is successful. \n
+                    - NULL, if the PPA Lock initialization fails.  \n
+    \note
+*/
+
+  void *ppa_alloc_dma(uint32_t size);
 
 /*! \brief   This function frees dynamically allocated memory.
     \param[in] buff Pointer to buffer allocated by ppa_malloc routine, which needs to be freed.
@@ -2393,7 +2522,6 @@ int32_t ppa_buf_cloned(PPA_BUF *ppa_buf);
 */
   PPA_SIZE_T  ppa_strlen(const uint8_t *s);
 
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
 /*! \brief   copy string, like strncpy
     \param[out] dest  destination buffer
     \param[in] src  source buffer
@@ -2402,7 +2530,6 @@ int32_t ppa_buf_cloned(PPA_BUF *ppa_buf);
 */
   int32_t ppa_str_cmp(char *str1,char *str2);
 
-#endif
 /*! \brief   shrink cache buffer. in linux, it is kmem_cache_shrink
     \param[in] p_cache Pointer to cache buffer
     \return return the string length
@@ -2545,13 +2672,36 @@ int32_t ppa_buf_cloned(PPA_BUF *ppa_buf);
                              PPA_TUPLE* tuple );
 
 
-/*! \brief  check if ifname is a slave of bond interface 
-    \param ifname 
-    \param netif 
-    \return On success returns one
+/*! \brief get default ip ttl
+    \return ipttl
     \note
 */
-  uint32_t ppa_is_bond_slave(PPA_IFNAME *ifname, PPA_NETIF *netif);
+int32_t ppa_get_ip_ttl(void);
+
+
+
+/*! \brief get system meminfo
+    \param pointer to systeminfo structure
+    \return system mem info 
+    \note
+*/
+void ppa_si_meminfo(PPA_SYSINFO *sysinfo);
+#ifndef CONFIG_SWAP
+/*! \brief get system meminfo
+    \param pointer to systeminfo structure
+    \return system swap info
+    \note
+*/
+void ppa_si_swapinfo(PPA_SYSINFO *sysinfo);
+
+/*! \brief get system free ram
+    \param pointer to systeminfo structure
+    \return system freeram
+    \note
+*/
+uint64_t ppa_si_freeram(PPA_SYSINFO *sysinfo);
+#endif
+uint32_t ppa_is_bond_slave(PPA_IFNAME *ifname, PPA_NETIF *netif);
 #endif  //  __KERNEL__
 /* @} */
 

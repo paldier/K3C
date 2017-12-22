@@ -156,7 +156,6 @@ static uint32_t        g_hit_polling_time = DEFAULT_HIT_POLLING_TIME;
 static PPA_TIMER        g_mib_cnt_timer;
 static uint32_t         g_mib_polling_time = DEFAULT_MIB_POLLING_TIME;
 PPA_ATOMIC              g_hw_session_cnt; /*including unicast & multicast sessions */
-
 /*
  *  multicast routing session table
  */
@@ -185,6 +184,11 @@ static PPA_MEM_CACHE               *g_ipsec_group_item_cache = NULL;
 
 static QOS_QUEUE_LIST_ITEM *g_qos_queue = NULL;
 static PPA_LOCK g_qos_queue_lock;
+
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+static QOS_INGGRP_LIST_ITEM *g_qos_inggrp_list = NULL;
+static PPA_LOCK g_qos_inggrp_list_lock;
+#endif
 
 static QOS_SHAPER_LIST_ITEM *g_qos_shaper = NULL;
 static PPA_LOCK g_qos_shaper_lock;
@@ -466,6 +470,132 @@ int32_t ppa_qos_queue_lookup(int32_t qnum, PPA_IFNAME ifname[16],QOS_QUEUE_LIST_
     return ret;
 }
 EXPORT_SYMBOL(ppa_qos_queue_lookup);
+
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+QOS_INGGRP_LIST_ITEM * ppa_qos_inggrp_alloc_item(void)    //  alloc_netif_info
+{
+    QOS_INGGRP_LIST_ITEM *obj;
+
+    obj = (QOS_INGGRP_LIST_ITEM *)ppa_malloc(sizeof(*obj));
+    if ( obj )
+    {
+        ppa_memset(obj, 0, sizeof(*obj));
+        ppa_atomic_set(&obj->count, 1);
+    }
+    return obj;
+}
+EXPORT_SYMBOL(ppa_qos_inggrp_alloc_item);
+
+void ppa_qos_inggrp_free_item(QOS_INGGRP_LIST_ITEM *obj)  //  free_netif_info
+{
+    if ( ppa_atomic_dec(&obj->count) == 0 )
+    {
+        ppa_free(obj);
+    }
+}
+EXPORT_SYMBOL(ppa_qos_inggrp_free_item);
+
+void ppa_qos_inggrp_lock_list(void)    //  lock_netif_info_list
+{
+    ppa_lock_get(&g_qos_inggrp_list_lock);
+}
+EXPORT_SYMBOL(ppa_qos_inggrp_lock_list);
+
+void ppa_qos_inggrp_unlock_list(void)  //  unlock_netif_info_list
+{
+    ppa_lock_release(&g_qos_inggrp_list_lock);
+}
+EXPORT_SYMBOL(ppa_qos_inggrp_unlock_list);
+
+void __ppa_qos_inggrp_add_item(QOS_INGGRP_LIST_ITEM *obj)   //  add_netif_info
+{
+    ppa_atomic_inc(&obj->count);
+    //ppa_netif_lock_list();
+    obj->next = g_qos_inggrp_list;
+    g_qos_inggrp_list = obj;
+    //ppa_netif_unlock_list();
+}
+EXPORT_SYMBOL(__ppa_qos_inggrp_add_item);
+
+void ppa_qos_inggrp_remove_item(PPA_IFNAME ifname[16], QOS_INGGRP_LIST_ITEM **pp_info)  //  remove_netif_info
+{
+    QOS_INGGRP_LIST_ITEM *p_prev, *p_cur;
+
+    if ( pp_info )
+        *pp_info = NULL;
+    p_prev = NULL;
+    ppa_qos_inggrp_lock_list();
+    for ( p_cur = g_qos_inggrp_list; p_cur; p_prev = p_cur, p_cur = p_cur->next )
+        if ((strcmp(p_cur->ifname,ifname) == 0))
+        {
+            if ( !p_prev )
+                g_qos_inggrp_list = p_cur->next;
+            else
+                p_prev->next = p_cur->next;
+            if ( pp_info )
+                *pp_info = p_cur;
+            else
+                ppa_qos_inggrp_free_item(p_cur);
+            break;
+        }
+    ppa_qos_inggrp_unlock_list();
+}
+EXPORT_SYMBOL(ppa_qos_inggrp_remove_item);
+
+void ppa_qos_inggrp_free_list(void)
+{
+   QOS_INGGRP_LIST_ITEM *obj;
+
+    ppa_qos_inggrp_lock_list();
+    while ( g_qos_inggrp_list )
+    {
+        obj = g_qos_inggrp_list;
+        g_qos_inggrp_list = g_qos_inggrp_list->next;
+
+        ppa_qos_inggrp_free_item(obj);
+        obj = NULL;
+    }
+    ppa_qos_inggrp_unlock_list();
+}
+EXPORT_SYMBOL(ppa_qos_inggrp_free_list);
+
+int32_t __ppa_qos_inggrp_lookup(PPA_IFNAME ifname[16],QOS_INGGRP_LIST_ITEM **pp_info)    //  netif_info_is_added
+{
+    int32_t ret = PPA_ENOTAVAIL;
+    QOS_INGGRP_LIST_ITEM *p;
+    ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s:%d: lookup ifname=%s\n", __func__, __LINE__, ifname);
+    //ppa_netif_lock_list();
+    for ( p = g_qos_inggrp_list; p; p = p->next ) {
+        ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s:%d: entry %p: ingress group=%d, ifname=%s\n", __func__, __LINE__, p, p->ingress_group, p->ifname); 
+        if (strcmp(p->ifname,ifname) == 0)
+        {
+            ret = PPA_SUCCESS;
+            if ( pp_info )
+            {
+                ppa_atomic_inc(&p->count);
+                *pp_info = p;
+            }
+            break;
+        }
+    }
+    //ppa_netif_unlock_list();
+
+    return ret;
+}
+EXPORT_SYMBOL(__ppa_qos_inggrp_lookup);
+
+int32_t ppa_qos_inggrp_lookup(PPA_IFNAME ifname[16],QOS_INGGRP_LIST_ITEM **pp_info)    //  netif_info_is_added
+{
+    int32_t ret;
+    ppa_qos_inggrp_lock_list();
+    ret = __ppa_qos_inggrp_lookup(ifname, pp_info);
+    ppa_qos_inggrp_unlock_list();
+
+    return ret;
+}
+EXPORT_SYMBOL(ppa_qos_inggrp_lookup);
+#endif
+
 #if defined(WMM_QOS_CONFIG) && WMM_QOS_CONFIG
 
 int32_t ppa_qos_create_c2p_map_for_wmm(PPA_IFNAME ifname[16],uint8_t c2p[])
@@ -661,6 +791,14 @@ int32_t ppa_delete_qos_queue( char *ifname, int32_t priority, uint32_t *queue_id
 	}
 #endif
 	return ret;
+}
+
+int32_t ppa_set_qos_inggrp(PPA_QOS_INGGRP_CFG *inggrp_info, uint32_t hal_id)
+{
+    /* For future use - presently the HAL doesn't need the grouping information,
+     * it is maintained only in PPA.
+     */
+    return PPA_SUCCESS;
 }
 
 int32_t qosal_eng_init_cfg()
@@ -873,6 +1011,8 @@ int32_t qosal_add_shaper(PPA_CMD_RATE_INFO *rate_info, QOS_SHAPER_LIST_ITEM **pp
     return ret; 
 }
 
+
+
 int32_t qosal_add_qos_queue(PPA_CMD_QOS_QUEUE_INFO *q_info, QOS_QUEUE_LIST_ITEM **pp_item)
 {
 
@@ -886,7 +1026,6 @@ int32_t qosal_add_qos_queue(PPA_CMD_QOS_QUEUE_INFO *q_info, QOS_QUEUE_LIST_ITEM 
     uint32_t k;
     uint8_t f_more_hals = 0;
 
-   
     memset(&add_q_cfg,0x00,sizeof(PPA_QOS_ADD_QUEUE_CFG)); 
     p_item = ppa_qos_queue_alloc_item();
     if ( !p_item )
@@ -967,11 +1106,13 @@ int32_t qosal_add_qos_queue(PPA_CMD_QOS_QUEUE_INFO *q_info, QOS_QUEUE_LIST_ITEM 
     }
 
     if(q_info->shaper.enable == 1)
-    {
-	caps_list[num_caps++].cap = Q_SHAPER;
-    }
-    
+        caps_list[num_caps++].cap = Q_SHAPER;
+
+    if (q_info->flags & PPA_QOS_Q_F_INGRESS)
+            caps_list[num_caps++].cap = QOS_INGGRP;
+
     if(ppa_select_hals_from_caplist(0, num_caps, caps_list) != PPA_SUCCESS) {
+        ppa_debug(DBG_ENABLE_MASK_ERR,"%s:%d: ppa_select_hals_from_caplist failed\n", __func__, __LINE__);
 		ppa_free(caps_list);
 		return PPA_FAILURE;
     }
@@ -1220,7 +1361,87 @@ UPDATE_FAILED:
 
 //#endif
 }
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+int32_t qosal_get_qos_inggrp(PPA_QOS_INGGRP inggrp, PPA_IFNAME ifnames[PPA_QOS_MAX_IF_PER_INGGRP][PPA_IF_NAME_SIZE])
+{
+    QOS_INGGRP_LIST_ITEM *p;
+    int32_t count = 0;
 
+    ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s;%d: find all interfaces in inggrp%d", __func__, __LINE__, inggrp);
+    ppa_qos_inggrp_lock_list();
+    for ( p = g_qos_inggrp_list; p && (count < PPA_QOS_MAX_IF_PER_INGGRP); p = p->next ) {
+        if (p->ingress_group == inggrp) {
+            ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s:%d: found interface %s in inggrp %d", __func__, __LINE__, p->ifname, inggrp); 
+            strncpy(ifnames[count++], p->ifname, PPA_IF_NAME_SIZE);
+        }
+    }
+    ppa_qos_inggrp_unlock_list();
+    return count;
+}
+EXPORT_SYMBOL(qosal_get_qos_inggrp);
+
+int32_t qosal_set_qos_inggrp(PPA_CMD_QOS_INGGRP_INFO *inggrp_info, QOS_INGGRP_LIST_ITEM **pp_item)
+{
+    QOS_INGGRP_LIST_ITEM *p_item = NULL;
+    PPA_HSEL_CAP_NODE hsel = {.cap = QOS_INGGRP};
+    PPA_QOS_INGGRP_CFG hcfg;
+    uint32_t ret=PPA_SUCCESS;
+
+    if (ppa_get_netif(inggrp_info->ifname) == NULL) {
+        ppa_debug(DBG_ENABLE_MASK_ERR, "%s:%d: interface %s does not exist!\n", __func__, __LINE__, inggrp_info->ifname);
+        return PPA_FAILURE;
+    }
+
+    ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s:%d: add %s to inggrp %d\n", __func__, __LINE__, inggrp_info->ifname, inggrp_info->ingress_group);
+
+    /* First, check if interface is already added */
+    if (ppa_qos_inggrp_lookup(inggrp_info->ifname, &p_item) == PPA_SUCCESS) {
+        /* interface found in inggrp list - modify ingress group */
+        if (PPA_INGGRP_VALID(inggrp_info->ingress_group) && inggrp_info->ingress_group != p_item->ingress_group) {
+            ppa_debug(DBG_ENABLE_MASK_ERR, "%s:%d: WARNING: modify %s ingress group %d -> %d (won't affect already active queues!)\n",
+                                            __func__, __LINE__, inggrp_info->ifname, p_item->ingress_group, inggrp_info->ingress_group);
+            p_item->ingress_group = inggrp_info->ingress_group;
+        }
+    } else if (PPA_INGGRP_INVALID(inggrp_info->ingress_group)) {
+            ppa_debug(DBG_ENABLE_MASK_ERR, "%s:%d: ERROR: invalid ingress group %d (%s)\n",
+                                            __func__, __LINE__, inggrp_info->ingress_group, inggrp_info->ifname);
+            return PPA_FAILURE;
+    }
+
+    /* Second, select HAL which supports Ingress Grouping amd call it */
+    if (ppa_select_hals_from_caplist(0, 1, &hsel) != PPA_SUCCESS) {
+        ppa_debug(DBG_ENABLE_MASK_ERR, "%s:%d: failed to find HAL with Ingress Grouping support\n", __func__, __LINE__);
+		return PPA_FAILURE;
+    }
+
+    memset(&hcfg, 0, sizeof(hcfg));
+    hcfg.ingress_group = inggrp_info->ingress_group;
+    strcpy(hcfg.ifname, inggrp_info->ifname);
+    if (ppa_set_qos_inggrp(&hcfg, hsel.hal_id) != PPA_SUCCESS) {
+        ppa_debug(DBG_ENABLE_MASK_ERR, "%s:%d: failed to set Ingress Grouping for HAL id %d\n", __func__, __LINE__, hsel.hal_id);
+		return PPA_FAILURE;
+    }
+
+    if (!p_item) {
+        /* Allocate a new node and add to the inggrp list */
+        p_item = ppa_qos_inggrp_alloc_item();
+        if (!p_item) {
+            ppa_debug(DBG_ENABLE_MASK_ERR, "%s:%d: alloc qos inggrp list item failed \n", __func__, __LINE__);
+            return PPA_ENOMEM;
+        }
+
+        strcpy(p_item->ifname, inggrp_info->ifname);
+        p_item->ingress_group = inggrp_info->ingress_group;
+        ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s:%d: Add item %p ifname=%s, inggrp=%d\n", __func__, __LINE__,
+                  p_item, p_item->ifname, p_item->ingress_group);
+        __ppa_qos_inggrp_add_item(p_item);
+    }
+
+    /* success */
+    *pp_item = p_item;
+    return ret;
+}
+#endif
 
 /*
  *  routing session list item operation
@@ -1233,6 +1454,7 @@ UPDATE_FAILED:
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
 extern PPA_HLIST_HEAD          g_session_list_hash_table[SESSION_LIST_HASH_TABLE_SIZE];
 
+#if 0
 int32_t ppa_session_ipsec_us_delete(struct session_list_item *p_item, uint32_t flags)
 {
     struct session_list_item  *p_item_new    = NULL;
@@ -1241,7 +1463,7 @@ int32_t ppa_session_ipsec_us_delete(struct session_list_item *p_item, uint32_t f
    if((p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND_LAN) ==  SESSION_FLAG2_VALID_IPSEC_OUTBOUND_LAN )
    {
 
-  		printk("\n%s,%d\n",__FUNCTION__,__LINE__);
+  		//printk("\n%s,%d\n",__FUNCTION__,__LINE__);
 
     for ( i = 0; i < NUM_ENTITY(g_session_list_hash_table); i++ )
     {
@@ -1253,7 +1475,7 @@ int32_t ppa_session_ipsec_us_delete(struct session_list_item *p_item, uint32_t f
 
       if( ((p_item_new->flag2 & ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA )) == ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA )) && ( p_item->routing_entry  == p_item_new->routing_entry) )
       {
-		printk("\n%s,%d Tunel Index=0x%x,routing entry=%d\n",__FUNCTION__,__LINE__,p_item_new->tunnel_idx,p_item_new->routing_entry);
+		//printk("\n%s,%d Tunel Index=0x%x,routing entry=%d\n",__FUNCTION__,__LINE__,p_item_new->tunnel_idx,p_item_new->routing_entry);
   		//printk("\n%s,%d\n",__FUNCTION__,__LINE__);
 
     __ppa_session_put(p_item_new);
@@ -1269,6 +1491,87 @@ int32_t ppa_session_ipsec_us_delete(struct session_list_item *p_item, uint32_t f
 }
 #endif
 
+#if 0
+#define  ppa_session_print(p_item) printk("<%s> %s: proto:%d %pI4:%d <-> %pI4:%d count=%u\n", \
+                                     __FUNCTION__,  \
+                                     ppa_is_BrSession((p_item)?"Bridged":"Routed"), \
+                                     p_item->ip_proto, \
+                                     &p_item->src_ip,p_item->src_port, \
+                                     &p_item->dst_ip,p_item->dst_port, \
+                                     p_item->num_adds);
+#endif
+
+int32_t ppa_session_delete_ipsec_mpe( uint32_t tunnel_index);
+
+int32_t ppa_session_delete_ipsec( uint32_t tunnel_index)
+{
+  int32_t ret = PPA_SUCCESS;
+  struct session_list_item *p_item;
+  int i =0;
+
+
+  ppa_session_list_lock();
+
+
+    for ( i = 0; i < NUM_ENTITY(g_session_list_hash_table); i++ )
+    {
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,8,13)
+      ppa_hlist_for_each_entry(p_item, node,&g_session_list_hash_table[i], hlist)
+#else
+      ppa_hlist_for_each_entry(p_item, &g_session_list_hash_table[i], hlist)
+#endif
+
+
+   if(  (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND) == SESSION_FLAG2_VALID_IPSEC_OUTBOUND ) {
+
+	//printk("\n%s,%d routing entry=%d\n",__FUNCTION__,__LINE__,p_item->routing_entry);
+      	//ppa_session_print(p_item);
+
+     	__ppa_session_put(p_item);
+    	__ppa_session_delete_item(p_item); 
+       }
+
+  } 
+  ppa_session_list_unlock();
+  return ret;
+}
+
+int32_t ppa_session_delete_ipsec_mpe( uint32_t tunnel_index)
+{
+  int32_t ret = PPA_SUCCESS;
+  struct session_list_item *p_item;
+  int i =0;
+
+
+    ppa_session_list_lock();
+
+    for ( i = 0; i < NUM_ENTITY(g_session_list_hash_table); i++ )
+    {
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,8,13)
+      ppa_hlist_for_each_entry(p_item, node,&g_session_list_hash_table[i], hlist)
+#else
+      ppa_hlist_for_each_entry(p_item, &g_session_list_hash_table[i], hlist)
+#endif
+
+
+   if(  ((p_item->flag2 & ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA )) == ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA )) ) {
+
+        printk("\n%s,%d Tunel Index=0x%x,routing entry=%d\n",__FUNCTION__,__LINE__,p_item->tunnel_idx,p_item->routing_entry);
+        //ppa_session_print(p_item);
+
+    	__ppa_session_put(p_item);
+    	__ppa_session_delete_item(p_item); 
+
+  	} 
+
+  } 
+  ppa_session_list_unlock();
+  return ret;
+}
+
+
+#endif
+
 int32_t ppa_session_delete(PPA_SESSION *p_session, uint32_t flags)
 {
   int32_t ret = PPA_FAILURE;
@@ -1278,32 +1581,12 @@ int32_t ppa_session_delete(PPA_SESSION *p_session, uint32_t flags)
   if ( __ppa_session_find_by_ct(p_session, 0, &p_item) == PPA_SESSION_EXISTS ) {
 	dump_list_item(p_item, "ppa_session_delete 0");
 
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-  if( ((p_item->flag2) & ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA )) == ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA ))
-  {
-  	ppa_session_list_unlock();
-        return ret;
-  } 
-
-    ppa_session_ipsec_us_delete(p_item, 0);
-#endif
-
     __ppa_session_put(p_item);
     __ppa_session_delete_item(p_item);
   } 
 
   if ( __ppa_session_find_by_ct(p_session, 1, &p_item) == PPA_SESSION_EXISTS ) {
 	dump_list_item(p_item, "ppa_session_delete 1");
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-
-  if( ((p_item->flag2) & ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA )) == ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA ))
-  {
-  	ppa_session_list_unlock();
-        return ret;
-  } 
-
-    ppa_session_ipsec_us_delete(p_item, 0);
-#endif
 
     __ppa_session_put(p_item);
     __ppa_session_delete_item(p_item);
@@ -1328,14 +1611,19 @@ int32_t ppa_speed_handle_frame( PPA_BUF *ppa_buf,
      */
 /* Set skb extmark bit to tell the stack packet is not classified by Flow rule */
 #ifdef CONFIG_NETWORK_EXTMARK
-    if(ppa_buf->priority == 0)
-    ppa_buf->extmark |= SESSION_FLAG_DSCP_REMARK;    
+    if( ppa_get_pkt_priority(ppa_buf) == 0)
+    	//ppa_buf->extmark |= SESSION_FLAG_DSCP_REMARK;    
+	ppa_set_skb_extmark(ppa_buf, SESSION_FLAG_DSCP_REMARK);
 #endif
 
     p_item->num_adds++;  
-    p_item->mips_bytes += ppa_buf->len + PPA_ETH_HLEN + PPA_ETH_CRCLEN;
+    p_item->mips_bytes += ppa_skb_len(ppa_buf) + PPA_ETH_HLEN + PPA_ETH_CRCLEN;
 #if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
     ppa_session_record_time(ppa_buf,p_item,0);
+#endif
+#ifdef CONFIG_PPA_PP_LEARNING
+	if( ppa_hw_accelerate(ppa_buf, p_item) )
+		ppa_pp_ingress_handler(ppa_buf, p_item);
 #endif
 
   } else {
@@ -1361,7 +1649,7 @@ int32_t ppa_speed_handle_frame( PPA_BUF *ppa_buf,
     if ( ppa_session_pass_criteria(ppa_buf,p_item,0) == PPA_FAILURE )
 #else
     //  not enough hit
-    if ( p_item->num_adds < g_ppa_min_hits )
+    if(ppa_session_entry_pass(p_item->num_adds, g_ppa_min_hits))
 #endif
     {
       ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"p_item->num_adds (%d) < g_ppa_min_hits (%d)\n", p_item->num_adds, g_ppa_min_hits);
@@ -1493,6 +1781,9 @@ int32_t ppa_update_session(PPA_BUF *ppa_buf, struct session_list_item *p_item, u
 {
     uint32_t ret = PPA_SESSION_NOT_ADDED;
 
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
+    uint32_t tunnel_index =0;
+#endif
 	// if ppa session is already added returning PPA_SESSION_ADDED
     if(p_item->flags & (SESSION_ADDED_IN_HW | SESSION_ADDED_IN_SW) ) {
     	ret = PPA_SESSION_ADDED;
@@ -1556,17 +1847,21 @@ int32_t ppa_update_session(PPA_BUF *ppa_buf, struct session_list_item *p_item, u
         p_item->priority = ppa_get_pkt_priority(ppa_buf);        
     }
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
-    //proto = ppa_get_pkt_ip_proto(ppa_buf); 
     if ( ppa_get_pkt_ip_proto(ppa_buf) == IP_PROTO_ESP)
     {
-    	p_item->flag2  		  |= ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND|SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA );
-         if(__ppa_update_ipsec_tunnelindex(p_item) == PPA_SUCCESS)
-	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,%d Tunel Index=0x%x,routing entry=%d\n",__FUNCTION__,__LINE__,p_item->tunnel_idx,p_item->routing_entry);
+    	p_item->flag2  		  |= ( SESSION_FLAG2_VALID_IPSEC_OUTBOUND);
+         if(__ppa_update_ipsec_tunnelindex(ppa_buf,&tunnel_index) == PPA_SUCCESS)
+         {
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,%d Tunel Index=0x%x,routing entry=%d\n",__FUNCTION__,__LINE__,p_item->tunnel_idx,p_item->routing_entry);
+		p_item->tunnel_idx 	  = tunnel_index;
+         }
          else
-	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,%d Tunel Index not found%x\n",__FUNCTION__,__LINE__);
-	//p_item->tunnel_idx 	  = tunnel_index;
+         {
+		//ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,%d Tunel Index not found%x\n",__FUNCTION__,__LINE__);
+		printk("\n%s,%d Tunel Index not found\n",__FUNCTION__,__LINE__);
+       		goto __UPDATE_FAIL;
+         }
     }
-    if((flags & PPA_F_LAN_IPSEC) != PPA_F_LAN_IPSEC) {
 #endif
     //  get information needed by hardware/firmware
     if ( (ret = ppa_update_session_info(ppa_buf, p_item, flags)) != PPA_SUCCESS )
@@ -1575,11 +1870,6 @@ int32_t ppa_update_session(PPA_BUF *ppa_buf, struct session_list_item *p_item, u
         goto __UPDATE_FAIL;
     }
 
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-}
-else
-      p_item->flags |= SESSION_LAN_ENTRY;
-#endif
 
     dump_list_item(p_item, "after ppa_update_session");
 
@@ -1592,9 +1882,6 @@ else
         && p_item->dst_mac[4] == 0
         && p_item->dst_mac[5] == 0 ) 
 	&& !(flags & PPA_F_SESSION_LOCAL_IN) 
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-        && (!(flags & PPA_F_LAN_IPSEC)) 
-#endif
 	)
     {
         SET_DBG_FLAG(p_item, SESSION_DBG_ZERO_DST_MAC);
@@ -1617,22 +1904,30 @@ else
 #endif
 
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)   
-        if(flags & PPA_F_LAN_IPSEC)
+        if ( ppa_get_pkt_ip_proto(ppa_buf) == IP_PROTO_ESP)
         {
 		p_item->flag2 |= SESSION_FLAG2_VALID_IPSEC_OUTBOUND_LAN;
-                p_item->mtu -= (ESP_HEADER + 13); 
+                //p_item->mtu -= (ESP_HEADER + 13); 
         }
 #endif
   /* place holder for some explicit criteria based on which the session 
      must go through SW acceleration */
+#ifdef CONFIG_PPA_PP_LEARNING
+	p_item->protocol	  = ppa_get_pkt_protocol(ppa_buf);
+#endif
 
 #ifdef CONFIG_PPA_PUMA7
   p_item->flag2 |= SESSION_FLAG2_UPDATE_INFO_PROCESSED;
 #endif
 
+#ifdef CONFIG_PPA_PUMA7
 __UPDATE_PROCESSED:
+#endif
   if( ppa_hw_accelerate(ppa_buf, p_item) ) { 
 
+#ifdef CONFIG_PPA_PP_LEARNING
+	ppa_pp_session_create(ppa_buf, p_item);
+#endif
 #if defined(CONFIG_LTQ_PPA_HAL_SELECTOR) && CONFIG_LTQ_PPA_HAL_SELECTOR
     if ( (ret = ppa_hsel_add_routing_session(p_item, 0)) != PPA_SUCCESS )
 #else
@@ -1644,32 +1939,25 @@ __UPDATE_PROCESSED:
 #if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
         // add to hardware failed.. so this session needs to go through software acceleration
         if(!(p_item->flag2 & SESSION_FLAG2_HW_LOCK_FAIL)) {
-            ppa_sw_add_session(ppa_buf, p_item);
-            ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"entry added in sw acceleration\n");
+            if (ppa_sw_add_session(ppa_buf, p_item)==PPA_SUCCESS)
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"entry added in sw acceleration\n");
+	    else {
+#if defined(CONFIG_LTQ_PPA_HAL_SELECTOR) && CONFIG_LTQ_PPA_HAL_SELECTOR
+		if (ppa_is_hal_registered_for_all_caps(p_item) != PPA_SUCCESS)
+#endif
+		    /* TODO: In future, need to handle the case in legacy platforms for a
+		     * protocol that supports hardware acceleration and not software acceleration,
+		     * but adding session to hardware failed this time, to try again in next cycle.
+		     */
+		    p_item->flags |= SESSION_NOT_ACCELABLE;
+		ret = PPA_FAILURE;
+		goto __UPDATE_FAIL;
+	    }
         }
 #endif
     }
     else {
         p_item->flag2 &= ~SESSION_FLAG2_ADD_HW_FAIL;
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)   
-        if(flags & PPA_F_LAN_IPSEC)
-        {
-#if 1
-	struct dst_entry *dst = skb_dst(ppa_buf);
-	struct xfrm_state *x = dst->xfrm;
-  	uint32_t tunnel_index =0;
-  	sa_direction dir;
-        ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nxfrm_id->daddr=0x%x\n",x->id.daddr.a4);
-        ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nxfrm_id->spi=0x%x\n",x->id.spi);
-        ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nxfrm_id->proto=%d\n",x->id.proto);
-        ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nprops->saddr=0x%x\n",x->props.saddr.a4);
-#endif
-       if(ppa_get_ipsec_tunnel_tbl_entry(x,&dir,&tunnel_index) == PPA_SUCCESS) {
-        //printk("\n%s,%d, tunnel index=%d,routing entry=%d\n",__FUNCTION__,__LINE__,tunnel_index, p_item->routing_entry);
-	ppa_ipsec_tunnel_tbl_routeindex(tunnel_index, p_item->routing_entry);
-  		}
-        }
-#endif
     }
   }
 #if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
@@ -1677,6 +1965,12 @@ __UPDATE_PROCESSED:
     // entry criteria to hardware failed so the session needs to put into software acceleration
     if(ppa_sw_add_session(ppa_buf, p_item)==PPA_SUCCESS)
     	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"entry added in sw acceleration\n");
+    else {
+	p_item->flags |= SESSION_NOT_ACCELABLE;
+	ret = PPA_FAILURE;
+	goto __UPDATE_FAIL;
+    }
+
   }
 #endif
 
@@ -2001,12 +2295,13 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
     PPA_HLIST_NODE            *node      = NULL;
 #endif
     
-    uint32_t i;
+    uint32_t i=0;
     PPE_ROUTING_INFO route = {0};
     PPE_MC_INFO      mc    = {0};
     uint64_t         tmp   = 0;
     
 #if defined(CONFIG_LTQ_PPA_IF_MIB) && CONFIG_LTQ_PPA_IF_MIB
+    uint32_t j=0;
     if( flag & PPA_CMD_CLEAR_PORT_MIB ) {
         clear_all_netif_mib();
     }
@@ -2016,7 +2311,7 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
     for ( i = 0; i < NUM_ENTITY(g_session_list_hash_table); i++ )
     {
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,8,13)
-      ppa_hlist_for_each_entry(p_item, node,&g_session_list_hash_table[i], hlist)
+      ppa_hlist_for_each_entry(p_item, node, &g_session_list_hash_table[i], hlist)
 #else
       ppa_hlist_for_each_entry(p_item, &g_session_list_hash_table[i], hlist)
 #endif
@@ -2137,12 +2432,14 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
     ppa_session_list_unlock();
       
     ppa_mc_get_htable_lock();   
-    for (i = 0; i < NUM_ENTITY(g_mc_group_list_hash_table); i ++){
+    for (i = 0; i < NUM_ENTITY(g_mc_group_list_hash_table); i++){
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,8,13)
-        ppa_hlist_for_each_entry(p_mc_item, node, &g_mc_group_list_hash_table[i], mc_hlist){
+        ppa_hlist_for_each_entry(p_mc_item, node, &g_mc_group_list_hash_table[i], mc_hlist)
 #else
-        ppa_hlist_for_each_entry(p_mc_item, &g_mc_group_list_hash_table[i], mc_hlist){
+        ppa_hlist_for_each_entry(p_mc_item, &g_mc_group_list_hash_table[i], mc_hlist)
 #endif
+	{
+	
             tmp = 0;
             mc.p_entry = p_mc_item->mc_entry;
 
@@ -2174,7 +2471,6 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
                     p_mc_item->last_hit_time = ppa_get_time_in_sec();
 #if !(defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500)
                     ppa_drv_get_mc_entry_bytes(&mc, flag);
-#endif
 
                     if( (uint32_t ) mc.bytes >= p_mc_item->last_bytes){
                         tmp = mc.bytes - (uint64_t)p_mc_item->last_bytes;
@@ -2184,14 +2480,24 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
                     p_mc_item->acc_bytes += tmp;
 
                     p_mc_item->last_bytes = mc.bytes;
+#else
+		    tmp = mc.bytes; 
+		    if( (p_mc_item->acc_bytes + mc.bytes) > (uint64_t)WRAPROUND_64BITS) {
+			err(" p_mc_item->acc_bytes  %llu wrapping around \n", p_mc_item->acc_bytes);
+			p_mc_item->acc_bytes = mc.bytes;
+		    } else { 
+			p_mc_item->last_bytes = p_mc_item->acc_bytes;
+			p_mc_item->acc_bytes += mc.bytes;
+		    }   
+#endif
 
                     #if defined(CONFIG_LTQ_PPA_IF_MIB) && CONFIG_LTQ_PPA_IF_MIB
                     if( p_mc_item->src_netif )
                        update_netif_hw_mib(ppa_get_netif_name(p_mc_item->src_netif), tmp, 1);
 
-                    for(i=0; i<p_mc_item->num_ifs; i++ )
-                       if( p_mc_item->netif[i])
-                           update_netif_hw_mib(ppa_get_netif_name(p_mc_item->netif[i]), tmp, 0);
+                    for(j=0; j<p_mc_item->num_ifs; j++ )
+                       if( p_mc_item->netif[j])
+                           update_netif_hw_mib(ppa_get_netif_name(p_mc_item->netif[j]), tmp, 0);
                     #endif
                 }
             }
@@ -2212,9 +2518,9 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
     }
     ppa_mc_release_htable_lock();
 
-  
+#if 1  
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
-  IPSEC_TUNNEL_MIB_INFO mib_info; 
+  IPSEC_TUNNEL_MIB_INFO mib_info={0,0,0,0,0}; 
   uint32_t  index=0;
   ppa_tunnel_entry *t_entry = NULL;
   ppe_lock_get(&g_tunnel_table_lock);
@@ -2223,9 +2529,64 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
     t_entry = g_tunnel_table[index];
     if ( t_entry != NULL && (t_entry->tunnel_type ==TUNNEL_TYPE_IPSEC)) {
 	mib_info.tunnel_id= index;
+        mib_info.rx_pkt_count= mib_info.rx_byte_count= mib_info.tx_pkt_count= mib_info.tx_byte_count=0x0;
+
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
             ppa_hsel_get_ipsec_tunnel_mib(&mib_info, 0, MPE_HAL);
-	   printk("\n Tunnel MIB for tunnel index=%d,rx pkt count=%d,rx byte count=%d,tx pkt count=%d,tx byte count=%d\n", index,mib_info.rx_pkt_count,mib_info.rx_byte_count,mib_info.tx_pkt_count,mib_info.tx_byte_count);
+	    //printk("\n Tunnel MIB for tunnel index=%d,rx pkt count=%u,rx byte count=%u,tx pkt count=%u,tx byte count=%u\n", index,mib_info.rx_pkt_count,mib_info.rx_byte_count,mib_info.tx_pkt_count,mib_info.tx_byte_count);
+#if 1
+
+
+	  if(t_entry->tunnel_info.ipsec_hdr.inbound != NULL)
+	  {
+	  spin_lock_bh(&t_entry->tunnel_info.ipsec_hdr.inbound->lock);
+	  
+	  t_entry->tunnel_info.ipsec_hdr.inbound->curlft.packets += (mib_info.rx_pkt_count - t_entry->tunnel_info.ipsec_hdr.inbound_pkt_cnt);
+	  t_entry->tunnel_info.ipsec_hdr.inbound->curlft.bytes += (mib_info.rx_byte_count - t_entry->tunnel_info.ipsec_hdr.inbound_byte_cnt);
+          t_entry->tunnel_info.ipsec_hdr.inbound_pkt_cnt = mib_info.rx_pkt_count;
+          t_entry->tunnel_info.ipsec_hdr.inbound_byte_cnt = mib_info.rx_byte_count;
+
+/* 
+	  if (t_entry->tunnel_info.ipsec_hdr.inbound->curlft.bytes >= t_entry->tunnel_info.ipsec_hdr.inbound->lft.hard_byte_limit) 
+          {
+		t_entry->tunnel_info.ipsec_hdr.inbound->curlft.bytes = t_entry->tunnel_info.ipsec_hdr.inbound->lft.soft_byte_limit;
+          }
+	  if (t_entry->tunnel_info.ipsec_hdr.inbound->curlft.packets >= t_entry->tunnel_info.ipsec_hdr.inbound->lft.hard_packet_limit) {
+
+		t_entry->tunnel_info.ipsec_hdr.inbound->curlft.packets = t_entry->tunnel_info.ipsec_hdr.inbound->lft.soft_packet_limit;
+          } */
+	  //xfrm_state_check_expire(t_entry->tunnel_info.ipsec_hdr.inbound);
+	  spin_unlock_bh(&t_entry->tunnel_info.ipsec_hdr.inbound->lock);
+          } 
+
+
+          if(t_entry->tunnel_info.ipsec_hdr.outbound != NULL)
+	  {
+
+	  spin_lock_bh(&t_entry->tunnel_info.ipsec_hdr.outbound->lock);
+
+	  t_entry->tunnel_info.ipsec_hdr.outbound->curlft.packets += (mib_info.tx_pkt_count - t_entry->tunnel_info.ipsec_hdr.outbound_pkt_cnt);
+;
+	  t_entry->tunnel_info.ipsec_hdr.outbound->curlft.bytes += (mib_info.tx_byte_count - t_entry->tunnel_info.ipsec_hdr.outbound_byte_cnt);
+;
+
+          t_entry->tunnel_info.ipsec_hdr.outbound_pkt_cnt = mib_info.tx_pkt_count;
+          t_entry->tunnel_info.ipsec_hdr.outbound_byte_cnt = mib_info.tx_byte_count;
+/*
+ 	  if (t_entry->tunnel_info.ipsec_hdr.outbound->curlft.bytes >= t_entry->tunnel_info.ipsec_hdr.outbound->lft.hard_byte_limit) 
+          {
+		t_entry->tunnel_info.ipsec_hdr.outbound->curlft.bytes = t_entry->tunnel_info.ipsec_hdr.outbound->lft.soft_byte_limit;
+          }
+	  if (t_entry->tunnel_info.ipsec_hdr.outbound->curlft.packets >= t_entry->tunnel_info.ipsec_hdr.outbound->lft.hard_packet_limit) {
+
+		t_entry->tunnel_info.ipsec_hdr.outbound->curlft.packets = t_entry->tunnel_info.ipsec_hdr.outbound->lft.soft_packet_limit;
+          } */
+
+	  //xfrm_state_check_expire(t_entry->tunnel_info.ipsec_hdr.outbound);
+	  spin_unlock_bh(&t_entry->tunnel_info.ipsec_hdr.outbound->lock); 
+	  }
+#endif      
+   
 #endif
    }
            
@@ -2233,7 +2594,7 @@ void ppa_check_hit_stat_clear_mib(int32_t flag)
   ppe_lock_release(&g_tunnel_table_lock);
 
 #endif
-
+#endif 
 
 }
 EXPORT_SYMBOL(ppa_check_hit_stat_clear_mib);
@@ -2437,11 +2798,11 @@ static INLINE void ppa_remove_mc_groups_on_netif(PPA_IFNAME *ifname)
     ppa_lock_get(&g_mc_group_list_lock);
     for ( idx = 0; idx < NUM_ENTITY(g_mc_group_list_hash_table); idx++ ){
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,8,13)
-        ppa_hlist_for_each_entry_safe(p_mc_item, node, tmp, &g_mc_group_list_hash_table[idx],mc_hlist){
+        ppa_hlist_for_each_entry_safe(p_mc_item, node, tmp, &g_mc_group_list_hash_table[idx],mc_hlist)
 #else
-        ppa_hlist_for_each_entry_safe(p_mc_item, tmp, &g_mc_group_list_hash_table[idx],mc_hlist){
+        ppa_hlist_for_each_entry_safe(p_mc_item, tmp, &g_mc_group_list_hash_table[idx],mc_hlist)
 #endif
-            
+           { 
             for ( i = 0; i < p_mc_item->num_ifs; i++ ){
                 if ( ppa_is_netif_name(p_mc_item->netif[i], ifname) ){
                     p_mc_item->netif[i] = NULL;
@@ -2453,16 +2814,19 @@ static INLINE void ppa_remove_mc_groups_on_netif(PPA_IFNAME *ifname)
                 continue;
             
             p_mc_item->num_ifs --;
-            if(!p_mc_item->num_ifs){
+            //if(!p_mc_item->num_ifs){
+            if(p_mc_item->num_ifs == 0){
                 ppa_remove_mc_group(p_mc_item);
             }
-            else{
+            else  if(p_mc_item->num_ifs > 0) {
                 for(i = i + 1; i < p_mc_item->num_ifs + 1; i ++){//shift other netif on the list
                     p_mc_item->netif[i - 1] = p_mc_item->netif[i];
                     p_mc_item->ttl[i - 1] = p_mc_item->ttl[i];
                 }
                 p_mc_item->if_mask = p_mc_item->if_mask >> 1; //should we remove this item???
-            }               
+            }
+	    else
+		break;               
         }
     }
         
@@ -2566,22 +2930,22 @@ int32_t ppa_add_session( PPA_BUF *ppa_buf,
 {
   struct session_list_item *p_item;
   int32_t ret;
-  struct sysinfo sysinfo;
+  PPA_SYSINFO sysinfo;
   PPA_TUPLE tuple;
   uint32_t is_reply = (flags & PPA_F_SESSION_REPLY_DIR) ? 1 : 0;
     
   struct netif_info *rx_ifinfo;
   int32_t hdr_offset; 
+  uint16_t hdrlen =0;
 
 
   if( sys_mem_check_flag )  {        
       
-    si_meminfo(&sysinfo);        
+    ppa_si_meminfo(&sysinfo);        
 #ifndef CONFIG_SWAP
-    si_swapinfo(&sysinfo);        
-    //printk(KERN_ERR "freeram=%d K\n", K(sysinfo.freeram) );        
-    if( K(sysinfo.freeram) <= stop_session_add_threshold_mem ) {            
-      err("System memory too low: %lu K bytes\n", K(sysinfo.freeram)) ;              
+    ppa_si_swapinfo(&sysinfo);        
+    if( K(ppa_si_freeram(&sysinfo)) <= stop_session_add_threshold_mem ) {            
+      err("System memory too low: %lu K bytes\n", K(ppa_si_freeram(&sysinfo)) ;              
       return PPA_ENOMEM;        
     }    
 #endif
@@ -2593,21 +2957,6 @@ int32_t ppa_add_session( PPA_BUF *ppa_buf,
     ret = __ppa_session_find_by_ct(p_session, is_reply, pp_item);
   else
     ret = __ppa_find_session_from_skb(ppa_buf,0, pp_item);
-
-
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-    //proto = ppa_get_pkt_ip_proto(ppa_buf); 
-  if( PPA_SESSION_EXISTS == ret ) {
-    if ( (ppa_get_pkt_ip_proto(ppa_buf) == IP_PROTO_ESP)  && ((*pp_item)->routing_entry != 0xFFFFFFFF ) )
-    {
-
-	 if(__ppa_search_ipsec_rtindex(*pp_item) != PPA_SUCCESS) {
-    		/* printk("\n%s,%d\n",__FUNCTION__,__LINE__); */
-		ret = PPA_SESSION_NOT_ADDED ;
-  	}
-    }
-  }
-#endif
 
     
   if( PPA_SESSION_EXISTS == ret ) {
@@ -2630,11 +2979,18 @@ int32_t ppa_add_session( PPA_BUF *ppa_buf,
     
     ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"ppa_get_session(ppa_buf) = %08X\n", (uint32_t)ppa_get_session(ppa_buf));
 
+#ifdef CONFIG_PPA_PP_LEARNING
+    p_item->protocol	  = ppa_get_pkt_protocol(ppa_buf);
+#endif
     p_item->ip_proto      = ppa_get_pkt_ip_proto(ppa_buf);
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
+    if ( p_item->ip_proto == PPA_IPPROTO_TCP ) 
+      p_item->flags |= SESSION_IS_TCP;
+#endif
     p_item->ip_tos        = ppa_get_pkt_ip_tos(ppa_buf);
-    p_item->src_ip        = ppa_get_pkt_src_ip(ppa_buf);
+    ppa_get_pkt_src_ip(&p_item->src_ip, ppa_buf);
     p_item->src_port      = ppa_get_pkt_src_port(ppa_buf);
-    p_item->dst_ip        = ppa_get_pkt_dst_ip(ppa_buf);
+    ppa_get_pkt_dst_ip(&p_item->dst_ip, ppa_buf);
     p_item->dst_port      = ppa_get_pkt_dst_port(ppa_buf);
     p_item->rx_if         = ppa_get_pkt_src_if(ppa_buf);
     p_item->timeout       = ppa_get_default_session_timeout();
@@ -2675,6 +3031,17 @@ int32_t ppa_add_session( PPA_BUF *ppa_buf,
 	goto __ADD_SESSION_DONE;
     }
 
+    if(rx_ifinfo->netif == NULL)
+    {
+       //interface is added but not updated completely, this happens when the interface is added which doesn't exist 
+       //and receives the frist packet for acceleration
+       if (ppa_netif_update(NULL,rx_ifinfo->name) != PPA_SUCCESS)
+       {
+           ppa_debug(DBG_ENABLE_MASK_ERR,"failed in update interface\n");
+           goto __ADD_SESSION_DONE;
+       }
+    } 
+
     hdr_offset = PPA_ETH_HLEN; 
 
     if( rx_ifinfo->flags & (NETIF_WAN_IF) ) {
@@ -2688,17 +3055,28 @@ int32_t ppa_add_session( PPA_BUF *ppa_buf,
 	}
 	
 	// 6rd interface
-	if(rx_ifinfo->netif->type == ARPHRD_SIT) {
+	if( ppa_netif_type(rx_ifinfo->netif) == ARPHRD_SIT) {
 
 	    hdr_offset += 20;
 #if defined(CONFIG_LTQ_PPA_DSLITE) && CONFIG_LTQ_PPA_DSLITE
-    } else if( rx_ifinfo->netif->type == ARPHRD_TUNNEL6 ) {
+    } else if( ppa_netif_type(rx_ifinfo->netif) == ARPHRD_TUNNEL6 ) {
 
 	hdr_offset += 40;
 #endif
     }
 
+#ifdef CONFIG_PPA_PP_LEARNING
+#if 0
+    // set the skb->mac_header to (skb->data - skb->head) - hdr_offset
+    ppa_skb_set_mac_header(ppa_buf, -hdr_offset);
+    // read the mac
+    ppa_get_pkt_rx_src_mac_addr(ppa_buf, p_item->src_mac);
+    // reset skb->mac_header to (skb->data - skb->head)
+    ppa_skb_reset_mac_header(ppa_buf);
+#endif
+    ppa_get_src_mac_addr(ppa_buf, p_item->src_mac, -hdr_offset);
 
+#endif
 
     if ( rx_ifinfo->flags & NETIF_GRE_TUNNEL ) {
         
@@ -2709,22 +3087,43 @@ int32_t ppa_add_session( PPA_BUF *ppa_buf,
        */
       if( rx_ifinfo->greInfo.flowId == FLOWID_IPV4_EoGRE || 
           rx_ifinfo->greInfo.flowId == FLOWID_IPV6_EoGRE ) {
+#if 0
         ppa_skb_set_mac_header(ppa_buf, -(PPA_ETH_HLEN));  
         ppa_get_pkt_rx_src_mac_addr(ppa_buf, p_item->src_mac);
         ppa_skb_reset_mac_header(ppa_buf);  
+#endif
+        ppa_get_src_mac_addr(ppa_buf, p_item->src_mac, -(PPA_ETH_HLEN));
         hdr_offset += PPA_ETH_HLEN; //To skip inner MAC hdr
       }
         
-      hdr_offset += rx_ifinfo->greInfo.tnl_hdrlen; 
+        //hdr_offset += rx_ifinfo->greInfo.tnl_hdrlen; 
+
+	PPA_NETIF *base_netif = p_item->rx_if;
+        PPA_IFNAME underlying_intname[PPA_IF_NAME_SIZE];
+
+
+        if( ppa_if_is_vlan_if(p_item->rx_if, NULL))
+        {
+                if(ppa_vlan_get_underlying_if(p_item->rx_if, NULL, underlying_intname) == PPA_SUCCESS)
+                {
+                        base_netif = ppa_get_netif(underlying_intname); //Get underling layer net dev
+      			hdr_offset += 4; 
+                }
+        }
+        ppa_get_gre_hdrlen(base_netif, &hdrlen);
+      	hdr_offset += hdrlen; 
     }
 
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+#if 0
     // set the skb->mac_header to (skb->data - skb->head) - hdr_offset 
     ppa_skb_set_mac_header(ppa_buf, -hdr_offset);  
     // read the mac
     ppa_get_pkt_rx_src_mac_addr(ppa_buf, p_item->s_mac);
     // reset skb->mac_header to (skb->data - skb->head)
     ppa_skb_reset_mac_header(ppa_buf);
+#endif
+        ppa_get_src_mac_addr(ppa_buf, p_item->s_mac,-hdr_offset);
 #endif
   } else {
     ppa_get_pkt_rx_src_mac_addr(ppa_buf, p_item->src_mac);
@@ -2750,7 +3149,7 @@ int32_t ppa_add_session( PPA_BUF *ppa_buf,
 #endif
   }
 
-  p_item->mips_bytes   += ppa_buf->len + PPA_ETH_HLEN + PPA_ETH_CRCLEN;
+  p_item->mips_bytes   += ppa_skb_len(ppa_buf) + PPA_ETH_HLEN + PPA_ETH_CRCLEN;
   p_item->num_adds++;
 #if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
   ppa_session_store_ewma(ppa_buf,p_item,0);
@@ -2773,12 +3172,46 @@ __ADD_SESSION_DONE:
   return ret;
 }
 
+#if 1 
+int32_t ppa_get_underlying_vlan_interface_if_eogre(PPA_NETIF *netif, PPA_NETIF **base_netif, int32_t *isEoGre)
+{
+	uint8_t isIPv4Gre = 0;
+	PPA_IFNAME underlying_intname[PPA_IF_NAME_SIZE];
+			
+	*base_netif = NULL;
+	
+	if( ppa_if_is_vlan_if(netif, NULL))
+	{
+		//printk("<%s> %s VLAN device found!!!!!\n",__func__, netif->name);
+		if(ppa_vlan_get_underlying_if(netif, NULL, underlying_intname) == PPA_SUCCESS) 
+		{
+			netif = ppa_get_netif(underlying_intname); //Get underling layer net dev
+			//printk("<%s> Underlying interface %s device found!!!!!\n",__func__, netif->name);
+		} else {
+			return PPA_FAILURE;
+		}
+	}  
+	
+	if( ppa_is_gre_netif_type(netif, &isIPv4Gre, isEoGre) ) 
+	{
+		//printk("<%s> %s is a GRE interface!!!!!\n",__func__, netif->name);
+		*base_netif = netif;
+		return PPA_SUCCESS;
+	}
+	
+	return PPA_FAILURE;
+
+}
+#endif
+
+
 int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_item, uint32_t flags)
 {
   int32_t ret = PPA_SUCCESS;
   PPA_NETIF *netif;
   PPA_IPADDR ip;
   uint32_t port;
+  uint8_t *nat_src_mac;
   uint32_t dscp;
   struct netif_info *rx_ifinfo=NULL, *tx_ifinfo=NULL;
   int f_is_ipoa_or_pppoa = 0;
@@ -2938,9 +3371,6 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
    *  detect bridge and get the real effective device under this bridge
    *  do not support VLAN interface created on bridge
    */
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-  if(p_item->ip_proto != 50) {
-#endif
   if ( rx_ifinfo && ((rx_ifinfo->flags & (NETIF_BRIDGE | NETIF_PPPOE)) == NETIF_BRIDGE ))
   //  can't handle PPPoE over bridge properly, because src mac info is corrupted
   {
@@ -2988,9 +3418,6 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
           }
       }
   }
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-  }
-#endif
 
 //printk(KERN_INFO"in %s %d\n",__FUNCTION__, __LINE__);
   if ( tx_ifinfo && (tx_ifinfo->flags & NETIF_BRIDGE) )
@@ -3043,17 +3470,11 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
   /*
    *  check whether physical port is determined or not
    */
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-  if(p_item->ip_proto != 50) {
-#endif
   if ( ((tx_ifinfo && !(tx_ifinfo->flags & NETIF_PHYS_PORT_GOT)) || ( rx_ifinfo && !(rx_ifinfo->flags & NETIF_PHYS_PORT_GOT)) ))
   {
       p_item->flags |= SESSION_NOT_VALID_PHY_PORT;
       ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"tx no NETIF_PHYS_PORT_GOT\n");
   }
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-  }
-#endif
 
 
   /*
@@ -3073,7 +3494,9 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
 		    ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"tx_ifinfo->flags wrong LAN/WAN flag\n");
 		    goto PPA_UPDATE_SESSION_DONE_SHOTCUT;
 		}
-	    }
+	    } else {
+		p_item->flags |= SESSION_WAN_ENTRY;
+	    }	
 	}
 	else
 	{
@@ -3111,29 +3534,55 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
    */
   
   tunnel_hdr_len = 0; 
-  if( (!rx_local && p_item->tx_if->type == ARPHRD_SIT) || (!tx_local && p_item->rx_if->type == ARPHRD_SIT) ){
+  if( (!rx_local && ppa_netif_type(p_item->tx_if) == ARPHRD_SIT) || (!tx_local && ppa_netif_type(p_item->rx_if) == ARPHRD_SIT) ){
       
     p_item->flags |= SESSION_TUNNEL_6RD;
     tunnel_hdr_len = 20; 
 #if defined(CONFIG_LTQ_PPA_DSLITE) && CONFIG_LTQ_PPA_DSLITE
   } else if( (!rx_local && p_item->tx_if->type == ARPHRD_TUNNEL6) || 
-      (!tx_local && p_item->rx_if->type == ARPHRD_TUNNEL6)) {
+      (!tx_local && ppa_netif_type(p_item->rx_if) == ARPHRD_TUNNEL6)) {
 
     p_item->flags |= SESSION_TUNNEL_DSLITE;
     tunnel_hdr_len = 40; 
 #endif
   } else if( rx_ifinfo && (rx_ifinfo->flags & NETIF_GRE_TUNNEL)) {
-    
+    PPA_NETIF *base_netif;
+    PPA_NETIF *temp_netif;
+    int32_t is_eogre;
     ppa_set_GreSession(p_item);
     isEoGre = ( rx_ifinfo->greInfo.flowId == FLOWID_IPV4_EoGRE || 
                 rx_ifinfo->greInfo.flowId == FLOWID_IPV6_EoGRE )?1:0;
-    ppa_get_gre_hdrlen(p_item->rx_if,&tunnel_hdr_len);
+    temp_netif = p_item->rx_if;
+    if(ppa_get_underlying_vlan_interface_if_eogre(p_item->rx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+    {
+	//if(is_eogre)
+	//	p_item->rx_if = base_netif;
+    }
+    //ppa_get_gre_hdrlen(p_item->rx_if,&tunnel_hdr_len);
+    ppa_get_gre_hdrlen(base_netif,&tunnel_hdr_len);
+    //printk("<rx_ifinfo> Header len %d\n",tunnel_hdr_len);
+    p_item->rx_if = temp_netif;
   } else if( tx_ifinfo && (tx_ifinfo->flags & NETIF_GRE_TUNNEL)) {
-  
+    PPA_NETIF *base_netif;
+    PPA_NETIF *temp_netif; 
+    int32_t is_eogre;
     ppa_set_GreSession(p_item);
     isEoGre = ( tx_ifinfo->greInfo.flowId == FLOWID_IPV4_EoGRE || 
                 tx_ifinfo->greInfo.flowId == FLOWID_IPV6_EoGRE )?1:0;
-    ppa_get_gre_hdrlen(p_item->rx_if,&tunnel_hdr_len);
+    temp_netif = p_item->tx_if;
+    if(ppa_get_underlying_vlan_interface_if_eogre(p_item->tx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+    {
+	//if(is_eogre)
+	//	p_item->tx_if = base_netif;
+    }
+    //ppa_get_gre_hdrlen(p_item->rx_if,&tunnel_hdr_len);
+    ppa_get_gre_hdrlen(base_netif,&tunnel_hdr_len);
+    if(isEoGre)
+    {
+	tunnel_hdr_len += 14;
+    }
+    //printk("<tx_ifinfo> Header len %d\n",tunnel_hdr_len);
+    p_item->tx_if = temp_netif;
   }
     
   if( ppa_is_LanSession(p_item) && tunnel_hdr_len)
@@ -3195,6 +3644,7 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
    */
 
   if(tx_ifinfo) {
+    PPA_SKBUF fake_skb;
     p_item->dest_ifid = tx_ifinfo->phys_port;
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
     if(rx_ifinfo) 
@@ -3206,7 +3656,8 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
 #endif
     if ( (tx_ifinfo->flags & NETIF_PHY_ATM) )
     {
-      qid = ppa_drv_get_netif_qid_with_pkt(ppa_buf, tx_ifinfo->vcc, 1);
+      fake_skb.priority = ppa_get_pkt_priority(ppa_buf);
+      qid = ppa_drv_get_netif_qid_with_pkt(&fake_skb, tx_ifinfo->vcc, 1);
       if ( qid >= 0 )
           p_item->dslwan_qid = qid;
       else
@@ -3233,7 +3684,8 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
     {
 	netif = ppa_get_netif(tx_ifinfo->phys_netif_name);
     
-	qid = ppa_drv_get_netif_qid_with_pkt(ppa_buf, netif, 0);
+        fake_skb.priority = ppa_get_pkt_priority(ppa_buf);
+	qid = ppa_drv_get_netif_qid_with_pkt(&fake_skb, netif, 0);
 	if ( qid >= 0 )
 	{
 	    p_item->dslwan_qid = qid;
@@ -3250,7 +3702,7 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
   //  only port change with same IP not supported here, not really useful
   ppa_memset( &p_item->nat_ip, 0, sizeof(p_item->nat_ip) );
   p_item->nat_port= 0;
-  ip = ppa_get_pkt_src_ip(ppa_buf);
+  ppa_get_pkt_src_ip(&ip, ppa_buf);
   if ( ppa_memcmp(&ip, &p_item->src_ip, ppa_get_pkt_ip_len(ppa_buf)) != 0 )
   {
       if( p_item->flags & SESSION_LAN_ENTRY )
@@ -3285,8 +3737,12 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
           goto PPA_UPDATE_SESSION_DONE_SHOTCUT;
        }
   }    
-  
-  ip = ppa_get_pkt_dst_ip(ppa_buf);
+
+ #if defined(CONFIG_LTQ_PPA_MPE_IP97)
+    if ( ppa_get_pkt_ip_proto(ppa_buf) != IP_PROTO_ESP) {
+#endif
+ 
+  ppa_get_pkt_dst_ip(&ip, ppa_buf);
   if ( ppa_memcmp(&ip, &p_item->dst_ip, ppa_get_pkt_ip_len(ppa_buf)) != 0 )
   {
       if( (p_item->flags & SESSION_WAN_ENTRY) && ( ppa_zero_ip(p_item->nat_ip) )  )
@@ -3321,8 +3777,25 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
           goto PPA_UPDATE_SESSION_DONE_SHOTCUT;
       }
   }
+
+  /*
+   * check for l2 source nat in bridged sessions
+   */
+  if ( ppa_is_BrSession(p_item) )
+  {
+      nat_src_mac = ppa_get_pkt_src_mac_ptr(ppa_buf);
+      if ( nat_src_mac && ppa_memcmp(nat_src_mac, p_item->src_mac, ETH_ALEN) )
+      {
+          ppa_memcpy(p_item->nat_src_mac, nat_src_mac, ETH_ALEN);
+          p_item->flag2 |= SESSION_FLAG2_VALID_L2_SNAT;
+      }
+  }
+
   CLR_DBG_FLAG(p_item, SESSION_DBG_PPE_EDIT_LIMIT);
 
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
+  }
+#endif
 //printk(KERN_INFO"in %s %d\n",__FUNCTION__, __LINE__);
   if ( tx_ifinfo && (tx_ifinfo->flags & (SESSION_LAN_ENTRY | NETIF_PPPOE)) == (SESSION_LAN_ENTRY | NETIF_PPPOE) )
   { //cannot accelerate
@@ -3372,12 +3845,21 @@ int32_t ppa_update_session_info(PPA_BUF *ppa_buf, struct session_list_item *p_it
      * is NULL (that is p_item->session) needs to be relooked. 
      */ 
     if(ppa_is_LanSession(p_item)) {
+	PPA_NETIF *base_netif;
+	PPA_NETIF *temp_netif;
+	int32_t is_eogre;
+	temp_netif = ppa_buf->dev;
+	printk("For LANSession %s\n",ppa_buf->dev->name);
+    	if(ppa_get_underlying_vlan_interface_if_eogre(p_item->tx_if, &base_netif, &is_eogre) == PPA_SUCCESS)
+		ppa_buf->dev = base_netif;
+	//printk("For LANSession --> Base Interface %s\n",ppa_buf->dev->name);
       if( ppa_get_dst_mac(ppa_buf, NULL, p_item->dst_mac, 0) != PPA_SUCCESS ) {
         ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
             "session:%x can not get dst mac!\n", (u32)ppa_get_session(ppa_buf));
         SET_DBG_FLAG(p_item, SESSION_DBG_GET_DST_MAC_FAIL);
         ret = PPA_EAGAIN;
       }
+	ppa_buf->dev = temp_netif;
     } else {
       ppa_get_pkt_rx_dst_mac_addr(ppa_buf,p_item->dst_mac);
     }
@@ -3425,7 +3907,7 @@ PPA_UPDATE_SESSION_DONE_SKIP_MAC:
 
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)   
     	if ( ppa_get_pkt_ip_proto(ppa_buf) == IP_PROTO_ESP)
-                p_item->mtu -= (ESP_HEADER + 4); 
+                p_item->mtu -= (ESP_HEADER + 5); 
 #endif
 
   if( PPA_SUCCESS != 
@@ -3522,15 +4004,14 @@ int32_t ppa_update_session_extra(PPA_SESSION_EXTRA *p_extra, struct session_list
 #if defined(CONFIG_LTQ_PPA_IF_MIB) && CONFIG_LTQ_PPA_IF_MIB
             	sw_del_session_mgmt_stats(p_item);
 #endif
-#if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
-				update_session_mgmt_stats(p_item, DELETE); 
-#endif
-				p_item->flags &= ~SESSION_ADDED_IN_SW;
+				/* software session management is handled by SAE */
+				ppa_sw_session_enable(p_item, 0, p_item->flags);
 			}
 #endif
 		} else {
 #if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
-	    	p_item->flags |= SESSION_ADDED_IN_SW;
+	        /* software session management is handled by SAE */
+	        ppa_sw_session_enable(p_item, 1, p_item->flags);
 #else
 	    	p_item->flags |= SESSION_NOT_ACCEL_FOR_MGM;
 #endif
@@ -3765,14 +4246,16 @@ int32_t ppa_hw_add_session(struct session_list_item *p_item, uint32_t f_test)
     PPA_L2TP_INFO l2tpinfo={0};
 #endif
  
-    int ret = PPA_SUCCESS;
+    int ret = PPA_FAILURE;
 
 #if defined(L2TP_CONFIG) && L2TP_CONFIG
     ppa_memset( &l2tpinfo, 0, sizeof(l2tpinfo) );
 #endif
 
-    /* Bridged sessions are excluded from acceleration */
-    if( ppa_is_BrSession(p_item) )
+    /* Following sessions are excluded from acceleration */
+    /* Bridged sessions */
+    /* GRE sessions (Not Supported in Legacy) */
+    if( ppa_is_BrSession(p_item) || ppa_is_GreSession(p_item) )
       return PPA_FAILURE;
 
     //  Only add session in H/w when the called from the post-NAT hook
@@ -3849,7 +4332,7 @@ int32_t ppa_hw_add_session(struct session_list_item *p_item, uint32_t f_test)
             p_item->tunnel_idx = route.tnnl_info.tunnel_idx;
         }else{
             ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"add tunnel 6rd entry error\n");
-            goto MTU_ERROR;
+            goto TUNNEL_ERROR;
         }
     }
     if(p_item->flags & SESSION_TUNNEL_6RD){
@@ -3868,7 +4351,7 @@ int32_t ppa_hw_add_session(struct session_list_item *p_item, uint32_t f_test)
             p_item->tunnel_idx = route.tnnl_info.tunnel_idx;
         }else{
             ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"add tunnel dslite entry error\n");
-            goto MTU_ERROR;
+            goto TUNNEL_ERROR;
         }
     }
     if(p_item->flags & SESSION_TUNNEL_DSLITE){
@@ -3980,6 +4463,7 @@ OUT_VLAN_ERROR:
     p_item->src_mac_entry = ~0;
     ppa_drv_del_mac_entry( &route.src_mac, 0);
 NEW_SRC_MAC_ERROR:
+TUNNEL_ERROR:
     p_item->mtu_entry = ~0;
     ppa_drv_del_mtu_entry(&route.mtu_info, 0);
 MTU_ERROR:
@@ -4443,29 +4927,32 @@ static int32_t ppa_mc_check_dst_itf(PPA_MC_GROUP *p_mc_group, struct mc_group_li
             }   
         }
 
+
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
-	if ( (p_netif_info->flags & NETIF_DIRECTPATH)  
+	if ((p_netif_info->flags & NETIF_VLAN_INNER
+				|| p_netif_info->flags & NETIF_VLAN_OUTER)
+			|| (p_netif_info->flags & NETIF_DIRECTPATH)
 #if defined(CONFIG_PPA_API_DIRECTCONNECT) && CONFIG_PPA_API_DIRECTCONNECT
-        /* For directconnect destif, find out the num of VAP and dest subif */
-        || (p_netif_info->flags & NETIF_DIRECTCONNECT) 
+			/* For directconnect destif, find out the num of VAP and dest subif */
+			|| (p_netif_info->flags & NETIF_DIRECTCONNECT)
 #endif
-	) {
-            /* For the 1st VAP, update the session subifid */
-            if (p_item->num_vap == 0)
-            {
-                p_item->num_vap++;
-                p_item->dest_subifid = p_netif_info->subif_id;
-            }
-            /* For the next VAP, if it is different subifid, then ignore session subifid (set it to 0) */
-            else if (p_item->num_vap == 1)
-            {
-                if (p_item->dest_subifid != p_netif_info->subif_id)
-                {
-                    p_item->num_vap++;
-                    p_item->dest_subifid = 0;
-                }
-            }
-        }
+	   ) {
+		/* For the 1st Virtual interface, update the session subifid */
+		if (p_item->num_vap == 0)
+		{
+			p_item->num_vap++;
+			p_item->dest_subifid = p_netif_info->subif_id;
+		}
+		/* For the next Virtual interface, if it is different subifid, then ignore session subifid (set it to 0) */
+		else if (p_item->num_vap == 1)
+		{
+			if (p_item->dest_subifid != p_netif_info->subif_id)
+			{
+				p_item->num_vap++;
+				p_item->dest_subifid = 0;
+			}
+		}
+	}
 #endif
         p_item->dest_ifid |= 1 << p_netif_info->phys_port; 
         p_item->netif[i] = p_netif_info->netif;
@@ -4488,6 +4975,9 @@ int32_t ppa_mc_group_setup(PPA_MC_GROUP *p_mc_group, struct mc_group_list_item *
 {
     struct netif_info *rx_ifinfo=NULL; 
     p_item->bridging_flag = p_mc_group->bridging_flag;
+
+    struct PPA_NETIF *rx_netif = NULL;
+
     if(!p_item->bridging_flag){
         //p_item->flags |=  SESSION_VALID_PPPOE;   //  firmware will remove PPPoE header, if and only if the PPPoE header available
 	if ( ppa_netif_lookup(p_mc_group->src_ifname, &rx_ifinfo) != PPA_SUCCESS )
@@ -4499,7 +4989,29 @@ int32_t ppa_mc_group_setup(PPA_MC_GROUP *p_mc_group, struct mc_group_list_item *
 	if ( (rx_ifinfo->flags & (NETIF_WAN_IF | NETIF_PPPOE)) == (NETIF_WAN_IF | NETIF_PPPOE) )
 	{
 	    p_item->flags |= SESSION_VALID_PPPOE;
-	}	
+	}
+
+
+        if((rx_ifinfo->flags & NETIF_GRE_TUNNEL) == NETIF_GRE_TUNNEL ) {
+  		p_item->flag2 |= SESSION_FLAG2_GRE;
+	}
+
+  	if ((rx_ifinfo->flags & NETIF_PPPOL2TP) ==  NETIF_PPPOL2TP) {
+    			p_item->flags |= SESSION_VALID_PPPOL2TP;
+
+	}
+
+	if( (rx_netif = ppa_dev_get_by_name(p_mc_group->src_ifname)) != NULL)
+        {
+  		if(ppa_netif_type(rx_netif) == ARPHRD_SIT) {
+    			p_item->flags |= SESSION_TUNNEL_6RD;
+		}
+        	if(ppa_netif_type(rx_netif) == ARPHRD_TUNNEL6) {
+    			p_item->flags |= SESSION_TUNNEL_DSLITE;
+		}
+		ppa_put_netif(rx_netif);
+	}
+	
     }
     p_item->SSM_flag = p_mc_group->SSM_flag;
 
@@ -4846,7 +5358,7 @@ int32_t ppa_add_mc_group(PPA_MC_GROUP *p_mc_group, struct mc_group_list_item **p
     p_item = ppa_alloc_mc_group_list_item();
     if ( !p_item )
         return PPA_ENOMEM;
-     
+ 
     //if( ppa_mc_group_checking(p_mc_group, p_item, flags ) !=PPA_SUCCESS )
     if( ppa_mc_group_setup(p_mc_group, p_item, flags ) != PPA_SUCCESS )
     {
@@ -5413,7 +5925,8 @@ int32_t ppa_ipsec_add_entry(uint32_t tunnel_index)
 {
     struct session_list_item *p_item;
     int32_t ret = PPA_SESSION_NOT_ADDED;
-
+    dp_subif_t dp_subif={0};
+    
     p_item = ppa_alloc_ipsec_group_list_item();
     if ( !p_item )
         return PPA_ENOMEM;
@@ -5439,6 +5952,29 @@ int32_t ppa_ipsec_add_entry(uint32_t tunnel_index)
     //p_item->timeout       = ppa_get_default_session_timeout();
     //p_item->last_hit_time = ppa_get_time_in_sec();
     p_item->tunnel_idx    = tunnel_index;
+
+
+    /* printk("\n%s : %pI4 \n", __FUNCTION__,&(ipsec_tnl_info.src_ip));
+       printk("\n%s : IPSec Tx interface name:%s\n",__FUNCTION__,ppa_get_netif_name(ipsec_tnl_info.tx_if)); */
+
+
+    PPA_IFNAME phys_netif_name[PPA_IF_NAME_SIZE];
+    struct netif_info *p_ifinfo;
+    if ( ppa_get_physical_if(ipsec_tnl_info.tx_if, NULL, phys_netif_name) == PPA_SUCCESS ) {
+    	if ( ppa_netif_lookup(ppa_get_netif(phys_netif_name), &p_ifinfo) == PPA_SUCCESS )
+    	{
+    
+    		//printk("\n%s,%d,physical intf name=%s\n",__FUNCTION__,__LINE__,(p_ifinfo->manual_lower_ifname));
+    		dp_subif.port_id =p_ifinfo->phys_port;
+    		if ((dp_get_netif_subifid(ppa_get_netif(p_ifinfo->manual_lower_ifname), NULL, p_ifinfo->vcc, NULL, &dp_subif, 0))==PPA_SUCCESS) {
+                              //printk("\n%s,%d,dest subifid=%d\n",__FUNCTION__,__LINE__,dp_subif.subif);
+                              p_item->dest_subifid  = (dp_subif.subif & 0xF00) >> 7;
+                } else {
+                         printk("\nfailed to get sub interface id\n");
+    			}
+    	}
+	}
+
     ppa_list_add(&p_item->hlist,&ipsec_list_head);
 
 
@@ -5496,27 +6032,9 @@ int32_t ppa_ipsec_add_entry_outbound(uint32_t tunnel_index)
     if ( !p_item )
         return PPA_ENOMEM;
 
+    p_item->flag2  		  = SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA;
 
-#if 0
-    p_item->flags  		  |= SESSION_IS_IPV4;
-    p_item->flags  		  |= SESSION_VALID_IPSEC_INBOUND;
-    p_item->flags         	  |= SESSION_WAN_ENTRY;
-    p_item->ip_proto      	  = IP_PROTO_ESP;
-#endif
-    //p_item->flags  		  = (SESSION_FLAG2_VALID_IPSEC_OUTBOUND | SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA);
-    p_item->flag2  		  = (SESSION_FLAG2_VALID_IPSEC_OUTBOUND | SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA);
-
-#if 0
-    p_item->src_ip        = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->props.saddr;
-    p_item->src_port      = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->id.spi >> 16;
-    p_item->dst_ip        = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->id.daddr.a4;
-    p_item->dst_port      = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->id.spi & 0xFFFF;
-    //p_item->rx_if         = ppa_get_pkt_src_if(ppa_buf);
-    //p_item->timeout       = ppa_get_default_session_timeout();
-    //p_item->last_hit_time = ppa_get_time_in_sec();
-#endif
-
-	p_item->tunnel_idx = tunnel_index;
+    p_item->tunnel_idx = tunnel_index;
 
   /* place holder for some explicit criteria based on which the session 
      must go through SW acceleration */
@@ -5582,8 +6100,8 @@ int32_t __ppa_lookup_ipsec_group(PPA_XFRM_STATE *ppa_x, struct session_list_item
 
 
     if(p_ipsec_item->hash == ppa_x->props.family){
-    if(ppa_ipsec_addr_equal(&(p_ipsec_item->src_ip),&(ppa_x->props.saddr),ppa_x->props.family)){
-			if(ppa_ipsec_addr_equal(&(p_ipsec_item->dst_ip), &(ppa_x->id.daddr),ppa_x->props.family)){
+    if(ppa_ipsec_addr_equal((PPA_XFRM_ADDR *)&(p_ipsec_item->src_ip),&(ppa_x->props.saddr),ppa_x->props.family)){
+			if(ppa_ipsec_addr_equal((PPA_XFRM_ADDR *)&(p_ipsec_item->dst_ip), &(ppa_x->id.daddr),ppa_x->props.family)){
 			if(p_ipsec_item->src_port == (ppa_x->id.spi >> 16)){
 			if(p_ipsec_item->dst_port == (ppa_x->id.spi & 0xFFFF)){
 			    *pp_item = p_ipsec_item;
@@ -5607,7 +6125,7 @@ int32_t ppa_ipsec_del_entry(struct session_list_item *p_item)
 #if defined(CONFIG_LTQ_PPA_HAL_SELECTOR) && CONFIG_LTQ_PPA_HAL_SELECTOR
           ppa_hsel_del_routing_session(p_item);
 #endif
-   ppa_list_delete(&p_item->hlist);
+   ppa_list_delete((PPA_LIST_HEAD*)&p_item->hlist);
    ppa_free_ipsec_group_list_item(p_item);
 
     return ret;
@@ -5624,20 +6142,9 @@ int32_t ppa_ipsec_del_entry_outbound(uint32_t tunnel_index)
         return PPA_ENOMEM;
 
 
-    //p_item->flags  		  = (SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA | SESSION_FLAG2_VALID_IPSEC_OUTBOUND);
-    p_item->flag2  		  = (SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA | SESSION_FLAG2_VALID_IPSEC_OUTBOUND);
+    p_item->flag2  		  = SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA;
 
-#if 0
-    p_item->src_ip        = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->props.saddr;
-    p_item->src_port      = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->id.spi >> 16;
-    p_item->dst_ip        = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->id.daddr.a4;
-    p_item->dst_port      = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr->sa_inbound->id.spi & 0xFFFF;
-    //p_item->rx_if         = ppa_get_pkt_src_if(ppa_buf);
-    //p_item->timeout       = ppa_get_default_session_timeout();
-    //p_item->last_hit_time = ppa_get_time_in_sec();
-#endif
-
-	p_item->tunnel_idx = tunnel_index;
+    p_item->tunnel_idx = tunnel_index;
 
 #if defined(CONFIG_LTQ_PPA_HAL_SELECTOR) && CONFIG_LTQ_PPA_HAL_SELECTOR
           ppa_hsel_del_routing_session(p_item);
@@ -5731,7 +6238,7 @@ int32_t __ppa_mc_group_update(PPA_MC_GROUP *p_mc_entry, struct mc_group_list_ite
 {
     struct mc_group_list_item *p_mc_item;
 
-    ASSERT(p_item != NULL, "p_item == NULL");
+    //ASSERT(p_item != NULL, "p_item == NULL");
     p_mc_item = ppa_alloc_mc_group_list_item();
     if ( !p_mc_item )
         goto UPDATE_FAIL;
@@ -6313,6 +6820,40 @@ int32_t ppa_bridging_add_session(uint8_t *mac, uint16_t fid, PPA_NETIF *netif, s
     ppa_netif_put(ifinfo);
 
     return PPA_SUCCESS;
+}
+
+int32_t ppa_bridging_flush_sessions()
+{
+	struct bridging_session_list_item *p_item;
+	uint32_t idx;
+
+	for ( idx = 0; idx < NUM_ENTITY(g_bridging_session_list_hash_table); idx++ ) {
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,8,13)
+		PPA_HLIST_NODE *node;
+		ppa_hlist_for_each_entry(p_item, node, &g_bridging_session_list_hash_table[idx],br_hlist)
+#else
+		ppa_hlist_for_each_entry(p_item, &g_bridging_session_list_hash_table[idx],br_hlist)
+#endif
+		{
+			if(!(p_item->flags & SESSION_STATIC)) { // bridge learned entry only delete
+#ifdef CONFIG_LTQ_PPA_GRX500
+				ppa_bridging_hw_del_session(p_item);
+#endif
+				ppa_bridging_remove_session(p_item);
+#ifdef CONFIG_LTQ_PPA_GRX500
+			} else {
+				if(p_item->ref_count==1) {
+					ppa_bridging_hw_del_session(p_item);
+					ppa_bridging_remove_session(p_item);
+				} else {
+					p_item->ref_count--;
+					p_item->flags &= ~SESSION_LAN_ENTRY;
+				}
+#endif
+			}
+		}
+	}
+	return PPA_SUCCESS;
 }
 
 void ppa_bridging_remove_session(struct bridging_session_list_item *p_item)

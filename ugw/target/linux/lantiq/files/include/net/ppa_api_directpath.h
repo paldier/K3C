@@ -67,8 +67,26 @@
     \brief PPA_F_DIRECTPATH_WAN
 */
 #define PPA_F_DIRECTPATH_WAN                    0x00800000  /*!< Directpath flag: Ethernet type*/
+/*!
+    \brief PPA_F_DIRECTLINK
+*/
+#define PPA_F_DIRECTLINK                        0x01000000  /*!< DirectLink flag: Ethernet type*/
 
-#define PPA_F_DIRECTLINK						0x01000000  /*!< DirectLink flag: Ethernet type*/
+/*!
+    \brief PPA_F_DIRECTLINK_XMIT_TO_WIFI
+*/
+#define PPA_F_DIRECTLINK_XMIT_TO_WIFI           (1 << 0)  /*!< Directlink send flag*/
+
+/*!
+    \brief PPA_F_DIRECTLINK_XMIT_FROM_WIFI
+*/
+#define PPA_F_DIRECTLINK_XMIT_FROM_WIFI         (1 << 1)  /*!< Directlink send flag*/
+
+/*!
+    \brief PPA_F_DIRECTPATH_XMIT_QOS
+*/
+#define PPA_F_DIRECTPATH_XMIT_QOS               (1 << 2)  /*!< Directpath send flag*/
+
 /*
  *  Directpath Internal Flags
  */
@@ -184,7 +202,7 @@ typedef int32_t (*PPA_FP_STOP_TX_FN)(PPA_NETIF *dev);
                PPA_FAILURE on error if the driver process the packet for some reason.
     \note This function must be provided by the CPU-bound interface driver and will be called by the PPA Directpath to pass on frames directly to the driver for transmitting out of its interface.
 */
-typedef int32_t (*PPA_FP_RX_FN)(PPA_NETIF *rxif, PPA_NETIF *txif, PPA_BUF *skb, int32_t len);
+typedef int32_t (*PPA_FP_RX_FN)(PPA_NETIF *rxif, PPA_NETIF *txif, PPA_SKBUF *skb, int32_t len);
 
 /*@}*/ /*PPA_API_DIRECTPATH */
 
@@ -240,7 +258,7 @@ struct ppe_directpath_data {
     PPA_NETIF                      *netif;          /*!< pointer to  PPA_NETIF*/
     uint32_t                        ifid;           /*!< directpath interface id */
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_QUEUE_SIZE) || defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_QUEUE_PKTS)
-    PPA_BUF                        *skb_list;       /*!< the directpath interface's skb list */
+    PPA_SKBUF                        *skb_list;       /*!< the directpath interface's skb list */
     spinlock_t                      txq_lock;       /*!< the lock to protect the skb list queue */
   #ifdef CONFIG_LTQ_PPA_DIRECTPATH_TX_QUEUE_SIZE
     uint32_t                        skb_list_size;  /*!< the skb list size */
@@ -354,7 +372,7 @@ int32_t ppa_directpath_ex_register_dev(PPA_SUBIF *subif, PPA_NETIF *dev, PPA_DIR
 */
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_IMQ)
 
-    int32_t ppa_directpath_reinject_from_imq(int32_t rx_if_id, PPA_BUF *buf, int32_t len, uint32_t flags);
+    int32_t ppa_directpath_reinject_from_imq(int32_t rx_if_id, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 
     extern int32_t ppa_directpath_imq_en_flag;
 #endif
@@ -368,7 +386,7 @@ int32_t ppa_directpath_ex_register_dev(PPA_SUBIF *subif, PPA_NETIF *dev, PPA_DIR
 		-	PPA_SUCCESS on sucess \n
 		-	PPA_FAILURE
 */
-  int32_t ppa_directpath_send(uint32_t rx_if_id, PPA_BUF *buf, int32_t len, uint32_t flags);
+  int32_t ppa_directpath_send(uint32_t rx_if_id, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 
 //#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
 /*!  \brief   This function allows the device driver to dequeue the traffic and return the packet to  PPA DirectPath interface. 
@@ -380,7 +398,7 @@ int32_t ppa_directpath_ex_register_dev(PPA_SUBIF *subif, PPA_NETIF *dev, PPA_DIR
 		-	PPA_SUCCESS on sucess \n
 		-	PPA_FAILURE
 */
-  int32_t ppa_directpath_ex_send(PPA_SUBIF *subif, PPA_BUF *skb, int32_t len, uint32_t flags);
+  int32_t ppa_directpath_ex_send(PPA_SUBIF *subif, PPA_SKBUF *skb, int32_t len, uint32_t flags);
 //#endif
 
 /*!  \brief   This function allows the device driver to indicate to the PPA that it cannot receive any further packets from the latter. The device driver can call this function for flow control.
@@ -455,8 +473,8 @@ int32_t ppa_directpath_ex_register_dev(PPA_SUBIF *subif, PPA_NETIF *dev, PPA_DIR
   int32_t ppa_directpath_ex_rx_restart(PPA_SUBIF *subif, uint32_t flags);
   int32_t ppa_directpath_ex_rx_stop(PPA_SUBIF *subif, uint32_t flags);
 
-  PPA_BUF* ppa_directpath_alloc_skb(PPA_SUBIF* psubif, int32_t len, uint32_t flags);
-  int32_t  ppa_directpath_recycle_skb(PPA_SUBIF* psubif, PPA_BUF* skb, uint32_t flags);
+  PPA_SKBUF* ppa_directpath_alloc_skb(PPA_SUBIF* psubif, int32_t len, uint32_t flags);
+  int32_t  ppa_directpath_recycle_skb(PPA_SUBIF* psubif, PPA_SKBUF* skb, uint32_t flags);
 
 #endif
 

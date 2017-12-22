@@ -26,8 +26,13 @@
 #include <linux/netip_subsystem.h>
 #include <linux/avalanche/generic/modphy_mrpc_api.h>
 
-extern int DWC_ETH_QOS_mdio_read_ext(int regaddr, int *phydata);
-extern int DWC_ETH_QOS_mdio_write_ext(int regaddr, int phydata);
+extern int DWC_ETH_QOS_mdio_read_direct(int bus_number, bool c45, int phyaddr, int mmd, int phyreg, int *phydata);
+extern int DWC_ETH_QOS_mdio_write_direct(int bus_number, bool c45, int phyaddr, int mmd, int phyreg, int phydata);
+
+#define MDIO_ADDR_LANTIQ 31
+#define C45_ENABLED 0
+#define MMD_DISABLED 32
+#define MDIO_BUS_NUMBER_0 0
 
 /* netip-subsystem gpio value set register*/
 #define DATA_OUT_SET_REG_OFFSET 0x14
@@ -76,16 +81,16 @@ int GSW_SMDIO_DataRead(void *cdev, GSW_MDIO_data_t *pPar)
 	u32 data;
 	int ret;
 
-	ret = DWC_ETH_QOS_mdio_read_ext(pPar->nAddressReg & 0x1F,
-					&data);
+	ret = DWC_ETH_QOS_mdio_read_direct(MDIO_BUS_NUMBER_0, C45_ENABLED, 
+						MDIO_ADDR_LANTIQ, MMD_DISABLED, pPar->nAddressReg & 0x1F, &data);
 	pPar->nData = data & 0xFFFF;
 	return ret;
 }
 
 int GSW_SMDIO_DataWrite(void *cdev, GSW_MDIO_data_t *pPar)
 {
-	return DWC_ETH_QOS_mdio_write_ext(pPar->nAddressReg & 0x1F,
-					  pPar->nData & 0xFFFF);
+	return DWC_ETH_QOS_mdio_write_direct(MDIO_BUS_NUMBER_0, C45_ENABLED, 
+						MDIO_ADDR_LANTIQ, MMD_DISABLED, pPar->nAddressReg & 0x1F, pPar->nData & 0xFFFF);
 }
 
 /** read the gswitch register */

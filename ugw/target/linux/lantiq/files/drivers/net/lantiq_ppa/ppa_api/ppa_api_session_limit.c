@@ -48,6 +48,10 @@
 #include "ppa_api_hal_selector.h"
 #endif
 
+#if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
+#include "ppa_sae_hal.h"
+#endif
+
 uint32_t g_ppa_lan_reserve_collisions = LAN_RESERVE_COLLISIONS;
 uint32_t g_ppa_wan_reserve_collisions = WAN_RESERVE_COLLISIONS;
 uint32_t g_ppa_lan_current_collisions = 0;
@@ -323,8 +327,8 @@ void delete_pitem_node(struct session_list_item *p_item, enum ppa_engine_type en
 #endif
 #if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
 	} else if (engine == SWAC) {
-  		update_session_mgmt_stats(p_item, DELETE);
-		p_item->flags &= ~SESSION_ADDED_IN_SW;
+		/* software session management is handled by SAE */
+		ppa_sw_session_enable(p_item, 0, p_item->flags);
 #else
 	} else { 
 		return;

@@ -179,7 +179,7 @@ int ppa_get_ipv4_tnl_dmac( uint8_t *mac,
    * 
    */
   //nexthop = (__force u32) rt_nexthop(rt, iph->daddr);
-   __be32 pkey;
+   __be32 pkey =0x0;
   /**To calculate MAC addr of nxt hop based on it is dst addr / gateway addr */
    if (rt->rt_gateway)
 	pkey = (__be32 ) rt->rt_gateway;

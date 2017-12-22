@@ -77,12 +77,12 @@ set_local_session_learning_for_lro()
 
 tune_watchdog_timer()
 {
-	if [ -n "$CONFIG_TARGET_LANTIQ_XRX200" ]; then
-		ubus call system watchdog '{ "timeout": 180 }';
-	else
-		ubus call system watchdog '{ "timeout": 90 }';
-	fi
+	# To Enable the Watchdog timer.... After Enabiling and disabling, please reboot.
+	#ubus call system watchdog '{ "timeout": 180 }';
+	# To Stop Watchdog and reset watchdog timer uncomment the below, to enable watchdog again comment below and uncomment above and then reboot the target.
+	ubus call system watchdog '{ "stop": true }';
 }
+
 start()
 {
 	tune_memory_parameters

@@ -84,6 +84,9 @@
 #include "ppa_api_hal_selector.h"
 #include "ppa_api_core.h"
 #include "ppa_api_tools.h"
+#if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
+#include "ppa_sae_hal.h"
+#endif
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
 #if defined(CONFIG_LTQ_PPA_COC_SUPPORT)
 #include "ppa_api_cpu_freq.h"
@@ -175,6 +178,12 @@ volatile uint8_t g_ppe_fastpath_enabled = 0;
 
 uint32_t g_ppa_ppa_mtu=DEFAULT_MTU;  /*maximum frame size from ip header to end of the data payload, not including MAC header/pppoe header/vlan */
 
+#ifdef CONFIG_LTQ_PPA_XRX330
+extern int32_t (*ppa_hook_ppa_phys_port_add_fn)(PPA_IFNAME *ifname, uint32_t port);
+extern void (*ppa_hook_ppa_phys_port_remove_fn)(uint32_t port);
+extern uint32_t *g_phys_port_atm_wan_get;
+extern uint32_t *g_phys_port_atm_wan_vlan_get;
+#endif
 
 /*
  * ####################################
@@ -195,7 +204,7 @@ static uint8_t g_bridged_flow_learning = 1;
 #endif
 
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
-void free_fid_list()
+void free_fid_list(void)
 {
     fid_info *tmp;   
     while(fid_list) {
@@ -482,8 +491,19 @@ if ( (ret = ppa_api_netif_manager_init()) != PPA_SUCCESS || !PPA_IS_PORT_CPU0_AV
 
 #endif /* CONFIG_LTQ_PPA_MFE */
 
-    ppa_set_init_status(PPA_INIT_STATE);
+#ifdef CONFIG_LTQ_PPA_XRX330
+    /* Assign func pointers. Used in DSL TC modules during rebootless switchover */
+    ppa_hook_ppa_phys_port_add_fn = ppa_phys_port_add;
+    ppa_hook_ppa_phys_port_remove_fn = ppa_phys_port_remove;
+    g_phys_port_atm_wan_get = &g_phys_port_atm_wan;
+    g_phys_port_atm_wan_vlan_get = &g_phys_port_atm_wan_vlan;
+#endif
 
+    ppa_set_init_status(PPA_INIT_STATE);
+#ifdef CONFIG_LTQ_PPA_API_SW_FASTPATH
+    ppa_hook_set_sw_fastpath_enable_fn(PPA_INIT_STATE); 
+#endif
+ 
     return PPA_SUCCESS;
 
 PPA_API_SESSION_MANAGER_INIT_FAIL:
@@ -507,6 +527,13 @@ static void ppa_exit_new(void)
 {
 #ifndef CONFIG_LTQ_PPA_GRX500
     PPE_BR_MAC_INFO br_mac={0};
+#endif
+#ifdef CONFIG_LTQ_PPA_XRX330
+    /* Remove func pointers. Used in DSL TC modules during rebootless switchover */
+    ppa_hook_ppa_phys_port_add_fn = NULL;
+    ppa_hook_ppa_phys_port_remove_fn = NULL;
+    g_phys_port_atm_wan_get = NULL;
+    g_phys_port_atm_wan_vlan_get = NULL;
 #endif
 #if defined(CONFIG_LTQ_PPA_DIRECTPATH_TX_IMQ)
    ppa_hook_directpath_reinject_from_imq_fn = NULL;
@@ -834,6 +861,17 @@ static INLINE int32_t ppa_pkt_filter(PPA_BUF *ppa_buf, uint32_t flags)
     {
         goto skip_lookup;
     }
+
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
+    if(sport == 500)
+    {
+ 	//ipsec_tnl_info.src_ip        = ppa_get_pkt_src_ip(ppa_buf);
+	ppa_get_pkt_src_ip(&ipsec_tnl_info.src_ip, ppa_buf);
+  	ipsec_tnl_info.tx_if         = tx_if;
+    } 
+#endif
+
+
     if( ppa_netif_lookup(ifname, &p_info) != PPA_SUCCESS )
     {
         return PPA_ENOTAVAIL;
@@ -920,22 +958,7 @@ int32_t ppa_session_add(PPA_BUF *ppa_buf, PPA_SESSION *p_session, uint32_t flags
         return PPA_SESSION_NOT_ADDED;
       }
     } else {
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-        if(ppa_get_pkt_ip_proto(ppa_buf) == 50) 
-        {
-                ret = ppa_find_session_for_ipsec(ppa_buf,0,&p_item);
-                if(ret != PPA_SESSION_EXISTS)
-                { 
-      		  return PPA_SESSION_NOT_ADDED;
-                }
-        }
-        else
-      		return PPA_SESSION_NOT_ADDED;
-
-
-#else
       return PPA_SESSION_NOT_ADDED;
-#endif
 
     }
   } 
@@ -946,6 +969,9 @@ int32_t ppa_session_add(PPA_BUF *ppa_buf, PPA_SESSION *p_session, uint32_t flags
     /* When control comes here, it must be from PRE routing hook
        from routed path */
     ppa_session_not_bridged(p_item,p_session);
+#ifdef CONFIG_PPA_PP_LEARNING
+    p_item->rx_if = ppa_get_pkt_src_if(ppa_buf);
+#endif
     goto done;/* Packet is already seen in bridged path */
   }
 
@@ -996,11 +1022,9 @@ int32_t ppa_session_modify(PPA_SESSION *p_session, PPA_SESSION_EXTRA *p_extra, u
 #endif
 #ifdef CONFIG_LTQ_PPA_API_SW_FASTPATH
           /* session was in hardware an the modification failed; so the 
-             session is moved out of HW and put in SW fastpath */
-          p_item->flags |= SESSION_ADDED_IN_SW;
-#if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
-		update_session_mgmt_stats(p_item, ADD);
-#endif
+             session is moved out of HW and put in SW fastpath.
+             software session management is handled by SAE */
+          ppa_sw_session_enable(p_item, 1, p_item->flags);
 #endif
           goto __MODIFY_DONE;
           
@@ -1035,7 +1059,6 @@ int32_t ppa_session_get(PPA_SESSION ***pp_sessions, PPA_SESSION_EXTRA **pp_extra
 //#warning ppa_session_get is not implemented
     return PPA_ENOTIMPL;
 }
-
 
 
 /*
@@ -1390,7 +1413,10 @@ int32_t ppa_mc_group_get(IP_ADDR_C  ip_mc_group, IP_ADDR_C src_ip, PPA_MC_GROUP 
     uint32_t bit;
     uint32_t i;
 
-    ASSERT(ppa_mc_entry != NULL, "ppa_mc_entry == NULL");
+    //ASSERT(ppa_mc_entry != NULL, "ppa_mc_entry == NULL");
+    if(ppa_mc_entry == NULL)
+    	return PPA_FAILURE;
+
 
     ppa_mc_get_htable_lock();
     if ( __ppa_lookup_mc_group(&ip_mc_group, &src_ip,  &p_item) != PPA_SESSION_EXISTS ){
@@ -1740,7 +1766,7 @@ int32_t ppa_bridge_entry_add(uint8_t *mac_addr, PPA_NETIF *brif, PPA_NETIF *neti
         }
     } else if(p_item->flags & SESSION_LAN_ENTRY) { // dynamic bridge entry getting updated
 	cur_time = ppa_get_time_in_sec(); 
-	if( cur_time - p_item->last_hit_time > 60) { //1 hw update per minute
+	if( cur_time - p_item->last_hit_time > 10) { //1 hw update per 10 sec
 	    p_item->last_hit_time = cur_time;
 	    goto __UPDATE_HW_SESSION;
  	}
@@ -1780,6 +1806,7 @@ __BR_SESSION_ADD_DONE:
 int32_t ppa_hook_bridge_enable(uint32_t f_enable, uint32_t flags)
 {
     g_bridging_mac_learning = f_enable;
+    ppa_bridge_entry_delete_all(f_enable);
     return PPA_SUCCESS;
 }
 
@@ -1788,6 +1815,19 @@ int32_t ppa_hook_get_bridge_status(uint32_t *f_enable, uint32_t flags)
     if( f_enable )
         *f_enable = g_bridging_mac_learning;
     return PPA_SUCCESS;
+}
+
+int32_t ppa_bridge_entry_delete_all(uint32_t f_enable)
+{
+    int32_t ret = PPA_FAILURE;
+
+    if( f_enable ) return PPA_SUCCESS;
+
+    ppa_br_get_htable_lock();
+    ret = ppa_bridging_flush_sessions();
+    ppa_br_release_htable_lock();
+
+    return ret;
 }
 
 int32_t ppa_bridge_entry_delete(uint8_t *mac_addr, PPA_NETIF *brif, uint32_t flags)
@@ -2661,7 +2701,10 @@ int32_t mcast_module_config(uint32_t grp_idx, struct net_device *member, mcast_s
 	uint8_t filter_mode; 
 	uint32_t portid;
 #endif
+
+#if !defined(CONFIG_LTQ_PPA_GRX500) && !(CONFIG_PPA_PUMA7)
 	int ret = PPA_FAILURE;
+#endif
 	char *mem_name,*pp_memname = NULL;
         ppa_memset( &mc_group, 0, sizeof(mc_group));
 
@@ -2771,8 +2814,14 @@ int32_t mcast_module_config(uint32_t grp_idx, struct net_device *member, mcast_s
 				}
 				for(i=0, idx=0; i < itf_num ; i++)
 				{
-					if( pp_item->netif[i] )
+					if( pp_item->netif[i])
 					{
+						/* This is to avoid duplicate member interface add */
+						if (ppa_is_netif_name(pp_item->netif[i], member->name) == 1) {
+							ppa_mc_group_stop_iteration();
+							ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"Member %s already exists\n", member->name);
+							goto EXIT_EOI;
+						}
 						pp_memname = ppa_get_netif_name(pp_item->netif[i]);
 						mc_group.array_mem_ifs[i].ifname = pp_memname;
 					}
@@ -2984,9 +3033,12 @@ int32_t ppa_add_if(PPA_IFINFO *ifinfo, uint32_t flags)
 int32_t ppa_del_if(PPA_IFINFO *ifinfo, uint32_t flags)
 {
     PPA_NETIF *netif;
+#if defined(CONFIG_PPA_PUMA7) && defined(CONFIG_TI_HIL_PROFILE_INTRUSIVE_P7)
     PPA_NETIF *lnetif;
-	struct netif_info *p_ifinfo;
-	PPA_IFNAME underlying_ifname[PPA_IF_NAME_SIZE];
+    struct netif_info *p_ifinfo;
+    PPA_IFNAME underlying_ifname[PPA_IF_NAME_SIZE];
+#endif
+
 #if defined(CONFIG_LANTIQ_MCAST_HELPER_MODULE) || defined(CONFIG_LANTIQ_MCAST_HELPER)
     uint32_t mcast_flag;
     char *addl_name = NULL;
@@ -3082,17 +3134,17 @@ int32_t ppa_disconn_if(PPA_NETIF *netif, PPA_DP_SUBIF *subif, uint8_t *mac, uint
     if (!netif && !subif && !mac)
         return PPA_FAILURE;
 
-    if (netif)
+    if (mac)
+    {
+        ppa_remove_sessions_on_macaddr(mac);
+    }
+    else if (netif)
     {
         ppa_remove_sessions_on_netif(ppa_get_netif_name(netif));
     }
     else if (subif)
     {
         ppa_remove_sessions_on_subif(subif);
-    }
-    else if (mac)
-    {
-        ppa_remove_sessions_on_macaddr(mac);
     }
 
     return PPA_SUCCESS;
@@ -3298,19 +3350,66 @@ int32_t ppa_zero_ip( PPA_IPADDR ip)
     return ( ppa_ip_comare(ip, zero_ip, 0 )==0 ) ? 1:0;
 }
 
+/* Statistics API */
+
+int32_t ppa_get_ct_stats(PPA_SESSION *p_session, PPA_CT_COUNTER *pCtCounter)
+{
+  int32_t ret = PPA_SUCCESS;
+  struct session_list_item *p_item;
+
+  ppa_session_list_lock();
+  if ( __ppa_session_find_by_ct(p_session, 0, &p_item) == PPA_SESSION_EXISTS ) {
+
+      pCtCounter->lastHitTime = p_item->last_hit_time;
+      if ( p_item->flags & SESSION_LAN_ENTRY ) {
+  		pCtCounter->txBytes = p_item->acc_bytes;
+  		//pCtCounter -> txPackets = p_item->acc_bytes;
+
+	} else if ( p_item->flags & SESSION_WAN_ENTRY ) {
+  		pCtCounter->rxBytes = p_item->acc_bytes;
+  		//pCtCounter -> rxPackets = p_item->acc_bytes;
+
+	}
+        else
+		ret = PPA_FAILURE;
+
+  } 
+
+  if ( __ppa_session_find_by_ct(p_session, 1, &p_item) == PPA_SESSION_EXISTS ) {
+
+      pCtCounter->lastHitTime = p_item->last_hit_time;
+      if ( p_item->flags & SESSION_LAN_ENTRY ) {
+  		pCtCounter->txBytes = p_item->acc_bytes;
+  		//pCtCounter -> txPackets = p_item->acc_bytes;
+
+	} else if ( p_item->flags & SESSION_WAN_ENTRY ) {
+  		pCtCounter->rxBytes = p_item->acc_bytes;
+  		//pCtCounter -> rxPackets = p_item->acc_bytes;
+
+	}
+        else
+		ret = PPA_FAILURE;
+
+  }
+
+  ppa_session_list_unlock();
+    
+  return ret;
+
+}
+
+
+
 #ifdef CONFIG_PPA_PUMA7
 void ppa_update_pp_add_fn(PPA_BUF *ppa_buf)
 {
 	int32_t ret = PPA_SESSION_NOT_ADDED;
-	struct session_list_item* p_item;
+	struct session_list_item* p_item = NULL;
 
-	if ((ppa_buf->pp_packet_info->pp_session.session_handle < AVALANCHE_PP_MAX_ACCELERATED_SESSIONS)) {
-		PPA_SESSION *p_session;
+	if ((ppa_get_session_handle(ppa_buf) < AVALANCHE_PP_MAX_ACCELERATED_SESSIONS)) {
+		PPA_SESSION *p_session = NULL;
 		enum ip_conntrack_info ctinfo;
 		uint32_t flags = 0;
-
-		p_item = NULL;
-		p_session = NULL;
 
 		p_session = nf_ct_get(ppa_buf, &ctinfo);
 
@@ -3326,7 +3425,8 @@ void ppa_update_pp_add_fn(PPA_BUF *ppa_buf)
 			if ( p_item->ip_proto != PPA_IPPROTO_UDP ) {
 				ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"p_item[%p] added to hardware\n", p_item);
 				p_item->flags |= SESSION_ADDED_IN_HW;
-				p_item->flags &= ~SESSION_ADDED_IN_SW;
+				/* software session management is handled by SAE */
+				ppa_sw_session_enable(p_item, 0, p_item->flags);
 			}
 			ppa_session_put(p_item);
 		}
@@ -3346,7 +3446,8 @@ void ppa_update_pp_del(PPA_SESSION *p_session)
 	ret = ppa_session_find_by_tuple(p_session, 0, &p_item);
 	if (ret == PPA_SESSION_EXISTS && p_item != NULL){
 		if (p_item->ip_proto == PPA_IPPROTO_UDP)
-			p_item->flags &= ~SESSION_ADDED_IN_SW;
+			/* software session management is handled by SAE */
+			ppa_sw_session_enable(p_item, 0, p_item->flags);
 		ppa_session_put(p_item);
 	}
 
@@ -3354,7 +3455,8 @@ void ppa_update_pp_del(PPA_SESSION *p_session)
 	ret = ppa_session_find_by_tuple(p_session, 1, &p_item);
 	if (ret == PPA_SESSION_EXISTS && p_item != NULL){
 		if (p_item->ip_proto == PPA_IPPROTO_UDP)
-			p_item->flags &= ~SESSION_ADDED_IN_SW;
+			/* software session management is handled by SAE */
+			ppa_sw_session_enable(p_item, 0, p_item->flags);
 		ppa_session_put(p_item);
 	}
 

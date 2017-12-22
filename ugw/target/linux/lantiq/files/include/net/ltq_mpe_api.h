@@ -36,14 +36,19 @@
 #define MAX_CMP_TABLE                 8      /*!< Maximum compare table supported in MPE */
 #define MAX_PMAC_PORT                 16     /*!< Maximum PMAC port number */
 #define MAX_MC_VAP_PORT               8      /*!< Maximum PMAC port number which will support VAP for multicast (port 7-14) */
+#define MAX_VAP_MIB_CNTS              2      /*!< Maximum MIB interface number per VAP for multicast */
 #define MAX_FW_SESSION_NUM            32767  /*!< Maximum FW acceleration sessions supported per table, ie, 32K-1 */
 #define MAX_HW_SESSION_NUM            4096   /*!< Maximum HW acceleration sessions supported*/
 #define MAX_VERSION_DESC_LEN          20     /*!< Maximum FW version description string length*/
 #define MAX_MIB_ITF_NUM               128    /*!< Maximum MIB interfaces supported */
 #define MAX_DISPATCH_BUF_NUM          64     /*!< Maximum DMA Descriptor number supported in Dispatch queue */
 #define MAX_TLB_NUM                   32     /*!< Maximum TLB entry number supported */
-#define MAX_DUMP_BYTE_LEN				  256    /*!< Maximum number of bytes when dumping a packet supported currently */
-#define MAX_DMA_DESC_DUP					24		/*!< Maximum number of packet duplication in multicast */
+#define MAX_DUMP_BYTE_LEN			  256    /*!< Maximum number of bytes when dumping a packet supported currently */
+#define MAX_DMA_DESC_DUP			  24	 /*!< Maximum number of packet duplication in multicast */
+#define DMA_DESC_CPU_MASK_0           -1     /*!< All bits are set */
+#define DMA_DESC_CPU_VAL_0            0      /*!< Default value for DW0 */
+#define DMA_DESC_CPU_MASK_1           0xFFFFBFFF /*!< All bits are set except bit 14 (MPE1) */
+#define DMA_DESC_CPU_VAL_1			  0      /*!< Default value for DW1 */
 
 #define TLB_PAGE_SIZE                 ( 16 * 1024 ) /*!< Default TLB page size 16K used in MPE FW*/
 #define TC_SP_BUFFER_SIZE             ( 2 * 1024 ) /*!< Maximum Buffer needed for stack only in bytes*/
@@ -60,13 +65,17 @@
 #define EIP97_ACD_MAX_SIZE  200	/*!< MAX ACD (Additional Command Descriptor) size in bytes */
 #define EIP97_CTX_MAX_SIZE  200	/*!< MAX CTX (Additional Context Record) size in bytes */
 
+#define DL_CS2_BUFFER_CHUNK_SIZE (4*1024*1024)
+#define DL_CS2_BUFFER_CHUNK_NUM 8
+
 /**
   \brief Supported TC type
  */
 enum TC_TYPE {
 	TYPE_WORKER = 0, /*!< Thread type: Worker */
 	TYPE_TM,         /*!< Thread type: TM */
-	TYPE_DIRECTLINK  /*!< Thread type: DirectLink */
+	TYPE_DIRECTLINK,  /*!< Thread type: DirectLink */
+	TYPE_UMT, /*!< Thread type: UMT */
 };
 
 /**
@@ -131,6 +140,8 @@ enum TC_CUR_STATE {
 	WK_YD_WKUP,	/*!<  Worker Yield Wake up */
 	DL_YD_WAIT,	/*!<  Directlink Yield Wait */
 	DL_YD_WKUP,	/*!<  Directlink Yield Wake up */
+	UM_YD_WAIT,	/*!<  Directlink Yield Wait */
+	UM_YD_WKUP,	/*!<  Directlink Yield Wake up */
 	MCPY_YD_WAIT,	/*!<  Mem copy Yield Wait */
 	MCPY_YD_WKUP,	/*!<  Mem copy Yield Wake up */
 	EIP97_YD_WAIT,	/*!<  Eip97 Yield Wait */
@@ -249,6 +260,16 @@ enum PMAC_PORT_TYPE {
 };
 
 /*!
+  \brief Allocate new CBM buffer related macros
+ */
+enum CBM_BUF_MACROS {
+	CBM_BUFSET_MAX = 2,       /*!< Maximum number of CBM buffer size available  */
+	CBM_BUF0_SIZE = 2048,     /*!< This CBM buffer contains maximum 2048 bytes */
+	CBM_BUF1_SIZE = 8192,     /*!< This CBM buffer contains maximum 8192 bytes */
+	CBM_BUF_DBG_PRINT = 2047  /*!< Buffer length required for FW debug print */
+};
+
+/*!
   \brief This is the structure for PMAC Port Info
  */
 struct port_info {
@@ -262,7 +283,7 @@ struct port_info {
 };
 
 /*!
-  \brief This is the structure for PMAC SubInterface
+  \brief This is the structure for PMAC SubInterface (solely for MPE FW)
  */
 struct port_subif {
 	uint32_t len: 8;  /*!< PMAC header length of this egress port */
@@ -432,6 +453,32 @@ struct dma_desc_3 {
 	uint32_t data_length: 16; /*!< data length in the dma descriptor's buffer */
 } ;
 
+/*!
+  \brief This is the structure for DL SW Queue Descriptor 0.
+ */
+struct dl_sw_desc_0 {
+	uint32_t dram_location; /*!< buffer address */
+} ;
+
+/*!
+  \brief This is the structure for DL SW Queue Descriptor 1.
+ */
+struct dl_sw_desc_1 {
+	uint32_t des_sub_if_id: 16; /*!< data length */
+	uint32_t resv: 1; /*!< data length */
+	uint32_t byte_offset: 3; /*!< data length */
+	uint32_t data_length: 12; /*!< data length */
+} ;
+/*!
+  \brief This is the structure for DL DMA1RX Descriptor.
+ */
+struct dl_dma_desc {
+	struct dma_desc_1 desc1;  /*!<DMA descriptor 1 */
+	struct dma_desc_0 desc0;  /*!<DMA descriptor 0 */
+	struct dma_desc_3 desc3;  /*!<DMA descriptor 3 */
+	struct dma_desc_2 desc2;  /*!<DMA descriptor 2 */
+} ;
+
 #else	//CONFIG_LITTLE_ENDIAN
 /*!
   \brief This is the structure for DMA Descriptor DW0.
@@ -485,6 +532,35 @@ struct dma_desc_3 {
 	uint32_t own: 1;  /*!< ownership: */
 } ;
 
+/*!
+  \brief This is the structure for DL SW Queue Descriptor 0.
+ */
+
+struct dl_sw_desc_0 {
+	uint32_t dram_location; /*!< buffer address */
+} ;
+
+/*!
+  \brief This is the structure for DL SW Queue Descriptor 0.
+ */
+
+struct dl_sw_desc_1 {
+	uint32_t data_length: 12; /*!< data length */
+	uint32_t byte_offset: 3; /*!< data length */
+	uint32_t resv: 1; /*!< data length */
+	uint32_t des_sub_if_id: 16; /*!< data length */
+} ;
+
+/*!
+  \brief This is the structure for DL DMA1RX Descriptor.
+ */
+struct dl_dma_desc {
+	struct dma_desc_0 desc0;  /*!<DMA descriptor 0 */
+	struct dma_desc_1 desc1;  /*!<DMA descriptor 1 */
+	struct dma_desc_2 desc2;  /*!<DMA descriptor 2 */
+	struct dma_desc_3 desc3;  /*!<DMA descriptor 3 */
+} ;
+
 #endif
 
 /*!
@@ -496,6 +572,17 @@ struct mpe_dma_desc {
 	struct dma_desc_2 desc2;  /*!<DMA descriptor 2 */
 	struct dma_desc_3 desc3;  /*!<DMA descriptor 3 */
 } ;
+
+/*!
+  \brief This is the structure for DL SW Queue Descriptor.
+ */
+
+struct dl_sw_desc {
+	/*!<DMA descriptor 1: sub-if: 16 | res 2| byteoff 2| length 12 */
+	struct dl_sw_desc_1 desc1;
+	/*!<DMA descriptor 0: dram location */
+	struct dl_sw_desc_0 desc0;
+};
 
 /*!
   \brief This is the enum for DMA descriptor node status
@@ -557,7 +644,9 @@ struct dl_buf_info {
 	uint32_t uncached_addr_size;	/*!< Uncached address size */
 	uint32_t uncached_addr_base;	/*!< Uncached address base */
 	uint32_t DlCommmIpi; /*!< DirectLink communication IPI */
-	uint32_t resv[2]; /*!< reserved */
+	uint32_t DlBufManPtrs[8]; /*!< DirectLink Buffer Management */
+	uint32_t dl_dma_queue_size; /*!< queue memory buffer size */
+	uint32_t dl_dma_queue_base; /*!< queue memory buffer base */
 };
 
 /**  \brief MPE FW Header File Structure. Its contect is in big endian mode */
@@ -620,6 +709,7 @@ It is used for MPE FW do TLB setting*/
 	struct TC_INFO tm_info; /*!< Normal TM information */
 	struct TC_INFO worker_info;   /*!< Normal Worker information */
 	struct TC_INFO dl_info;   /*!< Normal Directlink information */
+	struct TC_INFO umt_info;   /*!< Normal Directlink information */
 
 } ;
 
@@ -812,10 +902,14 @@ union ip_addr {
   \brief This is the data structure for VAP entry
  */
 struct vap_entry {
-	uint8_t num;    /*!< the number of vap which joinined this mc group. It should meet: num <= \ref MAX_VAP_PER_PORT */
+	uint8_t num;    /*!< the number of VAPs join this MC group. It should meet: num <= \ref MAX_VAP_PER_PORT */
 	uint8_t res[3]; /*!< Reserved*/
 	uint16_t vap_list[MAX_VAP_PER_PORT]; /*!< VAP List */
-} ;
+	uint8_t rx_itf_mib_num; /*!< Number of RX interface MIB for particular VAP */
+	uint8_t tx_itf_mib_num; /*!< Number of TX interface MIB for particular VAP */
+	uint8_t rx_itf_mib_ix[MAX_VAP_PER_PORT][MAX_VAP_MIB_CNTS]; /*!< RX interface MIB for this VAP */
+	uint8_t tx_itf_mib_ix[MAX_VAP_PER_PORT][MAX_VAP_MIB_CNTS]; /*!< TX interface MIB for this VAP */
+};
 
 /*!
   \brief This is enum for search engine mask type for hash index calculation
@@ -850,7 +944,7 @@ struct session_action {
 
 	/*2st byte of DWORD */
 	uint32_t tunnel_udp_offset_en: 1;  /*!< tunnel_udp_offset_en flag: 1-\ref tunnel_udp_offset is valid, 0-not valid */
-	uint32_t in_eth_iphdr_offset_en: 1; /*!< in_iphdr_offset_en flag: 1-\ref tunnel_ip_offset is valid, 0-not valid */
+	uint32_t in_eth_iphdr_offset_en: 1; /*!< in_iphdr_offset_en flag: 1-\ref in_eth_iphdr_offset is valid, 0-not valid */
 	uint32_t sess_mib_ix_en      : 1; /*!< sess_mib_ix_en flag: 1-\ref sess_mib_ix is valid. 0--not valid*/
 	uint32_t new_traffic_class_en: 1; /*!< traffic_class_en for DMA Descriptor: 1- \ref traffic_class is valid and copy to DMA Descriptor. 0-not valid */
 	uint32_t tunnel_rm_en        : 1; /*!< tunnel header remove flag: \n
@@ -866,7 +960,8 @@ struct session_action {
 	uint32_t tunnel_id: 4;		/*!< ipsec tunnel ID, currently valid from 0 ~ 15 > */
 
 	/*4th byte of DWORD */
-	uint32_t reserve2: 3;		/*!< reserved > */
+	uint32_t reserve2: 2;		/*!< reserved > */
+	uint32_t in_ethhdr_delta_en: 1; /*!< in_ethhdr_delta_en flag: 1-\ref in_ethhdr_delta is valid, 0-not valid */
 	uint32_t mc_way: 1;        /* Duplication method used for mcast: 1- always use new buffer, 0- depend on ingress PMAC setting \ref pmac_len_out */
 
 	/*1st byte of DWORD */
@@ -907,6 +1002,9 @@ struct session_action {
 	/*DWORDS*/
 	uint8_t *templ_buf;  /*!< Pointer to template buffer per session. */
 
+	char in_ethhdr_delta; /*!< Length difference between original packet  L2 header and the new one in template buffer,\n
+	                                           valid if \ref in_ethhdr_delta_en == 1. Used case in calculating MTU for adding EOGRE tunnel case. */
+
 	/*1st byte of DWORD */
 	char   pkt_len_delta;	/*!< Header length delta after editing. It is signed variable\n
                                              * The header data should be continuous data: MAC hdr, VLAN hdr,\n
@@ -921,10 +1019,11 @@ struct session_action {
 	uint8_t  pppoe_offset;	/*!< PPPOE header offset in the template buffer. Valid if \ref pppoe_offset_en ==1 \n
                                                * for updating payload length */
 	/*4th byte of DWORD */
-	uint8_t  tunnel_ip_offset;	/*!< tunnel's ip header offset in the template buffer. valid if \ref tunnel_ip_offset_en == 1 */
+	uint8_t  tunnel_ip_offset;	/*!< tunnel's ip header offset in the template buffer, valid if \ref tunnel_ip_offset_en == 1 */
 
 	/*1st byte of DWORD */
-	uint8_t  in_eth_iphdr_offset;	/*!< offset for inner ip header starting address according to template buffer\n. */
+	uint8_t  in_eth_iphdr_offset;	/*!< offset for inner ip header starting address according to template buffer, \n
+	                                                        valid if \ref in_eth_iphdr_offset_en == 1 */
 	/*2nd byte of DWORD */
 	uint8_t  tunnel_udp_offset;	/*!< tunnel udp offset based on its ip header. Its value is IP HLEN >> 2 */
 
@@ -978,13 +1077,11 @@ struct hw_act_ptr {
   \brief This is basic MIB info definition.
  */
 struct mib_info {
-	unsigned long long bytes ;   /*!< session bytes mib counter */
-	uint32_t pkt;            /*!< session packet mib counter for matched sessions\n
-                               UDP/TCP packet mib counter for non-matched packet ( For CPU path mib counter )
-                              */
-	uint32_t non_acc_pkt;  /*!< non accelerated packet mib counter ( as fragmented, too big pkt, TTL 1/0) for matched sessions\n
-                             non-UDP/TCP packet mib counter for non-matched packet( For CPU path mib counter ).
-                            */
+	unsigned long long bytes ;   /*!< session-based bytes mib counter */
+	uint32_t pkt;            /*!< session-based packet mib counter for matched sessions */
+	uint32_t non_acc_pkt;  /*!< non accelerated packet mib counter for non-IPSEC packets, \n
+	                            but it is counting errored decrypted packet for IPSEC packet.
+	                        */
 } ;
 
 /*!
@@ -1015,14 +1112,15 @@ struct mib_tc {
 	uint32_t pkt_cnt_in[MAX_PMAC_PORT]; /*!< Worker TC based dequeue packet counter for each PMAC port (sppid). \n
                             Increment by one for each dequeued packet from dispacth queue.
                             */
-
-	uint32_t dec_pkt[IPSEC_TUN_MAX]; /*!< Worker TC based, good decrypted packet counter for each IPSEC tunnel. \n
-                            Increment by one for each good decrypted packet to EIP97 HW.
+#if 0
+	uint32_t dec_pkt[IPSEC_TUN_MAX]; /*!< Worker TC based, decrypted packet counter for each IPSEC tunnel. \n
+                            Increment by one for each successful decrypted packet to EIP97 HW.
                             */
 
 	uint32_t dec_pkt_err[IPSEC_TUN_MAX]; /*!< Worker TC based, bad decrypted packet counter for each IPSEC tunnel. \n
                             Increment by one for each decrypted packet with specific error from EIP97 HW.
                             */
+#endif
 
 	uint32_t dl_deq_cnt; /*!< Dequeue counter per TC. It will be set by MPE FW on the fly: \n
                            Increment by one for each dequeued packet. Total of acc_pkt_cnt and \n
@@ -1134,7 +1232,16 @@ struct tc_hw_res {
 	uint32_t DlCbmFreeMemPort; 			/*!< MPE CONF: Directlink cbm dequeue port to free CBM buffer port */
 	uint32_t DlCbmFreeMemPortReg; 		/*!< MPE CONF: Directlink cbm dequeue port to free CBM buffer port register address */
 
-	uint32_t DlCommIpi;    /*!< Directlink TC's IPI  from Linux */
+	uint32_t DlCommIpi;    	/*!< MPE CONF: IPI from Linux to DL */
+	uint32_t DlLiIpi;    	/*!< MPE CONF: IPI from DL to Linux */
+	uint32_t DlMsiIrq;     	/*!< MPE CONF: DL MSI Irq for CE5 */
+	uint32_t DlDmaIrq;		/*!< MPE CONF: DL Dma Irq */
+	uint32_t DlDmaCis;		/*!< MPE CONF: DL Dma Channel Interrupt Status */
+	uint32_t DlDmaIrncr;		/*!< MPE CONF: DL Dma Channel Interrupt Request */
+	uint32_t DlDmaCisMask;	/*!< MPE CONF: DL Dma Channel Interrupt Status Mask */
+	uint32_t DlDmaCs;		/*!< MPE CONF: DL Dma Channel Select */
+
+	uint32_t GptcIrq;		/*!< MPE CONF: GPTC Irq */
 
 	uint32_t Dlfree_list_semid; 	/*!< HAL CONF: MIPS itc semaphore address for Directlink free list of DMA descriptor */
 	uint32_t Dldispatch_q_cnt_semid; /*!<  HAL CONF: MIPS itc semaphore address for Directlink TM dispatch queue counter */
@@ -1174,6 +1281,12 @@ struct mpe_profiling {
 	uint64_t tm_process_tc_q_end;		/*!< Profiling end for tm_process_tc_q() */
 	uint64_t wk_process_pkt_end;		/*!< Profiling end for wk_process_pkt() */
 	uint64_t wk_deq_dispatch_q_end;		/*!< Profiling end for dequeue from dispatch Q */
+
+	// Mcast
+	uint64_t mc_buffer_alloc_end;		/*!< Profiling end for CBM buffer allocation */
+	uint64_t mc_ddr2ddr_end;			/*!< Profiling end for memcpy hw DDR to DDR */
+	uint64_t mc_pmac_update_end;		/*!< Profiling end for editing Pmac for each copy */
+	// end of Mcast
 
 	uint64_t wk_profile_end;			/*!< wk full profiling end */
 
@@ -1469,10 +1582,16 @@ struct ipsec_info {
 
 	/*padding variables*/
 	uint8_t pad_en; 				/*!< flag whether pad needed or not. For block ciphers , it must be set to 1, otherwise 0*/
-	uint8_t pad_instr_offset;	/*!< the insert instruction index in the ACD for padding. valid only if pad_en is 1.
-												MPE FW need to update it accordingly if pad_en equal 1*/
-	uint8_t crypto_instr_offset;/*!< the insert instruction index in the ACD for crypto to encrypt/decrypt real data */
+	uint8_t pad_instr_offset;	/*!< the insert instruction offset (in bytes) in the ACD for padding. valid only if pad_en is 1.
+										MPE FW need to update it accordingly if pad_en is set */
+	uint8_t crypto_instr_offset;/*!< direction instruction offset (in bytes) in the ACD for crypto to encrypt/decrypt data */
 	uint8_t blk_size; 		/*!< crypto block size for calculating padding length in bytes */
+
+	/* AES-CCM specific */
+	uint32_t hash_pad_instr_offset; /*!< insert instr offset (in bytes) in the ACD for adding hash padding length. \n
+	                                     Offset > 0 for AES-CCM mode and must be 0 for other modes. */
+	uint32_t msg_len_instr_offset;  /*!< message length instr offset (in bytes) in the ACD. \n
+	                                     Offset > 0 for AES-CCM mode and must be 0 for other modes.  */
 
 	/* Integrity Check Value (ICV) */
 	uint8_t icv_len; 			/*!< ICV length in bytes. Used by FW for MTU sanity checking */
@@ -1482,24 +1601,36 @@ struct ipsec_info {
 
 	/*For debugging */
 	uint8_t key_len; 			/*!< the key length in DWORDS */
-	uint8_t key_offset; 		/*!< It is the offset based on context base. Valid only if key_len is non_zero*/
+	uint8_t key_offset; 		/*!< It is the offset (in bytes) based on context base. Valid only if key_len is non_zero*/
 	uint8_t digest0_len; 	/*!< the digest0 length  in DWORDS */
-	uint8_t digest0_offset;	/*!< It is the offset based on context base. Valid only if digest0_len is non_zero */
+	uint8_t digest0_offset;	/*!< It is the offset (in bytes) based on context base. Valid only if digest0_len is non_zero */
 	uint8_t digest1_len; 	/*!< the digest1 length  in DWORDS */
-	uint8_t digest1_offset; /*!< It is the offset based on context base. Valid only if digest1_len is non_zero */
-	uint8_t spi_offset; 		/*!< It is the offset based on context base. */
+	uint8_t digest1_offset; /*!< It is the offset (in bytes) based on context base. Valid only if digest1_len is non_zero */
+	uint8_t spi_offset; 		/*!< It is the offset (in bytes) based on context base. */
 	uint8_t seq_num_len; 	/*!< the sequence number length  in DWORDS */
-	uint8_t seq_num_offset;	/*!< It is the offset based on context base. Valid only if seq_num_len is non_zero*/
+	uint8_t seq_num_offset;	/*!< It is the offset (in bytes) based on context base. Valid only if seq_num_len is non_zero*/
 	uint8_t seq_mask_len; 	/*!< the sequence mask length  in DWORDS */
-	uint8_t seq_mask_offset;/*!< It is the offset based on context base. Valid only if seq_mask_len is non_zero*/
-	uint8_t iv_offset; 		/*!< It is the offset based on acd_ptr or ctx_ptr (as base). Valid only if iv_len is non_zero*/
+	uint8_t seq_mask_offset;/*!< It is the offset (in bytes) based on context base. Valid only if seq_mask_len is non_zero*/
+	uint8_t iv_offset; 		/*!< It is the offset (in bytes) based on acd_ptr or ctx_ptr (as base). Valid only if iv_len is non_zero*/
 
 };
 
-struct ipsec_tunl_setup {
+struct ipsec_sample_tunl {
 	uint8_t id;
 	uint32_t dstip[4];
 	uint32_t spi;
+};
+
+/*!
+  \brief This is the structure for dltx_ce5 ring management
+ */
+
+struct dltx_ce5_index {
+	uint32_t qca_rd_idx;	/*!< QCA Read Index from PCIE */
+	uint32_t rd_idx;		/*!< DLTX Read Index */
+	uint32_t par_idx;		/*!< DLTX Parsing Index */
+	uint32_t wraparnd_cnt;	/*!< DLTX Wrap Around Count Tx */
+	uint32_t par_thresh;	/*!< DLTX Parsing Threshold */
 };
 
 /************************Below is General Configuration (Genconf ) Definition *************************************/
@@ -1513,7 +1644,7 @@ struct genconf {
 	  at the begining of the geoncof structure
 	  so as assemly code can easily access it with fixed offset 0.
 	 *******************************************************************************/
-	uint32_t eva_config_flag;/*!< EVA Setting Flag set by MPE HAL: one bit is for one register. Its value definitiion : \n
+	uint32_t eva_config_flag;/*!< EVA Setting Flag set by MPE HAL: one bit is for one register. Its value definition :\n
                                &nbsp;&nbsp; 0  -- this register value not valid and no need to set.\n
                                &nbsp;&nbsp; 1  -- this register value valid and need to set \n
 Note:\n
@@ -1528,11 +1659,11 @@ Note:\n
 	uint32_t ddr_address;	/*!< Used to convert between PHY and VIR address in EVA mode. HW dependent. */
 	uint32_t vmb_fw_msg_base[VPE_NUM]; /*!< VMB msg base address (from VMB to FW message) per VPE. It is set by MPE HAL*/
 	uint32_t fw_vmb_msg_base[VPE_NUM]; /*!< FW msg base address (from FW to VMB reply message) per VPE. It is set by MPE HAL*/
-	uint32_t fw_dbg_flag[2]; /*!< FW debug flags accessible by kernel. Set by MPE FW, read only to MPE HAL. */
-
+	uint32_t fw_dbg_flag;   /*!< FW debug flags accessible by kernel. Set by MPE FW, read only to MPE HAL. */
+	uint32_t end_mpe_accel; /*!< FW flag to disable MPE Acceleration. It is set by MPE HAL, read only to MPE FW. */
 	struct fw_hdr fw_hdr; /*!< MPE FW header. It is set during compilation or by post scripts. It is readonly to MPE FW/HAL*/
 
-	uint32_t features_list[4];  /*!< features_list[0] bit defition as below.
+	uint32_t features_list[4];  /*!< features_list[0] bit defition as below. \n
                                   features_list[0]: \n
                                   &nbsp;&nbsp; bit 0: ipv4 routing, \n
                                   &nbsp;&nbsp; bit 1: ipv6 routing, \n
@@ -1541,7 +1672,7 @@ Note:\n
                                   \ref FEATURE_LIST2, \ref FEATURE_LIST3 \n.
                                   It is set during compilation and readonly to MPE FW/HAL.
                                  */
-	uint32_t dbg_mpe_q_id  : 8;  /*!< Debug queue ID for MPE HAL to receive event/msg from MPE FW.\n
+	uint32_t dbg_mpe_q_id  : 8;  /*!< Debug queue ID for MPE HAL to receive event or msg from MPE FW\n
                                    Valid only if \ref dbg_mpe_q_id_en == 1 \n
                                    It is set by MPE HAL.
                                   */
@@ -1588,8 +1719,11 @@ Note:\n
                                                                      Maximum \ref MAX_WORKER_NUM TC are supported \n
                                                                      It is per worker based in order to avoid lock between different workers.\n
                                                                     */
-	uint16_t mib_itf_num;      /*!< maximum MIB Interface configured by MPE HAL ( up to \ref MAX_MIB_ITF_NUM )\n
-                                 Readonly to MPE HAL once MPE activated
+	uint16_t mib_itf_num;      /*!< maximum MIB Interface configured by MPE HAL ( up to \ref MAX_MIB_ITF_NUM ) \n
+                                 Readonly to MPE HAL once MPE activated.
+                                */
+	uint16_t mib_e97_dec_num;  /*!< maximum IPSEC tunnel counter per TC configured by MPE HAL ( up to \ref IPSEC_TUN_MAX ) \n
+                                 Readonly to MPE HAL once MPE activated. Designed for EIP97 inbound packet/byte MIB counter.
                                 */
 	uint16_t hw_act_num;      /*!< Maximum HW session number set by MPE HAL for complemantry mode. \n
                                 It is up to \ref MAX_HW_SESSION_NUM.\n
@@ -1605,6 +1739,12 @@ Note:\n
                                                   Each table's memory size per table is ( its \ref mib_itf_num * sizeof(struct \ref mpe_itf_mib)) bytes. \n
                                                   It is up to ( \ref MAX_MIB_ITF_NUM * sizeof(struct \ref mpe_itf_mib) )\n
                                                   MPE FW access the base address via hw_res->logic_mpe_tc_id, ie, \ref mib_itf_tbl_base[hw_res->logic_mpe_tc_id]\n
+                                                 */
+	uint32_t mib_e97_dec_base[MAX_WORKER_NUM];  /*!< EIP97 decrypted MIB counter base address per TC set by MPE HAL.\n
+                                                  The memory is allocated by MPE HAL.\n
+                                                  Each table's memory size per table is ( its \ref mib_e97_dec_num * sizeof(struct \ref mib_info)) bytes. \n
+                                                  It is up to ( \ref IPSEC_TUN_MAX * sizeof(struct \ref mib_info) )\n
+                                                  Designed for EIP97 inbound packet/byte MIB counter.\n
                                                  */
 
 	/* MPE FW Acceleration Extension */
@@ -1626,6 +1766,9 @@ Note:\n
                              Mainly used for testing purpose in chiptest*/
 	uint32_t dic_flag: 1; /*!< TX DMA descriptor DIC field to discard not-hit-by-rule packet from CPU queue. It is for testing only in chiptest */
 
+	uint32_t dma_desc_cpu_mask[2]; /*!< DMA Descriptor mask set by MPE HAL for return to CPU path packets */
+	uint32_t dma_desc_cpu_val[2];  /*!< DMA Descriptor value set by MPE HAL for return to CPU path packets */
+
 	struct mib_tc tc_mib[MAX_MPE_TC_NUM]; /*!< per TC based rx MIB counter: \n
                                             It is accessed via hw_res->logic_mpe_tc_id
                                            */
@@ -1636,7 +1779,7 @@ Note:\n
                                                Each entry in the table is a strcut \ref vap_entry  .\n
                                                each port's VAP table's memory size is \ref mc_vap_num[i] * sizeof(struct \ref vap_entry) bytes\n
                                                each port's VAP table's memory size is up to \ref MAX_MC_NUM * sizeof(struct \ref vap_entry) bytes\n
-Note: each mc session's maximum supported VAP number is \ref MAX_VAP_PER_PORT
+                                               Note: each mc session's maximum supported VAP number is \ref MAX_VAP_PER_PORT
                                               */
 
 	struct port_info port[MAX_PMAC_PORT]; /*!< per pmac port information set by MPE HAL*/
@@ -1677,14 +1820,23 @@ Note: each mc session's maximum supported VAP number is \ref MAX_VAP_PER_PORT
 	uint32_t dl_ep2radioId_base[MAX_EP2RADIO_ENTRY];	/*!< EP to Radio ID mapping array */
 	uint32_t dl_dispatch_q_buf_num;  /*!< The dispatch queue's buffer number/length. Maximum up to \ref MAX_DISPATCH_BUF_NUM \n
 														 Note, the buffer is allocated in MPE FW, not by MPE HAL*/
+	uint32_t dl_dma_desc_base;		/*!< DL DMA Descriptor_base */
+	uint32_t dl_dma_desc_len;		/*!< DL DMA Descriptor_len */
+	uint32_t dl_dma_chan;			/*!< DL DMA Channel Number */
+	uint32_t dl_dma_buf_off;		/*!< DL Dma Data buffer starting offset */
 
-	uint8_t e97_init_flag;	/*!< whether EIP97 is initialized by Linux Driver or not. 1– Initialized successfully */
-
+	struct dltx_ce5_index dltxce5;  /*!< All Index managed by DLTX for dual ring support */
+	uint8_t e97_init_flag;	/*!< The flag is configured by MPE HAL during kernel boot up. \n
+                                 1: EIP97 HW is initialized by Linux Driver, 0: MPE FW need to initialise EIP97 e.g in chiptest
+                                 */
+	uint8_t e97_mpe_en;     /*!< The flag is configured by MPE HAL during kernel boot up. \n
+                                 1: MPE is using EIP97 HW for enc/decryption, 0: MPE is not using EIP97
+                                 */
 	uint8_t tunnel_esp_test;	/*!<  MPE FW workaround to set DEC=1, ENC=0, and tunnel_id in RX DMA descriptor : 0: real FW, 1: testing only*/
 	uint8_t tunnel_redir_port;	/*!<  source port id in ingress PMAC after a tunnel ESP packet decrypted : valid id from 7 - 14 */
 
 	/* IPSec testing tunnel setup for decryption */
-	struct ipsec_tunl_setup ips_tunl[IPSEC_TUN_MAX + IPSEC_TUN_MAX];	/*!<  for MPE FW  workaround to set tunnel_id in RX DMA descriptor testing. \n
+	struct ipsec_sample_tunl ips_tunl[IPSEC_TUN_MAX + IPSEC_TUN_MAX];	/*!<  for MPE FW  workaround to set tunnel_id in RX DMA descriptor testing. \n
 	                                                                                                            It consists 16 tunnels for IPv4 and 16 tunnels for IPv6. Only valid when \n
 	                                                                                                            tunnel_esp_test = EN */
 
@@ -1696,13 +1848,22 @@ Note: each mc session's maximum supported VAP number is \ref MAX_VAP_PER_PORT
 	uint8_t ipsec_input_flag[IPSEC_TUN_MAX]; 	/*!< Tunnel flag: 0 –its configuration not valid, 1 –valid 2—For MPE use */
 	uint8_t ipsec_output_flag[IPSEC_TUN_MAX]; /*!< Tunnel flag: 0 –its configuration not valid, 1 --valid */
 
-	/*For MPE HAL to construct CDR/RDR. It is Per Worker based. MPE HAL need to allocate the buffer */
+	/*For MPE HAL to construct CDR/RDR. It is Per Worker based. MPE HAL need to allocate the buffer for IPSEC traffic */
 	uint32_t e97_cdr_in[MAX_WORKER_NUM][IPSEC_TUN_MAX];	/*!< MPE HAL alloc per CDR input buffer EIP97_CD_SIZE * 4 */
-	uint32_t e97_cdr_out[MAX_WORKER_NUM][IPSEC_TUN_MAX];	/*!< MPE HAL alloc per CDR input buffer EIP97_CD_SIZE * 4. */;
+	uint32_t e97_cdr_out[MAX_WORKER_NUM][IPSEC_TUN_MAX];	/*!< MPE HAL alloc per CDR input buffer EIP97_CD_SIZE * 4 */
 	uint32_t e97_acd_in[MAX_WORKER_NUM][IPSEC_TUN_MAX]; 	/*!< MPE HAL alloc per ACD input buffer EIP97_ACD_MAX_SIZE */
 	uint32_t e97_acd_out[MAX_WORKER_NUM][IPSEC_TUN_MAX]; 	/*!< MPE HAL alloc per ACD output buffer EIP97_ACD_MAX_SIZE */
-	uint32_t e97_rdr[MAX_WORKER_NUM]; 							/*!< MPE HAL alloc per RDR buffer e97_rdw)  */;
+	uint32_t e97_rdr[MAX_WORKER_NUM]; 						/*!< MPE HAL alloc per RDR buffer e97_rdw)  */
 
+	/* Allocation of new CBM buffer */
+	uint32_t cbm_bufset_num;                   /* Number of available Cbm buffer set to use, maximum is \ref CBM_BUFSET_MAX */
+	uint32_t cbm_bufset_size[CBM_BUFSET_MAX];  /* Maximum number of bytes can be stored in each specific buffer */
+	uint32_t cbm_bufset_base[CBM_BUFSET_MAX];  /* Base address of each specific buffer */
+
+	uint32_t jiffies;	/*!< jiffies for timer */
+	uint32_t cpufreq;	/*!< MPE HAL set CPU current Frequency for timer	*/
+
+	uint32_t umt_data_write[8];
 } ;
 
 /*!

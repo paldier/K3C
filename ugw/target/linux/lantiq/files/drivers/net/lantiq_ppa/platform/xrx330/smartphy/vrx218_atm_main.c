@@ -2037,6 +2037,12 @@ static int __init ppe_init(void)
     xet_phy_wan_port(7,NULL,0,1);
 
     proc_file_create();
+    if (g_phys_port_atm_wan_get) {
+        *g_phys_port_atm_wan_get = 7;
+    }
+    if (g_phys_port_atm_wan_vlan_get) {
+        *g_phys_port_atm_wan_vlan_get = 1;
+    }
 
     printk("  %d device(s) are detected!\n", dev_num);
 
@@ -2046,6 +2052,13 @@ static int __init ppe_init(void)
 static void __exit ppe_exit(void)
 {
     extern int32_t register_ppe_ext_generic_hook(ppe_generic_hook_t datapath_hook, ppe_generic_hook_t hal_hook);
+
+    if (g_phys_port_atm_wan_get) {
+        *g_phys_port_atm_wan_get = ~0;
+    }
+    if (g_phys_port_atm_wan_vlan_get) {
+        *g_phys_port_atm_wan_vlan_get = 0;
+    }
 
     proc_file_delete();
 

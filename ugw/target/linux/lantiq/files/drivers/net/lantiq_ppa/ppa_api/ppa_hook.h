@@ -234,6 +234,21 @@ extern int32_t ppa_hook_session_get_fn(PPA_SESSION ***pp_sessions, PPA_SESSION_E
 #endif
 
 /*! 
+    \brief Returns session statistics
+    \param[in]  p_session   Pointer to the session 
+    \param[in]  pCtCounter  Pointer to the statistics structure 
+    \return The return value can be any one of the following:  \n
+               - PPA_SUCCESS \n
+               - PPA_FAILURE 
+*/
+#ifdef NO_DOXY
+extern int32_t (*ppa_hook_get_ct_stats_fn)(PPA_SESSION *p_session,PPA_CT_COUNTER* pCtCounter);
+#else
+extern int32_t ppa_hook_get_ct_stats_fn(PPA_SESSION *p_session,PPA_CT_COUNTER* pCtCounter);
+#endif
+
+
+/*! 
     \brief Add, Modify and Delete PPA multicast group information like membership of interfaces to a multicast group address.
     \param[in] ppa_mc_entry Pointer to multicast group entry.                                                           I
     \param[in] flags Flags for the multicast group update operation. Valid values are:\n
@@ -798,9 +813,9 @@ extern int32_t ppa_hook_directlink_register_dev_fn(int32_t *if_id, PPA_DTLK_T *d
               Note : The CPU-bound device driver is strongly recommended to call this API from tasklet mode (or equivalent non-interrupt context on non-Linux OS) and not from IRQ context for better system dynamics.           
 */
 #ifdef NO_DOXY
-extern int32_t (*ppa_hook_directpath_send_fn)(uint32_t rx_if_id, PPA_BUF *buf, int32_t len, uint32_t flags);
+extern int32_t (*ppa_hook_directpath_send_fn)(uint32_t rx_if_id, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 #else
-extern int32_t ppa_hook_directpath_send_fn(uint32_t rx_if_id, PPA_BUF *buf, int32_t len, uint32_t flags);
+extern int32_t ppa_hook_directpath_send_fn(uint32_t rx_if_id, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 #endif
 
 /*! 
@@ -823,9 +838,9 @@ extern int32_t ppa_hook_directpath_send_fn(uint32_t rx_if_id, PPA_BUF *buf, int3
               Note : The CPU-bound device driver is strongly recommended to call this API from tasklet mode (or equivalent non-interrupt context on non-Linux OS) and not from IRQ context for better system dynamics.           
 */
 #ifdef NO_DOXY
-extern int32_t (*ppa_hook_directpath_ex_send_fn)(PPA_SUBIF *subif, PPA_BUF *buf, int32_t len, uint32_t flags);
+extern int32_t (*ppa_hook_directpath_ex_send_fn)(PPA_SUBIF *subif, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 #else
-extern int32_t ppa_hook_directpath_ex_send_fn(PPA_SUBIF *subif, PPA_BUF *buf, int32_t len, uint32_t flags);
+extern int32_t ppa_hook_directpath_ex_send_fn(PPA_SUBIF *subif, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 #endif
 
 
@@ -910,15 +925,15 @@ extern int32_t ppa_hook_directpath_ex_rx_restart_fn(PPA_SUBIF *subif, uint32_t f
     \param[in] len    Length of the skb buffer
     \param[in] flags  reserved
     \return The return value can be any one of the following:  \n
-               - Not-null PPA_BUF pointer on sucess\n
+               - Not-null PPA_SKBUF pointer on sucess\n
                - NULL or (void *)PPA_FAILURE or (void *)PPA_EINVAL on fail\n 
     \note      It is recommended for a device driver to recycle this buffer using ppa_hook_directpath_recycle_skb_fn function.
 
 */
 #ifdef NO_DOXY
-extern PPA_BUF * (*ppa_hook_directpath_alloc_skb_fn)(PPA_SUBIF* psubif, int32_t len, uint32_t flags);
+extern PPA_SKBUF * (*ppa_hook_directpath_alloc_skb_fn)(PPA_SUBIF* psubif, int32_t len, uint32_t flags);
 #else
-extern PPA_BUF * ppa_hook_directpath_alloc_skb_fn(PPA_SUBIF* psubif, int32_t len, uint32_t flags);
+extern PPA_SKBUF * ppa_hook_directpath_alloc_skb_fn(PPA_SUBIF* psubif, int32_t len, uint32_t flags);
 #endif
 
 /*! 
@@ -933,9 +948,9 @@ extern PPA_BUF * ppa_hook_directpath_alloc_skb_fn(PPA_SUBIF* psubif, int32_t len
 
 */
 #ifdef NO_DOXY
-extern int32_t (*ppa_hook_directpath_recycle_skb_fn)(PPA_SUBIF* psubif, PPA_BUF* skb, uint32_t flags);
+extern int32_t (*ppa_hook_directpath_recycle_skb_fn)(PPA_SUBIF* psubif, PPA_SKBUF* skb, uint32_t flags);
 #else
-extern int32_t ppa_hook_directpath_recycle_skb_fn(PPA_SUBIF* psubif, PPA_BUF* skb, uint32_t flags);
+extern int32_t ppa_hook_directpath_recycle_skb_fn(PPA_SUBIF* psubif, PPA_SKBUF* skb, uint32_t flags);
 #endif
 
 /*! 
@@ -1376,9 +1391,9 @@ extern PPA_NETIF* (*ppa_ipv6_gre_phy_fn)(struct net_device *dev);
     \return int32_t, The return value can be 0 or 1
 */               
 #ifdef NO_DOXY
-extern int32_t (*ppa_hook_directpath_enqueue_to_imq_fn)(PPA_BUF *skb, uint32_t portID);
+extern int32_t (*ppa_hook_directpath_enqueue_to_imq_fn)(PPA_SKBUF *skb, uint32_t portID);
 #else
-extern int32_t ppa_hook_directpath_enqueue_to_imq_fn(PPA_BUF *skb, uint32_t portID);
+extern int32_t ppa_hook_directpath_enqueue_to_imq_fn(PPA_SKBUF *skb, uint32_t portID);
 #endif
 
 /*!
@@ -1390,9 +1405,9 @@ extern int32_t ppa_hook_directpath_enqueue_to_imq_fn(PPA_BUF *skb, uint32_t port
     \return int32_t, The return value can be 0 or 1
 */  
 #ifdef NO_DOXY
-extern int32_t (*ppa_hook_directpath_reinject_from_imq_fn)(int32_t rx_if_id, PPA_BUF *buf, int32_t len, uint32_t flags);
+extern int32_t (*ppa_hook_directpath_reinject_from_imq_fn)(int32_t rx_if_id, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 #else
-extern int32_t ppa_hook_directpath_reinject_from_imq_fn(int32_t rx_if_id, PPA_BUF *buf, int32_t len, uint32_t flags);
+extern int32_t ppa_hook_directpath_reinject_from_imq_fn(int32_t rx_if_id, PPA_SKBUF *buf, int32_t len, uint32_t flags);
 #endif
 
 
@@ -1476,6 +1491,25 @@ extern int32_t ppa_hook_get_sw_fastpath_status_fn(uint32_t* flags);
 #endif
 
 #endif
+
+#if defined(CONFIG_L2NAT_MODULE) || defined(CONFIG_L2NAT)
+
+/*!
+    \brief Check if network interafce is a part of l2nat
+    \param[in] netif Pointer to the network interface structure in the protocol stack. For eg. pointer to a struct net_device
+    \param[in] ifname Interface name
+    \param[in] flags  Reserved for future use
+
+    \return The return value can be any one of the following:  \n
+               - 1 if network interafce is a part of l2nat \n
+               - 0 otherwise
+*/
+#ifdef NO_DOXY
+extern int32_t (*ppa_check_if_netif_l2nat_fn)(PPA_NETIF *netif, char *ifname, uint32_t flags);
+#else
+extern int32_t ppa_check_if_netif_l2nat_fn(PPA_NETIF *netif, char *ifname, uint32_t flags);
+#endif
+#endif // CONFIG_L2NAT
 
 #endif //end of __KERNEL__
 

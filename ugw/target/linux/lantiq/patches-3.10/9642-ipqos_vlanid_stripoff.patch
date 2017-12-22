@@ -3,11 +3,13 @@ IPQoS patch required to strip off vlan tag
 diff --git a/net/8021q/vlan_core.c b/net/8021q/vlan_core.c
 --- a/net/8021q/vlan_core.c
 +++ b/net/8021q/vlan_core.c
-@@ -5,6 +5,59 @@
+@@ -5,6 +5,61 @@
  #include <linux/export.h>
  #include "vlan.h"
  
 +#ifdef CONFIG_VLAN_8021Q_UNTAG
++#include <linux/rtnetlink.h>
++#include "../bridge/br_private.h"
 +void rem_vlan_tag(struct sk_buff *skb)
 +{
 +	unsigned char *rawp = NULL;
@@ -63,7 +65,7 @@ diff --git a/net/8021q/vlan_core.c b/net/8021q/vlan_core.c
  bool vlan_do_receive(struct sk_buff **skbp)
  {
  	struct sk_buff *skb = *skbp;
-@@ -12,15 +65,43 @@
+@@ -12,15 +67,61 @@ bool vlan_do_receive(struct sk_buff **sk
  	u16 vlan_id = vlan_tx_tag_get_id(skb);
  	struct net_device *vlan_dev;
  	struct vlan_pcpu_stats *rx_stats;
@@ -92,15 +94,33 @@ diff --git a/net/8021q/vlan_core.c b/net/8021q/vlan_core.c
  		return false;
  
 +#ifdef CONFIG_VLAN_8021Q_UNTAG
-+	if (tag_remove == true) {
-+		u16 vlan_tci = skb->vlan_tci;
-+		rem_vlan_tag(skb);
-+		u32 vid = vlan_id;
-+		u32 vprio = (vlan_tci >> 13);
++	u16 vlan_tci = skb->vlan_tci;
++	u32 vid = vlan_id;
++	u32 vprio = (vlan_tci >> 13);
++
 +#ifdef CONFIG_NETWORK_EXTMARK
-+		SET_DATA_FROM_MARK_OPT(skb->extmark, VLANID_MASK, VLANID_START_BIT_POS, vid);
-+		SET_DATA_FROM_MARK_OPT(skb->extmark, VPRIO_MASK, VPRIO_START_BIT_POS, vprio);
++	SET_DATA_FROM_MARK_OPT(skb->extmark, VLANID_MASK, VLANID_START_BIT_POS, vid);
++	SET_DATA_FROM_MARK_OPT(skb->extmark, VPRIO_MASK, VPRIO_START_BIT_POS, vprio);
 +#endif
++
++	if (tag_remove == true) {
++		/*
++		*	Q-in-Q -Protyping  
++		*	Don't reset vlan_tci if skb->dev is part of bridge port 
++		*/
++		struct net_port_vlans *pv = NULL;
++	
++		if(br_port_exists(skb->dev))
++		{
++			pv  = nbp_get_vlan_info(br_port_get_rcu(skb->dev));
++			if(pv && test_bit( vlan_id, pv->vlan_bitmap)){
++				/*Q-in-Q prototype -> dont reset vlan_tci return false */
++				return false;	
++			}
++		}
++
++		//printk(KERN_INFO"vlan %x dropped from dev=%s\n",vlan_id, skb->dev->name);
++		rem_vlan_tag(skb);
 +		skb->vlan_tci = 0;
 +		return true;
 +	}
@@ -112,7 +132,7 @@ diff --git a/net/8021q/vlan_core.c b/net/8021q/vlan_core.c
 diff --git a/net/Kconfig b/net/Kconfig
 --- a/net/Kconfig
 +++ b/net/Kconfig
-@@ -199,6 +199,27 @@
+@@ -219,6 +219,27 @@ config BRIDGE_NETFILTER
  
  	  If unsure, say N.
  

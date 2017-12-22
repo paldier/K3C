@@ -109,7 +109,7 @@ typedef struct sw_header {
   uint32_t extmark; 		/* marking */
   sw_acc_type type;  		/* Software acceleration type */
   PPA_NETIF *tx_if;   		/* Out interface */
-  int (*tx_handler)(PPA_BUF *skb); /* tx handler function */
+  int (*tx_handler)(PPA_SKBUF *skb); /* tx handler function */
 #if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
   struct dst_entry *dst; 	/* route entry */
 #endif
@@ -226,8 +226,10 @@ struct flag_header {
 #define Is6rdSession(flags)           ( (flags) &  SESSION_TUNNEL_6RD)
 #define IsL2TPSession(flags)          ( (flags) & SESSION_VALID_PPPOL2TP)
 #define IsValidNatIP(flags)           ( (flags) & SESSION_VALID_NAT_IP)
+#define IsGRESession(flags)          ( flags & SESSION_FLAG2_GRE)
 
 #define IsBridgedSession(p_item)       ( ((p_item)->flag2) & SESSION_FLAG2_BRIDGED_SESSION) 
+#define IsGreSession(p_item)           ( ((p_item)->flag2) & SESSION_FLAG2_GRE)
 
 static int flag_header_ipv6( struct flag_header *pFlagHdr, 
                               const unsigned char* data,
@@ -248,6 +250,8 @@ extern int check_ingress(struct sk_buff *skb);
 #if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
 extern int ppa_sw_litepath_local_deliver(struct sk_buff *skb);
 #endif
+
+static int32_t ip_ttl_default = 64;
 
 unsigned short swa_sw_out_header_len( struct session_list_item *p_item,  
                                       /* ETH type of outgoing packet */
@@ -357,7 +361,7 @@ static inline int get_6rd_tunnel_header(PPA_NETIF *dev, struct iphdr* iph)
   iph->version        = 4;
   iph->protocol       = IPPROTO_IPV6;
   iph->ihl        = 5;
-  iph->ttl        = 64;
+  iph->ttl        = ip_ttl_default;
   iph->saddr      = t->parms.iph.saddr;
   iph->daddr      = 0; /* Don't use tunnel destination address; Later, it is selected based on IPv6 dst address. */
 
@@ -377,6 +381,12 @@ int32_t sw_update_session(PPA_BUF *skb, struct session_list_item *p_item, struct
 
   t_sw_hdr  swaHdr;
   t_sw_hdr  *p_swaHdr;
+
+  /* Following sessions are excluded from software acceleration */
+  /* GRE sessions (skip processing) */
+  if(IsGreSession(p_item)) {
+     return PPA_SUCCESS;
+  }
 
   // if the header is already allocated return
   if(p_item->sah == NULL) {
@@ -508,8 +518,13 @@ int32_t sw_update_session(PPA_BUF *skb, struct session_list_item *p_item, struct
 	    if( IsBridgedSession(p_item) ) {
 		ppa_memcpy(hdr,skb->data, ETH_ALEN*2);  
 	    }else {
-	    //get the MAC address of txif
-		ppa_get_netif_hwaddr(p_item->tx_if, hdr + ETH_ALEN, 1);
+		//get the MAC address of txif
+		//in case of l2nat we need the mac address of the lower device, not the bridge
+		if (tx_ifinfo && tx_ifinfo->flags & NETIF_L2NAT) {
+		    ppa_get_netif_hwaddr(swaHdr.tx_if, hdr + ETH_ALEN, 1);
+		} else {
+		    ppa_get_netif_hwaddr(p_item->tx_if, hdr + ETH_ALEN, 1);
+		}
 		ppa_memcpy(hdr, p_item->dst_mac, ETH_ALEN);
 	    }
 	    hdr += ETH_ALEN*2;
@@ -587,6 +602,9 @@ int32_t sw_update_session(PPA_BUF *skb, struct session_list_item *p_item, struct
 		struct iphdr iph;
 		get_6rd_tunnel_header(p_item->tx_if, &iph);
 		iph.daddr = p_item->sixrd_daddr;
+#ifdef CONFIG_PPA_PP_LEARNING
+  		iph.check = ip_fast_csum((unsigned char *)&iph, iph.ihl);
+#endif
 		ppa_memcpy(p_swaHdr->hdr+p_swaHdr->network_offset, &iph, sizeof(iph));
 	    }
 	}
@@ -616,8 +634,17 @@ int32_t sw_add_session(PPA_BUF *skb, struct session_list_item *p_item) {
 //	    return PPA_FAILURE;
   	}
 #endif
+//skip the telnet sessions ; tcp port 23
+	if(p_item->src_port==23 || p_item->dst_port==23) {
+            p_item->flags |= SESSION_NOT_ACCELABLE; //to avoid hitting the complete learning path again
+	    return PPA_FAILURE;
+	}
   }
 #endif 
+
+  /* Skip the sessions that do not have the software acceleration header created */
+  if(p_item->sah == NULL)
+    return PPA_FAILURE;
 
   if(p_item->flags & SESSION_ADDED_IN_SW)
     return PPA_SUCCESS;
@@ -628,7 +655,9 @@ int32_t sw_add_session(PPA_BUF *skb, struct session_list_item *p_item) {
     update_session_mgmt_stats(p_item, ADD);
 #endif 
   }
-  
+
+  // check for ttl default value change
+  ip_ttl_default = ppa_get_ip_ttl();
   return PPA_SUCCESS;
 }
 
@@ -823,7 +852,7 @@ static int set_flag_header( struct flag_header *pFlagHdr,
 }
 
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
-static inline unsigned char *skb_data_begin(PPA_BUF *skb)
+static inline unsigned char *skb_data_begin(PPA_SKBUF *skb)
 {
 	struct dma_rx_desc_2 *desc_2 = (struct dma_rx_desc_2 *)&((struct sk_buff *)skb)->DW2;
 
@@ -832,7 +861,7 @@ static inline unsigned char *skb_data_begin(PPA_BUF *skb)
 #endif
 
 
-static inline unsigned char *get_skb_flag_header(PPA_BUF *skb)
+static inline unsigned char *get_skb_flag_header(PPA_SKBUF *skb)
 {
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
   return (skb_data_begin(skb));
@@ -893,7 +922,7 @@ static inline unsigned char get_pf(struct flag_header *flg_hdr)
   return pf;
 }
 
-static int sw_mod_ipv4_skb( PPA_BUF *skb, 
+static int sw_mod_ipv4_skb( PPA_SKBUF *skb, 
                             struct session_list_item *p_item)
 {
   
@@ -980,7 +1009,7 @@ static int sw_mod_ipv4_skb( PPA_BUF *skb,
   return org_iph.tot_len;
 }
 
-static int sw_mod_ipv6_skb( PPA_BUF *skb, 
+static int sw_mod_ipv6_skb( PPA_SKBUF *skb, 
                             struct session_list_item *p_item)
 {
   t_sw_hdr  *swa;
@@ -1074,7 +1103,7 @@ static int sw_mod_ipv6_skb( PPA_BUF *skb,
   return htons(ntohs(ip6h->payload_len) + IPV6_HDR_LEN);
 }
 
-static int sw_mod_dslite_skb( PPA_BUF *skb, 
+static int sw_mod_dslite_skb( PPA_SKBUF *skb, 
                                struct session_list_item *p_item)
 {
   t_sw_hdr  *swa;
@@ -1113,7 +1142,7 @@ static int sw_mod_dslite_skb( PPA_BUF *skb,
   return ret;
 }
 
-static int sw_mod_6rd_skb( PPA_BUF *skb, 
+static int sw_mod_6rd_skb( PPA_SKBUF *skb, 
 				struct session_list_item *p_item)
 {
   t_sw_hdr  *swa;
@@ -1153,7 +1182,7 @@ static int sw_mod_6rd_skb( PPA_BUF *skb,
   return ret;
 }
 
-static int sw_mod_bridged_skb( PPA_BUF *skb, 
+static int sw_mod_bridged_skb( PPA_SKBUF *skb, 
                                struct session_list_item *p_item)
 {
   int ret;
@@ -1175,7 +1204,7 @@ static int sw_mod_bridged_skb( PPA_BUF *skb,
 }
 
 #if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
-struct dst_entry * swa_get_pkt_dst(PPA_BUF* skb1, PPA_NETIF* netif)
+struct dst_entry * swa_get_pkt_dst(PPA_SKBUF* skb1, PPA_NETIF* netif)
 {
     struct dst_entry *dst1=NULL;
 	
@@ -1296,7 +1325,7 @@ static sw_acc_type_fn afn_SoftAcceleration[SW_ACC_TYPE_MAX] = {
 #endif
 };
 
-int32_t swa_check_ingress(PPA_BUF *skb)
+int32_t swa_check_ingress(PPA_SKBUF *skb)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	return check_ingress(skb);
@@ -1304,7 +1333,7 @@ int32_t swa_check_ingress(PPA_BUF *skb)
 	return -1;
 #endif
 }
-PPA_BUF* swa_handle_ing(PPA_BUF	*skb)
+PPA_SKBUF* swa_handle_ing(PPA_SKBUF	*skb)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	struct net_device *orig_dev;
@@ -1324,13 +1353,14 @@ static inline int get_time_in_sec(void)
         return (jiffies + HZ / 2) / HZ;
 }
 
-static inline int swa_get_session_from_skb(PPA_BUF *skb, unsigned char pf, struct session_list_item **pp_item)
+static inline int swa_get_session_from_skb(PPA_SKBUF *skb, unsigned char pf, struct session_list_item **pp_item)
 {
   skb_reset_network_header((struct sk_buff *)skb);
+// this API will work only if PPA_SKBUF == PPA_BUF
   return ppa_find_session_from_skb(skb, pf, pp_item);
 }
 
-int32_t ppa_do_sw_acceleration(PPA_BUF *skb)
+int32_t ppa_do_sw_acceleration(PPA_SKBUF *skb)
 {
   struct flag_header *flg_hdr=NULL,flghdr;
   unsigned int ppa_processed=0;           
@@ -1411,6 +1441,7 @@ int32_t ppa_do_sw_acceleration(PPA_BUF *skb)
        *  - Not L2TP
        */ 
 	if( IsL2TPSession(p_item->flags) || 
+	( IsGRESession(p_item->flag2)) || 
         	  ! (IsSoftwareAccelerated(p_item->flags)) ||
           	((skb->len > p_item->mtu) 
 #if defined(CONFIG_LTQ_PPA_LRO) && CONFIG_LTQ_PPA_LRO
@@ -1453,7 +1484,7 @@ int32_t ppa_do_sw_acceleration(PPA_BUF *skb)
 	    if ( (!ppa_processed && reqHeadRoom ) || 
                               (skb_headroom(skb) < reqHeadRoom) ) {
             
-		PPA_BUF* skb2;
+		PPA_SKBUF* skb2;
 		skb2 = skb_realloc_headroom(skb, reqHeadRoom);
 		if (skb2 == NULL) {
 		/* Drop the packet */
@@ -1537,11 +1568,50 @@ int32_t get_sw_fastpath_status(uint32_t *f_enable, uint32_t flags)
 
 int32_t sw_session_enable(struct session_list_item *p_item, uint32_t f_enable, uint32_t flags)
 {
-  if ( f_enable )
-    p_item->flags |= SESSION_ADDED_IN_SW;
-  else
-    p_item->flags &= ~SESSION_ADDED_IN_SW;
+  if ( f_enable ) {
+#if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
+  // local session = CPU_BOUND
+  if( (p_item->flag2 & SESSION_FLAG2_CPU_BOUND) ) {
+	// in case of local in traffic
+	// session can be sw accelerated IFF  1: session is added to LRO 2: session cannot be added to lro
+	// in case of local out traffic SESSION_FLAG2_ADD_HW_FAIL will always be set
+#if defined(CONFIG_LTQ_PPA_LRO) && CONFIG_LTQ_PPA_LRO
+	if(!(p_item->flag2 & SESSION_FLAG2_LRO) && !(p_item->flag2 & SESSION_FLAG2_ADD_HW_FAIL)) {
+//	    return PPA_FAILURE;
+	}
+#endif
+//skip the telnet sessions ; tcp port 23
+	if(p_item->src_port==23 || p_item->dst_port==23) {
+            p_item->flags |= SESSION_NOT_ACCELABLE; //to avoid hitting the complete learning path again
+	    return PPA_FAILURE;
+	}
+  }
+#endif
 
+  /* Skip the sessions that do not have the software acceleration header created */
+  if(p_item->sah == NULL)
+    return PPA_FAILURE;
+
+  if(p_item->flags & SESSION_ADDED_IN_SW)
+    return PPA_SUCCESS;
+
+  if( !(p_item->flags & SESSION_CAN_NOT_ACCEL) && g_sw_fastpath_enabled) {
+    p_item->flags |= SESSION_ADDED_IN_SW;
+#if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
+    update_session_mgmt_stats(p_item, ADD);
+#endif
+  }
+
+  // check for ttl default value change
+  ip_ttl_default = ppa_get_ip_ttl();
+  } else {
+    if( (p_item->flags & SESSION_ADDED_IN_SW) ) {
+#if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
+	  update_session_mgmt_stats(p_item, DELETE);
+#endif
+      p_item->flags &=  ~SESSION_ADDED_IN_SW;
+    }
+  }
   return PPA_SUCCESS;
 }
         
@@ -1557,7 +1627,7 @@ int32_t get_sw_session_status(struct session_list_item *p_item, uint32_t *f_enab
   return PPA_SUCCESS;
 }
 
-int32_t sw_fastpath_send(PPA_BUF *skb) 
+int32_t sw_fastpath_send(PPA_SKBUF *skb) 
 {
     
   if( skb == NULL )
@@ -1573,7 +1643,7 @@ int32_t sw_fastpath_send(PPA_BUF *skb)
 }
 
 #if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
-static inline int sw_update_iph(PPA_BUF *skb, int* offset, unsigned char *pf)
+static inline int sw_update_iph(PPA_SKBUF *skb, int* offset, unsigned char *pf)
 { 
     struct rtable *rt = NULL;
     struct iphdr *iph = NULL;
@@ -1616,7 +1686,8 @@ printk("in %s %d ipv6\n",__FUNCTION__, __LINE__);
 	iph->daddr = inet->inet_daddr;
 	iph->protocol = sk->sk_protocol;
 	iph->tot_len = skb->len;
-#if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 102)))
+  	iph->ttl = ip_ttl_default;
+#if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 104)))
 	ip_select_ident_more(iph, &rt->dst, sk, (skb_shinfo(skb)->gso_segs ?: 1) - 1);
 #else
 	ip_select_ident_segs(skb, sk, (skb_shinfo(skb)->gso_segs ?: 1));	
@@ -1630,7 +1701,7 @@ printk("in %s %d ipv6\n",__FUNCTION__, __LINE__);
 }
 
 
-int32_t sw_litepath_tcp_send_skb(PPA_BUF *skb)
+int32_t sw_litepath_tcp_send_skb(PPA_SKBUF *skb)
 {
     int32_t offset = 0;
     unsigned char pf=0;
@@ -1652,11 +1723,12 @@ int32_t sw_litepath_tcp_send_skb(PPA_BUF *skb)
 #if 1
 		if(skb_headroom(skb) < swa->tot_hdr_len) {
 		    // realloc headroom
-		    PPA_BUF *skb2;
+		    PPA_SKBUF *skb2;
 		    skb2 = skb_realloc_headroom(skb, swa->tot_hdr_len);
 		    if (skb2 == NULL) {
 			/* Drop the packet */
 			PPA_SKB_FREE(skb);
+                        offset=0;
 			skb = NULL;
 			goto skip_accel;
 		    }
@@ -1724,7 +1796,7 @@ skip_accel:
     return PPA_FAILURE;
 }
                
-int32_t sw_litepath_tcp_send(PPA_BUF *skb) 
+int32_t sw_litepath_tcp_send(PPA_SKBUF *skb) 
 {
     
   if( skb == NULL )
@@ -1738,7 +1810,7 @@ int32_t sw_litepath_tcp_send(PPA_BUF *skb)
 
   return PPA_FAILURE;
 }
-extern int32_t (*ppa_sw_litepath_tcp_send_hook)(PPA_BUF *);
+extern int32_t (*ppa_sw_litepath_tcp_send_hook)(PPA_SKBUF *);
 #endif
 
 extern int32_t (*ppa_sw_add_session_hook)(PPA_BUF* skb, struct session_list_item *p_item);
@@ -1749,9 +1821,9 @@ extern int32_t (*ppa_sw_fastpath_enable_hook)(uint32_t, uint32_t);
 extern int32_t (*ppa_get_sw_fastpath_status_hook)(uint32_t *, uint32_t);
 extern int32_t (*ppa_sw_session_enable_hook)(struct session_list_item *p_item, uint32_t, uint32_t);
 extern int32_t (*ppa_get_sw_session_status_hook)(struct session_list_item *p_item, uint32_t *, uint32_t);
-extern int32_t (*ppa_sw_fastpath_send_hook)(PPA_BUF *);
+extern int32_t (*ppa_sw_fastpath_send_hook)(PPA_SKBUF *);
 
-extern int32_t sw_fastpath_send(PPA_BUF *skb);
+extern int32_t sw_fastpath_send(PPA_SKBUF *skb);
 extern int32_t get_sw_fastpath_status(uint32_t *f_enable, uint32_t flags);
 extern int32_t sw_fastpath_enable(uint32_t f_enable, uint32_t flags);
 extern int32_t get_sw_session_status(struct session_list_item *p_item, uint32_t *f_enable, uint32_t flags);

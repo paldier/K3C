@@ -78,6 +78,7 @@
 #define NETIF_DIRECTPATH			0x00800000
 #define NETIF_GRE_TUNNEL                        0x01000000
 #define NETIF_DIRECTCONNECT                     0x02000000
+#define NETIF_L2NAT                             0x04000000
 
 /*
  * ####################################
@@ -155,10 +156,10 @@ struct netif_info {
     uint16_t 			fid;
     uint16_t			fid_index;
     uint16_t			subif_id;
+#endif
     uint8_t			tc;
     uint8_t			flowId;
     uint8_t			flowId_en;
-#endif
     uint32_t                    mac_entry;
     PPA_NETIF                   *out_vlan_netif;
     PPA_NETIF                   *in_vlan_netif;

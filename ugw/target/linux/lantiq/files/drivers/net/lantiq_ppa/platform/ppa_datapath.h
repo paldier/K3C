@@ -393,7 +393,6 @@ extern int32_t (*tmu_hal_get_csum_ol_mib_hook_fn)(
                 struct tmu_hal_qos_stats *csum_mib,
                 uint32_t flag);
 extern int32_t (*tmu_hal_clear_csum_ol_mib_hook_fn)(
-                struct tmu_hal_qos_stats *csum_mib,
                 uint32_t flag);
 extern int32_t (*tmu_hal_clear_qos_mib_hook_fn)(
                 struct net_device *netdev,

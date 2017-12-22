@@ -53,7 +53,7 @@ int32_t ppa_sw_fastpath_send(struct sk_buff *skb);
 */
 extern int32_t (*ppa_sw_fastpath_enable_hook)(uint32_t, uint32_t);
 extern int32_t (*ppa_get_sw_fastpath_status_hook)(uint32_t *, uint32_t);
-extern int32_t (*ppa_sw_fastpath_send_hook)(PPA_BUF *);
+extern int32_t (*ppa_sw_fastpath_send_hook)(PPA_SKBUF *);
 
 extern int32_t (*ppa_sw_add_session_hook)(PPA_BUF *skb, struct session_list_item *p_item);
 extern int32_t (*ppa_sw_update_session_hook)(PPA_BUF *skb, struct session_list_item *p_item,struct netif_info *tx_ifinfo);

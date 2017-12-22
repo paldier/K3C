@@ -37,12 +37,12 @@
 
 #if defined(CONFIG_LTQ_PPA_TMU_MIB_SUPPORT)
 struct tmu_hal_qos_stats {
-	uint32_t enqPkts; /* Enqueued packets Count */
-	uint32_t enqBytes; /* Enqueued Bytes Count */
-	uint32_t deqPkts; /* Dequeued packets Count */
-	uint32_t deqBytes; /* Dequeued Bytes Count */
-	uint32_t dropPkts; /* Dropped Packets Count */
-	uint32_t dropBytes; /* Dropped Bytes Count - UNUSED for now */
+	uint64_t enqPkts; /* Enqueued packets Count */
+	uint64_t enqBytes; /* Enqueued Bytes Count */
+	uint64_t deqPkts; /* Dequeued packets Count */
+	uint64_t deqBytes; /* Dequeued Bytes Count */
+	uint64_t dropPkts; /* Dropped Packets Count */
+	uint64_t dropBytes; /* Dropped Bytes Count - UNUSED for now */
 	uint32_t qOccPkts; /* Queue Occupancy Packets Count - Only at Queue level */
 };
 
@@ -50,7 +50,6 @@ extern int32_t (*tmu_hal_get_csum_ol_mib_hook_fn)(
                 struct tmu_hal_qos_stats *csum_mib,
                 uint32_t flag);
 extern int32_t (*tmu_hal_clear_csum_ol_mib_hook_fn)(
-                struct tmu_hal_qos_stats *csum_mib,
                 uint32_t flag);
 
 extern int32_t(*tmu_hal_get_qos_mib_hook_fn)(

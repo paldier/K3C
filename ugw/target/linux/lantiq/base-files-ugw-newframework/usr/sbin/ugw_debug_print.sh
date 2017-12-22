@@ -48,8 +48,8 @@ print_cmd "route" route -n
 
 print_cmd "ppa api netif" cat /proc/ppa/api/netif
 
-[ -f /etc/switchports.conf ] && {
-	. /etc/switchports.conf
+[ -f /opt/lantiq/etc/switchports.conf ] && {
+	. /opt/lantiq/etc/switchports.conf
 	for i in $switch_lan_ports; do print_cmd "switch port '$i' status" switch_cli GSW_PORT_LINK_CFG_GET nPortId=$i; done
 	for i in $switch_mii1_port; do print_cmd "switch port '$i' status" switch_cli GSW_PORT_LINK_CFG_GET nPortId=$i dev=1; done
 }

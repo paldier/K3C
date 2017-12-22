@@ -222,7 +222,7 @@ all:
 	@ln -s $(PATCH_DIR_p) $(KERNEL_TREE)/target_patches
 	@mkdir -p $(KERNEL_TREE)/.hg; ln -sf ../target_patches $(KERNEL_TREE)/.hg/patches;rm -f $(KERNEL_TREE)/target_patches/{series,status,guards}
 	@$(if ,cd $(KERNEL_TREE)/target_patches && ( hg update 2>/dev/null || true ))
-	@cd $(KERNEL_TREE)/target_patches && ( ls *.patch > series; );$(call succ)
+	@cd $(KERNEL_TREE)/target_patches && ( ls *.patch|LC_ALL=C LANG=C sort > series; );$(call succ)
 	@echo -en "Adding files to version control.."
 	@cd $(KERNEL_TREE)/ && ( hg add > /dev/null 2>/dev/null || ( $(call err) ) )
 	@cd $(KERNEL_TREE)/ && ( unset hg; hg ci -m "temporary checkin" || ( $(call err) ) );$(call succ)

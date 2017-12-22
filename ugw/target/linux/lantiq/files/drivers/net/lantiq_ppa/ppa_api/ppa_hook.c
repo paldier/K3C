@@ -145,7 +145,6 @@ int32_t (*ppa_hook_session_ipsec_add_fn)(PPA_XFRM_STATE *, sa_direction ) = NULL
 int32_t (*ppa_hook_session_ipsec_del_fn)(PPA_XFRM_STATE *) = NULL;
 #endif
 
-
 /********************************************************************************************** 
   * PPA unicast routing hook function:ppa_hook_session_add_fn
   * It it used to delete a  unicast routing session when it is timeout, reset or purposely.
@@ -176,7 +175,15 @@ int32_t (*ppa_hook_session_prio_fn)(PPA_SESSION *, uint32_t) = NULL;
 **********************************************************************************************/
 int32_t (*ppa_hook_session_modify_fn)(PPA_SESSION *, PPA_SESSION_EXTRA *, uint32_t) = NULL;
 int32_t (*ppa_hook_session_get_fn)(PPA_SESSION ***, PPA_SESSION_EXTRA **, int32_t *, uint32_t) = NULL;
+/********************************************************************************************** 
+  * PPA unicast routing hook function:ppa_hook_get_ct_stats_fn
+  * It it used to read the statistics counters of specified session
+  * input parameter PPA_SESSION *: the session pointer
+  * input parameter PPA_CT_COUNTER *: the session stats counter structure pointer
+  * return: PPA_SUCCESS: the session statistics read sucessfully
+**********************************************************************************************/
 
+int32_t (*ppa_hook_get_ct_stats_fn)(PPA_SESSION *, PPA_CT_COUNTER*) = NULL;
 /********************************************************************************************** 
   * PPA multicast hook function:ppa_hook_mc_group_update_fn
   * It it used to add/modify/delete a unicast routing session. It will be called manually by IGMP proxy or IGMP snooping module. 
@@ -568,30 +575,29 @@ int32_t (*ppa_hook_directlink_register_dev_fn)(int32_t *, PPA_DTLK_T *, PPA_DIRE
   * PPA Extra interface  hook function :ppa_hook_directpath_send_fn
   * it is used to send a packet to PPE FW when extra ethernet interface receive a packet
   * input parameter uint32_t:  the virtual port id
-  * input parameter PPA_BUF *: the packet to send
+  * input parameter PPA_SKBUF *: the packet to send
   * input parameter int32_t *: the packet length
   * input parameter uint32_t: for future purpose
   * return: PPA_SUCCESS: send sucessfully
   *            others: fail to send
 **********************************************************************************************/    
-int32_t (*ppa_hook_directpath_send_fn)(uint32_t, PPA_BUF *, int32_t, uint32_t) = NULL;
+int32_t (*ppa_hook_directpath_send_fn)(uint32_t, PPA_SKBUF *, int32_t, uint32_t) = NULL;
 
 /********************************************************************************************** 
   * PPA Extra interface  hook function :ppa_hook_directpath_ex_send_fn
   * it is used to send a packet to PPE FW when extra ethernet interface receive a packet
   * input parameter PPA_SUBIF:  the virtual port id and sub interface id
-  * input parameter PPA_BUF *: the packet to send
   * input parameter int32_t *: the packet length
   * input parameter uint32_t: for future purpose
   * return: PPA_SUCCESS: send sucessfully
   *            others: fail to send
 **********************************************************************************************/    
-int32_t (*ppa_hook_directpath_ex_send_fn)(PPA_SUBIF *, PPA_BUF *, int32_t, uint32_t) = NULL;
+int32_t (*ppa_hook_directpath_ex_send_fn)(PPA_SUBIF *, PPA_SKBUF *, int32_t, uint32_t) = NULL;
 
 /*Note, ppa_hook_directpath_enqueue_to_imq_fn will be set by imq module during initialization */
-int32_t (*ppa_hook_directpath_enqueue_to_imq_fn)(PPA_BUF *skb, uint32_t portID) = NULL;
+int32_t (*ppa_hook_directpath_enqueue_to_imq_fn)(PPA_SKBUF *skb, uint32_t portID) = NULL;
 /*it will be called by imq module */
-int32_t (*ppa_hook_directpath_reinject_from_imq_fn)(int32_t rx_if_id, PPA_BUF *buf, int32_t len, uint32_t flags) = NULL;
+int32_t (*ppa_hook_directpath_reinject_from_imq_fn)(int32_t rx_if_id, PPA_SKBUF *buf, int32_t len, uint32_t flags) = NULL;
 int32_t ppa_directpath_imq_en_flag=0;
 
 
@@ -635,8 +641,8 @@ int32_t (*ppa_hook_directpath_rx_restart_fn)(uint32_t, uint32_t) = NULL;
 **********************************************************************************************/   
 int32_t (*ppa_hook_directpath_ex_rx_restart_fn)(PPA_SUBIF *, uint32_t) = NULL;
 
-int32_t (*ppa_hook_directpath_recycle_skb_fn)(PPA_SUBIF*, PPA_BUF*, uint32_t) = NULL;
-PPA_BUF*  (*ppa_hook_directpath_alloc_skb_fn)(PPA_SUBIF*, int32_t, uint32_t) = NULL;
+int32_t (*ppa_hook_directpath_recycle_skb_fn)(PPA_SUBIF*, PPA_SKBUF*, uint32_t) = NULL;
+PPA_SKBUF*  (*ppa_hook_directpath_alloc_skb_fn)(PPA_SUBIF*, int32_t, uint32_t) = NULL;
 
 /********************************************************************************************** 
   * PPA Extra interface  hook function :ppa_hook_get_netif_for_ppa_ifid_fn
@@ -766,6 +772,19 @@ int32_t  (*ppa_hook_set_wan_seperate_flag_fn)( uint32_t flag) = NULL;
 uint32_t (*ppa_hook_get_wan_seperate_flag_fn)( uint32_t flag) = NULL;
 
 
+#if defined(CONFIG_L2NAT_MODULE) || defined(CONFIG_L2NAT)
+/**********************************************************************************************
+  * PPA interface hook function:ppa_check_if_netif_l2nat_fn
+  * It it used to check if network interface is an l2nat interface
+  * input parameter PPA_NETIF *: pointer to stack network interface structure
+  * input parameter char *: interface name
+  * input parameter uint32_t: for future purpose
+  * return: 1: if network interafce is an l2nat interface
+  *            0: otherwise
+**********************************************************************************************/
+int32_t (*ppa_check_if_netif_l2nat_fn)( PPA_NETIF *, char *, uint32_t ) = NULL;
+#endif
+
 #if PPA_DP_DBG_PARAM_ENABLE
 /*Below varabiles are used for debugging only: force PPE driver to use kernel's boot parameter:
    if ppa_drv_datapath_dbg_param_enable is enabled, then PPE driver will take parameter from kernel's boot paramter whether
@@ -849,6 +868,7 @@ EXPORT_SYMBOL(ppa_hook_exit_fn);
 EXPORT_SYMBOL(ppa_hook_enable_fn);
 EXPORT_SYMBOL(ppa_hook_get_status_fn);
 EXPORT_SYMBOL(ppa_hook_session_add_fn);
+EXPORT_SYMBOL(ppa_hook_get_ct_stats_fn);
 EXPORT_SYMBOL(ppa_hook_session_bradd_fn);
 EXPORT_SYMBOL(ppa_hook_session_del_fn);
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
@@ -954,4 +974,7 @@ EXPORT_SYMBOL(ppa_hook_get_wan_seperate_flag_fn);
 EXPORT_SYMBOL(ppa_hook_set_sw_fastpath_enable_fn);
 EXPORT_SYMBOL(ppa_hook_get_sw_fastpath_status_fn);
 EXPORT_SYMBOL(ppa_hook_sw_fastpath_send_fn);
+#endif
+#if defined(CONFIG_L2NAT_MODULE) || defined(CONFIG_L2NAT)
+EXPORT_SYMBOL(ppa_check_if_netif_l2nat_fn);
 #endif

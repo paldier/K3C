@@ -90,6 +90,14 @@
 extern ppa_tunnel_entry*        g_tunnel_table[MAX_TUNNEL_ENTRIES];
 #include <crypto/ltq_ipsec_ins.h>
 #endif
+#include <linux/dma-mapping.h>
+#include <lantiq_dmax.h>
+#include <net/drv_tmu_ll.h>
+#include <linux/skbuff.h>
+#include <linux/if_ether.h>
+#include <linux/klogging.h>
+
+
 #define FIRMWARE   "mpe_fw_be.img" //Firmware Name
 #define FIRMWARE_REQUEST 1
 
@@ -223,16 +231,21 @@ int32_t mpe_hal_del_wan_mc_entry(PPE_MC_INFO *mc);
 int32_t mpe_hal_add_ipsec_tunl_entry(PPE_ROUTING_INFO *route);
 int32_t mpe_hal_del_ipsec_tunl_entry(PPE_ROUTING_INFO *route);
 
-int32_t mpe_hal_dump_ipsec_tunnel_info(int32_t tun_id);
+int32_t mpe_hal_dump_ipsec_tunnel_info(uint32_t tun_id);
 int32_t mpe_hal_alloc_cdr_rdr(void);
 int32_t mpe_hal_free_cdr_rdr(void);
 
 int32_t mpe_hal_get_ipsec_tunnel_mib(IPSEC_TUNNEL_MIB_INFO *route);
+int32_t mpe_hal_clear_ipsec_tunnel_mib(int32_t tunnel_id);
 #endif
 
 int32_t mpe_hal_test_and_clear_hit_stat(PPE_ROUTING_INFO *route);
 int32_t mpe_hal_get_session_acc_bytes(PPE_ROUTING_INFO *route);
 
+#if defined(CONFIG_ACCL_11AC_CS2)                               
+static int32_t dl_setup_dma_chan(u32 desc_len, u32 dma_ch);
+void dl_pmac_egcfg(u32 pid, u32 dma_chan);
+#endif
 static int32_t mpe_hal_deregister_caps(void);
 /*================================================================================================ */
 
@@ -658,7 +671,7 @@ uint32_t mpe_hal_find_free_index(void *pCmpTbl,uint32_t type)
         struct fw_compare_hash_auto_ipv4 *pV4;
         struct fw_compare_hash_auto_ipv6 *pV6;
         if(type == 0){
-		while(count < g_GenConf->fw_sess_tbl_num[0])
+		while(count < (g_GenConf->fw_sess_tbl_num[0]-1))
         	{
                 	pV4  = (struct fw_compare_hash_auto_ipv4 *)(pCmpTbl + (count * sizeof(struct fw_compare_hash_auto_ipv4))); 
                 	if(pV4->valid == 0) {
@@ -691,24 +704,47 @@ static inline void dump_pkt(u32 len, char *pData){
         printk("\n");
 }
 
+int32_t  get_all_entry_of_same_hash(struct fw_compare_hash_auto_ipv4  *pIp4CmpTbl,struct fw_compare_hash_auto_ipv4  *start_ptr)
+{
+	uint32_t count=0;
+	uint32_t temp =0;
+	temp= start_ptr->first_ptr;
+	//temp=(pIp4CmpTbl + temp)->first_ptr;
+	printk("after entring in to get_all_entry_of_same_hash-->hash index to first pointer temp=[%d],temp-->next[%d]\n",temp, (pIp4CmpTbl + temp)->nxt_ptr);
+	while((pIp4CmpTbl + temp)->valid){
 
+		printk("print------>temp->first_ptr=[%d]\n",(pIp4CmpTbl + temp)->first_ptr);
+		printk("print------>temp->nextpoiunter=[%d]\n",(pIp4CmpTbl + temp)->nxt_ptr);
+		printk("count[%d]",count);
+		temp=(pIp4CmpTbl + temp)->nxt_ptr;
+		count++;
+		if( count == (MAX_SEARCH_ITRN-1) ) {
+		printk("ERROR--->Maximum count is reached Count=[%d]",count);
+                printk("starting hash index is [%d] and temp->first_ptr=[%d]and temp->nextpointer=[%d]\n ",start_ptr,(pIp4CmpTbl + temp)->first_ptr,(pIp4CmpTbl + temp)->nxt_ptr, count);
+		return MAX_ENTRY_ERROR;
+        	}
+	}
+	return 0;
+}
 
 uint32_t mpe_hal_add_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, struct ipv4_hash_auto_key *p_key, uint32_t sess_action)
 {
 	uint32_t free_index=0;
 	uint32_t count=0;
-	uint32_t current_index;
+	uint32_t current_index = 0;
+	uint32_t last_index = 0;
 	uint32_t hash_index =0;
-	uint32_t tmp;
-	struct fw_compare_hash_auto_ipv4  *temp_ptr;
+	uint32_t tmp =0;
+	struct fw_compare_hash_auto_ipv4  *hash_index_ptr=NULL;
+	struct fw_compare_hash_auto_ipv4  *temp_ptr=NULL;
 
-//	dump_pkt(sizeof(struct ipv4_hash_auto_key), (char *)p_key);
+	//	dump_pkt(sizeof(struct ipv4_hash_auto_key), (char *)p_key);
 	hash_index = mpe_cal_hash(p_key, NULL, 0); 
 	//hash_index = mpe_hal_calculate_hash((void *)p_key, 0);
-//	printk("\n CRC Calculation %x\n",hash_index);
+	//	printk("\n CRC Calculation %x\n",hash_index);
 	hash_index &= (g_GenConf->fw_sess_tbl_num[0] - 1);
-//	printk("\n<%s> Hash Index %d\n",__FUNCTION__,hash_index);
-	
+	//	printk("\n<%s> Hash Index %d\n",__FUNCTION__,hash_index);
+
 #if 0
 	int32_t i=0;
 	for(i = 0; i < g_GenConf->fw_sess_tbl_num[0]; i++ ) {
@@ -721,7 +757,7 @@ uint32_t mpe_hal_add_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 	}
 
 #endif
-	
+
 	if(pIp4CmpTbl == NULL){
 		printk("No IPV4 Compare Table is allocated\n");
 		return PPA_FAILURE;
@@ -731,36 +767,48 @@ uint32_t mpe_hal_add_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 		return PPA_FAILURE;
 	}
 
-        tmp  = ((pIp4CmpTbl + (hash_index))->first_ptr);
-	while(tmp != (pIp4CmpTbl + tmp)->nxt_ptr)
-        {
-                tmp=(pIp4CmpTbl + tmp)->nxt_ptr;
-                count++;
-        }
-//	printk("<%s>Iteration count : %d\n",__FUNCTION__,count);
-	if( count > MAX_SEARCH_ITRN ) {
-                printk("\nNumber of entries for hash=%X is %d \n", hash_index, count);
-                return PPA_FAILURE;
-        }
 
-	current_index = ((pIp4CmpTbl + hash_index)->first_ptr);
-//	printk("current index %d\n",current_index);
+	hash_index_ptr = (pIp4CmpTbl + hash_index);
+	//tmp  = ((pIp4CmpTbl + (hash_index))->first_ptr);
+	tmp  = hash_index_ptr->first_ptr;
+	last_index = tmp;
+	//printk("tmp index---> %d\n",tmp);
+	while(tmp != (pIp4CmpTbl + tmp)->nxt_ptr)
+	{
+		last_index = tmp;
+
+		//if(((pIp4CmpTbl + tmp)->nxt_ptr) != g_GenConf->fw_sess_tbl_num[0] -1)
+		tmp=(pIp4CmpTbl + tmp)->nxt_ptr;
+		count++;
+		//printk("<%s>Iteration count : %d\n",__FUNCTION__,count);
+	}
+	//printk("tmp index %d last index %d\n",tmp,last_index);
+	//	printk("<%s>Iteration count : %d\n",__FUNCTION__,count);
+	if( count > (MAX_SEARCH_ITRN-1) ) {
+		printk("\nNumber of entries for hash=%X[%d] is %d \n", hash_index, hash_index, count);
+		return PPA_FAILURE;
+	}
+
+	//current_index = ((pIp4CmpTbl + hash_index)->first_ptr);
+	current_index = (hash_index_ptr->first_ptr);
+	//printk("current index %d\n",current_index);
 	if( current_index == g_GenConf->fw_sess_tbl_num[0] -1 )  //not valid first_ptr. it means there is no session yet in this hash_index
 	{
-		temp_ptr= pIp4CmpTbl + hash_index;
+		//temp_ptr= pIp4CmpTbl + hash_index;
+		temp_ptr = hash_index_ptr;
 		if(temp_ptr->valid) {
 			if((free_index = mpe_hal_find_free_index(pIp4CmpTbl,0)) == MPE_HAL_NO_FREE_ENTRY){
-				printk("\n No Free Entry\n");
+				//printk("\n No Free Entry for no session yet in this hash index !!!!!! \n");
 				return PPA_FAILURE;
 			}
 			else {
 			}
 
-//				printk("\n free_index[%d]\n",free_index);
+			//printk("\n free_index[%d]\n",free_index);
 		}
 		else {
 			free_index = hash_index;
-//			printk("\n Index is not a valid entry ---> free_index=hash_index[%d]\n",free_index);
+			//printk("\n Index is not a valid entry ---> free_index=hash_index[%d]\n",free_index);
 		}
 	}
 	else /*some session already exists in hash_index*/
@@ -768,21 +816,46 @@ uint32_t mpe_hal_add_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 		temp_ptr = (pIp4CmpTbl + current_index);
 		if(temp_ptr->valid) {
 			if((free_index = mpe_hal_find_free_index(pIp4CmpTbl,0)) == MPE_HAL_NO_FREE_ENTRY){
-				printk(" No Free Entry\n");
+				//printk(" No Free Entry for session already exist in hash index \n");
 				return PPA_FAILURE;
 			}
 			else {
 			}
-	//			printk("\n free_index[%d]\n",free_index);
+			//printk("\n free_index[%d] for hash[%d]\n",free_index,hash_index);
 		}
 		else
 			free_index = current_index;
 	}
+#if 0
+	if(hash_index == g_GenConf->fw_sess_tbl_num[0] -1) {
+		printk("\nFor HASH Index--->hash_index=[%d] and free_index= [%d]!!and hash_index_ptr=[%x] and hash index ptr-->firstpointer[%d]\n",hash_index,free_index,hash_index_ptr,current_index);
+		//get_all_entry_of_same_hash(pIp4CmpTbl,hash_index_ptr);
+		//return PPA_FAILURE;
+	}
+#endif
+	if( count == (MAX_SEARCH_ITRN-1) ) {
+		printk("\nEntriy Index for hash=%d =  [%d] for count is %d \n", hash_index, free_index, count);
+	} 
 	temp_ptr= pIp4CmpTbl + free_index;
-	temp_ptr->nxt_ptr = (pIp4CmpTbl + hash_index)->first_ptr;
-	(pIp4CmpTbl + hash_index)->first_ptr = free_index;
-	if(temp_ptr->nxt_ptr == g_GenConf->fw_sess_tbl_num[0] -1 )
-		temp_ptr->nxt_ptr = free_index;
+	if(count >0) {
+		if(((pIp4CmpTbl + last_index)->nxt_ptr) == g_GenConf->fw_sess_tbl_num[0] -1)
+			(pIp4CmpTbl + last_index)->nxt_ptr = free_index;
+	}
+	//temp_ptr->nxt_ptr = hash_index_ptr->first_ptr;
+	if(hash_index_ptr->first_ptr == g_GenConf->fw_sess_tbl_num[0] -1 )
+		hash_index_ptr->first_ptr = free_index;
+	else 
+	{
+		if(hash_index_ptr == temp_ptr)
+		{
+			hash_index_ptr->nxt_ptr = current_index;
+			hash_index_ptr->first_ptr = free_index;
+			(pIp4CmpTbl + last_index)->nxt_ptr = g_GenConf->fw_sess_tbl_num[0] -1;
+		}
+	}
+
+	//if(temp_ptr->nxt_ptr == g_GenConf->fw_sess_tbl_num[0] -1 )
+	//	temp_ptr->nxt_ptr = free_index;
 
 	temp_ptr->valid        = 1;
 	temp_ptr->key.srcip     = p_key->srcip;
@@ -791,27 +864,29 @@ uint32_t mpe_hal_add_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 	temp_ptr->key.dstport   = p_key->dstport;
 	temp_ptr->key.extn      = p_key->extn;
 	temp_ptr->act           = sess_action;
-//	printk("Action Pointer: %x \n",temp_ptr->act);
-//	printk("<%s> returning Free Index: %d \n",__FUNCTION__,free_index);
+	//	printk("Action Pointer: %x \n",temp_ptr->act);
+	//	printk("<%s> returning Free Index: %d \n",__FUNCTION__,free_index);
 
 #if 0
 	int32_t i=0;
 	for(i = 0; i < g_GenConf->fw_sess_tbl_num[0]; i++ ) {
-		printk("Next Entry %d address 0x%x\n",i, (uint32_t)(pIp4CmpTbl + i ));
-		printk("Valid: %d\n",(pIp4CmpTbl + (i ))->valid);
-		printk("Next Pointer: %d\n",(pIp4CmpTbl + (i ))->nxt_ptr);
-		printk("First Pointer: %d\n",(pIp4CmpTbl + (i ))->first_ptr);
-		printk("Action Pointer: %x\n",(pIp4CmpTbl + (i ))->act);
+		if((pIp4CmpTbl + (i ))->valid) {
+			printk("Next Entry %d address 0x%x\n",i, (uint32_t)(pIp4CmpTbl + i ));
+			printk("Valid: %d\n",(pIp4CmpTbl + (i ))->valid);
+			printk("Next Pointer: %d\n",(pIp4CmpTbl + (i ))->nxt_ptr);
+			printk("First Pointer: %d\n",(pIp4CmpTbl + (i ))->first_ptr);
+			printk("Action Pointer: %x\n",(pIp4CmpTbl + (i ))->act);
 
-		printk("SrcIp: %s\n",inet_ntoa((pIp4CmpTbl + (i ))->key.srcip));
-		printk("DstIp: %s\n",inet_ntoa((pIp4CmpTbl + (i ))->key.dstip));
-		printk("SrcPort: %d\n",(pIp4CmpTbl + (i ))->key.srcport);
-		printk("DstPort: %d\n",(pIp4CmpTbl + (i ))->key.dstport);
-		printk("====================\n");
+			printk("SrcIp: %s\n",inet_ntoa((pIp4CmpTbl + (i ))->key.srcip));
+			printk("DstIp: %s\n",inet_ntoa((pIp4CmpTbl + (i ))->key.dstip));
+			printk("SrcPort: %d\n",(pIp4CmpTbl + (i ))->key.srcport);
+			printk("DstPort: %d\n",(pIp4CmpTbl + (i ))->key.dstport);
+			printk("====================\n");
+		}
 	}
 
 #endif
-	
+
 	/* Set the MIB and Hit counter for this session index */
 	((struct session_action *)(temp_ptr->act))->sess_mib_ix_en = 1;
 	((struct session_action *)(temp_ptr->act))->sess_mib_hit_en = 1;
@@ -820,14 +895,17 @@ uint32_t mpe_hal_add_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 	return free_index;
 }
 
+
 uint32_t mpe_hal_add_session_ipv6(struct fw_compare_hash_auto_ipv6 *pIp6CmpTbl, struct ipv6_hash_auto_key *p_key, uint32_t sess_action)
 {
 	uint32_t free_index=0;
 	uint32_t count=0;
-	uint32_t current_index;
-	uint32_t hash_index;
-	uint32_t tmp;
-	struct fw_compare_hash_auto_ipv6  *temp_ptr;
+	uint32_t current_index=0;
+	uint32_t last_index=0;
+	uint32_t hash_index=0;
+	uint32_t tmp=0;
+	struct fw_compare_hash_auto_ipv6  *hash_index_ptr=NULL;
+	struct fw_compare_hash_auto_ipv6  *temp_ptr=NULL;
 
 	//dump_pkt(sizeof(struct ipv6_hash_auto_key), (char *)p_key);
 	hash_index = mpe_cal_hash( NULL, p_key, 0); 
@@ -856,10 +934,13 @@ uint32_t mpe_hal_add_session_ipv6(struct fw_compare_hash_auto_ipv6 *pIp6CmpTbl, 
 		//printk("No Session Action Pointer\n");
 		return PPA_FAILURE;
 	}
-
-	tmp  = (pIp6CmpTbl + hash_index)->first_ptr;
+	hash_index_ptr = (pIp6CmpTbl + hash_index);
+	tmp = (hash_index_ptr->first_ptr);
+	last_index = tmp;
+	//tmp  = (pIp6CmpTbl + hash_index)->first_ptr;
 	while(tmp != (pIp6CmpTbl + tmp)->nxt_ptr)
         {
+		last_index=tmp;
                 tmp=(pIp6CmpTbl + tmp)->nxt_ptr;
                 count++;
         }
@@ -868,10 +949,12 @@ uint32_t mpe_hal_add_session_ipv6(struct fw_compare_hash_auto_ipv6 *pIp6CmpTbl, 
                 return PPA_FAILURE;
         }
 
-	current_index = (pIp6CmpTbl + hash_index)->first_ptr;
+	//current_index = (pIp6CmpTbl + hash_index)->first_ptr;
+	current_index=(hash_index_ptr->first_ptr);
 	if( current_index == g_GenConf->fw_sess_tbl_num[1] - 1 )  //not valid first_ptr. it means there is no session yet in this hash_index
 	{
-		temp_ptr= (pIp6CmpTbl + hash_index);
+		//temp_ptr= (pIp6CmpTbl + hash_index);
+		temp_ptr = hash_index_ptr;
 		if(temp_ptr->valid) {
 			if((free_index = mpe_hal_find_free_index(pIp6CmpTbl,1)) == MPE_HAL_NO_FREE_ENTRY){
 				printk("\n No Free Entry !!!\n");
@@ -897,11 +980,33 @@ uint32_t mpe_hal_add_session_ipv6(struct fw_compare_hash_auto_ipv6 *pIp6CmpTbl, 
 		else
 			free_index = current_index;
 	}
+#if 0
 	temp_ptr= pIp6CmpTbl + free_index;
 	temp_ptr->nxt_ptr = (pIp6CmpTbl + hash_index)->first_ptr;
 	(pIp6CmpTbl + hash_index)->first_ptr = free_index;
 	if(temp_ptr->nxt_ptr == g_GenConf->fw_sess_tbl_num[1] -1 )
 		temp_ptr->nxt_ptr = free_index;
+#endif
+
+	temp_ptr= pIp6CmpTbl + free_index;
+        if(count >0) {
+        if(((pIp6CmpTbl + last_index)->nxt_ptr) == g_GenConf->fw_sess_tbl_num[1] -1)
+                (pIp6CmpTbl + last_index)->nxt_ptr = free_index;
+        }
+
+	if(hash_index_ptr->first_ptr == g_GenConf->fw_sess_tbl_num[1] -1 )
+                hash_index_ptr->first_ptr = free_index;
+        else
+        {
+                if(hash_index_ptr == temp_ptr)
+                {
+                        hash_index_ptr->nxt_ptr = current_index;
+                        hash_index_ptr->first_ptr = free_index;
+                        (pIp6CmpTbl + last_index)->nxt_ptr = g_GenConf->fw_sess_tbl_num[1] -1;
+                }
+        }
+
+	
 
 	temp_ptr->valid        = 1;
 #if 1 //khalil
@@ -940,7 +1045,7 @@ uint32_t mpe_hal_add_session_ipv6(struct fw_compare_hash_auto_ipv6 *pIp6CmpTbl, 
 
 
 
-uint32_t mpe_hal_del_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, struct ipv4_hash_auto_key *p_key, uint32_t hash_index)
+uint32_t mpe_hal_del_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, struct ipv4_hash_auto_key *p_key, uint32_t entry_index)
 {
 	uint32_t index=0;
 	uint32_t counter = 0;
@@ -948,7 +1053,7 @@ uint32_t mpe_hal_del_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 	uint32_t hash_start=0;
 	uint32_t start, next;
 
-//	printk("<%s> Delete Index: %d\n",__FUNCTION__,hash_index);
+//	printk("<%s> Delete Index: %d\n",__FUNCTION__,entry_index);
 	//hash_start = mpe_hal_calculate_hash((void *)p_key, 0);
 	hash_start = mpe_cal_hash(p_key, NULL, 0); 
 //	printk("\n CRC %x\n",hash_start);
@@ -956,19 +1061,27 @@ uint32_t mpe_hal_del_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 	hash_start &= ((g_GenConf->fw_sess_tbl_num[0]) - 1);
 //	printk("\n<%s> Hash Index %x\n",__FUNCTION__,hash_start);
 
-        if(hash_index >= g_GenConf->fw_sess_tbl_num[0])
+        if(entry_index > (g_GenConf->fw_sess_tbl_num[0]-1))
         {
+		printk("Error --> Entry index is wrong for hash[%d] !!!!\n",hash_start);
                 return MAX_ENTRY_ERROR;
         }
-
-        if((pIp4CmpTbl + hash_index)->valid)
+#if 0	
+	if(hash_start == g_GenConf->fw_sess_tbl_num[0] -1) {
+		printk("Wrong HASH Index for entry index [%d] !!!\n",entry_index);
+		return PPA_FAILURE;
+	}
+#endif
+        if((pIp4CmpTbl + entry_index)->valid)
         {
 		previous=hash_start;
                 index=((pIp4CmpTbl + previous)->first_ptr);
-                while(hash_index!= index)
+                while(entry_index!= index)
                 {
-                        if(counter > MAX_SEARCH_ITRN)
+                        if(counter > (MAX_SEARCH_ITRN-1)){
+				printk("Error --> Counter exceeds the MAX iteration for hash[%d] Entry index[%d] !!!!and the index is [%d]\n",hash_start, entry_index,index);
                                 return MAX_ENTRY_ERROR;
+			}
                         previous=index;
                         index=(pIp4CmpTbl + index)->nxt_ptr;
                         counter++;
@@ -976,15 +1089,15 @@ uint32_t mpe_hal_del_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
 		start = (pIp4CmpTbl + previous)->first_ptr;
                 next = (pIp4CmpTbl + index)->nxt_ptr;
 
-                if(hash_index == start) /* delete first entry */
+                if(entry_index == start) /* delete first entry */
                 {
-                         if(hash_index==hash_start && next==hash_start )
+                         if(entry_index==hash_start && next==hash_start )
                                 (pIp4CmpTbl + hash_start)->first_ptr= g_GenConf->fw_sess_tbl_num[0]-1;
                          else
                                 (pIp4CmpTbl + previous)->first_ptr=(pIp4CmpTbl + index)->nxt_ptr;
 
                 }
-		else if(hash_index == next) /* delete last entry */
+		else if(entry_index == next) /* delete last entry */
                 {
                          (pIp4CmpTbl + previous)->nxt_ptr=previous;
                 }
@@ -992,6 +1105,7 @@ uint32_t mpe_hal_del_session_ipv4(struct fw_compare_hash_auto_ipv4 *pIp4CmpTbl, 
                 {
                         (pIp4CmpTbl + previous)->nxt_ptr= (pIp4CmpTbl + index)->nxt_ptr;
                 }
+
                 (pIp4CmpTbl + index)->nxt_ptr = g_GenConf->fw_sess_tbl_num[0]-1;
                 (pIp4CmpTbl + index)->valid=0;
 
@@ -1071,15 +1185,14 @@ uint32_t mpe_hal_del_session_ipv6(struct fw_compare_hash_auto_ipv6 *pIp6CmpTbl, 
 
 
 
-#if 1
+#ifdef HW_SESS_TEST
 
 uint8_t src_mac_ipv4[6] = {0x00, 0x10, 0x20, 0x30, 0x40, 0x50};
 uint8_t dst_mac_ipv4[6] = {0x00, 0x10, 0x20, 0x30, 0x40, 0x50};
 
 struct session_action paction = {0};
 
-#if 1
-void create_action()
+void create_action(void)
 {
 	paction.entry_vld = 1;
 	paction.pkt_len_delta = 4;
@@ -1094,7 +1207,6 @@ void create_action()
 	paction.protocol = 1;
 	paction.new_dst_port = 0x5000;
 }
-#endif
 int32_t create_hw_action(struct session_action *paction)
 {
 	paction->entry_vld = 1;
@@ -1259,13 +1371,19 @@ uint32_t mpe_hal_add_hw_session(PPE_ROUTING_INFO *route)
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
 	if(route->tnnl_info.tunnel_type == TUNNEL_TYPE_IPSEC)
 	{
-		printk("<%s>%d\n",__FUNCTION__,__LINE__);
-		if(
+		/*if(
 			((route->entry == 0) && (route->f_is_lan)) //outbound
 				|| 
 			(!route->f_is_lan) //inbound 
 		  )
+		{*/
+		if((((route->flags & SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA) == SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA) && (route->f_is_lan)) 
+				|| 
+			(!route->f_is_lan) ) //inbound
+		{
+			//printk("<%s> Add SA \n",__FUNCTION__);
 			return mpe_hal_add_ipsec_tunl_entry(route);
+		}
 
 	}
 #endif
@@ -1298,6 +1416,7 @@ uint32_t mpe_hal_add_hw_session(PPE_ROUTING_INFO *route)
 	return PPA_SUCCESS;
 }
 
+#ifdef HW_SESS_TEST
 uint32_t mpe_hal_add_hw_session_test(void)
 {
 
@@ -1321,7 +1440,7 @@ uint32_t mpe_hal_add_hw_session_test(void)
 	//ppa_free(&sess_action.templ_buf);
 	return PPA_SUCCESS;
 }
-
+#endif
 
 uint32_t mpe_hal_del_hw_session(PPE_ROUTING_INFO *route)
 {
@@ -1330,11 +1449,11 @@ uint32_t mpe_hal_del_hw_session(PPE_ROUTING_INFO *route)
 	if(route->entry > g_GenConf->hw_act_num )
 		return PPA_FAILURE;
 
-	printk("<%s>Routing session index is : %d\n",__FUNCTION__,route->entry);
+	//printk("<%s>Routing session index is : %d\n",__FUNCTION__,route->entry);
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
 	if(route->tnnl_info.tunnel_type == TUNNEL_TYPE_IPSEC) //outbound
 	{
-		if(((route->entry == 0) && (route->f_is_lan)) 
+		if((((route->flags & SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA) == SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA) && (route->f_is_lan)) 
 				|| 
 			(!route->f_is_lan) ) //inbound
 			return mpe_hal_del_ipsec_tunl_entry(route);
@@ -1385,7 +1504,7 @@ int32_t mpe_hal_add_wan_mc_entry(PPE_MC_INFO *mc)
 				if(vap) {
 					vap =k;
 					ve->vap_list[ve->num] = mc->group_id;
-					ve->vap_list[ve->num] |= 1 << 7; // group_flag
+					//This is one final multicast replication point. Group flag should not be set.
 					ve->vap_list[ve->num] |= (vap & 0xF) << 8 ;// VAP[8:11]
 					ve->vap_list[ve->num] |= 1 << 14 ;// MC bit set for multicast
 					ve->num++;
@@ -1539,7 +1658,7 @@ int32_t mpe_hal_free_cdr_rdr(void)
 }
 int32_t mpe_hal_construct_cdr_rdr(struct ltq_crypto_ipsec_params *eip97_params, struct ipsec_info *ipsec_info)
 {
-	printk("<%s> Entry \n",__FUNCTION__);
+	//printk("<%s> Entry \n",__FUNCTION__);
 
 	ipsec_info->cd_info.dw0.acd_size = eip97_params->tokenwords;
 	ipsec_info->cd_info.dw0.first_seg = 1;
@@ -1556,24 +1675,28 @@ int32_t mpe_hal_construct_cdr_rdr(struct ltq_crypto_ipsec_params *eip97_params, 
 
 	ipsec_info->cd_info.dw5.ctx_ptr = (uint32_t)eip97_params->SA_buffer;
 
-	ipsec_info->pad_instr_offset = (eip97_params->pad_offs[0] * 4);
+	ipsec_info->pad_instr_offset = (eip97_params->total_pad_offs * 4);
 	ipsec_info->pad_en = 1;
 	ipsec_info->crypto_instr_offset = (eip97_params->crypto_offs * 4);
 
+	ipsec_info->hash_pad_instr_offset = eip97_params->hash_pad_offs ;
+	ipsec_info->msg_len_instr_offset = eip97_params->msg_len_offs;
+
 	ipsec_info->cd_size = EIP97_CD_SIZE;
-	ipsec_info->iv_len = 16;
-	ipsec_info->icv_len = 12;
-	ipsec_info->blk_size = 16;
+
+	ipsec_info->iv_len = eip97_params->ivsize; //16;
+	ipsec_info->icv_len = eip97_params->ICV_length; //12;
+	ipsec_info->blk_size = eip97_params->pad_blksize;
 	return PPA_SUCCESS;
 }
 
 int32_t mpe_hal_construct_ipsec_buffer(int32_t dir, int32_t tunlId, struct ltq_crypto_ipsec_params *eip97_params)
 {
 
-	printk("<%s> Entry \n",__FUNCTION__);
+	//printk("<%s> Entry \n",__FUNCTION__);
 	if(dir == LTQ_SAB_DIRECTION_INBOUND ){
 		if(g_GenConf->ipsec_input_flag[tunlId] != 1){
-			printk("<%s> ipsec Buffer for inbound tunnel %d\n",__FUNCTION__, tunlId);
+			//printk("<%s> ipsec Buffer for inbound tunnel %d\n",__FUNCTION__, tunlId);
 			memset(&g_GenConf->ipsec_input[tunlId], 0, sizeof(struct ipsec_info));
 			mpe_hal_construct_cdr_rdr(eip97_params, &g_GenConf->ipsec_input[tunlId]);
 			g_GenConf->ipsec_input_flag[tunlId] = 1;	
@@ -1581,7 +1704,7 @@ int32_t mpe_hal_construct_ipsec_buffer(int32_t dir, int32_t tunlId, struct ltq_c
 
 	} else if(dir == LTQ_SAB_DIRECTION_OUTBOUND) {
 		if(g_GenConf->ipsec_output_flag[tunlId] != 1) {
-			printk("<%s> ipsec Buffer for outbound tunnel %d\n",__FUNCTION__, tunlId);
+			//printk("<%s> ipsec Buffer for outbound tunnel %d\n",__FUNCTION__, tunlId);
 			memset(&g_GenConf->ipsec_output[tunlId], 0, sizeof(struct ipsec_info));
 			mpe_hal_construct_cdr_rdr(eip97_params, &g_GenConf->ipsec_output[tunlId]);
 			g_GenConf->ipsec_output_flag[tunlId] = 1;	
@@ -1629,6 +1752,12 @@ int32_t mpe_hal_get_auth_algo(char *algo)
 		return LTQ_SAB_AUTH_HMAC_SHA2_384;
 	if(!strcmp(algo, "hmac(sha512)"))
 		return LTQ_SAB_AUTH_HMAC_SHA2_512;
+	if(!strcmp(algo, "xcbc(aes)"))
+		return LTQ_SAB_AUTH_AES_XCBC_MAC;
+	if(!strcmp(algo, "gcm"))
+		return LTQ_SAB_AUTH_AES_GCM;
+	if(!strcmp(algo, "gmac"))
+		return LTQ_SAB_AUTH_AES_GMAC;
 
 	return PPA_FAILURE;
 }
@@ -1681,10 +1810,24 @@ int32_t mpe_hal_get_crypto_mode_algo(char *alg, char *mode, char *algo )
 {
         int32_t i=0;
         uint8_t alg1[64] = "";
+	char tmp[10];
+        int slen=0;
+
         uint8_t *dash = strchr(alg, '(');
 	
 	if(dash == NULL)
 		return PPA_FAILURE;
+
+        strncpy(tmp, alg, 3 );
+        tmp[3] = '\0';
+        //printk("tmp:%s\n",&tmp[0]);
+        slen = strlen(dash +1 ) -1;
+        if(!strcmp(tmp, "rfc")) {
+                //printk("Matched\n");
+                alg = dash+1;
+                dash = strchr(alg, '(');
+                slen = strlen(dash+1) -2;
+        }
 
         for(i=0; *(alg+i) != '('; i++)
         {
@@ -1694,9 +1837,10 @@ int32_t mpe_hal_get_crypto_mode_algo(char *alg, char *mode, char *algo )
 
         alg1[i] = '\0';
 	strcpy(mode, alg1);
-	printk("len1:%d len2:%d\n",(strlen(dash+1)), strlen(alg));
-        strncpy(algo, dash+1, (strlen(dash+1)-1));
-        printk("<%s> mode %s algo %s\n",__FUNCTION__, mode, algo);
+	//printk("len1:%d len2:%d\n",(strlen(dash+1)), strlen(alg));
+        //strncpy(algo, dash+1, (strlen(dash+1)-1));
+        strncpy(algo, dash+1, slen);
+        //printk("<%s> mode %s algo %s\n",__FUNCTION__, mode, algo);
 
         return PPA_SUCCESS;
 }
@@ -1705,12 +1849,12 @@ int32_t mpe_hal_get_ipsec_spi(uint32_t tunnel_index, uint32_t dir, uint32_t *spi
 	ppa_tunnel_entry *t_entry = NULL;
 	PPA_XFRM_STATE *xfrm_sa = NULL;
 
+	if(tunnel_index > (IPSEC_TUN_MAX-1))
+		return PPA_FAILURE;
 	t_entry = g_tunnel_table[tunnel_index];
 	if ( t_entry == NULL ) 
 		return PPA_FAILURE;
 
-	if ((tunnel_index < 0) || (tunnel_index > IPSEC_TUN_MAX))
-		return PPA_FAILURE;
 
 	if (dir == LTQ_SAB_DIRECTION_INBOUND ) {
 		xfrm_sa = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr.inbound;
@@ -1733,12 +1877,13 @@ int32_t mpe_hal_dump_ipsec_xfrm_sa(uint32_t tunnel_index)
 	PPA_XFRM_STATE *xfrm_sa_out;
 	uint32_t key_len, i;
 
+	if(tunnel_index > (IPSEC_TUN_MAX-1))
+		return PPA_FAILURE;
+
 	t_entry = g_tunnel_table[tunnel_index];
 	if ( t_entry == NULL ) 
 		return PPA_FAILURE;
 
-	if ((tunnel_index < 0) || (tunnel_index > IPSEC_TUN_MAX))
-		return PPA_FAILURE;
 
 	xfrm_sa_in = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr.inbound;
 	xfrm_sa_out = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr.outbound;
@@ -1881,20 +2026,22 @@ int32_t mpe_hal_add_ipsec_tunl_entry(PPE_ROUTING_INFO *route)
 
 	tunnel_index = route->tnnl_info.tunnel_idx;
 
-	if ((tunnel_index < 0) || (tunnel_index > IPSEC_TUN_MAX))
+	if ((tunnel_index < 0) || (tunnel_index > (IPSEC_TUN_MAX-1)))
 		return PPA_FAILURE;
 	
-	printk("<%s> Tunnel Index: %d\n",__FUNCTION__,tunnel_index);
+	//printk("<%s> Tunnel Index: %d\n",__FUNCTION__,tunnel_index);
 	memset(&ipsec_eip97_params, 0, sizeof(struct ltq_crypto_ipsec_params));
 
 	dir = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr.dir;
-	printk("<%s> Direction: %d\n",__FUNCTION__, dir);
+	//printk("<%s> Direction: %d\n",__FUNCTION__, dir);
 
 	if(dir == LTQ_SAB_DIRECTION_INBOUND ) {
 		xfrm_sa = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr.inbound;
 	} else if(dir == LTQ_SAB_DIRECTION_OUTBOUND) {
 		xfrm_sa = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr.outbound;
-	}
+	} else
+		return PPA_FAILURE;
+		
 	
 	ipsec_eip97_params.ipsec_mode = LTQ_SAB_IPSEC_ESP; //xfrm_sa->id.proto;
 	ipsec_eip97_params.ipsec_tunnel = LTQ_SAB_IPSEC_TUNNEL;
@@ -1903,20 +2050,46 @@ int32_t mpe_hal_add_ipsec_tunl_entry(PPE_ROUTING_INFO *route)
 	ipsec_eip97_params.ip_type = LTQ_SAB_IPSEC_IPV4;
 	ipsec_eip97_params.ring_no = 1;
 
-	mpe_hal_get_crypto_mode_algo(xfrm_sa->ealg->alg_name, emode, ealgo);
-	ipsec_eip97_params.crypto_mode = mpe_hal_get_crypto_mode(emode);
-	ipsec_eip97_params.crypto_algo = mpe_hal_get_crypto_algo(ealgo);
-	printk("Crypto -> Algo:%d Mode:%d\n",ipsec_eip97_params.crypto_algo, ipsec_eip97_params.crypto_mode);
-	ipsec_eip97_params.crypto_keysize = (xfrm_sa->ealg->alg_key_len + 7)/8;
-	ipsec_eip97_params.crypto_key = &xfrm_sa->ealg->alg_key[0];
+	if(xfrm_sa->aead->alg_name != NULL) {
+		printk("<%s> Aead Algo %s\n",__func__,xfrm_sa->aead->alg_name);
+		mpe_hal_get_crypto_mode_algo(xfrm_sa->aead->alg_name, emode, ealgo);
+		ipsec_eip97_params.crypto_mode = mpe_hal_get_crypto_mode(emode);
+		//ipsec_eip97_params.crypto_mode = LTQ_SAB_CRYPTO_MODE_GCM; //mpe_hal_get_crypto_mode(emode);
+		ipsec_eip97_params.crypto_algo = mpe_hal_get_crypto_algo(ealgo);
+		//ipsec_eip97_params.crypto_algo = LTQ_SAB_CRYPTO_AES; //mpe_hal_get_crypto_algo(ealgo);
+		//printk("Crypto -> Algo:%d Mode:%d\n",ipsec_eip97_params.crypto_algo, ipsec_eip97_params.crypto_mode);
+		ipsec_eip97_params.crypto_keysize = (xfrm_sa->aead->alg_key_len + 7)/8;
+		ipsec_eip97_params.crypto_key = &xfrm_sa->aead->alg_key[0];
+
+		ipsec_eip97_params.auth_algo = LTQ_SAB_AUTH_AES_GCM;
+		//printk("Auth Algo: %d\n",ipsec_eip97_params.auth_algo);
+		ipsec_eip97_params.authsize = (xfrm_sa->aead->alg_key_len + 7)/8; // mpe_hal_get_auth_size(xfrm_sa->aalg->alg_name);
+		ipsec_eip97_params.auth_keysize = (xfrm_sa->aead->alg_key_len + 7)/8;
+		ipsec_eip97_params.auth_key = &xfrm_sa->aead->alg_key[0];
 
 
-	ipsec_eip97_params.auth_algo = mpe_hal_get_auth_algo(xfrm_sa->aalg->alg_name);
-	printk("Auth Algo: %d\n",ipsec_eip97_params.auth_algo);
-	ipsec_eip97_params.authsize =(xfrm_sa->aalg->alg_key_len + 7)/8; // mpe_hal_get_auth_size(xfrm_sa->aalg->alg_name);
-	ipsec_eip97_params.auth_keysize = (xfrm_sa->aalg->alg_key_len + 7)/8;
-	ipsec_eip97_params.auth_key = &xfrm_sa->aalg->alg_key[0];
+	}
+	if(xfrm_sa->ealg->alg_name != NULL) {
+		//printk("<%s> Crypto Algo %s\n",__func__,xfrm_sa->ealg->alg_name);
+		mpe_hal_get_crypto_mode_algo(xfrm_sa->ealg->alg_name, emode, ealgo);
+		ipsec_eip97_params.crypto_mode = mpe_hal_get_crypto_mode(emode);
+		//ipsec_eip97_params.crypto_mode = LTQ_SAB_CRYPTO_MODE_GCM; //mpe_hal_get_crypto_mode(emode);
+		ipsec_eip97_params.crypto_algo = mpe_hal_get_crypto_algo(ealgo);
+		//ipsec_eip97_params.crypto_algo = LTQ_SAB_CRYPTO_AES; //mpe_hal_get_crypto_algo(ealgo);
+		//printk("Crypto -> Algo:%d Mode:%d\n",ipsec_eip97_params.crypto_algo, ipsec_eip97_params.crypto_mode);
+		ipsec_eip97_params.crypto_keysize = (xfrm_sa->ealg->alg_key_len + 7)/8;
+		ipsec_eip97_params.crypto_key = &xfrm_sa->ealg->alg_key[0];
+	}
 
+	if(xfrm_sa->aalg->alg_name != NULL){
+		//printk("<%s> Auth Algo %s\n",__func__,xfrm_sa->aalg->alg_name);
+		ipsec_eip97_params.auth_algo =mpe_hal_get_auth_algo(xfrm_sa->aalg->alg_name);
+		//ipsec_eip97_params.auth_algo = LTQ_SAB_AUTH_AES_GCM; //mpe_hal_get_auth_algo(xfrm_sa->aalg->alg_name);
+		//printk("Auth Algo: %d\n",ipsec_eip97_params.auth_algo);
+		ipsec_eip97_params.authsize =(xfrm_sa->aalg->alg_key_len + 7)/8; // mpe_hal_get_auth_size(xfrm_sa->aalg->alg_name);
+		ipsec_eip97_params.auth_keysize = (xfrm_sa->aalg->alg_key_len + 7)/8;
+		ipsec_eip97_params.auth_key = &xfrm_sa->aalg->alg_key[0];
+	}
 	if(dir == LTQ_SAB_DIRECTION_INBOUND ) {
 
 		ipsec_eip97_params.cryptosize = 80; //xfrm_sa->ealg->alg_key_len;
@@ -1927,38 +2100,47 @@ int32_t mpe_hal_add_ipsec_tunl_entry(PPE_ROUTING_INFO *route)
 		ipsec_eip97_params.data_len = 16; //xfrm_sa->ealg->alg_key_len;
 	}
 
-#if 1
-	printk("Crypto Key length: %d\n",ipsec_eip97_params.crypto_keysize );
-                        for (i=0; i< ipsec_eip97_params.crypto_keysize ; i++) {
-                                printk("%2x",(ipsec_eip97_params.crypto_key[i]) & 0xFF);
-                                if( i != 0 && i%8 == 0)
-                                        printk("  ");
-                        }
+#if 0
+	printk("<%s> Crypto Key length: %d\n",__func__,ipsec_eip97_params.crypto_keysize );
+	for (i=0; i< ipsec_eip97_params.crypto_keysize ; i++) {
+		printk("%2x",(ipsec_eip97_params.crypto_key[i]) & 0xFF);
+		if( i != 0 && i%8 == 0)
+			printk("  ");
+	}
+#endif
 
 	if(ltq_ipsec_setkey(&ipsec_eip97_params) != 0 ) {
 		printk("<%s> SetKey failed!!!\n",__FUNCTION__);
 		return PPA_FAILURE;
 	}
-	if(ltq_get_ipsec_token(&ipsec_eip97_params) != 0) {
-		printk("<%s> Get Ipsec Token failed !!!\n",__FUNCTION__);
-		mpe_hal_dump_ipsec_eip97_params_info(&ipsec_eip97_params);
-		return PPA_FAILURE;
-	}
-#endif
-
-	mpe_hal_dump_ipsec_eip97_params_info(&ipsec_eip97_params);
+	
+	//mpe_hal_dump_ipsec_eip97_params_info(&ipsec_eip97_params);
 	if(dir == LTQ_SAB_DIRECTION_INBOUND ) {
 		memcpy(&crypto_ipsec_params_in[tunnel_index], &ipsec_eip97_params, sizeof(struct ltq_crypto_ipsec_params));
+		if(ltq_get_ipsec_token(&crypto_ipsec_params_in[tunnel_index]) != 0) {
+			printk("<%s> Get Ipsec Token failed !!!\n",__FUNCTION__);
+			mpe_hal_dump_ipsec_eip97_params_info(&crypto_ipsec_params_in[tunnel_index]);
+			return PPA_FAILURE;
+		}
+		//memcpy(&crypto_ipsec_params_in[tunnel_index], &ipsec_eip97_params, sizeof(struct ltq_crypto_ipsec_params));
+		return mpe_hal_construct_ipsec_buffer(dir, tunnel_index, &crypto_ipsec_params_in[tunnel_index]);
 	} else if(dir == LTQ_SAB_DIRECTION_OUTBOUND ) {
 		memcpy(&crypto_ipsec_params_out[tunnel_index], &ipsec_eip97_params, sizeof(struct ltq_crypto_ipsec_params));
+		if(ltq_get_ipsec_token(&crypto_ipsec_params_out[tunnel_index]) != 0) {
+			printk("<%s> Get Ipsec Token failed !!!\n",__FUNCTION__);
+			mpe_hal_dump_ipsec_eip97_params_info(&crypto_ipsec_params_out[tunnel_index]);
+			return PPA_FAILURE;
+		}
+		return mpe_hal_construct_ipsec_buffer(dir, tunnel_index, &crypto_ipsec_params_out[tunnel_index]);
+
 	}
-	printk("Context %x Token %x\n",ipsec_eip97_params.SA_buffer, ipsec_eip97_params.token_buffer);
-	printk("Crypto Offs:%d Pad Offs:%d\n",ipsec_eip97_params.crypto_offs,ipsec_eip97_params.pad_offs[0]);
-	return mpe_hal_construct_ipsec_buffer(dir, tunnel_index, &ipsec_eip97_params);
+	//printk("Context %x Token %x\n",ipsec_eip97_params.SA_buffer, ipsec_eip97_params.token_buffer);
+	//printk("Crypto Offs:%d Pad Offs:%d\n",ipsec_eip97_params.crypto_offs,ipsec_eip97_params.total_pad_offs);
+	return PPA_SUCCESS;
 
 }
 
-int32_t mpe_hal_ipsec_active_tunnel_get()
+int32_t mpe_hal_ipsec_active_tunnel_get(void)
 {
 	int32_t i, count=0;
 
@@ -1976,10 +2158,12 @@ int32_t mpe_hal_delete_ipsec_buffer(int32_t dir, int32_t tunlId)
 
 	if(dir == LTQ_SAB_DIRECTION_INBOUND ){
 		g_GenConf->ipsec_input_flag[tunlId] = 0;	
+		udelay(200);
 		memset(&g_GenConf->ipsec_input[tunlId], 0, sizeof(struct ipsec_info));
 
 	} else if(dir == LTQ_SAB_DIRECTION_OUTBOUND) {
 		g_GenConf->ipsec_output_flag[tunlId] = 0;	
+		udelay(200);
 		memset(&g_GenConf->ipsec_output[tunlId], 0, sizeof(struct ipsec_info));
 	} else {
 		printk("Wrong SA Direction !!!\n");
@@ -1994,8 +2178,8 @@ int32_t mpe_hal_del_ipsec_tunl_entry(PPE_ROUTING_INFO *route)
 
 	tunnel_index = route->tnnl_info.tunnel_idx;
 
-	printk("<%s> <%d> Tunnel Index %d\n",__FUNCTION__,__LINE__, tunnel_index);
-	if ((tunnel_index < 0) || (tunnel_index > IPSEC_TUN_MAX))
+	//printk("<%s> <%d> Tunnel Index %d\n",__FUNCTION__,__LINE__, tunnel_index);
+	if ((tunnel_index < 0) || (tunnel_index > (IPSEC_TUN_MAX-1)))
 		return PPA_FAILURE;
 
 	dir = g_tunnel_table[tunnel_index]->tunnel_info.ipsec_hdr.dir;
@@ -2007,6 +2191,7 @@ int32_t mpe_hal_del_ipsec_tunl_entry(PPE_ROUTING_INFO *route)
 		ltq_destroy_ipsec_sa(&crypto_ipsec_params_out[tunnel_index]);
 	}
 
+	mpe_hal_clear_ipsec_tunnel_mib(tunnel_index);
 	//if(mpe_hal_ipsec_active_tunnel_get() == 0)
 	return PPA_SUCCESS;
 }
@@ -2115,7 +2300,6 @@ static int32_t mpe_hal_set_ipsec_loopback_connectivity(void)
 
 static int32_t mpe_hal_remove_ipsec_loopback_connectivity(void)
 {
-	uint32_t dp_port_id;
 	dp_cb_t cb={0};
 
 	printk("Remove IPSEC loopback connectivity for the interface %s: redirect port %d\n",module_loopback.name,g_GenConf->tunnel_redir_port);
@@ -2169,7 +2353,7 @@ void mpe_hal_dump_token(uint32_t *token_buffer, uint32_t buf_len)
 	printk("=============\n");
 }
 
-int32_t mpe_hal_dump_ipsec_tunnel_info(int32_t tun_id)
+int32_t mpe_hal_dump_ipsec_tunnel_info(uint32_t tun_id)
 {
 	uint32_t ctx_size;
 	uint32_t *ctx = NULL;
@@ -2208,6 +2392,12 @@ int32_t mpe_hal_dump_ipsec_tunnel_info(int32_t tun_id)
 				g_GenConf->ipsec_output[tun_id].cd_info.dw3.iv,
 				g_GenConf->ipsec_output[tun_id].cd_info.dw3.u,
 				g_GenConf->ipsec_output[tun_id].cd_info.dw3.type);
+
+		printk("IV Length: [%d] ICV Length: [%d]\n", 
+				g_GenConf->ipsec_output[tun_id].iv_len, g_GenConf->ipsec_output[tun_id].icv_len);
+
+		printk("hash_pad_instr_offset: [%d] msg_len_instr_offset: [%d]\n", 
+				g_GenConf->ipsec_output[tun_id].hash_pad_instr_offset, g_GenConf->ipsec_output[tun_id].msg_len_instr_offset);
 	}
 
 	if(g_GenConf->ipsec_input_flag[tun_id] == 1)
@@ -2244,6 +2434,11 @@ int32_t mpe_hal_dump_ipsec_tunnel_info(int32_t tun_id)
 				g_GenConf->ipsec_input[tun_id].cd_info.dw3.u,
 				g_GenConf->ipsec_input[tun_id].cd_info.dw3.type);
 
+		printk("IV Length: [%d] ICV Length: [%d]\n", 
+				g_GenConf->ipsec_input[tun_id].iv_len, g_GenConf->ipsec_input[tun_id].icv_len);
+
+		printk("hash_pad_instr_offset: [%d] msg_len_instr_offset: [%d]\n", 
+				g_GenConf->ipsec_input[tun_id].hash_pad_instr_offset, g_GenConf->ipsec_input[tun_id].msg_len_instr_offset);
 	}
 	return PPA_SUCCESS;
 }
@@ -2267,14 +2462,14 @@ int32_t mpe_hal_get_ring_id(int32_t *id)
 
 int32_t mpe_hal_free_ring_id(int32_t id)
 {
-	ring_id_pool[id] == -1;
+	ring_id_pool[id] = -1;
 	return PPA_SUCCESS;
 }
 
-int32_t mpe_hal_ipsec_test()
+#ifdef IPSEC_TEST
+int32_t mpe_hal_ipsec_test(void)
 {
 
-	int32_t dir;
 	PPA_XFRM_STATE xfrm_sa;
 	PPA_XFRM_STATE *xfrm, *xfrm_out;
 	PPE_ROUTING_INFO route;
@@ -2352,6 +2547,10 @@ int32_t mpe_hal_ipsec_test()
 	return PPA_SUCCESS;
 }
 #endif
+#endif
+
+
+
 
 int32_t mpe_hal_get_session_bytes(uint32_t cmb_tbl_typ, uint32_t sess_index, uint32_t * f_bytes)
 {
@@ -2588,19 +2787,16 @@ int ipv6_routing_test(void)
     return 0;    // Non-zero return means that the module couldn't be loaded.
 }
 
+#ifdef MULTICAST_VAP_TEST
 int multicast_routing_test(void)
 {
     PPE_MC_INFO mc;
-    int session_index = -1;
-
-    u8 mcMAC[6] = {0x01, 0x00, 0x5e, 0x00, 0x00, 0x10}; // multicast mac
-    u8 br0MAC[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x02}; // br0 port mac
 
     char *mcastip = "235.0.10.10";
     char *gwip = "100.100.100.1";
 
     uint8_t f_ipv6;
-    uint32_t portmap=0, groupid=1, numvap=0, subifid=0;
+    uint32_t portmap=0, numvap=0, subifid=0;
 
     IP_ADDR gw_IP, mc_IP;
 
@@ -2636,7 +2832,7 @@ int multicast_routing_test(void)
     printk(KERN_INFO "multicast route added.. !\n");
     return 0;    // Non-zero return means that the module couldn't be loaded.
 }
-
+#endif
 #endif
 
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
@@ -2655,12 +2851,12 @@ int32_t mpe_hal_get_ipsec_tunnel_mib(IPSEC_TUNNEL_MIB_INFO *mib_info)
         unsigned int rxp[MAX_WORKER_NUM] = {0};
         unsigned int txp[MAX_WORKER_NUM] = {0};
 
-	printk("Get tunnel mib for tunnel id %d\n",mib_info->tunnel_id);
+	//printk("Get tunnel mib for tunnel id %d\n",mib_info->tunnel_id);
 	rx_pkt_sum=0;
 	tx_pkt_sum=0;
 	tx_byte=0;
 	rx_byte=0;
-#if 1
+
 	for(i=0; i<MAX_WORKER_NUM; i++) {
 		base = (struct mpe_itf_mib *)(g_GenConf->mib_itf_tbl_base[i] + (mib_info->tunnel_id * 2)*sizeof(struct mpe_itf_mib));
 		//rxp[i] = base->rx_mib.pkt;
@@ -2670,25 +2866,52 @@ int32_t mpe_hal_get_ipsec_tunnel_mib(IPSEC_TUNNEL_MIB_INFO *mib_info)
 		tx_byte+=base->tx_mib.bytes;
 		//rx_byte+=base->rx_mib.bytes;
         }
-#endif
-        for(i=0;i < MAX_MPE_TC_NUM;i++) {
+
+        for(i=0;i < MAX_WORKER_NUM;i++) {
 		if(!g_GenConf->hw_res[i].flag)
 			continue;			
 		if(IsValidRingId(g_GenConf->hw_res[i].e97_ring_id)) {
-			rxp[i] = g_GenConf->tc_mib[i].dec_pkt[mib_info->tunnel_id];
-			//txp[i] = g_GenConf->tc_mib[i].enc_pkt[mib_info->tunnel_id];
+			base = (struct mib_info *)(g_GenConf->mib_e97_dec_base[i] + (mib_info->tunnel_id * sizeof(struct mib_info)));
+			rxp[i] = base->rx_mib.pkt;
 			rx_pkt_sum += rxp[i];
-			//tx_pkt_sum += txp[i];
+			rx_byte+= base->rx_mib.bytes;
 		}
         }
 	mib_info->rx_pkt_count = rx_pkt_sum;
 	mib_info->tx_pkt_count = tx_pkt_sum;
 	mib_info->tx_byte_count = tx_byte;
-	mib_info->rx_byte_count = rx_pkt_sum;
-	printk("<%s> rx_pkt_count [%d] tx_pkt_count:[%d] tx_byte_count: [%d] rx_byte_count: [%d]\n",
-			__FUNCTION__,mib_info->rx_pkt_count,mib_info->tx_pkt_count,mib_info->tx_byte_count,mib_info->rx_byte_count);
+	mib_info->rx_byte_count = rx_byte;
+	//printk("<%s> rx_pkt_count [%d] tx_pkt_count:[%d] tx_byte_count: [%d] rx_byte_count: [%d]\n", __FUNCTION__,mib_info->rx_pkt_count,mib_info->tx_pkt_count,mib_info->tx_byte_count,mib_info->rx_byte_count);
 	return PPA_SUCCESS;
 }
+
+int32_t mpe_hal_clear_ipsec_tunnel_mib(int32_t tunnel_id)
+{
+        unsigned int i;
+        struct mpe_itf_mib * base;
+
+        //printk("Get tunnel mib for tunnel id %d\n",mib_info->tunnel_id);
+
+        for(i=0; i<MAX_WORKER_NUM; i++) {
+                base = (struct mpe_itf_mib *)(g_GenConf->mib_itf_tbl_base[i] + (tunnel_id * 2)*sizeof(struct mpe_itf_mib));
+                base->tx_mib.pkt = 0;
+                base->tx_mib.bytes = 0;
+        }
+
+        for(i=0;i < MAX_WORKER_NUM;i++) {
+                if(!g_GenConf->hw_res[i].flag)
+                        continue;                       
+                if(IsValidRingId(g_GenConf->hw_res[i].e97_ring_id)) {
+                        base = (struct mib_info *)(g_GenConf->mib_e97_dec_base[i] + (tunnel_id * sizeof(struct mib_info)));
+                        base->rx_mib.pkt =0;
+                        base->rx_mib.bytes = 0;
+                }
+        }
+        //printk("<%s> rx_pkt_count [%d] tx_pkt_count:[%d] tx_byte_count: [%d] rx_byte_count: [%d]\n", __FUNCTION__,mib_info->rx_pkt_count,mib_info->tx_pkt_count,mib_info->tx_byte_count,mib_info->rx_byte_count);
+        return PPA_SUCCESS;
+}
+
+
 #endif
 
 /* ======================================================================================================= */
@@ -2885,7 +3108,7 @@ static int32_t mpe_hal_set_fw_connectivity(void)
 
 	q_map.ep = 0;
 	q_map.mpe1 = 1;
-	q_map.mpe2 = 0;
+	//q_map.mpe2 = 0;
 	//q_map.flowid = 0;
 
 	q_map_mask |= 
@@ -2893,6 +3116,7 @@ static int32_t mpe_hal_set_fw_connectivity(void)
 		CBM_QUEUE_MAP_F_DE_DONTCARE |
 		CBM_QUEUE_MAP_F_FLOWID_H_DONTCARE |
 		CBM_QUEUE_MAP_F_FLOWID_L_DONTCARE |
+		CBM_QUEUE_MAP_F_MPE2_DONTCARE |
 		CBM_QUEUE_MAP_F_TC_DONTCARE ;
 	cbm_queue_map_set(tmu_res->tmu_q, &q_map, q_map_mask);
 
@@ -3073,19 +3297,24 @@ int32_t mpe_hal_test(uint32_t testcase)
 	}
 	case 3:
 	{
+#ifdef HW_SESS_TEST
 		mpe_hal_add_hw_session_test();
+#endif
 		return PPA_SUCCESS;
 	}
 	case 4:
 	{
+#ifdef MULTICAST_VAP_TEST
 		multicast_routing_test();
+#endif
 		return PPA_SUCCESS;
 	}
 	case 5:
 	{
-
+#ifdef IPSEC_TEST
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
 		mpe_hal_ipsec_test();
+#endif
 #endif
 		return PPA_SUCCESS;
 	}
@@ -3104,7 +3333,8 @@ int32_t mpe_hal_display_ipv4_session_action(uint32_t current_ptr)
 	int v =0,vap_entry_index=0,dst_pmac_port_no = 0, pmac_port_num =0;
 	struct vap_entry *ve = NULL;
 
-	if(current_ptr > MAX_HW_SESSION_NUM) {
+	//if(current_ptr > MAX_HW_SESSION_NUM) {
+	if(current_ptr > (g_GenConf->fw_sess_tbl_num[0]-1) ) {
 		printk("Index is exceeding the table size \n");
 		return PPA_FAILURE;
 	}
@@ -3204,7 +3434,8 @@ int32_t mpe_hal_display_ipv6_session_action(uint32_t current_ptr)
 	int v =0,vap_entry_index=0,dst_pmac_port_no = 0, pmac_port_num =0;
 	struct vap_entry *ve = NULL;
 
-	if(current_ptr > MAX_HW_SESSION_NUM) {
+	//if(current_ptr > MAX_HW_SESSION_NUM) {
+	if(current_ptr > (g_GenConf->fw_sess_tbl_num[1]-1) ) {
 		printk("Index is exceeding the table size \n");
 		return PPA_FAILURE;
 	}
@@ -3708,7 +3939,7 @@ int mpe_hal_dump_ipv4_cmp_table_entry(struct seq_file *seq)
 	int32_t i=0;
 	struct fw_compare_hash_auto_ipv4 * pIp4CmpTbl;
 	pIp4CmpTbl = (struct fw_compare_hash_auto_ipv4 *)g_GenConf->fw_cmp_tbl_base[0];
-	for(i = 0; i < g_GenConf->fw_sess_tbl_num[0]; i++ ) {
+	for(i = 0; i < (g_GenConf->fw_sess_tbl_num[0]-1); i++ ) {
 	//	seq_printf(seq,"Next Entry %d address 0x%x\n",i,((pIp4CmpTbl + (i ))));
 		if(((pIp4CmpTbl + (i ))->valid) == 1) {
 			seq_printf(seq,"\n");
@@ -3722,7 +3953,7 @@ int mpe_hal_dump_ipv4_cmp_table_entry(struct seq_file *seq)
 			seq_printf(seq,"DstIp: %s\n",inet_ntoa((pIp4CmpTbl + (i ))->key.dstip));
 			seq_printf(seq,"SrcPort: %d\n",(pIp4CmpTbl + (i ))->key.srcport);
 			seq_printf(seq,"DstPort: %d\n",(pIp4CmpTbl + (i ))->key.dstport);
-			seq_printf(seq,"DstPort: %d\n",(pIp4CmpTbl + (i ))->key.extn);
+			seq_printf(seq,"Extn: %d\n",(pIp4CmpTbl + (i ))->key.extn);
 			seq_printf(seq,"====================\n");
 		}
 	}
@@ -3747,14 +3978,14 @@ int mpe_hal_dump_ipv4_cmp_table_entry(struct seq_file *seq)
 	return 0;
 }
 
-void mpe_hal_dump_ipv6_cmp_table_entry( struct seq_file *seq )
+int32_t mpe_hal_dump_ipv6_cmp_table_entry( struct seq_file *seq )
 {
 	//mpe_hal_dump_table_hashidx_entry((void *)&g_GenConf->fw_cmp_tbl_base[1],g_GenConf->fw_sess_tbl_num[1], 1, seq);
 #if 1
 	int32_t i=0;
 	struct fw_compare_hash_auto_ipv6 * pIp6CmpTbl;
 	pIp6CmpTbl = (struct fw_compare_hash_auto_ipv6 *)g_GenConf->fw_cmp_tbl_base[1];
-	for(i = 0; i < g_GenConf->fw_sess_tbl_num[1]; i++ ) {
+	for(i = 0; i < (g_GenConf->fw_sess_tbl_num[1]-1); i++ ) {
 	//	seq_printf(seq,"Next Entry %d address 0x%x\n",i,((pIp4CmpTbl + (i ))));
 		if(((pIp6CmpTbl + (i ))->valid) == 1) {
 			seq_printf(seq,"\n");
@@ -3799,7 +4030,7 @@ void mpe_hal_dump_vap_list(void)
         for(j=0; j<g_GenConf->mc_vap_num[i]; j++) {
             ve = (struct vap_entry *)(g_GenConf->mc_vap_tbl_base[i] + (sizeof(struct vap_entry) * j));
             if(!ve->num) continue;
-            	printk("Port%02u:%03u base(%x) num(%02u):\n", i, j, ve, ve->num);
+            	printk("Port%02u:%03u base(%p) num(%02u):\n", i, j, ve, ve->num);
             for(k=0; k<ve->num ;k++) {
                 printk("%04x ", ve->vap_list[k]);
             }
@@ -3895,7 +4126,7 @@ char *get_tc_health_cond(int idx)
         return("Unknown");	
 }
 
-void dump_tc_current_status()
+void dump_tc_current_status(void)
 {
     int i=0;
 
@@ -3966,6 +4197,9 @@ void mpe_hal_dump_fw_header(struct seq_file *seq)
 
 void mpe_hal_dump_genconf_offset(struct seq_file *seq)
 {
+#if defined(CONFIG_ACCL_11AC_CS2)
+	int i;
+#endif
         seq_printf(seq, "EVA mode: %d\n",g_GenConf->eva_config_flag);
         seq_printf(seq, "Segment control registers SEG0 = 0:%.8x SEG1 = 1:%.8x SEG2 = 2:%.8x\n",g_GenConf->eva_SegCtl0,g_GenConf->eva_SegCtl1,g_GenConf->eva_SegCtl2);
 
@@ -4011,6 +4245,12 @@ void mpe_hal_dump_genconf_offset(struct seq_file *seq)
 		
 	seq_printf(seq, "	Uncached Buffer:		0x%x\n",g_GenConf->fw_hdr.dl_buf_info_base[0].uncached_addr_base);
 	seq_printf(seq, "				size:		0x%x\n",g_GenConf->fw_hdr.dl_buf_info_base[0].uncached_addr_size);
+#if defined(CONFIG_ACCL_11AC_CS2)
+	seq_printf(seq, "DirectLink CS2 Buffer Management\n");
+	for (i = 0; i < DL_CS2_BUFFER_CHUNK_NUM; i++) {
+		seq_printf(seq, "	Chunk[%i]:		0x%x\n", i, g_GenConf->fw_hdr.dl_buf_info_base[0].DlBufManPtrs[i]);
+	}
+#endif
 #endif
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
 	seq_printf(seq, "	CDR in base address:		0x%x\n",g_GenConf->e97_cdr_in[0][0]);
@@ -4885,6 +5125,9 @@ int32_t mpe_hal_config_accl_mode(uint32_t mode)
 	}
 	return 0;
 }
+extern int32_t cbm_port_quick_reset(
+int32_t cbm_port_id,
+uint32_t flags );
 
 /**************************************************************************/
 
@@ -4894,6 +5137,9 @@ int32_t mpe_hal_config_accl_mode(uint32_t mode)
      */
 static void mpe_hal_update_tc_hw_info(uint8_t cpu_num, uint8_t tc_num, uint8_t tcType, struct tc_hw_res *tc_res)
 {
+#ifdef CONFIG_LTQ_PPA_MPE_IP97
+	int32_t id;
+#endif
 	tc_res->flag = 1; // this hw resource is assigned to the TC
 	tc_res->tcType = tcType;
 	tc_res->TcNum = tc_num;
@@ -4917,6 +5163,10 @@ static void mpe_hal_update_tc_hw_info(uint8_t cpu_num, uint8_t tc_num, uint8_t t
 			tc_res->Dlfree_list_semid = g_GenConf->hw_res[j].Dlfree_list_semid; 	
 			tc_res->Dldispatch_q_cnt_semid = g_GenConf->hw_res[j].Dldispatch_q_cnt_semid;
 			tc_res->DlCbmDeQPort = mpe_hal_get_cbm_deq_port(tcType);
+			printk("<%s>: Reset CBM dequeue port[%d] for DirectLink\n",
+				__func__,
+				tc_res->DlCbmDeQPort);
+			cbm_port_quick_reset(tc_res->DlCbmDeQPort, CBM_PORT_F_DEQUEUE_PORT);
 		} else {
 			//tc_res->itc_view;			
 			tc_res->disp_q_semid = g_GenConf->hw_res[j].disp_q_semid;  	
@@ -4925,7 +5175,6 @@ static void mpe_hal_update_tc_hw_info(uint8_t cpu_num, uint8_t tc_num, uint8_t t
 			tc_res->dispatch_q_cnt_semid = g_GenConf->hw_res[j].dispatch_q_cnt_semid;
 		}
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
-		int32_t id;
 		if(mpe_hal_get_ring_id(&id)==PPA_SUCCESS)
 		{
 			tc_res->e97_ring_id = id;
@@ -4992,7 +5241,6 @@ char *itoa(int32_t i )
 void dump_mpe_version(struct seq_file *seq )
 {
 #if 1
-	char *str;
 //	seq_printf(seq, "MPE version:v.%d.%d.%d.%d(%s)\n", VER_MAJ, VER_MID, VER_MIN, VER_TAG, VER_DESC );
 	g_mpe_version = kmalloc( sizeof(char) * 4, GFP_KERNEL );
 	memset(g_mpe_version, '\0', sizeof(char) * 4);
@@ -5015,12 +5263,12 @@ void mpe_session_count ( struct seq_file *seq)
 {
 	int32_t i=0, count=0;
 	struct fw_compare_hash_auto_ipv4 * pIp4CmpTbl;
+	struct fw_compare_hash_auto_ipv6 * pIp6CmpTbl;
 	pIp4CmpTbl = (struct fw_compare_hash_auto_ipv4 *)g_GenConf->fw_cmp_tbl_base[0];
 
-	struct fw_compare_hash_auto_ipv6 * pIp6CmpTbl;
 	pIp6CmpTbl = (struct fw_compare_hash_auto_ipv6 *)g_GenConf->fw_cmp_tbl_base[1];
 
-	for(i = 0; i < g_GenConf->fw_sess_tbl_num[0]; i++ ) {
+	for(i = 0; i < (g_GenConf->fw_sess_tbl_num[0]-1); i++ ) {
 	//	seq_printf(seq,"Next Entry %d address 0x%x\n",i,((pIp4CmpTbl + (i ))));
 		if(((pIp4CmpTbl + (i ))->valid) == 1) {
 			count++;
@@ -5028,7 +5276,7 @@ void mpe_session_count ( struct seq_file *seq)
 	}
 	seq_printf(seq, "IPv4 session count = %d\n", count);
 
-	for(i = 0, count = 0; i < g_GenConf->fw_sess_tbl_num[1]; i++ ) {
+	for(i = 0, count = 0; i < (g_GenConf->fw_sess_tbl_num[1]-1); i++ ) {
 	//	seq_printf(seq,"Next Entry %d address 0x%x\n",i,((pIp4CmpTbl + (i ))));
 		if(((pIp6CmpTbl + (i ))->valid) == 1) {
 			count++;	
@@ -5067,6 +5315,7 @@ int mpe_hal_delete_tc(uint8_t ucCpu, uint8_t ucTc)
 	{
 		if((logic_tc_mapping[j] == ucTc) && (g_GenConf->hw_res[j].CpuNum == ucCpu))
 		{
+			mpe_hal_free_yield(ucCpu, 1);
 			vmb_tc_stop(ucCpu, ucTc);
 			g_GenConf->hw_res[j].flag = 0; // Free this hardware resource
 			g_GenConf->hw_res[j].state = STATE_INACTIVE;
@@ -5076,6 +5325,7 @@ int mpe_hal_delete_tc(uint8_t ucCpu, uint8_t ucTc)
 	}
 	return PPA_SUCCESS;
 }
+static DECLARE_WAIT_QUEUE_HEAD(dl_wq);
 
 int mpe_hal_add_tc(uint8_t ucCpu, uint32_t tc_type)
 {
@@ -5106,15 +5356,35 @@ int mpe_hal_add_tc(uint8_t ucCpu, uint32_t tc_type)
 			j= MAX_TM_NUM + MAX_WORKER_NUM;
 
 		printk("<%s>Free hardware resource Index is %d\n",__FUNCTION__, j );
+		if (1) {
+			u32 *temp = (u32 *)(g_MpeFw_stack_addr + (g_GenConf->fw_hdr.fw_stack_priv_data_size * j));
+			printk("%s: DIRECTLINK preparation  [%p]size[%x]\n", __func__,
+				temp,
+				g_GenConf->fw_hdr.fw_priv_data_size);
+			memset(temp,
+				0x0,
+				g_GenConf->fw_hdr.fw_stack_priv_data_size);
+		}
 		logic_tc_mapping[j] = tc_num;
 		mpe_hal_update_tc_hw_info(ucCpu, tc_num, tc_type, &g_GenConf->hw_res[j]);
 		mpe_hal_prepare_tc_launch(tc_num, tc_type, &g_GenConf->hw_res[j], &tc_launch);
+		if(tc_type == TYPE_DIRECTLINK) {
+                    g_GenConf->tc_cur_state[j] = UNKNOWN;
+                }
 		ret = vmb_tc_start(ucCpu, &tc_launch ,1);     
 		if((ret == -VMB_ETIMEOUT) ||(ret == -VMB_ENACK))
 		{
 			printk("Failed to start TC for the CPU %d\n", ucCpu );
 			return PPA_FAILURE;
-		}  	 
+		}
+
+		if(tc_type == TYPE_DIRECTLINK) {
+		if (wait_event_interruptible_timeout(dl_wq, g_GenConf->tc_cur_state[j] == DL_YD_WAIT, 10000) <= 0)
+			pr_err("%s: could not bring DirectLink TX up\n", __func__);
+                    printk("DL changed state to %d %s\n",g_GenConf->tc_cur_state[j], get_status_str(g_GenConf->tc_cur_state[j]));
+						;
+                    printk("DL Successfully changed state to %d %s\n",g_GenConf->tc_cur_state[j], get_status_str(g_GenConf->tc_cur_state[j]));
+                }
 	}
 	//return tc_num;
 	return j;
@@ -5158,10 +5428,13 @@ int mpe_hal_dl_alloc_resource(
         uint32_t flags)
 {
 	struct dl_drv_address_map *dl_resource_addr;
+#if defined(CONFIG_ACCL_11AC_CS2)
+	int i;
+#endif
 	printk("<%s> Allocating resources for DL\n",__FUNCTION__);
 
 	if(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].tx_cfg_ctxt_buf_size != 0 &&
-		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].tx_cfg_ctxt_buf_base == NULL)
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].tx_cfg_ctxt_buf_base == 0)
 #if 0	
 		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].tx_cfg_ctxt_buf_base = (uint32_t)alloc_pages_exact(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].tx_cfg_ctxt_buf_size, GFP_DMA); 
 #else
@@ -5176,10 +5449,15 @@ int mpe_hal_dl_alloc_resource(
   	{
     		printk("Failed to allocate memory for tx_cfg_ctxt_buf_base\n");
     		goto CLEANUP;
+	} else {
+		memset(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].tx_cfg_ctxt_buf_base,
+		0,
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].tx_cfg_ctxt_buf_size);
+		printk("%s: Clear memory for TX CFG\n", __func__);
 	}
   
 	if(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_cfg_ctxt_buf_size != 0 &&
-		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_cfg_ctxt_buf_base == NULL)
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_cfg_ctxt_buf_base == 0)
 #if 0
 		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_cfg_ctxt_buf_base = (uint32_t)alloc_pages_exact(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_cfg_ctxt_buf_size, GFP_DMA); 
 #else
@@ -5194,10 +5472,16 @@ int mpe_hal_dl_alloc_resource(
   	{
     		printk("Failed to allocate memory for rx_cfg_ctxt_buf_base\n");
     		goto CLEANUP;
+	} else {
+		memset(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_cfg_ctxt_buf_base,
+		0,
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_cfg_ctxt_buf_size
+		);
+		printk("%s: Clear memory for RX CFG\n", __func__);
 	}
 
 	if(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_size != 0 &&
-		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_base == NULL)
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_base == 0)
 #if 0
 		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_base = (uint32_t)alloc_pages_exact(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_size, GFP_DMA); 
 #else
@@ -5211,9 +5495,14 @@ int mpe_hal_dl_alloc_resource(
   	{
     		printk("Failed to allocate memory for rx_msgbuf_base\n");
     		goto CLEANUP;
+	} else {
+		memset(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_base,
+		0,
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_size);
+		printk("%s: Clear memory for RX MSG BUF\n", __func__);
 	}
 
-	if(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].uncached_addr_base == NULL &&
+	if(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].uncached_addr_base == 0 &&
 		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].uncached_addr_size != 0)
 #if 0
 		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].uncached_addr_base = (uint32_t)alloc_pages_exact(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_size, GFP_DMA); 
@@ -5228,18 +5517,28 @@ int mpe_hal_dl_alloc_resource(
   	{
     		printk("Failed to allocate memory for uncached_addr_base\n");
     		goto CLEANUP;
+	} else {
+		memset(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].uncached_addr_base,
+		0,
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].uncached_addr_size);
+		printk("%s: Clear memory for UNCACHED\n", __func__);
 	}
 
 
 	if(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_size != 0 &&
-		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_base == NULL)
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_base == 0)
 		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_base = (uint32_t)alloc_pages_exact(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_size, 
 									GFP_KERNEL | __GFP_ZERO); 
 	if (!g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_base)
   	{
     		printk("Failed to allocate memory for comm_buf_base\n");
     		goto CLEANUP;
-	}
+	} else {
+		memset(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_base,
+		0,
+		g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_size);
+		printk("%s: Clear memory for COMM\n", __func__);
+		}
 #if 1
 	dl_resource_addr = memAddr;
 	dl_resource_addr->dl_buf_info_addr =(uint32_t) &(g_GenConf->fw_hdr.dl_buf_info_base[0]);
@@ -5254,6 +5553,25 @@ int mpe_hal_dl_alloc_resource(
 	printk("<%s> DlCommmIpi: %d\n",__FUNCTION__, g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlCommmIpi);
 
 	//*memAddr = &g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature];
+#if defined(CONFIG_ACCL_11AC_CS2)
+	for (i = 0; i < DL_CS2_BUFFER_CHUNK_NUM; i++) {
+		if (g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i] == NULL) {
+			g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i] = (uint32_t)dma_zalloc_coherent(g_Mpedev,
+				DL_CS2_BUFFER_CHUNK_SIZE,
+				&dma_phys3, GFP_ATOMIC);
+			g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i] =
+				((g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i] & 0x0fffffff) | KSEG0);
+			if (!g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i])
+			{
+				printk("Failed to allocate memory for uncached_addr_base\n");
+				goto CLEANUP;
+			}
+		} else
+			memset(g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i],
+				0,
+				DL_CS2_BUFFER_CHUNK_SIZE);
+	}
+#endif
 	return PPA_SUCCESS;
 	
 CLEANUP:
@@ -5265,10 +5583,152 @@ CLEANUP:
 		free_pages_exact((void *)g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_base, g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].rx_msgbuf_size);
 	if (!g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_base)
 		free_pages_exact((void *)g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_base, g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].comm_buf_size);
+#if defined(CONFIG_ACCL_11AC_CS2)
+	for (i = 0; i < DL_CS2_BUFFER_CHUNK_NUM; i++) {
+		if (g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i])
+			free_pages_exact((void *)g_GenConf->fw_hdr.dl_buf_info_base[mpeFeature].DlBufManPtrs[i],
+				DL_CS2_BUFFER_CHUNK_SIZE);
+	}
+#endif
 	return PPA_FAILURE;
 
 }
 EXPORT_SYMBOL(mpe_hal_dl_alloc_resource);
+
+#if defined(CONFIG_ACCL_11AC_CS2)                                
+void dl_dma_res_get(u32 *dma_chan, u32 *desc_num)
+{
+	cbm_eq_port_res_t eqport;
+	int32_t ret,i;
+
+	memset(&eqport, 0, sizeof(cbm_eq_port_res_t));
+
+	/*Read back cbm_enqueue_port_resources_get */
+	ret = cbm_enqueue_port_resources_get(&eqport, DP_F_ENQ_DL);
+
+	if (ret == -1) {
+		printk("cbm_enqueue_port_resources_get failed\n");
+		return -1;
+	}
+
+	for (i = 0; i < eqport.num_eq_ports; i++) {
+		*dma_chan = eqport.eq_info[i].dma_rx_chan_std;
+		*desc_num = eqport.eq_info[i].num_desc;
+	}
+	
+	if (eqport.eq_info)
+		kfree(eqport.eq_info);
+
+	return;
+
+}
+
+void dl_free_dma_chan()
+{
+	u32 chan;
+	u32 dma_chan=0, desc_num=0;
+
+	dl_dma_res_get(&dma_chan, &desc_num);
+
+    chan =_DMA_C(DMA1RX, DMA1RX_PORT, dma_chan);
+	ltq_dma_chan_desc_free(chan);
+
+	ltq_free_dma(chan);
+
+	return;
+
+}
+
+#define DL_DMA_BUFFER_START_OFFSET 0x100
+static int32_t dl_setup_dma_chan(u32 desc_len, u32 dma_ch)
+{
+    u32 chan;
+
+    chan =_DMA_C(DMA1RX, DMA1RX_PORT, dma_ch);
+
+    if ((ltq_request_dma(chan, "dma1 rx ch")) < 0) {
+        printk(" %s failed to open chan for chan%d\r\n",__func__, chan);
+        return -1;
+    }
+
+    /* RX decriptor setup */
+    if (ltq_dma_chan_desc_alloc(chan, desc_len) == 0)
+        ltq_dma_chan_data_buf_alloc(chan);
+    else {
+        printk(" %s failed to setup chan desc for chan%d\r\n", __func__, chan);
+        return -1;				
+    }
+
+    printk("rx desc base 0x%08x\n",
+            (u32)ltq_dma_chan_get_desc_phys_base(chan));
+    g_GenConf->dl_dma_desc_base = ((ltq_dma_chan_get_desc_phys_base(chan) & 0x0FFFFFFF) | 0xA0000000);
+
+    ltq_dma_chan_data_buf_free(chan);
+
+    /* Dma channel IRQ enable */
+    if (ltq_dma_chan_irq_enable(chan) < 0) {
+        printk(" %s failed to disable IRQ for chan%d\r\n",__func__, chan);
+        return -1;
+    }
+    /* Dma Channel on */
+    if (ltq_dma_chan_on(chan) < 0) {
+        printk(" %s failed to ON chan%d\r\n", __func__, chan);
+        return -1;
+    }
+
+    /* Received the packet */	
+    printk("Received the packet %s\n", __func__);
+    return 0;
+}
+#endif
+void dl_pmac_egcfg(u32 pid, u32 dma_chan)
+{
+    struct dp_pmac_cfg pmac_cfg;
+
+    memset(&pmac_cfg, 0, sizeof(pmac_cfg));
+    pmac_cfg.eg_pmac_flags = EG_PMAC_F_RXID | EG_PMAC_F_PMAC;
+
+    printk("pmac_cfg.eg_pmac_flags %08x\n",pmac_cfg.eg_pmac_flags);
+
+    pmac_cfg.eg_pmac.rx_dma_chan=dma_chan;
+
+    pmac_cfg.eg_pmac.pmac = 1;
+    pmac_cfg.eg_pmac.fcs = 0;
+    pmac_cfg.eg_pmac.tc_enable = 0;
+
+    dp_pmac_set(pid, &pmac_cfg);
+}
+
+#if defined(CONFIG_ACCL_11AC_CS2)                                
+static void mpe_hal_dl_cs2(u32 port_id)
+{
+    int32_t j=0;
+    u32 dma_chan=0, desc_num=0;
+
+    for (j=0; j< MAX_MPE_TC_NUM; j++)
+    {
+        if(g_GenConf->hw_res[j].tcType == TYPE_DIRECTLINK){
+            break;
+        }
+    }
+    g_GenConf->hw_res[j].DlMsiIrq = 134;
+    //g_GenConf->g_mpe_dbg_enable = 0x00020000;
+
+    disable_irq(74);
+    gic_yield_setup(0, 0, 74);
+
+    dl_dma_res_get(&dma_chan, &desc_num);
+
+    g_GenConf->dl_dma_desc_len = desc_num;
+    g_GenConf->dl_dma_chan = dma_chan;
+    g_GenConf->dl_dma_buf_off = DL_DMA_BUFFER_START_OFFSET;
+
+    //dl_pmac_egcfg(port_id, dma_chan);
+    dl_setup_dma_chan(desc_num, dma_chan);
+
+    return;
+}
+#endif
 #endif
 
 int mpe_hal_feature_start(
@@ -5286,10 +5746,16 @@ int mpe_hal_feature_start(
 			if(port_id != 0) { 
 				printk("<%s> Start DL Feature for port id %d\n",__FUNCTION__,port_id);
 				g_dl1_pmac_port = port_id;
+#if defined(CONFIG_ACCL_11AC_CS2)                                
+                                mpe_hal_dl_cs2(port_id);
+#endif                                
 				tc_id = mpe_hal_add_tc(g_MPELaunch_CPU, TYPE_DIRECTLINK);
 				if(tc_id != PPA_FAILURE) {
 					printk("DL TC is %d: state %s\n",tc_id, get_tc_health_cond(tc_id));
 					dl_tc_info[mpeFeature].mpe_tc_id = tc_id;
+#if defined(CONFIG_ACCL_11AC_CS2)                                        
+					dl_pmac_egcfg(port_id, g_GenConf->dl_dma_chan);
+#endif                                        
 				} else {
 					printk("ADD DL TC failed\n");
 					return PPA_FAILURE;
@@ -5310,6 +5776,9 @@ int mpe_hal_feature_start(
 				printk("<%s> Stop DL Feature for port id %d\n",__FUNCTION__,port_id);
 				mpe_hal_delete_tc(g_GenConf->hw_res[dl_tc_info[mpeFeature].mpe_tc_id].CpuNum, 
 						g_GenConf->hw_res[dl_tc_info[mpeFeature].mpe_tc_id].TcNum);
+#if defined(CONFIG_ACCL_11AC_CS2)                                
+				dl_free_dma_chan();
+#endif
 			}
 
 	} else {
@@ -5481,7 +5950,8 @@ static int mpe_hal_allocate_fw_table(void)
 	/* Configuration required for Full Precessing */
 	/* Compare Table for IPv4 session */
 	g_GenConf->fw_sess_tbl_type[0] = 1; //IPv4 table
-	g_GenConf->fw_sess_tbl_num[0] = MAX_HW_SESSION_NUM;
+//	g_GenConf->fw_sess_tbl_num[0] = MAX_HW_SESSION_NUM;
+	g_GenConf->fw_sess_tbl_num[0] = MAX_FW_SESSION_NUM;
 	g_GenConf->fw_sess_tbl_iterate[0] = MAX_SEARCH_ITRN;
 	g_GenConf->fw_cmp_tbl_base[0] = (uint32_t)kmalloc(g_GenConf->fw_sess_tbl_num[0]* sizeof(struct fw_compare_hash_auto_ipv4), GFP_DMA);
 	if (!g_GenConf->fw_cmp_tbl_base[0])
@@ -5493,7 +5963,10 @@ static int mpe_hal_allocate_fw_table(void)
 		memset((void *)g_GenConf->fw_cmp_tbl_base[0], 0, g_GenConf->fw_sess_tbl_num[0]* sizeof(struct fw_compare_hash_auto_ipv4));
 		for(i = 0; i < g_GenConf->fw_sess_tbl_num[0] ; i++ ) {
 			//printk("Next Entry %d address 0x%x\n",i,((struct fw_compare_hash_auto_ipv4 *)(g_GenConf->fw_cmp_tbl_base[0] + (i * sizeof(struct fw_compare_hash_auto_ipv4)))));
-			((struct fw_compare_hash_auto_ipv4 *)(g_GenConf->fw_cmp_tbl_base[0] + (i * sizeof(struct fw_compare_hash_auto_ipv4))))->valid=0;
+			if(i < g_GenConf->fw_sess_tbl_num[0] -1)
+				((struct fw_compare_hash_auto_ipv4 *)(g_GenConf->fw_cmp_tbl_base[0] + (i * sizeof(struct fw_compare_hash_auto_ipv4))))->valid=0;
+			else 
+				((struct fw_compare_hash_auto_ipv4 *)(g_GenConf->fw_cmp_tbl_base[0] + (i * sizeof(struct fw_compare_hash_auto_ipv4))))->valid=1;
 			((struct fw_compare_hash_auto_ipv4 *)(g_GenConf->fw_cmp_tbl_base[0] + (i * sizeof(struct fw_compare_hash_auto_ipv4))))->nxt_ptr= g_GenConf->fw_sess_tbl_num[0] - 1;
 			((struct fw_compare_hash_auto_ipv4 *)(g_GenConf->fw_cmp_tbl_base[0] + (i * sizeof(struct fw_compare_hash_auto_ipv4))))->first_ptr= g_GenConf->fw_sess_tbl_num[0] - 1;
 			((struct fw_compare_hash_auto_ipv4 *)(g_GenConf->fw_cmp_tbl_base[0] + (i * sizeof(struct fw_compare_hash_auto_ipv4))))->act=0;
@@ -5515,7 +5988,10 @@ static int mpe_hal_allocate_fw_table(void)
 		//printk("IPv6 compare table address %x\n", g_GenConf->fw_cmp_tbl_base[1]);
 		memset((void *)g_GenConf->fw_cmp_tbl_base[1], 0, g_GenConf->fw_sess_tbl_num[1]* sizeof(struct fw_compare_hash_auto_ipv6));
 		for(i = 0; i < g_GenConf->fw_sess_tbl_num[1]; i++ ) {
-			((struct fw_compare_hash_auto_ipv6 *)(g_GenConf->fw_cmp_tbl_base[1] + (i * sizeof(struct fw_compare_hash_auto_ipv6))))->valid=0;
+			if(i < g_GenConf->fw_sess_tbl_num[1] -1)
+				((struct fw_compare_hash_auto_ipv6 *)(g_GenConf->fw_cmp_tbl_base[1] + (i * sizeof(struct fw_compare_hash_auto_ipv6))))->valid=0;
+			else
+				((struct fw_compare_hash_auto_ipv6 *)(g_GenConf->fw_cmp_tbl_base[1] + (i * sizeof(struct fw_compare_hash_auto_ipv6))))->valid=1;
 			((struct fw_compare_hash_auto_ipv6 *)(g_GenConf->fw_cmp_tbl_base[1] + (i * sizeof(struct fw_compare_hash_auto_ipv6))))->nxt_ptr= g_GenConf->fw_sess_tbl_num[1] - 1;
 			((struct fw_compare_hash_auto_ipv6 *)(g_GenConf->fw_cmp_tbl_base[1] + (i * sizeof(struct fw_compare_hash_auto_ipv6))))->first_ptr= g_GenConf->fw_sess_tbl_num[1] - 1;
 			((struct fw_compare_hash_auto_ipv6 *)(g_GenConf->fw_cmp_tbl_base[1] + (i * sizeof(struct fw_compare_hash_auto_ipv6))))->act=0;
@@ -5588,6 +6064,18 @@ static int mpe_hal_allocate_fw_table(void)
 		memset((void *)g_GenConf->mib_itf_tbl_base[i], 0, g_GenConf->mib_itf_num * sizeof(struct mpe_itf_mib));
 	}
 
+#ifdef CONFIG_LTQ_PPA_MPE_IP97
+	/** IPSEC Inbound MIB table base address per Worker TC  */
+	for(i=0; i< MAX_WORKER_NUM; i++) {
+		g_GenConf->mib_e97_dec_base[i] = (uint32_t )kmalloc((IPSEC_TUN_MAX * sizeof(struct mib_info)), GFP_DMA);
+		if (!g_GenConf->mib_e97_dec_base[i])
+		{
+			printk("Failed to allocate memory for IPSEC Inbound Session MIB table for Worker %d\n",i);
+			return PPA_FAILURE;
+		}
+		memset((void *)g_GenConf->mib_e97_dec_base[i], 0, IPSEC_TUN_MAX * sizeof(struct mib_info));
+	}
+#endif
 	g_HAL_State = MPE_HAL_FW_RESOURCE_ALLOC;
 	//printk("MPE HAL Allocate FW Data Success.\n");
 	return PPA_SUCCESS;
@@ -5682,10 +6170,8 @@ static int mpe_hal_run_fw(uint8_t ucCpu, uint8_t ucNum_worker)
 	g_VpeInfo.vpe[j-MAX_WORKER_NUM].ucState = 1;
 	g_VpeInfo.vpe[j-MAX_WORKER_NUM].ucActualVpeNo = ucCpuNum;
 	tc_num = get_tm_from_vpe(ucCpuNum);
-
-#ifdef CONFIG_CRYPTO_DEV_LANTIQ_EIP97
+	g_GenConf->e97_mpe_en =0;
 	g_GenConf->e97_init_flag = 1;
-#endif
 
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
 	for(i=0; i<MAX_RING;i++)
@@ -5693,7 +6179,9 @@ static int mpe_hal_run_fw(uint8_t ucCpu, uint8_t ucNum_worker)
 		ring_id_pool[i] = -1;
 	}
 	ring_id_pool[0] = 0; //used by Linux
+	ring_id_pool[1] = 1; //used by Linux
 	mpe_hal_alloc_cdr_rdr();
+	g_GenConf->e97_mpe_en =1;
 	g_GenConf->e97_init_flag = 1;
 #endif
 	/* Allocate a TC bound to a particular CPU */

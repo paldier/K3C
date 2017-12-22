@@ -167,6 +167,8 @@ int32_t ppa_ioctl_get_sw_fastpath_enable(unsigned int cmd, unsigned long arg, PP
 int32_t ppa_ioctl_set_sw_session_enable(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
 int32_t ppa_ioctl_get_sw_session_enable(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
 #endif
+extern void ppa_session_delete_by_ip(PPA_IPADDR *ip);
+extern void ppa_session_delete_by_macaddr(uint8_t *mac);
 
 /*
  * ####################################
@@ -1697,6 +1699,16 @@ static long ppa_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     }
 
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+    case PPA_CMD_SET_QOS_INGGRP:
+    {
+        res = ppa_ioctl_set_qos_ingress_group(cmd, arg, cmd_info );
+        break;
+    }
+    case PPA_CMD_GET_QOS_INGGRP:
+    {
+        res = ppa_ioctl_get_qos_ingress_group(cmd, arg, cmd_info );
+        break;
+    }
     case PPA_CMD_ADD_CLASSIFIER:
     {
 	res = ppa_ioctl_add_class_rule(cmd , arg, cmd_info);
@@ -2384,8 +2396,23 @@ int32_t ppa_ioctl_get_portid(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *
 
 int32_t ppa_ioctl_del_session(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *cmd_info)
 {
-  printk("This ioctl is no more supported. No Session will be added/deleted from user space\n");
-  return PPA_FAILURE;
+  // only IP address based session delete is supported
+  PPA_CMD_DEL_SESSION_INFO *pSessInfo;
+
+  pSessInfo = &cmd_info->del_session;
+
+  if ( ppa_copy_from_user(pSessInfo, (void *)arg, sizeof(cmd_info->del_session)) != 0 )
+  {
+        return PPA_FAILURE;
+  }
+  if(pSessInfo->type == PPA_SESS_DEL_USING_MAC) {
+    ppa_session_delete_by_macaddr(pSessInfo->u.mac_addr);
+  }
+  else {
+    ppa_session_delete_by_ip(&(pSessInfo->u.ip));
+  }
+
+  return PPA_SUCCESS;
 }
 
 
@@ -2463,6 +2490,10 @@ int32_t ppa_ioctl_modify_session(unsigned int cmd, unsigned long arg, PPA_CMD_DA
                pSessExtraInfo->session, (uint32_t)p_item->session );
 
     /* Check if other direction need to be modified */
+
+
+    if( p_item ) {
+   
     if( p_item->flags & SESSION_WAN_ENTRY && 
          (pSessExtraInfo->lan_wan_flags & SESSION_LAN_ENTRY )) {
       r_direction = 1;
@@ -2470,6 +2501,7 @@ int32_t ppa_ioctl_modify_session(unsigned int cmd, unsigned long arg, PPA_CMD_DA
          pSessExtraInfo->lan_wan_flags & SESSION_WAN_ENTRY ) {
       r_direction = 1;
                 }
+    }
 
     if( r_direction != -1 ) {
       __ppa_session_find_by_ct(p_item->session,
@@ -2624,14 +2656,14 @@ int32_t ppa_ioctl_manage_sessions(unsigned int cmd, unsigned long arg, PPA_CMD_D
 #else
 					ppa_hw_del_session(p_item);
 #endif
-					p_item->flags |= SESSION_ADDED_IN_SW;
-					update_session_mgmt_stats(p_item, ADD);
+					/* software session management is handled by SAE */
+					ppa_sw_session_enable(p_item, 1, p_item->flags);
 					p_item->prev_sess_bytes = 0x00;
 
 				} else if(p_item->flags & SESSION_ADDED_IN_SW) {
 #if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
-     				update_session_mgmt_stats(p_item, DELETE);
-					p_item->flags &= ~SESSION_ADDED_IN_SW;
+					/* software session management is handled by SAE */
+					ppa_sw_session_enable(p_item, 0, p_item->flags);
 #if defined(CONFIG_LTQ_PPA_HAL_SELECTOR) && CONFIG_LTQ_PPA_HAL_SELECTOR
 					if(ppa_hsel_add_routing_session(p_item, 0) != PPA_SUCCESS )
 #else
@@ -2724,7 +2756,7 @@ int32_t ppa_ioctl_set_sw_fastpath_enable(unsigned int cmd, unsigned long arg, PP
     if ( copy_from_user( &cmd_info->sw_fastpath_enable_info, (void *)arg, sizeof(cmd_info->sw_fastpath_enable_info)) != 0 )
         return PPA_FAILURE;
 
-    res = ppa_sw_fastpath_enable( cmd_info->sw_fastpath_enable_info.sw_fastpath_enable, cmd_info->sw_fastpath_enable_info.flags);
+    res = ppa_sw_fastpath_enable( cmd_info->sw_fastpath_enable_info.sw_fastpath_enable);
 
     if ( res == PPA_SUCCESS ) {
       if( cmd_info->sw_fastpath_enable_info.sw_fastpath_enable ) {
@@ -2756,7 +2788,7 @@ int32_t ppa_ioctl_get_sw_fastpath_enable(unsigned int cmd, unsigned long arg, PP
     if ( copy_from_user( &cmd_info->sw_fastpath_enable_info, (void *)arg, sizeof(cmd_info->sw_fastpath_enable_info)) != 0 )
         return PPA_FAILURE;
 
-    res = ppa_get_sw_fastpath_status( &cmd_info->sw_fastpath_enable_info.sw_fastpath_enable, cmd_info->sw_fastpath_enable_info.flags);
+    res = ppa_get_sw_fastpath_status( &cmd_info->sw_fastpath_enable_info.sw_fastpath_enable);
 
     if ( res != PPA_SUCCESS )
     {
@@ -2896,6 +2928,9 @@ void ppa_reg_expfn(void)
   //extern uint32_t ppa_enable_rpfn, ppa_get_status_rpfn;
   ppa_reg_export_fn(PPA_ENABLE_FN,        (uint32_t)ppa_enable, "ppa_enable", (uint32_t *)&ppa_hook_enable_fn,(uint32_t)ppa_enable_rpfn );
   ppa_reg_export_fn(PPA_GET_STATUS_FN,    (uint32_t)ppa_get_status, "ppa_get_status", (uint32_t *)&ppa_hook_get_status_fn, (uint32_t)ppa_get_status_rpfn);
+
+
+  ppa_reg_export_fn(PPA_GET_CT_STAT_FN,   (uint32_t)ppa_get_ct_stats, "ppa_get_ct_stats",(uint32_t *)&ppa_hook_get_ct_stats_fn, (uint32_t)ppa_get_ct_stats_rpfn );
 
   //extern uint32_t ppa_session_add_rpfn, ppa_session_del_rpfn,ppa_session_modify_rpfn, ppa_session_get_rpfn;
   ppa_reg_export_fn(PPA_SESSION_ADD_FN,   (uint32_t)ppa_session_add, "ppa_session_add",(uint32_t *)&ppa_hook_session_add_fn, (uint32_t)ppa_session_add_rpfn );

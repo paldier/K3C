@@ -41,3 +41,9 @@ endef
 
 $(eval $(call Profile,EASY300_AC1200))
 
+define Profile/EASY330_RT
+  NAME:=EASY330 ETH RT Board (720MHz)
+  PACKAGES:=
+endef
+
+$(eval $(call Profile,EASY330_RT))

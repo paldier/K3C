@@ -125,9 +125,9 @@ PPA_NETIF* ppa_get_netif_for_ppa_ifid_rpfn(uint32_t if_id)
 }
 EXPORT_SYMBOL(ppa_get_netif_for_ppa_ifid_rpfn);
 
-int32_t ppa_directpath_send_rpfn(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32_t flags)
+int32_t ppa_directpath_send_rpfn(uint32_t rx_if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags)
 {          
-    int32_t (*pfn)(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32_t flags) = NULL;
+    int32_t (*pfn)(uint32_t rx_if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags) = NULL;
     uint8_t  drop_flag = 0;
     int32_t ret = PPA_EINVAL;
 
@@ -144,7 +144,7 @@ int32_t ppa_directpath_send_rpfn(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, u
                 drop_flag = 1; 
             }
             else {
-                pfn =  (int32_t (*)(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32_t flags))g_expfn_table[PPA_DIRECTPATH_SEND_FN].hook_addr;
+                pfn =  (int32_t (*)(uint32_t rx_if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags))g_expfn_table[PPA_DIRECTPATH_SEND_FN].hook_addr;
                 if(pfn){                            
                     ret = pfn(rx_if_id, skb,len,flags);
                 } 
@@ -471,13 +471,12 @@ int32_t ppa_ioctl_set_mem(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cm
 int32_t ppa_ioctl_dbg_tool_test(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *cmd_info)
 {    
     int res = PPA_SUCCESS;
-    
-   if ( ppa_copy_from_user( &cmd_info->dbg_tool_info, (void *)arg, sizeof(cmd_info->dbg_tool_info)) != 0 )
+    uint8_t *pBuf = NULL;
+    if ( ppa_copy_from_user( &cmd_info->dbg_tool_info, (void *)arg, sizeof(cmd_info->dbg_tool_info)) != 0 )
         return PPA_FAILURE;
 
     if( cmd_info->dbg_tool_info.mode == PPA_CMD_DBG_TOOL_LOW_MEM_TEST )
     {  /*currently once the memory is allocated, there is no way to free it any more */
-        uint8_t *pBuf = NULL;
         uint32_t  left_size = cmd_info->dbg_tool_info.value.size * 1000; 
         uint32_t  blocksize = left_size; 
         #define MIN_DBG_TOOL_TEST_BLK_SIZE  10000  /*bytes */
@@ -512,9 +511,11 @@ int32_t ppa_ioctl_dbg_tool_test(unsigned int cmd, unsigned long arg, PPA_CMD_DAT
     if ( ppa_copy_to_user( (void *) arg, &cmd_info->dbg_tool_info, sizeof(cmd_info->dbg_tool_info)) != 0 )
     {
         ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "ppa_copy_to_user failed \n");
-        return PPA_FAILURE;
+        ppa_free(pBuf); 
+	return PPA_FAILURE;
     }
     
+    ppa_free(pBuf); 
     return res;
 
 }

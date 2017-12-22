@@ -416,7 +416,12 @@ extern int32_t ppa_directlink_get_status (uint32_t flag);
 
 extern uint32_t ppa_dl_qca_h2t_ring_init ( uint32_t h2tRingSize, uint32_t entrySize,uint32_t src_ring_base,uint32_t pcie_base, uint32_t flags );
 
-extern uint32_t ppa_dl_qca_cpu_h2t_ring_init (uint32_t h2tCpuMsgRingSize, uint32_t entrySize, uint32_t flags);
+extern uint32_t ppa_dl_qca_cpu_h2t_ring_init (uint32_t h2tCpuMsgRingSize, uint32_t entrySize, uint32_t flags
+#if defined(CONFIG_ACCL_11AC_CS2)
+,
+uint32_t irq_base
+#endif
+);
 
  extern int32_t ppa_dl_qca_cpu_h2t_ring_get_write_idx (uint32_t flags);
 

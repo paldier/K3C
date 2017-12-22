@@ -57,7 +57,7 @@
 #endif
 
 #ifndef VLAN_VAP_QOS     //if not defined in kernel's .configure file, then use local's definition
-#define VLAN_VAP_QOS               0
+#define VLAN_VAP_QOS               1
 #endif
 
 #ifndef WMM_QOS_CONFIG     //if not defined in kernel's .configure file, then use local's definition

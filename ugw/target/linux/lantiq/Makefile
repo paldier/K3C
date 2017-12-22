@@ -12,7 +12,7 @@ FEATURES:=squashfs jffs2
 DEFAULT_SUBTARGET:=danube
 VENDOR_PATH="/opt/lantiq"
 
-LINUX_VERSION:=3.10.102
+LINUX_VERSION:=3.10.104
 
 CFLAGS=-Os -pipe -mips32r2 -mno-branch-likely
 

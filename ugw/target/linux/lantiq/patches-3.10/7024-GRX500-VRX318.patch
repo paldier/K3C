@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 3ff3382ea6eac32a2b67d9a30a53d88c7604d854
+# Parent 3677b3d49b8fe5adceb427d61cf444156f12b971
 
 diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
 --- a/drivers/net/ethernet/lantiq/Kconfig
@@ -55,16 +55,13 @@ diff --git a/drivers/net/ethernet/lantiq/vrx318/Makefile b/drivers/net/ethernet/
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/vrx318/Makefile
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,6 @@
 +#
 +# Makefile for VRX318 driver
 +#
-+obj-$(CONFIG_VRX318_DATAPATH) += vrx318_common.o
 +obj-$(CONFIG_VRX318_TC) += vrx318_tc.o
 +
-+
-+vrx318_tc-objs = vrx318.o vrx318_atm_tc.o vrx318_ptm_tc.o vrx318_api.o vrx318_proc.o
-+
++vrx318_tc-objs = vrx318.o vrx318_common.o vrx318_atm_tc.o vrx318_ptm_tc.o vrx318_api.o vrx318_proc.o
 diff --git a/drivers/net/ethernet/lantiq/vrx318/fw/vrx318_a1plus.h b/drivers/net/ethernet/lantiq/vrx318/fw/vrx318_a1plus.h
 new file mode 100755
 --- /dev/null
@@ -3717,8 +3714,8 @@ new file mode 100644
 +#define ATM_OAM_SIZE		64
 +
 +/* align is required because buffer may allocated in pdb ram */
-+#define ATM_TXQ_NUM(qos_en)	((qos_en) ? (QOSQ_NUM / 2) : QOSQ_NUM)
-+#define ATM_PVC_NUM(qos_en) ((qos_en) ? (QOSQ_NUM / 2) : ATM_PVC_NUMBER)
++#define ATM_TXQ_NUM(qos_en)	((qos_en) ? (QOSQ_NUM / (qos_en)) : QOSQ_NUM)
++#define ATM_PVC_NUM(qos_en) 	((qos_en) ? (QOSQ_NUM / (qos_en)) : ATM_PVC_NUMBER)
 +#define DESC_QID(qid)		(((qid) & 0xF) << 3)
 +/* Pass Through (No AAL5 encapsulation required) */
 +#define DESC_MPOA_PT(pt)	(((pt) & 0x1) << 2)
@@ -4180,7 +4177,7 @@ new file mode 100755
 +
 +#define BC0_LINK_STATUS			PPE_REG_ADDR(0x0DC0)
 +#define DSL_TC_INDICATE			PPE_REG_ADDR(0x0DC4)
-+#define PPE_TC_SWITCH			PPE_REG_ADDR(0x0DC5)
++#define PPE_BC0_CW_SIZE			PPE_REG_ADDR(0x0DC5)
 +
 +/* SAR/PDMA REG*/
 +#define PPE_SAR_PDMA_RX_CMDBUF_CFG	PPE_REG_ADDR(0x0F00)
@@ -10725,7 +10722,7 @@ diff --git a/drivers/net/ethernet/lantiq/vrx318/include/vrx318_framework.h b/dri
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/vrx318/include/vrx318_framework.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,143 @@
 +/*
 + *  This program is free software; you can redistribute it and/or modify it
 + *  under the terms of the GNU General Public License version 2 as published
@@ -10765,8 +10762,8 @@ new file mode 100644
 +	unsigned int lle_in_sb:1;
 +	unsigned int pmac_en:1;
 +	unsigned int dfe_loopback:1;
-+	unsigned int atm_qos:1;
-+	unsigned int res0:26;
++	unsigned int atm_qos:3;
++	unsigned int res0:24;
 +
 +	int q_gamma_map[4];
 +	int qsb_tau;
@@ -10776,6 +10773,12 @@ new file mode 100644
 +	int aal5r_min_pktsz;
 +	int aal5s_max_pktsz;
 +	int oam_prio;
++};
++
++struct tc_req {
++	struct work_struct work;
++	u32 id;
++	enum dsl_tc_mode tc_mode;
 +};
 +
 +/* Please note, any HW specific/related paramter must be accessed via MACRO.
@@ -10797,6 +10800,7 @@ new file mode 100644
 +	dp_cb_t	cb; /* Datapath library callback function set */
 +	void *tc_priv;
 +	struct vrx318_param param;
++	struct tc_req tc_wkq;
 +	spinlock_t fw_lock; /* Framework lock */
 +};
 +
@@ -10822,9 +10826,7 @@ new file mode 100644
 +#define DBG_QOS		BIT(12)
 +#define DBG_TC_SWITCH	BIT(13)
 +#define DBG_LOOPBACK	BIT(14)
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
 +#define DBG_COC		BIT(15)
-+#endif
 +
 +extern u32 g_vrx318_dbg;
 +
@@ -10847,11 +10849,7 @@ new file mode 100644
 +				| DBG_EVENT | DBG_TC_SWITCH)
 +
 +
-+extern void vrx318_cb_setup(void *, void *, void *, void *
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
-+	, void *
-+#endif
-+);
++extern void vrx318_cb_setup(void *, void *, void *, void *, void *);
 +extern int vrx318_unload_atm_tc(struct vrx318_priv *, int);
 +extern int max_pvc_num(u32);
 +extern void vrx318_atm_param_setup(struct vrx318_priv *, int, int,
@@ -12063,7 +12061,7 @@ diff --git a/drivers/net/ethernet/lantiq/vrx318/include/vrx318_ptm_tc.h b/driver
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/vrx318/include/vrx318_ptm_tc.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,78 @@
 +/*
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms of the GNU General Public License version 2 as published
@@ -12101,6 +12099,7 @@ new file mode 100644
 +
 +#define PTM_PRIO_Q_NUM		8
 +#define PTM_DESC_QID(qid) (((qid) & 0xF) << 3)
++#define CW_PAGE_SZ		65
 +
 +struct vrx318_priv;
 +struct vrx318_ptm_bnd {
@@ -12127,7 +12126,7 @@ new file mode 100644
 +	struct net_device *dev;
 +	dp_cb_t	ptm_cb;
 +	spinlock_t ptm_lock;
-+	struct net_device_stats stats;
++	struct rtnl_link_stats64 stats;
 +	struct vrx318_ptm_hw_mib ptm_mib[MAX_VRX318_NUM];
 +	int subif_id;
 +	int ptm_prio_queue_map[PTM_PRIO_Q_NUM];
@@ -12136,6 +12135,8 @@ new file mode 100644
 +
 +extern int ptm_in_showtime(void);
 +extern int ptm_power_saving(struct vrx318_ptm_tc *, int, int);
++extern int ptm_qos_qnum(void);
++extern u32 ptm_qos_mib_base(void);
 +
 +#endif /* __VRX318_PTM_TC_H__ */
 +
@@ -12143,7 +12144,7 @@ diff --git a/drivers/net/ethernet/lantiq/vrx318/vrx318.c b/drivers/net/ethernet/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/vrx318/vrx318.c
-@@ -0,0 +1,636 @@
+@@ -0,0 +1,646 @@
 +/*
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms of the GNU General Public License version 2 as published
@@ -12219,11 +12220,11 @@ new file mode 100644
 +MODULE_SUPPORTED_DEVICE("LTQ CPE SmartPHY PCIe EP for Devices GRX35X, GRX5XX");
 +
 +#define DRV_MODULE_NAME	"VRX318_DRIVER"
-+#define DRV_MODULE_VERSION "2.0.4"
++#define DRV_MODULE_VERSION "2.0.8"
 +static int queue_gamma_map[4] = {0x00FF, 0x0000, 0x0000, 0x0000};
 +static int p2p_en;
 +static int loopback_en;
-+static int atm_qos;
++static int qos_en;
 +static int oam_prio;
 +static int qsb_tau = 1;	/*  QSB cell delay variation due to concurrency */
 +static int qsb_srvm = 0x0F; /*  QSB scheduler burst length */
@@ -12236,8 +12237,8 @@ new file mode 100644
 +MODULE_PARM_DESC(queue_gamma_map, "TX QoS queues mapping to 4 TX Gamma interfaces.");
 +module_param(oam_prio, int, 0444);
 +MODULE_PARM_DESC(oam_prio, "OAM Priority (0 to max queue number id (7/15)).");
-+module_param(atm_qos, int, 0444);
-+MODULE_PARM_DESC(atm_qos, "ATM QoS Enable/Disable. if Enable, only support up to 8 PVCs.");
++module_param(qos_en, int, 0444);
++MODULE_PARM_DESC(qos_en, "QoS queue divider. (ATM: 0/1/2, PTM: 0/1/2)");
 +module_param(p2p_en, int, 0444);
 +MODULE_PARM_DESC(p2p_en, "PTM Bonding directly access Peer Enable flag.");
 +module_param(loopback_en, int, 0444);
@@ -12289,18 +12290,13 @@ new file mode 100644
 +
 +void vrx318_cb_setup(void *rx_fn, void *stop_fn,
 +	void *restart_fn, void *get_subifid_fn
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
-+	, void *coc_confirm_stat_fn
-+#endif
-+	)
++	, void *coc_confirm_stat_fn)
 +{
 +	vrx318_rx_fn = rx_fn;
 +	vrx318_stop_fn = stop_fn;
 +	vrx318_restart_fn = restart_fn;
 +	vrx318_get_subifid_fn = get_subifid_fn;
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
 +	vrx318_coc_confirm_stat_fn = coc_confirm_stat_fn;
-+#endif
 +}
 +
 +static int pcie_ep_probe(struct vrx318_priv *pcie_ep)
@@ -12357,18 +12353,25 @@ new file mode 100644
 +	cfg->dfe_loopback = loopback_en;
 +	cfg->lle_in_sb = LLE_IN_PDBRAM ? 0 : 1;
 +	cfg->p2p_en = p2p_en;
-+	cfg->atm_qos = atm_qos;
-+	if (oam_prio < 0 || oam_prio >= max_pvc_num(atm_qos))
++	qos_en = qos_en & 0x7;
++
++	if (!qos_en)
++		cfg->atm_qos = 1;
++	else {
++		for (i = 1; (qos_en >> i) != 0; i++)
++			;
++		cfg->atm_qos = BIT(i);
++	}
++	if (!cfg->atm_qos)
++		cfg->atm_qos = 1;
++
++	if (oam_prio < 0 || oam_prio >= max_pvc_num(cfg->atm_qos))
 +		cfg->oam_prio = 0;
 +	else
 +		cfg->oam_prio = oam_prio;
 +
 +	priv->pdev = priv->ep_dev[0].dev;
-+	vrx318_cb_setup(NULL, NULL, NULL, NULL
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
-+	, NULL
-+#endif
-+	);
++	vrx318_cb_setup(NULL, NULL, NULL, NULL, NULL);
 +
 +	if (IS_ENABLED(CONFIG_USE_EMULATOR))
 +		priv->param.dfe_loopback = 1;
@@ -12479,7 +12482,6 @@ new file mode 100644
 +	return ret;
 +}
 +
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
 +static int32_t vrx318_coc_confirm_stat(enum ltq_cpufreq_state new_state,
 +	enum ltq_cpufreq_state old_state,
 +	uint32_t flags)
@@ -12505,17 +12507,12 @@ new file mode 100644
 +	return ret;
 +}
 +
-+#endif
 +int vrx318_unload_tc(struct vrx318_priv *priv, int ep_id)
 +{
 +	int err = 0;
 +
 +	/* Unload Callback function in Framework */
-+	vrx318_cb_setup(NULL, NULL, NULL, NULL
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
-+	, NULL
-+#endif
-+	);
++	vrx318_cb_setup(NULL, NULL, NULL, NULL, NULL);
 +
 +	if (priv->tc_mode[ep_id] == TC_ATM_SL_MODE)
 +		err = vrx318_unload_atm_tc(priv, ep_id);
@@ -12618,6 +12615,15 @@ new file mode 100644
 +
 +}
 +
++static void vrx318_req_workqueue(struct work_struct *wk)
++{
++	struct tc_req *req_work;
++
++	req_work = container_of(wk, struct tc_req, work);
++	vrx318_tc_switch(g_vrx318_priv, req_work->id, req_work->tc_mode);
++}
++
++
 +/**
 + * API defintion for the DSL MEI driver to call to do TC switch
 + * line_no: the DSL line number
@@ -12654,7 +12660,11 @@ new file mode 100644
 +		return -EINVAL;
 +	}
 +
-+	return vrx318_tc_switch(priv, line_no, tc_mode);
++	priv->tc_wkq.id = line_no;
++	priv->tc_wkq.tc_mode = tc_mode;
++	queue_work(system_wq, &priv->tc_wkq.work);
++	
++	return 0;
 +}
 +
 +static void print_ver(const char *name, const char *ver)
@@ -12698,9 +12708,8 @@ new file mode 100644
 +	priv->cb.restart_fn	= vrx318_restart;
 +	priv->cb.rx_fn		= vrx318_rx;
 +	priv->cb.get_subifid_fn = vrx318_get_subifid;
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
 +	priv->cb.dp_coc_confirm_stat_fn = vrx318_coc_confirm_stat;
-+#endif
++
 +	if (dp_register_dev(priv->owner, dp_id, &priv->cb, 0) != DP_SUCCESS) {
 +		vrx318_dbg(DBG_ERR, "%s:dp_register_dev failed for port id %d",
 +			__func__, dp_id);
@@ -12710,6 +12719,7 @@ new file mode 100644
 +	vrx318_dbg(DBG_INFO, "DP register VRX318 successfully, dp_id: %d\n",
 +		dp_id);
 +
++	INIT_WORK(&priv->tc_wkq.work, vrx318_req_workqueue);
 +	print_ver(DRV_MODULE_NAME, DRV_MODULE_VERSION);
 +	vrx318_dbg(DBG_INFO, "Total %d device are detected\n", priv->ep_num);
 +
@@ -12745,6 +12755,7 @@ new file mode 100644
 +	g_vrx318_priv = NULL;
 +	spin_unlock_bh(&priv->fw_lock);
 +
++	cancel_work_sync(&priv->tc_wkq.work);
 +	for (i = 0; i < priv->ep_num; i++) {
 +		if (priv->tc_mode[i] != TC_NONE_MODE) {
 +			vrx318_unload_tc(priv, i);
@@ -13408,7 +13419,7 @@ diff --git a/drivers/net/ethernet/lantiq/vrx318/vrx318_atm_tc.c b/drivers/net/et
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/vrx318/vrx318_atm_tc.c
-@@ -0,0 +1,3527 @@
+@@ -0,0 +1,3530 @@
 +/*
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms of the GNU General Public License version 2 as published
@@ -13950,6 +13961,7 @@ new file mode 100644
 +			priv->port[i].dev->link_rate = DEFAULT_CELL_RATE;
 +			priv->port[i].dev->dev_data = priv;
 +			priv->port[i].dev->phy_data = (void *)(unsigned long)i;
++			atm_dev_signal_change(priv->port[i].dev, ATM_PHY_SIG_LOST);
 +		}
 +	}
 +
@@ -14729,11 +14741,10 @@ new file mode 100644
 + */
 +static void vrx318_ppe_atm_init(struct vrx318_atm_tc *priv, int qsb_en)
 +{
-+	u32 base, qos_en;
++	u32 base;
 +	struct vrx318_priv *frwk = priv->frwk;
 +
 +	base = (u32)frwk->ep_dev[priv->ep_id].membase;
-+	qos_en = frwk->param.atm_qos;
 +
 +	vrx318_sb_clear(base);
 +	vrx318_atm_pdma_init(base);
@@ -15610,6 +15621,7 @@ new file mode 100644
 +			line_idx, priv->frwk->tc_stat);
 +	spin_unlock_bh(&priv->frwk->fw_lock);
 +
++    atm_dev_signal_change(priv->port[line_idx].dev, ATM_PHY_SIG_FOUND);
 +	vrx318_dbg(DBG_INFO, "ATM line[%d]:enter showtime, cell rate: 0 - %d, 1 - %d\n",
 +		line_idx, priv->port[0].tx_max_cell_rate,
 +		priv->port[1].tx_max_cell_rate);
@@ -15627,6 +15639,7 @@ new file mode 100644
 +		CBM_F_DPATH_DISABLE);
 +	*/
 +
++    atm_dev_signal_change(g_atm_tc->port[line_idx].dev, ATM_PHY_SIG_LOST);
 +	vrx318_dbg(DBG_INFO, "ATM line[%d]:leave showtime\n", line_idx);
 +
 +	return 0;
@@ -15920,6 +15933,8 @@ new file mode 100644
 +	vrx318_cb_setup(atm_push, NULL, NULL, atm_get_qid_by_vcc
 +#ifdef CONFIG_LTQ_VRX318_CPUFREQ
 +		, atm_coc_confirm_stat
++#else
++		, NULL
 +#endif
 +	);
 +
@@ -16069,7 +16084,7 @@ new file mode 100644
 +	for (i = 0; i < TOTAL_QOS_DES_NUM; i++) {
 +		phy_addr = vrx318_r32_sb(__US_QOSQ_DES_LIST_BASE + (i * 2) + 1,
 +					base) - VRX318_OB_BADDR;
-+		cbm_buffer_free(0, phy_addr, 0);
++		cbm_buffer_free(0, phy_addr, 1);
 +	}
 +
 +	/* Free DS AAL5 buffers, not required in GRX350 */
@@ -16145,7 +16160,6 @@ new file mode 100644
 +
 +	/* Indicate PPE FW to stop */
 +	priv->comp.done = 0;
-+	vrx318_w32(1, PPE_TC_SWITCH, base);
 +	err = wait_for_completion_timeout(&priv->comp,
 +			msecs_to_jiffies(FW_STOP_TIMEOUT));
 +
@@ -17129,7 +17143,7 @@ diff --git a/drivers/net/ethernet/lantiq/vrx318/vrx318_proc.c b/drivers/net/ethe
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/vrx318/vrx318_proc.c
-@@ -0,0 +1,1523 @@
+@@ -0,0 +1,1614 @@
 +#include <linux/fs.h>
 +#include <linux/seq_file.h>
 +#include <net/datapath_proc_api.h>
@@ -17171,9 +17185,7 @@ new file mode 100644
 +	"qos",
 +	"tc",
 +	"loopback",
-+#ifdef CONFIG_LTQ_VRX318_CPUFREQ
 +	"coc"
-+#endif
 +};
 +
 +static int proc_read_atm_cfg(struct seq_file *seq, void *v)
@@ -17762,7 +17774,7 @@ new file mode 100644
 +	int queue = -1;
 +	int ret, num;
 +	int i;
-+	char *param_list[20];
++	char *param_list[64];
 +
 +	len = sizeof(local_buf) < count ? sizeof(local_buf) - 1 : count;
 +	len = len - copy_from_user(local_buf, buf, len);
@@ -18073,8 +18085,7 @@ new file mode 100644
 +		priv->param.lle_in_sb ? "Enable" : "Disable");
 +	seq_printf(seq, "PMAC Enable: %s\n",
 +		priv->param.pmac_en ? "Yes" : "No");
-+	seq_printf(seq, "ATM QOS: %s\n",
-+		priv->param.atm_qos ? "Yes" : "No");
++	seq_printf(seq, "ATM QOS number: %d\n", ATM_PVC_NUM(priv->param.atm_qos));
 +	seq_printf(seq, "DP ID: %d\n", priv->port_id);
 +
 +	seq_puts(seq, "ATM parameters:\n");
@@ -18508,14 +18519,15 @@ new file mode 100644
 +	char *p1;
 +	int prio = -1;
 +	int queue = -1;
-+	int num;
++	int num, qnum;
 +	int i;
-+	char *param_list[20];
++	char *param_list[64];
 +
 +	len = sizeof(local_buf) < count ? sizeof(local_buf) - 1 : count;
 +	len = len - copy_from_user(local_buf, buf, len);
 +	local_buf[len] = 0;
 +	p1 = local_buf;
++	qnum = ptm_qos_qnum();
 +
 +	num = dp_split_buffer(local_buf, param_list, ARRAY_SIZE(param_list));
 +	priv =  (struct vrx318_ptm_tc *)PDE_DATA(file_inode(file));
@@ -18535,8 +18547,8 @@ new file mode 100644
 +			else
 +				vrx318_dbg(DBG_ERR, "Error: expecting queue\n");
 +
-+			if (queue < 0 || queue >= PTM_PRIO_Q_NUM
-+				|| prio < 0 || prio >= PTM_PRIO_Q_NUM) {
++			if (queue < 0 || queue >= qnum
++				|| prio < 0 || prio >= qnum) {
 +				vrx318_dbg(DBG_ERR, "%s: invalid parameter: prio: %d, queue: %d\n",
 +					__func__, prio, queue);
 +				goto proc_ptm_prio_help;
@@ -18555,16 +18567,18 @@ new file mode 100644
 +
 +static int proc_ptm_read_prio(struct seq_file *seq, void *v)
 +{
-+	int i;
++	int i, qnum;
 +	struct vrx318_ptm_tc *priv = (struct vrx318_ptm_tc *)seq->private;
-+		seq_puts(seq, "\n   Prio: ");
-+		for (i = 0; i < PTM_PRIO_Q_NUM; i++)
-+			seq_printf(seq, "%d ", i);
-+			seq_puts(seq, "\n   Qid:  ");
-+		for (i = 0; i < PTM_PRIO_Q_NUM; i++)
-+			seq_printf(seq, "%d ",
-+				priv->ptm_prio_queue_map[i]);
-+			seq_puts(seq, "\n");
++	qnum = ptm_qos_qnum();
++
++	seq_puts(seq, "\n   Prio: ");
++	for (i = 0; i < qnum; i++)
++		seq_printf(seq, "%d ", i);
++		seq_puts(seq, "\n   Qid:  ");
++	for (i = 0; i < qnum; i++)
++		seq_printf(seq, "%d ",
++			priv->ptm_prio_queue_map[i]);
++		seq_puts(seq, "\n");
 +	return 0;
 +}
 +
@@ -18579,6 +18593,89 @@ new file mode 100644
 +	.read		= seq_read,
 +	.llseek		= seq_lseek,
 +	.write		= proc_ptm_write_prio,
++	.release	= single_release,
++};
++
++ssize_t proc_ptm_write_qos(struct file *file, const char __user *buf,
++				size_t count, loff_t *data)
++{
++	struct vrx318_ptm_tc *priv;
++	char local_buf[256];
++	int len;
++	char *p1;
++	int num, idx, qnum;
++	u32 base, addr;
++	char *param_list[64];
++
++	qnum = ptm_qos_qnum();
++
++	len = sizeof(local_buf) < count ? sizeof(local_buf) - 1 : count;
++	len = len - copy_from_user(local_buf, buf, len);
++	local_buf[len] = 0;
++	p1 = local_buf;
++	
++	num = dp_split_buffer(local_buf, param_list, ARRAY_SIZE(param_list));
++	priv =  (struct vrx318_ptm_tc *)PDE_DATA(file_inode(file));
++	idx = priv->ep_id;
++	base = (u32)priv->frwk->ep_dev[idx].membase;
++
++	if ((dp_strcmpi(param_list[0], "clear") == 0)
++		|| (dp_strcmpi(param_list[0], "clean") == 0)
++		|| (dp_strcmpi(param_list[0], "c") == 0)) {
++	}
++
++	addr = ptm_qos_mib_base();
++	if (dp_strcmpi(param_list[0], "help") == 0)
++		goto proc_ptm_qos_help;
++	else
++		dword_ep_clear(SB_BUFFER(addr), sizeof(qosq_mib_t) * qnum, base);
++
++	return count;
++
++proc_ptm_qos_help:
++	vrx318_dbg(DBG_INFO, "echo clear > qos\n");
++	return count;
++}
++
++static int proc_ptm_read_qos(struct seq_file *seq, void *v)
++{
++	int i, qnum;
++	struct vrx318_ptm_tc *priv = (struct vrx318_ptm_tc *)seq->private;
++	u32 base = (u32)priv->frwk->ep_dev[priv->ep_id].membase;
++	qosq_mib_t mib;
++	u32 addr;
++
++	qnum = ptm_qos_qnum();
++	addr = ptm_qos_mib_base();
++
++	seq_printf(seq, "\nTotal QoS Qnum: %d\n", qnum);
++	seq_puts(seq, "\t rx_pkt/rx_bytes \t tx_pkt/tx_bytes \t small_drop[cnt/bytes] \t large_drop[cnt/bytes] \t address\n");
++	for (i = 0; i < qnum; i++) {
++		dword_mem_read(&mib,
++			SB_BUFFER(addr + (i * sizeof(mib) / 4)),
++			sizeof(mib), base);
++		seq_printf(seq, "Q[%d]:\t %010u/%010u \t %010u/%010u \t %010u/%010u \t %010u/%010u \t @0x%4x\n",
++			i, mib.rx_pkt_cnt, mib.rx_byte_cnt,
++			mib.tx_pkt_cnt, mib.tx_byte_cnt,
++			mib.small_pkt_drop_cnt, mib.small_pkt_drop_byte_cnt,
++			mib.large_pkt_drop_cnt, mib.large_pkt_drop_byte_cnt,
++			addr + (i * sizeof(mib) / 4));
++	}
++
++	return 0;
++}
++
++static int proc_ptm_read_qos_seq_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, proc_ptm_read_qos, PDE_DATA(inode));
++}
++
++static const struct file_operations vrx318_ptm_qos_proc_fops = {
++	.owner		= THIS_MODULE,
++	.open		= proc_ptm_read_qos_seq_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.write		= proc_ptm_write_qos,
 +	.release	= single_release,
 +};
 +
@@ -18622,9 +18719,16 @@ new file mode 100644
 +	if (!entry)
 +		goto err6;
 +
++	entry = proc_create_data("qos", 0644,
++			vrx318_dir, &vrx318_ptm_qos_proc_fops, (void *)priv);
++	if (!entry)
++		goto err7;
++
 +	priv->proc_dir = vrx318_dir;
 +	return 0;
 +
++err7:
++	remove_proc_entry("prio", vrx318_dir);
 +err6:
 +	remove_proc_entry("cfg", vrx318_dir);
 +err5:
@@ -18650,6 +18754,7 @@ new file mode 100644
 +	remove_proc_entry("mem", priv->proc_dir);
 +	remove_proc_entry("pp32", priv->proc_dir);
 +	remove_proc_entry("prio", priv->proc_dir);
++	remove_proc_entry("qos", priv->proc_dir);
 +	remove_proc_entry("ptm", priv->frwk->proc_dir);
 +}
 +EXPORT_SYMBOL(vrx318_ptm_proc_exit);
@@ -18657,7 +18762,7 @@ diff --git a/drivers/net/ethernet/lantiq/vrx318/vrx318_ptm_tc.c b/drivers/net/et
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/vrx318/vrx318_ptm_tc.c
-@@ -0,0 +1,2990 @@
+@@ -0,0 +1,3026 @@
 +/*
 + * This program is free software; you can redistribute it and/or modify it
 + * under the terms of the GNU General Public License version 2 as published
@@ -18732,7 +18837,8 @@ new file mode 100644
 +
 +static int ptm_open(struct net_device *);
 +static int ptm_stop(struct net_device *);
-+static struct net_device_stats *ptm_get_stats(struct net_device *);
++static struct rtnl_link_stats64 *ptm_get_stats (struct net_device *dev,
++		struct rtnl_link_stats64 *storage);
 +static int ptm_set_mac_address(struct net_device *, void *);
 +static void ptm_tx_timeout(struct net_device *);
 +static int ptm_ioctl(struct net_device *, struct ifreq *, int);
@@ -18794,7 +18900,7 @@ new file mode 100644
 +static struct net_device_ops g_ptm_netdev_ops = {
 +	.ndo_open		= ptm_open,
 +	.ndo_stop		= ptm_stop,
-+	.ndo_get_stats		= ptm_get_stats,
++	.ndo_get_stats64	= ptm_get_stats,
 +	.ndo_set_mac_address	= ptm_set_mac_address,
 +	.ndo_start_xmit		= ptm_xmit,
 +	.ndo_tx_timeout		= ptm_tx_timeout,
@@ -18846,11 +18952,19 @@ new file mode 100644
 +	return 0;
 +}
 +
-+static struct net_device_stats *ptm_get_stats(struct net_device *dev)
++static struct rtnl_link_stats64 *ptm_get_stats (struct net_device *dev,
++	struct rtnl_link_stats64 *storage)
 +{
-+	struct vrx318_ptm_tc *priv = netdev_priv(dev);
++	struct vrx318_ptm_tc *priv;
++	
++	priv = netdev_priv(dev);
++	if (IS_ENABLED(CONFIG_LTQ_DATAPATH_MIB)) {
++		dp_get_netif_stats(dev, NULL, storage, 0);
++		storage->tx_errors += priv->stats.tx_errors;
++	} else 
++		*storage = priv->stats;
 +
-+	return &priv->stats;
++	return storage;
 +}
 +
 +static int ptm_set_mac_address(struct net_device *dev, void *p)
@@ -18909,6 +19023,7 @@ new file mode 100644
 +		return -EINVAL;
 +
 +	priv->show_time_stat[line_idx] = 1;
++    netif_carrier_on(g_ptm_tc->dev);
 +	return 0;
 +}
 +
@@ -18921,6 +19036,7 @@ new file mode 100644
 +		return -EINVAL;
 +
 +	priv->show_time_stat[line_idx] = 0;
++    netif_carrier_off(g_ptm_tc->dev);
 +	return 0;
 +}
 +
@@ -18980,11 +19096,24 @@ new file mode 100644
 +		"skb: nfrag: %d\n", skb_shinfo(skb)->nr_frags);
 +}
 +
++int ptm_qos_qnum()
++{
++	if (!g_ptm_tc)
++		return PTM_PRIO_Q_NUM;
++	return PTM_PRIO_Q_NUM / g_ptm_tc->frwk->param.atm_qos;
++}
++
++u32 ptm_qos_mib_base()
++{
++	return __QOSQ_MIB_BASE;
++}
++
 +static int ptm_xmit(struct sk_buff *skb, struct net_device *dev)
 +{
 +	struct vrx318_ptm_tc *priv = netdev_priv(dev);
 +	dp_subif_t dp_id;
 +	int qid, prio;
++	int qnum;
 +
 +	if (!ptm_in_showtime())
 +		goto PTM_XMIT_DROP;
@@ -18994,8 +19123,9 @@ new file mode 100644
 +
 +	dump_skb_info(skb);
 +
-+	prio = skb->priority < PTM_PRIO_Q_NUM ?
-+			skb->priority : PTM_PRIO_Q_NUM - 1;
++	qnum = ptm_qos_qnum();
++	prio = skb->priority < qnum ?
++			skb->priority : qnum - 1;
 +	qid = priv->ptm_prio_queue_map[prio];
 +	dp_id.subif = priv->subif_id | PTM_DESC_QID(qid);
 +	/* Set EP */
@@ -19098,16 +19228,19 @@ new file mode 100644
 +			dp_subif_t *subif, uint32_t flags)
 +{
 +	struct vrx318_ptm_tc *priv = g_ptm_tc;
-+	int qid, prio;
++	int qid, prio, qnum;
++
 +	if (subif->port_id != priv->frwk->port_id) {
 +		vrx318_dbg(DBG_ERR,
 +			"%s: Port_id not compliance: Input: %d, Local: %d\n",
 +			__func__, subif->port_id, priv->frwk->port_id);
 +		return -EINVAL;
 +	}
++
++	qnum = ptm_qos_qnum();
 +	if (skb)
-+			prio = skb->priority < PTM_PRIO_Q_NUM ?
-+					skb->priority : PTM_PRIO_Q_NUM - 1;
++			prio = skb->priority < qnum ?
++					skb->priority : qnum - 1;
 +	else
 +			prio = 0;
 +	qid = priv->ptm_prio_queue_map[prio];
@@ -19168,6 +19301,7 @@ new file mode 100644
 +		goto err1;
 +
 +	g_ptm_tc = priv;
++	netif_carrier_off(dev);
 +
 +	return 0;
 +err1:
@@ -19244,6 +19378,10 @@ new file mode 100644
 +
 +	vrx318_w32(0x00030050, PPE_FFSM_CFG0, base);
 +	vrx318_w32(0x00030050, PPE_FFSM_CFG1, base);
++
++	val = (((0x70 * CW_PAGE_SZ) << 16) |
++		(0x50 * CW_PAGE_SZ));
++	vrx318_w32(val, PPE_BC0_CW_SIZE, base);
 +
 +	return;
 +}
@@ -20146,18 +20284,20 @@ new file mode 100644
 +	int offset, i;
 +	rx_descriptor_t rx_desc;
 +	dma_addr_t phy_addr;
++	u32 qnum;
 +
 +	if ((is_bonding == 1) && (ep_id == DS_BONDING_MASTER))
 +		return;
 +
 +	/* Setup QoSQ_CFG_CTXT */
 +	dword_clear(&qosq_cfg_ctxt, sizeof(qosq_cfg_ctxt));
++	qnum = QOSQ_NUM / priv->frwk->param.atm_qos;
 +
 +	qosq_cfg_ctxt.threshold = 8;
-+	qosq_cfg_ctxt.des_num	= TOTAL_QOS_DES_NUM / QOSQ_NUM;
++	qosq_cfg_ctxt.des_num	= TOTAL_QOS_DES_NUM / qnum;
 +
 +	offset = 0;
-+	for (i = 0; i < QOSQ_NUM; i++) {
++	for (i = 0; i < qnum; i++) {
 +		qosq_cfg_ctxt.des_base_addr = __US_QOSQ_DES_LIST_BASE + offset;
 +		dword_mem_write(SB_BUFFER((__QOSQ_CFG_CTXT_BASE + (i * __QOSQ_CFG_CTXT_SIZE))),
 +			&qosq_cfg_ctxt, sizeof(qosq_cfg_ctxt), base);
@@ -21116,6 +21256,8 @@ new file mode 100644
 +	vrx318_cb_setup(ptm_dp_rx, ptm_dp_stop_tx, ptm_dp_restart_tx, ptm_get_subif_id
 +#ifdef CONFIG_LTQ_VRX318_CPUFREQ
 +		, ptm_coc_confirm_stat
++#else
++		, NULL
 +#endif
 +	);
 +	ppa_callback_set(LTQ_MEI_SHOWTIME_ENTER, ptm_showtime_enter);
@@ -21353,7 +21495,6 @@ new file mode 100644
 +
 +	/* Indicate PPE FW to stop */
 +	priv->comp.done = 0;
-+	vrx318_w32(1, PPE_TC_SWITCH, base);
 +	err = wait_for_completion_timeout(&priv->comp,
 +			msecs_to_jiffies(FW_STOP_TIMEOUT));
 +
@@ -21425,14 +21566,14 @@ new file mode 100644
 +{
 +	seq_puts(seq, "Driver MIB:\n");
 +
-+	seq_printf(seq, "RX PKTs:\t %lu\n", priv->stats.rx_packets);
-+	seq_printf(seq, "RX Bytes:\t %lu\n", priv->stats.rx_bytes);
-+	seq_printf(seq, "RX Error:\t %lu\n", priv->stats.rx_errors);
-+	seq_printf(seq, "RX Drop:\t %lu\n\n", priv->stats.rx_dropped);
-+	seq_printf(seq, "TX PKTs:\t %lu\n", priv->stats.tx_packets);
-+	seq_printf(seq, "TX Bytes:\t %lu\n", priv->stats.tx_bytes);
-+	seq_printf(seq, "TX Err:\t %lu\n", priv->stats.tx_errors);
-+	seq_printf(seq, "TX Drop:\t %lu\n", priv->stats.tx_dropped);
++	seq_printf(seq, "RX PKTs:\t %lu\n", (unsigned long)priv->stats.rx_packets);
++	seq_printf(seq, "RX Bytes:\t %lu\n", (unsigned long)priv->stats.rx_bytes);
++	seq_printf(seq, "RX Error:\t %lu\n", (unsigned long)priv->stats.rx_errors);
++	seq_printf(seq, "RX Drop:\t %lu\n\n", (unsigned long)priv->stats.rx_dropped);
++	seq_printf(seq, "TX PKTs:\t %lu\n", (unsigned long)priv->stats.tx_packets);
++	seq_printf(seq, "TX Bytes:\t %lu\n", (unsigned long)priv->stats.tx_bytes);
++	seq_printf(seq, "TX Err:\t %lu\n", (unsigned long)priv->stats.tx_errors);
++	seq_printf(seq, "TX Drop:\t %lu\n", (unsigned long)priv->stats.tx_dropped);
 +}
 +
 +int proc_read_ptm_wanmib(struct seq_file *seq, void *v)

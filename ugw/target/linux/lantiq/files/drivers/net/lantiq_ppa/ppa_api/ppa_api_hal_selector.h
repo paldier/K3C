@@ -51,6 +51,8 @@
  * ####################################
  */
 
+// check if a session has hals registered for all its capabilities
+extern int32_t ppa_is_hal_registered_for_all_caps(struct session_list_item *p_item);
 
 // unicast routing entries
 extern int32_t ppa_hsel_add_routing_session(struct session_list_item *p_item, uint32_t f_test);

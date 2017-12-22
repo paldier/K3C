@@ -51,43 +51,61 @@ ver_toolchain()
 
 ver_dsl()
 {
-	local ii line driver_ver api_ver mei_ver V_VER A_VER param val;
+	local ii _line _param _val;
+	local _fw_vdsl_ver _fw_adsl_ver _mei_ver _drv_ver _app_ver _fapi_ver _sl_ver;
+	local _bin_dir="/opt/lantiq/bin";
+	local _dsl_fw_dir;
 		
 	grep -q drv_dsl_cpe_api /proc/modules && {
 	
-		driver_ver=`/opt/lantiq/bin/what.sh /opt/lantiq/bin/drv_dsl_cpe_api.ko | cut -c14-`
-		api_ver=`/opt/lantiq/bin/what.sh /opt/lantiq/bin/dsl_cpe_control | cut -d@ -f2 | sed 's/(#)//'`
+		_drv_ver=`${_bin_dir}/what.sh ${_bin_dir}/drv_dsl_cpe_api.ko | cut -c14-`
+		_app_ver=`${_bin_dir}/what.sh ${_bin_dir}/dsl_cpe_control | cut -d@ -f2 | sed 's/(#)//'`
+		_fapi_ver=`${_bin_dir}/what.sh /usr/lib/libdslfapi* 2>/dev/null`
+		[ -n "$_fapi_ver" ] && _fapi_ver=", FAPI $_fapi_ver"
+		_sl_ver=`${_bin_dir}/what.sh /usr/lib/libdslsl* 2>/dev/null`
+		[ -n "$_sl_ver" ] && _sl_ver=", SL $_sl_ver"
 		
 		if [ -n "$CONFIG_PACKAGE_DSL_CPE_API_VRX" -o -n "$CONFIG_PACKAGE_IFX_DSL_CPE_API_VRX_BONDING" ]; then
-			mei_ver=`what.sh /opt/lantiq/bin/drv_mei_cpe.ko|sed 's/.*version //'`
-##Firmware directory is changed to /lib/firmware from /firmware, so we are checking both path to test
+			_mei_ver=`${_bin_dir}/what.sh ${_bin_dir}/drv_mei_cpe.ko|sed 's/.*version //'`
+			# Firmware directory might be /lib/firmware or /firmware, so we are checking both possibilities
 			if [ -f /firmware/xcpe_hw.bin ]; then
-				V_VER=`/opt/lantiq/bin/what.sh /firmware/xcpe_hw.bin | cut -f2 -d@ | cut -c 1-11 | sed 's/(#)//'`
-				A_VER=`/opt/lantiq/bin/what.sh /firmware/xcpe_hw.bin | cut -f3 -d@ | cut -c13- |sed 's/(#)//'`
+				_dsl_fw_dir="/firmware"
 			elif [ -f /lib/firmware/xcpe_hw.bin ]; then
-				V_VER=`/opt/lantiq/bin/what.sh /lib/firmware/xcpe_hw.bin | cut -f2 -d@ | cut -c 1-11 | sed 's/(#)//'`
-				A_VER=`/opt/lantiq/bin/what.sh /lib/firmware/xcpe_hw.bin | cut -f3 -d@ | cut -c13- |sed 's/(#)//'`
+				_dsl_fw_dir="/lib/firmware"
 			fi
 			
-			echo "DSL: FW $V_VER, $A_VER, DRIVER $driver_ver, API $api_ver, MEI $mei_ver"
+			if [ -n "${_dsl_fw_dir}" ]; then
+				_fw_vdsl_ver=`${_bin_dir}/what.sh ${_dsl_fw_dir}/xcpe_hw.bin | cut -f2 -d@ | cut -c 1-11 | sed 's/(#)//'`
+				_fw_adsl_ver=`${_bin_dir}/what.sh ${_dsl_fw_dir}/xcpe_hw.bin | cut -f3 -d@ | cut -c13- |sed 's/(#)//'`
+			fi
+
+			echo "DSL: FW $_fw_vdsl_ver, $_fw_adsl_ver, MEI $_mei_ver, DRIVER $_drv_ver, APP $_app_ver${_fapi_ver}${_sl_ver}"
 			
 		else
 			if [ -n "$CONFIG_FEATURE_DSL_BONDING_SUPPORT" ]; then
-				line="0"
+				_line="0"
 			fi
-			for ii in `/opt/lantiq/bin/dsl_cpe_pipe.sh vig $line`; do
-				param=${ii%%=*}
-				val=${ii#*=}
-				case $param in
-					"DSL_ChipSetFWVersion") A_VER=$val;;
-					"DSL_DriverVersionMeiBsp") mei_ver=$val;;
+			for ii in `/opt/lantiq/bin/dsl_cpe_pipe.sh vig $_line`; do
+				_param=${ii%%=*}
+				_val=${ii#*=}
+				case $_param in
+					"DSL_ChipSetFWVersion") _fw_adsl_ver=$_val;;
+					"DSL_DriverVersionMeiBsp") _mei_ver=$_val;;
 				esac
 			done
 			
-			echo "DSL: FW $A_VER, DRIVER $driver_ver, API $api_ver, MEI $mei_ver"
+			echo "DSL: FW $_fw_adsl_ver, MEI $_mei_ver, DRIVER $_drv_ver, APP $_app_ver${_fapi_ver}${_sl_ver}"
 			
 		fi
 	}
+}
+
+ver_xtc()
+{
+	# Finding PTM/ATM TC driver version info
+	local _xtc_ver;
+	_xtc_ver=`cat /proc/driver/vrx518/ver 2>/dev/null|grep -E 'ver'|sed -e 's/:/: /' -e 's/^[ \t]*//'`
+	[ -n "$_xtc_ver" ] && echo "$_xtc_ver"
 }
 
 ver_ppa()
@@ -134,7 +152,7 @@ ver_wlan()
 			[ -n "$wave500_progmodel_ver" ] && echo "Wave wlan Wave500 PROGMODEL version: $wave500_progmodel_ver"
 			[ -n "$wave500B_progmodel_ver" ] && echo "Wave wlan Wave500B PROGMODEL version: $wave500B_progmodel_ver"
 			[ -n "$wave_fpga_sim_ver" ] && echo "FPGA SIM version: $wave_fpga_sim_ver"
-			[ -n "$wave_psd_ver" ] && echo "Wave wlan PSD version: $wave_psd_ver"
+			[ -n "$wave_psd_ver" ] && [ "$wave_psd_ver" != "TODO_UPDATE_VER_STRING" ] && echo "Wave wlan PSD version: $wave_psd_ver"
 			[ -n "$wave_scripts_ver" ] && echo "Wave wlan scripts version: $wave_scripts_ver"
 		fi
 	fi
@@ -205,7 +223,7 @@ ver_coc()
 
 	if [ -e /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver ];then
 		VER_STR=`cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver`
-		echo "$VER_STR"
+		echo "CoC: $VER_STR"
 	fi
 }
 

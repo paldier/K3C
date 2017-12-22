@@ -1,10 +1,10 @@
 # HG changeset patch
-# Parent c6eb49fc92bb68c9610014a6724204077fad7abe
+# Parent 4f9d3a62d3f54dc9191ef085cbb341686262ba45
 
 diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
 --- a/drivers/net/ethernet/lantiq/Kconfig
 +++ b/drivers/net/ethernet/lantiq/Kconfig
-@@ -21,9 +21,15 @@ config LANTIQ_VRX318
+@@ -21,10 +21,21 @@ config LANTIQ_VRX318
  config ACCL_11AC
      tristate "Support DirectLink 11AC QCA"
      depends on LTQ_PPA_GRX500
@@ -12,14 +12,21 @@ diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/K
      default n
      ---help---
      Supported DirectLink for QCA 11AC
+-
 +config ACCL_11AC_DLRX
 +    tristate "Build DirectLink DLRX FW -- loadable modules only"
 +    depends on ACCL_11AC && m
 +	 ---help---
 +	 Build DirectLink DLRX FW
- 
++if ACCL_11AC
++config ACCL_11AC_CS2
++    bool "Support CS2"
++	 ---help---
++	 DirectLink in CS2 mode
++endif
  config LANITQ_VRX318_PCIE_SWITCH_DSL_BONDING
  	tristate "VRX318 SmartPHY DSL bonding with PCIe Switch"
+ 	depends on LANTIQ_VRX318
 diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
 --- a/drivers/net/ethernet/lantiq/Makefile
 +++ b/drivers/net/ethernet/lantiq/Makefile
@@ -46,7 +53,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_drv_api_fn
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_drv_api_fns.c
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,269 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -185,6 +192,7 @@ new file mode 100644
 +Description  : Get the current rxpb pointer and the data length
 +Parameters   : rxpb_ptr - Location passed by the driver to store the rxpb pointer
 +	data_len - Location passed by the driver to store the data length
++	flags - For Beeliner or Cascade, there are padding bytes.
 +Return value : -1 - Read index is equal to write index
 +	0 - Success status
 +Functions called by this module:
@@ -194,12 +202,15 @@ new file mode 100644
 +	value in the context structure before calling this function. Check the
 +	notes of functions called for complete list to be set in the context.
 +******************************************************************************/
-+int dlrx_drv_get_cur_rxpb_ptr(unsigned int *rxpb_ptr, unsigned int *data_len)
++int dlrx_drv_get_cur_rxpb_ptr(unsigned int *rxpb_ptr,
++	unsigned int *data_len,
++	unsigned int *flags)
 +{
 +	unsigned int rxpb_ptr_read_index;
 +	unsigned int rxpb_ptr_write_index;
 +	unsigned int rxpb_ptr_ring_badr;
 +	unsigned int *tmp_rxpb_ptr;
++	unsigned int padding_bytes = 0;
 +
 +	rxpb_ptr_read_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_read_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
 +	rxpb_ptr_write_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_write_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
@@ -209,16 +220,14 @@ new file mode 100644
 +
 +	rxpb_ptr_ring_badr = UNCACHE_ADDR(g_cfg_badr_rxpb_ptr_ring);
 +
-+#if defined (USE_CACHED_ADDR) && USE_CACHED_ADDR
 +	tmp_rxpb_ptr = (unsigned int *)CACHE_ADDR(DLRX_RXPB_PTR_RING_rxpb_ptr_get_indirect((unsigned int *)rxpb_ptr_ring_badr, rxpb_ptr_read_index));
 +	dre_dma_unmap((unsigned int)(tmp_rxpb_ptr), (HTT_RX_BUF_SIZE));
 +	*rxpb_ptr = (unsigned int)tmp_rxpb_ptr;
-+#else
-+	tmp_rxpb_ptr = (unsigned int *)UNCACHE_ADDR(DLRX_RXPB_PTR_RING_rxpb_ptr_get_indirect((unsigned int *)rxpb_ptr_ring_badr, rxpb_ptr_read_index));
-+	*rxpb_ptr = (unsigned int)CACHE_ADDR(tmp_rxpb_ptr);
-+#endif
 +
 +	*data_len = DLRX_RXPB_HDR_msdu_len_get_indirect((unsigned int *)(*rxpb_ptr), CFG_OFFSET_ATTEN_IN_DWORDS);
++	if (g_qca_hw == BEELINER_BOARD)
++		padding_bytes = DLRX_RXPB_HDR_BEELINER_l3_header_padding_get_indirect((unsigned int *)*rxpb_ptr, CFG_OFFSET_ATTEN_IN_DWORDS);
++	*flags = ((padding_bytes << 16) | 1);
 +	/* pr_info("skb :0x%x  read index: %u  write index: %u rxpb_ptr 0x%x, rxpb_ptr_ptr 0x%x rxpb_ptr_ring_badr 0x%x \n",
 +		 *(tmp_rxpb_ptr-1), rxpb_ptr_read_index, rxpb_ptr_write_index,
 +		 (unsigned int)*rxpb_ptr, (unsigned int)rxpb_ptr, (unsigned int)rxpb_ptr_ring_badr);
@@ -253,6 +262,9 @@ new file mode 100644
 +			  unsigned int pcie_membase
 +			 )
 +{
++#ifdef CONFIG_ACCL_11AC_CS2
++	dlrx_cfg_ctxt_ce5_resource_t ce5_resource;
++#endif
 +	ddr_base = (unsigned int *)ddr_membase;
 +	pcie_base = (unsigned int *)pcie_membase;
 +	cfg_ctxt_base = (unsigned int *)cfg_ctxt_membase;
@@ -260,7 +272,22 @@ new file mode 100644
 +	DLRX_CFG_GLOBAL_dlrx_cfg_ctxt_base_set_indirect(DLRX_CFG_GLOBAL_BASE, 0, cfg_ctxt_membase);
 +	DLRX_CFG_GLOBAL_dlrx_ddr_base_set_indirect(DLRX_CFG_GLOBAL_BASE, 0, ddr_membase);
 +	DLRX_CFG_GLOBAL_dlrx_pcie_base_set_indirect(DLRX_CFG_GLOBAL_BASE, 0, pcie_membase);
-+
++#ifdef CONFIG_ACCL_11AC_CS2
++	ce5_resource.qca_target_ce5_read_index_ptr =
++		(uint32_t)DLRX_QCA_TARGET_CE5_READ_INDEX(g_ce5_offset);
++	ce5_resource.qca_target_ce5_write_index_ptr =
++			(uint32_t)DLRX_TARGET_CE5_WRITE_INDEX(g_ce5_offset);
++	ce5_resource.qca_target_ce5_is_host_ptr =
++			(uint32_t)DLRX_TARGET_CE5_IS_HOST_INDEX(g_ce5_offset);
++	ce5_resource.ce5_numb = GET_NUM_CE5BUF;
++	ce5_resource.ce5_ctxt_ce5des_base =
++		g_cfg_badr_ce5des;
++	ce5_resource.ce5_ctxt_ce5buf_base =
++		g_cfg_badr_ce5buf;
++	memcpy((void *)DLRX_CE5_RESOURCES_BASE,
++		(void *)&ce5_resource,
++		sizeof(dlrx_cfg_ctxt_ce5_resource_t));
++#endif
 +	return 0;
 +}
 +int dlrx_drv_set_wapi_rxpn(unsigned int peer, unsigned int *rxpn)
@@ -284,7 +311,6 @@ new file mode 100644
 +	return 0;
 +}
 +
-+#if DLRX_SUPPORT_UNLOAD
 +/******************************************************************************
 +Function name: dre_dl_set_dlrx_unload_t
 +Description  : Set Flag indicating the unload of the dlrx module
@@ -297,13 +323,11 @@ new file mode 100644
 +{
 +	DLRX_CFG_GLOBAL_dlrx_cfg_unload_set_indirect(DLRX_CFG_GLOBAL_BASE, 0, 1);
 +}
-+#endif
-+
 diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_fw_init.c b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_fw_init.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_fw_init.c
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,231 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -338,6 +362,11 @@ new file mode 100644
 +#include "../include/dlrx_fw_data_structure_macro.h"
 +
 +/* #include "../include/cycle_counter.h" */
++#include <linux/interrupt.h>
++#include <lantiq_soc.h>
++#include <asm/gic.h>
++
++
 +#define DLRX_SRAM_PHY_ADDR      0x1F107400
 +
 +#define DMA_BASE		0xBE104100
@@ -357,14 +386,6 @@ new file mode 100644
 +unsigned int g_cfg_badr_ro_linklist;
 +unsigned int g_cfg_badr_ro_mainlist;
 +
-+#if USE_GLOBAL_VARIABLES
-+unsigned int g_cfg_num_ce5buf;
-+unsigned int g_cfg_size_shift_ce5buf;
-+unsigned int g_cfg_num_rxpb_ptr_ring;
-+unsigned int g_cfg_size_rxpktdes;
-+unsigned int g_cfg_offset_atten;
-+#endif
-+
 +unsigned int g_qca_hw;
 +unsigned int g_ce5_offset;
 +unsigned int g_qca_hw_sub_type;
@@ -376,6 +397,20 @@ new file mode 100644
 +
 +extern int dlrx_main(void);
 +
++#if defined(CONFIG_ACCL_11AC_CS2)
++static void dlrx_tasklet(unsigned long data)
++{
++	dlrx_main();
++	return;
++}
++DECLARE_TASKLET(dl_linux_tasklet, &dlrx_tasklet, 0);
++
++static irqreturn_t dl_linux_handler(int irq, void *data)
++{
++	tasklet_schedule(&dl_linux_tasklet);
++	return IRQ_HANDLED;	
++}
++#endif
 +static int __init dlrx_fw_init(void)
 +{
 +	/* #if DLRX_GRX330_BOARD_CFG */
@@ -384,23 +419,18 @@ new file mode 100644
 +	/* #else */
 +	unsigned int sram_phy_addr;
 +	/* #endif */
++#if defined(CONFIG_ACCL_11AC_CS2)
++	int err = 0;
++#endif
 +
 +#if DLRX_GRX330_BOARD_CFG
-+#if defined(USE_CACHED_ADDR) && USE_CACHED_ADDR
 +	cfg_ctxt_base = (unsigned int *)CACHE_ADDR(DLRX_SRAM_PHY_ADDR);
-+#else
-+	cfg_ctxt_base = (unsigned int *)UNCACHE_ADDR(DLRX_SRAM_PHY_ADDR);
-+#endif
 +#else
 +	sram_phy_addr = ppa_dl_dre_get_sram_addr();
 +	dl_kseg0 = ppa_dl_dre_get_kseg0();
 +	dl_kseg1 = ppa_dl_dre_get_kseg1();
 +
-+#if defined(USE_CACHED_ADDR) && USE_CACHED_ADDR
 +	cfg_ctxt_base = (unsigned int *)CACHE_ADDR(sram_phy_addr);
-+#else
-+	cfg_ctxt_base = (unsigned int *)UNCACHE_ADDR(sram_phy_addr);
-+#endif
 +#endif
 +
 +	DLRX_CFG_GLOBAL_fw_ver_id_set_indirect(DLRX_CFG_GLOBAL_BASE, 0, DRE_FW_VERSION);
@@ -413,15 +443,14 @@ new file mode 100644
 +	ppa_dl_dre_fn_register(DRE_GET_CURMSDU_FN, dlrx_drv_get_cur_rxpb_ptr);
 +	ppa_dl_dre_fn_register(DRE_SET_MEMBASE_FN, dlrx_drv_set_mem_base);
 +	ppa_dl_dre_fn_register(DRE_SET_RXPN_FN, dlrx_drv_set_wapi_rxpn);
-+#if DLRX_SUPPORT_UNLOAD
 +	ppa_dl_dre_fn_register(DRE_SET_DLRX_UNLOAD, dre_drv_set_dlrx_unload);
-+#endif
 +
-+	pr_info("Hello, dlrx_fw\n=============\n");
 +	pr_info("DRE_Version is 0x%x, DRE_Feature is 0x%x \n",
 +		DRE_FW_VERSION,
 +		DRE_FW_FEATURE);
-+
++#ifdef CONFIG_ACCL_11AC_CS2
++	pr_info("QCA CS2 Support 4\n");
++#endif
 +	global_debug_flag = 0;
 +	/* global_debug_print = 1; */
 +	g_cfg_badr_ce5buf = DLRX_CFG_CTXT_CE5BUF_cfg_badr_ce5buf_get_indirect(DLRX_CFG_CTXT_CE5BUF_BASE, 0);
@@ -440,14 +469,6 @@ new file mode 100644
 +	g_cfg_badr_rxpb_ptr_ring = DLRX_CFG_CTXT_RXPB_PTR_RING_cfg_badr_rxpb_ptr_ring_get_indirect(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE, 0);
 +	g_cfg_badr_ro_linklist = DLRX_CFG_CTXT_RO_LINKLIST_cfg_badr_ro_linklist_get_indirect(DLRX_CFG_CTXT_RO_LINKLIST_BASE, 0);
 +	g_cfg_badr_ro_mainlist = DLRX_CFG_CTXT_RO_MAINLIST_cfg_badr_ro_mainlist_get_indirect(DLRX_CFG_CTXT_RO_MAINLIST_BASE, 0);
-+
-+#if USE_GLOBAL_VARIABLES
-+	g_cfg_num_ce5buf = DLRX_CFG_CTXT_CE5BUF_cfg_num_ce5buf_get_indirect(DLRX_CFG_CTXT_CE5BUF_BASE, 0);
-+	g_cfg_size_shift_ce5buf = DLRX_CFG_CTXT_CE5BUF_cfg_size_shift_ce5buf_get_indirect(DLRX_CFG_CTXT_CE5BUF_BASE, 0);
-+	g_cfg_num_rxpb_ptr_ring = DLRX_CFG_CTXT_RXPB_PTR_RING_cfg_num_rxpb_ptr_ring_get_indirect(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE, 0);
-+	g_cfg_size_rxpktdes = DLRX_CFG_CTXT_RXPB_cfg_size_rxpktdes_get_indirect(DLRX_CFG_CTXT_RXPB_BASE, 0);
-+	g_cfg_offset_atten = DLRX_CFG_CTXT_RXPB_cfg_offset_atten_get_indirect(DLRX_CFG_CTXT_RXPB_BASE, 0);
-+#endif
 +
 +	g_qca_hw = DLRX_CFG_GLOBAL_dlrx_qca_hw_get_indirect(DLRX_CFG_GLOBAL_BASE, 0);
 +	g_qca_hw_sub_type = DLRX_CFG_GLOBAL_dlrx_qca_hw_sub_type_get_indirect(DLRX_CFG_GLOBAL_BASE, 0);
@@ -472,7 +493,10 @@ new file mode 100644
 +	/* Each entry in the ce5 des ring is two dwords,
 +	Multiply GET_NUM_CE5BUF by 8 to convert to bytes
 +	*/
++#ifdef USING_BBCPU_SRAM
++#else
 +	dre_dma_map(g_cfg_badr_ce5des, (GET_NUM_CE5BUF * 2) * 4);
++#endif
 +	/* Each entry in the ce5 buffer is 512 bytes
 +	Multiply GET_NUM_CE5BUF by 512
 +	*/
@@ -487,9 +511,6 @@ new file mode 100644
 +	/* 2 is offset for the write index */
 +	write_index_address = (unsigned int)((unsigned int *)CACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE) + 2);
 +
-+#if TEST_GRX350
-+	*((unsigned int *)UNCACHE_ADDR(write_index_address)) =  512;
-+#endif
 +	dre_dma_map(write_index_address, 4);
 +	/* function1_cycles  = CycleCounter_Create("Rx Ind : Overall"); */
 +#if DLRX_GRX330_BOARD_CFG
@@ -499,12 +520,20 @@ new file mode 100644
 +	*DMA_CS 	= 7;
 +	*DMA_CCTRL	= 0x30101;
 +#endif
++#ifdef CONFIG_ACCL_11AC_CS2
++	pr_info("register irq for DL IPI\n");
++
++	err = request_irq(DL_LI_IPI_NO,
++			dl_linux_handler, IRQF_DISABLED, "DL_LI", NULL);
++	if (err)
++		pr_err("request_irq for IRQ DL to Linux = %d failed !!! \n",
++			DL_LI_IPI_NO);
++#endif
 +	return 0;
 +}
 +
 +static void __exit dlrx_fw_exit(void)
 +{
-+#if DLRX_SUPPORT_UNLOAD
 +	/* Find duplicate pointer values in the rxpb
 +	ring ans set to 0 if duplicate is found
 +	*/
@@ -514,11 +543,15 @@ new file mode 100644
 +	*/
 +	rxpb_free_buffers_on_unload();
 +	/* Clear the RO list */
++	pr_info("%s: clear RO list\n", __func__);
 +	ro_list_clear();
 +	/* Unregister functions that are already registered with the driver */
 +	dlrx_unregister_driver_fns();
++#ifdef CONFIG_ACCL_11AC_CS2
++	pr_info("Deregister irq\n");
++	free_irq(DL_LI_IPI_NO,
++		NULL);
 +#endif
-+	pr_info("Goodbye, dlrx_fw\n");
 +}
 +
 +module_init(dlrx_fw_init);
@@ -530,7 +563,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_main.c b/d
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_main.c
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,355 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -608,16 +641,15 @@ new file mode 100644
 +{
 +	unsigned int ce5_parsing_index;
 +	unsigned int ptr_in_ce5_ring;
-+
 +	/* printk("dlrx_main_called\n"); */
 +	if (DLRX_CFG_GLOBAL_dlrx_enable_get_indirect(DLRX_CFG_GLOBAL_BASE, 0)) {
 +		ce5_parsing_index = DLRX_CFG_CTXT_CE5BUF_local_ce5_parsing_index_get_indirect(DLRX_CFG_CTXT_CE5BUF_BASE, 0);
-+
 +		/* Check CE5 message status */
 +		/* Read unload from memory during every iteration */
-+		while (((*DLRX_TARGET_CE5_READ_INDEX(g_ce5_offset)) != ce5_parsing_index)
-+		       && !global_debug_flag &&
-+		       !(DLRX_CFG_GLOBAL_dlrx_cfg_unload_get_indirect(DLRX_CFG_GLOBAL_BASE, 0))) {
++		while (((*DLRX_TARGET_CE5_READ_INDEX(g_ce5_offset))
++				!= ce5_parsing_index)
++			&& !global_debug_flag
++			&& !(DLRX_CFG_GLOBAL_dlrx_cfg_unload_get_indirect(DLRX_CFG_GLOBAL_BASE, 0))) {
 +			unsigned int *ce5buf_ptr;
 +			unsigned int *ce5des_ptr;
 +			unsigned int msg_len;
@@ -628,9 +660,13 @@ new file mode 100644
 +			If not wait for the value to come below threshold
 +			If timeout occurs return
 +			*/
++#ifdef USING_BBCPU_SRAM
++			ce5des_ptr = ((unsigned int *)(g_cfg_badr_ce5des)
++							      + (ce5_parsing_index << 1));
++#else
 +			ce5des_ptr = ((unsigned int *)UNCACHE_ADDR(g_cfg_badr_ce5des)
 +				      + (ce5_parsing_index << 1));
-+
++#endif
 +			msg_len = DLRX_CE5DES_FORMAT_nbytes_get_indirect(ce5des_ptr, 0);
 +			ptr_in_ce5_ring = DLRX_CE5DES_FORMAT_dest_ptr_get_indirect(ce5des_ptr, 0);
 +
@@ -639,13 +675,15 @@ new file mode 100644
 +			/* Note: cfg_size_ce5buf is the number of bytes in power of 2 */
 +			ce5buf_ptr = (unsigned int *)((uint8_t *)g_cfg_badr_ce5buf
 +						      + (ce5_parsing_index << GET_CE5BUF_SIZE_SHIFT));
++			/*
++			printk("ce5des_ptr=0x%x, msg_len=0x%x\n",
++				ce5des_ptr, msg_len);*/
 +
-+			/* printk("ce5des_ptr=0x%x, msg_len=0x%x\n",
-+				ce5des_ptr, msg_len);
-+			*/
 +			if (msg_len) {
 +				/* TODO: remove */
++#if !defined(CONFIG_ACCL_11AC_CS2)
 +				dre_dma_unmap((unsigned int)ce5buf_ptr, msg_len + 4);
++#endif
 +				msg_type = DLRX_IND_MSG_msg_type_get_indirect(ce5buf_ptr, 0);
 +
 +				if (DLRX_CFG_GLOBAL_dlrx_enable_get_indirect(DLRX_CFG_GLOBAL_BASE, 0) == 0xf)
@@ -663,30 +701,18 @@ new file mode 100644
 +					global_debug_flag = 1;
 +					break;
 +				}
-+
++				/*
++				pr_err("Msg type: 0x%x msg_len: %u\n",
++										msg_type,
++										msg_len);*/
 +				DLRX_CFG_CTXT_CE5BUF_ce5_msg_type_set_indirect(DLRX_CFG_CTXT_CE5BUF_BASE, 0, msg_type);
 +
 +				/* TODO: DEBUG */
 +				if (DLRX_CFG_GLOBAL_dltx_enable_get_indirect(DLRX_CFG_GLOBAL_BASE, 0)) {
 +					switch (msg_type) {
 +					case HTT_RX_IND_MSG:
-+#if 0
-+						if (!dlrx_check_congestion_status()) {
-+							g_congestion_timeout_num++;
-+
-+							if (g_congestion_timeout_num >= DLRX_CFG_GLOBAL_dlrx_timout_count_th_get_indirect(DLRX_CFG_GLOBAL_BASE, 0))
-+								g_congestion_drop_flag = 1;
-+							else
-+								return 0;
-+						} else {
-+							g_congestion_timeout_num = 0;
-+							g_congestion_drop_flag = 0;
-+						}
-+
-+#else
 +						g_congestion_timeout_num = 0;
 +						g_congestion_drop_flag = 0;
-+#endif
 +						dlrx_ind_msg_process(ce5buf_ptr);
 +						break;
 +
@@ -699,9 +725,18 @@ new file mode 100644
 +						break;
 +
 +					case HTT_TX_CMP_MSG:
++#if defined(CONFIG_ACCL_11AC_CS2)
++						break;
++#else
 +						dlrx_tx_cmpl_msg_process(ce5buf_ptr);
 +						break;
-+
++#endif
++#if defined(CONFIG_ACCL_11AC_CS2)
++					case HTT_TX_T2H_MSG_TYPE_TX_INSPECT_IND:
++					case HTT_TX_T2H_MSG_TYPE_TX_FETCH_CONF:
++					case HTT_TX_T2H_MSG_TYPE_TX_MODE_SWITCH_IND:
++						break;
++#endif
 +					default:
 +						/*Increment message mib for WLAN
 +						(Not TX complete, not RX indication,
@@ -715,32 +750,49 @@ new file mode 100644
 +									 0);
 +						break;
 +					}
-+				} else if (msg_type == HTT_TX_CMP_MSG)/* always send to QCA */
++				} else if (msg_type == HTT_TX_CMP_MSG) {/* always send to QCA */
++#if !defined(CONFIG_ACCL_11AC_CS2)
 +					dlrx_tx_cmpl_msg_process(ce5buf_ptr);
++#endif
++				}
 +				else
 +					ppa_dl_dre_wlan_msg_send(msg_type,
 +								 (unsigned int)ce5buf_ptr,
 +								 msg_len,
 +								 0);
 +
-+				/* dre_dma_map((unsigned int)ce5buf_ptr, msg_len); */
-+#if 1 /* test */
-+				dre_dma_wback_invalidate((unsigned int)ce5buf_ptr, msg_len + 4);
++#if defined(CONFIG_ACCL_11AC_CS2)
++				if (msg_type != HTT_TX_CMP_MSG)
++					dre_dma_wback_invalidate((unsigned int)ce5buf_ptr, msg_len + 4);
 +#else
-+				dre_dma_map((unsigned int)ce5buf_ptr, msg_len + 4);
-+				dre_dma_unmap((unsigned int)ce5buf_ptr, msg_len + 4);
++				dre_dma_wback_invalidate((unsigned int)ce5buf_ptr, msg_len + 4);
 +#endif
-+			} /* if(msg_len) */
++			} 	else { /* if(msg_len) */
++				/* this may be the TX Completion */
++				ce5_write_index_update(&ce5_parsing_index);
++				continue;
++			}
 +
-+#if 1
-+			else
-+				break;
 +
-+#endif
-+#if 1/* tmp remove */
++#if defined(CONFIG_ACCL_11AC_CS2)
++			if (msg_type != HTT_TX_CMP_MSG
++					&& msg_type != HTT_TX_T2H_MSG_TYPE_TX_INSPECT_IND
++					&& msg_type != HTT_TX_T2H_MSG_TYPE_TX_FETCH_CONF
++					&& msg_type != HTT_TX_T2H_MSG_TYPE_TX_MODE_SWITCH_IND)
++				DLRX_IND_MSG_msg_type_set_indirect((unsigned int *)UNCACHE_ADDR(ce5buf_ptr), 0, 0xFF);
++#else
 +			DLRX_IND_MSG_msg_type_set_indirect((unsigned int *)UNCACHE_ADDR(ce5buf_ptr), 0, 0xFF);
 +#endif
++
++#if defined(CONFIG_ACCL_11AC_CS2)
++			if (msg_type != HTT_TX_CMP_MSG
++					&& msg_type != HTT_TX_T2H_MSG_TYPE_TX_INSPECT_IND
++					&& msg_type != HTT_TX_T2H_MSG_TYPE_TX_FETCH_CONF
++					&& msg_type != HTT_TX_T2H_MSG_TYPE_TX_MODE_SWITCH_IND)
++				DLRX_CE5DES_FORMAT_nbytes_set_indirect(ce5des_ptr, 0, 0);
++#else
 +			DLRX_CE5DES_FORMAT_nbytes_set_indirect(ce5des_ptr, 0, 0);
++#endif
 +			ce5_write_index_update(&ce5_parsing_index);
 +		}
 +
@@ -1360,7 +1412,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_playout_pr
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_playout_process.c
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,188 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -1417,17 +1469,20 @@ new file mode 100644
 +	unsigned int mpdu_index;
 +	unsigned int start_seq_id;
 +	unsigned int total_seq_id;
++	unsigned int peer = DLRX_CTXT_MSG_peer_get_indirect(DLRX_CTXT_MSG_BASE, 0);
++	unsigned int ext_tid = DLRX_CTXT_MSG_ext_tid_get_indirect(DLRX_CTXT_MSG_BASE, 0);
++	unsigned int seq_mask = dlrx_get_seq_mask(peer, ext_tid);
 +
 +	start_seq_id = DLRX_CTXT_MSG_start_seqid_get_indirect(DLRX_CTXT_MSG_BASE, 0);
 +	total_seq_id = DLRX_CTXT_MSG_total_seqid_get_indirect(DLRX_CTXT_MSG_BASE, 0);
-+
++	start_seq_id &= seq_mask;
 +	/* Step 27 , Step 28 */
 +	for (mpdu_index = 0; mpdu_index < total_seq_id; mpdu_index++) {
 +		DLRX_CTXT_MSG_mpdu_index_set_indirect(DLRX_CTXT_MSG_BASE, 0, start_seq_id);
 +		ro_list_release_data(ce5_buf_ptr);
 +
 +		start_seq_id++;
-+		start_seq_id %=  NUM_SEQ_ID;   /* Check wrap around condition */
++		start_seq_id &= seq_mask;   /* Check wrap around condition */
 +	}
 +}
 +
@@ -1511,11 +1566,7 @@ new file mode 100644
 +
 +		if (discard == 0) {
 +#if (defined (DLRX_GRX330_BOARD_CFG) && (DLRX_GRX330_BOARD_CFG == 1))
-+
 +			if (vap2int == 15) {
-+				/* TODO: test remove packet send to PS */
-+#if 1
-+
 +				if (release_bit == 1)
 +					dre_dma_unmap((unsigned int)(rxpb_buf_ptr + MAX_INV_HEADER_LEN), HTT_RX_BUF_SIZE - MAX_INV_HEADER_LEN);
 +
@@ -1523,9 +1574,6 @@ new file mode 100644
 +
 +				driver_status = ppa_dl_dre_ps_send(rxpb_buf_ptr, data_ptr, msdu_length, vap);
 +				mib_update_vap_protocol_stack_data(msdu_length);
-+#else
-+				;
-+#endif
 +			} else
 +#endif
 +			{
@@ -1533,22 +1581,10 @@ new file mode 100644
 +					pmac_hdr_ptr = (unsigned int)(((uint8_t *)data_ptr) - 8);
 +				else
 +					pmac_hdr_ptr = (unsigned int)(((uint8_t *)data_ptr) - 4);
-+
 +				/* call driver API to send packet to gswip dma */
-+				if (forward == 0) {
-+
-+#if (defined (DLRX_GRX330_BOARD_CFG) && (DLRX_GRX330_BOARD_CFG == 1))
-+#else
-+#if	 OPTIMIZE_PERF
-+#else
-+					dre_dma_unmap((unsigned int)(rxpb_buf_ptr + MAX_INV_HEADER_LEN), HTT_RX_BUF_SIZE - MAX_INV_HEADER_LEN);
-+#endif
-+#endif
++				if (forward == 0)
 +					driver_status = ppa_dl_dre_gswip_dma_send(vap, rxpb_buf_ptr, data_ptr, msdu_length, release_bit, pmac_hdr_ptr , 0);
-+					/*printk(" data ptr 0x%x  data : 0x%x    0x%x	 0x%x   0x%x  0x%x  0x%x  \n",  \
-+											  (unsigned int)data_ptr, *((unsigned int *)data_ptr), *((unsigned int *)data_ptr+1),*((unsigned int *)data_ptr+2),*((unsigned int *)data_ptr+3),*((unsigned int *)data_ptr+4), *((unsigned int *)data_ptr+5)); */
-+
-+				} else /* already unmapped */
++				else /* already unmapped */
 +					driver_status = ppa_dl_dre_gswip_dma_send(vap, rxpb_buf_ptr, data_ptr, msdu_length, release_bit, pmac_hdr_ptr, 1);
 +
 +				mib_update_vap_gswip_data(msdu_length);
@@ -1569,7 +1605,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_reorder_bu
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_reorder_buffering_process.c
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,344 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -1640,7 +1676,6 @@ new file mode 100644
 +	unsigned int total_msdus, last_msdu = 0, msdu_number_debug_count = 0;
 +	unsigned int msdu_chained = 0;
 +	unsigned int seq_id_mask;
-+	unsigned int *seq_mask_base = DLRX_DDR_SEQ_MASK_BASE;
 +
 +	mpdu_data_offset = dlrx_get_ind_msg_mpdu_data_offset(ce5_buf_ptr);
 +
@@ -1650,12 +1685,7 @@ new file mode 100644
 +	peer_vld = DLRX_CTXT_MSG_peer_vld_get_indirect(DLRX_CTXT_MSG_BASE, 0);
 +	rxpb_ptr_read_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_read_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
 +
-+	seq_id_mask = seq_mask_base[(peer * 16) + ext_tid];
-+
-+	if ((seq_id_mask == 0) || (seq_id_mask > 0x40))
-+		seq_id_mask = 0x40;
-+
-+	seq_id_mask--;
++	seq_id_mask = dlrx_get_seq_mask(peer, ext_tid);
 +
 +	DLRX_CTXT_MSG_msdu_index_set_indirect(DLRX_CTXT_MSG_BASE, 0, msdu_index);
 +	total_msdus = DLRX_IND_MSG_fw_rx_desc_byte_num_get_indirect(ce5_buf_ptr, 0);
@@ -1678,16 +1708,11 @@ new file mode 100644
 +		DLRX_CTXT_MSG_mpdu_cnt_set_indirect(DLRX_CTXT_MSG_BASE, 0, mpdu_cnt);
 +		DLRX_CTXT_MSG_mpdu_status_set_indirect(DLRX_CTXT_MSG_BASE, 0, mpdu_status);
 +
-+#if DL_BAND_STEERING
-+
 +		if ((mpdu_status == MPDU_STATUS_SUCCESS) && peer) {
 +			unsigned int peer_id;
 +			peer_id = DLRX_IND_MSG_peer_id_get_indirect(ce5_buf_ptr, 0);
 +			ppa_dl_dre_peer_act_fn(peer_id);
 +		}
-+
-+#endif
-+
 +		/* Step 8 , Step 28 and Step 29 */
 +		for (mpdu_index = 0; mpdu_index < mpdu_cnt; mpdu_index++) {
 +			unsigned int msdu_length = 0;
@@ -1699,35 +1724,29 @@ new file mode 100644
 +			msdu_chained = 0;
 +
 +			while (1) {
-+#if defined(USE_CACHED_ADDR) && USE_CACHED_ADDR
 +				rxpb_buf_ptr = (unsigned int *)(dlrx_get_current_rxpb_buf_ptr());
 +				rxpb_buf_ptr = (unsigned int *)CACHE_ADDR((unsigned int)rxpb_buf_ptr);
-+
 +				if (DLRX_CFG_GLOBAL_dlrx_enable_get_indirect(DLRX_CFG_GLOBAL_BASE, 0) == 0xf)
-+
-+					/*	if(	mpdu_status == MPDU_STATUS_SUCCESS ) */
-+					printk("ce5buf 0x%x RXPB ADD 0x%x  mpdu_status : 0x%x  mpdu_cnt :0x%x    peer : 0x%x  peer_id : 0x%x  peer_vld:0x%x  \n",  \
-+					       (unsigned int)ce5_buf_ptr, (unsigned int)rxpb_buf_ptr, mpdu_status, mpdu_cnt, peer, DLRX_IND_MSG_peer_id_get_indirect(ce5_buf_ptr, 0), peer_vld);
++					pr_err("ce5buf 0x%x RXPB ADD 0x%x  mpdu_status : 0x%x  mpdu_cnt :0x%x    peer : 0x%x  peer_id : 0x%x  peer_vld:0x%x  \n",
++					       (unsigned int)ce5_buf_ptr, (unsigned int)rxpb_buf_ptr,
++						   mpdu_status, mpdu_cnt, peer,
++						   DLRX_IND_MSG_peer_id_get_indirect(ce5_buf_ptr, 0),
++						   peer_vld);
 +
 +				dre_dma_unmap((unsigned int)rxpb_buf_ptr, MAX_INV_HEADER_LEN);
-+
-+#else
-+				rxpb_buf_ptr = (unsigned int *)UNCACHE_ADDR((unsigned int *)dlrx_get_current_rxpb_buf_ptr());
-+#endif
 +
 +				if (msdu_chain_num == 0) {
 +					unsigned int time_out_index;
 +
-+					for (time_out_index = 0; time_out_index < 0x8000000; time_out_index++) {
++					for (time_out_index = 0; time_out_index < 0x8000000; time_out_index++)
 +						if (DLRX_RXPB_HDR_msdu_load_status_get_indirect(rxpb_buf_ptr, CFG_OFFSET_ATTEN_IN_DWORDS))
 +							break;
-+					}
 +
 +					if (time_out_index) {
 +						unsigned int rxpb_ptr_write_index;
 +
 +						rxpb_ptr_write_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_write_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
-+						printk("Time out index value: %u  ce5_buf_ptr: 0x%x rxpb_buf_ptr: 0x%x (Read_idx *4): 0x%x (write_idx *4): 0x%x\n", \
++						pr_err("Time out index value: %u  ce5_buf_ptr: 0x%x rxpb_buf_ptr: 0x%x (Read_idx *4): 0x%x (write_idx *4): 0x%x\n", \
 +						       time_out_index, (unsigned int)ce5_buf_ptr, (unsigned int)rxpb_buf_ptr, (rxpb_ptr_read_index * 4), (rxpb_ptr_write_index * 4));
 +						global_debug_flag = 1;
 +#if defined(DRE_DBG_PRINT_ENABLE) && DRE_DBG_PRINT_ENABLE
@@ -1758,8 +1777,10 @@ new file mode 100644
 +				}
 +
 +				if (first_msdu) {
++					unsigned int seq_mask = dlrx_get_seq_mask(peer, ext_tid);
 +					/* Setting seq_id here as it is valid when it is the first msdu */
 +					seq_id = (DLRX_RXPB_HDR_seqid_get_indirect(rxpb_buf_ptr, CFG_OFFSET_ATTEN_IN_DWORDS)) & seq_id_mask;   /* Since seqid is between 0-63 , AND with the value of seq_id_mask */
++					seq_id &= seq_mask;
 +					DLRX_CTXT_MSG_seqid_set_indirect(DLRX_CTXT_MSG_BASE, 0, seq_id);
 +
 +					/* Step 10 */
@@ -1774,23 +1795,6 @@ new file mode 100644
 +					if ((mpdu_status == MPDU_STATUS_SUCCESS) && (ext_tid < NUM_TID)) {
 +
 +						unsigned int discard, forward, inspect;
-+
-+#if TEST_GRX350
-+						{
-+							unsigned int rx_atten;
-+							unsigned int rxpb_ptr_write_index;
-+
-+							rx_atten = *(rxpb_buf_ptr + CFG_OFFSET_ATTEN_IN_DWORDS);
-+
-+							if (rx_atten & 0xf0000) {
-+
-+								rxpb_ptr_write_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_write_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
-+								printk("packet error  rx_atten: 0x%x  ce5_buf_ptr: 0x%x rxpb_buf_ptr: 0x%x (Read_idx): 0x%x (write_idx): 0x%x\n", \
-+								       rx_atten, (unsigned int)ce5_buf_ptr, (unsigned int)rxpb_buf_ptr, rxpb_ptr_read_index, rxpb_ptr_write_index);
-+							}
-+
-+						}
-+#endif
 +
 +						dlrx_get_fw_rx_desc_byte_data(ce5_buf_ptr);
 +						discard = DLRX_CTXT_MSG_discard_get_indirect(DLRX_CTXT_MSG_BASE, 0);
@@ -1944,28 +1948,13 @@ new file mode 100644
 +			}
 +		}
 +	}
-+
-+#if TEST_GRX350
-+
-+	if (msdu_number_debug_count != total_msdus && total_msdus != 0) {
-+		printk("*****MSDU Count not matching !!!! ***** \n");
-+		printk("ce5_bufptr: 0x%x next rxpb_ptr_read_idx: %u  Debug_count: %u total_msdu: %u curr_rxpb_ptr: 0x%x\n", (unsigned int)ce5_buf_ptr, rxpb_ptr_read_index, msdu_number_debug_count, total_msdus, (unsigned int)rxpb_buf_ptr);
-+		printk("last_msdu: %u  ; msdu_chained : %u msdu_mpdu_index: %u  \n", 	last_msdu,   msdu_chained, msdu_mpdu_index);
-+		global_debug_flag = 1;
-+#if defined(DRE_DBG_PRINT_ENABLE) && DRE_DBG_PRINT_ENABLE
-+		dlrx_generate_debug(0);
-+#endif
-+
-+	}
-+
-+#endif
 +}
 +
 diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_ro_list_fns.c b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_ro_list_fns.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_ro_list_fns.c
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,455 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -2378,15 +2367,11 @@ new file mode 100644
 +
 +		if (rxpb_release_type == RECYCLE_RXPB)
 +			rxpb_write_free_buffer_to_rxpb_ptr_ring(RECYCLE_LL_RXPB_PTR);
-+
-+#if DLRX_SUPPORT_UNLOAD
 +		else {
 +			unsigned int rxpb_buf_ptr;
 +			rxpb_buf_ptr = VIR_TO_PHY(dlrx_get_ro_ll_rxpb_ptr());
 +			ppa_dl_dre_rxpb_buf_free(rxpb_buf_ptr);
 +		}
-+
-+#endif
 +
 +		/* Step 25*/
 +		next_ptr_index_to_process = ro_linklist_return_free_ptr(temp_cur_ro_desc_index);
@@ -2403,7 +2388,6 @@ new file mode 100644
 +	DLRX_RO_MAINLIST_mcast_bcast_set_indirect(temp_mainlist_data_ptr, mpdu_index, 0);    /* Reset the mcast bcast data*/
 +}
 +
-+#if DLRX_SUPPORT_UNLOAD
 +/**************************************************************************************
 +//      Function name: ro_list_clear
 +//      Description  : Clear the RO list data
@@ -2426,13 +2410,11 @@ new file mode 100644
 +		}
 +	}
 +}
-+#endif   /* #if DLRX_SUPPORT_UNLOAD */
-+
 diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_rx_flush_msg.c b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_rx_flush_msg.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_rx_flush_msg.c
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,119 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -2458,7 +2440,7 @@ new file mode 100644
 +#include "../include/dlrx_fw_def.h"
 +#include "../include/dlrx_fw_data_structure_macro.h"
 +#include "../include/dlrx_fw_data_structure.h"
-+
++#include "../include/dlrx_inl_fns.h"
 +void dlrx_rx_flush_msg_process(unsigned int *ce5buf_ptr);
 +
 +extern void msg_mib_inc(unsigned int msg_type);
@@ -2515,18 +2497,20 @@ new file mode 100644
 +			msg_mib_inc(HTT_RX_INVALID_TID);
 +		} else {
 +			unsigned int start_seqid, end_seqid, total_seqid;
-+
++			unsigned int seq_mask = dlrx_get_seq_mask(peer, ext_tid);
++			unsigned int seq_num = seq_mask + 1;
 +			start_seqid = DLRX_FLUSH_MSG_flush_start_seqid_get_indirect(ce5buf_ptr, 0);
 +			end_seqid =  DLRX_FLUSH_MSG_flush_end_seqid_get_indirect(ce5buf_ptr, 0);
-+
++			start_seqid &= seq_mask;
++			end_seqid &= seq_mask;
 +			/*Note: end_seqid is the sequence number one larger */
 +			/*than the sequence number of the last MPDU to check to flush */
 +			if (end_seqid > start_seqid)
 +				total_seqid = end_seqid - start_seqid;
 +			else if (end_seqid == start_seqid)
-+				total_seqid = 1;
++				total_seqid = seq_num;
 +			else
-+				total_seqid = end_seqid + NUM_SEQ_ID - start_seqid;
++				total_seqid = end_seqid + seq_num - start_seqid;
 +
 +			DLRX_CTXT_MSG_start_seqid_set_indirect(DLRX_CTXT_MSG_BASE, 0, start_seqid);
 +			DLRX_CTXT_MSG_total_seqid_set_indirect(DLRX_CTXT_MSG_BASE, 0, total_seqid);
@@ -2661,7 +2645,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_rx_ind_msg
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_rx_ind_msg.c
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,257 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -2871,17 +2855,20 @@ new file mode 100644
 +		/*It is possible to have both fv and rv set, in this case, */
 +		/*perform flush first and followed by release */
 +		if (fv) {
++			unsigned int seq_mask = dlrx_get_seq_mask(peer, ext_tid);
++			unsigned int seq_num = seq_mask + 1;
 +			start_seqid = DLRX_IND_MSG_flush_start_seqid_get_indirect(ce5buf_ptr, 0);
 +			end_seqid =  DLRX_IND_MSG_flush_end_seqid_get_indirect(ce5buf_ptr, 0);
-+
++			start_seqid &= seq_mask;
++			end_seqid &= seq_mask;
 +			/*Note: end_seqid is the sequence number one larger */
 +			/*than the sequence number of the last MPDU to check to flush */
 +			if (end_seqid > start_seqid)
 +				total_seqid = end_seqid - start_seqid;
 +			else if (end_seqid == start_seqid)
-+				total_seqid = 1;
++				total_seqid = seq_num;
 +			else
-+				total_seqid = end_seqid + NUM_SEQ_ID - start_seqid;
++				total_seqid = end_seqid + seq_num - start_seqid;
 +
 +			DLRX_CTXT_MSG_start_seqid_set_indirect(DLRX_CTXT_MSG_BASE, 0, start_seqid);
 +			DLRX_CTXT_MSG_total_seqid_set_indirect(DLRX_CTXT_MSG_BASE, 0, total_seqid);
@@ -2891,17 +2878,20 @@ new file mode 100644
 +		}
 +
 +		if (rv) {
++			unsigned int seq_mask = dlrx_get_seq_mask(peer, ext_tid);
++			unsigned int seq_num = seq_mask + 1;
 +			start_seqid = DLRX_IND_MSG_release_start_seqid_get_indirect(ce5buf_ptr, 0);
 +			end_seqid =  DLRX_IND_MSG_release_end_seqid_get_indirect(ce5buf_ptr, 0);
-+
++			start_seqid &= seq_mask;
++			end_seqid &= seq_mask;
 +			/*Note: end_seqid is the sequence number one larger */
 +			/*than the sequence number of the last MPDU to check to release */
 +			if (end_seqid > start_seqid)
 +				total_seqid = end_seqid - start_seqid;
 +			else if (end_seqid == start_seqid)
-+				total_seqid = 1;
++				total_seqid = seq_num;
 +			else
-+				total_seqid = end_seqid + NUM_SEQ_ID - start_seqid;
++				total_seqid = end_seqid + seq_num - start_seqid;
 +
 +			DLRX_CTXT_MSG_start_seqid_set_indirect(DLRX_CTXT_MSG_BASE, 0, start_seqid);
 +			DLRX_CTXT_MSG_total_seqid_set_indirect(DLRX_CTXT_MSG_BASE, 0, total_seqid);
@@ -2917,7 +2907,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_rxpb_fns.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_rxpb_fns.c
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,190 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -2979,10 +2969,6 @@ new file mode 100644
 +	switch (free_ptr_type) {
 +	case RECYCLE_RXPB_PTR:
 +		rxpb_buf_ptr = dlrx_get_current_rxpb_buf_ptr();
-+#if TEST_GRX350
-+		ppa_dl_dre_rxpb_buf_free(rxpb_buf_ptr);
-+		rxpb_buf_ptr = VIR_TO_PHY(dlrx_dl_dre_rxpb_buf_alloc());
-+#endif
 +		break;
 +
 +	case NEW_RXPB_PTR:
@@ -2991,11 +2977,6 @@ new file mode 100644
 +
 +	case RECYCLE_LL_RXPB_PTR:
 +		rxpb_buf_ptr = VIR_TO_PHY(dlrx_get_ro_ll_rxpb_ptr());
-+#if TEST_GRX350
-+		ppa_dl_dre_rxpb_buf_free(rxpb_buf_ptr);
-+		rxpb_buf_ptr = VIR_TO_PHY(dlrx_dl_dre_rxpb_buf_alloc());
-+#endif
-+
 +		break;
 +
 +	default:
@@ -3006,13 +2987,8 @@ new file mode 100644
 +	if (!rxpb_buf_ptr)
 +		return;
 +
-+#ifdef USE_CACHED_ADDR
 +	va_rxpb_buf_ptr = CACHE_ADDR(rxpb_buf_ptr);
-+#else
-+	va_rxpb_buf_ptr = UNCACHE_ADDR(rxpb_buf_ptr);
-+#endif
 +
-+/*test only */
 +	rxpb_ptr_read_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_read_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
 +
 +	DLRX_RXPB_HDR_msdu_load_status_clear_indirect((unsigned int *)va_rxpb_buf_ptr, CFG_OFFSET_ATTEN_IN_DWORDS);
@@ -3020,18 +2996,6 @@ new file mode 100644
 +	dre_dma_map(CACHE_ADDR(rxpb_buf_ptr), MAX_INV_HEADER_LEN);
 +
 +	tmp_buf_ptr = (unsigned int *)CACHE_ADDR(rxpb_buf_ptr);
-+/*	printk("rxpb_ptr_write_index is 0x%x, reset 1st 256 DW to 0 from rxpb_buf_ptr 0x%x \n",rxpb_ptr_write_index,(unsigned int)tmp_buf_ptr); */
-+/*#if	 OPTIMIZE_PERF */
-+#if 1
-+#else
-+
-+	for (i = 0; i < 480 ; i++)
-+		*(tmp_buf_ptr + i) = 0;
-+
-+	dre_dma_map(CACHE_ADDR(rxpb_buf_ptr), HTT_RX_BUF_SIZE);
-+#endif
-+	/*printk("phy rxpb_buf_ptr is 0x%x, va_rxpb_buf_ptr is 0x%x  uncached address is 0x%x ,  context is 0x%x , 0x%x, 0x%x ,0x%x \n" ,rxpb_buf_ptr,va_rxpb_buf_ptr ,tmp_buf_ptr, */
-+	/*	   *(tmp_buf_ptr),*(tmp_buf_ptr+1),*(tmp_buf_ptr+2) ,*(tmp_buf_ptr+3)); */
 +
 +/*    printk("rxpb_ptr_write_index 0x%x, read_idx 0x%x free_type %u,rxpb_buf_ptr 0x%x skb 0x%x\n",rxpb_ptr_write_index,rxpb_ptr_read_index,free_ptr_type,(unsigned int)rxpb_buf_ptr,*((unsigned int *)va_rxpb_buf_ptr-1)); */
 +	DLRX_RXPB_PTR_RING_rxpb_ptr_set_indirect((unsigned int *)rxpb_ring_base_address, rxpb_ptr_write_index, rxpb_buf_ptr);
@@ -3041,8 +3005,6 @@ new file mode 100644
 +	tmp_buf_ptr = (unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE);
 +	DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_write_index_set_indirect(tmp_buf_ptr, 0, rxpb_ptr_write_index);
 +}
-+
-+#if DLRX_SUPPORT_UNLOAD
 +
 +/**************************************************************************************
 +//      Function name: rxpb_find_duplicate_ptr_value
@@ -3072,7 +3034,7 @@ new file mode 100644
 +	rxpb_read_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_read_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
 +	rxpb_ring_base_address = UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_cfg_badr_rxpb_ptr_ring_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0));
 +
-+	/*printk("dlrx_fw_exit : Read index %u  Write index %u\n",rxpb_read_index,rxpb_write_index); */
++	printk("dlrx_fw_exit : Read index %u  Write index %u\n",rxpb_read_index,rxpb_write_index);
 +	if (rxpb_write_index < rxpb_read_index)
 +		loop_count = (GET_NUM_RXPB_PTR_RING + rxpb_write_index) - rxpb_read_index;
 +	else
@@ -3092,7 +3054,7 @@ new file mode 100644
 +			temp_rxpb_ptr = DLRX_RXPB_PTR_RING_rxpb_ptr_get_indirect((unsigned int *)rxpb_ring_base_address, temp_rxpb_idx);
 +
 +			if (temp_rxpb_ptr == rxpb_ptr) {
-+				/*printk("Duplicate ptr value found in index %u and %u . Ptr value = 0x%x\n", rxpb_idx,temp_rxpb_idx, rxpb_ptr); */
++				printk("Duplicate ptr value found in index %u and %u . Ptr value = 0x%x\n", rxpb_idx,temp_rxpb_idx, rxpb_ptr);
 +				DLRX_RXPB_PTR_RING_rxpb_ptr_set_indirect((unsigned int *)rxpb_ring_base_address, loop_index_2, 0);
 +			}
 +		}
@@ -3121,7 +3083,6 @@ new file mode 100644
 +	rxpb_write_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_write_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
 +	rxpb_read_index = DLRX_CFG_CTXT_RXPB_PTR_RING_rxpb_ptr_read_index_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0);
 +	rxpb_ring_base_address = UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_cfg_badr_rxpb_ptr_ring_get_indirect((unsigned int *)UNCACHE_ADDR(DLRX_CFG_CTXT_RXPB_PTR_RING_BASE), 0));
-+
 +	if (rxpb_write_index < rxpb_read_index)
 +		loop_count = (GET_NUM_RXPB_PTR_RING + rxpb_write_index) - rxpb_read_index;
 +	else
@@ -3136,15 +3097,12 @@ new file mode 100644
 +		rxpb_ptr = DLRX_RXPB_PTR_RING_rxpb_ptr_get_indirect((unsigned int *)rxpb_ring_base_address, rxpb_idx);
 +		ppa_dl_dre_rxpb_buf_free(rxpb_ptr);
 +	}
-+
 +}
-+#endif  /* #if DLRX_SUPPORT_UNLOAD */
-+
 diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_tx_cmpl_msg.c b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_tx_cmpl_msg.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_tx_cmpl_msg.c
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,152 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -3292,19 +3250,16 @@ new file mode 100644
 +			offload_tx_release_data.msdu_ids[i - 1] = tx_desc_id;
 +	}
 +
-+/*tmp disable TX completion release  for GRX350_DL_TEST */
-+#if 1
-+
 +	if (ppa_dl_dre_txpkt_buf_release(num_msdus, (unsigned int *)&offload_tx_release_data, 0))
-+		printk("%s : %d : LTQ11ACOL OFFLOAD txpkt_buf_release failed num_msdus: %d\n", __func__, __LINE__, num_msdus);
++		pr_err("%s : %d : failed num_msdus: %d\n",
++			__func__, __LINE__, num_msdus);
 +
-+#endif
 +}
 diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_utility_fns.c b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_utility_fns.c
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/dlrx_fw/dlrx_utility_fns.c
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,633 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -3917,7 +3872,6 @@ new file mode 100644
 +	printk("--------------------------------------------------------\n");
 +}
 +
-+#if DLRX_SUPPORT_UNLOAD
 +/*****************************************************************************************
 +//      Function name: dlrx_unregister_driver_fns
 +//      Description  : Unregister the functions registered with the driver
@@ -3937,7 +3891,7 @@ new file mode 100644
 +	ppa_dl_dre_fn_register(DRE_SET_RXPN_FN , NULL);
 +	ppa_dl_dre_fn_register(DRE_SET_DLRX_UNLOAD, NULL);
 +}
-+#endif
++
 +
 diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/include/cycle_counter.h b/drivers/net/ethernet/lantiq/directlink/dlrx/include/cycle_counter.h
 new file mode 100755
@@ -3992,7 +3946,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_dre_api.h 
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_dre_api.h
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,250 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -4116,7 +4070,8 @@ new file mode 100755
 +/* return base addr and data len */
 +typedef int (*dre_dl_getmsdu_fn_t)(
 +			unsigned int *rxpb_ptr,
-+			unsigned int *data_len
++			unsigned int *data_len,
++			unsigned int *flags
 +			);
 +/* configure the base address */
 +typedef int (*dre_dl_set_membase_fn_t)(
@@ -4283,7 +4238,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_data_st
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_data_structure_be.h
-@@ -0,0 +1,854 @@
+@@ -0,0 +1,862 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -5129,13 +5084,21 @@ new file mode 100755
 +} dlrx_cfg_global_t;
 +
 +typedef struct {
-+
 +	unsigned int cfg_peer_handler;
-+
 +	unsigned int cfg_peer_count;
-+
 +} dlrx_cfg_ctxt_peer_handler_t;
-+
++#if defined(CONFIG_ACCL_11AC_CS2)
++typedef struct {
++	/* QCA target */
++	unsigned int qca_target_ce5_read_index_ptr;
++	unsigned int qca_target_ce5_write_index_ptr;
++	unsigned int qca_target_ce5_is_host_ptr;
++	/* CE5 resources */
++	unsigned int ce5_numb;
++	unsigned int ce5_ctxt_ce5des_base;
++	unsigned int ce5_ctxt_ce5buf_base;
++} dlrx_cfg_ctxt_ce5_resource_t;
++#endif
 +#endif
 +
 diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_data_structure_le.h b/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_data_structure_le.h
@@ -15637,7 +15600,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_def.h b
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_def.h
-@@ -0,0 +1,504 @@
+@@ -0,0 +1,518 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -15666,7 +15629,7 @@ new file mode 100755
 +#include <linux/io.h>
 +#include <linux/kernel.h>
 +
-+#define TEST_GRX350 0
++#define USING_BBCPU_SRAM 1
 +#define OPTIMIZE_PERF 1
 +extern unsigned int *ddr_base, *pcie_base, *cfg_ctxt_base;
 +extern unsigned int dl_kseg0, dl_kseg1;
@@ -15934,95 +15897,110 @@ new file mode 100755
 +	#define DLRX_DDR_RX_PKT_BUF_RING_BASE                   \
 +			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x800)
 +
-+	/* 2048 * (64 + 4) DWORDS */
++	/* (128 * 16=tid + 128*16) 2048 * (64 + 4) DWORDS  */
 +	#define DLRX_DDR_RO_MAINLIST_BASE                       \
 +			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x1800)
 +
 +	/* 4096 * 6 DWORDS */
 +	#define DLRX_DDR_RO_LINKLIST_BASE                       \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x23800)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x23800 + 0x22000)
 +
 +	/* 2 * (1 * 8) DWORDS */
 +	#define DLRX_DDR_CPU_CE5_DESC_BASE                      \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x29800)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x29800 + 0x22000)
 +
 +	/* 264 x 1 dwords i.e 1056 x 1 bytes */
 +	#define DLRX_CFG_PEER_ID_TO_PEER_MAP_BASE(i)            \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2a000 + i)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2a000 + i  + 0x22000)
 +
-+	/* 128*16 Dword */
++	/* 128*(16 + 16) Dword */
 +	#define DLRX_DDR_SEQ_MASK_BASE                          \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2a200)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2a200 + 0x22000)
 +
 +	/* 4 dword */
 +	#define DLRX_CFG_CTXT_GSWIP_DMA_BASE                    \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa00)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa00 + 0x22000 + 0x800)
 +
 +	/* 4 dword */
 +	#define DLRX_CFG_CTXT_WLAN_DMA_BASE                     \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa04)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa04 + 0x22000 + 0x800)
 +
 +	/* 4 dword */
 +	#define DLRX_CFG_CTXT_PROT_DMA_BASE                     \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa08)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa08 + 0x22000 + 0x800)
 +
 +	/* 1 x 12 dwords */
 +	#define DLRX_CFG_CTXT_CE5BUF_BASE                       \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa0C)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa0C + 0x22000 + 0x800)
 +
 +	/* 1 x 4 dwords */
 +	#define DLRX_CFG_CTXT_CE5DES_BASE                       \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa18)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa18 + 0x22000 + 0x800)
 +
 +	/* 1 x 8 dword */
 +	#define DLRX_CFG_CTXT_CPU_CE5DES_BASE                   \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa1C)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa1C + 0x22000 + 0x800)
 +
 +	/* 1 x 8 dwords */
 +	#define DLRX_CFG_CTXT_RXPB_PTR_RING_BASE                \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa24)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa24 + 0x22000 + 0x800)
 +
 +	/* 1 x 4 dwords */
 +	#define DLRX_CFG_CTXT_RXPB_BASE                         \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa2C)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa2C + 0x22000 + 0x800)
 +
-+	/* 1 x 16 dwords */
++	/* 1 x 16 dwords + 16*/
 +	#define DLRX_CFG_CTXT_RO_LINKLIST_BASE                  \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa30)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa30 + 0x22000 + 0x800)
 +
 +	/* 1 x 8 dword */
 +	#define DLRX_CFG_CTXT_RO_MAINLIST_BASE                  \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa40)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa40 + 0x22000 + 0x800 + 0x10)
 +
 +	/* 1 x 48 dwords */
 +	#define DLRX_CTXT_MSG_BASE                              \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa48)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa48 + 0x22000 + 0x800 + 0x10)
 +
 +	/* 1 x 4 dwords */
 +	#define DLRX_CFG_CTXT_RXPB_PTR_REL_MSGBUF_BASE          \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa78)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa78 + 0x22000 + 0x800 + 0x10)
 +
 +	/* 1 x 8 dwords */
 +	#define DLRX_CFG_GLOBAL_BASE                            \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa80)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa80 + 0x22000 + 0x800 + 0x10)
 +
 +	/* 128 x 2 dwords i.e. 128 peers x 2 dwords */
 +	#define DLRX_CFG_CTXT_PEER_HANDLER_BASE(i)              \
 +			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2aa90 + \
-+							(i) * 2)
++							(i) * 2 + 0x22000 + 0x800 + 0x10)
 +
 +	/* 4 x 1 dwords */
 +	#define DLRX_CFG_CTXT_PEER_BITMAP_BASE(i)               \
-+			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2ab90 + i)
++			(unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2ab90 + i + 0x22000 + 0x800 + 0x10)
 +
 +	/* 255 * 2 DWORDS  */
 +	#define DLRX_DDR_GSWIP_DMA_DESC_BASE                    \
-+		(volatile unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2ac00)
++		(volatile unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2ac00 + 0x22000 + 0x800 + 0x10)
 +
 +	/* 512 * 2 DWORDS (shift from  SRAM) */
++#ifdef USING_BBCPU_SRAM
++	#define BBCPU_SRAM_ADDR 0xb4000000
 +	#define DLRX_DDR_CE5DESC_BASE                           \
-+		(volatile unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2ae00)
-+
++		(unsigned int *)(BBCPU_SRAM_ADDR)
++	#define DLRX_BBCPU_CE5_CTXT_RD_IDX_BASE                           \
++		(unsigned int *)(BBCPU_SRAM_ADDR + (1024*2*4))
++	#define DLRX_BBCPU_CE5_CTXT_WRAPAROUND_IDX_BASE                           \
++		(unsigned int *)(BBCPU_SRAM_ADDR + (1024*2*4) + 4)
++	#define DLRX_BBCPU_CE5_CTXT_QCA_RD_IDX_BASE                           \
++		(unsigned int *)(BBCPU_SRAM_ADDR + (1024*2*4) + 8)
++#else
++	#define DLRX_DDR_CE5DESC_BASE                           \
++		(volatile unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2ae00 + 0x22000 + 0x800 + 0x10)
++#endif
++#if defined(CONFIG_ACCL_11AC_CS2)
++	#define DLRX_CE5_RESOURCES_BASE                         \
++		(volatile unsigned int *)(RX_CFG_CTXT_BUF_BASE + 0x2b200 + 0x22000 + 0x800 + 0x10)
++#endif
 +	/* 2048 * 512 Bytes (2e000 -*/
 +	#define DLRX_DDR_CE5BUF_BASE                            \
 +			(unsigned int *)(RX_MSG_BUF_BASE)
@@ -16030,13 +16008,21 @@ new file mode 100755
 +
 +	#define DLRX_TARGET_CE5_PEREGRINE                       0x00058800
 +	#define DLRX_TARGET_CE5_BEELINER                        0x0004B400
-+
++#ifdef USING_BBCPU_SRAM
++	#define DLRX_TARGET_CE5_READ_INDEX(base)                \
++		(volatile unsigned int *)(DLRX_BBCPU_CE5_CTXT_RD_IDX_BASE)
++	#define DLRX_QCA_TARGET_CE5_READ_INDEX(base)                \
++		(volatile unsigned int *)(pcie_base + ((base+0x48)>>2))
++#else
 +	#define DLRX_TARGET_CE5_READ_INDEX(base)                \
 +		(volatile unsigned int *)(pcie_base + ((base+0x48)>>2))
-+
++#endif
 +	/* 1 dword? */
 +	#define DLRX_TARGET_CE5_WRITE_INDEX(base)               \
 +		(volatile unsigned int *)(pcie_base + ((base+0x40)>>2))
++
++	#define DLRX_TARGET_CE5_IS_HOST_INDEX(base)               \
++		(volatile unsigned int *)(pcie_base + ((base+0x30)>>2))
 +#endif
 +
 +/* Message type */
@@ -16044,6 +16030,9 @@ new file mode 100755
 +#define HTT_RX_FLUSH_MSG                                0x2
 +#define HTT_RX_FRAG_IND_MSG                             0xA
 +#define HTT_TX_CMP_MSG                                  0x7
++#define HTT_TX_T2H_MSG_TYPE_TX_INSPECT_IND 				0x16
++#define HTT_TX_T2H_MSG_TYPE_TX_FETCH_CONF 				0x17
++#define HTT_TX_T2H_MSG_TYPE_TX_MODE_SWITCH_IND			0x30
 +
 +/* Not actual message type, defined to identify message being sent
 +	to wlan driver/cpu_ce5/cpu_ce4/invalid_tid
@@ -16077,7 +16066,7 @@ new file mode 100755
 +#define SEC_TYPE_PN_128_ODD                             0x3
 +
 +#define NUM_PEER                                        128
-+#define NUM_TID                                         16
++#define NUM_TID                                         31
 +#define NUM_SEQ_ID                                      64
 +
 +/* Need to define a value for NULL_PTR as 0 is also a valid pointer */
@@ -16095,9 +16084,6 @@ new file mode 100755
 +
 +/* Inspect Flag Set Rx Packet */
 +#define WLAN_INSPECT_TYPE		0x1
-+
-+
-+#define USE_CACHED_ADDR			1
 +#define DRE_DBG_PRINT_ENABLE	1
 +
 +/*#define DBG_CACHED_ADDR		1*/
@@ -16106,19 +16092,10 @@ new file mode 100755
 +extern void  dre_dma_map(unsigned int addr, unsigned int size);
 +extern void dre_dma_unmap(unsigned int  addr, unsigned int size);
 +
-+#if defined(USE_CACHED_ADDR) && USE_CACHED_ADDR
-+
 +#define dre_dma_map(addr, size) ppa_dl_dre_dma_writeback(addr, size)
 +#define dre_dma_unmap(addr, size) ppa_dl_dre_dma_invalidate(addr, size)
 +#define dre_dma_wback_invalidate(addr, size) \
 +	ppa_dl_dre_dma_wback_inv(addr, size)
-+/* #define dre_dma_map(addr, size)		dma_cache_wback(addr, size) */
-+/* #define dre_dma_unmap(addr, size)	dma_cache_inv(addr, size) */
-+#else
-+#define dre_dma_map(addr , size)
-+#define dre_dma_unmap(addr , size)
-+#define dre_dma_wback_invalidate(addr , size)
-+#endif
 +
 +#if (defined(DLRX_GRX330_BOARD_CFG) && (DLRX_GRX330_BOARD_CFG == 1))
 +#define VIR_TO_PHY(addr) CPHYSADDR(addr)
@@ -16146,7 +16123,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_interna
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_fw_internal_def.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,185 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -16178,12 +16155,10 @@ new file mode 100755
 +#define uint16_t unsigned short
 +#define uint32_t unsigned int
 +
-+/* Flag to indicate if global variables are to be used instead of #defines */
-+#define USE_GLOBAL_VARIABLES      0
-+/* Flag to enable/disable load unload support */
-+#define DLRX_SUPPORT_UNLOAD       1
-+/* Flag to enable/disable call to band steering */
-+#define DL_BAND_STEERING		  1
++#if defined(CONFIG_ACCL_11AC_CS2)
++/* 125 + 8 for linux */
++#define DL_LI_IPI_NO		133
++#endif
 +/* The value of 3 is set as the interface value to prevent passing
 +* invalid interface value to the switch during the playout process.
 +* The value could be any value between 3 to 7. Only condition is
@@ -16241,14 +16216,6 @@ new file mode 100755
 +extern unsigned int g_cfg_badr_ro_linklist;
 +extern unsigned int g_cfg_badr_ro_mainlist;
 +
-+#if USE_GLOBAL_VARIABLES
-+extern unsigned int g_cfg_num_ce5buf;
-+extern unsigned int g_cfg_size_shift_ce5buf;
-+extern unsigned int g_cfg_num_rxpb_ptr_ring;
-+extern unsigned int g_cfg_size_rxpktdes;
-+extern unsigned int g_cfg_offset_atten;
-+#endif
-+
 +extern unsigned int g_qca_hw;
 +extern unsigned int g_qca_hw_sub_type;
 +extern unsigned int g_ce5_offset;
@@ -16258,13 +16225,6 @@ new file mode 100755
 +
 +
 +
-+#if USE_GLOBAL_VARIABLES
-+    #define GET_NUM_CE5BUF          (g_cfg_num_ce5buf)
-+    #define GET_CE5BUF_SIZE_SHIFT   (g_cfg_size_shift_ce5buf)
-+    #define GET_NUM_RXPB_PTR_RING   (g_cfg_num_rxpb_ptr_ring)
-+    #define GET_RXPKT_DESC_SIZE     (g_cfg_size_rxpktdes)
-+    #define GET_OFFSET_ATTEN        (g_cfg_offset_atten)
-+#else
 +/* 2 NOTE: Make sure the values set here are same as
 +* the ones set by driver in the cfg ctxt structure
 +*/
@@ -16273,7 +16233,8 @@ new file mode 100755
 +#define GET_CE5BUF_SIZE_SHIFT	(9)
 +#define GET_NUM_RXPB_PTR_RING   (1024)
 +#else
-+#define GET_NUM_CE5BUF			(512)
++//#define GET_NUM_CE5BUF			(512)
++#define GET_NUM_CE5BUF			(1024)
 +#define GET_CE5BUF_SIZE_SHIFT	(9)
 +#define GET_NUM_RXPB_PTR_RING	 (1024)
 +#endif
@@ -16283,7 +16244,7 @@ new file mode 100755
 +			QCA_CASCADE_11AC_CFG_OFFSET_ATTEN) : \
 +			QCA_PEREGRINE_11AC_CFG_OFFSET_ATTEN)
 +#define GET_OFFSET_ATTEN (4)
-+#endif
++
 +/* Function Definition */
 +/* Functions defined in DLRX_reorder_buffering_process.c */
 +void dlrx_reorder_buffering_process(unsigned int *ce5_buf_ptr);
@@ -16319,10 +16280,8 @@ new file mode 100755
 +
 +/* Functions defined in RXPB_fns.c */
 +void rxpb_write_free_buffer_to_rxpb_ptr_ring(rxpb_free_ptr_type free_ptr_type);
-+#if DLRX_SUPPORT_UNLOAD
 +void rxpb_find_duplicate_ptr_value(void);
 +void rxpb_free_buffers_on_unload(void);
-+#endif
 +
 +/* Functions defined in MIB_data_update.c */
 +void mib_update_status_counters(mib_msdu_mpdu_update_switch switch_value,
@@ -16339,7 +16298,9 @@ new file mode 100755
 +void dlrx_drv_reset(unsigned int reset_type, unsigned int id_num);
 +unsigned int *dlrx_drv_get_mib_data(unsigned int mib_type,
 +		unsigned int vap_id);
-+int dlrx_drv_get_cur_rxpb_ptr(unsigned int *rxpb_ptr, unsigned int *data_len);
++int dlrx_drv_get_cur_rxpb_ptr(unsigned int *rxpb_ptr,
++	unsigned int *data_len,
++	unsigned int *flags);
 +/* void dlrx_drv_replenish_rxpb_ptr(void); */
 +/* configure the base address */
 +int dlrx_drv_set_mem_base(unsigned int ddr_membase,
@@ -16667,7 +16628,7 @@ diff --git a/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_inl_fns.h 
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/directlink/dlrx/include/dlrx_inl_fns.h
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,322 @@
 +/*******************************************************************************
 +
 +  Intel DirectLink driver
@@ -16965,6 +16926,28 @@ new file mode 100755
 +	}
 +	return temp_pmac_ptr;
 +}
++extern inline unsigned int dlrx_get_seq_mask(unsigned int peer, unsigned int ext_tid)
++{
++	unsigned int seq_id_mask;
++	unsigned int *seq_mask_base = DLRX_DDR_SEQ_MASK_BASE;
++	seq_id_mask = seq_mask_base[(peer * NUM_TID) + ext_tid];
 +
++	if ((seq_id_mask == 0) || (seq_id_mask > NUM_SEQ_ID)) {
++		if (seq_id_mask != 0)
++			pr_err("<%s>: seq_id_mask trouble[%x]peer[%d]ext_tid[%d]\n", __func__,
++				seq_id_mask,
++				peer,
++				ext_tid);
++		else if (ext_tid) {
++			/* get the first tid */
++			seq_id_mask = seq_mask_base[(peer * NUM_TID)];
++		}
++		if ((seq_id_mask == 0) || (seq_id_mask > NUM_SEQ_ID))
++			seq_id_mask = NUM_SEQ_ID;
++	}
++
++	seq_id_mask--;
++	return seq_id_mask;
++}
 +#endif
 +

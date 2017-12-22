@@ -133,7 +133,7 @@ static int32_t ppa_check_if_netif_directpath(PPA_NETIF *netif, uint16_t flag)
     int8_t ret=PPA_FAILURE;
     int8_t found=0;
     struct ppe_directpath_data *info;
-    uint32_t pos;
+    uint32_t pos=0;
     
     if ((ret = ppa_directpath_data_start_iteration(&pos, &info)) == PPA_SUCCESS )
     {
@@ -543,6 +543,8 @@ int32_t ppa_reset_intfid(struct netif_info *pNetIf, const char* ifname)
 	return ret;
 }
 #endif
+
+#if 0
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
 static 
 int32_t ppa_netif_config_pmac(uint8_t uiFlowId, uint8_t uiRemBytes)
@@ -618,6 +620,7 @@ int32_t ppa_netif_config_pmac(uint8_t uiFlowId, uint8_t uiRemBytes)
   return PPA_SUCCESS;
 }
 #endif
+#endif
 
 int32_t ppa_netif_add(PPA_IFNAME *ifname, int f_is_lan, struct netif_info **pp_ifinfo, PPA_IFNAME *ifname_lower, int force_wanitf)
 {
@@ -640,8 +643,19 @@ int32_t ppa_netif_add(PPA_IFNAME *ifname, int f_is_lan, struct netif_info **pp_i
     PPA_CLASS_RULE class_rule;
 #endif
 
-//printk(KERN_INFO "%s %s %d ifname=%s ifname_lower=%s\n", __FILE__,__FUNCTION__,__LINE__,ifname,ifname_lower);
-    //ppa_netif_lock_list();
+    netif = ppa_get_netif(ifname);
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+    //Is netdev under bridge
+    //Note that device must be added to bridge before getting added to PPA
+    if (netif && netif->priv_flags & IFF_BRIDGE_PORT) {
+        ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"netif=%s is under bridge\n",
+		  netif->name);
+        ppa_rtnl_lock();
+        brif = ppa_netdev_master_upper_dev_get(netif);
+        ppa_rtnl_unlock();
+    }
+#endif
+
     if ( ppa_netif_lookup(ifname, &p_ifinfo) != PPA_SUCCESS )
     {
 
@@ -652,15 +666,14 @@ int32_t ppa_netif_add(PPA_IFNAME *ifname, int f_is_lan, struct netif_info **pp_i
         }
 
         ppa_strncpy(p_ifinfo->name, ifname, sizeof(p_ifinfo->name));
-        if( ifname_lower && ppa_strlen(ifname_lower) )
-        {
+        if (ifname_lower && ppa_strlen(ifname_lower)) {
             ppa_strncpy(p_ifinfo->manual_lower_ifname, ifname_lower, sizeof(p_ifinfo->manual_lower_ifname)-1);
             ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"Set manual_lower_ifname to %s\n", p_ifinfo->manual_lower_ifname);
-        }
-        else 
+        } else {
             p_ifinfo->manual_lower_ifname[0] = 0;
+            ppa_get_lower_if(NULL, ifname, p_ifinfo->manual_lower_ifname);
+        }
 
-        netif = ppa_get_netif(ifname);
         if ( netif )
         {
             p_ifinfo->netif = netif;
@@ -689,7 +702,26 @@ LOOP_CHECK:
               
               uint8_t isIPv4Gre = 0;
               uint8_t isGreTap = 0;
-              
+#if 1 
+		PPA_IFNAME underlying_intname[PPA_IF_NAME_SIZE];
+		PPA_NETIF *netif_new;
+		if( ppa_if_is_vlan_if(netif, NULL))
+		{
+			//printk("<%s> %s VLAN device found!!!!!\n",__func__, netif->name);
+			if(ppa_vlan_get_underlying_if(netif, NULL, underlying_intname) == PPA_SUCCESS) 
+			{
+				netif_new = ppa_get_netif(underlying_intname); //Get underling layer net dev
+				//printk("<%s> %s device found!!!!!\n",__func__, netif_new->name);
+                        	if( ppa_is_gre_netif_type(netif_new, &isIPv4Gre, &isGreTap) ) 
+				{
+					printk("<%s> %s is a GRE interface!!!!!\n",__func__, netif_new->name);
+					netif = netif_new;
+				}
+			}
+
+			netif_new = NULL;
+		}  
+#endif
               if( ppa_is_gre_netif_type(netif, &isIPv4Gre, &isGreTap) ) {
                 
                 p_ifinfo->flags |= NETIF_PHY_TUNNEL | NETIF_GRE_TUNNEL;
@@ -942,8 +974,18 @@ back_to_ppp:
                 }
             }
 #endif
+
+#if defined(CONFIG_L2NAT_MODULE) || defined(CONFIG_L2NAT)
+            /* Check whether the netif is an l2nat interface or not */
+            if (ppa_check_if_netif_l2nat_fn && ppa_check_if_netif_l2nat_fn(netif, NULL, 0))
+            {
+                p_ifinfo->flags |= NETIF_L2NAT;
+            }
+#endif
 #endif
         }
+	else
+            p_ifinfo->netif = NULL;
 
 PPA_NETIF_ADD_ATM_BASED_NETIF_DONE:
         if ( (p_ifinfo->flags & NETIF_PHY_ATM) )
@@ -986,9 +1028,19 @@ PPA_NETIF_ADD_ATM_BASED_NETIF_DONE:
                 p_ifinfo->flags |= NETIF_PHYS_PORT_GOT;
     
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+                if(p_ifinfo->vcc == NULL)
+                {
+			//printk("\n%s,%d\n",__FUNCTION__,__LINE__);
+                	dp_subif.port_id = p_ifinfo->phys_port;
+                }
                 if ((dp_get_netif_subifid(netif, NULL, p_ifinfo->vcc, NULL, &dp_subif, 0))==PPA_SUCCESS) {
+                   if(p_ifinfo->vcc)
+                   {
+			//printk("\n%s,%d\n",__FUNCTION__,__LINE__);
+		  	p_ifinfo->phys_port = dp_subif.port_id;
+                   }
+		  //printk(" ====== port %d subif %d =======\n",dp_subif.port_id, dp_subif.subif);
                   p_ifinfo->subif_id = dp_subif.subif;
-                  p_ifinfo->phys_port = dp_subif.port_id;
                 }
 #endif
             }
@@ -1067,21 +1119,26 @@ PPA_NETIF_ADD_PHYS_IF_CONTINUE:
 
 				    vlan_info.port_id = p_ifinfo->phys_port;
 				    vlan_info.subif_id = ((p_ifinfo->subif_id & 0xF00) >> 8);
-				    //UGW stack currently does not support VLAN from the LAN side
-				    //all incoming VLANs are removed. 
-				    //Revisit when Q-in-Q support is added to UGW
+				    /* get the VLAN protocol type from the inner VLAN interface*/
+				    vlan_info.vlan_type = ppa_get_vlan_type(p_ifinfo->in_vlan_netif);
+				    /* NETIF_VLAN_OUTER flag will be set only if the interface is double VLAN tagged (eg eth1.100.10)*/
 				    if(p_ifinfo->flags & NETIF_VLAN_OUTER) {
 					vlan_info.stag_vlan_id = p_ifinfo->outer_vid;
 					vlan_info.stag_ins = 1;
-				    //} else {
 				    	vlan_info.stag_rem = 1;
 				    }
-			    
+			   	    /* in case of single VLAN tagged interface we need to check the VLAN type and / 
+				    /  1. IF the VLAN type is 0x8100; remove the incoming ctag vlan and add the new vlan in ctag/
+				    /  2. IF the VLAN type is 0x88A8; preserve the incoming ctag and add stag */ 		
 				    if(p_ifinfo->flags & NETIF_VLAN_INNER) {
-					vlan_info.vlan_id = p_ifinfo->inner_vid;
-					vlan_info.ctag_ins = 1;
-				    //} else {
-					vlan_info.ctag_rem = 1;
+					if(vlan_info.vlan_type == PPA_VLAN_PROTO_8021Q) {	
+					    vlan_info.vlan_id = p_ifinfo->inner_vid;
+					    vlan_info.ctag_ins = 1;
+					    vlan_info.ctag_rem = 1;
+					} else if(vlan_info.vlan_type == PPA_VLAN_PROTO_8021AD) {
+					    vlan_info.stag_vlan_id = p_ifinfo->inner_vid;
+					    vlan_info.stag_ins = 1;
+					}
 				    }
     
 				    if ( ppa_hsel_add_outer_vlan_entry( &vlan_info, 0, PAE_HAL) != PPA_SUCCESS ){
@@ -1111,34 +1168,32 @@ PPA_NETIF_ADD_PHYS_IF_CONTINUE:
         }
   
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
-  //Is netdev under bridge
-  //Note that device must be added to bridge before getting added to PPA
-  if( (p_ifinfo->netif) && p_ifinfo->netif->priv_flags & IFF_BRIDGE_PORT ) {
-    ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"netif=%s is under bridge\n", p_ifinfo->netif->name); 
-    ppa_rtnl_lock();
-    if((brif=ppa_netdev_master_upper_dev_get(p_ifinfo->netif)) != NULL) {
-	ppa_rtnl_unlock();  
+    if (brif != NULL) {
 	if(ppa_if_is_br_if(brif, NULL)) {
 	    if(ppa_get_fid(ppa_get_netif_name(brif), &p_ifinfo->fid)!=PPA_SUCCESS) {
 		ppa_debug(DBG_ENABLE_MASK_ERR,"Failed in getting fid of bridge %s\n", ppa_get_netif_name(brif));
 	    }
 
 	    // if fid > 0 then bridge is not br0; then we need to add PCE rules to set alternate FID
-	    if(p_ifinfo->fid) {
-		PPA_BR_PORT_INFO port_info={0};
-		port_info.brid = p_ifinfo->fid;
-		port_info.port = p_ifinfo->phys_port;
-		port_info.vid = p_ifinfo->inner_vid;
+	    PPA_BR_PORT_INFO port_info={0};
+	    port_info.brid = p_ifinfo->fid;
+	    port_info.port = p_ifinfo->phys_port;
+	    if (( p_ifinfo->flags & NETIF_DIRECTPATH) || ( p_ifinfo->flags & NETIF_DIRECTCONNECT)) {
+		port_info.subif_en = 1;
+		port_info.subif = p_ifinfo->subif_id;
 		if(ppa_drv_add_br_port(&port_info, 0)==PPA_SUCCESS) {
 		    p_ifinfo->fid_index = port_info.index;
 		}
-	    }
+	    } else {
+		if(p_ifinfo->fid || p_ifinfo->inner_vid) {
+	    	    port_info.vid = p_ifinfo->inner_vid;
+		    if(ppa_drv_add_br_port(&port_info, 0)==PPA_SUCCESS) {
+			p_ifinfo->fid_index = port_info.index;
+		    }
+		}
+	    }	
 	}   
-    } else {
-      ppa_rtnl_unlock();
     }
-  }
-
 #endif
         if ( (p_ifinfo->flags & NETIF_MAC_AVAILABLE) )
         {
@@ -1233,7 +1288,7 @@ void ppa_netif_remove(PPA_IFNAME *ifname, int f_is_lan)
         if ( !(p_ifinfo->flags & (NETIF_LAN_IF | NETIF_WAN_IF)) )
         {
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
-      if(p_ifinfo->fid) {
+      if(p_ifinfo->fid || p_ifinfo->inner_vid || (p_ifinfo->flags & NETIF_DIRECTPATH) || ( p_ifinfo->flags & NETIF_DIRECTCONNECT)) {
     	PPA_BR_PORT_INFO port_info={0};
     	port_info.brid = p_ifinfo->fid;
     	port_info.port = p_ifinfo->phys_port;
@@ -1340,6 +1395,23 @@ void ppa_netif_put(struct netif_info *p_info)
 	ppa_netif_free_item(p_info);
 }
 
+/*
+ * This is called only from netif_update to check tunnel or any other interfce on top of tunnel.
+*/
+uint32_t ppa_is_tunnel_if(PPA_NETIF *netif)
+{
+
+   if ( (netif->type == ARPHRD_SIT ) || (netif->type == ARPHRD_TUNNEL6) || (ppa_is_gre_netif(netif)) || ppa_if_is_vlan_if(netif,NULL) ) 
+	return 1;
+   else 
+	return 0;
+
+	//return ppa_is_gre_netif(netif);
+
+}
+
+
+
 int32_t ppa_netif_update(PPA_NETIF *netif, PPA_IFNAME *ifname)
 {
     struct netif_info *p_info;
@@ -1353,6 +1425,10 @@ int32_t ppa_netif_update(PPA_NETIF *netif, PPA_IFNAME *ifname)
     PPA_NETIF *new_netif;
 #endif
 
+    PPA_HW_ACCEL_STATS          hw_accel_stats_tmp;
+    PPA_SW_ACCEL_STATS          sw_accel_stats_tmp;
+
+
     if ( netif )
         ifname = ppa_get_netif_name(netif);
     else
@@ -1363,7 +1439,7 @@ int32_t ppa_netif_update(PPA_NETIF *netif, PPA_IFNAME *ifname)
         return PPA_EINVAL;
     }
 
-    if ( ppa_netif_lookup(ifname, &p_info) != PPA_SUCCESS ){
+    if (ppa_netif_lookup(ifname, &p_info) != PPA_SUCCESS){
         ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"fail: device: %s not accelerated\n", ifname);
         return PPA_ENOTAVAIL;
     }
@@ -1406,15 +1482,23 @@ int32_t ppa_netif_update(PPA_NETIF *netif, PPA_IFNAME *ifname)
 #endif
     else if ( (flags & NETIF_PPPOE) )
     {
-        if ( !ppa_check_is_pppoe_netif(netif) )
-            f_need_update = 1;
+        if ( !ppa_check_is_pppoe_netif(netif) ) {
+		if ( ppa_is_tunnel_if(netif) == 0)
+		{
+			//printk("\n%s,%d  :: %s\n",__FUNCTION__,__LINE__,netif->name);
+            		f_need_update = 1;
+		}
+	}
         else
             p_info->pppoe_session_id = ppa_pppoe_get_pppoe_session_id(netif);
     }
     else if ( (flags & NETIF_PPPOATM) )
     {
         if ( !ppa_if_is_pppoa(netif, NULL) )
-            f_need_update = 1;
+        {
+		if ( ppa_is_tunnel_if(netif) == 0)
+            		f_need_update = 1;
+	}
     }
 
     if ( !f_need_update && (flags & (NETIF_BRIDGE | NETIF_PHY_ETH | NETIF_EOA)) != 0 )
@@ -1448,6 +1532,17 @@ int32_t ppa_netif_update(PPA_NETIF *netif, PPA_IFNAME *ifname)
             p_info->mac_entry = ~0;
             p_info->flags &= ~(NETIF_MAC_ENTRY_CREATED | NETIF_MAC_AVAILABLE);
         }
+#if defined(CONFIG_L2NAT_MODULE) || defined(CONFIG_L2NAT)
+        /* Check whether the netif is an l2nat interface or not */
+        if (ppa_check_if_netif_l2nat_fn)
+        {
+            if (ppa_check_if_netif_l2nat_fn(netif, NULL, 0)) {
+                p_info->flags |= NETIF_L2NAT;
+            } else {
+                p_info->flags &= ~NETIF_L2NAT;
+            }
+        }
+#endif
     }
 
     force_wantif = p_info->f_wanitf.flag_force_wanitf; //save the force_wanitf flag
@@ -1455,6 +1550,15 @@ int32_t ppa_netif_update(PPA_NETIF *netif, PPA_IFNAME *ifname)
         ppa_strncpy(manual_lower_ifname, p_info->manual_lower_ifname, sizeof(manual_lower_ifname));
     else
         manual_lower_ifname[0] = 0;
+
+    if ( f_need_update )
+    {
+	hw_accel_stats_tmp.rx_bytes = p_info->hw_accel_stats.rx_bytes;
+	hw_accel_stats_tmp.tx_bytes = p_info->hw_accel_stats.tx_bytes;
+	sw_accel_stats_tmp.rx_bytes = p_info->sw_accel_stats.rx_bytes;
+	sw_accel_stats_tmp.tx_bytes = p_info->sw_accel_stats.tx_bytes;
+    } 
+
     ppa_netif_put(p_info);
 
     if ( f_need_update )
@@ -1473,7 +1577,19 @@ int32_t ppa_netif_update(PPA_NETIF *netif, PPA_IFNAME *ifname)
             ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"update wan interface %s fail\n", ifname);
             return PPA_FAILURE;
         }        
-        
+     
+	if ( ppa_netif_lookup(ifname, &p_info) != PPA_SUCCESS ){
+        	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"fail: device: %s not accelerated\n", ifname);
+        	return PPA_ENOTAVAIL;
+    	}
+   
+	p_info->hw_accel_stats.rx_bytes = hw_accel_stats_tmp.rx_bytes;
+	p_info->hw_accel_stats.tx_bytes = hw_accel_stats_tmp.tx_bytes;
+	p_info->sw_accel_stats.rx_bytes = sw_accel_stats_tmp.rx_bytes;
+	p_info->sw_accel_stats.tx_bytes = sw_accel_stats_tmp.tx_bytes;
+
+    	ppa_netif_put(p_info);
+    
     }
 
     return PPA_SUCCESS;
@@ -1524,6 +1640,173 @@ void ppa_netif_stop_iteration(void)
     ppa_netif_unlock_list();
 }
 
+#ifdef CONFIG_LTQ_PPA_NETIF_EVENT
+static void ppa_update_netif_name(PPA_NETIF *netif)
+{
+	struct netif_info *p;
+	bool found = false;
+	PPA_IFNAME ifname[PPA_IF_NAME_SIZE];
+
+	ifname[0] = 0;
+
+	ppa_netif_lock_list();
+	for (p = g_netif; p; p = p->next)
+		if (p->netif == netif)
+		{
+			found = true;
+			ppa_strncpy(ifname, p->name, PPA_IF_NAME_SIZE);
+			break;
+		}
+	if(!found || ifname[0] == 0)
+	{
+		ppa_netif_unlock_list();
+		return;
+	}
+
+	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+			"updating netif name change [%s:%s]\n",
+			ifname, ppa_get_netif_name(netif));
+	for (p = g_netif; p; p = p->next)
+	{
+		if (ppa_str_cmp(p->name, ifname))
+			ppa_strncpy(p->name, netif->name, PPA_IF_NAME_SIZE);
+
+		if (ppa_str_cmp(p->manual_lower_ifname, ifname))
+			ppa_strncpy(p->manual_lower_ifname, netif->name,
+					PPA_IF_NAME_SIZE);
+
+		if (ppa_str_cmp(p->phys_netif_name, ifname))
+			ppa_strncpy(p->phys_netif_name, netif->name,
+					PPA_IF_NAME_SIZE);
+
+	}
+	ppa_netif_unlock_list();
+}
+
+static void ppa_register_new_netif(PPA_NETIF *netif)
+{
+	PPA_IFNAME phy_ifname[PPA_IF_NAME_SIZE];
+	PPA_IFNAME *ifname;
+	struct netif_info *ifinfo = NULL;
+
+	phy_ifname[0] = 0;
+
+	ifname = ppa_get_netif_name(netif);
+
+	if (ifname == NULL)
+		return;
+
+	/* New netif will automatically be added into PPA if its physcial
+	 * is already present in PPA. If netif is bridge, it will be added
+	 * LAN group
+	 * All handling done after ppacmd init.
+	 */
+	if ((ppa_get_physical_if(netif, NULL, phy_ifname) == PPA_SUCCESS) &&
+			(ppa_strlen(phy_ifname)> 0)) {
+		if ((ppa_netif_lookup(phy_ifname, &ifinfo) == PPA_SUCCESS) &&
+				(ifinfo != NULL)) {
+			if (!ppa_str_cmp(ifname, phy_ifname)) {
+				ppa_netif_add(ifname,
+						ifinfo->flags & NETIF_LAN_IF,
+						NULL, NULL,
+						ifinfo->f_wanitf.flag_force_wanitf);
+				ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+						"dynamically adding iface[%s]\n",
+						ifname);
+			}
+			ppa_netif_put(ifinfo);
+		} else if (ppa_if_is_br_if(netif, NULL)) {
+			ppa_netif_add(ifname, NETIF_LAN_IF, NULL, NULL, 0);
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+					"dynamically adding bridge iface[%s]\n",
+					ifname);
+		}
+	}
+}
+
+static void ppa_unregister_new_netif(PPA_NETIF *netif)
+{
+	PPA_IFNAME phy_ifname[PPA_IF_NAME_SIZE];
+	PPA_IFNAME *ifname;
+	struct netif_info *ifinfo = NULL;
+	int f_is_lan = 0;
+
+	phy_ifname[0] = 0;
+
+	ifname = ppa_get_netif_name(netif);
+
+	if (ifname == NULL)
+		return;
+
+	/* Logically netif will automatically be removed from PPA after
+	 * ppacmd init. If netif is bridge, LAN group
+	 * All handling is done after ppacmd init
+	 */
+	if ((ppa_get_physical_if(netif, NULL, phy_ifname) == PPA_SUCCESS) &&
+			(ppa_strlen(phy_ifname)> 0) &&
+			(!ppa_str_cmp(ifname, phy_ifname))) {
+		if ((ppa_netif_lookup(phy_ifname, &ifinfo) == PPA_SUCCESS) &&
+				ifinfo != NULL) {
+			f_is_lan = ifinfo->flags & NETIF_LAN_IF;
+			ppa_netif_put(ifinfo);
+			ppa_netif_remove(ifname, f_is_lan);
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+					"dynamically removing netif[%s]\n",
+					ifname);
+		}
+	} else if (ppa_if_is_br_if(netif, NULL)) {
+		ppa_netif_remove(ifname, NETIF_LAN_IF);
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+				"dynamically removing bridge[%s]\n",
+				ifname);
+	}
+}
+
+static void ppa_netif_up(netif)
+{
+	/* ppa_get_physical_if() fails for pppoe net_dev because call to
+	 * ppa_check_is_pppoe_netif() also validated only if pppoe_addr
+	 * is assigned to fetch the physical interface.
+	 * So, adding pppoe into ppa on up event
+	 */
+	if (ppa_check_is_pppoe_netif(netif))
+		ppa_register_new_netif(netif);
+}
+int ppa_phy_netdevice_event(PPA_NOTIFIER_BLOCK *nb,
+		unsigned long action, void *ptr)
+{
+	PPA_NETIF *netif = NULL;
+
+	if ( ptr == NULL )
+		return PPA_NOTIFY_BAD;
+
+	netif = (PPA_NETIF *)ptr;
+
+	switch (action) {
+		case NETDEV_CHANGENAME:
+			ppa_update_netif_name(netif);
+			break;
+		case NETDEV_UP:
+			ppa_netif_up(netif);
+		case NETDEV_REGISTER:
+			ppa_register_new_netif(netif);
+			break;
+		case NETDEV_UNREGISTER:
+			ppa_unregister_new_netif(netif);
+			break;
+		default:
+			ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
+					"net_dev event capture for[%s:%lu]\n",
+					ppa_get_netif_name(netif), action);
+	}
+	return PPA_NOTIFY_OK;
+}
+
+PPA_NOTIFIER_BLOCK ppa_netdevice_notifier = {
+	.notifier_call = ppa_phy_netdevice_event
+};
+#endif
+
 /*
  * ####################################
  *           Init/Cleanup API
@@ -1536,7 +1819,7 @@ int32_t ppa_api_netif_manager_init(void)
 #if defined(CONFIG_LTQ_PPA_API_DIRECTPATH)
     struct ppe_directpath_data *info;
 #endif
-    uint32_t pos;
+    uint32_t pos=0;
     int i,ret=PPA_SUCCESS;
     PPE_IFINFO if_info;
     PPE_COUNT_CFG count={0};
@@ -1606,6 +1889,10 @@ int32_t ppa_api_netif_manager_init(void)
     }
 #endif  
 
+#ifdef CONFIG_LTQ_PPA_NETIF_EVENT
+    ppa_register_netdevice_notifier(&ppa_netdevice_notifier);
+#endif
+
     return ret;
 
 PPA_API_NETIF_MANAGER_INIT_FAIL:
@@ -1616,6 +1903,9 @@ PPA_API_NETIF_MANAGER_INIT_FAIL:
 void ppa_api_netif_manager_exit(void)
 {
     ppa_netif_free_list();
+#ifdef CONFIG_LTQ_PPA_NETIF_EVENT
+    ppa_unregister_netdevice_notifier(&ppa_netdevice_notifier);
+#endif
     ppa_phys_port_free_list();
 }
 

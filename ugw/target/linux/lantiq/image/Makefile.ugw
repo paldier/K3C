@@ -5,11 +5,10 @@
 # See /LICENSE for more information.
 #
 include $(TOPDIR)/rules.mk
-
 UGW_VERSION:=UGW-$(shell cat $(TOPDIR)/ugw_version)
 JFFS2_BLOCKSIZE:=$(call qstrip,$(CONFIG_TARGET_ROOTFS_IMAGE_PHYSICAL_ERASE_SIZE))
+TIME_STAMP:=$(shell date +%s)
 include $(INCLUDE_DIR)/image.mk
-
 #ifeq ($(CONFIG_IFX_CONFIG_CPU),"AMAZON_S")
 #  CPE_NAME:=xRX100
 #else
@@ -24,7 +23,11 @@ else
   ifeq ($(CONFIG_TARGET_lantiq_xrx330),y)
     UBINIZE_OPTS:= -p $(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE)) -m 512 -s 256
   else
-    UBINIZE_OPTS:= -p $(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE)) -m 2048 -s 512
+    ifeq ($(CONFIG_TARGET_lantiq_xrx500),y)
+      UBINIZE_OPTS:= -p $(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE)) -m 2048 -s 2048
+    else
+      UBINIZE_OPTS:= -p $(patsubst %k,%KiB,$(JFFS2_BLOCKSIZE)) -m 2048 -s 512
+    endif
   endif
 endif
 
@@ -33,6 +36,13 @@ define put_ltq_banner
 	b_chars=`echo -n $$b_str | wc -m`; \
 	(echo -n " +"; for ((i=2;i<$$b_chars;i++)); do echo -n "-"; done; echo "+"; \
 	echo "$$b_str";echo -n " +";for ((i=2;i<$$b_chars;i++));do echo -n "-";done;echo -en "+\n\n") > $(1)
+endef
+
+define prepare_uts
+	$(if $(BUILD_VERSION), \
+		temp_suffix_tag=`echo $${BUILD_VERSION##built_}`;temp_branch=`echo $${temp_suffix_tag/_[0-9]*T[0-9]*/}`; \
+		echo -en "BRANCH=$$temp_branch\nVERSION_ID=$$temp_suffix_tag\n" > $(TARGET_DIR)/etc/os-release \
+	)
 endef
 
 # add_image_padding <input_image_name> <block_size(bytes)> <size_to_less(bytes)>
@@ -64,10 +74,18 @@ endef
 define gen_xml_db
         $(if $(wildcard $(STAGING_DIR)/xml/*_control.xml), \
                 $(if $(wildcard $(STAGING_DIR)/xml/*_data.xml), \
+      	               touch $(TARGET_IMG_DIR)/metadata.txt; \
+                       echo "" >> $(TARGET_IMG_DIR)/metadata.txt; \
+                       echo "hw_model=$(CONFIG_HW_MODEL_NAME)" >> $(TARGET_IMG_DIR)/metadata.txt; \
+                       echo "hw_version=$(CONFIG_HW_MODEL_VERSION)" >> 	$(TARGET_IMG_DIR)/metadata.txt; \
+                       echo "sw_timestamp=$(TIME_STAMP)" >> $(TARGET_IMG_DIR)/metadata.txt; \
                         cd $(STAGING_DIR)/xml/ && { \
                                 $(STAGING_DIR_HOST)/bin/python $(STAGING_DIR_HOST)/bin/merge.py -v $(STAGING_DIR_HOST)/bin/target_validate.xsd *_control*.xml -o=control.xml || exit 1; \
                                 $(STAGING_DIR_HOST)/bin/openssl aes-256-cbc -base64 -in control.xml -out $(TARGET_DIR)/etc/ctrlcfg -pass pass:SEINTELCHK ; \
                                 $(STAGING_DIR_HOST)/bin/python $(STAGING_DIR_HOST)/bin/merge.py -v $(STAGING_DIR_HOST)/bin/target_validate.xsd *_data*.xml -o=data.xml || exit 1; \
+                                sed -i "s/\(<HwModelName.*>\).*\(<.*\)/\1$(CONFIG_HW_MODEL_NAME)\2/" data.xml;\
+																sed -i "s/\(<HwVersion.*>\).*\(<.*\)/\1$(CONFIG_HW_MODEL_VERSION)\2/" data.xml;\
+																sed -i "s/\(<SwUpdtTimeStamp.*>\).*\(<.*\)/\1$(TIME_STAMP)\2/" data.xml;\
                                 $(STAGING_DIR_HOST)/bin/openssl aes-256-cbc -base64 -in data.xml -out $(TARGET_DIR)/etc/datacfg -pass pass:SEINTELCHK ;\
                         } \
                 )
@@ -276,6 +294,7 @@ endif
 endef
 
 define Image/mkfs/prepare/platform
+	- @$$(call prepare_uts)
 	- echo "$(UGW_VERSION)" > $(TARGET_DIR)/etc/version
 	- date +%H%M-%d%b%y > $(TARGET_DIR)/etc/timestamp
 	- echo "$(CONFIG_GCC_VERSION)" > $(TARGET_DIR)/etc/toolchain_ver
@@ -396,6 +415,10 @@ define Image/Build/fullimage
 	if [ -n "$(CONFIG_PACKAGE_open_uboot)" -a -z "$(CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS)" ]; then \
 		IMAGE_LIST="$$IMAGE_LIST $(TARGET_IMG_DIR)/firmware.img"; \
 	fi; \
+	if [ -n "$(CONFIG_swdownload_support)" ]; then \
+		$(KDIR)/u-boot-*/tools/mkimage -n 'SUIF Info' -T script -C none -d "$(TARGET_IMG_DIR)/metadata.txt" "$(TARGET_IMG_DIR)/SUIF.img"; \
+		rm -rf $(TARGET_IMG_DIR)/metadata.txt; \
+	fi; \
 	ONEIMAGE="$(TARGET_IMG_DIR)/fullimage.img"; \
 	PLATFORM=`echo $(SUBTARGET)|cut -d_ -f2-|awk '{ print toupper($$1) }'`; \
 	rm -f $$ONEIMAGE; \
@@ -433,8 +456,9 @@ define Image/Build/system_sw
 		echo -en "\n\033[32;02mCreating UBI image system_sw.bin\033[00m\n"; \
 		OUT_DIR="$(TARGET_IMG_DIR)/flashprogram_bins"; mkdir -p $$OUT_DIR; \
 		if [ -z "$(CONFIG_UBOOT_CONFIG_FIRMWARE_IN_ROOTFS)" ]; then \
-			$(CP) ./ubinize_fw.cfg $(KDIR)/ubinize.cfg; \
-		else $(CP) ./ubinize.cfg $(KDIR)/; fi; \
+			$(CP) ./ubinize$(if $(CONFIG_PACKAGE_ltq-xrx500-bootcore),_bootcore)_fw.cfg $(KDIR)/ubinize.cfg; \
+		else $(CP) ./ubinize$(if $(CONFIG_PACKAGE_ltq-xrx500-bootcore),_bootcore).cfg $(KDIR)/; fi; \
+		if [ -f "$(TARGET_IMG_DIR)/uImage_bootcore" ]; then $(CP) $(TARGET_IMG_DIR)/uImage_bootcore $(KDIR)/; fi; \
 		(cd $(KDIR)/ && \
 			$(STAGING_DIR_HOST)/bin/ubinize $(UBINIZE_OPTS) \
 			-o $$OUT_DIR/system_sw.bin ubinize.cfg); \
@@ -501,6 +525,12 @@ define Image/Build/flashprogrammer
 			   "gphyfirmware") ln -sf ../gphy_firmware.img gphy_firmware.bin; \
 				$(call add_image_padding,gphy_firmware.bin,$$m_byte,0); \
 				cat gphy_firmware.bin.padded >> $$OUT_BIN;; \
+			   "bootcore") echo "0" > bootcoreempty; \
+				$(call add_image_padding,bootcoreempty,$$m_byte,0); \
+				cat bootcoreempty.padded >> $$OUT_BIN;; \
+			   "calibration") echo "0" > calibrationempty; \
+				$(call add_image_padding,calibrationempty,$$m_byte,0); \
+				cat calibrationempty.padded >> $$OUT_BIN;; \
 			   "system_sw") cat system_sw.bin >> $$OUT_BIN;; \
 			esac; rm -f *.padded; \
 		done;); \

@@ -15,6 +15,7 @@ OUTPUT_DIR="./docs/ugw"
 FILE_UGW="$INPUT_DIR/ugw_doxy.h"
 FILE_MAINPAGE="$INPUT_DIR/ugw_mainpage.h"
 FILE_UGW_FAPI="$INPUT_DIR/ugw_doxy_fapi.h"
+FILE_UGW_VOIP="$INPUT_DIR/ugw_doxy_voip.h"
 FILE_UGW_FRAMEWORK="$INPUT_DIR/ugw_doxy_framework.h"
 rm -rf $OUTPUT_DIR
 
@@ -37,6 +38,9 @@ gen_defs_ugw() {
 /** \defgroup FAPI Functional API (FAPI)
     \brief FAPI provides an interface to manage platform specific system configure. Each module
            is offered in the form of C libraries and can be integrated with any framework.  
+	
+/** \defgroup VOIP VoIP Library
+    \brief Provides an interface to various components of VoIP application.
 		
 */
 
@@ -88,6 +92,30 @@ gen_defs_ugw_fapi() {
 *   @ingroup FAPI
     \brief Provides interface to initialize, configure various Telephony features. 
 */
+EOM
+}
+
+gen_defs_ugw_voip() {
+	/bin/cat <<EOM >$FILE_UGW_VOIP
+/*! \file ugw_doxy_voip.h
+    \brief File contains the VoIP doxygen macros definitions for UGW Programmer's Reference
+*/
+
+/** \defgroup VOIP_CMGR Call Manager (CMGR)
+*   @ingroup VOIP
+    \brief Provides interface to Call Manager module of VoIP application.
+*/
+
+/** \defgroup VOIP_MMGR Media Manager (MMGR)
+*   @ingroup VOIP
+    \brief Provides interface to Media Manager module of VoIP application.
+*/
+
+/** \defgroup VOIP_MISC Miscellaneous
+*   @ingroup VOIP
+    \brief Provides interface to other modules (like Dial plan, timer etc.) of VoIP application.
+*/
+
 EOM
 }
 
@@ -197,6 +225,7 @@ fi
 
 gen_defs_ugw
 gen_defs_ugw_fapi
+gen_defs_ugw_voip
 gen_defs_ugw_framework
 gen_mainpage
 gen_apidoc
@@ -207,6 +236,7 @@ rm $DOXY_TMP_FILE
 rm $FILE_MAINPAGE
 rm $FILE_UGW
 rm $FILE_UGW_FAPI
+rm $FILE_UGW_VOIP
 rm $FILE_UGW_FRAMEWORK
 exit 0
 

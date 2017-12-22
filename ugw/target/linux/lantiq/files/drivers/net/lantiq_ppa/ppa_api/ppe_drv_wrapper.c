@@ -88,11 +88,11 @@ EXPORT_SYMBOL(ppa_sw_session_enable_hook);
 int32_t (*ppa_get_sw_session_status_hook)(struct session_list_item *p_item, uint32_t *f_enable, uint32_t flags) = NULL;
 EXPORT_SYMBOL(ppa_get_sw_session_status_hook);
 
-int32_t (*ppa_sw_fastpath_send_hook)(PPA_BUF *skb) = NULL; 
+int32_t (*ppa_sw_fastpath_send_hook)(PPA_SKBUF *skb) = NULL; 
 EXPORT_SYMBOL(ppa_sw_fastpath_send_hook);
 
 #if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
-int32_t (*ppa_sw_litepath_tcp_send_hook)(PPA_BUF *skb) = NULL;
+int32_t (*ppa_sw_litepath_tcp_send_hook)(PPA_SKBUF *skb) = NULL;
 EXPORT_SYMBOL(ppa_sw_litepath_tcp_send_hook);
 #endif
 
@@ -101,7 +101,7 @@ int32_t (*ppa_construct_template_buf_hook)( PPA_BUF *skb,
                                             struct session_list_item *p_item,
                                             struct netif_info *tx_ifinfo) = NULL;
 EXPORT_SYMBOL(ppa_construct_template_buf_hook);
-struct session_action * (*ppa_construct_mc_template_buf_hook)(void *pitem, uint32_t dest_list) = NULL;
+struct session_action * (*ppa_construct_mc_template_buf_hook)(struct mc_group_list_item *p_item, uint32_t dest_list) = NULL;
 EXPORT_SYMBOL(ppa_construct_mc_template_buf_hook);
 void (*ppa_destroy_template_buf_hook)(void* tmpl_buf) = NULL;
 EXPORT_SYMBOL(ppa_destroy_template_buf_hook);

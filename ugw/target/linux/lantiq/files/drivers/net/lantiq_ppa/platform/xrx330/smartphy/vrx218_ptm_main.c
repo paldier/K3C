@@ -3526,6 +3526,8 @@ static int __init ppe_init(void)
     register_ppe_ext_generic_hook(ppe_generic_hook, ppe_generic_hook);
     xet_phy_wan_port(7,NULL,1,1);
     proc_file_create();
+    if (ppa_hook_ppa_phys_port_add_fn)
+        ppa_hook_ppa_phys_port_add_fn("ptm0", 7);
 
     printk(KERN_INFO "  total %d device(s) are detected!\n", dev_num);
     if ( valid_dev_num ) {
@@ -3543,6 +3545,9 @@ static void __exit ppe_exit(void)
     extern int32_t register_ppe_ext_generic_hook(ppe_generic_hook_t datapath_hook, ppe_generic_hook_t hal_hook);
 
     int i;
+
+    if (ppa_hook_ppa_phys_port_remove_fn)
+        ppa_hook_ppa_phys_port_remove_fn(7);
 
     proc_file_delete();
 

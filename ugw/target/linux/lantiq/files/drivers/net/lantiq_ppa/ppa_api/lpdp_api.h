@@ -69,10 +69,10 @@ struct ppa_lpdp_cb {
 extern struct ppe_directpath_data *ppa_drv_g_ppe_directpath_data;
 extern int32_t ppa_litepath_ll_register(struct ppa_lpdp_cb* lpcb, int flags);
 extern int32_t ppa_drv_lpdp_directpath_register(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_DIRECTPATH_CB *pDirectpathCb, int32_t *index, uint32_t flags);
-extern int32_t ppa_drv_lpdp_directpath_send(PPA_SUBIF *p_subif, struct sk_buff *skb, int32_t len, uint32_t flags);
+extern int32_t ppa_drv_lpdp_directpath_send(PPA_SUBIF *p_subif, PPA_SKBUF *skb, int32_t len, uint32_t flags);
 extern int32_t ppa_drv_lpdp_directpath_flowctrl(PPA_SUBIF *psubif, uint32_t flags);
-extern PPA_BUF *ppa_drv_lpdp_directpath_alloc_skb(PPA_SUBIF *subif, int32_t len, uint32_t flags);
-extern int32_t ppa_drv_lpdp_directpath_recycle_skb(PPA_SUBIF *subif, PPA_BUF *skb, uint32_t flags);
+extern PPA_SKBUF *ppa_drv_lpdp_directpath_alloc_skb(PPA_SUBIF *subif, int32_t len, uint32_t flags);
+extern int32_t ppa_drv_lpdp_directpath_recycle_skb(PPA_SUBIF *subif, PPA_SKBUF *skb, uint32_t flags);
 
 #if 0
 /* Exposed API to get lpdp callback reference */

@@ -61,7 +61,7 @@
 /*Hook API for PPE Driver's Datapath layer: these hook will be set in PPE datapath driver*/
 /* First part is for direct path */
 struct ppe_directpath_data *ppa_drv_g_ppe_directpath_data = NULL;
-int32_t (*ppa_drv_directpath_send_hook)(uint32_t, PPA_BUF *, int32_t, uint32_t) = NULL;
+int32_t (*ppa_drv_directpath_send_hook)(uint32_t, PPA_SKBUF *, int32_t, uint32_t) = NULL;
 int32_t (*ppa_drv_directpath_rx_stop_hook)(uint32_t, uint32_t) = NULL;
 int32_t (*ppa_drv_directpath_rx_start_hook)(uint32_t, uint32_t) = NULL;
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
@@ -87,7 +87,6 @@ int32_t (*tmu_hal_get_csum_ol_mib_hook_fn)(
                 uint32_t flag) = NULL;
 EXPORT_SYMBOL(tmu_hal_get_csum_ol_mib_hook_fn);
 int32_t (*tmu_hal_clear_csum_ol_mib_hook_fn)(
-                struct tmu_hal_qos_stats *csum_mib,
                 uint32_t flag) = NULL;
 EXPORT_SYMBOL(tmu_hal_clear_csum_ol_mib_hook_fn);
 int32_t(*tmu_hal_get_qos_mib_hook_fn)(
@@ -107,8 +106,8 @@ EXPORT_SYMBOL(tmu_hal_clear_qos_mib_hook_fn);
 #endif
 /*    others:: these hook will be set in PPE datapath driver  */
 int (*ppa_drv_get_dslwan_qid_with_vcc_hook)(struct atm_vcc *vcc)= NULL;
-int (*ppa_drv_get_netif_qid_with_pkt_hook)(struct sk_buff *skb, void *arg, int is_atm_vcc)= NULL;
-int (*ppa_drv_get_atm_qid_with_pkt_hook)(struct sk_buff *skb, void *arg, int is_atm_vcc)= NULL;
+int (*ppa_drv_get_netif_qid_with_pkt_hook)(PPA_SKBUF *skb, void *arg, int is_atm_vcc)= NULL;
+int (*ppa_drv_get_atm_qid_with_pkt_hook)(PPA_SKBUF *skb, void *arg, int is_atm_vcc)= NULL;
 int (*ppa_drv_ppe_clk_change_hook)(unsigned int arg, unsigned int flags)= NULL;
 int (*ppa_drv_ppe_pwm_change_hook)(unsigned int arg, unsigned int flags)= NULL;
 int32_t (*ppa_drv_datapath_generic_hook)(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint32_t flag)=NULL;
@@ -118,7 +117,7 @@ int32_t (*ppa_drv_datapath_mac_entry_setting)(uint8_t  *mac, uint32_t fid, uint3
 /* Hook API for datapath A1 to get MPoA type */
 int32_t (*ppa_drv_hal_get_mpoa_type_hook)(uint32_t dslwan_qid, uint32_t *mpoa_type) = NULL;
 
-int ppa_drv_directpath_send(uint32_t if_id, struct sk_buff *skb, int32_t len, uint32_t flags)
+int ppa_drv_directpath_send(uint32_t if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags)
 {
     if( !ppa_drv_directpath_send_hook ) return PPA_EINVAL;
     return ppa_drv_directpath_send_hook(if_id, skb, len, flags);
@@ -137,7 +136,7 @@ int ppa_drv_directpath_rx_start(uint32_t if_id, uint32_t flags)
 }
 
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
-int32_t ppa_drv_directpath_register(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_DIRECTPATH_CB *pDirectpathCb, int32_t *index, uint32_t flags)
+int ppa_drv_directpath_register(PPA_SUBIF *subif, PPA_NETIF *netif, PPA_DIRECTPATH_CB *pDirectpathCb, int32_t *index, uint32_t flags)
 {
     if( !ppa_drv_directpath_register_hook ) return PPA_EINVAL;
     return ppa_drv_directpath_register_hook(subif, netif, pDirectpathCb, index, flags);
@@ -155,11 +154,10 @@ int32_t ppa_drv_get_csum_ol_mib(
 EXPORT_SYMBOL(ppa_drv_get_csum_ol_mib);
 
 int32_t ppa_drv_clear_csum_ol_mib(
-                struct tmu_hal_qos_stats *csum_mib,
                 uint32_t flag)
 {
     if( !tmu_hal_clear_csum_ol_mib_hook_fn ) return PPA_EINVAL;
-    return tmu_hal_clear_csum_ol_mib_hook_fn (csum_mib, flag);
+    return tmu_hal_clear_csum_ol_mib_hook_fn (flag);
 
 }
 EXPORT_SYMBOL(ppa_drv_clear_csum_ol_mib);
@@ -195,7 +193,7 @@ int ppa_drv_get_dslwan_qid_with_vcc(struct atm_vcc *vcc)
     else return ppa_drv_get_dslwan_qid_with_vcc_hook(vcc);
 }
 
-int ppa_drv_get_netif_qid_with_pkt(struct sk_buff *skb, void *arg, int is_atm_vcc)
+int ppa_drv_get_netif_qid_with_pkt(PPA_SKBUF *skb, void *arg, int is_atm_vcc)
 {
     if( !ppa_drv_get_netif_qid_with_pkt_hook ) return 0;
     else return ppa_drv_get_netif_qid_with_pkt_hook(skb, arg, is_atm_vcc);

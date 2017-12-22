@@ -21,7 +21,6 @@
  ** $Date        $Author                $Comment
  ** 8 Aug 2014   Purnendu Ghosh         Initiate Version
  *******************************************************************************/
-
 /************************Below is Common Macro Definition *************************************/
 /** \addtogroup  TMU_HEADER_MACRO */
 /*@{*/
@@ -514,6 +513,25 @@ struct tmu_hal_shaper_track_info {
   struct tmu_hal_token_bucket_shaper_cfg tb_cfg;
 };
 
+struct tmu_hal_qos_mib {
+	uint32_t enqPkts; /* Enqueued packets Count */
+	uint32_t enqBytes; /* Enqueued Bytes Count */
+	uint32_t deqPkts; /* Dequeued packets Count */
+	uint32_t deqBytes; /* Dequeued Bytes Count */
+	uint32_t dropPkts; /* Dropped Packets Count */
+	uint32_t dropBytes; /* Dropped Bytes Count - UNUSED for now */
+	uint32_t qOccPkts; /* Queue Occupancy Packets Count - Only at Queue level */
+};
+struct tmu_hal_subif_mib {
+	uint64_t enqPkts; /* Enqueued packets Count */
+	uint64_t enqBytes; /* Enqueued Bytes Count */
+	uint64_t deqPkts; /* Dequeued packets Count */
+	uint64_t deqBytes; /* Dequeued Bytes Count */
+	uint64_t dropPkts; /* Dropped Packets Count */
+	uint64_t dropBytes; /* Dropped Bytes Count - UNUSED for now */
+	uint64_t qOccPkts; /* Queue Occupancy Packets Count - Only at Queue level */
+};
+
 struct tmu_hal_user_queue_info {
   /** Actual Queue index */
   uint32_t  queue_index; 
@@ -533,6 +551,7 @@ struct tmu_hal_user_queue_info {
   uint8_t   no_of_tc;
   /** Drop params for this queue */ 
   struct tmu_hal_equeue_cfg ecfg;
+  struct tmu_hal_qos_mib q_mib;
 
 };
 
@@ -565,6 +584,8 @@ struct tmu_hal_user_subif_abstract {
   uint32_t  default_prio;
   /**  All the Queue details of this egress interface */
   struct tmu_hal_user_queue_info user_queue[TMU_HAL_MAX_QUEUE_PER_EGRESS_INTERFACE];
+
+  struct tmu_hal_subif_mib subif_mib;
 };
 
 

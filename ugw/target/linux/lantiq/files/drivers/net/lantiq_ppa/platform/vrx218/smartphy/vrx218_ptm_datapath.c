@@ -381,8 +381,10 @@ static struct sk_buff* skb_break_away_from_protocol(struct sk_buff *skb)
     nf_conntrack_put(new_skb->nfct);
     new_skb->nfct = NULL;
   #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
-    nf_conntrack_put_reasm(new_skb->nfct_reasm);
-    new_skb->nfct_reasm = NULL;
+    #if LINUX_VERSION_CODE <= KERNEL_VERSION(3,10,12)
+      nf_conntrack_put_reasm(new_skb->nfct_reasm);
+      new_skb->nfct_reasm = NULL;
+    #endif
   #endif
   #ifdef CONFIG_BRIDGE_NETFILTER
     nf_bridge_put(new_skb->nf_bridge);
@@ -550,6 +552,9 @@ ETH_XMIT_DROP:
 static int ptm_qos_hard_start_xmit_b(struct sk_buff *skb, struct net_device *dev)
 {
     int qid;
+    int nRet = -1;
+    int nLen = skb->len;
+    struct eth_priv_data *pxBasePriv = ifx_eth_fw_netdev_priv(g_ptm_net_dev[0]);
 
     if(!in_showtime()){
 	dev_kfree_skb_any(skb);
@@ -564,7 +569,16 @@ static int ptm_qos_hard_start_xmit_b(struct sk_buff *skb, struct net_device *dev
        qid = get_qid_by_priority(PTM_PORT, skb->priority);
     dump_skb(skb, skb->len, __FUNCTION__, 0, 0, 1);
     swap_mac(skb->data);
-    eth_xmit(skb, PTM_PORT /* DSL */, 2, 2, qid ,0);/* Changed tc to qid to fix Qos in Sw fast path*/
+    nRet = eth_xmit(skb, PTM_PORT /* DSL */, 2, 2, qid ,0);/* Changed tc to qid to fix Qos in Sw fast path*/
+
+    /* Update base interface MIB counters */
+    if (nRet != 0) {
+        pxBasePriv->tx_dropped++;
+    } else {
+        pxBasePriv->tx_packets++;
+        pxBasePriv->tx_bytes += nLen;
+    }
+
     return 0;
 }
 
@@ -660,6 +674,7 @@ static void ptm_tx_timeout(struct net_device *dev)
 static int ptm_push(struct sk_buff *skb, struct flag_header *header, unsigned int ifid)
 {
     struct eth_priv_data *priv;
+    int nLen = skb->len;
 
     if ( ifid != 7 )
         return -EINVAL;
@@ -682,7 +697,7 @@ static int ptm_push(struct sk_buff *skb, struct flag_header *header, unsigned in
         else
         {
             priv->rx_packets++;
-            priv->rx_bytes += skb->len;
+            priv->rx_bytes += nLen;
         }
     }
     else

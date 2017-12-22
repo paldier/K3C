@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent a18b5da7661136eeb6d81000f9a429fc29fb51b6
+# Parent 89ef32ee8cdf9a37f7f4adb771887b3888850f77
 
 diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
 --- a/drivers/net/ethernet/lantiq/Kconfig
@@ -9,7 +9,7 @@ diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/K
  	Lantiq framework for ethernet drivers
  
 +config LTQ_ETH_XRX500
-+        bool "Lantiq Ethernet driver for XRX500 series"
++        tristate "Lantiq Ethernet driver for XRX500 series"
 +        depends on LANTIQ && SOC_GRX500 && LTQ_ETHSW_API && (LTQ_CBM || LTQ_DATAPATH_LIBRARY)
 +        default n
 +        ---help---
@@ -17,8 +17,8 @@ diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/K
 +
 +config XRX500_ETH_DRV_COC_SUPPORT
 +		bool "CoC support in the ethernet driver"
-+        depends on LTQ_ETH_XRX500 && LTQ_DATAPATH_CPUFREQ
-+		default n
++        depends on LTQ_ETH_XRX500 && LTQ_DATAPATH_CPUFREQ && LTQ_CPUFREQ
++		default y
 +		---help---
 +		CoC support in the Ethernet driver of XRX500 series
 +
@@ -51,7 +51,7 @@ diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethe
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
-@@ -0,0 +1,1953 @@
+@@ -0,0 +1,2123 @@
 +/******************************************************************************
 +**
 +** FILE NAME    : lantiq_eth_drv.c
@@ -96,6 +96,8 @@ new file mode 100755
 +
 +#define CONFIG_XRX500_MDIO_SUPPORT
 +#define CONFIG_USERSPACE_LINK_NOTIFICATION
++
++#define LTQ_ETH_DATA_LEN 8000
 +
 +#ifdef CONFIG_USERSPACE_LINK_NOTIFICATION
 +#include <net/genetlink.h>
@@ -198,7 +200,7 @@ new file mode 100755
 +		.notifier_call = phy_netdevice_event
 +};
 +
-+//#define DUMP_PACKET
++#undef DUMP_PACKET
 +
 +#ifdef DUMP_PACKET
 +/*
@@ -436,18 +438,183 @@ new file mode 100755
 +    return 0;
 +}
 +
++static int ltq_enable_gsw_l_jumbo(struct net_device *dev) 
++{
++	ltq_switch_priv_t *priv = netdev_priv(dev);
++	GSW_API_HANDLE gswl;
++	GSW_register_t regCfg;
++
++	pr_info("%s called for id: %d\n", __func__, priv->id);
++
++	/* Do the GSW-L configuration */
++	pr_info("doing the GSW-L configuration for jumbo\n");
++	gswl = gsw_api_kopen("/dev/switch_api/0");
++	if (gswl == 0) {
++		pr_err("%s: Open SWAPI device FAILED !!\n", __func__ );
++		return -EIO;
++	}
++
++	/* Set the MAC control register 2 to enable Jumbo frames */
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0x8f9 + (0xc * (priv->id + 1));
++	gsw_api_kioctl(gswl, GSW_REGISTER_GET, (unsigned int)&regCfg);
++	regCfg.nData |= 0x8;
++	gsw_api_kioctl(gswl, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	/* PMAC control register 2 to enable jumbo frames */
++	pr_info("doing the PMAC configuration for jumbo at GSW-L\n");
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0xd05;
++	gsw_api_kioctl(gswl, GSW_REGISTER_GET, (unsigned int)&regCfg);
++	regCfg.nData |= 0x8;
++	gsw_api_kioctl(gswl, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	/* Set the frame length */
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0xd06;
++	regCfg.nData = 9216;
++	gsw_api_kioctl(gswl, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	gsw_api_kclose(gswl);
++
++
++	return 0;
++}
++
++static int ltq_disable_gsw_l_jumbo(struct net_device *dev) 
++{
++	ltq_switch_priv_t *priv = netdev_priv(dev);
++	GSW_API_HANDLE gswl;
++	GSW_register_t regCfg;
++
++	pr_info("%s called for id: %d\n", __func__, priv->id);
++
++	/* Do the GSW-L configuration */
++	pr_info("doing the GSW-L configuration for jumbo\n");
++	gswl = gsw_api_kopen("/dev/switch_api/0");
++	if (gswl == 0) {
++		pr_err("%s: Open SWAPI device FAILED !!\n", __func__ );
++		return -EIO;
++	}
++
++	/* Set the MAC control register 2 to enable Jumbo frames */
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0x8f9 + (0xc * (priv->id + 1));
++	gsw_api_kioctl(gswl, GSW_REGISTER_GET, (unsigned int)&regCfg);
++	regCfg.nData &= ~8;
++	gsw_api_kioctl(gswl, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	gsw_api_kclose(gswl);
++	return 0;
++}
++
++static int ltq_enable_gsw_r_pmac_jumbo (struct net_device *dev)
++{
++	GSW_API_HANDLE gswr;
++	GSW_register_t regCfg;
++
++	/* Do the GSW-R configuration */
++	gswr = gsw_api_kopen("/dev/switch_api/1");
++	if (gswr == 0) {
++		pr_err("%s: Open SWAPI device FAILED !!\n", __func__ );
++		return -EIO;
++	}
++	/* PMAC control register 2 to enable jumbo frames */
++	pr_info("doing the PMAC configuration for jumbo at GSW-R\n");
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0xd05;
++	gsw_api_kioctl(gswr, GSW_REGISTER_GET, (unsigned int)&regCfg);
++	regCfg.nData |= 0x8;
++	gsw_api_kioctl(gswr, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	/* Set the frame length */
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0xd06;
++	regCfg.nData = 1728;
++	gsw_api_kioctl(gswr, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	gsw_api_kclose(gswr);
++
++	return 0;
++}
++
++static int ltq_enable_gsw_r_jumbo(struct net_device *dev) 
++{
++	GSW_API_HANDLE gswr;
++	GSW_register_t regCfg;
++
++	/* Do the GSW-R configuration */
++	gswr = gsw_api_kopen("/dev/switch_api/1");
++	if (gswr == 0) {
++		pr_err("%s: Open SWAPI device FAILED !!\n", __func__ );
++		return -EIO;
++	}
++
++	/* Set the MAC control register 2 to enable Jumbo frames */
++	pr_info("doing the GSW-R configuration for jumbo\n");
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0x905;
++	gsw_api_kioctl(gswr, GSW_REGISTER_GET, (unsigned int)&regCfg);
++	regCfg.nData |= 0x8;
++	gsw_api_kioctl(gswr, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	gsw_api_kclose(gswr);
++
++	return 0;
++}
++
++static int ltq_disable_gsw_r_jumbo(struct net_device *dev) 
++{
++	GSW_API_HANDLE gswr;
++	GSW_register_t regCfg;
++
++	/* Do the GSW-R configuration */
++	gswr = gsw_api_kopen("/dev/switch_api/1");
++	if (gswr == 0) {
++		pr_err("%s: Open SWAPI device FAILED !!\n", __func__ );
++		return -EIO;
++	}
++
++	/* Set the MAC control register 2 to enable Jumbo frames */
++	pr_info("doing the GSW-R configuration for jumbo\n");
++	memset((void *)&regCfg, 0x00, sizeof(regCfg));
++	regCfg.nRegAddr = 0x905;
++	gsw_api_kioctl(gswr, GSW_REGISTER_GET, (unsigned int)&regCfg);
++	regCfg.nData |= 0x8;
++	gsw_api_kioctl(gswr, GSW_REGISTER_SET, (unsigned int)&regCfg);
++
++	gsw_api_kclose(gswr);
++
++	return 0;
++}
++
 +/* Change the MTU value of the netwrok device interfaces */
 +static int ltq_change_mtu (struct net_device *dev, int new_mtu)
 +{
-+	int mtu_max;
-+	#ifdef CONFIG_LTQ_MINI_JUMBO_FRAME_SUPPORT
-+			mtu_max = 1860 - (NET_IP_ALIGN + NET_SKB_PAD);        /* Max. octets in payload    */
-+	#else
-+			mtu_max = ETH_DATA_LEN;
-+	#endif
++	ltq_switch_priv_t *priv = netdev_priv(dev);
 +
-+	if(new_mtu < ETH_ZLEN || new_mtu > mtu_max)
++	if(new_mtu < ETH_ZLEN || new_mtu > LTQ_ETH_DATA_LEN)
 +		return -EINVAL;
++
++	/* if the MTU > 1500, do the jumbo config in switch */
++	if (new_mtu > ETH_DATA_LEN && !(priv->jumbo_enabled)) {
++		if (priv->wan) {
++			if (ltq_enable_gsw_r_jumbo(dev) < 0)
++				return -EIO;
++		} else {
++			if (ltq_enable_gsw_l_jumbo(dev) < 0)
++				return -EIO;
++		}
++		ltq_enable_gsw_r_pmac_jumbo(dev);
++		priv->jumbo_enabled = 1;
++	} else if (priv->jumbo_enabled) {
++		if (priv->wan)
++			ltq_disable_gsw_r_jumbo(dev);
++		else
++			ltq_disable_gsw_l_jumbo(dev);
++		priv->jumbo_enabled = 0;
++	}
++
 +	dev->mtu = new_mtu;
 +	return 0;
 +}
@@ -695,7 +862,7 @@ new file mode 100755
 +#endif
 +				egCfg.bPmacEna      = 1; //((k == 15) || (k < 7)) ? 1 : 0;
 +				egCfg.bFcsEna       = (k == 13) ? 1 /*PTM_Bonding_Mode*/: 0;
-+				egCfg.bRemL2Hdr     = ((k == 12) || (k == 14))? 1 : 0; 
++				egCfg.bRemL2Hdr     = 0; //((k == 12) || (k == 14))? 1 : 0;
 +				egCfg.numBytesRem   = (k == 14) ? 1 /*CAPWAP_HD_BYTES*/: 0; 
 +				egCfg.nResDW1       = 0;
 +				egCfg.nRes1DW0      = 0;
@@ -1020,8 +1187,10 @@ new file mode 100755
 +	memset(p, 0, sizeof(struct xrx500_port));
 +	p->phy_node = of_parse_phandle(port, "phy-handle", 0);
 +	addr = of_get_property(p->phy_node, "reg", NULL);
-+	if (!addr)
++	if (!addr) {
++		pr_info("no real internal PHY attached to this interface !\n");
 +		return;
++	}
 +
 +	p->num = *id;
 +	p->phy_addr = *addr;
@@ -1367,6 +1536,7 @@ new file mode 100755
 +	pr_info("trying to connect: %s to device: %s with irq: %d\n",
 +				dev->name, dev_name(&phydev->dev), port->irq_num);
 +	phydev->irq = port->irq_num;
++	irq_set_status_flags(phydev->irq, IRQ_NOAUTOEN);
 +	phydev = phy_connect(dev, dev_name(&phydev->dev), &xrx500_mdio_link,
 +				port->phy_if);
 +
@@ -1374,7 +1544,7 @@ new file mode 100755
 +		netdev_err(dev, "Could not attach to PHY\n");
 +		return PTR_ERR(phydev);
 +	}
-+
++	enable_irq(phydev->irq);
 +	phydev->supported &= (SUPPORTED_10baseT_Half
 +			| SUPPORTED_10baseT_Full
 +			| SUPPORTED_100baseT_Half
@@ -1792,10 +1962,10 @@ new file mode 100755
 +
 +	/* load the interfaces */
 +	/* add a dummy interface */
-+	xrx500_hw.num_devs = 1;
++	xrx500_hw.num_devs = 0;
 +	for_each_child_of_node(node, iface_np)
 +		if (of_device_is_compatible(iface_np, "lantiq,xrx500-pdi")) {
-+			pr_debug("adding the interface: %d\n", xrx500_hw.num_devs);
++			pr_info("adding the interface: %d\n", xrx500_hw.num_devs);
 +			if (xrx500_hw.num_devs < NUM_ETH_INF)
 +				xrx500_of_iface(&xrx500_hw, iface_np);
 +			else
@@ -2009,7 +2179,7 @@ diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h b/drivers/net/ethe
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
-@@ -0,0 +1,557 @@
+@@ -0,0 +1,558 @@
 +/*
 +** FILE NAME    : ltqmips_eth.h
 +** PROJECT      : Lantiq UEIP
@@ -2523,6 +2693,7 @@ new file mode 100644
 +	unsigned short port_map;
 +	int id;
 +	int wan;
++	int jumbo_enabled;
 +#define FLAG_PAUSE_AUTO         0x00000001
 +#define FLAG_FULL_DUPLEX        0x00000002
 +#define FLAG_10_BASE_T          0x00000010

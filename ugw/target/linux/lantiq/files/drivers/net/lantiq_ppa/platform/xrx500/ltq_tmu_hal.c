@@ -82,12 +82,13 @@ int gsw_api_kioctl(GSW_API_HANDLE handle, u32 command, u32 arg);
 #define INVALID_SCHED_ID 0xFF
 #define INVALID_SHAPER_ID 256
 #define CPU_PORT_ID 2
-#define TMU_HAL_ADD_QUEUE_INGRESS   0x00000000
-#define TMU_HAL_ADD_QUEUE_EXPLICIT   0x00000000
+#define TMU_HAL_QUEUE_SHAPER_INGRESS_MPE   0x0F000000
 #define TMU_HAL_DEL_SHAPER_CFG 0x00F00000
+#define TMU_HAL_ADD_QUEUE_EXPLICIT   0x00000000
 #define TMU_HAL_QUEUE_FLUSH_TIMEOUT 100000
 
 #define CBM_QUEUE_FLUSH_SUPPORT
+#define WRAPAROUND_32_BITS 0xFFFFFFFF
 
 int8_t LAN_PORT[] = {2,3,4,5,6};
 int8_t LAN_PORT_Q[][4] = { {8,9,10,11}, {12,13,14,15}, {16,17,18,19},{20,21,22,23},{24,25,26,27} };
@@ -113,6 +114,10 @@ int32_t g_CPU_PortId;
 int32_t g_CPU_Sched;
 int32_t g_CPU_Queue;
 
+// MPE Port Resources
+int32_t g_MPE_PortId = -1;
+int32_t g_MPE_Sched = -1;
+int32_t g_MPE_Queue = -1;
 // Directpath Egress 
 uint32_t g_DpEgressQueueScheduler=0;
 uint32_t g_Root_sched_id_DpEgress = 0xFF;
@@ -151,6 +156,13 @@ int tmu_hal_get_user_index_from_qid(struct tmu_hal_user_subif_abstract *subif_in
 enum tmu_hal_errorcode tmu_hal_scheduler_cfg_get(uint32_t index);
 int tmu_hal_del_shaper_index(int shaper_index);
 
+int tmu_hal_delete_mpe_ingress_queue(
+		struct net_device *netdev, 
+		uint32_t q_id, 
+		uint32_t priority,
+		uint32_t scheduler_id, 
+		uint32_t flags);
+
 static int tmu_hal_add_q_map(uint32_t q_index, uint32_t pmac_port, cbm_queue_map_entry_t *p_qmap, uint32_t bit_mask);
 static int tmu_hal_dp_egress_root_create(struct net_device *netdev);
 static int tmu_hal_dp_port_resources_get(uint32_t dp_port, struct tmu_hal_dp_res_info *res_p);
@@ -161,6 +173,7 @@ static int32_t tmu_hal_qos_uninit_cfg(void);
 static int32_t tmu_hal_qos_set_gswr(uint32_t cmd,void *cfg);
 static int32_t tmu_hal_qos_set_gswl(uint32_t cmd,void *cfg);
 
+struct tmu_hal_qos_mib g_csum_ol_mib = {0}; 
 int32_t tmu_hal_get_qos_mib1(struct net_device *netdev, uint32_t portid, uint32_t queueid, PPA_QOS_MIB *mib, uint32_t flag);
 int32_t
 tmu_hal_get_qos_mib(
@@ -458,6 +471,9 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 	  if((res = ppa_drv_register_cap(QOS_QUEUE, 1, TMU_HAL)) != PPA_SUCCESS) {
 		printk("ppa_drv_register_cap returned failure for capability QOS_QUEUE,!!!\n");	
 	  }
+	  if((res = ppa_drv_register_cap(QOS_INGGRP, 1, TMU_HAL)) != PPA_SUCCESS) {
+		printk("ppa_drv_register_cap returned failure for capability QOS_QUEUE,!!!\n");	
+	  }
 	  if((res = ppa_drv_register_cap(Q_SCH_WFQ, 1, TMU_HAL)) != PPA_SUCCESS) {
 		printk("ppa_drv_register_cap returned failure for capability Q_SCH_WFQ,!!!\n");	
 	  }
@@ -480,16 +496,19 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 		printk("ppa_drv_register_cap returned failure for PORT_SHAPER,!!!\n");	
 	  }
 	  if((res = ppa_drv_register_cap(QOS_INIT, 1, TMU_HAL)) != PPA_SUCCESS) {
-		printk("ppa_drv_register_cap returned failure for capability Q_SHAPER,!!!\n");	
+		printk("ppa_drv_register_cap returned failure for capability QOS_INIT!!!\n");	
 	  }
 	  if((res = ppa_drv_register_cap(QOS_UNINIT, 1, TMU_HAL)) != PPA_SUCCESS) {
-		printk("ppa_drv_register_cap returned failure for capability Q_SHAPER,!!!\n");	
+		printk("ppa_drv_register_cap returned failure for capability QOS_UNINIT!!!\n");	
 	  }
 	  if((res = ppa_drv_register_cap(QOS_WMM_INIT, 1, TMU_HAL)) != PPA_SUCCESS) {
-		printk("ppa_drv_register_cap returned failure for capability Q_SHAPER,!!!\n");	
+		printk("ppa_drv_register_cap returned failure for capability QOS_WMM_INIT!!!\n");	
 	  }
 	  if((res = ppa_drv_register_cap(QOS_WMM_UNINIT, 1, TMU_HAL)) != PPA_SUCCESS) {
-		printk("ppa_drv_register_cap returned failure for capability Q_SHAPER,!!!\n");	
+		printk("ppa_drv_register_cap returned failure for capability QOS_WMM_UNINIT!!!\n");	
+	  }
+	  if((res = ppa_drv_register_cap(QOS_INGGRP, 1, TMU_HAL)) != PPA_SUCCESS) {
+		printk("ppa_drv_register_cap returned failure for capability QOS_INGGRP!!!\n");	
 	  }
             return PPA_SUCCESS;
         }
@@ -522,6 +541,8 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 		v->major = 0;
 		v->mid = 0;
 		v->minor = 1;
+
+
 		return PPA_SUCCESS;
 	}
 
@@ -535,9 +556,13 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 		v->major = 1;
 		v->mid = 1;
 		v->minor =  0 ;
+
+
+		return PPA_SUCCESS;
 	}   
     case PPA_GENERIC_HAL_GET_QOS_STATUS:    //get QOS status
         {
+
             return get_qos_status((PPA_QOS_STATUS *)buffer);
         }
     case PPA_GENERIC_HAL_GET_QOS_QUEUE_NUM:
@@ -552,7 +577,6 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 			printk("Invalid interface name\n");
 			return PPA_FAILURE;
 	   	}*/
-
 		res = tmu_hal_get_queue_num(if_dev, cfg->portid, &q_count);
 		cfg->num = q_count;
 		return res;
@@ -649,7 +673,13 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 	   else
 	   dev_put(if_dev);
 	   TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"<%s> Priority=%d\n", __FUNCTION__, cfg->priority);
-	   return tmu_hal_delete_queue( if_dev, cfg->q_id, cfg->priority, 0, flag);
+
+	if((cfg->flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS)
+        {
+	   if(g_MPE_PortId)
+	   	tmu_hal_delete_mpe_ingress_queue( if_dev, cfg->q_id, cfg->priority, 0, cfg->flags);
+	}
+	   return tmu_hal_delete_queue( if_dev, cfg->q_id, cfg->priority, 0, cfg->flags);
 	}
   case PPA_GENERIC_HAL_MOD_SUBIF_PORT_CFG:
 	{//mod_subif_port
@@ -747,8 +777,14 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 
 		if(cfg->queueid == -1)	
 			tmu_hal_add_port_rate_shaper(if_dev, cfg, cfg->flag);
-		else
+		else {
 			tmu_hal_add_queue_rate_shaper_ex(if_dev, cfg, -1, cfg->flag);
+
+			if(((cfg->flag & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) && (g_MPE_PortId != -1))
+			{
+				tmu_hal_add_queue_rate_shaper_ex(if_dev, cfg, -1, (cfg->flag | TMU_HAL_QUEUE_SHAPER_INGRESS_MPE));
+			}
+		}
 		
 		return PPA_SUCCESS;
         }
@@ -770,9 +806,15 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
 		dev_put(if_dev);
 
 		if(cfg->queueid == -1)	
-			tmu_hal_del_port_rate_shaper(if_dev, cfg, 0);
+			tmu_hal_del_port_rate_shaper(if_dev, cfg, cfg->flag);
 		else
-			tmu_hal_del_queue_rate_shaper_ex(if_dev, cfg, -1,  TMU_HAL_DEL_SHAPER_CFG);
+		{
+			tmu_hal_del_queue_rate_shaper_ex(if_dev, cfg, -1,  (cfg->flag | TMU_HAL_DEL_SHAPER_CFG));
+			if(((cfg->flag & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) && (g_MPE_PortId != -1))
+			{
+				tmu_hal_del_queue_rate_shaper_ex(if_dev, cfg, -1,  (cfg->flag | TMU_HAL_DEL_SHAPER_CFG | TMU_HAL_QUEUE_SHAPER_INGRESS_MPE));
+			}
+		}
 		
 		return PPA_SUCCESS;
 
@@ -804,6 +846,25 @@ static int32_t tmu_hal_generic_hook(PPA_GENERIC_HOOK_CMD cmd, void *buffer, uint
     return PPA_FAILURE;
 }
 
+/** =================================  STATS API's ====================================== */
+static int32_t update_queue_mib(uint32_t *curr, uint32_t *last, uint32_t *accumulated)
+{
+	int32_t delta;
+	
+	if( *curr >= *last) {
+		delta = (*curr - *last);
+		*accumulated += delta;
+	} else {
+		delta = (*curr + WRAPAROUND_32_BITS - *last);
+		*accumulated += delta;
+	}
+	*last = *curr;
+	return delta;
+
+}
+
+
+
 /*!
     \brief This is to get the mib couter for specified port and queue
     \param[in] portid the physical port id
@@ -823,7 +884,7 @@ int32_t tmu_hal_get_qos_mib1(
 	uint32_t qdc[4];
 	int32_t ret = TMU_HAL_STATUS_OK;
 	int32_t nof_of_tmu_ports, index;
-        cbm_tmu_res_t *tmu_res ;
+        cbm_tmu_res_t *tmu_res = NULL ;
         dp_subif_t dp_subif = {0};
 	struct tmu_hal_user_subif_abstract *subif_index = NULL;
 	struct tmu_hal_user_subif_abstract *port_subif_index = NULL;
@@ -874,7 +935,7 @@ int32_t tmu_hal_get_qos_mib1(
 
         mib->total_rx_pkt = get_enq_counter(subif_index->user_queue[index].queue_index);
         mib->total_tx_pkt = get_deq_counter(subif_index->user_queue[index].queue_index);
-	TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Rx: %llu TX:%llu\n",mib->total_rx_pkt,mib->total_tx_pkt);
+	TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Rx: %lld TX:%lld\n",mib->total_rx_pkt,mib->total_tx_pkt);
 	tmu_qdct_read(subif_index->user_queue[index].queue_index, qdc);
 
 	mib->fast_path_total_pkt_drop_cnt = (qdc[0] + qdc[1] + qdc[2] + qdc[3]);
@@ -891,15 +952,37 @@ int32_t tmu_hal_get_csum_ol_mib(
 		struct tmu_hal_qos_stats *csum_mib, 
 		uint32_t flag)
 {
-	int32_t nof_of_tmu_ports;
-	cbm_tmu_res_t *tmu_res ;
+	int32_t nof_of_tmu_ports = 0;
+	cbm_tmu_res_t *tmu_res = NULL ;
 	int32_t ret = TMU_HAL_STATUS_OK;
-	if(cbm_dp_port_resources_get(0, &nof_of_tmu_ports, &tmu_res, DP_F_CHECKSUM) != 0) {
+        dp_subif_t dp_subif = {0};
+	int32_t delta = 0 , enq_temp = 0, deq_temp = 0,  mode = 0;
+	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_CHECKSUM) != 0) {
 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get TMU Resources\n", __FUNCTION__, __LINE__);
 			return TMU_HAL_STATUS_ERR;
+	
 	}
-	csum_mib->enqPkts = get_enq_counter(tmu_res->tmu_q);
-	csum_mib->deqPkts = get_deq_counter(tmu_res->tmu_q);
+	//printk( "<%s> TMU Port: %d SB: %d Q: %d\n",
+	//		__FUNCTION__, tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> TMU Port: %d SB: %d Q: %d\n",
+			__FUNCTION__, tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
+	cbm_counter_mode_get(0, &mode);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Enq/Deq Counter Mode is =%s \n",__FUNCTION__, (mode==1)?"Bytes":"Packet");
+
+	enq_temp= get_enq_counter(tmu_res->tmu_q);
+	deq_temp= get_deq_counter(tmu_res->tmu_q);
+	if(mode == 0){
+	
+		delta = update_queue_mib(&g_csum_ol_mib.enqPkts, &enq_temp, &g_csum_ol_mib.enqPkts);
+		csum_mib->enqPkts += delta;
+		delta = update_queue_mib(&g_csum_ol_mib.deqPkts, &deq_temp, &g_csum_ol_mib.deqPkts);
+		csum_mib->deqPkts += delta;
+	} else {
+		delta = update_queue_mib(&g_csum_ol_mib.enqBytes, &enq_temp, &g_csum_ol_mib.enqBytes);
+		csum_mib->enqBytes += delta;
+		delta = update_queue_mib(&g_csum_ol_mib.deqBytes, &deq_temp, &g_csum_ol_mib.deqBytes);
+		csum_mib->deqBytes += delta;
+	}
 
 	kfree(tmu_res);
 	
@@ -909,9 +992,23 @@ int32_t tmu_hal_get_csum_ol_mib(
 }
 
 int32_t tmu_hal_clear_csum_ol_mib(
-		struct tmu_hal_qos_stats *csum_mib, 
 		uint32_t flag)
 {
+	int32_t nof_of_tmu_ports = 0;
+	cbm_tmu_res_t *tmu_res = NULL ;
+        dp_subif_t dp_subif = {0};
+	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_CHECKSUM) != 0) {
+			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get TMU Resources\n", __FUNCTION__, __LINE__);
+			return TMU_HAL_STATUS_ERR;
+	}
+	reset_enq_counter(tmu_res->tmu_q);
+	reset_deq_counter(tmu_res->tmu_q);
+
+	memset(&g_csum_ol_mib, 0, sizeof(struct tmu_hal_subif_mib));
+	kfree(tmu_res);
+	
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Exit --> \n",__FUNCTION__);	
+
 	return PPA_SUCCESS;
 }
 
@@ -925,10 +1022,11 @@ tmu_hal_get_qos_mib(
 {
 	uint32_t qdc[4];
 	int32_t ret = TMU_HAL_STATUS_OK;
-	int32_t nof_of_tmu_ports, index;
+	int32_t index;
 	uint32_t qocc, wq, qrth, qavg;
-	cbm_tmu_res_t *tmu_res ;
-	dp_subif_t dp_subif = {0};
+	uint32_t nof_of_tmu_ports=0;
+        cbm_tmu_res_t *tmu_res=NULL;
+        dp_subif_t dp_subif = {0};
 	struct tmu_hal_user_subif_abstract *subif_index = NULL;
 	struct tmu_hal_user_subif_abstract *port_subif_index = NULL;
 
@@ -942,25 +1040,39 @@ tmu_hal_get_qos_mib(
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR, "netdev=%p port_id=%d\n", netdev,subif_id->port_id);
 		return PPA_FAILURE;
 	}
-	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Get MIB for QueueId %d\n",__FUNCTION__, queueid); 
 
+	dp_subif.port_id = subif_id->port_id;
+	dp_subif.subif = subif_id->subif;
+	if(tmu_hal_get_tmu_res_from_netdevice(netdev, 0, &dp_subif, &nof_of_tmu_ports, &tmu_res, flag) != TMU_HAL_STATUS_OK){
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"%s:%d Error: Failed to get resources from Netdevice\n", __FUNCTION__, __LINE__);
+		return TMU_HAL_STATUS_ERR;
+	}
+#if 0
 	if(netdev)
-	{
-		if(dp_get_netif_subifid(netdev, NULL, NULL, 0, &dp_subif, 0) != PPA_SUCCESS) {
-			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get Subif Id\n", __FUNCTION__, __LINE__);
+	{	
+		printk("1\n");
+		if(tmu_hal_get_tmu_res_from_netdevice(netdev, 0, &dp_subif, &nof_of_tmu_ports, &tmu_res, flag) != TMU_HAL_STATUS_OK){
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"%s:%d Error: Failed to get resources from Netdevice\n", __FUNCTION__, __LINE__);
 			return TMU_HAL_STATUS_ERR;
 		}
+		/*if(dp_get_netif_subifid(netdev, NULL, NULL, 0, &dp_subif, 0) != PPA_SUCCESS) {
+			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get Subif Id\n", __FUNCTION__, __LINE__);
+			return TMU_HAL_STATUS_ERR;
+		}*/
 	} else {
 #ifdef TMU_HAL_TEST
 		dp_subif.port_id = 15; //2;
 		dp_subif.subif = 0;
 #endif
+		printk("2\n");
+		dp_subif.port_id = subif_id->port_id;
 		if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, 0) != 0) {
 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get TMU Resources\n", __FUNCTION__, __LINE__);
 			return TMU_HAL_STATUS_ERR;
 		}
 
 	}
+#endif
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
 			__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
 	dp_subif.subif  = dp_subif.subif >> 8; 
@@ -980,6 +1092,7 @@ tmu_hal_get_qos_mib(
 	}
 	if((queueid != -1) && (queueid < EGRESS_QUEUE_ID_MAX))
 	{ // for individual queue
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Get MIB for QueueId %d\n",__FUNCTION__, queueid); 
 		if( (index = tmu_hal_get_user_index_from_qid(subif_index, queueid) ) == TMU_HAL_STATUS_ERR) {
 			ret = TMU_HAL_STATUS_INVALID_QID;
 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Invalid Queue Id\n", __FUNCTION__, __LINE__);
@@ -991,24 +1104,59 @@ tmu_hal_get_qos_mib(
 
 		qos_mib->enqPkts = get_enq_counter(subif_index->user_queue[index].queue_index);
 		qos_mib->deqPkts = get_deq_counter(subif_index->user_queue[index].queue_index);
-		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Rx: %llu TX:%llu\n",qos_mib->enqPkts,qos_mib->deqPkts);
+		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Rx: %lld TX:%lld\n",qos_mib->enqPkts,qos_mib->deqPkts);
 		tmu_qdct_read(subif_index->user_queue[index].queue_index, qdc);
 		qos_mib->dropPkts = (qdc[0] + qdc[1] + qdc[2] + qdc[3]);
 		
 		tmu_qoct_read(subif_index->user_queue[index].queue_index, &wq, &qrth, &qocc, &qavg);
 		qos_mib->qOccPkts = qocc;
-		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"<%s> Dropped Pkts: %llu  QoCC:%d\n",__FUNCTION__,qos_mib->dropPkts, qos_mib->qOccPkts);
+		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"<%s> Dropped Pkts: %lld  QoCC:%d\n",__FUNCTION__,qos_mib->dropPkts, qos_mib->qOccPkts);
 	} else if (queueid == -1) { // for that netdevice
-		int32_t i, q_count;
+		int32_t i, q_count, mode;
+		int32_t enq_temp = 0, deq_temp = 0, drop_temp = 0, delta = 0;
 
+		cbm_counter_mode_get(0, &mode);
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Enq/Deq Counter Mode is =%s \n",__FUNCTION__, (mode==1)?"Bytes":"Packet");
+		//printk("<%s> Enq/Deq Counter Mode is =%s \n",__FUNCTION__, (mode==1)?"Bytes":"Packet");
 		tmu_hal_get_queue_num(netdev, subif_id->port_id, &q_count);
 		for(i=0; i< q_count; i++)
 		{
-			qos_mib->enqPkts+= get_enq_counter(subif_index->user_queue[i].queue_index);
-			qos_mib->deqPkts += get_deq_counter(subif_index->user_queue[i].queue_index);
+			enq_temp= get_enq_counter(subif_index->user_queue[i].queue_index);
+			if(mode == 0){
+				delta = update_queue_mib(&subif_index->user_queue[i].q_mib.enqPkts, &enq_temp, &subif_index->user_queue[i].q_mib.enqPkts);
+				subif_index->subif_mib.enqPkts += delta;
+			} else {
+				delta = update_queue_mib(&subif_index->user_queue[i].q_mib.enqBytes, &enq_temp, &subif_index->user_queue[i].q_mib.enqBytes);
+				subif_index->subif_mib.enqBytes += delta;
+
+			}
+
+			deq_temp= get_deq_counter(subif_index->user_queue[i].queue_index);
+			if(mode == 0){
+				delta = update_queue_mib(&subif_index->user_queue[i].q_mib.deqPkts, &deq_temp, &subif_index->user_queue[i].q_mib.deqPkts);
+				subif_index->subif_mib.deqPkts += delta;
+			} else {
+				delta = update_queue_mib(&subif_index->user_queue[i].q_mib.deqBytes, &deq_temp, &subif_index->user_queue[i].q_mib.deqBytes);
+				subif_index->subif_mib.deqPkts += delta;
+			}
+
 			tmu_qdct_read(subif_index->user_queue[i].queue_index, qdc);
-			qos_mib->dropPkts = (qdc[0] + qdc[1] + qdc[2] + qdc[3]);
+			drop_temp = (qdc[0] + qdc[1] + qdc[2] + qdc[3]);
+			delta = update_queue_mib(&subif_index->user_queue[i].q_mib.dropPkts, &drop_temp, &subif_index->user_queue[i].q_mib.dropPkts);
+			subif_index->subif_mib.dropPkts += delta;
+			//qos_mib->dropPkts += (qdc[0] + qdc[1] + qdc[2] + qdc[3]);
 		}
+		if(mode == 0) {
+			qos_mib->enqPkts = subif_index->subif_mib.enqPkts;
+			qos_mib->deqPkts = subif_index->subif_mib.deqPkts;
+			TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Subif Pkts ===> Rx: %lld TX:%lld\n",qos_mib->enqPkts,qos_mib->deqPkts);
+		} else {
+			qos_mib->enqBytes = subif_index->subif_mib.enqBytes;
+			qos_mib->deqBytes = subif_index->subif_mib.deqBytes;
+			TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Subif Bytes ====> Rx: %lld TX:%lld\n",qos_mib->enqBytes, qos_mib->deqBytes);
+			//printk("Subif Bytes ====> Rx: %d TX:%d\n",qos_mib->enqBytes, qos_mib->deqBytes);
+		}
+		qos_mib->dropPkts = subif_index->subif_mib.dropPkts;
 	} else
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"<%s> Wrong Queue Id %d\n", __FUNCTION__, queueid);
 		
@@ -1029,7 +1177,7 @@ tmu_hal_reset_qos_mib(
 	uint32_t qdc[4];
 	int32_t ret = TMU_HAL_STATUS_OK;
 	int32_t nof_of_tmu_ports, index;
-	cbm_tmu_res_t *tmu_res ;
+	cbm_tmu_res_t *tmu_res = NULL ;
 	dp_subif_t dp_subif = {0};
 	struct tmu_hal_user_subif_abstract *subif_index = NULL;
 	struct tmu_hal_user_subif_abstract *port_subif_index = NULL;
@@ -1044,8 +1192,15 @@ tmu_hal_reset_qos_mib(
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR, "netdev=%p port_id=%d\n", netdev,subif_id->port_id);
 		return PPA_FAILURE;
 	}
-	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Get MIB for QueueId %d\n",__FUNCTION__, queueid); 
+	
+	dp_subif.port_id = subif_id->port_id;
+	dp_subif.subif = subif_id->subif;
+	if(tmu_hal_get_tmu_res_from_netdevice(netdev, 0, &dp_subif, &nof_of_tmu_ports, &tmu_res, flag) != TMU_HAL_STATUS_OK){
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"%s:%d Error: Failed to get resources from Netdevice\n", __FUNCTION__, __LINE__);
+		return TMU_HAL_STATUS_ERR;
+	}
 
+#if 0
 	if(netdev)
 	{
 		if(dp_get_netif_subifid(netdev, NULL, NULL, 0, &dp_subif, 0) != PPA_SUCCESS) {
@@ -1063,6 +1218,7 @@ tmu_hal_reset_qos_mib(
 		}
 
 	}
+#endif
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
 			__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
 	dp_subif.subif  = dp_subif.subif >> 8; 
@@ -1082,6 +1238,7 @@ tmu_hal_reset_qos_mib(
 	}
 	if((queueid != -1) && (queueid < EGRESS_QUEUE_ID_MAX))
 	{ // for individual queue
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Get MIB for QueueId %d\n",__FUNCTION__, queueid); 
 		if( (index = tmu_hal_get_user_index_from_qid(subif_index, queueid) ) == TMU_HAL_STATUS_ERR) {
 			ret = TMU_HAL_STATUS_INVALID_QID;
 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Invalid Queue Id\n", __FUNCTION__, __LINE__);
@@ -1108,6 +1265,9 @@ tmu_hal_reset_qos_mib(
 			memset(qdc, 0, sizeof(qdc));
 			tmu_qdct_read(subif_index->user_queue[i].queue_index, qdc);
 		}
+		memset(&subif_index->subif_mib, 0, sizeof(struct tmu_hal_subif_mib));
+		for(i=0; i< TMU_HAL_MAX_QUEUE_PER_EGRESS_INTERFACE; i++)
+			memset(&subif_index->user_queue[i].q_mib, 0, sizeof(struct tmu_hal_qos_mib));
 	} else 
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"<%s> Wrong Queue Id %d\n", __FUNCTION__, queueid);
 CBM_RESOURCES_CLEANUP:
@@ -1234,6 +1394,7 @@ int tmu_hal_dump_sb_info(uint32_t sb_index)
 	Sindex = tmu_hal_sched_track[sb_index];
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"\n =================\n");
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Used: %d\n", Sindex.in_use);
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"SBID: %d\n", sb_index);
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"LVL: %d\n", Sindex.level);
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"LEAF-MASK: %x\n", Sindex.leaf_mask);
@@ -1331,8 +1492,10 @@ tmu_hal_egress_queue_create(const struct tmu_hal_equeue_create *param)
 	idx = param->scheduler_input >> 3;
 	TMU_HAL_ASSERT(idx >= TMU_HAL_MAX_SCHEDULER);
 
-	if (tmu_hal_sched_track[idx].in_use == 0)
+	if (tmu_hal_sched_track[idx].in_use == 0) {
+		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d  Scheduler is not in use \n", __FUNCTION__, __LINE__);
 		return TMU_HAL_STATUS_NOT_AVAILABLE;
+	}
 	leaf = scheduler_input & 7;
 	//TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> SB:%d leaf:%d\n",__FUNCTION__, idx, leaf); 
 	if (tmu_hal_sched_track[idx].policy == TMU_HAL_POLICY_WFQ) {
@@ -1572,7 +1735,7 @@ tmu_hal_queue_enable_disable_if_qocc(
 
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Qocc %d\n",
 			__FUNCTION__, qocc);
-		//printk("<%s> Qocc %d\n",__FUNCTION__, qocc);
+		//printk("<%s> Qocc  ------> %d ------> Need to Flush \n",__FUNCTION__, qocc);
 		return TMU_HAL_STATUS_ERR;
 	}
 
@@ -2186,6 +2349,7 @@ tmu_hal_scheduler_create(const struct tmu_hal_sched_create *param)
 	/* update the leaf mask of the connected scheduler  */
 	tmu_hal_sched_track[param->connected_scheduler_index].leaf_mask |= (1 << leaf) ;
 
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Exit -------------> \n");
 	return ret;
 }
 
@@ -2903,20 +3067,18 @@ enum tmu_hal_errorcode
 tmu_hal_safe_queue_and_shaper_delete(struct net_device *netdev, int32_t index, int32_t tmu_port, uint32_t shaper_index, int32_t remap_to_qid, uint32_t flags)
 {
 
-	//printk("<%s> Entry ----> \n",__FUNCTION__);
 #ifdef CBM_QUEUE_FLUSH_SUPPORT
 	if(tmu_hal_queue_enable_disable_if_qocc(netdev, index, tmu_port, remap_to_qid, 0) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"%s:%d ERROR to flush qocc by disabling \n", __FUNCTION__, __LINE__);
 
-		udelay(20000);
 		//tmu_hal_enable_disable_queue(index, 1);
 		if(tmu_hal_flush_queue_if_qocc(netdev, index, -1, -1) != TMU_HAL_STATUS_OK) {
 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
 			return TMU_HAL_STATUS_ERR;
 		}
 	}
-	/*TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete Queue %d for netdev %s\n",__FUNCTION__, index, netdev->name);
-	if(tmu_hal_flush_queue_if_qocc(netdev, index, tmu_port, remap_to_qid) != TMU_HAL_STATUS_OK) {
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete Queue %d for netdev %s\n",__FUNCTION__, index, netdev->name);
+	/*if(tmu_hal_flush_queue_if_qocc(netdev, index, tmu_port, remap_to_qid) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
 		return TMU_HAL_STATUS_ERR;
 	}*/
@@ -2942,7 +3104,6 @@ tmu_hal_safe_queue_and_shaper_delete(struct net_device *netdev, int32_t index, i
 		return TMU_HAL_STATUS_ERR;
 	}
 
-	//printk("<%s> Exit ----> \n", __FUNCTION__);
 	return TMU_HAL_STATUS_OK;
 }
 int32_t tmu_hal_shift_up_down_q(
@@ -2992,6 +3153,20 @@ int32_t tmu_hal_shift_up_down_q(
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Reconnecting the queue %d of weight %d from scheduler input %d to scheduler input %d\n",
 			__FUNCTION__, q_in, q_reconnect.iwgt, equeue_link.sbin, q_reconnect.scheduler_input );
 	ret = tmu_hal_egress_queue_create(&q_reconnect);
+#if 0
+	tmu_egress_queue_create(q_in, q_reconnect.scheduler_input, port);
+
+	/* Configure the weight of Scheduler Input */
+	tmu_sched_blk_in_link_get(q_reconnect.scheduler_input, &ilink);
+	ilink.iwgt = q_reconnect.iwgt;
+	tmu_sched_blk_in_link_set(q_reconnect.scheduler_input, &ilink);
+
+	tmu_hal_sched_track[q_reconnect.scheduler_input >> 3].leaf_mask |= (1 << leaf) ;
+	/** Remember scheduler id to which it is connected to of that queue  */
+	tmu_hal_queue_track[q_in].connected_to_sched_id = q_reconnect.scheduler_input >> 3;
+	/** Remember scheduler id input to which it is connected to of that queue  */
+	tmu_hal_queue_track[q_in].sched_input = q_reconnect.scheduler_input;
+#endif
 
 	user_q_index = tmu_hal_queue_track[q_in].user_q_idx;
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Configure Drop params for mode %s \n",
@@ -3035,15 +3210,17 @@ int32_t tmu_hal_shift_up_down_q(
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Q map pointer =%p\n", q_map_get);
 		for (j=0; j<no_entries;j++)
 			cbm_queue_map_set(q_in, &q_map_get[j], 0);
-		kfree(q_map_get);
-		q_map_get = NULL;
 		no_entries = 0;
 	}
-	cbm_queue_map_get(q_in, &no_entries, &q_map_get, 0);
+	kfree(q_map_get);
+	q_map_get = NULL;
+
+	/*cbm_queue_map_get(q_in, &no_entries, &q_map_get, 0);
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> %d No of entries is %d for queue=%d\n", __FUNCTION__,__LINE__, no_entries, q_in);
 	if (no_entries > 0) 
- 		kfree(q_map_get);	
+ 		kfree(q_map_get);	*/
 	subif_index->user_queue[tmu_hal_queue_track[q_in].user_q_idx].sbin = q_reconnect.scheduler_input;
+	//printk("<%s> Exit -----> Q: %d \n",__FUNCTION__,q_in);
 	return ret;
 }
 #endif
@@ -3142,7 +3319,7 @@ tmu_hal_add_new_queue(
 			if(ilink.sit == 0) // input is QID
 			{	
 				struct tmu_hal_equeue_create q_reconnect;
-				QOS_RATE_SHAPING_CFG cfg;
+				//QOS_RATE_SHAPING_CFG cfg;
 				uint32_t cfg_shaper, user_q_index;
 				struct tmu_hal_equeue_cfg q_param = {0};
 				cbm_queue_map_entry_t *q_map_get = NULL;
@@ -3192,26 +3369,24 @@ tmu_hal_add_new_queue(
 				q_reconnect.scheduler_input =  new_sched << 3 | 0; //highest priority leaf
 				q_reconnect.iwgt = (tmu_hal_queue_track[q_index].prio_weight == 0)?1:tmu_hal_queue_track[q_index].prio_weight ;
 				ret = tmu_hal_egress_queue_create(&q_reconnect);
-	if(cfg_shaper != 0xFF) {
-		cfgShaper.enable = true;
-		cfgShaper.mode = tmu_hal_shaper_track[cfg_shaper].tb_cfg.mode;
-		cfgShaper.cir = (tmu_hal_shaper_track[cfg_shaper].tb_cfg.cir * 1000) / 8;
-		cfgShaper.pir = (tmu_hal_shaper_track[cfg_shaper].tb_cfg.pir * 1000 ) / 8;
-		cfgShaper.cbs = tmu_hal_shaper_track[cfg_shaper].tb_cfg.cbs; // 4000;
-		cfgShaper.pbs = tmu_hal_shaper_track[cfg_shaper].tb_cfg.pbs; // 4000;
-		cfgShaper.index = cfg_shaper;
+				if(cfg_shaper != 0xFF) {
+					cfgShaper.enable = true;
+					cfgShaper.mode = tmu_hal_shaper_track[cfg_shaper].tb_cfg.mode;
+					cfgShaper.cir = (tmu_hal_shaper_track[cfg_shaper].tb_cfg.cir * 1000) / 8;
+					cfgShaper.pir = (tmu_hal_shaper_track[cfg_shaper].tb_cfg.pir * 1000 ) / 8;
+					cfgShaper.cbs = tmu_hal_shaper_track[cfg_shaper].tb_cfg.cbs; // 4000;
+					cfgShaper.pbs = tmu_hal_shaper_track[cfg_shaper].tb_cfg.pbs; // 4000;
+					cfgShaper.index = cfg_shaper;
 
-		tmu_hal_token_bucket_shaper_cfg_set(&cfgShaper);
-		//Add the token to the scheduler input
-		tmu_hal_token_bucket_shaper_create(cfg_shaper, q_reconnect.scheduler_input);
-		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Shaper %d is created for scheduler input %d \n",
-				__FUNCTION__, cfg_shaper, q_reconnect.scheduler_input);
-	}
+					tmu_hal_token_bucket_shaper_cfg_set(&cfgShaper);
+					//Add the token to the scheduler input
+					tmu_hal_token_bucket_shaper_create(cfg_shaper, q_reconnect.scheduler_input);
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Shaper %d is created for scheduler input %d \n",
+							__FUNCTION__, cfg_shaper, q_reconnect.scheduler_input);
+				}
 
-	//tmu_hal_shaper_track[shaper_index].sb_input = q_reconnect.scheduler_input;
-	udelay(20000);
-
-
+				//tmu_hal_shaper_track[shaper_index].sb_input = q_reconnect.scheduler_input;
+				udelay(20000);
 
 				if(subif_index != NULL) {
 					user_q_index = tmu_hal_queue_track[q_index].user_q_idx;
@@ -3239,16 +3414,16 @@ tmu_hal_add_new_queue(
 					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Q map pointer =%p\n", q_map_get);
 					for (j=0; j<no_entries;j++)
 						cbm_queue_map_set(q_index, &q_map_get[j], 0);
-					kfree(q_map_get);
-					q_map_get = NULL;
 					no_entries = 0;
 				}
-				cbm_queue_map_get(q_index, &no_entries, &q_map_get, 0);
+				kfree(q_map_get);
+				q_map_get = NULL;
+				/*cbm_queue_map_get(q_index, &no_entries, &q_map_get, 0);
 				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> %d No of entries is %d for queue=%d\n", 
 						__FUNCTION__,__LINE__, no_entries, q_index);
 
 				if (no_entries > 0) 
-					kfree(q_map_get);	
+					kfree(q_map_get);	*/
 
 
 				/*if(cfg_shaper != 0xFF) {
@@ -3354,8 +3529,8 @@ int tmu_hal_shift_up_sbin_conn(
 			if(ilink.sit == 0) // input is QID
 			{
 				//QOS_RATE_SHAPING_CFG cfg;
-				uint32_t cfg_shaper, user_q_index;
-				struct tmu_hal_equeue_cfg q_param = {0};
+				uint32_t cfg_shaper;
+				//struct tmu_hal_equeue_cfg q_param = {0};
 
 				q_in = ilink.qsid;
 
@@ -3585,8 +3760,8 @@ int tmu_hal_shift_down_sbin_conn(
 		if(ilink.sit == 0) // input is QID
 		{
 			//QOS_RATE_SHAPING_CFG cfg;
-			uint32_t cfg_shaper, user_q_index;
-			struct tmu_hal_equeue_cfg q_param = {0};
+			uint32_t cfg_shaper;
+			//struct tmu_hal_equeue_cfg q_param = {0};
 
 			q_in = ilink.qsid;
 
@@ -3803,8 +3978,8 @@ Q_ALIGN_INDEX:
 		if(ilink.sit == 0) // input is QID
                 {
 			//QOS_RATE_SHAPING_CFG cfg;
-			uint32_t cfg_shaper,user_q_index;
-			struct tmu_hal_equeue_cfg q_param = {0};
+			uint32_t cfg_shaper;
+			//struct tmu_hal_equeue_cfg q_param = {0};
 
 			q_in = ilink.qsid;
 
@@ -4485,7 +4660,7 @@ EXPORT_SYMBOL(tmu_hal_get_queue_map);
 
 int tmu_hal_get_detailed_queue_map(uint32_t queue_index)
 {
-	cbm_queue_map_entry_t *q_map_get;
+	cbm_queue_map_entry_t *q_map_get = NULL;
 	int32_t num_entries, i=0;
 	cbm_queue_map_get(
 			queue_index,
@@ -4673,6 +4848,7 @@ tmu_hal_modify_subif_to_port(
 	cbm_tmu_res_t *tmu_res;
 	dp_subif_t dp_subif = {0}; 
 	PPA_VCC *vcc = NULL; 
+	int32_t ret = TMU_HAL_STATUS_OK;
 	int32_t tmuport;
 	struct tmu_hal_user_subif_abstract *subif_index;
 	struct tmu_hal_user_subif_abstract *port_subif_index;
@@ -4696,7 +4872,7 @@ tmu_hal_modify_subif_to_port(
 	//TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Delete Qid: %d\n",__FUNCTION__,q_id);	
 
 	tmuport = tmu_res->tmu_port;
-	if(flags & TMU_HAL_ADD_QUEUE_INGRESS)
+	if(flags & PPA_QOS_Q_F_INGRESS)
 	{
 		subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
 		port_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
@@ -4725,7 +4901,8 @@ tmu_hal_modify_subif_to_port(
 			if(tmu_hal_get_subif_index_from_netdev(netdev, port_subif_index) == TMU_HAL_STATUS_ERR)
 			{
 				TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"<%s> No valid port index found for the subif \n",__FUNCTION__);
-				return TMU_HAL_STATUS_ERR;
+				ret = TMU_HAL_STATUS_ERR;
+				goto CBM_RESOURCES_CLEANUP;
 			}
 			tmuport = (tmu_res+1)->tmu_port;
 		}
@@ -4895,18 +5072,19 @@ CBM_RESOURCES_CLEANUP:
 }
 
 int tmu_hal_get_tmu_res_from_netdevice(
-			struct net_device *netdev, 
-			uint32_t sub_if, 
-			dp_subif_t *dp_if, 
-			uint32_t *tmu_ports_cnt, 
-			cbm_tmu_res_t **res, 
-			uint32_t flags)
+		struct net_device *netdev, 
+		uint32_t sub_if, 
+		dp_subif_t *dp_if, 
+		uint32_t *tmu_ports_cnt, 
+		cbm_tmu_res_t **res, 
+		uint32_t flags)
 {
 	uint32_t i=0;
 	uint32_t nof_of_tmu_ports;
 	cbm_tmu_res_t *tmu_res;
 	dp_subif_t dp_subif = {0}; 
 	PPA_VCC *vcc = NULL; 
+	uint32_t flag = 0;
 	//struct tmu_hal_user_subif_abstract *subif_index;
 	//struct tmu_hal_user_subif_abstract *ingress_subif_index;
 
@@ -4914,47 +5092,58 @@ int tmu_hal_get_tmu_res_from_netdevice(
 #ifdef TMU_HAL_TEST
 	uint32_t port;
 	port = dp_subif.port_id = 15; //2;
-//#define TMU_HAL_ADD_QUEUE_INGRESS   0x00000001
+	//#define PPA_QOS_Q_F_INGRESS   0x00000001
 	dp_subif.subif = sub_if;
 #endif
-	//if(flags & TMU_HAL_ADD_QUEUE_INGRESS) {
+	//if(flags & PPA_QOS_Q_F_INGRESS) {
 	if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) {
-		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<tmu_hal_get_tmu_res_from_netdevice> TMU_HAL_ADD_QUEUE_INGRESS\n");
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<tmu_hal_get_tmu_res_from_netdevice> PPA_QOS_Q_F_INGRESS\n");
 		//dp_subif.port_id = dp_if->port_id;
 		//dp_subif.subif = dp_if->subif;
+		if((flags & DP_F_MPE_ACCEL) == DP_F_MPE_ACCEL)
+			flag = DP_F_MPE_ACCEL;
+		
 	} else {
-		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Get the DP Port Id for netdevice %s\n",__FUNCTION__,netdev->name);
-		//if(ppa_if_is_ipoa(netdev,NULL))				
-		ppa_br2684_get_vcc(netdev,&vcc);
-		if(vcc == NULL)
-			TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"VCC is NULL\n");	
-		if(dp_get_netif_subifid(netdev, NULL, vcc, 0, &dp_subif, flags) != PPA_SUCCESS) {
-			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get Subif Id\n", __FUNCTION__, __LINE__);
-			return TMU_HAL_STATUS_ERR;
-		}
+		if(netdev)
+		{
 
-		dp_if->port_id = dp_subif.port_id;
-		dp_if->subif = dp_subif.subif >> 8;
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Get the DP Port Id for netdevice %s\n",__FUNCTION__,netdev->name);
+			//if(ppa_if_is_ipoa(netdev,NULL))				
+			ppa_br2684_get_vcc(netdev,&vcc);
+			if(vcc == NULL)
+				TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"VCC is NULL\n");	
+			if(dp_get_netif_subifid(netdev, NULL, vcc, 0, &dp_subif, flags) != PPA_SUCCESS) {
+				TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get Subif Id\n", __FUNCTION__, __LINE__);
+				return TMU_HAL_STATUS_ERR;
+			}
+
+			dp_if->port_id = dp_subif.port_id;
+			dp_if->subif = dp_subif.subif >> 8;
+		} else {
+			dp_subif.port_id = dp_if->port_id;
+			dp_subif.subif = dp_if->subif;
+		}
 	}
 	dp_subif.subif  = dp_subif.subif >> 8;
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> dp_subif.port_id =%d dp_subif.subif=%d\n",__FUNCTION__, dp_subif.port_id, dp_subif.subif); 
 
-	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, 0) != 0) {
-		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get TMU Resources\n", __FUNCTION__, __LINE__);
+	//printk("<%s> flag: %d\n",__func__,flag);
+	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, flag) != 0) {
+		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"%s:%d ERROR Failed to Get TMU Resources\n", __FUNCTION__, __LINE__);
 		return TMU_HAL_STATUS_ERR;
 	}
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> For Datapath Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
-					__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
-	
+			__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
+
 	*tmu_ports_cnt = nof_of_tmu_ports;
 	*res = tmu_res;
-	
+
 	for(i=0; i<nof_of_tmu_ports; i++) {
 		if(tmu_hal_port_track[(tmu_res+i)->tmu_port].default_sched_id == 0xFF) {
 			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
-				__FUNCTION__, dp_subif.port_id,dp_subif.subif,(tmu_res + i)->tmu_port,(tmu_res+i)->tmu_sched,(tmu_res+i)->tmu_q);
+					__FUNCTION__, dp_subif.port_id,dp_subif.subif,(tmu_res + i)->tmu_port,(tmu_res+i)->tmu_sched,(tmu_res+i)->tmu_q);
 			if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) {
 				(tmu_hal_user_sub_interface_ingress_info + ((tmu_res + i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif)->is_logical = (dp_subif.subif == 0) ? 0 : 1; 
 				(tmu_hal_user_sub_interface_ingress_info + ((tmu_res + i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif)->tmu_port_idx = tmu_res->tmu_port; 
@@ -4994,7 +5183,7 @@ int tmu_hal_get_tmu_res_from_netdevice(
 					(tmu_hal_user_sub_interface_info + ((tmu_res + i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + j)->port_shaper_sched = INVALID_SCHED_ID; 
 					(tmu_hal_user_sub_interface_info + ((tmu_res + i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + j)->shaper_idx = INVALID_SHAPER_ID; 
 					(tmu_hal_user_sub_interface_info + ((tmu_res + i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + j)->default_q = 0; 
-			
+
 				}
 
 			}
@@ -5017,6 +5206,11 @@ int tmu_hal_get_tmu_res_from_netdevice(
 			tmu_hal_sched_track[(tmu_res+i)->tmu_sched].sched_out_conn = 0; // default connected to the port
 			tmu_hal_sched_track[(tmu_res+i)->tmu_sched].omid = (tmu_res+i)->tmu_port;
 			tmu_hal_sched_track[(tmu_res+i)->tmu_sched].tbs = 0xFF;
+
+
+			if(flag == DP_F_MPE_ACCEL) {
+				tmu_hal_sched_track[(tmu_res+i)->tmu_sched].policy = TMU_HAL_POLICY_WFQ;
+			}
 
 			/** Update the Queue info*/
 			tmu_hal_queue_track[(tmu_res+i)->tmu_q].is_enabled = 1;
@@ -5059,16 +5253,164 @@ int32_t tmu_hal_get_ingress_index(uint32_t flags)
 	return index;
 }
 
-int32_t tmu_hal_set_ingress_grp_qmap(uint32_t flags, uint32_t q_index, char tc)
+int32_t tmu_hal_get_mpe_ingress_index(uint32_t flags)
+{
+	int32_t index = TMU_HAL_STATUS_ERR;
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> flags %x\n ",__FUNCTION__,flags);
+	if((flags & PPA_QOS_Q_F_INGGRP1) == PPA_QOS_Q_F_INGGRP1)
+		index = 10; //PPA_QOS_Q_F_INGGRP1 >> 7;
+	if((flags & PPA_QOS_Q_F_INGGRP2) == PPA_QOS_Q_F_INGGRP2)
+		index = 11; //PPA_QOS_Q_F_INGGRP2 >> 7;
+	if((flags & PPA_QOS_Q_F_INGGRP3) == PPA_QOS_Q_F_INGGRP3)
+		index = 12; //PPA_QOS_Q_F_INGGRP3 >> 7;
+	if((flags & PPA_QOS_Q_F_INGGRP4) == PPA_QOS_Q_F_INGGRP4)
+		index = 13; //PPA_QOS_Q_F_INGGRP4 >> 7;
+	if((flags & PPA_QOS_Q_F_INGGRP5) == PPA_QOS_Q_F_INGGRP5)
+		index = 14; //PPA_QOS_Q_F_INGGRP5 >> 7;
+	if((flags & PPA_QOS_Q_F_INGGRP6) == PPA_QOS_Q_F_INGGRP6)
+		index = 15; //PPA_QOS_Q_F_INGGRP6 >> 7;
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Group index is %d\n ",__FUNCTION__,index);
+	return index;
+}
+#if 0
+int32_t tmu_hal_init_ingress_index( struct tmu_hal_user_subif_abstract subif_index)
+{
+	if(subif_index->base_sched_id_egress == 0xFF) {
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->is_logical = (dp_subif.subif == 0) ? 0 : 1; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->tmu_port_idx = tmu_res->tmu_port; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->base_sched_id_egress = tmu_res->tmu_sched; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->user_queue[0].queue_index = tmu_res->tmu_q; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->user_queue[0].queue_type = TMU_HAL_POLICY_STRICT;
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->user_queue[0].qid = 0; 				
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->user_queue[0].prio_level = 0; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->user_queue[0].sbin = tmu_res->tmu_sched << 3; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->user_queue[0].qmap[MAX_TC_NUM] = 0; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->qid_last_assigned = 0; 
+		(tmu_hal_user_sub_interface_ingress_info + (tmuport_index * TMU_HAL_MAX_SUB_IFID_PER_PORT) )->queue_cnt++; 
+
+	} 
+
+}
+#endif
+
+int32_t tmu_hal_set_mpe_ingress_grp_qmap(struct tmu_hal_user_subif_abstract *subif_index, uint32_t prio_level, uint32_t flags, uint32_t q_index, char *tc , uint8_t no_of_tc)
 {
 	cbm_queue_map_entry_t q_map;
-        int32_t q_map_mask = 0;
+	int32_t q_map_mask = 0, x=0, i=0;
 
 	/** Configure the QMAP table to connect to the Egress queue*/
 	memset(&q_map, 0, sizeof(cbm_queue_map_entry_t));
 
 	q_map.ep = 0;
-	q_map.tc = tc;
+	q_map.tc = *tc;
+
+	if((flags & PPA_QOS_Q_F_INGGRP1) == PPA_QOS_Q_F_INGGRP1)
+	{
+		q_map.flowid = 0;
+		q_map.enc = 0;
+		q_map.dec = 0;
+		q_map.mpe1 = 1;
+		q_map.mpe2 = 0;
+	}
+
+	if((flags & PPA_QOS_Q_F_INGGRP2) == PPA_QOS_Q_F_INGGRP2)
+	{
+		q_map.flowid = 0;
+		q_map.enc = 0;
+		q_map.dec = 0;
+		q_map.mpe1 = 1;
+		q_map.mpe2 = 1;
+	}
+
+	if((flags & PPA_QOS_Q_F_INGGRP3) == PPA_QOS_Q_F_INGGRP3)
+	{
+		q_map.flowid = 1;
+		q_map.enc = 0;
+		q_map.dec = 0;
+		q_map.mpe1 = 1;
+		q_map.mpe2 = 0;
+	}
+	if((flags & PPA_QOS_Q_F_INGGRP4) == PPA_QOS_Q_F_INGGRP4)
+	{
+		q_map.flowid = 1;
+		q_map.enc = 0;
+		q_map.dec = 0;
+		q_map.mpe1 = 1;
+		q_map.mpe2 = 1;
+	}
+	if((flags & PPA_QOS_Q_F_INGGRP5) == PPA_QOS_Q_F_INGGRP5)
+	{
+		q_map.flowid = 1;
+		q_map.enc = 0;
+		q_map.dec = 0;
+		q_map.mpe1 = 1;
+		q_map.mpe2 = 1;
+	}
+	if((flags & PPA_QOS_Q_F_INGGRP6) == PPA_QOS_Q_F_INGGRP6)
+	{
+		q_map.flowid = 0;
+		q_map.enc = 0;
+		q_map.dec = 0;
+		q_map.mpe1 = 1;
+		q_map.mpe2 = 1;
+	}
+#if 1
+	if(prio_level == subif_index->default_prio ) 
+	{ //default Q of Physical interface
+
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Map Default Q: %d\n",__FUNCTION__,q_index);
+		q_map_mask |= CBM_QUEUE_MAP_F_TC_DONTCARE ;
+		cbm_queue_map_set(q_index, &q_map, q_map_mask);
+		subif_index->default_q = q_index;
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Queue count: %d\n",__FUNCTION__, subif_index->queue_cnt);
+		for(x=1; x<subif_index->queue_cnt; x++)
+		{
+			q_map_mask = 0;
+			/** Configure the QMAP table to connect to the Ingress queue*/
+			memset(&q_map, 0, sizeof(cbm_queue_map_entry_t));
+
+			q_map.ep = 0;
+			for(i=0; i< subif_index->user_queue[x].no_of_tc; i++)
+			{
+				q_map.tc = subif_index->user_queue[x].qmap[i];
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Deafult Q --> Add QMAP for Port %d and TC: %d\n",
+						__FUNCTION__,q_map.ep,q_map.tc);
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Default Q --> User Index %d Q Index: %d\n",
+						__FUNCTION__, x, subif_index->user_queue[x].queue_index);
+				cbm_queue_map_set(subif_index->user_queue[x].queue_index, &q_map, q_map_mask);
+			}
+
+		}
+	} else { // not for default q
+		/** Configure the QMAP table to connect to the Ingress queue*/
+		q_map.ep = 0;
+		for(i=0; i< no_of_tc; i++)
+		{
+			q_map.tc = *(tc+i);
+
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Add QMAP for Port %d and TC: %d\n",__FUNCTION__,q_map.ep,q_map.tc);
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Index of New Q: %d\n",__FUNCTION__, q_index);
+			cbm_queue_map_set(q_index, &q_map, q_map_mask);
+			subif_index->user_queue[subif_index->queue_cnt].qmap[i] =*(tc+i); //tc[i];
+		}	
+		subif_index->user_queue[subif_index->queue_cnt].no_of_tc = no_of_tc;
+	}
+
+#endif
+	return TMU_HAL_STATUS_OK;
+
+}
+int32_t tmu_hal_set_ingress_grp_qmap(struct tmu_hal_user_subif_abstract *subif_index, uint32_t prio_level, uint32_t flags, uint32_t q_index, char *tc , uint8_t no_of_tc)
+{
+	cbm_queue_map_entry_t q_map;
+        int32_t q_map_mask = 0, x=0, i=0;
+
+	/** Configure the QMAP table to connect to the Egress queue*/
+	memset(&q_map, 0, sizeof(cbm_queue_map_entry_t));
+
+	q_map.ep = 0;
+	q_map.tc = *tc;
 
 	if((flags & PPA_QOS_Q_F_INGGRP1) == PPA_QOS_Q_F_INGGRP1)
 	{
@@ -5087,16 +5429,7 @@ int32_t tmu_hal_set_ingress_grp_qmap(uint32_t flags, uint32_t q_index, char tc)
 		q_map.mpe1 = 0;
 		q_map.mpe2 = 1;
 	}
-
 	if((flags & PPA_QOS_Q_F_INGGRP3) == PPA_QOS_Q_F_INGGRP3)
-	{
-		q_map.flowid = 0;
-		q_map.enc = 0;
-		q_map.dec = 0;
-		q_map.mpe1 = 1;
-		q_map.mpe2 = 1;
-	}
-	if((flags & PPA_QOS_Q_F_INGGRP4) == PPA_QOS_Q_F_INGGRP4)
 	{
 		q_map.flowid = 1;
 		q_map.enc = 0;
@@ -5104,7 +5437,7 @@ int32_t tmu_hal_set_ingress_grp_qmap(uint32_t flags, uint32_t q_index, char tc)
 		q_map.mpe1 = 0;
 		q_map.mpe2 = 0;
 	}
-	if((flags & PPA_QOS_Q_F_INGGRP5) == PPA_QOS_Q_F_INGGRP5)
+	if((flags & PPA_QOS_Q_F_INGGRP4) == PPA_QOS_Q_F_INGGRP4)
 	{
 		q_map.flowid = 1;
 		q_map.enc = 0;
@@ -5112,7 +5445,7 @@ int32_t tmu_hal_set_ingress_grp_qmap(uint32_t flags, uint32_t q_index, char tc)
 		q_map.mpe1 = 0;
 		q_map.mpe2 = 1;
 	}
-	if((flags & PPA_QOS_Q_F_INGGRP6) == PPA_QOS_Q_F_INGGRP6)
+	if((flags & PPA_QOS_Q_F_INGGRP5) == PPA_QOS_Q_F_INGGRP5)
 	{
 		q_map.flowid = 1;
 		q_map.enc = 0;
@@ -5120,8 +5453,58 @@ int32_t tmu_hal_set_ingress_grp_qmap(uint32_t flags, uint32_t q_index, char tc)
 		q_map.mpe1 = 1;
 		q_map.mpe2 = 1;
 	}
-	q_map_mask |= CBM_QUEUE_MAP_F_TC_DONTCARE ;
-	cbm_queue_map_set(q_index, &q_map, q_map_mask);
+	if((flags & PPA_QOS_Q_F_INGGRP6) == PPA_QOS_Q_F_INGGRP6)
+	{
+		q_map.flowid = 0;
+		q_map.enc = 0;
+		q_map.dec = 0;
+		q_map.mpe1 = 1;
+		q_map.mpe2 = 1;
+	}
+#if 1
+	if(prio_level == subif_index->default_prio ) 
+	{ //default Q of Physical interface
+
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Map Default Q: %d\n",__FUNCTION__,q_index);
+		q_map_mask |= CBM_QUEUE_MAP_F_TC_DONTCARE ;
+		cbm_queue_map_set(q_index, &q_map, q_map_mask);
+		subif_index->default_q = q_index;
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Queue count: %d\n",__FUNCTION__, subif_index->queue_cnt);
+		for(x=1; x<subif_index->queue_cnt; x++)
+		{
+			q_map_mask = 0;
+			/** Configure the QMAP table to connect to the Ingress queue*/
+			memset(&q_map, 0, sizeof(cbm_queue_map_entry_t));
+
+			q_map.ep = 0;
+			for(i=0; i< subif_index->user_queue[x].no_of_tc; i++)
+			{
+				q_map.tc = subif_index->user_queue[x].qmap[i];
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Deafult Q --> Add QMAP for Port %d and TC: %d\n",
+						__FUNCTION__,q_map.ep,q_map.tc);
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Default Q --> User Index %d Q Index: %d\n",
+						__FUNCTION__, x, subif_index->user_queue[x].queue_index);
+				cbm_queue_map_set(subif_index->user_queue[x].queue_index, &q_map, q_map_mask);
+			}
+
+		}
+	} else { // not for default q
+		/** Configure the QMAP table to connect to the Ingress queue*/
+		q_map.ep = 0;
+		for(i=0; i< no_of_tc; i++)
+		{
+			q_map.tc = *(tc+i);
+
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Add QMAP for Port %d and TC: %d\n",__FUNCTION__,q_map.ep,q_map.tc);
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Index of New Q: %d\n",__FUNCTION__, q_index);
+			cbm_queue_map_set(q_index, &q_map, q_map_mask);
+			subif_index->user_queue[subif_index->queue_cnt].qmap[i] =*(tc+i); //tc[i];
+		}	
+		subif_index->user_queue[subif_index->queue_cnt].no_of_tc = no_of_tc;
+	}
+
+#endif
+
 	return TMU_HAL_STATUS_OK;
 
 }
@@ -5142,6 +5525,7 @@ int tmu_hal_add_ingress_queue(
 	cbm_tmu_res_t *tmu_res=NULL;
 	dp_subif_t dp_subif = {0};  
 	int32_t tmuport;
+	int32_t ret = TMU_HAL_STATUS_OK;
 
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Enter --> \n",__FUNCTION__);	
@@ -5167,10 +5551,13 @@ int tmu_hal_add_ingress_queue(
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> CPU Ingress --> For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d No Of TMU ports: %d\n",
 				__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q,nof_of_tmu_ports);
 		tmuport = tmu_res->tmu_port;
+		kfree(tmu_res);
 	}
 
-	if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
-		return PPA_FAILURE;
+	if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+		ret = PPA_FAILURE;
+		goto CBM_RESOURCES_CLEANUP;
+	}
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Group index is %d\n ",__FUNCTION__,tmuport);
 
@@ -5200,15 +5587,22 @@ int tmu_hal_add_ingress_queue(
 			uint32_t q_index = 0xFF;
 			struct tmu_hal_equeue_create q_reconnect;
 			struct tmu_hal_sched_track_info Snext;
-			enum tmu_hal_errorcode eErr;
+			cbm_queue_map_entry_t *q_map_get = NULL;
+			int32_t no_entries =0;
+			//struct tmu_hal_token_bucket_shaper_cfg cfg_shaper = {0};
+			//struct tmu_hal_equeue_cfg q_param = {0};
+
+
+
 
 #ifdef TMU_HAL_TEST
 			dp_subif.port_id = 0;
 			dp_subif.subif = 0;
 #endif
-			if(tmu_hal_get_tmu_res_from_netdevice(netdev, schedid, &dp_subif, &nof_of_cpu_tmu_ports, &cpu_tmu_res, flags) == TMU_HAL_STATUS_ERR) {
+			//if(tmu_hal_get_tmu_res_from_netdevice(netdev, schedid, &dp_subif, &nof_of_cpu_tmu_ports, &cpu_tmu_res, flags) == TMU_HAL_STATUS_ERR) {
+			if(tmu_hal_get_tmu_res_from_netdevice(netdev, schedid, &dp_subif, &nof_of_cpu_tmu_ports, &cpu_tmu_res, PPA_QOS_Q_F_INGRESS) == TMU_HAL_STATUS_ERR) {
 				TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"%s:%d Error: Failed to get resources from Netdevice\n", __FUNCTION__, __LINE__);
-				kfree(tmu_res);
+				kfree(cpu_tmu_res);
 				return TMU_HAL_STATUS_ERR;
 			}
 
@@ -5221,6 +5615,8 @@ int tmu_hal_add_ingress_queue(
 
 			q_index = cpu_tmu_res->tmu_q; // this is the QID						
 			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Already queue %d is attached to this leaf\n",q_index);
+
+			cbm_queue_map_get(q_index, &no_entries, &q_map_get, 0);
 			//tmu_hal_egress_queue_delete(q_index);
 			tmu_hal_safe_queue_delete(netdev, q_index, -1, -1);
 
@@ -5241,10 +5637,22 @@ int tmu_hal_add_ingress_queue(
 
 			g_Root_sched_id_Ingress = root_omid;
 
+			udelay(20000);
+			if (no_entries > 0) {
+				int32_t j;
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Q map pointer =%p\n", q_map_get);
+				for (j=0; j<no_entries;j++)
+					cbm_queue_map_set(q_index, &q_map_get[j], 0);
+				no_entries = 0;
+			}
+			kfree(q_map_get);
+			q_map_get = NULL;
+
 			/* Now create the Port scheduler for the interface */
 			sched_port = create_new_scheduler(g_Root_sched_id_Ingress, 0, TMU_HAL_POLICY_WFQ, tmu_hal_sched_track[root_omid].level + 1, 1);
 			tmu_hal_sched_track[sched_port].policy = TMU_HAL_POLICY_STRICT;
-			q_new = tmu_hal_add_new_queue(netdev, cpu_tmu_res->tmu_port, prio_type, prio_level, weight, sched_port, ingress_subif_index, &eErr );
+			//q_new = tmu_hal_add_new_queue(netdev, cpu_tmu_res->tmu_port, prio_type, prio_level, weight, sched_port, ingress_subif_index, &eErr );
+			q_new = tmu_hal_queue_add(netdev,cpu_tmu_res->tmu_port,sched_port, prio_type, prio_level, weight, ingress_subif_index); 
 
 
 			port_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT); 
@@ -5261,15 +5669,22 @@ int tmu_hal_add_ingress_queue(
 			ingress_subif_index->user_queue[ingress_subif_index->queue_cnt].sbin = tmu_hal_queue_track[q_new].sched_input;
 			ingress_subif_index->user_queue[ingress_subif_index->queue_cnt].qid = qid_last_assigned;
 			ingress_subif_index->queue_cnt++ ;
+
+			if((flags & PPA_QOS_Q_F_DEFAULT) == PPA_QOS_Q_F_DEFAULT)
+			{	
+				TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Priority Level for Default Q : %d\n",prio_level);
+				ingress_subif_index->default_prio = prio_level;
+			}
 			tmu_hal_dump_subif_queue_info(ingress_subif_index);
 			
-			for(i=0; i< no_of_tc; i++)
+			tmu_hal_set_ingress_grp_qmap(ingress_subif_index, prio_level, flags, q_new, tc, no_of_tc);
+			/*for(i=0; i< no_of_tc; i++)
 			{
 				tmu_hal_set_ingress_grp_qmap(flags, q_new, *(tc+i));
 				ingress_subif_index->user_queue[ingress_subif_index->queue_cnt].qmap[i] =*(tc+i); 
 			}
 
-			ingress_subif_index->user_queue[ingress_subif_index->queue_cnt].no_of_tc = no_of_tc;
+			ingress_subif_index->user_queue[ingress_subif_index->queue_cnt].no_of_tc = no_of_tc;*/
 			kfree(cpu_tmu_res);
 		} else {
 			//Root Scheduler is already connected
@@ -5348,26 +5763,191 @@ int tmu_hal_add_ingress_queue(
 			subif_index->user_queue[subif_index->queue_cnt].queue_index = q_new;
 			subif_index->user_queue[subif_index->queue_cnt].queue_type = prio_type;
 			subif_index->user_queue[subif_index->queue_cnt].prio_level = prio_level;
+			subif_index->user_queue[subif_index->queue_cnt].weight = weight;
 			subif_index->user_queue[subif_index->queue_cnt].sbin = tmu_hal_queue_track[q_new].sched_input;
 			subif_index->user_queue[subif_index->queue_cnt].qid = qid_last_assigned;
 			subif_index->netdev = netdev ;
 			subif_index->queue_cnt++ ;
 
+			if((flags & PPA_QOS_Q_F_DEFAULT) == PPA_QOS_Q_F_DEFAULT)
+			{	
+				TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Priority Level for Default Q : %d\n",prio_level);
+				subif_index->default_prio = prio_level;
+			}
 			tmu_hal_dump_subif_queue_info(subif_index);
-			for(i=0; i< no_of_tc; i++)
+			tmu_hal_set_ingress_grp_qmap(subif_index, prio_level, flags, q_new, tc, no_of_tc);
+			/*for(i=0; i< no_of_tc; i++)
 			{
 				tmu_hal_set_ingress_grp_qmap(flags, q_new, *(tc+i));
 				subif_index->user_queue[subif_index->queue_cnt].qmap[i] =*(tc+i); 
 			}
 
-			subif_index->user_queue[subif_index->queue_cnt].no_of_tc = no_of_tc;
+			subif_index->user_queue[subif_index->queue_cnt].no_of_tc = no_of_tc;*/
 		}
+		
 	}
-	kfree(tmu_res);
+CBM_RESOURCES_CLEANUP:
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Exit --> \n",__FUNCTION__);	
 	return qid_last_assigned ;
 
 }
+
+int tmu_hal_add_mpe_ingress_queue(
+		struct net_device *netdev, 
+		char *tc,
+		uint8_t no_of_tc,
+		uint32_t schedid, 
+		uint32_t prio_type, 
+		uint32_t prio_level, 
+		uint32_t weight, 
+		uint32_t flowId,
+		QOS_Q_ADD_CFG *params, 
+		uint32_t flags)
+{
+	uint32_t i=0, base_sched, qid_last_assigned = 0;
+	uint32_t nof_of_tmu_ports=0;
+	//cbm_tmu_res_t *tmu_res=NULL;
+	cbm_tmu_res_t *cpu_tmu_res = NULL;
+	dp_subif_t dp_subif = {0};  
+	int32_t tmuport;
+	int32_t ret = TMU_HAL_STATUS_OK;
+
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Enter --> \n",__FUNCTION__);	
+
+	if(( tmuport = (tmu_hal_get_mpe_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+		ret = PPA_FAILURE;
+		goto CBM_RESOURCES_CLEANUP;
+	}
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Group index is %d\n ",__FUNCTION__,tmuport);
+
+	if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS)
+	{
+		struct tmu_hal_user_subif_abstract *ingress_subif_index = NULL;
+		struct tmu_hal_user_subif_abstract *subif_index = NULL;
+		struct tmu_hal_user_subif_abstract *port_index = NULL;
+		struct tmu_hal_user_subif_abstract *subif_index_port = NULL;
+		uint32_t nof_of_cpu_tmu_ports;
+		uint32_t q_new, sched_port;
+
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Add Ingress Queue for Datapath Port %d\n",__FUNCTION__, dp_subif.port_id);
+
+		//if(tmu_hal_get_tmu_res_from_netdevice(netdev, schedid, &dp_subif, &nof_of_cpu_tmu_ports, &cpu_tmu_res, (flags | DP_F_MPE_ACCEL)) == TMU_HAL_STATUS_ERR) {
+		if(tmu_hal_get_tmu_res_from_netdevice(netdev, schedid, &dp_subif, &nof_of_cpu_tmu_ports, &cpu_tmu_res, (PPA_QOS_Q_F_INGRESS | DP_F_MPE_ACCEL)) == TMU_HAL_STATUS_ERR) {
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"%s:%d Error: Failed to get resources from Netdevice\n", __FUNCTION__, __LINE__);
+			kfree(cpu_tmu_res);
+			return TMU_HAL_STATUS_ERR;
+		}
+		for(i=0; i<nof_of_tmu_ports; i++) {
+			(tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif)->is_logical = (dp_subif.subif == 0) ? 0 : 1; 
+			(tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif)->tmu_port_idx = tmuport; 
+			//(tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif)->base_sched_id_egress = 0xFF; 
+			//(tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif)->root_sched_id_ingress = g_Root_sched_id_Ingress;
+		}
+
+		ingress_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Ingres  Sub interface index %p\n",__FUNCTION__,ingress_subif_index);
+
+		port_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT); 
+		//if(ingress_subif_index->port_sched_in_egress == 0xFF) 
+		if(port_index->base_sched_id_egress == 0xFF) {
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Create Port Scheduler for the port \n");
+			sched_port = create_new_scheduler(cpu_tmu_res->tmu_sched, 0, TMU_HAL_POLICY_WFQ, tmu_hal_sched_track[cpu_tmu_res->tmu_sched].level + 1, 1);
+			tmu_hal_sched_track[sched_port].policy = TMU_HAL_POLICY_STRICT;
+
+			port_index->base_sched_id_egress = sched_port;
+			for(i=0; i<TMU_HAL_MAX_SUB_IFID_PER_PORT; i++) {
+				(port_index + i)->port_sched_in_egress = sched_port; 
+				//(port_index + i)->base_sched_id_egress = sched_port; 
+			}
+		}
+		else {
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Port Scheduler for the port %d is %d\n",dp_subif.port_id, ingress_subif_index->port_sched_in_egress);
+		}
+		subif_index = ingress_subif_index;
+		subif_index_port = port_index;
+		if(dp_subif.subif != 0)
+		{
+			uint32_t port_prio_level;
+			if(subif_index->queue_cnt == 0 && subif_index->base_sched_id_egress == 0xFF)
+			{
+#if 0					
+				tmu_hal_find_min_prio_level_of_port(subif_index_port, &base_sched, &prio_level);
+			} else if(subif_index->queue_cnt == 1 && subif_index->base_sched_id_egress == 0xFF)
+			{
+#endif
+				uint8_t leaf;
+				uint32_t port_sched;
+				tmu_hal_find_min_prio_level_of_port(subif_index_port, &port_sched, &port_prio_level);
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Add First Queue of the subif %d to the Port Scheduler %d\n",dp_subif.subif,port_sched);
+				subif_index->port_sched_in_user_lvl = port_prio_level;
+
+				if (tmu_hal_scheduler_free_input_get(
+							port_sched,
+							&leaf) < 0)
+				{
+				} else
+					port_prio_level = leaf;
+
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Adding the Sub interface to the leaf %d\n",port_prio_level);
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"port_sched_in_egress= %d\n", subif_index->port_sched_in_egress );
+				if(subif_index->port_sched_in_egress >> 3 == NULL_SCHEDULER_BLOCK_ID){
+					tmu_hal_connect_subif_to_port(netdev, subif_index, subif_index_port, port_sched, port_prio_level, weight);
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Base Scheduler is already there\n");	
+				}
+				base_sched = subif_index->base_sched_id_egress;
+
+			} else {
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Minimum 1 Queue is already added for the subif %d to the Port Scheduler \n",dp_subif.subif);
+				base_sched = subif_index->base_sched_id_egress;
+			}
+		} else {
+
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE," For the main physical interface of the Port \n");
+			base_sched = subif_index->base_sched_id_egress;
+		}
+
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Base scheduler for the interface is %d \n",base_sched);
+
+		q_new = tmu_hal_queue_add(netdev, g_MPE_PortId, base_sched, prio_type, prio_level, weight, subif_index);
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"User Queue/Prio Level/Weight --> %d/%d/%d is mapped to Queue index-->%d \n",
+				subif_index->queue_cnt, prio_level, weight, q_new);
+
+		qid_last_assigned = ++(subif_index->qid_last_assigned);
+		tmu_hal_queue_track[q_new].user_q_idx = subif_index->queue_cnt;
+
+		subif_index->user_queue[subif_index->queue_cnt].queue_index = q_new;
+		subif_index->user_queue[subif_index->queue_cnt].queue_type = prio_type;
+		subif_index->user_queue[subif_index->queue_cnt].prio_level = prio_level;
+		subif_index->user_queue[subif_index->queue_cnt].weight = weight;
+		subif_index->user_queue[subif_index->queue_cnt].sbin = tmu_hal_queue_track[q_new].sched_input;
+		subif_index->user_queue[subif_index->queue_cnt].qid = qid_last_assigned;
+		subif_index->netdev = netdev ;
+		subif_index->queue_cnt++ ;
+		if((flags & PPA_QOS_Q_F_DEFAULT) == PPA_QOS_Q_F_DEFAULT)
+		{	
+			TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"Priority Level for Default Q : %d\n",prio_level);
+			subif_index->default_prio = prio_level;
+		}
+		tmu_hal_dump_subif_queue_info(subif_index);
+		tmu_hal_set_mpe_ingress_grp_qmap(subif_index, prio_level, flags, q_new, tc, no_of_tc);
+		/*for(i=0; i< no_of_tc; i++)
+		{
+			tmu_hal_set_mpe_ingress_grp_qmap(flags, q_new, *(tc+i));
+			subif_index->user_queue[subif_index->queue_cnt].qmap[i] =*(tc+i); 
+		}
+
+		subif_index->user_queue[subif_index->queue_cnt].no_of_tc = no_of_tc;*/
+	}
+CBM_RESOURCES_CLEANUP:
+	kfree(cpu_tmu_res);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Exit --> \n",__FUNCTION__);	
+	return qid_last_assigned ;
+
+}
+
 
 int tmu_hal_add_egress_queue(
 		struct net_device *netdev, 
@@ -6269,6 +6849,22 @@ int tmu_hal_add_queue(
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Enter --> \n",__FUNCTION__);	
 
 	if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) {
+		if(g_MPE_PortId != -1)
+		{
+			tmu_hal_add_mpe_ingress_queue(
+                		netdev,
+                		tc,
+                		no_of_tc,
+                		schedid,
+                		prio_type,
+                		prio_level,
+                		weight,
+                		flowId,
+				params, 
+				flags);
+
+
+		}
 		return tmu_hal_add_ingress_queue(
                 		netdev,
                 		tc,
@@ -6381,7 +6977,7 @@ int tmu_hal_reconnect_q_to_high_sched_lvl(
 {
 	struct tmu_hal_equeue_create q_reconnect;
 	uint32_t schedin, reconn_sched, index;
-	QOS_RATE_SHAPING_CFG cfg;
+	//QOS_RATE_SHAPING_CFG cfg;
 	uint32_t cfg_shaper,user_q_index;
 	struct tmu_hal_equeue_cfg q_param = {0};
 	cbm_queue_map_entry_t *q_map_get = NULL;                            
@@ -6394,16 +6990,16 @@ int tmu_hal_reconnect_q_to_high_sched_lvl(
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Shaper %d is attached to this Queue\n",__FUNCTION__,tmu_hal_queue_track[q_index].tb_index);
 	cfg_shaper = tmu_hal_queue_track[q_index].tb_index;
-	if(cfg_shaper != 0xFF) {
-		memset(&cfg, 0, sizeof(QOS_RATE_SHAPING_CFG));
-		cfg.shaperid = cfg_shaper ;
-		tmu_hal_del_queue_rate_shaper_ex(netdev, &cfg, q_index, 0);
-	}
+	/*if(cfg_shaper != 0xFF) {
+	  memset(&cfg, 0, sizeof(QOS_RATE_SHAPING_CFG));
+	  cfg.shaperid = cfg_shaper ;
+	  tmu_hal_del_queue_rate_shaper_ex(netdev, &cfg, q_index, 0);
+	  }*/
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Queue %d is connected to the Scheduler %d\n",__FUNCTION__,q_index, schedin);
 
 	cbm_queue_map_get(q_index, &no_entries, &q_map_get, 0);
-        TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> %d No of entries is %d for queue=%d\n", __FUNCTION__,__LINE__, no_entries, q_index);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> %d No of entries is %d for queue=%d\n", __FUNCTION__,__LINE__, no_entries, q_index);
 	//tmu_sched_blk_in_enable(tmu_hal_queue_track[q_index].sched_input, 0);
 	//tmu_sched_blk_in_enable(sched_connect_to << 3, 0);
 	//tmu_hal_egress_queue_delete(q_index);
@@ -6479,16 +7075,17 @@ int tmu_hal_reconnect_q_to_high_sched_lvl(
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Q map pointer =%p\n", q_map_get);
 		for (j=0; j<no_entries;j++)
 			cbm_queue_map_set(q_index, &q_map_get[j], 0);
-		kfree(q_map_get);
-		q_map_get = NULL;
 		no_entries = 0;
 	}
+	kfree(q_map_get);
+	q_map_get = NULL;
+	/*
 	cbm_queue_map_get(q_index, &no_entries, &q_map_get, 0);
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> %d No of entries is %d for queue=%d\n", __FUNCTION__,__LINE__, no_entries, q_index);
 
 	if (no_entries > 0) 
- 		kfree(q_map_get);	
-
+		kfree(q_map_get);	
+	*/
 
 	tmu_hal_queue_track[q_index].connected_to_sched_id = reconn_sched >> 3;
 	tmu_hal_queue_track[q_index].sched_input = reconn_sched;
@@ -6504,8 +7101,7 @@ int tmu_hal_reconnect_q_to_high_sched_lvl(
 	return TMU_HAL_STATUS_OK;
 }
 
-
-int tmu_hal_delete_queue(
+int tmu_hal_delete_mpe_ingress_queue(
 		struct net_device *netdev, 
 		uint32_t q_id, 
 		uint32_t priority,
@@ -6532,15 +7128,11 @@ int tmu_hal_delete_queue(
 	if(dp_get_netif_subifid(netdev, NULL, vcc, 0, &dp_subif, flags) != PPA_SUCCESS)
 		return TMU_HAL_STATUS_ERR;
 
-#ifdef TMU_HAL_TEST
-	dp_subif.port_id = 15; //2;
-	dp_subif.subif = scheduler_id;
-
-#endif
 
 	dp_subif.subif  = dp_subif.subif >> 8; 
 	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, 0) != 0) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get TMU Resources\n", __FUNCTION__, __LINE__);
+		kfree(tmu_res);
 		return TMU_HAL_STATUS_ERR;
 	}
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
@@ -6551,8 +7143,10 @@ int tmu_hal_delete_queue(
 	tmuport = tmu_res->tmu_port;
 	if(flags & PPA_QOS_Q_F_INGRESS)
 	{
-		if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
-                return PPA_FAILURE;
+		if(( tmuport = (tmu_hal_get_mpe_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+			ret = TMU_HAL_STATUS_ERR;
+			goto CBM_RESOURCES_CLEANUP;
+		}
 
         	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Group index is %d\n ",__FUNCTION__,tmuport);
 
@@ -6563,46 +7157,16 @@ int tmu_hal_delete_queue(
 		port_subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
 	}
 
-	//For Directpath interface
-	if((dp_subif.port_id !=0) && (tmu_res->tmu_port == g_CPU_PortId) ) {
-		struct tmu_hal_dp_res_info res = {0};
-		tmu_hal_dp_port_resources_get(dp_subif.port_id, &res);
-		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Port Id for Directpath interface is %d\n",__FUNCTION__,res.dp_egress_res.dp_port);
+	
 
-		subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-		port_subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
-		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> subif index is %p\n",__FUNCTION__,subif_index);
-
+	if(flags & PPA_QOS_Q_F_INGRESS) {
+		tmu_q_sys = g_MPE_Queue;
+		tmuport = g_MPE_PortId;
 	}
-
-	if(flags & PPA_QOS_Q_F_INGRESS)
-		tmu_q_sys = g_CPU_Queue;
 	else
 		tmu_q_sys = tmu_res->tmu_q;
 
-	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> priority=%d high_prio_q_limit=%d\n", __FUNCTION__, priority, high_prio_q_limit);
-	if(priority > high_prio_q_limit) {
-		int32_t base_sched;
-		if(nof_of_tmu_ports > 1) {
-			base_sched = (tmu_res)->tmu_sched;
-			tmuport = (tmu_res)->tmu_port;
-			tmu_q_sys = (tmu_res)->tmu_q;
-			subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-			port_subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
-			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Low Priority Port:%d SB: %d \n",__FUNCTION__,tmuport,base_sched);
-		}	
-	} else {
-		int32_t base_sched;
-		if(nof_of_tmu_ports > 1) {
-			base_sched = (tmu_res+1)->tmu_sched;
-			tmuport = (tmu_res+1)->tmu_port;
-			tmu_q_sys = (tmu_res+1)->tmu_q;
-			subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-			port_subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
-			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> High Priority Port:%d SB: %d \n",__FUNCTION__,tmuport,base_sched);
-		}
-
-	}
+	
 
 	if( (index = tmu_hal_get_user_index_from_qid(subif_index, q_id) ) == TMU_HAL_STATUS_ERR) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d Invalid Queue Id\n", __FUNCTION__, __LINE__);
@@ -6613,18 +7177,7 @@ int tmu_hal_delete_queue(
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete Actual Queue Index %d\n",__FUNCTION__,subif_index->user_queue[index].queue_index);
 
 	prio = subif_index->user_queue[index].prio_level; 
-	/** Delete the rate shaper associated to it */
-	/*if(tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index != 0xFF)
-	{
-		QOS_RATE_SHAPING_CFG cfg;
-		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Shaper %d is attached to this Queue\n",
-				__FUNCTION__,tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index);
-		memset(&cfg, 0, sizeof(QOS_RATE_SHAPING_CFG));
-		cfg.shaperid = tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index;
-		cfg.queueid = q_id;
-		tmu_hal_del_queue_rate_shaper_ex(netdev, &cfg, -1, TMU_HAL_DEL_SHAPER_CFG);
-
-	}*/
+	
 	/** If the delete is for Egress queue and for the physical interface 
 	  --> then don't allow to delete the reserved queue
 	 */
@@ -6656,17 +7209,7 @@ int tmu_hal_delete_queue(
 	cbm_queue_map_get(
 		subif_index->user_queue[index].queue_index,
 			&num_entries, &q_map_get, 0);
-#if 0
-	//tmu_hal_safe_queue_delete(netdev, subif_index->user_queue[index].queue_index, -1, -1);
-	tmu_hal_safe_queue_and_shaper_delete(netdev, subif_index->user_queue[index].queue_index, -1, tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index,  -1, TMU_HAL_DEL_SHAPER_CFG);
 
-	connected_sched = subif_index->user_queue[index].sbin >> 3;
-	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Queue sbin %d sb:%d\n",__FUNCTION__,subif_index->user_queue[index].sbin, connected_sched);
-
-	//tmu_hal_shift_up_sbin_conn(netdev, tmu_res->tmu_port, subif_index, subif_index->user_queue[index].sbin);
-	tmu_hal_shift_up_sbin_conn(netdev, tmuport, subif_index, subif_index->user_queue[index].sbin);
-	subif_index->queue_cnt--;
-#endif
 	{
 		if(prio == subif_index->default_prio ) {
 
@@ -6711,10 +7254,10 @@ int tmu_hal_delete_queue(
 	}
 
 	if (num_entries > 0) {
-		kfree(q_map_get);
-		q_map_get = NULL;
 		num_entries =0;
 	}
+	kfree(q_map_get);
+	q_map_get = NULL;
 #if 1
 
 	tmu_hal_safe_queue_and_shaper_delete(netdev, subif_index->user_queue[index].queue_index, -1, tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index,  -1, TMU_HAL_DEL_SHAPER_CFG);
@@ -6866,6 +7409,374 @@ CBM_RESOURCES_CLEANUP:
 	return ret;
 }
 
+
+int tmu_hal_delete_queue(
+		struct net_device *netdev, 
+		uint32_t q_id, 
+		uint32_t priority,
+		uint32_t scheduler_id, 
+		uint32_t flags)
+{
+	uint32_t i=0, connected_sched, index;
+	uint32_t nof_of_tmu_ports;
+	int32_t prio;
+	int32_t ret = TMU_HAL_STATUS_OK;
+	cbm_tmu_res_t *tmu_res;
+	dp_subif_t dp_subif={0};  
+	struct tmu_hal_user_subif_abstract *subif_index = NULL;
+	struct tmu_hal_user_subif_abstract *port_subif_index = NULL;
+	PPA_VCC *vcc = NULL;
+	int32_t tmuport, tmu_q_sys;
+	int32_t recnct=255;
+
+	cbm_queue_map_entry_t *q_map_get = NULL;
+	int32_t num_entries=0;
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Enter --> \n",__FUNCTION__);	
+	ppa_br2684_get_vcc(netdev,&vcc);
+	if(dp_get_netif_subifid(netdev, NULL, vcc, 0, &dp_subif, flags) != PPA_SUCCESS)
+		return TMU_HAL_STATUS_ERR;
+
+#ifdef TMU_HAL_TEST
+	dp_subif.port_id = 15; //2;
+	dp_subif.subif = scheduler_id;
+
+#endif
+
+	dp_subif.subif  = dp_subif.subif >> 8; 
+	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, 0) != 0) {
+		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Get TMU Resources\n", __FUNCTION__, __LINE__);
+		return TMU_HAL_STATUS_ERR;
+	}
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
+			__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Delete Qid: %d\n",__FUNCTION__,q_id);	
+
+	tmuport = tmu_res->tmu_port;
+	if(flags & PPA_QOS_Q_F_INGRESS)
+	{
+		if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+                	ret = TMU_HAL_STATUS_ERR;
+			goto CBM_RESOURCES_CLEANUP;
+		}
+
+        	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Group index is %d\n ",__FUNCTION__,tmuport);
+
+		subif_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+		port_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+	} else {
+		subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+		port_subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+	}
+
+	//For Directpath interface
+	if((dp_subif.port_id !=0) && (tmu_res->tmu_port == g_CPU_PortId) ) {
+		struct tmu_hal_dp_res_info res = {0};
+		tmu_hal_dp_port_resources_get(dp_subif.port_id, &res);
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Port Id for Directpath interface is %d\n",__FUNCTION__,res.dp_egress_res.dp_port);
+
+		subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+		port_subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> subif index is %p\n",__FUNCTION__,subif_index);
+
+	}
+
+	if(flags & PPA_QOS_Q_F_INGRESS) {
+		tmu_q_sys = g_CPU_Queue;
+		tmuport = g_CPU_PortId;
+	}
+	else
+		tmu_q_sys = tmu_res->tmu_q;
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> priority=%d high_prio_q_limit=%d\n", __FUNCTION__, priority, high_prio_q_limit);
+	if(!(flags & PPA_QOS_Q_F_INGRESS))
+	{
+	if(priority > high_prio_q_limit) {
+		int32_t base_sched;
+		if(nof_of_tmu_ports > 1) {
+			base_sched = (tmu_res)->tmu_sched;
+			tmuport = (tmu_res)->tmu_port;
+			tmu_q_sys = (tmu_res)->tmu_q;
+			subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+			port_subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Low Priority Port:%d SB: %d \n",__FUNCTION__,tmuport,base_sched);
+		}	
+	} else {
+		int32_t base_sched;
+		if(nof_of_tmu_ports > 1) {
+			base_sched = (tmu_res+1)->tmu_sched;
+			tmuport = (tmu_res+1)->tmu_port;
+			tmu_q_sys = (tmu_res+1)->tmu_q;
+			subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+			port_subif_index = tmu_hal_user_sub_interface_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> High Priority Port:%d SB: %d \n",__FUNCTION__,tmuport,base_sched);
+		}
+
+	}
+	}
+
+	if( (index = tmu_hal_get_user_index_from_qid(subif_index, q_id) ) == TMU_HAL_STATUS_ERR) {
+		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d Invalid Queue Id\n", __FUNCTION__, __LINE__);
+		ret = TMU_HAL_STATUS_INVALID_QID;
+		goto CBM_RESOURCES_CLEANUP;
+	}
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete User Queue Index =%d \n",__FUNCTION__, index);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete Actual Queue Index %d\n",__FUNCTION__,subif_index->user_queue[index].queue_index);
+
+	prio = subif_index->user_queue[index].prio_level; 
+	/** Delete the rate shaper associated to it */
+	/*if(tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index != 0xFF)
+	{
+		QOS_RATE_SHAPING_CFG cfg;
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Shaper %d is attached to this Queue\n",
+				__FUNCTION__,tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index);
+		memset(&cfg, 0, sizeof(QOS_RATE_SHAPING_CFG));
+		cfg.shaperid = tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index;
+		cfg.queueid = q_id;
+		tmu_hal_del_queue_rate_shaper_ex(netdev, &cfg, -1, TMU_HAL_DEL_SHAPER_CFG);
+
+	}*/
+	/** If the delete is for Egress queue and for the physical interface 
+	  --> then don't allow to delete the reserved queue
+	 */
+	if((! (flags & PPA_QOS_Q_F_INGRESS)) && subif_index->is_logical != 1) {
+		if(subif_index->user_queue[index].queue_index < g_No_Of_TMU_Res_Queue) {
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"<%s> Reserved Queue %d can't be deleted \n",__FUNCTION__,subif_index->user_queue[index].queue_index);
+			ret = TMU_HAL_STATUS_ERR;
+			goto CBM_RESOURCES_CLEANUP;
+		}
+	}
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> User Queue sbin %d  Actual Queue SBIN:%d\n",
+			__FUNCTION__,subif_index->user_queue[index].sbin, tmu_hal_queue_track[subif_index->user_queue[index].queue_index].sched_input);
+
+	subif_index->user_queue[index].sbin = tmu_hal_queue_track[subif_index->user_queue[index].queue_index].sched_input;
+	//tmu_sched_blk_in_enable(subif_index->user_queue[index].sbin, 0);
+	//tmu_hal_egress_queue_delete(subif_index->user_queue[index].queue_index);
+	//printk("subif_index->default_q=%d tmu_q_sys=%d\n", subif_index->default_q, tmu_q_sys);
+
+	if(subif_index->default_q != 0)
+	{
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Deafult Queue %d \n",__FUNCTION__, subif_index->default_q);
+		recnct = subif_index->default_q;	
+	} else  {
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>QoS Deafult Queue %d \n",__FUNCTION__, tmu_q_sys);
+		recnct = tmu_q_sys;
+	}
+
+	cbm_queue_map_get(
+		subif_index->user_queue[index].queue_index,
+			&num_entries, &q_map_get, 0);
+#if 0
+	//tmu_hal_safe_queue_delete(netdev, subif_index->user_queue[index].queue_index, -1, -1);
+	tmu_hal_safe_queue_and_shaper_delete(netdev, subif_index->user_queue[index].queue_index, -1, tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index,  -1, TMU_HAL_DEL_SHAPER_CFG);
+
+	connected_sched = subif_index->user_queue[index].sbin >> 3;
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Queue sbin %d sb:%d\n",__FUNCTION__,subif_index->user_queue[index].sbin, connected_sched);
+
+	//tmu_hal_shift_up_sbin_conn(netdev, tmu_res->tmu_port, subif_index, subif_index->user_queue[index].sbin);
+	tmu_hal_shift_up_sbin_conn(netdev, tmuport, subif_index, subif_index->user_queue[index].sbin);
+	subif_index->queue_cnt--;
+#endif
+	{
+		if(prio == subif_index->default_prio ) {
+
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Prio Level/No Of TMU ports --> %d/%d/ \n",prio,nof_of_tmu_ports);
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Default Queue %d has mapped entries %d \n",__FUNCTION__,subif_index->user_queue[index].queue_index,num_entries);
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Remap to System Default Q: %d\n",__FUNCTION__,tmu_q_sys);
+
+			if (num_entries > 0) {
+				for(i = 0; i < num_entries; i++) {
+					tmu_hal_add_q_map(tmu_q_sys, CPU_PORT_ID, &q_map_get[i], 0);
+				}
+			}
+
+			subif_index->default_q = 0;
+			//subif_index->default_prio = 0;
+		} else {
+			cbm_queue_map_entry_t q_map;
+			uint32_t q_map_mask =0;
+			for(i = 0; i < subif_index->user_queue[index].no_of_tc; i++) {
+				/** Configure the QMAP table to connect to the DP egress queue*/
+				memset(&q_map, 0, sizeof(cbm_queue_map_entry_t));
+
+				q_map.ep = dp_subif.port_id;
+				q_map.tc = subif_index->user_queue[index].qmap[i];
+				q_map_mask |= CBM_QUEUE_MAP_F_FLOWID_L_DONTCARE |
+					CBM_QUEUE_MAP_F_FLOWID_H_DONTCARE |
+					CBM_QUEUE_MAP_F_EN_DONTCARE |
+					CBM_QUEUE_MAP_F_DE_DONTCARE |
+					CBM_QUEUE_MAP_F_MPE1_DONTCARE |
+					CBM_QUEUE_MAP_F_MPE2_DONTCARE ;
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete QMAP for Port %d and TC: %d\n",__FUNCTION__,q_map.ep,q_map.tc);
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Remap to Q: %d\n",__FUNCTION__,tmu_q_sys);
+				if(subif_index->default_q != 0) {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Remap to default Q: %d\n",__FUNCTION__,subif_index->default_q);
+					tmu_hal_add_q_map(subif_index->default_q, CPU_PORT_ID, &q_map, q_map_mask);
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Remap to Q: %d\n",__FUNCTION__,tmu_q_sys);
+					tmu_hal_add_q_map(tmu_q_sys, CPU_PORT_ID, &q_map, q_map_mask);
+				}
+			} // for loop no_of_tc
+		}
+	}
+
+	if (num_entries > 0) {
+		num_entries =0;
+	}
+	kfree(q_map_get);
+	q_map_get = NULL;
+#if 1
+
+	tmu_hal_safe_queue_and_shaper_delete(netdev, subif_index->user_queue[index].queue_index, -1, tmu_hal_queue_track[subif_index->user_queue[index].queue_index].tb_index,  -1, TMU_HAL_DEL_SHAPER_CFG);
+
+	connected_sched = subif_index->user_queue[index].sbin >> 3;
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Queue sbin %d sb:%d\n",__FUNCTION__,subif_index->user_queue[index].sbin, connected_sched);
+
+	tmu_hal_shift_up_sbin_conn(netdev, tmuport, subif_index, subif_index->user_queue[index].sbin);
+	subif_index->queue_cnt--;
+#endif
+
+	/** For all the logical interface if the last queue is getting deleted, then
+	  1> Delete then scheduler 
+	  2> Disable the scheduler input of the connected scheduler
+	  3> If the connected scheduler is Port scheduler then shift up the all the connected index of port scheduler to that index
+	  4> Update the subif_index 
+	 */		
+	if(subif_index->is_logical == 1 && subif_index->queue_cnt == 0)
+	{
+		uint32_t omid, port_omid;
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> No more queue for the sub interface\n",__FUNCTION__);
+		//Delete the sub interface base scheduler 
+		omid = tmu_hal_sched_track[subif_index->base_sched_id_egress].omid;
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete Scheduler subif_index: base_sched_id_egress: %d port_sched_in_egress: %d OMID: %d\n",
+				__FUNCTION__,subif_index->base_sched_id_egress, subif_index->port_sched_in_egress, omid);
+		//tmu_sched_blk_in_enable(subif_index->port_sched_in_egress, 0);
+		tmu_sched_blk_in_enable(omid, 0);
+		tmu_hal_scheduler_delete(subif_index->base_sched_id_egress);
+
+		if(omid == subif_index->port_sched_in_egress)
+			tmu_hal_shift_up_sbin_conn(netdev, tmuport, port_subif_index, subif_index->port_sched_in_egress);
+		else if((omid >> 3 )== subif_index->port_shaper_sched) {
+			QOS_RATE_SHAPING_CFG cfg;
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Need to Delete Port rate shaper %d\n",__FUNCTION__, (omid >> 3));
+			/** Base scheduler is already deleted. So update the next_sched_id of the
+			  port rate shaper scheduler even before deleting it. 
+			 */
+			port_omid = tmu_hal_sched_track[omid >> 3].omid;
+			tmu_hal_sched_track[omid >> 3].next_sched_id = INVALID_SCHED_ID;
+			if(tmu_hal_del_port_rate_shaper(netdev, &cfg, 0) == TMU_HAL_STATUS_OK) {
+				tmu_sched_blk_in_enable(port_omid, 0);
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Shift the Port egress input up %d\n",__FUNCTION__, subif_index->port_sched_in_egress);
+				tmu_hal_shift_up_sbin_conn(netdev, tmuport, port_subif_index, subif_index->port_sched_in_egress);
+			}
+		} else {
+			if(tmu_hal_sched_track[omid >> 3].leaf_mask == 0) {
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Nothing connected to any leaf. Delete scheduler %d\n",__FUNCTION__, (omid >> 3));
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Omid: %d\n",__FUNCTION__, tmu_hal_sched_track[omid >> 3].omid);				
+				tmu_sched_blk_in_enable(tmu_hal_sched_track[omid >> 3].omid, 0);
+				tmu_hal_scheduler_delete(omid >> 3);
+				tmu_hal_shift_up_sbin_conn(netdev, tmuport, port_subif_index, subif_index->port_sched_in_egress);
+			}
+		}
+		subif_index->base_sched_id_egress = INVALID_SCHED_ID;
+		subif_index->port_sched_in_egress = NULL_SCHEDULER_INPUT_ID;
+		ret = TMU_HAL_STATUS_OK;
+		goto CBM_RESOURCES_CLEANUP;
+	}
+
+	/** Now after deleting the queue, we have to rearrange the user queue info buffer
+	  1> Compaction --> move up all the queue index information till the deleted index.
+	  2> If all the queues of that scheduler are deleted, then delete the scheduler and 
+	  adjust the priority level. 
+	 */	
+	if(subif_index->queue_cnt != 0) {
+		uint32_t temp;
+		uint32_t qindex = 0xFF;
+		struct tmu_hal_user_subif_abstract *sub_index = NULL;
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Index %d Queue Count is %d\n",index,subif_index->queue_cnt);
+		for(i = index; i <subif_index->queue_cnt; i++) {
+			temp = subif_index->user_queue[index].sbin;
+			memcpy(&subif_index->user_queue[i], &subif_index->user_queue[i+1], sizeof(struct tmu_hal_user_queue_info));
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"i=%d temp sbin %d user sbin %d\n",i,temp , subif_index->user_queue[i].sbin);
+			//subif_index->user_queue[index].sbin = temp;
+			tmu_hal_queue_track[subif_index->user_queue[i+1].queue_index].user_q_idx = i;
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Q %d -> User Index %d\n",
+					subif_index->user_queue[i+1].queue_index , 
+					tmu_hal_queue_track[subif_index->user_queue[i+1].queue_index].user_q_idx);
+		}
+		subif_index->user_queue[i].queue_index = 0xFF;
+		subif_index->user_queue[i].sbin = NULL_SCHEDULER_INPUT_ID;
+		subif_index->user_queue[i].prio_level = TMU_HAL_MAX_PRIORITY_LEVEL;
+		subif_index->user_queue[i].qid = 0;
+
+		if(tmu_hal_sched_track[connected_sched].leaf_mask == 0) {
+			uint32_t next_sched, peer_sched;
+			next_sched = tmu_hal_sched_track[subif_index->base_sched_id_egress].next_sched_id;
+			peer_sched = tmu_hal_sched_track[tmu_hal_sched_track[subif_index->base_sched_id_egress].next_sched_id].peer_sched_id;
+
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Scheduler %d has no queue connected\n",__FUNCTION__, connected_sched);
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Priority Selector %d\n",tmu_hal_sched_track[connected_sched].priority_selector);
+			if(tmu_hal_sched_track[connected_sched].priority_selector == 3) {
+				if(tmu_hal_sched_track[tmu_hal_sched_track[subif_index->base_sched_id_egress].next_sched_id].peer_sched_id == connected_sched) {
+					tmu_hal_del_scheduler_level(netdev, tmuport, subif_index->base_sched_id_egress , connected_sched);
+					//subif_index->base_sched_id_egress = tmu_hal_sched_track[subif_index->base_sched_id_egress].next_sched_id;
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> New Base Scheduler %d \n",__FUNCTION__, next_sched);
+					subif_index->base_sched_id_egress = next_sched;
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Something is wrong\n");
+				}
+			} else if(tmu_hal_sched_track[connected_sched].priority_selector ==2 ) {
+				if(tmu_hal_sched_track[subif_index->base_sched_id_egress].next_sched_id == connected_sched) {
+					tmu_hal_del_scheduler_level(netdev, tmuport, subif_index->base_sched_id_egress , connected_sched);
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> New Base Scheduler %d \n",__FUNCTION__, peer_sched);
+					subif_index->base_sched_id_egress = peer_sched;
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Something is wrong\n");
+				}
+			} else if(tmu_hal_sched_track[connected_sched].policy == TMU_HAL_POLICY_WFQ ) {
+
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Must be the WFQ scheduler %d of same level \n", __FUNCTION__, connected_sched);
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Disableing the omid %d of the scheduler \n", 
+							__FUNCTION__, tmu_hal_sched_track[connected_sched].omid);
+				tmu_sched_blk_in_enable(tmu_hal_sched_track[connected_sched].omid, 0);
+				tmu_hal_scheduler_delete(tmu_hal_sched_track[connected_sched].id);
+			}
+		}
+#if 1 
+		if(tmu_hal_get_no_of_q_for_prio_lvl(subif_index, prio, &qindex, sub_index) == 1)
+		{
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Only 1 queue is connected this priority level of scheduler/Policy %d:%d\n",
+					connected_sched, tmu_hal_sched_track[connected_sched].policy);
+			if(tmu_hal_sched_track[connected_sched].policy == TMU_HAL_POLICY_WFQ) {
+				uint32_t new_sched_in;
+				index = 0 ;
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE," Connect the Queue %d to the higher scheduler level \n", qindex);
+				//tmu_hal_reconnect_q_to_high_sched_lvl(netdev, subif_index, qindex, tmu_res->tmu_port, connected_sched, &new_sched_in);
+				tmu_hal_reconnect_q_to_high_sched_lvl(netdev, subif_index, qindex, tmuport, connected_sched, &new_sched_in);
+#if 0
+				if( (index = tmu_hal_get_user_index_from_q_index(subif_index, qindex) ) == TMU_HAL_STATUS_ERR) {
+					TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d Invalid Queue Id\n", __FUNCTION__, __LINE__);
+					ret = TMU_HAL_STATUS_INVALID_QID;
+					goto CBM_RESOURCES_CLEANUP;
+				}
+				subif_index->user_queue[index].sbin = new_sched_in;
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> New Scheduler Input %d leaf:%d \n",
+						__FUNCTION__, (subif_index->user_queue[index].sbin >>3), (subif_index->user_queue[index].sbin & 7));
+#endif
+			}
+		}
+#endif
+		tmu_hal_dump_subif_queue_info(subif_index);
+	}
+
+CBM_RESOURCES_CLEANUP:
+	kfree(tmu_res);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Exit --> \n",__FUNCTION__);	
+	return ret;
+}
+
 int tmu_hal_modify_queue(struct net_device *netdev, QOS_Q_MOD_CFG *param)
 {
 	int32_t ret = TMU_HAL_STATUS_OK;
@@ -7012,7 +7923,7 @@ int tmu_hal_get_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
 				__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
 
-	if(flags & TMU_HAL_ADD_QUEUE_INGRESS)
+	if(flags & PPA_QOS_Q_F_INGRESS)
 	{
 		subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
 		port_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
@@ -7079,6 +7990,37 @@ CBM_RESOURCES_CLEANUP:
 	return ret;
 }
 
+/** Fill shaper cfg from shaper track and Create a new shaper instance or update it.
+    ** 1> Fill shaper cfg structure from shaper tarck corresponding to input shaperid
+    ** 2> Get New free shaper and Update the shaper tracking information.
+    ** 3> Return the shaper index.
+ */
+int tmu_hal_set_cfg_shaper_from_shaper_track(QOS_RATE_SHAPING_CFG *cfg)
+{
+
+	int shaper_index;
+	cfg->shaper.mode = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.mode;
+	cfg->shaper.pir = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.pir;
+	cfg->shaper.cir = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.cir;
+	cfg->shaper.pbs = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.pbs;
+	cfg->shaper.cbs = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.cbs;
+
+
+	shaper_index = tmu_hal_get_free_shaper();
+	TMU_HAL_ASSERT(shaper_index >= TMU_HAL_MAX_SHAPER);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>New Shaper  %d\n",__FUNCTION__, shaper_index);
+	
+	tmu_hal_shaper_track[shaper_index].is_enabled = true;
+	tmu_hal_shaper_track[shaper_index].tb_cfg.index = shaper_index;
+	tmu_hal_shaper_track[shaper_index].tb_cfg.mode = cfg->shaper.mode;
+	tmu_hal_shaper_track[shaper_index].tb_cfg.pir = cfg->shaper.pir;
+	tmu_hal_shaper_track[shaper_index].tb_cfg.cir = cfg->shaper.cir;
+	tmu_hal_shaper_track[shaper_index].tb_cfg.pbs = cfg->shaper.pbs;
+	tmu_hal_shaper_track[shaper_index].tb_cfg.cbs = cfg->shaper.cbs;
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Exit --> \n",__FUNCTION__);	
+	return shaper_index;
+}
+
 /** Create a new shaper instance or update it.
     ** 1> if shaper id <=0, then get free shaper instance
     ** 2> Update the shaper tracking information for the new or given shaper index.
@@ -7119,7 +8061,7 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 {
 	int32_t i=0, shaper_index = 0;
 	int32_t ret = TMU_HAL_STATUS_OK;
-	int32_t index = 0; 
+	int32_t index = 0, tmuport=0; 
 	uint32_t q_index;
 	uint32_t nof_of_tmu_ports;
 	uint32_t fail_cnt = 0;
@@ -7168,10 +8110,22 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 
 
 
-		if(flags & TMU_HAL_ADD_QUEUE_INGRESS)
+		if(flags & PPA_QOS_Q_F_INGRESS)
 		{
-			subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-			port_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+			if((flags & TMU_HAL_QUEUE_SHAPER_INGRESS_MPE) == TMU_HAL_QUEUE_SHAPER_INGRESS_MPE) { //for MPE Ingress Queue
+				if(( tmuport = (tmu_hal_get_mpe_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+					ret = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
+				} 
+			} else {//for CPU Ingress queue
+				if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+					ret = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
+				}
+
+			}
+			subif_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+			port_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
 		} else {
 			subif_index = tmu_hal_user_sub_interface_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
 			port_subif_index = tmu_hal_user_sub_interface_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
@@ -7192,28 +8146,39 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 		// Find the user qid from the user queue array
 		for(i=0; i < nof_of_tmu_ports; i++)
 		{
-			if((dp_subif.port_id !=0) && (tmu_res->tmu_port == g_CPU_PortId) ) {
-				struct tmu_hal_dp_res_info res = {0};
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Adding the shaper for Directpath interface!!!\n",__FUNCTION__);
-				tmu_hal_dp_port_resources_get(dp_subif.port_id, &res);
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Port Id for Directpath interface is %d\n",__FUNCTION__,res.dp_egress_res.dp_port);
-
-				subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-				port_subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> subif index is %p\n",__FUNCTION__,subif_index);
-
-			} else {
-				subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-				port_subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+			if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS)
+			{
+				if( (index = tmu_hal_get_user_index_from_qid(subif_index, cfg->queueid) ) == TMU_HAL_STATUS_ERR) {
+					fail_cnt++;
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Qid Matched QId=%d\n",__FUNCTION__, cfg->queueid);
+					break;
+				}
 			}
-			if( (index = tmu_hal_get_user_index_from_qid(subif_index, cfg->queueid) ) == TMU_HAL_STATUS_ERR) {
-				fail_cnt++;
-			} else {
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Qid Matched QId=%d\n",__FUNCTION__, cfg->queueid);
-				break;
-			}
+			else
+			{
+				if((dp_subif.port_id !=0) && (tmu_res->tmu_port == g_CPU_PortId) ) {
+					struct tmu_hal_dp_res_info res = {0};
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Adding the shaper for Directpath interface!!!\n",__FUNCTION__);
+					tmu_hal_dp_port_resources_get(dp_subif.port_id, &res);
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Port Id for Directpath interface is %d\n",__FUNCTION__,res.dp_egress_res.dp_port);
 
-		}	
+					subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+					port_subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> subif index is %p\n",__FUNCTION__,subif_index);
+
+				} else {
+					subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+					port_subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+				}
+				if( (index = tmu_hal_get_user_index_from_qid(subif_index, cfg->queueid) ) == TMU_HAL_STATUS_ERR) {
+					fail_cnt++;
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Qid Matched QId=%d\n",__FUNCTION__, cfg->queueid);
+					break;
+				}
+			}
+		}
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Count=%d nof_of_tmu_ports=%d\n",__FUNCTION__, fail_cnt, nof_of_tmu_ports);
 		if(fail_cnt == nof_of_tmu_ports)
 		{
@@ -7250,7 +8215,8 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete Queue %d for netdev %s\n",__FUNCTION__, q_index, netdev->name);
 	if(tmu_hal_flush_queue_if_qocc(netdev, q_index, -1, -1) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
-		return TMU_HAL_STATUS_ERR;
+		ret = TMU_HAL_STATUS_ERR;
+		goto CBM_RESOURCES_CLEANUP;
 	}
 	/*if(tmu_hal_queue_enable_disable_if_qocc(netdev, q_index,-1, -1, 0) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"%s:%d ERROR to flush qocc by disabling \n", __FUNCTION__, __LINE__);
@@ -7263,6 +8229,20 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 		//return TMU_HAL_STATUS_ERR;
 	}*/
 #endif
+
+	if(flags & PPA_QOS_Q_F_INGRESS)
+	{
+		if((flags & TMU_HAL_QUEUE_SHAPER_INGRESS_MPE) == TMU_HAL_QUEUE_SHAPER_INGRESS_MPE) { //for MPE Ingress Queue
+			shaper_index = tmu_hal_set_cfg_shaper_from_shaper_track(cfg);
+	/*		if((shaper_index = tmu_hal_get_free_shaper()) >= TMU_HAL_MAX_SHAPER )
+			{
+				TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"<%s> No shaper available !!!\n",__FUNCTION__);
+				ret = TMU_HAL_STATUS_ERR;
+				goto CBM_RESOURCES_CLEANUP;
+			}*/
+			cfg->shaperid = shaper_index;
+		}
+	}
 	memset(&cfg_shaper, 0, sizeof(struct tmu_hal_token_bucket_shaper_cfg));
 	if(tmu_hal_queue_track[q_index].sched_input == 1023) {
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Wrong Queue %d\n",__FUNCTION__, q_index);
@@ -7307,8 +8287,8 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 			cfg_shaper.mode = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.mode;
 			cfg_shaper.cir = (tmu_hal_shaper_track[cfg->shaperid].tb_cfg.cir * 1000) / 8;
 			cfg_shaper.pir = (tmu_hal_shaper_track[cfg->shaperid].tb_cfg.pir * 1000 ) / 8;
-			cfg_shaper.cbs = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.cbs; // 4000;
-			cfg_shaper.pbs = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.pbs; // 4000;
+			cfg_shaper.cbs = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.cbs; ;
+			cfg_shaper.pbs = tmu_hal_shaper_track[cfg->shaperid].tb_cfg.pbs; ;
 			shaper_index = cfg->shaperid;
 			tmu_hal_token_bucket_shaper_cfg_set(&cfg_shaper);
 			//Add the token to the scheduler input
@@ -7322,7 +8302,8 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Enable Queue %d for netdev %s\n",__FUNCTION__, q_index, netdev->name);
 	if(tmu_hal_enable_queue_after_flush(netdev, q_index, -1, q_index) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to enable queue after queue flush\n", __FUNCTION__, __LINE__);
-		return TMU_HAL_STATUS_ERR;
+		ret = TMU_HAL_STATUS_ERR;
+		goto CBM_RESOURCES_CLEANUP;
 	}
 	/*if(tmu_hal_queue_enable_disable_if_qocc(netdev, q_index, -1, -1, 1) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
@@ -7333,13 +8314,17 @@ int tmu_hal_add_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Q map pointer =%p no_entries=%d\n", q_map_get, num_entries);
 		for (j=0; j<num_entries;j++)
 			cbm_queue_map_set(q_index, &q_map_get[j], 0);
-		kfree(q_map_get);
 		num_entries = 0;
-		q_map_get = NULL;
 	}
+	//kfree(q_map_get);
+	//q_map_get = NULL;
 #endif
 CBM_RESOURCES_CLEANUP:
 	kfree(tmu_res);
+#ifdef CBM_QUEUE_FLUSH_SUPPORT
+	kfree(q_map_get);
+	q_map_get = NULL;
+#endif
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Exit --> \n",__FUNCTION__);	
 	if((ret == TMU_HAL_STATUS_INVALID_QID) || (ret == TMU_HAL_STATUS_ERR))
@@ -7369,7 +8354,8 @@ int tmu_hal_del_shaper_index(int shaper_index)
 int tmu_hal_del_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, int32_t tmu_q_idx, uint32_t flags)
 {
 	//struct tmu_sched_blk_in_tbs tbs;
-	int32_t i=0, shaper_index;
+	int32_t i=0, shaper_index,tmuport=0;
+	int32_t ret = TMU_HAL_STATUS_OK;
 	uint32_t index, q_index , fail_cnt=0;
 	uint32_t nof_of_tmu_ports;
 	cbm_tmu_res_t *tmu_res = NULL;
@@ -7411,10 +8397,22 @@ int tmu_hal_del_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>For Port: %d subif: %d --> TMU Port: %d SB: %d Q: %d\n",
 				__FUNCTION__,dp_subif.port_id,dp_subif.subif,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
 
-		if(flags & TMU_HAL_ADD_QUEUE_INGRESS)
+		if(flags & PPA_QOS_Q_F_INGRESS)
 		{
-			subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-			port_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+			if((flags & TMU_HAL_QUEUE_SHAPER_INGRESS_MPE) == TMU_HAL_QUEUE_SHAPER_INGRESS_MPE) { //for MPE Ingress Queue
+				if(( tmuport = (tmu_hal_get_mpe_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+					ret = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
+				} 
+			} else {//for CPU Ingress queue
+				if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR) {
+					ret = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
+				}
+
+			}
+			subif_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+			port_subif_index = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
 		} else {
 			subif_index = tmu_hal_user_sub_interface_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
 			port_subif_index = tmu_hal_user_sub_interface_info + (tmu_res->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
@@ -7434,46 +8432,61 @@ int tmu_hal_del_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 #endif
 		for(i=0; i < nof_of_tmu_ports; i++)
 		{
-			if((dp_subif.port_id !=0) && (tmu_res->tmu_port == g_CPU_PortId) ) {
-				struct tmu_hal_dp_res_info res = {0};
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Deleting the shaper for Directpath interface!!!\n",__FUNCTION__);
-				tmu_hal_dp_port_resources_get(dp_subif.port_id, &res);
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Port Id for Directpath interface is %d\n",__FUNCTION__,res.dp_egress_res.dp_port);
-
-				subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-				port_subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> subif index is %p\n",__FUNCTION__,subif_index);
-
-			} else {
-				subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
-				port_subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+			if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS)
+			{
+				if( (index = tmu_hal_get_user_index_from_qid(subif_index, cfg->queueid) ) == TMU_HAL_STATUS_ERR) {
+					fail_cnt++;
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Qid Matched QId=%d\n",__FUNCTION__, cfg->queueid);
+					break;
+				}
 			}
-			if( (index = tmu_hal_get_user_index_from_qid(subif_index, cfg->queueid) ) == TMU_HAL_STATUS_ERR) {
-				fail_cnt++;
-			} else {
-				TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Qid Matched QId=%d\n",__FUNCTION__, cfg->queueid);
-				break;
-			}
+			else
+			{
+				if((dp_subif.port_id !=0) && (tmu_res->tmu_port == g_CPU_PortId) ) {
+					struct tmu_hal_dp_res_info res = {0};
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Deleting the shaper for Directpath interface!!!\n",__FUNCTION__);
+					tmu_hal_dp_port_resources_get(dp_subif.port_id, &res);
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Port Id for Directpath interface is %d\n",__FUNCTION__,res.dp_egress_res.dp_port);
+	
+					subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+					port_subif_index = tmu_hal_user_sub_interface_ingress_info + (res.dp_egress_res.dp_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> subif index is %p\n",__FUNCTION__,subif_index);
 
+				} else {
+					subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT) + dp_subif.subif;
+					port_subif_index = tmu_hal_user_sub_interface_info + ((tmu_res+i)->tmu_port * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+				}	
+				if( (index = tmu_hal_get_user_index_from_qid(subif_index, cfg->queueid) ) == TMU_HAL_STATUS_ERR) {
+					fail_cnt++;
+				} else {
+					TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Qid Matched QId=%d\n",__FUNCTION__, cfg->queueid);
+					break;
+				}
+			}
 		}	
 		if(fail_cnt == nof_of_tmu_ports)
 		{
 			TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"<%s> Invalid Queue Id %d\n",__FUNCTION__, cfg->queueid);
-			return TMU_HAL_STATUS_INVALID_QID;
-			//ret = TMU_HAL_STATUS_INVALID_QID;
-			//goto CBM_RESOURCES_CLEANUP;
+			ret = TMU_HAL_STATUS_INVALID_QID;
+			goto CBM_RESOURCES_CLEANUP;
 		}
-		kfree(tmu_res);
 		// Find the user queue index for user qid from the user queue array
 		if( (index = tmu_hal_get_user_index_from_qid(subif_index, cfg->queueid) ) == TMU_HAL_STATUS_ERR)
-			return TMU_HAL_STATUS_INVALID_QID;
+		{
+			ret = TMU_HAL_STATUS_INVALID_QID;
+			goto CBM_RESOURCES_CLEANUP;
+		}
 
 		//TMU Queue Index
 		q_index = subif_index->user_queue[index].queue_index;
 	} else
 		q_index = tmu_q_idx;
 
-	shaper_index = cfg->shaperid;
+	if(((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) && ((flags & TMU_HAL_QUEUE_SHAPER_INGRESS_MPE) == TMU_HAL_QUEUE_SHAPER_INGRESS_MPE ))
+		shaper_index = tmu_hal_queue_track[q_index].tb_index;
+	else
+		shaper_index = cfg->shaperid;
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Delete Shaper %d of Queue %d\n",__FUNCTION__,shaper_index, q_index);
 	// Make sure that all the packets are dequeued 
@@ -7485,7 +8498,8 @@ int tmu_hal_del_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Delete Queue %d for netdev %s\n",__FUNCTION__, q_index, netdev->name);
 	if(tmu_hal_flush_queue_if_qocc(netdev, q_index, -1, -1) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
-		return TMU_HAL_STATUS_ERR;
+		ret = TMU_HAL_STATUS_ERR;
+		goto CBM_RESOURCES_CLEANUP;
 	}	
 	/*if(tmu_hal_queue_enable_disable_if_qocc(netdev, q_index,-1, -1, 0) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"%s:%d ERROR to flush qocc by disabling \n", __FUNCTION__, __LINE__);
@@ -7527,7 +8541,8 @@ int tmu_hal_del_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Enable Queue %d for netdev %s\n",__FUNCTION__, q_index, netdev->name);
 	if(tmu_hal_enable_queue_after_flush(netdev, q_index, -1, q_index) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to enable queue after queue flush\n", __FUNCTION__, __LINE__);
-		return TMU_HAL_STATUS_ERR;
+		ret = TMU_HAL_STATUS_ERR;
+		goto CBM_RESOURCES_CLEANUP;
 	}
 	/*if(tmu_hal_queue_enable_disable_if_qocc(netdev, q_index, -1, -1, 1) != TMU_HAL_STATUS_OK) {
 		TMU_HAL_DEBUG_MSG(TMU_DEBUG_TRACE,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
@@ -7538,16 +8553,18 @@ int tmu_hal_del_queue_rate_shaper_ex(struct net_device *netdev, QOS_RATE_SHAPING
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"Q map pointer =%p no_entries=%d\n", q_map_get, num_entries);
 		for (j=0; j<num_entries;j++)
 			cbm_queue_map_set(q_index, &q_map_get[j], 0);
-		kfree(q_map_get);
 		num_entries = 0;
-		q_map_get = NULL;
 	}
 
 #endif
 	tmu_hal_queue_track[q_index].tb_index = 0xFF;
 
+CBM_RESOURCES_CLEANUP:
+	kfree(q_map_get);
+	q_map_get = NULL;
+	kfree(tmu_res);
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Exit --> \n",__FUNCTION__);	
-	return TMU_HAL_STATUS_OK;
+	return ret;
 
 }
 
@@ -7569,18 +8586,18 @@ typedef struct {
     ** 6> Update the scheduler/shaper tracking information.
     ** 7> Configure the shaper.
 */
-int tmu_hal_add_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, uint32_t flags)
+int tmu_hal_add_cpu_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, struct tmu_hal_user_subif_abstract *subif_index_logical, uint32_t flags)
 {
 	uint8_t leaf=0;
-	uint32_t tmuport, p_sched;
+	uint32_t p_sched;
 	int32_t sched_old, shaper_index, sched_new;
 	struct tmu_hal_token_bucket_shaper_cfg cfg_shaper;
-	struct tmu_hal_user_subif_abstract *subif_index_logical = NULL;
+	//struct tmu_hal_user_subif_abstract *subif_index_logical = NULL;
 
-	if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
-		return PPA_FAILURE;
+	/*if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
+		return PPA_FAILURE;*/
 
-	subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+	//subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
 	sched_old = subif_index_logical->base_sched_id_egress;
 
 	if(subif_index_logical->port_shaper_sched == 0xFF)
@@ -7654,6 +8671,53 @@ int tmu_hal_add_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHA
 	return TMU_HAL_STATUS_OK;
 }
 
+int tmu_hal_add_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, uint32_t flags)
+{
+	uint32_t tmuport;
+	int32_t cpu_shaper_index;
+	struct tmu_hal_user_subif_abstract *subif_index_logical = NULL;
+
+	if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
+		return PPA_FAILURE;
+
+	subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+	tmu_hal_add_cpu_ingress_port_rate_shaper(netdev, cfg, subif_index_logical, flags);
+	cpu_shaper_index =  cfg->shaperid;
+
+	if(g_MPE_PortId != -1)
+	{
+		int32_t shaper_index;
+		if(( tmuport = (tmu_hal_get_mpe_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
+			return PPA_FAILURE;
+		subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+
+#if 1
+		shaper_index = tmu_hal_get_free_shaper();
+		if(shaper_index >= TMU_HAL_MAX_SHAPER)
+		{
+			TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR,"<%s> Invalid Shaper index. Shaper not available.!!!! \n",__FUNCTION__);
+			shaper_index = TMU_HAL_STATUS_ERR;
+			return PPA_FAILURE;
+		}
+		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>New Shaper %d is created \n",__FUNCTION__,shaper_index);
+		tmu_hal_shaper_track[shaper_index].is_enabled = true;
+		  tmu_hal_shaper_track[shaper_index].tb_cfg.index = shaper_index;
+		  tmu_hal_shaper_track[shaper_index].tb_cfg.enable = false;
+		  tmu_hal_shaper_track[shaper_index].tb_cfg.mode = tmu_hal_shaper_track[cpu_shaper_index].tb_cfg.mode;
+		  tmu_hal_shaper_track[shaper_index].tb_cfg.pir = tmu_hal_shaper_track[cpu_shaper_index].tb_cfg.pir;
+		  tmu_hal_shaper_track[shaper_index].tb_cfg.cir = tmu_hal_shaper_track[cpu_shaper_index].tb_cfg.cir;
+		  tmu_hal_shaper_track[shaper_index].tb_cfg.pbs = tmu_hal_shaper_track[cpu_shaper_index].tb_cfg.pbs;
+		  tmu_hal_shaper_track[shaper_index].tb_cfg.cbs = tmu_hal_shaper_track[cpu_shaper_index].tb_cfg.cbs;
+
+#endif
+		cfg->shaperid = shaper_index;
+		tmu_hal_add_cpu_ingress_port_rate_shaper(netdev, cfg, subif_index_logical, flags);
+	}
+
+	return TMU_HAL_STATUS_OK;
+}
+
+
 /** The tmu_hal_add_egress_port_rate_shaper adds the port rate shaper.
     ** 1> Get free Shaper index
     ** 2> Add a Shaper Scheduler for that port.           
@@ -7665,7 +8729,7 @@ int tmu_hal_add_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHA
 */
 int tmu_hal_add_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, uint32_t flags)
 {
-	int32_t shaper_index, port, count=0;
+	int32_t shaper_index, port=0, count=0;
 	struct tmu_hal_token_bucket_shaper_cfg cfg_shaper;
 	uint32_t i=0, j=0,k=0, num_q=0;
 	uint32_t nof_of_tmu_ports;
@@ -7673,8 +8737,8 @@ int tmu_hal_add_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 	dp_subif_t dp_subif={0};  
 	PPA_VCC *vcc = NULL;
 	struct tmu_hal_user_subif_abstract *subif_index_logical = NULL;
-	int32_t sched_old, prev_shaper_id = 0;
-	uint32_t sched_new, p_sched;		
+	int32_t sched_new, sched_old, prev_shaper_id = 0;
+	uint32_t p_sched;		
 #ifdef CBM_QUEUE_FLUSH_SUPPORT
 	tmu_hal_queue_qmap qmap[16];
 #endif
@@ -7775,7 +8839,8 @@ int tmu_hal_add_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 				tmu_hal_scheduler_cfg_get(sched_old);
 				if(tmu_hal_flush_queue_if_qocc(netdev, -1, port, -1) != TMU_HAL_STATUS_OK) {
 					TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
-					return TMU_HAL_STATUS_ERR;
+					shaper_index = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
 				}
 				udelay(20000);
 				/*for(i=0; i < num_q; i++ )
@@ -7875,7 +8940,8 @@ int tmu_hal_add_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 				}*/
 				if(tmu_hal_enable_queue_after_flush(netdev, -1, port, -1) != TMU_HAL_STATUS_OK) {
                 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to enable queue after queue flush\n", __FUNCTION__, __LINE__);
-                			return TMU_HAL_STATUS_ERR;
+					shaper_index = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
         			}
 				udelay(20000);
 
@@ -7931,7 +8997,8 @@ int tmu_hal_add_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 #ifdef CBM_QUEUE_FLUSH_SUPPORT
 				if(tmu_hal_enable_queue_after_flush(netdev, -1, port, -1) != TMU_HAL_STATUS_OK) {
                 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to enable queue after queue flush\n", __FUNCTION__, __LINE__);
-                			return TMU_HAL_STATUS_ERR;
+					shaper_index = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
         			}
 				udelay(20000);
 
@@ -8010,7 +9077,8 @@ int tmu_hal_add_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 								-1,-1) == PPA_FAILURE)
 					{
 						TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Flush Queue\n", __FUNCTION__, __LINE__);
-						return TMU_HAL_STATUS_ERR;
+						shaper_index = TMU_HAL_STATUS_ERR;
+						goto CBM_RESOURCES_CLEANUP;
 					}
 				}
 #endif
@@ -8019,9 +9087,9 @@ int tmu_hal_add_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 
 			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>Port Scheduler level is %d \n",__FUNCTION__, tmu_hal_sched_track[sched_old].level);
 			if ( (sched_new = create_new_scheduler(tmu_hal_sched_track[sched_old].omid >> 3, 0, TMU_HAL_POLICY_STRICT, tmu_hal_sched_track[sched_old].level, leaf)) < 0 ) {
-				//			if ( create_new_scheduler(tmu_hal_sched_track[sched_old].omid >> 3, 0, TMU_HAL_POLICY_STRICT, tmu_hal_sched_track[sched_old].level, leaf) < 0 ) {
 				TMU_HAL_DEBUG_MSG( TMU_DEBUG_ERR, "ERRoR schedular Not available/ busy status=%d\n", sched_new);
-				return TMU_HAL_STATUS_ERR;
+				shaper_index = TMU_HAL_STATUS_ERR;
+				goto CBM_RESOURCES_CLEANUP;
 			}
 			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s>New Port Shaper Scheduler %d\n",__FUNCTION__,sched_new);
 
@@ -8095,7 +9163,7 @@ int tmu_hal_add_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG
 {
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Enter --> \n",__FUNCTION__);	
 
-	if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) {
+	if((flags & PPA_QOS_OP_F_INGRESS) == PPA_QOS_OP_F_INGRESS) {
 		return tmu_hal_add_ingress_port_rate_shaper(
                 		netdev,
                 		cfg, 
@@ -8112,21 +9180,21 @@ int tmu_hal_add_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG
 }
 
 
-int tmu_hal_del_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, uint32_t flags)
+int tmu_hal_del_cpu_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, struct tmu_hal_user_subif_abstract *subif_index_logical, uint32_t flags)
 {
 	struct tmu_sched_blk_in_tbs tbs;
 	int32_t shaper_index;
 	int32_t ret = TMU_HAL_STATUS_OK;
 	uint32_t tmuport;
 	uint32_t sb_conn=0, next_sched_to_shaper;
-	struct tmu_hal_user_subif_abstract *subif_index_logical = NULL;
+	//struct tmu_hal_user_subif_abstract *subif_index_logical = NULL;
 	int32_t omid =0;
 	uint32_t subif_lvl =0;
 
 	if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
 		return PPA_FAILURE;
 
-	subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+	//subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
 
 
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> netdev:%s port_sched_in_egress : %d \n",
@@ -8194,6 +9262,30 @@ int tmu_hal_del_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHA
 
 	return shaper_index;
 }
+
+int tmu_hal_del_ingress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG *cfg, uint32_t flags)
+{
+	uint32_t tmuport;
+	struct tmu_hal_user_subif_abstract *subif_index_logical = NULL;
+
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Enter --> \n",__FUNCTION__);	
+	if(( tmuport = (tmu_hal_get_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
+		return PPA_FAILURE;
+
+	subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+	tmu_hal_del_cpu_ingress_port_rate_shaper(netdev, cfg, subif_index_logical, flags);
+
+	if(g_MPE_PortId != -1)
+	{
+		if(( tmuport = (tmu_hal_get_mpe_ingress_index(flags))) == TMU_HAL_STATUS_ERR)
+			return PPA_FAILURE;
+		subif_index_logical = tmu_hal_user_sub_interface_ingress_info + (tmuport * TMU_HAL_MAX_SUB_IFID_PER_PORT);
+		tmu_hal_del_cpu_ingress_port_rate_shaper(netdev, cfg, subif_index_logical, flags);
+	}
+
+	return TMU_HAL_STATUS_OK;
+}
+
 
 /** The tmu_hal_del_egress_port_rate_shaper deletes the port rate shaper.
  ** 1> Find the shaper scheduler id from the shaper index
@@ -8296,7 +9388,8 @@ int tmu_hal_del_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 			TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> Number of Queues %d\n",__FUNCTION__, num_q);
 			if(tmu_hal_flush_queue_if_qocc(netdev, -1, port, -1) != TMU_HAL_STATUS_OK) {
 					TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to flush qocc\n", __FUNCTION__, __LINE__);
-					return TMU_HAL_STATUS_ERR;
+					ret = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
 			}
 			udelay(20000);
 			/*for(i=0; i < num_q; i++ )
@@ -8390,7 +9483,8 @@ int tmu_hal_del_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 			}*/
 			if(tmu_hal_enable_queue_after_flush(netdev, -1, port, -1) != TMU_HAL_STATUS_OK) {
                 			TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR to enable queue after queue flush\n", __FUNCTION__, __LINE__);
-                			return TMU_HAL_STATUS_ERR;
+					ret = TMU_HAL_STATUS_ERR;
+					goto CBM_RESOURCES_CLEANUP;
         		}
 			udelay(20000);
 #endif
@@ -8484,7 +9578,8 @@ int tmu_hal_del_egress_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAP
 							//subif_index_logical->user_queue[i].queue_index) == PPA_FAILURE)
 					{
 						TMU_HAL_DEBUG_MSG(TMU_DEBUG_ERR,"%s:%d ERROR Failed to Flush Queue\n", __FUNCTION__, __LINE__);
-						return TMU_HAL_STATUS_ERR;
+						ret = TMU_HAL_STATUS_ERR;
+						goto CBM_RESOURCES_CLEANUP;
 					}
 			}
 #endif
@@ -8565,7 +9660,7 @@ int tmu_hal_del_port_rate_shaper(struct net_device *netdev, QOS_RATE_SHAPING_CFG
 {
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> <-- Enter --> \n",__FUNCTION__);	
 
-	if((flags & PPA_QOS_Q_F_INGRESS) == PPA_QOS_Q_F_INGRESS) {
+	if((flags & PPA_QOS_OP_F_INGRESS) == PPA_QOS_OP_F_INGRESS) {
 		return tmu_hal_del_ingress_port_rate_shaper(
                 		netdev,
                 		cfg, 
@@ -8634,7 +9729,8 @@ int tmu_hal_get_queue_num(struct net_device *netdev, int32_t portid, int32_t *q_
 	TMU_HAL_DEBUG_MSG( TMU_DEBUG_HIGH," Sub interface index %p\n",subif_index);
 
 	*q_num = subif_index->queue_cnt; 
-	TMU_HAL_DEBUG_MSG( TMU_DEBUG_HIGH," Number of Queues %d for interface %s \n",*q_num, netdev->name);
+	TMU_HAL_DEBUG_MSG( TMU_DEBUG_HIGH," Number of Queues %d \n",*q_num );
+	//TMU_HAL_DEBUG_MSG( TMU_DEBUG_HIGH," Number of Queues %d for interface %s \n",*q_num, netdev->name);
 	kfree(tmu_res);
 
 	return TMU_HAL_STATUS_OK;
@@ -8861,15 +9957,16 @@ int tmu_hal_setup_dp_ingress_connectivity(
 
 	if(g_DpIngressQueueScheduler == 0xFF) {
 		dp_get_netif_subifid(netdev, NULL, NULL, 0, &dp_subif, 0);  
-		//cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_DIRECTPATH_RX);
-		if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_DIRECTPATH_RX) != 0)
+		if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_DIRECTPATH_RX) != 0) {
+			kfree(tmu_res);
 			return TMU_HAL_STATUS_ERR;
+		}
 		TMU_HAL_DEBUG_MSG( TMU_DEBUG_TRACE,"<%s> TMU resources for Directpath Rx is Port:%d ,SB:%d, Q:%d \n",
 				__FUNCTION__,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
-		g_DpIngressQueueScheduler = tmu_res->tmu_sched; //14
-		g_Port_id_DpIngress = tmu_res->tmu_port; //21
-		g_Queue_id_DpIngress = tmu_res->tmu_q; //30
-		q_new = tmu_res->tmu_q; //30
+		g_DpIngressQueueScheduler = tmu_res->tmu_sched; 
+		g_Port_id_DpIngress = tmu_res->tmu_port; 
+		g_Queue_id_DpIngress = tmu_res->tmu_q; 
+		q_new = tmu_res->tmu_q; 
 		tmu_hal_sched_track[g_DpIngressQueueScheduler].policy = TMU_HAL_POLICY_WFQ;
 		tmu_hal_sched_track[g_DpIngressQueueScheduler].leaf_mask = 0x01;
 		kfree(tmu_res);
@@ -8912,8 +10009,10 @@ int tmu_hal_setup_dp_ingress_connectivity(
 		FLOW ID: 00 DEC:1 ENC:1 MPE1:0 MPE2:1 EP: 7-14 CLASS: XX 
 	*/
 	dp_subif.port_id = pmac_port;
-	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_CHECKSUM) != 0)
+	if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_CHECKSUM) != 0) {
+		kfree(tmu_res);
 		return TMU_HAL_STATUS_ERR;
+	}
 	printk( "<%s> TMU resources for Checksum is Port:%d ,SB:%d, Q:%d \n",
 			__FUNCTION__,tmu_res->tmu_port,tmu_res->tmu_sched,tmu_res->tmu_q);
 
@@ -8946,6 +10045,7 @@ int tmu_hal_setup_dp_ingress_connectivity(
 		tmu_hal_add_q_map(q_new, CPU_PORT_ID, &q_map, q_map_mask);
 	} 
 		
+	kfree(tmu_res);		
 	return TMU_HAL_STATUS_OK;
 }
 EXPORT_SYMBOL(tmu_hal_setup_dp_ingress_connectivity);
@@ -9090,8 +10190,8 @@ int hal_init(void)
 	g_No_Of_TMU_Res_Port = port + TMU_HAL_MAX_DIRECTPATH_PORT;
         g_No_Of_Ingress_Interface = port + TMU_HAL_MAX_DIRECTPATH_PORT; 
 	
-	//printk("Total node : %d  and size of each node: %d\n", g_No_Of_TMU_Res_Port * TMU_HAL_MAX_SUB_IFID_PER_PORT , sizeof(struct tmu_hal_user_subif_abstract));
-	//printk("Total allocated size=%d\n", g_No_Of_TMU_Res_Port * TMU_HAL_MAX_SUB_IFID_PER_PORT * sizeof(struct tmu_hal_user_subif_abstract));
+	printk("Total node : %d  and size of each node: %d\n", g_No_Of_TMU_Res_Port * TMU_HAL_MAX_SUB_IFID_PER_PORT , sizeof(struct tmu_hal_user_subif_abstract));
+	printk("Total allocated size=%d\n", g_No_Of_TMU_Res_Port * TMU_HAL_MAX_SUB_IFID_PER_PORT * sizeof(struct tmu_hal_user_subif_abstract));
 	// User Abstraction list for Egress Queues
   	tmu_hal_user_sub_interface_info = (struct tmu_hal_user_subif_abstract *) 
 			alloc_pages_exact(((g_No_Of_TMU_Res_Port+1) * TMU_HAL_MAX_SUB_IFID_PER_PORT * sizeof(struct tmu_hal_user_subif_abstract)) , GFP_KERNEL);
@@ -9110,7 +10210,7 @@ int hal_init(void)
     		return TMU_HAL_STATUS_ERR;
 	}
 	//printk("tmu_hal_user_sub_interface_ingress_info: %p\n", tmu_hal_user_sub_interface_ingress_info);
-	//printk("Total node : %d  and size of each node: %d\n", g_No_Of_Ingress_Interface * TMU_HAL_MAX_SUB_IFID_PER_PORT , sizeof(struct tmu_hal_user_subif_abstract));
+	printk("Total node : %d  and size of each node: %d\n", g_No_Of_Ingress_Interface * TMU_HAL_MAX_SUB_IFID_PER_PORT , sizeof(struct tmu_hal_user_subif_abstract));
 	memset(tmu_hal_user_sub_interface_ingress_info, 0, (g_No_Of_Ingress_Interface+1) * TMU_HAL_MAX_SUB_IFID_PER_PORT * sizeof(struct tmu_hal_user_subif_abstract));
 
 
@@ -9134,6 +10234,7 @@ int hal_init(void)
 		for(j=0; j< g_No_Of_Ingress_Interface * TMU_HAL_MAX_SUB_IFID_PER_PORT; j++) {
 			(tmu_hal_user_sub_interface_ingress_info + j)->base_sched_id_egress = 0xFF;
 			(tmu_hal_user_sub_interface_ingress_info + j)->port_sched_in_egress = NULL_SCHEDULER_INPUT_ID ; 
+			(tmu_hal_user_sub_interface_ingress_info + j)->port_shaper_sched = 0xFF ; 
 
 		}
 	}
@@ -9165,6 +10266,7 @@ int hal_init(void)
         	cbm_tmu_res_t *tmu_res = NULL;
         	dp_subif_t dp_subif = {0};
 
+		/** Get the TMU resources for CPU */
 		if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, 0) != 0)
 			return TMU_HAL_STATUS_ERR;
 
@@ -9175,6 +10277,21 @@ int hal_init(void)
 		TMU_HAL_DEBUG_MSG( TMU_ENABLE_ALL_DEBUG,"<%s> Number of CPU TMU Ports are:%d \n",__FUNCTION__, nof_of_tmu_ports);
 		TMU_HAL_DEBUG_MSG( TMU_ENABLE_ALL_DEBUG,"<%s> CPU TMU resources are Port:%d ,SB:%d, Q:%d \n",__FUNCTION__,g_CPU_PortId, g_CPU_Sched, g_CPU_Queue);
 		kfree(tmu_res);
+
+		/** Get the TMU resources for MPE */
+		nof_of_tmu_ports =0;
+        	tmu_res = NULL;
+		if(cbm_dp_port_resources_get(&dp_subif.port_id, &nof_of_tmu_ports, &tmu_res, DP_F_MPE_ACCEL) != 0)
+			return TMU_HAL_STATUS_ERR;
+
+		g_MPE_PortId = tmu_res->tmu_port;
+		g_MPE_Sched = tmu_res->tmu_sched;
+		g_MPE_Queue = tmu_res->tmu_q;
+		
+		TMU_HAL_DEBUG_MSG( TMU_ENABLE_ALL_DEBUG,"<%s> Number of MPE TMU Ports are:%d \n",__FUNCTION__, nof_of_tmu_ports);
+		TMU_HAL_DEBUG_MSG( TMU_ENABLE_ALL_DEBUG,"<%s> MPE TMU resources are Port:%d ,SB:%d, Q:%d \n",__FUNCTION__,g_MPE_PortId, g_MPE_Sched, g_MPE_Queue);
+		kfree(tmu_res);
+
 	}
 
 	//if(high_prio_q_limit < 16)

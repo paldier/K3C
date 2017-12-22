@@ -58,11 +58,9 @@ int32_t ppa_sw_update_session(struct sk_buff *skb,
 int32_t ppa_sw_del_session(struct session_list_item *p_item);
 int32_t ppa_sw_fastpath_send(void *skb); 
 
-int32_t ppa_sw_fastpath_enable(uint32_t f_enable, 
-                               uint32_t flags);
+int32_t ppa_sw_fastpath_enable(uint32_t f_enable);
 
-int32_t ppa_get_sw_fastpath_status(uint32_t *f_enable, 
-                                   uint32_t flags);
+int32_t ppa_get_sw_fastpath_status(uint32_t *f_enable);
 
 int32_t ppa_sw_session_enable(struct session_list_item *p_item, 
                               uint32_t f_enable, 

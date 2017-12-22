@@ -268,6 +268,50 @@ static int proc_read_hook_seq_open(struct inode *inode, struct file *file)
     return single_open(file, proc_read_hook, NULL);
 }
 
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+static ssize_t proc_write_inggrp(struct file *file, const char __user *buf, size_t count, loff_t *data)
+{
+    ppa_qos_inggrp_free_list();
+    return count;
+}
+
+extern int32_t qosal_get_qos_inggrp(PPA_QOS_INGGRP inggrp, PPA_IFNAME ifnames[PPA_QOS_MAX_IF_PER_INGGRP][PPA_IF_NAME_SIZE]);
+static int proc_read_inggrp(struct seq_file *seq, void *v)
+{
+    PPA_IFNAME ifnames[PPA_QOS_MAX_IF_PER_INGGRP][PPA_IF_NAME_SIZE];
+    int32_t i, j, count;
+
+    seq_printf(seq, "Ingress Groups interfaces\n");
+
+    memset(ifnames, 0, sizeof(ifnames));
+
+    for (i = 0; i < PPA_QOS_INGGRP_MAX; i++) {
+        count = qosal_get_qos_inggrp(i, ifnames);
+        if ( count ) {
+            seq_printf(seq, "Ingress Group %d has %d interfaces:\n", i, count);
+            for (j = 0; j < count; j++)
+                seq_printf(seq, "  %s\n", ifnames[j]);
+        }
+        memset(ifnames, 0, sizeof(ifnames));
+    }
+
+    return 0;
+}
+
+static int proc_read_inggrp_seq_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, proc_read_inggrp, NULL);
+}
+
+static struct file_operations g_proc_file_inggrp_seq_fops = {
+    .owner      = THIS_MODULE,
+    .open       = proc_read_inggrp_seq_open,
+    .read       = seq_read,
+    .write      = proc_write_inggrp,
+    .llseek     = seq_lseek,
+    .release    = single_release,
+};
+#endif
 #if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
 static int proc_read_sess_mgmt_seq_open(struct inode *inode, struct file *file)
 {
@@ -478,7 +522,7 @@ static ssize_t proc_write_classprio_seq(struct file *file, const char __user *bu
     {
         if ( stricmp(p1, "help") == 0 )
         {
-            printk("echo <wlan0/wlan1> class xx prio xx [class xx prio xx] > /proc/ppa/api/classprio\n");
+            printk("echo <wlanX> class xx prio xx [class xx prio xx] > /proc/ppa/api/classprio\n");
             break;
         }
         else if ( stricmp(p1, "wlan0") == 0 )
@@ -492,6 +536,18 @@ static ssize_t proc_write_classprio_seq(struct file *file, const char __user *bu
             port = 1;
             prio = class = -1;
             ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"port = 1");
+        }
+        else if ( stricmp(p1, "wlan2") == 0 )
+        {
+            port = 2;
+            prio = class = -1;
+            ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"port = 2");
+        }
+        else if ( stricmp(p1, "wlan3") == 0 )
+        {
+            port = 3;
+            prio = class = -1;
+            ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"port = 3");
         }
 /*        else if ( stricmp(p1, "pvc") == 0 )
         {
@@ -1187,6 +1243,7 @@ static int proc_read_netif_seq_show(struct seq_file *seq, void *v)
         "NETIF_DIRECTPATH",
         "NETIF_GRE_TUNNEL",         //  0x01000000
         "NETIF_DIRECTCONNECT",
+        "NETIF_L2NAT",
     };
 
     struct netif_info *ifinfo = (struct netif_info *)v;
@@ -1691,6 +1748,9 @@ static INLINE int proc_read_routing_session_seq_show(struct seq_file *seq, void 
     seq_printf(seq,     "    next             = 0x%08X\n", (uint32_t)&p_item->hlist);
     seq_printf(seq,     "    session          = 0x%08X\n", (uint32_t)p_item->session);
     seq_printf(seq,     "    ip_proto         = %u\n",   (uint32_t)p_item->ip_proto);
+#ifdef CONFIG_PPA_PP_LEARNING
+    seq_printf(seq,     "    eth_type         = %u\n",   (uint32_t)p_item->protocol);
+#endif
     seq_printf(seq,     "    ip_tos           = %u\n",   (uint32_t)p_item->ip_tos);
     seq_printf(seq,     "    src_ip           = %s\n",   ppa_get_pkt_ip_string(p_item->src_ip, p_item->flags & SESSION_IS_IPV6, strbuf));
     seq_printf(seq,     "    src_port         = %u\n",   (uint32_t)p_item->src_port);
@@ -1700,6 +1760,7 @@ static INLINE int proc_read_routing_session_seq_show(struct seq_file *seq, void 
     seq_printf(seq,     "    dst_mac[6]       = %s\n",   ppa_get_pkt_mac_string(p_item->dst_mac, strbuf));
     seq_printf(seq,     "    nat_ip           = %s\n",   ppa_get_pkt_ip_string(p_item->nat_ip, p_item->flags & SESSION_IS_IPV6, strbuf));
     seq_printf(seq,     "    nat_port         = %u\n",   (uint32_t)p_item->nat_port);
+    seq_printf(seq,     "    nat_src_mac[6]   = %s\n",   ppa_get_pkt_mac_string(p_item->nat_src_mac, strbuf));
     seq_printf(seq,     "    num_adds         = %u( minimum required hit is %d)\n",   (uint32_t)p_item->num_adds, g_ppa_min_hits);
 #ifdef CONFIG_MIPS
     if ( (uint32_t)p_item->rx_if < KSEG0 || (uint32_t)p_item->rx_if >= KSEG1 )
@@ -2619,6 +2680,10 @@ void ppa_api_proc_file_create(void)
                             S_IRUGO|S_IWUSR,
                             g_ppa_api_proc_dir,
 			    &g_proc_file_classprio_seq_fops);
+    res = proc_create("inggrp",
+                            S_IRUGO|S_IWUSR,
+                            g_ppa_api_proc_dir,
+			    &g_proc_file_inggrp_seq_fops);
 #endif
     res = proc_create("dbg",
                             S_IRUGO|S_IWUSR,
@@ -2628,7 +2693,6 @@ void ppa_api_proc_file_create(void)
                             S_IRUGO|S_IWUSR,
                             g_ppa_api_proc_dir,
 			    &g_proc_file_hook_seq_fops);
-
     res = proc_create("phys_port",
                             S_IRUGO,
                             g_ppa_api_proc_dir,

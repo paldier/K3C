@@ -24,9 +24,9 @@
 
 #define VER_MAJ             0
 #define VER_MID             3
-#define VER_MIN             0
+#define VER_MIN             11
 #define VER_TAG             0
 #define VER_DESC            "Silver"
-#define FW_COMPATIBLE_ID    3
+#define FW_COMPATIBLE_ID    13
 
 #endif /*__LTQ_MPE_VER_H__201308_05_1913__ */

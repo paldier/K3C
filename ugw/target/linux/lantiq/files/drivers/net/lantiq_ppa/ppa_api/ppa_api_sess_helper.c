@@ -272,6 +272,8 @@ void ppa_session_list_free_item(struct session_list_item *p_item)
 #if defined CONFIG_LTQ_PPA_MPE_HAL || defined CONFIG_LTQ_PPA_MPE_HAL_MODULE
   ppa_session_destroy_tmplbuf(p_item);
 #endif
+ 
+  p_item->num_adds=0x0;
 
 __DELETE_SUCCESS:
 #ifdef PPA_SESSION_RCU_LIST
@@ -426,6 +428,7 @@ void ppa_session_delete_by_subif(PPA_DP_SUBIF *subif)
     ppa_session_list_unlock();
     
 }
+#endif
 
 void ppa_session_delete_by_macaddr(uint8_t *mac)
 {
@@ -440,7 +443,6 @@ void ppa_session_delete_by_macaddr(uint8_t *mac)
      
       if ( 0 == ppa_memcmp(p_item->dst_mac, mac, sizeof(p_item->dst_mac)) ||
            0 == ppa_memcmp(p_item->src_mac, mac, sizeof(p_item->src_mac)) ) {
-
         __ppa_session_delete_item(p_item);
       }
       
@@ -448,142 +450,35 @@ void ppa_session_delete_by_macaddr(uint8_t *mac)
   }
   ppa_session_list_unlock();
 }
-#endif
 
-static INLINE int ppa_compare_with_tuple(const PPA_TUPLE *t1, 
-                                          struct session_list_item *t2)
+void ppa_session_delete_by_ip(PPA_IPADDR *pIP)
+{
+  uint32_t idx;
+  struct session_list_item *p_item = NULL;
+  PPA_HLIST_NODE *tmp;
+
+  ppa_session_list_lock();
+  for ( idx = 0; idx < SESSION_LIST_HASH_TABLE_SIZE; idx++ )
+  {
+    PPA_SESSION_LIST_FOR_EACH_ENTRY(p_item, tmp, &g_session_list_hash_table[idx], hlist) {
+      if ( 0 == ppa_memcmp((void *)&(p_item->dst_ip), (void *)&(pIP->ip), sizeof(p_item->dst_ip)) ||
+           0 == ppa_memcmp((void *)&(p_item->src_ip), (void *)&(pIP->ip), sizeof(p_item->src_ip)) ) {
+        __ppa_session_delete_item(p_item);
+      }
+    }
+  }
+  ppa_session_list_unlock();
+}
+
+static INLINE int ppa_compare_with_tuple(PPA_TUPLE *t1, struct session_list_item *t2)
 {
   unsigned short l3num;
 
   l3num = (t2->flags & SESSION_IS_IPV6)?AF_INET6:AF_INET;
 
-  if( t1->src.l3num == l3num &&
-      t1->dst.protonum == t2->ip_proto &&
-      t1->src.u.all == t2->src_port &&
-	  t1->dst.u.all == t2->dst_port ) {
-#ifdef CONFIG_LTQ_PPA_IPv6_ENABLE 
-      if (t1->src.u3.all[0] == t2->src_ip.ip6[0] &&
-			t1->src.u3.all[1] == t2->src_ip.ip6[1] &&
-			t1->src.u3.all[2] == t2->src_ip.ip6[2] &&
-			t1->src.u3.all[3] == t2->src_ip.ip6[3] &&
-			t1->dst.u3.all[0] == t2->dst_ip.ip6[0] &&
-			t1->dst.u3.all[1] == t2->dst_ip.ip6[1] &&
-			t1->dst.u3.all[2] == t2->dst_ip.ip6[2] &&
-			t1->dst.u3.all[3] == t2->dst_ip.ip6[3] ) 
-#else
-	 if (t1->src.u3.all[0] == t2->src_ip.ip &&
-			t1->dst.u3.all[0] == t2->dst_ip.ip )	
-#endif
-	{
-      return 1;
-    }
-  }
+  return ppa_compare_connection_tuple(t1, l3num, t2->ip_proto, t2->src_port, t2->dst_port, &t2->src_ip, &t2->dst_ip);
 
-  return 0;
 }
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
-static INLINE int ppa_compare_with_skb(PPA_BUF* skb, 
-                                          struct session_list_item *t2)
-{
-  unsigned short l3num;
-
-  l3num = (t2->flags & SESSION_IS_IPV6)?AF_INET6:AF_INET;
-
-    	PPA_IPADDR src_addr,dst_addr;
-        src_addr.ip6[0] =0x0;
-        src_addr.ip6[1] =0x0;
-        src_addr.ip6[2] =0x0;
-        src_addr.ip6[3] =0x0;
-
-        dst_addr.ip6[0] =0x0;
-        dst_addr.ip6[1] =0x0;
-        dst_addr.ip6[2] =0x0;
-        dst_addr.ip6[3] =0x0;
-
-    	src_addr =  ppa_get_pkt_src_ip(skb);
-    	dst_addr =  ppa_get_pkt_dst_ip(skb);
-
-
-  //if( t1->src.l3num == l3num &&
-    if( ppa_get_pkt_ip_proto(skb)== t2->ip_proto &&
-      ppa_get_pkt_src_port(skb) == t2->src_port &&
-      (src_addr.ip6[0] == t2->src_ip.ip6[0])) { 
-      /* (src_addr.ip6[0] == t2->src_ip.ip6[0] &&
-      src_addr.ip6[1] == t2->src_ip.ip6[1] &&
-      src_addr.ip6[2] == t2->src_ip.ip6[2] &&
-      src_addr.ip6[3] == t2->src_ip.ip6[3]) ) { */
-
-    if( ppa_get_pkt_dst_port(skb) == t2->dst_port && 
-        dst_addr.ip6[0] == t2->dst_ip.ip6[0] ) {
-        /* dst_addr.ip6[0] == t2->dst_ip.ip6[0] &&
-        dst_addr.ip6[1] == t2->dst_ip.ip6[1] &&
-        dst_addr.ip6[2] == t2->dst_ip.ip6[2] &&
-        dst_addr.ip6[3] == t2->dst_ip.ip6[3] ) { */
-      return 1;
-    }
-  }
-  return 0;
-}
-
-
-/*
- * Find the session from skb. 
- */
-int ppa_find_session_for_ipsec(PPA_BUF* skb, uint8_t pf, struct session_list_item **pp_item)
-{
-  uint32_t hash;
-  PPA_TUPLE tuple;
-  struct session_list_item *p_item;
-  uint32_t index;
-  int ret;
-  
-  if(ppa_get_hash_from_packet(skb,pf, &hash, &tuple))
-    return PPA_SESSION_NOT_ADDED;
-
-  ret = PPA_SESSION_NOT_ADDED;
-
-  index = ppa_session_get_index(hash);
-  
-  ppa_session_list_read_lock();
-  PPA_SESSION_LIST_FOR_EACH_ENTRY_READ(p_item, 
-                                   (g_session_list_hash_table+index), hlist) {
-
-    if(p_item->hash == hash && ppa_compare_with_skb(skb,p_item) ) {
-
-    if ( p_item->routing_entry != 0xFFFFFFFF) { 
-	if(__ppa_search_ipsec_rtindex(p_item) == PPA_SUCCESS) 	      {
-    		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,%d\n",__FUNCTION__,__LINE__);
-			   
-      if( !ppa_atomic_inc_not_zero(&p_item->used) )
-        break;
-
-      ret = PPA_SESSION_EXISTS;
-      *pp_item = p_item;
-      break;
-    }
-   }
-   else
-   {
-        if( !ppa_atomic_inc_not_zero(&p_item->used) )
-        break;
-
-
-      ret = PPA_SESSION_EXISTS;
-      *pp_item = p_item;
-      break;
-   }
-
-  }
-  }
-  ppa_session_list_read_unlock();
-
-  return ret;
-}
-EXPORT_SYMBOL(ppa_find_session_for_ipsec);
-
-
-#endif
-
 
 /*
  * Search the session from sbk. Should be called when lock is held
@@ -1130,7 +1025,8 @@ struct session_action *ppa_session_mc_construct_tmplbuf(void *p_item, uint32_t d
     return ppa_construct_mc_template_buf_hook(p_item, dest_list);
   }
 
-  return PPA_FAILURE;
+  //return PPA_FAILURE;
+  return NULL;
 
 }
 

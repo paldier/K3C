@@ -10,6 +10,13 @@ define Package/base-files/install-target
 
 	mkdir -p $(1)/overlay
 	mkdir -p $(1)/mnt/data
+	rm -f $(1)/etc/config/network
+
+	echo "#<< switch_ports" > $(1)/etc/switchports.conf
+	echo "switch_mii1_port=\""$(CONFIG_SWITCH_MII1_PORT)"\"" >> $(1)/etc/switchports.conf
+	echo "switch_lan_ports=\""$(CONFIG_SWITCH_LAN_PORTS)"\"" >> $(1)/etc/switchports.conf
+	echo "#>> switch_ports" >> $(1)/etc/switchports.conf
+
 	$(if $(CONFIG_TARGET_DATAFS_JFFS2),
 		echo jffs2:$(CONFIG_TARGET_ROOTFS_DATAFS_SIZE) > $(1)/mnt/data/fs)
 	$(if $(CONFIG_TARGET_DATAFS_UBIFS),
@@ -116,10 +123,27 @@ endif
 	cd $(1)/usr/sbin; \
 		rm -f mini_fo.sh; ln -sf overlayfs.sh mini_fo.sh
 
+	mkdir -p $(1)/ramdisk_copy/etc/config
+	$(if $(1)/etc/config/network,\
+		$(CP) $(1)/etc/config/network $(1)/ramdisk_copy/etc/config/;\
+	,\
+		touch $(1)/ramdisk_copy/etc/config/network;\
+	)
+	cd $(1)/etc/config; \
+		rm -f network; ln -sf ../../ramdisk/etc/config/network network
+
+ifdef CONFIG_NEW_FRAMEWORK
+	mkdir -p $(1)/opt/lantiq/etc
+	echo "#<< switch_ports" > $(1)/opt/lantiq/etc/switchports.conf
+	echo "switch_mii1_port=\""$(CONFIG_SWITCH_MII1_PORT)"\"" >> $(1)/opt/lantiq/etc/switchports.conf
+	echo "switch_lan_ports=\""$(CONFIG_SWITCH_LAN_PORTS)"\"" >> $(1)/opt/lantiq/etc/switchports.conf
+	echo "#>> switch_ports" >> $(1)/opt/lantiq/etc/switchports.conf
+else
 	echo "#<< switch_ports" > $(1)/etc/switchports.conf
 	echo "switch_mii1_port=\""$(CONFIG_SWITCH_MII1_PORT)"\"" >> $(1)/etc/switchports.conf
 	echo "switch_lan_ports=\""$(CONFIG_SWITCH_LAN_PORTS)"\"" >> $(1)/etc/switchports.conf
 	echo "#>> switch_ports" >> $(1)/etc/switchports.conf
+endif
 
 	$(if $(CONFIG_PACKAGE_quantenna), \
 	echo "#<< switch_ports" > $(1)/etc/switchports.conf ;\

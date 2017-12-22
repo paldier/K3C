@@ -65,22 +65,20 @@ int ppa_sw_del_session(struct session_list_item *p_item)
   return PPA_SUCCESS;
 }
 
-int32_t ppa_sw_fastpath_enable(uint32_t f_enable, 
-                               uint32_t flags)
+int32_t ppa_sw_fastpath_enable(uint32_t f_enable)
 {
 	if( !ppa_sw_fastpath_enable_hook ) {
 		return PPA_FAILURE;
 	}
-	return ppa_sw_fastpath_enable_hook(f_enable, flags);
+	return ppa_sw_fastpath_enable_hook(f_enable, 0);
 }
 
-int32_t ppa_get_sw_fastpath_status( uint32_t *f_enable, 
-                                    uint32_t flags)
+int32_t ppa_get_sw_fastpath_status( uint32_t *f_enable)
 {
 	if ( !ppa_get_sw_fastpath_status_hook ) 
     return PPA_FAILURE;
 	
-  return ppa_get_sw_fastpath_status_hook(f_enable, flags);
+  return ppa_get_sw_fastpath_status_hook(f_enable, 0);
 }
 
 int32_t ppa_sw_session_enable(struct session_list_item *p_item, 

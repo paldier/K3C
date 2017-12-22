@@ -93,6 +93,7 @@ extern PPE_LOCK g_tunnel_table_lock;
 
 extern struct session_action * ppa_session_mc_construct_tmplbuf( void *p_item, uint32_t dest_list);
 extern int32_t ppa_session_mc_destroy_tmplbuf(void *);
+extern int32_t ppa_bypass_lro(PPA_SESSION *p_session);
 static void ppa_del_tunnel_tbl_entry(PPE_TUNNEL_INFO* tInfo)
 {
   uint32_t  tunnel_idx = tInfo->tunnel_idx;
@@ -110,6 +111,7 @@ static void ppa_del_tunnel_tbl_entry(PPE_TUNNEL_INFO* tInfo)
      */
     ppa_hsel_del_tunnel_entry(tInfo, 0, PAE_HAL);
     ppa_free(g_tunnel_table[tunnel_idx]);
+    g_tunnel_table[tunnel_idx] = NULL;
   }
   ppe_lock_release(&g_tunnel_table_lock);
 }
@@ -223,7 +225,11 @@ static uint32_t ppa_add_tunnel_tbl_entry(PPE_TUNNEL_INFO * entry)
                  "iphdr src/dst address is zero");
           break;
       }
-    
+   
+
+        entry->tunnel_idx = index;
+    	g_tunnel_table[index] = t_entry;
+ 
       if( entry->tunnel_type == TUNNEL_TYPE_DSLITE ||
           entry->tunnel_type == TUNNEL_TYPE_6RD ) { 
                   
@@ -231,8 +237,8 @@ static uint32_t ppa_add_tunnel_tbl_entry(PPE_TUNNEL_INFO * entry)
                     "Adding tunnel type %d index%d\n",
                     entry->tunnel_type, index);
 
-        entry->tunnel_idx = index;
-    	g_tunnel_table[index] = t_entry;
+        //entry->tunnel_idx = index;
+    	//g_tunnel_table[index] = t_entry;
         /* Required for DS-Lite and 6rd Tunnels */
         if (ppa_hsel_add_tunnel_entry(entry, 0, PAE_HAL) != PPA_SUCCESS) {
   
@@ -277,7 +283,7 @@ uint32_t ppa_add_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction dir,
         empty_entry = index;
     } else {
           //compere the src and dst address       
-	    if ( t_entry->tunnel_info.ipsec_hdr.inbound != NULL)
+	    if ( ( t_entry->tunnel_info.ipsec_hdr.inbound != NULL) && (t_entry->tunnel_info.ipsec_hdr.inbound->aalg->alg_name != NULL) && (t_entry->tunnel_info.ipsec_hdr.inbound->ealg->alg_name != NULL)  )
             {
             if ( ( (t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr.a4 == entry->props.saddr.a4) 
 		&& (t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr.a4 == entry->id.daddr.a4) 
@@ -294,7 +300,24 @@ uint32_t ppa_add_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction dir,
             		goto tunnel_found;
           	  }
              }
-	    if ( t_entry->tunnel_info.ipsec_hdr.outbound != NULL)
+             else if ( t_entry->tunnel_info.ipsec_hdr.inbound != NULL) 
+             {
+             if ( ( (t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr.a4 == entry->props.saddr.a4) 
+		&& (t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr.a4 == entry->id.daddr.a4) 
+		&& (t_entry->tunnel_info.ipsec_hdr.outbound == NULL)
+              	)
+		) {
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n %s,Inbound Tunnlel found index =%d\n",__FUNCTION__, index);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\ninbound daddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\ninbound saddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry daddr=0x%x\n",entry->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry saddr=0x%x\n",entry->props.saddr.a4);
+            		goto tunnel_found;
+          	  }
+              }
+
+
+	    if ( ( t_entry->tunnel_info.ipsec_hdr.outbound != NULL) && ( t_entry->tunnel_info.ipsec_hdr.outbound->aalg->alg_name != NULL) && ( t_entry->tunnel_info.ipsec_hdr.outbound->ealg->alg_name != NULL) )
             {
               	if ( (t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr.a4 == entry->props.saddr.a4) 
 		&& (t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr.a4 == entry->id.daddr.a4) 
@@ -311,6 +334,23 @@ uint32_t ppa_add_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction dir,
             		goto tunnel_found;
           	}
              }
+             else  if ( t_entry->tunnel_info.ipsec_hdr.outbound != NULL ) 
+             {
+              	if ( (t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr.a4 == entry->props.saddr.a4) 
+		&& (t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr.a4 == entry->id.daddr.a4) 
+		&& (t_entry->tunnel_info.ipsec_hdr.inbound == NULL)
+		)
+	        {
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n %s,Outbound Tunnlel found index =%d\n",__FUNCTION__, index);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\noutbound daddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\noutbound saddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry daddr=0x%x\n",entry->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry saddr=0x%x\n",entry->props.saddr.a4);
+            		goto tunnel_found;
+          	}
+             }
+
+
     }
   }
   index = empty_entry;
@@ -325,6 +365,13 @@ uint32_t ppa_add_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction dir,
       t_entry->hal_buffer = NULL;
       t_entry->tunnel_info.ipsec_hdr.inbound = NULL;
       t_entry->tunnel_info.ipsec_hdr.outbound = NULL;
+      t_entry->tunnel_info.ipsec_hdr.routeindex = 0xFFFFFFFF;
+#if 1
+      t_entry->tunnel_info.ipsec_hdr.inbound_pkt_cnt=0x0;
+      t_entry->tunnel_info.ipsec_hdr.inbound_byte_cnt=0x0;
+      t_entry->tunnel_info.ipsec_hdr.outbound_pkt_cnt=0x0;
+      t_entry->tunnel_info.ipsec_hdr.outbound_byte_cnt=0x0;
+#endif
       g_tunnel_table[index] = t_entry;
 
       }
@@ -366,7 +413,7 @@ uint32_t ppa_get_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction *dir
     } else {
           //compere the src and dst address       
 
-	    if ( t_entry->tunnel_info.ipsec_hdr.inbound != NULL)
+	    if ( (t_entry->tunnel_info.ipsec_hdr.inbound != NULL) && (t_entry->tunnel_info.ipsec_hdr.inbound->aalg->alg_name != NULL) && (t_entry->tunnel_info.ipsec_hdr.inbound->ealg->alg_name != NULL) )
             {
 
             if ( (t_entry->tunnel_info.ipsec_hdr.inbound->id.spi == entry->id.spi) 
@@ -385,7 +432,27 @@ uint32_t ppa_get_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction *dir
             		goto tunnel_found;
                }
              }
-	     if ( t_entry->tunnel_info.ipsec_hdr.outbound != NULL) {
+             else if ( t_entry->tunnel_info.ipsec_hdr.inbound != NULL)
+             {
+
+             if ( (t_entry->tunnel_info.ipsec_hdr.inbound->id.spi == entry->id.spi) 
+                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr) ,&entry->id.daddr,entry->props.family)
+		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr), &entry->props.saddr,entry->props.family) 
+               ) {
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,Inbound Tunnlel found index =%d\n",__FUNCTION__, index);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nINBOUND daddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nINBOUND saddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry daddr=0x%x\n",entry->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry saddr=0x%x\n",entry->props.saddr.a4);
+                        *dir = INBOUND;
+			t_entry->tunnel_info.ipsec_hdr.dir = INBOUND;
+            		goto tunnel_found;
+               }
+             }
+
+
+ 
+	     if ( (t_entry->tunnel_info.ipsec_hdr.outbound != NULL) && (t_entry->tunnel_info.ipsec_hdr.outbound->aalg->alg_name != NULL) && (t_entry->tunnel_info.ipsec_hdr.outbound->ealg->alg_name != NULL) ) {
 
                   if ( (t_entry->tunnel_info.ipsec_hdr.outbound->id.spi == entry->id.spi) 
                 && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr),&entry->id.daddr,entry->props.family)
@@ -402,7 +469,23 @@ uint32_t ppa_get_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction *dir
 			t_entry->tunnel_info.ipsec_hdr.dir = OUTBOUND;
             		goto tunnel_found;
                }
-             }
+             } 
+             else if ( t_entry->tunnel_info.ipsec_hdr.outbound != NULL) {
+
+                  if ( (t_entry->tunnel_info.ipsec_hdr.outbound->id.spi == entry->id.spi) 
+                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr),&entry->id.daddr,entry->props.family)
+		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr) ,&entry->props.saddr, entry->props.family) 
+               ) {
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,Outbound Tunnlel found index =%d\n",__FUNCTION__, index);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nOUTBOUND daddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nOUTBOUND saddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry daddr=0x%x\n",entry->id.daddr.a4);
+            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nentry saddr=0x%x\n",entry->props.saddr.a4);
+                        *dir = OUTBOUND;
+			t_entry->tunnel_info.ipsec_hdr.dir = OUTBOUND;
+            		goto tunnel_found;
+               }
+             }  
 
     }
   }
@@ -420,11 +503,10 @@ tunnel_err:
   return ret;
 }
 
+extern int32_t ppa_session_delete_ipsec( uint32_t tunnel_index);
 uint32_t ppa_add_ipsec_tunnel_tbl_update(sa_direction dir, uint32_t tunnel_index )
 {
-  uint32_t  index;
   uint32_t  ret = PPA_SUCCESS;
-  uint32_t  empty_entry = MAX_TUNNEL_ENTRIES;
   ppa_tunnel_entry *t_entry = NULL;
 
   if (tunnel_index == MAX_TUNNEL_ENTRIES)
@@ -446,50 +528,19 @@ uint32_t ppa_add_ipsec_tunnel_tbl_update(sa_direction dir, uint32_t tunnel_index
     ppa_free(g_tunnel_table[tunnel_index]);
     g_tunnel_counter[tunnel_index]--;
     g_tunnel_table[tunnel_index] = NULL;
+    ppe_lock_release(&g_tunnel_table_lock);
+    ppa_session_delete_ipsec(tunnel_index);
   }
-  ppe_lock_release(&g_tunnel_table_lock);
+  else
+  	ppe_lock_release(&g_tunnel_table_lock);
 
   return ret;
 
 }
 
-uint32_t ppa_ipsec_tunnel_tbl_routeindex(uint32_t tunnel_index, uint32_t routing_entry)
-{
-  uint32_t  ret = PPA_SUCCESS;
-  ppa_tunnel_entry *t_entry = NULL;
 
-  if (tunnel_index == MAX_TUNNEL_ENTRIES)
-     return PPA_FAILURE;
-  ppe_lock_get(&g_tunnel_table_lock);
-  // first lookup for a matching entry
-
-  t_entry = g_tunnel_table[tunnel_index];
-  if ( t_entry != NULL ) {
-
-	t_entry->tunnel_info.ipsec_hdr.routeindex =routing_entry;
-  }
-
-  ppe_lock_release(&g_tunnel_table_lock);
-
-  return ret;
-
-}
-
-uint32_t ppa_del_tunnel_ipsec_entry(uint32_t  tunnel_idx)
-{
-  uint32_t  ret = PPA_SUCCESS;
-  if (tunnel_idx >= MAX_TUNNEL_ENTRIES)
-    return PPA_FAILURE;
-
-  ppe_lock_get(&g_tunnel_table_lock);
-  if (g_tunnel_counter[tunnel_idx] && !--g_tunnel_counter[tunnel_idx]) {
-  //  ppa_hsel_del_tunnel_entry(tInfo, 0, PAE_HAL);
-    ppa_free(g_tunnel_table[tunnel_idx]);
-  }
-  ppe_lock_release(&g_tunnel_table_lock);
-}
-
-int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item)
+//int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item,PPA_BUF *ppa_buf)
+int32_t __ppa_update_ipsec_tunnelindex(PPA_BUF *ppa_buf,uint32_t* tunnel_index)
 {
 
   uint32_t  index;
@@ -498,8 +549,27 @@ int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item)
   ppa_tunnel_entry *t_entry = NULL;
 
   uint32_t  spi_id =0x0;
-  spi_id = ((pp_item->src_port << 16) & 0xFFFF0000); 
-  spi_id |= ((pp_item->dst_port) & 0xFFFF); 
+  PPA_IPADDR  src_ip;
+  uint16_t    src_port =0x0;
+  PPA_IPADDR  dst_ip;
+  uint16_t    dst_port =0x0;
+
+
+  ppa_memset(&src_ip, 0, sizeof(src_ip));
+  ppa_memset(&dst_ip, 0, sizeof(dst_ip));
+
+  //src_ip        = ppa_get_pkt_src_ip(ppa_buf);
+  ppa_get_pkt_src_ip(&src_ip,ppa_buf);
+  src_port      = ppa_get_pkt_src_port(ppa_buf);
+  //dst_ip        = ppa_get_pkt_dst_ip(ppa_buf);
+  ppa_get_pkt_dst_ip(&dst_ip,ppa_buf);
+  dst_port      = ppa_get_pkt_dst_port(ppa_buf);
+
+
+
+  spi_id = ((src_port << 16) & 0xFFFF0000); 
+  spi_id |= ((dst_port) & 0xFFFF);
+
   ppe_lock_get(&g_tunnel_table_lock);
   // first lookup for a matching entry
   for (index = 0; index < MAX_TUNNEL_ENTRIES; index++) {
@@ -515,8 +585,8 @@ int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item)
             {
 
             if ( (t_entry->tunnel_info.ipsec_hdr.inbound->id.spi == spi_id) 
-                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr) , &(pp_item->dst_ip),t_entry->tunnel_info.ipsec_hdr.inbound->props.family)
-		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr), &(pp_item->src_ip),t_entry->tunnel_info.ipsec_hdr.inbound->props.family) 
+                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr) ,(PPA_XFRM_ADDR *) &(dst_ip),t_entry->tunnel_info.ipsec_hdr.inbound->props.family)
+		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr),(PPA_XFRM_ADDR *) &(src_ip),t_entry->tunnel_info.ipsec_hdr.inbound->props.family) 
 /*
 		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.inbound->aalg->alg_name , entry->aalg->alg_name)) 
 		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.inbound->ealg->alg_name , entry->ealg->alg_name)) */
@@ -530,8 +600,8 @@ int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item)
 	     if ( t_entry->tunnel_info.ipsec_hdr.outbound != NULL) {
 
                   if ( (t_entry->tunnel_info.ipsec_hdr.outbound->id.spi == spi_id) 
-                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr),&(pp_item->dst_ip),t_entry->tunnel_info.ipsec_hdr.outbound->props.family)
-		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr) , &(pp_item->src_ip),t_entry->tunnel_info.ipsec_hdr.outbound->props.family)
+                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr),(PPA_XFRM_ADDR *)&(dst_ip),t_entry->tunnel_info.ipsec_hdr.outbound->props.family)
+		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr) ,(PPA_XFRM_ADDR *) &(src_ip),t_entry->tunnel_info.ipsec_hdr.outbound->props.family)
 /* 
 		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.outbound->aalg->alg_name , entry->aalg->alg_name)) 
 		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.outbound->ealg->alg_name , entry->ealg->alg_name)) */
@@ -551,9 +621,9 @@ int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item)
 
 tunnel_found:
   ret = PPA_SUCCESS;
-  //*tunnel_index = index;
-   pp_item->tunnel_idx = index;
-   pp_item->routing_entry =t_entry->tunnel_info.ipsec_hdr.routeindex;
+   *tunnel_index = index;
+   //pp_item->tunnel_idx = index;
+   //pp_item->routing_entry =t_entry->tunnel_info.ipsec_hdr.routeindex;
 tunnel_err:
   ppe_lock_release(&g_tunnel_table_lock);
 
@@ -561,88 +631,6 @@ tunnel_err:
 
 
 }
-
-int32_t __ppa_search_ipsec_rtindex(struct session_list_item *pp_item)
-{
-
-  uint32_t  index;
-  uint32_t  ret =PPA_EAGAIN;
-  uint32_t  empty_entry = MAX_TUNNEL_ENTRIES;
-  ppa_tunnel_entry *t_entry = NULL;
-
-  uint32_t  spi_id =0x0;
-  spi_id = ((pp_item->src_port << 16) & 0xFFFF0000); 
-  spi_id |= ((pp_item->dst_port) & 0xFFFF); 
-  ppe_lock_get(&g_tunnel_table_lock);
-  // first lookup for a matching entry
-  for (index = 0; index < MAX_TUNNEL_ENTRIES; index++) {
-
-    t_entry = g_tunnel_table[index];
-    if ( !t_entry ) {
-      if (empty_entry == MAX_TUNNEL_ENTRIES)
-        empty_entry = index;
-    } else {
-          //compere the src and dst address       
-
-	    if ( t_entry->tunnel_info.ipsec_hdr.inbound != NULL)
-            {
-
-            if ( (t_entry->tunnel_info.ipsec_hdr.inbound->id.spi == spi_id) 
-                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr) , &(pp_item->dst_ip),t_entry->tunnel_info.ipsec_hdr.inbound->props.family)
-		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr), &(pp_item->src_ip),t_entry->tunnel_info.ipsec_hdr.inbound->props.family) 
-/*
-		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.inbound->aalg->alg_name , entry->aalg->alg_name)) 
-		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.inbound->ealg->alg_name , entry->ealg->alg_name)) */
-               ) {
-            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,Inbound Tunnlel found index =%d\n",__FUNCTION__, index);
-            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nINBOUND daddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.inbound->id.daddr.a4);
-            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nINBOUND saddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.inbound->props.saddr.a4);
-            		goto tunnel_found;
-               }
-             }
-	     if ( t_entry->tunnel_info.ipsec_hdr.outbound != NULL) {
-
-                  if ( (t_entry->tunnel_info.ipsec_hdr.outbound->id.spi == spi_id) 
-                && ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr),&(pp_item->dst_ip),t_entry->tunnel_info.ipsec_hdr.outbound->props.family)
-		&& ppa_ipsec_addr_equal(&(t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr) , &(pp_item->src_ip),t_entry->tunnel_info.ipsec_hdr.outbound->props.family)
-/* 
-		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.outbound->aalg->alg_name , entry->aalg->alg_name)) 
-		&& (ppa_str_cmp(t_entry->tunnel_info.ipsec_hdr.outbound->ealg->alg_name , entry->ealg->alg_name)) */
-               ) {
-            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,Outbound Tunnlel found index =%d\n",__FUNCTION__, index);
-            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nOUTBOUND daddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.outbound->id.daddr.a4);
-            		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\nOUTBOUND saddr=0x%x\n",t_entry->tunnel_info.ipsec_hdr.outbound->props.saddr.a4);
-            		goto tunnel_found;
-               }
-             }
-
-    }
-  }
-//  index = empty_entry;
-  if (index >= MAX_TUNNEL_ENTRIES) 
-  {
-    ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,"\n%s,%d Tunnel Error\n",__FUNCTION__,__LINE__);
-    goto tunnel_err;
-  }
-
-tunnel_found:
-  ret = PPA_SUCCESS;
-  //*tunnel_index = index;
-
-   if(pp_item->routing_entry != t_entry->tunnel_info.ipsec_hdr.routeindex)
-  	ret = PPA_FAILURE;
-tunnel_err:
-  ppe_lock_release(&g_tunnel_table_lock);
-
-  return ret;
-
-
-}
-
-
-
-
-
 
 #endif
 
@@ -779,7 +767,8 @@ static uint32_t ppa_form_capability_list(struct session_list_item * p_item)
       ppa_is_LanSession(p_item)?TUNNEL_GRE_US:TUNNEL_GRE_DS;
   }
 #ifdef CONFIG_LTQ_PPA_MPE_IP97
-  if (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND) {
+  //if (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND) {
+  if ( (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND) || (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA) ) {
     // ppp over L2TP
     p_item->caps_list[total_caps++].cap = TUNNEL_IPSEC_US;
   }
@@ -868,6 +857,38 @@ static int32_t ppa_get_baseif_for_flowid(const char *in_if,const char **out_base
 	return ret;
 }
 #endif
+
+/*****************************************************************************************/
+// ppa_api_session.c will call this to check if a session has hals registered for all
+// its capabilities.
+/*****************************************************************************************/
+int32_t ppa_is_hal_registered_for_all_caps(struct session_list_item * p_item)
+{
+  uint32_t num_caps = 0, i, j;
+  PPA_HAL_ID hal_id;
+  int ret = PPA_SUCCESS;
+
+  ppa_memset(p_item->caps_list, 0,
+             sizeof(PPA_HSEL_CAP_NODE) * MAX_RT_SESS_CAPS);
+
+  // find the capabilities needed by the session and form a list of them
+  num_caps = ppa_form_capability_list(p_item);
+
+  if (ppa_select_hals_from_caplist(0, num_caps, p_item->caps_list) != PPA_SUCCESS)
+    return PPA_FAILURE;
+
+  // for each capability find out the hal
+  for (i = 0; i < num_caps; i+=j) {
+    j = ppa_group_hals_in_capslist(i, num_caps, p_item->caps_list);
+
+    // check if a valid hal is registered for that capability
+    hal_id = p_item->caps_list[i].hal_id;
+    if (hal_id < PPE_HAL || hal_id >= MAX_HAL)
+      return PPA_FAILURE;
+  }
+
+  return ret;
+}
 
 /*****************************************************************************************/
 // ppa_api_session.c will call this when a session is getting added
@@ -994,7 +1015,7 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
       if ( ppa_is_6rdSession(p_item) ) {
         ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
                   "add 6RD entry to acceleration, tx dev: %s\n",
-                  p_item->tx_if->name);
+                  ppa_get_netif_name(p_item->tx_if));
         route.tnnl_info.tunnel_type = TUNNEL_TYPE_6RD;
 	if(route.f_is_lan) {
 	    route.new_ip.f_ipv6 = 0;
@@ -1003,7 +1024,7 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
       } else if ( ppa_is_DsLiteSession(p_item)) {
         ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
                   "add Dslite entry to acceleration, tx dev: %s\n",
-                  p_item->tx_if->name);
+                  ppa_get_netif_name(p_item->tx_if));
         route.tnnl_info.tunnel_type = TUNNEL_TYPE_DSLITE;
       } else if(ppa_is_GreSession(p_item) ) {
 
@@ -1011,9 +1032,9 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
         char* ifName;
   
         if( ppa_is_gre_netif(p_item->tx_if))
-          ifName = p_item->tx_if->name;
+          ifName = ppa_get_netif_name(p_item->tx_if);
         else 
-          ifName = p_item->rx_if->name;
+          ifName = ppa_get_netif_name(p_item->rx_if);
 
         if( PPA_SUCCESS != ppa_netif_lookup(ifName, &pnetinfo)) {
           goto MTU_ERROR; // Should never happen
@@ -1037,7 +1058,7 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
 
         ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT,
                   "add L2TP entry to acceleration, tx dev: %s\n",
-                  p_item->tx_if->name);
+                  ppa_get_netif_name(p_item->tx_if));
         route.tnnl_info.tunnel_type = TUNNEL_TYPE_L2TP;  
       }
 #endif
@@ -1146,9 +1167,15 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
       // source mac 
       if (!(p_item->flags & SESSION_TX_ITF_IPOA_PPPOA_MASK)) {
 
-        if( route.tnnl_info.tunnel_type == TUNNEL_TYPE_EOGRE ||
-            route.tnnl_info.tunnel_type == TUNNEL_TYPE_6EOGRE ) {
-          ppa_memcpy(route.src_mac.mac,p_item->src_mac,6);
+        if( route.tnnl_info.tunnel_type == TUNNEL_TYPE_EOGRE  ||
+            route.tnnl_info.tunnel_type == TUNNEL_TYPE_6EOGRE ||
+	    p_item->flag2 & SESSION_FLAG2_BRIDGED_SESSION) {
+
+          if (p_item->flag2 & SESSION_FLAG2_VALID_L2_SNAT)
+            ppa_memcpy(route.src_mac.mac, p_item->nat_src_mac, 6);
+          else
+            ppa_memcpy(route.src_mac.mac, p_item->src_mac, 6);
+
         } else {
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
 	  if((!(route.tnnl_info.tunnel_type == TUNNEL_TYPE_IPSEC) 
@@ -1180,7 +1207,6 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
                                  PPA_F_STATIC_ENTRY);
           } else {
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
-	printk("%d\n",__LINE__);
 	if((p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)
 			||
 		(p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND))
@@ -1252,6 +1278,7 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
     	route.f_tc_remark_enable = 0;
     /* skb->priority 0 - 7 refers to Low->High priority Queue & TC 0-7 also refers to Low->High priority Queue*/	    
     route.tc_remark = p_item->priority;
+
 #endif
 #if defined(VLAN_VAP_QOS) && VLAN_VAP_QOS
 /*Start of : Set FlowId & TC for Vlan intercface */
@@ -1259,7 +1286,7 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
     {
 	struct netif_info *p_ifinfo;
 	char *ifname,*ifname_base;
-	ifname = p_item->tx_if->name;
+	ifname = ppa_get_netif_name(p_item->tx_if);
 	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT," %s:%d : calling ppa_get_baseif_for_flowid() with ifname = %s \n",__FUNCTION__,__LINE__,ifname);
 	if(ppa_get_baseif_for_flowid(ifname,&ifname_base) == PPA_SUCCESS)
 	{
@@ -1414,7 +1441,7 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
     case TUNNEL_IPSEC_DS:
 #endif
 	{
-	printk("%d\n",__LINE__);
+	//printk("%d\n",__LINE__);
       if ((ret = ppa_hsel_add_complement(&route, 0, p_item->caps_list[i].hal_id)) != PPA_SUCCESS) {
         ret = PPA_FAILURE;
 	}
@@ -1428,6 +1455,9 @@ int32_t ppa_hsel_add_routing_session(struct session_list_item * p_item,
 	route.f_is_lan = 1;
 	route.entry = p_item->routing_entry;
         route.sessionAction = p_item->sessionAction;
+
+  	if((p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA)) 
+		route.flags |= SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA;
       if ((ret = ppa_hsel_add_complement(&route, 0, p_item->caps_list[i].hal_id)) != PPA_SUCCESS) {
         ret = PPA_FAILURE;
       } else
@@ -1632,7 +1662,7 @@ void ppa_hsel_del_routing_session(struct session_list_item *p_item)
   }
 
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
-  if((p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND)) 
+  if((p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_INBOUND) || (p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND)) 
     	route.tnnl_info.tunnel_type = TUNNEL_TYPE_IPSEC; 
 
   if((p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA)) 
@@ -1708,14 +1738,23 @@ void ppa_hsel_del_routing_session(struct session_list_item *p_item)
               ppa_hsel_del_tunnel_entry(&route.tnnl_info, 0, PPE_HAL);
           } else {
 
-            if( route.tnnl_info.tunnel_idx != ~0 )
-              ppa_del_tunnel_tbl_entry(&route.tnnl_info);
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
+          if( (route.tnnl_info.tunnel_idx != ~0)  && (route.tnnl_info.tunnel_type != TUNNEL_TYPE_IPSEC) )
+#else
+          if(route.tnnl_info.tunnel_idx != ~0)  
+#endif
+          {
+              printk("\n%s,%d, ppa_del_tunnel_tbl_entry called\n",__FUNCTION__,__LINE__);
+              ppa_del_tunnel_tbl_entry(&route.tnnl_info); 
+
+          }
+
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
             ppa_bridge_entry_delete(p_item->s_mac, NULL, PPA_F_STATIC_ENTRY);
 #endif
           }
 
-          p_item->routing_entry = ~0;
+          //p_item->routing_entry = ~0;
           p_item->flags &= ~SESSION_ADDED_IN_HW;
 
 #if !(defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500)
@@ -1743,7 +1782,7 @@ void ppa_hsel_del_routing_session(struct session_list_item *p_item)
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
 	case TUNNEL_IPSEC_DS:
 	{
-	printk("%d\n",__LINE__);
+	//printk("%d\n",__LINE__);
 	route.f_is_lan = 0;
 	route.tnnl_info.tunnel_type = TUNNEL_TYPE_IPSEC;
         route.tnnl_info.tunnel_idx = p_item->tunnel_idx;
@@ -1755,10 +1794,14 @@ void ppa_hsel_del_routing_session(struct session_list_item *p_item)
 
 	case TUNNEL_IPSEC_US:
 	{
-	printk("<%s> %d\n",__FUNCTION__,__LINE__);
+	//printk("<%s> %d\n",__FUNCTION__,__LINE__);
 	route.tnnl_info.tunnel_type = TUNNEL_TYPE_IPSEC;
         route.tnnl_info.tunnel_idx = p_item->tunnel_idx;
 	route.entry = p_item->routing_entry;
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
+  if((p_item->flag2 & SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA)) 
+	route.flags |= SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA;
+#endif
 	route.f_is_lan = 1;
       if ((ppa_hsel_del_complement(&route, 0, p_item->caps_list[i].hal_id)) != PPA_SUCCESS) {
             printk("Failed to delete Complementary entry!!!\n");
@@ -2303,7 +2346,25 @@ int32_t ppa_hsel_add_wan_mc_group(struct mc_group_list_item *p_item)
       mc.out_vlan_info.vlan_entry = p_item->out_vlan_entry;
       mc.f_out_vlan_rm_enable = p_item->flags & SESSION_VALID_OUT_VLAN_RM;
       mc.f_new_dscp_enable = p_item->flags & SESSION_VALID_NEW_DSCP;
-      mc.f_tunnel_rm_enable = p_item->flags & (SESSION_TUNNEL_6RD | SESSION_TUNNEL_DSLITE);     //for only downstream multicast acceleration
+      //mc.f_tunnel_rm_enable = p_item->flags & (SESSION_TUNNEL_6RD | SESSION_TUNNEL_DSLITE);     //for only downstream multicast acceleration
+      
+      // handle tunnels
+      /* ?? Better to store tunnel type in p_item ???  */
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+      mc.tnnl_info.tunnel_type = TUNNEL_TYPE_NULL;
+      if ( ((p_item->flags) & SESSION_TUNNEL_6RD) == SESSION_TUNNEL_6RD) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_6RD;
+      } else if ( ((p_item->flags) &  SESSION_TUNNEL_DSLITE) == SESSION_TUNNEL_DSLITE ) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_DSLITE;
+      } else if( ((p_item->flag2) & SESSION_FLAG2_GRE)  == SESSION_FLAG2_GRE ) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_IPOGRE;
+      }
+#if defined(L2TP_CONFIG) && L2TP_CONFIG
+      else if ( ((p_item->flags) & SESSION_VALID_PPPOL2TP) == SESSION_VALID_PPPOL2TP) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_L2TP;
+      }
+#endif
+#endif
       mc.new_dscp = p_item->new_dscp;
       mc.dest_qid = p_item->dslwan_qid;
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
@@ -2479,6 +2540,7 @@ void ppa_hsel_del_wan_mc_group(struct mc_group_list_item *p_item)
       ppa_hsel_get_mc_entry_bytes(&mc, 0, p_item->caps_list[0].hal_id);
       if (mc.f_hit) {
 
+#if !(defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500)
         if ((uint32_t) mc.bytes >= p_item->last_bytes) {
           tmp = mc.bytes - (uint64_t) p_item->last_bytes;
         } else {
@@ -2486,7 +2548,9 @@ void ppa_hsel_del_wan_mc_group(struct mc_group_list_item *p_item)
               mc.bytes + (uint64_t) WRAPROUND_32BITS -
               (uint64_t) p_item->last_bytes;
         }
-
+#else
+	tmp = mc.bytes; 
+#endif
         /* reset the accelerated counters, as it is going to be deleted */
         p_item->acc_bytes = 0;
         p_item->last_bytes = 0;
@@ -2560,7 +2624,7 @@ void ppa_hsel_del_wan_mc_group(struct mc_group_list_item *p_item)
 #if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
         mc.group_id = p_item->group_id;
 #endif
-    	mc.p_entry = p_item->mc_entry;
+    	//mc.p_entry is expected to be filled beforehand
         mc.dest_list = l_dest_list_vap;
 	ppa_hsel_del_wan_mc_entry(&mc, 0, p_item->caps_list[i].hal_id);
 
@@ -2671,7 +2735,26 @@ int32_t ppa_hsel_update_wan_mc_group(struct mc_group_list_item *p_item,
       mc.out_vlan_info.vlan_entry = p_item->out_vlan_entry;
       mc.f_out_vlan_rm_enable = p_item->flags & SESSION_VALID_OUT_VLAN_RM;
       mc.f_new_dscp_enable = p_item->flags & SESSION_VALID_NEW_DSCP;
-      mc.f_tunnel_rm_enable = p_item->flags & (SESSION_TUNNEL_6RD | SESSION_TUNNEL_DSLITE);     //for only downstream multicast acceleration
+      //mc.f_tunnel_rm_enable = p_item->flags & (SESSION_TUNNEL_6RD | SESSION_TUNNEL_DSLITE);     //for only downstream multicast acceleration
+
+      // handle tunnels
+      /* ?? Better to store tunnel type in p_item ???  */
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+      mc.tnnl_info.tunnel_type = TUNNEL_TYPE_NULL;
+      if ( ((p_item->flags) & SESSION_TUNNEL_6RD) == SESSION_TUNNEL_6RD) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_6RD;
+      } else if ( ((p_item->flags) &  SESSION_TUNNEL_DSLITE) == SESSION_TUNNEL_DSLITE ) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_DSLITE;
+      } else if( ((p_item->flag2) & SESSION_FLAG2_GRE)  == SESSION_FLAG2_GRE ) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_IPOGRE;
+      }
+#if defined(L2TP_CONFIG) && L2TP_CONFIG
+      else if ( ((p_item->flags) & SESSION_VALID_PPPOL2TP) == SESSION_VALID_PPPOL2TP) {
+        mc.tnnl_info.tunnel_type = TUNNEL_TYPE_L2TP;
+      }
+#endif
+#endif
+
       mc.new_dscp = p_item->new_dscp;
       mc.dest_qid = p_item->dslwan_qid;
       mc.dest_list = 0;
@@ -2853,7 +2936,7 @@ int32_t ppa_del_lro_entry(struct session_list_item * p_item)
 }
 EXPORT_SYMBOL(ppa_del_lro_entry);
 
-int32_t ppa_lro_entry_criteria(struct session_list_item * p_item, PPA_BUF *ppa_buf, uint32_t flags)
+int32_t ppa_lro_entry_criteria(struct session_list_item *p_item, PPA_BUF *ppa_buf, uint32_t flags)
 {
     // 1. Session gets added to lro only after 64k bytes are transmitted (TCP segment size) 
     // 2. Session gets added to lro only if packet size is large (to avoid tcp ack)
@@ -2862,7 +2945,10 @@ int32_t ppa_lro_entry_criteria(struct session_list_item * p_item, PPA_BUF *ppa_b
 //    if(ppa_check_is_lro_enabled_netif(p_item->rx_if, p_item->src_mac)!=PPA_SUCCESS)
 //	return PPA_FAILURE;    
 
-    if ( p_item->mips_bytes > 64000 && ppa_buf->len > (p_item->mtu - 128) ) {
+     if (ppa_bypass_lro(p_item->session))
+	return PPA_FAILURE;
+
+    if ( p_item->mips_bytes > 64000 && ppa_skb_len(ppa_buf) > (p_item->mtu - 128) ) {
 	return PPA_SUCCESS; 
     }
     return PPA_FAILURE;
@@ -2871,6 +2957,7 @@ EXPORT_SYMBOL(ppa_lro_entry_criteria);
 
 #endif // defined(CONFIG_LTQ_PPA_LRO) && CONFIG_LTQ_PPA_LRO
 
+EXPORT_SYMBOL(ppa_is_hal_registered_for_all_caps);
 EXPORT_SYMBOL(ppa_hsel_add_routing_session);
 EXPORT_SYMBOL(ppa_hsel_del_routing_session);
 EXPORT_SYMBOL(ppa_hsel_update_routing_session);

@@ -6,7 +6,9 @@
 #
 
 LANTIQ_MENU:=Lantiq
+INTEL_MENU:=Intel
 SUBTARGET_SUFFIX:=$(shell echo $(subst .,_,$(subst -,_,$(subst /,_,$(SUBTARGET)))) | cut -d_ -f2-)
+CPE_NAME:=$(shell echo $(SUBTARGET) | awk '{ print toupper($$1) }')
 
 define KernelPackage/lantiq-deu
   TITLE:=Lantiq data encryption unit
@@ -128,7 +130,7 @@ define KernelPackage/usb-xhci
 	CONFIG_USB_PHY=y \
 	CONFIG_LTQ_DWC3_PHY=y
   FILES:=$(LINUX_DIR)/drivers/usb/host/xhci-hcd.$(LINUX_KMOD_SUFFIX)
-  AUTOLOAD:=$(call AutoLoad,50,usb-xhci,1)
+  AUTOLOAD:=$(call AutoLoad,50,xhci-hcd)
 endef
 
 define KernelPackage/usb-xhci/description
@@ -391,13 +393,27 @@ endef
 
 $(eval $(call KernelPackage,lantiq_eth_drv_builtin))
 
-CPE_NAME:=$(shell echo $(SUBTARGET) | awk '{ print toupper($$1) }')
+define KernelPackage/intel_eth_drv_xrx500_module
+ SUBMENU:=$(INTEL_MENU)
+ TITLE:= Intel Ethernet Driver for xRX500 (Module Support)
+ DEPENDS:=@TARGET_lantiq_xrx500
+ KCONFIG:= \
+	CONFIG_LTQ_ETH_XRX500
+ AUTOLOAD:=$(call AutoLoad,41,ltq_eth_drv_xrx500)
+ FILES:= \
+	$(LINUX_DIR)/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.$(LINUX_KMOD_SUFFIX)
+endef
+
+define KernelPackage/intel_eth_drv_xrx500_module/description
+ Intel Ethernet Driver (Module Support)
+endef
+
+$(eval $(call KernelPackage,intel_eth_drv_xrx500_module))
 
 define KernelPackage/lantiq_mini_jumbo_frame
   SUBMENU:=$(LANTIQ_MENU)
   TITLE:=Mini Jumbo Frames Support
   KCONFIG:= \
-		CONFIG=y \
 		CONFIG_LTQ_MINI_JUMBO_FRAME_SUPPORT=y
 endef
 
@@ -441,7 +457,7 @@ $(eval $(call KernelPackage,lantiq_imq))
 define KernelPackage/lantiq_qos
   SUBMENU:=$(LANTIQ_MENU)
   TITLE:=Lantiq support for QoS
-  #DEPENDS:= +ebtables +ebtables-utils 
+  DEPENDS:=@TARGET_lantiq
   KCONFIG:= \
 	CONFIG_LANTIQ_IPQOS=y \
 	CONFIG_LANTIQ_ALG_QOS=y \
@@ -466,7 +482,6 @@ define KernelPackage/lantiq_qos
 	CONFIG_NET_SCH_TEQL=n \
 	CONFIG_NET_SCH_HFSC=n \
 	CONFIG_VLAN_8021Q=y \
-	CONFIG_VLAN_8021Q_UNTAG=y \
 	CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ=y
 endef
 
@@ -475,6 +490,20 @@ define KernelPackage/lantiq_qos/description
 endef
 
 $(eval $(call KernelPackage,lantiq_qos))
+
+define KernelPackage/lantiq_vlan_qos
+  SUBMENU:=$(LANTIQ_MENU)
+  TITLE:=Lantiq support for QoS based on LAN VLANs
+  DEPENDS:=@!PACKAGE_kmod-qinq-support +kmod-lantiq_qos
+  KCONFIG:= \
+	CONFIG_VLAN_8021Q_UNTAG=y
+endef
+
+define KernelPackage/lantiq_vlan_qos/description
+  Kernel Support for ingress vlan based QoS.
+endef
+
+$(eval $(call KernelPackage,lantiq_vlan_qos))
 
 define KernelPackage/lantiq_layer7
   SUBMENU:=$(LANTIQ_MENU)
@@ -567,6 +596,7 @@ define KernelPackage/lan-port-sep
   KCONFIG:= \
 	CONFIG_LTQ_ETHSW=m \
 	CONFIG_LTQ_PPA_PORT_SEPARATION=y
+  AUTOLOAD:=$(call AutoLoad,10,lantiq_ethsw)
   FILES:=$(LINUX_DIR)/drivers/net/lantiq_ethsw.$(LINUX_KMOD_SUFFIX)
 endef
 
@@ -772,9 +802,11 @@ $(eval $(call KernelPackage,lantiq_vdsl_vectoring_support))
 define KernelPackage/usb-ncm
   TITLE:=Support for USB Network Control Model Device CDC NCM
   KCONFIG:= \
-	CONFIG_USB_NET_CDC_NCM
+	CONFIG_USB_NET_CDC_NCM=m \
+	CONFIG_USB_NET_CDCETHER=m
   FILES:= \
-  	$(LINUX_DIR)/drivers/net/usb/cdc_ncm.ko
+		$(LINUX_DIR)/drivers/net/usb/cdc_ncm.ko \
+		$(LINUX_DIR)/drivers/net/usb/cdc_ether.ko
   SUBMENU:=$(USB_MENU)
   DEPENDS:= +kmod-usb-net
 endef
@@ -786,7 +818,7 @@ endef
 $(eval $(call KernelPackage,usb-ncm))
 
 define KernelPackage/usb-sierra-lte
-  TITLE:=Support for USB Network Control Model Device CDC NCM
+  TITLE:=Support for USB Network Control Model Sierra Device
   KCONFIG:= \
 	CONFIG_USB_LTE_SIERRA_HL7548
   FILES:= \
@@ -796,7 +828,7 @@ define KernelPackage/usb-sierra-lte
 endef
 
 define KernelPackage/usb-sierra-lte/description
- Kernel support for USB Network Control Model Device CDC NCM
+ Kernel support for USB Network Control Model Sierra Device
 endef
 
 $(eval $(call KernelPackage,usb-sierra-lte))
@@ -1025,19 +1057,6 @@ endef
 
 $(eval $(call KernelPackage,regulator-tps65273))
 
-define KernelPackage/mcast-helper
-  SUBMENU:=$(LANTIQ_MENU)
-  TITLE:=MCAST-HELPER support
-  KCONFIG:= CONFIG_LANTIQ_MCAST_HELPER=m
-  FILES:=$(LINUX_DIR)/net/lantiq/mcast_helper.$(LINUX_KMOD_SUFFIX)
-endef
-
-define KernelPackage/mcast-helper/description
- A kernel module for multicast PPA and ACL support.
-endef
-
-$(eval $(call KernelPackage,mcast-helper))
-
 define KernelPackage/memory-compaction
   SUBMENU:=Other modules
   TITLE:=Support for memory compaction
@@ -1083,6 +1102,49 @@ define KernelPackage/vrx318-dp-mod/description
 endef
 
 $(eval $(call KernelPackage,vrx318-dp-mod))
+
+define KernelPackage/pcie-vrx518
+  SUBMENU:=Lantiq
+  TITLE:=VRX518 PCIe EP/ACA module
+  KCONFIG:= \
+	CONFIG_VRX518=y \
+	CONFIG_NET_VENDOR_INTEL=y
+endef
+
+define KernelPackage/pcie-vrx518/description
+   Enables VRX518 PCIe EP/ACA driver
+endef
+
+$(eval $(call KernelPackage,pcie-vrx518))
+
+define KernelPackage/vrx518-dp-mod
+  SUBMENU:=Lantiq
+  TITLE:=VRX518 Datapath ATM/PTM modules (xRX500 SoC)
+  KCONFIG:= \
+	CONFIG_VRX518_TC=m
+  FILES:= \
+	$(LINUX_DIR)/drivers/net/ethernet/intel/vrx518/tc/vrx518_tc.ko
+endef
+
+define KernelPackage/vrx518-dp-mod/description
+   Enables VRX518 Datapath and builds ATM/PTM driver as Modules for xRX500 SoCs
+endef
+$(eval $(call KernelPackage,vrx518-dp-mod))
+
+define KernelPackage/pcie-switch-vrx518-bonding
+  SUBMENU:=Lantiq
+  TITLE:=VRX518 PCIe switch for bonding 
+  DEPENDS+=@PACKAGE_kmod-vrx518-dp-mod
+  KCONFIG:= \
+        CONFIG_VRX518_PCIE_SWITCH_BONDING=y
+endef
+
+define KernelPackage/pcie-switch-vrx518-bonding/description
+   Enables VRX518 PCIe switch for bonding
+endef
+
+$(eval $(call KernelPackage,pcie-switch-vrx518-bonding))
+
 
 define KernelPackage/lantiq_directconnect_support
  SUBMENU:=$(LANTIQ_MENU)
@@ -1268,8 +1330,10 @@ define KernelPackage/wavflow
         CONFIG_WLAN=y \
         CONFIG_IWLWIFI \
         CONFIG_IWLDVM \
-        CONFIG_IWLMVM
+        CONFIG_IWLMVM \
+        CONFIG_WIDAN_NETFILTER
  FILES:= \
+        $(LINUX_DIR)/drivers/net/widan_netf.ko \
         $(LINUX_DIR)/drivers/net/wireless/iwlwifi/iwlwifi.ko \
         $(LINUX_DIR)/drivers/net/wireless/iwlwifi/dvm/iwldvm.ko \
         $(LINUX_DIR)/drivers/net/wireless/iwlwifi/mvm/iwlmvm.ko \
@@ -1282,3 +1346,57 @@ endef
 
 $(eval $(call KernelPackage,wavflow))
 
+define KernelPackage/qinq-support
+ SUBMENU:=$(LANTIQ_MENU)
+ TITLE:=QinQ support in kernel
+ DEPENDS:=@TARGET_lantiq_xrx500
+ KCONFIG:= \
+	CONFIG_BRIDGE_VLAN_FILTERING=y \
+	CONFIG_VLAN_8021Q_UNTAG=n
+endef
+
+define KernelPackage/qinq-support/description
+ Kernel support for enabling qinq configuration
+endef
+
+$(eval $(call KernelPackage,qinq-support))
+
+define KernelPackage/tproxy
+  SUBMENU:=Lantiq
+  TITLE:=TPROXY modules in kernel
+  KCONFIG := \
+	CONFIG_NETFILTER_TPROXY=y \
+	CONFIG_NETFILTER_XT_MATCH_SOCKET=y \
+	CONFIG_NETFILTER_XT_TARGET_TPROXY=y
+endef
+
+define KernelPackage/tproxy/description
+  TPROXY modules in kernel
+endef
+
+$(eval $(call KernelPackage,tproxy))
+
+define KernelPackage/prio_mark
+  SUBMENU:=Intel
+  TITLE:=Prioritiy marking module
+  KCONFIG:=CONFIG_BOOST_MARK=y
+endef
+
+define KernelPackage/prio_mark/description
+  Kernel module to mark prioritiy of skb
+endef
+
+$(eval $(call KernelPackage,prio_mark))
+
+define KernelPackage/l2nat
+  SUBMENU:=Intel
+  TITLE:=Layer 2 nat driver
+  KCONFIG:=CONFIG_L2NAT=m
+  FILES:=$(LINUX_DIR)/drivers/net/l2nat/l2nat.ko
+endef
+
+define KernelPackage/l2nat/description
+ Kernel support for Layer 2 nat for bridged client mode
+endef
+
+$(eval $(call KernelPackage,l2nat))

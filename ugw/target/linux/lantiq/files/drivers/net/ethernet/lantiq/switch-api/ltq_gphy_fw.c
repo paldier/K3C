@@ -203,12 +203,18 @@ struct task_struct *gphy_rmon_poll_thread_id;
 #define LED_ON		1
 #define LED_FLASH	2
 #define GPIO_VRX200_OFFSET  200
+#define GPIO_GRX330_OFFSET  194
 enum gphy_gpio_mapping {
 	GPHY_2_GPIO = 33 + GPIO_VRX200_OFFSET,
 	GPHY_3_GPIO = 11 + GPIO_VRX200_OFFSET,
 	GPHY_4_GPIO = 12 + GPIO_VRX200_OFFSET,
 	GPHY_5_GPIO = 15 + GPIO_VRX200_OFFSET,
 };
+
+enum gphy_grx330_gpio_mapping {
+        GPHY_GRX330_2_GPIO = 10 + GPIO_GRX330_OFFSET,
+};
+
 int gphy_led_state[NUM_OF_PORTS] = {0,0,0,0,0,0};	/* 0: OFF, 1: ON, 2: flash */
 int gphy_led_status_on[NUM_OF_PORTS] = {0,0,0,0,0,0};
 //end For VRX220 SW control PHY LED
@@ -931,23 +937,31 @@ static int gphy_ssd_err_thread (void *arg)
  *		:	on_off */
  /* Process: Use the GPIO to ON/OFF the LED 
  */
- void gphy_data_led_on_off (int port, int on_off)
- {
- 	u32 gpio_pin = GPHY_2_GPIO;
- 	switch (port) {
- 		case 2:
- 			gpio_pin = GPHY_2_GPIO;
- 			break;
- 		case 3:
- 			gpio_pin = GPHY_3_GPIO;
-			break;
-		case 4:
-			gpio_pin = GPHY_4_GPIO;
-			break;	
-		case 5:
-			gpio_pin = GPHY_5_GPIO;
-			break;
+void gphy_data_led_on_off (int port, int on_off)
+{
+	u32 gpio_pin;
+	if (of_machine_is_compatible("lantiq,grx390")){
+		if ( port == 1)
+			gpio_pin= GPHY_GRX330_2_GPIO;
+		else
+			return;
 	}
+	if (of_machine_is_compatible("lantiq,xrx220")){
+		switch (port) {
+			case 2:
+				gpio_pin = GPHY_2_GPIO;
+				break;
+			case 3:
+				gpio_pin = GPHY_3_GPIO;
+				break;
+			case 4:
+				gpio_pin = GPHY_4_GPIO;
+				break;
+			case 5:
+				gpio_pin = GPHY_5_GPIO;
+				break;
+			}
+		}
 	if (on_off) {
 		gpio_set_value(gpio_pin, 1);
 	} else {
@@ -964,14 +978,23 @@ static int gphy_rmon_poll_thread (void *arg)
 	int port_tx_prev[NUM_OF_PORTS] = {0,0,0,0,0,0};
 	IFX_ETHSW_RMON_cnt_t param;
 	IFX_ETHSW_portLinkCfg_t param_link;
+	int START_PORT , MAX_PORTS;
 	printk (KERN_INFO "start %p ..\n", current);
 	allow_signal(SIGKILL);
 	while(!kthread_should_stop ()) {
 		set_current_state(TASK_INTERRUPTIBLE);
 		if (signal_pending(current))
 			break;
-		swithc_api_fd = ltq_ethsw_api_kopen("/dev/switch_api/0");	 
-		for (port = 2; port < NUM_OF_PORTS; port++) {
+		swithc_api_fd = ltq_ethsw_api_kopen("/dev/switch_api/0");
+		if (of_machine_is_compatible("lantiq,xrx220")){
+			START_PORT = 2;
+			MAX_PORTS = NUM_OF_PORTS;
+			}
+		else {
+			START_PORT = 1;
+			MAX_PORTS = 2;
+			}
+		for (port = START_PORT; port < MAX_PORTS; port++) {
 			memset(&param, 0, sizeof(IFX_ETHSW_RMON_cnt_t));
 			memset(&param_link, 0, sizeof(IFX_ETHSW_portLinkCfg_t));
 			param.nPortId = port;
@@ -1002,6 +1025,21 @@ static int gphy_rmon_poll_thread (void *arg)
 		}
 		ltq_ethsw_api_kclose(swithc_api_fd);
 		msleep(30);
+	}
+	return 0;
+}
+
+int GRX330_F2_GPHY_LED_init(void)
+{
+        if (!gpio_request(GPHY_GRX330_2_GPIO, "SW-LED"))
+                gpio_direction_output(GPHY_GRX330_2_GPIO, 1);  //set gpio direction as  output
+        else
+                printk(KERN_EMERG "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        gphy_rmon_poll_thread_id = kthread_create(gphy_rmon_poll_thread, NULL, \
+                "gphy_rmon_poll_thread");
+        if (!IS_ERR(gphy_rmon_poll_thread_id)) {
+                printk (KERN_EMERG "GPHY RMON poll thread created..\n");
+                wake_up_process(gphy_rmon_poll_thread_id);
 	}
 	return 0;
 }
@@ -1114,7 +1152,10 @@ static int __init gphy_driver_init (struct platform_device *pdev)
         //For VRX220 SW control PHY LED
 	if (of_machine_is_compatible("lantiq,xrx220"))
 	    AR10_F2_GPHY_LED_init();
+    if (of_machine_is_compatible("lantiq,grx390"))
+        GRX330_F2_GPHY_LED_init();
 	return 0;
+
 }
 
 static int __init gphy_driver_exit (struct platform_device *pdev)

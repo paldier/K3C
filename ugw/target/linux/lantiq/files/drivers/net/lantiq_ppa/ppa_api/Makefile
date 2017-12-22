@@ -55,7 +55,7 @@ endif
 # Note: Do not add any thing below this line. Following the lines 
 #       "CUT_HERE_FOR_CD" will be removed during CD creation.
 ifeq ($(CONFIG_LTQ_PPA_API_SW_FASTPATH),y)
-   obj-m += swa_stack_al.o
+#   obj-m += swa_stack_al.o
    ppa_api-objs += ppa_sae_hal.o
    obj-m += ppa_api_sw_accel_mod.o
    ppa_api_sw_accel_mod-objs = ppa_api_sw_accel.o ppa_api_sw_accel_module.o 
@@ -64,4 +64,7 @@ endif
 ifeq ($(CONFIG_LTQ_PPA_MPE_HAL),m)
   obj-m += ppa_api_tmplbuf.o
   ppa_api_tmplbuf-objs = ppa_api_tmpl_buf.o ppa_api_tmplbuf_module.o
+endif
+ifeq ($(CONFIG_PPA_PP_LEARNING),y)
+ppa_api-objs += ppa_api_pp_core.o
 endif

@@ -1,8 +1,5 @@
 #!/bin/sh
 
-LAN_INTERFACE="eth0_1 eth0_2 eth0_3 eth0_4"
-WAN_INTERFACE="eth1"
-
 get_uboot_env()
 {
 	local env=$1; local def=$2; local val

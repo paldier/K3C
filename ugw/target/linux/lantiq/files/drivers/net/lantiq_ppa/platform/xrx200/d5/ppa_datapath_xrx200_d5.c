@@ -275,7 +275,7 @@ MODULE_PARM_DESC(qos_queue_len, "QoS queue's length for each QoS queue");
 
 #define DEBUG_FW_PROC                           1
 
-#define DEBUG_MIRROR_PROC                       0
+#define DEBUG_MIRROR_PROC                       1
 
 #define DEBUG_REDIRECT_FASTPATH_TO_CPU          0
 
@@ -2261,7 +2261,7 @@ static struct sk_buff* skb_break_away_from_protocol(struct sk_buff *skb)
     nf_conntrack_put(new_skb->nfct);
     new_skb->nfct = NULL;
   #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
-  #if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 102)))
+  #if ((LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)) && (LINUX_VERSION_CODE != KERNEL_VERSION(3, 10, 104)))
     nf_conntrack_put_reasm(new_skb->nfct_reasm);
     new_skb->nfct_reasm = NULL;
   #endif

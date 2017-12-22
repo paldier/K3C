@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 3d0eddb6444001a5123a8658b17bfda470376a73
+# Parent 1aa595c02a3cacaf4d12e3ea0e0df52216143510
 et/ethernet/lantiq/cbm/cbm.c
 
 diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
@@ -76,7 +76,7 @@ diff --git a/drivers/net/ethernet/lantiq/cbm/cbm.c b/drivers/net/ethernet/lantiq
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/cbm/cbm.c
-@@ -0,0 +1,5511 @@
+@@ -0,0 +1,5612 @@
 +#include "cbm.h"
 +#include <linux/dma-mapping.h>
 +#include <lantiq_dmax.h>
@@ -84,6 +84,8 @@ new file mode 100755
 +#include <linux/skbuff.h>
 +#include <linux/if_ether.h>
 +#include <linux/klogging.h>
++
++#include <linux/ltq_hwmcpy.h>
 +
 +#define xrx500_cbm_r32(m_reg)		__raw_readl(m_reg)
 +#define xrx500_cbm_w32(m_reg, val)	__raw_writel(val, m_reg)
@@ -217,7 +219,7 @@ new file mode 100755
 +struct t_symstruct {
 +char *key;
 +int val;
-+} ;
++};
 +
 +static struct t_symstruct device_table[] = {
 +	{ "ltq_dqm_ports", DQM_PORTS_VALUE },
@@ -247,6 +249,8 @@ new file mode 100755
 +		return EQM_TOE_TYPE;
 +	else if (port == EQM_VRX318_TYPE)
 +		return EQM_VRX318_TYPE;
++	else if (port == EQM_DL_TYPE)
++		return EQM_DL_TYPE;
 +	else
 +		return CBM_FAILURE;
 +
@@ -328,7 +332,7 @@ new file mode 100755
 +	int num_deq_ports, i;
 +	uint32_t port_map, index;
 +
-+	if ((flags != DP_F_MPE_ACCEL) && (flags != DP_F_DIRECTPATH_RX))
++	if ((flags != DP_F_MPE_ACCEL) && (flags != DP_F_DIRECTPATH_RX)  && (flags != DP_F_CHECKSUM))
 +		flags = DP_F_DONTCARE;
 +	spin_lock_irqsave(&cbm_port_mapping, lock_flags);
 +	if (flags == DP_F_DONTCARE) {
@@ -338,9 +342,9 @@ new file mode 100755
 +			for (i = 0; i < num_deq_ports; i++) {
 +				index = get_is_bit_set(port_map);
 +				if ((index == cbm)
-+			&& (ptr->egp_type != DP_F_MPE_ACCEL)
-+			&& (ptr->egp_type != DP_F_DIRECTPATH_RX)
-+			) {
++				&& (ptr->egp_type != DP_F_MPE_ACCEL)
++				&& (ptr->egp_type != DP_F_DIRECTPATH_RX)
++				) {
 +				spin_unlock_irqrestore(&cbm_port_mapping, lock_flags);
 +				return ptr;
 +				}
@@ -366,11 +370,7 @@ new file mode 100755
 +	struct cbm_pmac_port_map *ptr = NULL;
 +	unsigned long lock_flags;
 +
-+	#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
-+	if ((!(flags & DP_F_MPE_ACCEL)) && (!(flags & DP_F_DIRECTPATH_RX)) /*&& (!(flags & DP_F_CHECKSUM))*/)
-+	#else
 +	if ((!(flags & DP_F_MPE_ACCEL)) && (!(flags & DP_F_DIRECTPATH_RX)) && (!(flags & DP_F_CHECKSUM)))
-+	#endif
 +		flags = DP_F_DONTCARE;
 +	LOGF_KLOG_DEBUG("%s: flags 0x%x\r\n", __func__, flags);
 +	spin_lock_irqsave(&cbm_port_mapping, lock_flags);
@@ -411,7 +411,7 @@ new file mode 100755
 +	int found = 0;
 +	unsigned long lock_flags;
 +
-+	if ((flags != DP_F_MPE_ACCEL) && (flags != DP_F_DIRECTPATH_RX))
++	if ((flags != DP_F_MPE_ACCEL) && (flags != DP_F_DIRECTPATH_RX) && (flags != DP_F_CHECKSUM))
 +		flags = DP_F_DONTCARE;
 +	LOGF_KLOG_DEBUG("%s: flags 0x%x\r\n", __func__, flags);
 +
@@ -2070,6 +2070,11 @@ new file mode 100755
 +	return;
 +}
 +
++uint32_t cbm_get_std_free_count (void) {
++	return xrx500_cbm_r32(FSQM_BASE(g_cbm_buff.std_fsqm_idx) + OFSC);
++}
++EXPORT_SYMBOL(cbm_get_std_free_count);
++
 +/*
 + *	CBM Interrupt handler
 + */
@@ -2481,7 +2486,7 @@ new file mode 100755
 +
 +	LOGF_KLOG_DEBUG("Qlen Port %lu recv %d pkts\n", cpu, pkt_recvd);
 +	if (pkt_recvd > 0) {
-+		deq_ret = cbm_cpu_dequeue_list (cpu);
++		deq_ret = cbm_cpu_dequeue_list(cpu);
 +		desc_list = &g_cbm_dlist[cpu][0];
 +		while (desc_list->desc.desc2) {
 +			/* Build the SKB */
@@ -2510,7 +2515,7 @@ new file mode 100755
 +				skb->DW3 = desc_list->desc.desc3;
 +				skb_put(skb, data_len);
 +				dp_rx(skb, 0);
-+				LOGF_KLOG_DEBUG ("%s: rx to datapath library\n", __func__);
++				LOGF_KLOG_DEBUG("%s: rx to datapath library\n", __func__);
 +			} else {
 +				LOGF_KLOG_ERROR("%s:failure in allocating skb, free cbm data pointer\r\n", __func__);
 +				cbm_buffer_free(smp_processor_id(), desc_list->desc.desc2, 0);
@@ -2921,25 +2926,34 @@ new file mode 100755
 +}
 +EXPORT_SYMBOL(cbm_buffer_upd_rcnt);
 +
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++static uint32_t cbm_ctrl_reg_shadow = 0;
++#endif
++
 +inline void set_wlan_ep(int ep, int cbm_port)
 +{
++	uint32_t* addr = 0;
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	addr = &cbm_ctrl_reg_shadow;
++#else
++	addr = CBM_BASE + CBM_CTRL;
++#endif
 +	switch (cbm_port) {
 +	case 4:
-+		set_val((CBM_BASE + CBM_CTRL), ep, 0xF00000, 20);
++		set_val(addr, ep, 0xF00000, 20);
 +		break;
 +	case 24:
-+		set_val((CBM_BASE + CBM_CTRL), ep, 0xF000, 12);
++		set_val(addr, ep, 0xF000, 12);
 +		break;
 +	case 25:
-+		set_val((CBM_BASE + CBM_CTRL), ep, 0xF00, 8);
++		set_val(addr, ep, 0xF00, 8);
 +		break;
 +	case 26:
-+		set_val((CBM_BASE + CBM_CTRL), ep, 0xF0, 4);
++		set_val(addr, ep, 0xF0, 4);
 +		break;
 +	default:
 +		break;
 +	}
-+
 +}
 +inline void cbm_populate_entry(
 +struct cbm_pmac_port_map *local_entry,
@@ -2977,6 +2991,9 @@ new file mode 100755
 +			xrx500_cbm_w32((CBM_DQM_BASE + CBM_DQM_CPU_PORT(cbm_port_id, dptr)), 0x1f);
 +			xrx500_cbm_w32((CBM_DQM_BASE + CBM_DQM_CPU_PORT(cbm_port_id, resv2[0])), 0x0);
 +			xrx500_cbm_w32((CBM_DQM_BASE + CBM_DQM_CPU_PORT(cbm_port_id, dqpc)), 0x0);
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++			umt_reset_port_dq_idx(cbm_port_id);
++#endif
 +			xrx500_cbm_w32((CBM_DQM_BASE + CBM_DQM_CPU_PORT(cbm_port_id, bprc)), 0x0);
 +		break;
 +		case 0:
@@ -3002,6 +3019,22 @@ new file mode 100755
 +}
 +EXPORT_SYMBOL(cbm_port_quick_reset);
 +
++uint32_t 
++cbm_get_dptr_scpu_egp_count (uint32_t cbm_port_id, uint32_t flags)
++{
++	if (cbm_port_id == 4 || cbm_port_id == 24 || cbm_port_id == 25 || cbm_port_id == 26)
++	{
++		uint32_t reg = 0;
++		reg = xrx500_cbm_r32(CBM_DQM_BASE + CBM_DQM_CPU_PORT(cbm_port_id, dptr));
++		reg  = (reg >> 16) & 0x1F;
++	 	return reg;	
++	}
++	else
++		return 0;
++	
++}
++EXPORT_SYMBOL(cbm_get_dptr_scpu_egp_count);
++
 +int32_t
 +cbm_dp_port_alloc(
 +	struct module *owner,
@@ -3021,6 +3054,7 @@ new file mode 100755
 +	pmac[CBM_MAX_PHY_PORT_PER_EP];
 +	struct cbm_pmac_port_map *test_ptr = NULL;
 +	struct cbm_pmac_port_map local_entry = {0};
++	struct cbm_pmac_port_map *dp_local_entry = NULL;
 +	uint32_t num;
 +	struct cbm_qidt_elm qidt_set = {0};
 +	struct cbm_qidt_mask qidt_mask = {1, 1, 1, 1, 1, 1, 1, 1};
@@ -3033,6 +3067,7 @@ new file mode 100755
 +		cbm_delete_from_list(port_id, flags);
 +		return DP_SUCCESS;
 +	}
++	pr_info("flags 0x%x\n", flags);
 +	/*to allocate port*/
 +	if (flags & DP_F_FAST_ETH_LAN) {
 +		port_start = PMAC_ETH_LAN_START_ID;
@@ -3059,7 +3094,12 @@ new file mode 100755
 +		goto ALLOC_OK;
 +	} else { /* dynamic alloc a free port */
 +		for (i = port_start; i <= port_end; i++) {
-+			if (!is_dp_allocated(i, flags)) {
++			if (flags == DP_F_CHECKSUM) {
++				dp_local_entry = is_dp_allocated(i, 0);
++			} else {
++				dp_local_entry = is_dp_allocated(i, flags);
++			}
++			if (!dp_local_entry) {
 +				port_id = i;
 +				goto ALLOC_OK;
 +			}
@@ -3079,6 +3119,10 @@ new file mode 100755
 +			return DP_FAILURE;
 +		}
 +		local_entry.pmac = port_id;
++		local_entry.owner = owner;
++		local_entry.dev = dev;
++		local_entry.dev_port = dev_port;
++		local_entry.flags = P_ALLOCATED;
 +		for (i = 0; i < CBM_MAX_PHY_PORT_PER_EP; i++) {
 +			if (pmac[i] != CBM_PORT_INVALID) {
 +				temp_flags = (flags & DP_F_FAST_WLAN) ? DP_F_FAST_WLAN : flags;
@@ -3114,8 +3158,36 @@ new file mode 100755
 +						}
 +					}
 +				break;
++				case DP_F_CHECKSUM:
++					if (cbm_port[i] != CBM_PORT_NOT_APPL) {
++						test_ptr = NULL;
++						test_ptr = is_cbm_allocated(cbm_port[i], flags);
++						if (test_ptr) {
++							cbm_delete_from_list(CBM_PMAC_NOT_APPL, flags);
++							cbm_populate_entry(&local_entry, &phys_port, cbm_port[i], flags, &pmac_found);
++							exit = 1;
++						}
++					}
++				break;
++				case DP_F_PORT_TUNNEL_DECAP:
++					pr_info("0x%x 0x%x\n", port_id, flags);
++					local_entry.egp_type = flags;
++					cbm_add_to_list(&local_entry);
++					return port_id;
++				break;
++				case DP_F_DIRECT:
++					if (cbm_port[i] != CBM_PORT_NOT_APPL) {
++						pr_info("0x%x 0x%x\n", cbm_port[i], flags);
++						cbm_populate_entry(&local_entry, &phys_port, cbm_port[i], flags, &pmac_found);
++						cbm_add_to_list(&local_entry);
++						return port_id;
++					}
++				break;
 +				default:
-+					cbm_populate_entry(&local_entry, &phys_port, cbm_port[i], flags, &pmac_found);
++					if (cbm_port[i] != CBM_PORT_NOT_APPL) {
++						pr_info("0x%x 0x%x\n", cbm_port[i], flags);
++						cbm_populate_entry(&local_entry, &phys_port, cbm_port[i], flags, &pmac_found);
++					}
 +				break;
 +				}
 +				if (exit)
@@ -3125,10 +3197,7 @@ new file mode 100755
 +		if (!pmac_found)
 +			return DP_FAILURE;
 +	}
-+	local_entry.owner = owner;
-+	local_entry.dev = dev;
-+	local_entry.dev_port = dev_port;
-+	local_entry.flags = P_ALLOCATED;
++
 +
 +	cbm_add_to_list(&local_entry);
 +
@@ -3145,18 +3214,22 @@ new file mode 100755
 +			LOGF_KLOG_ERROR("Error getting resources for port_id %d\n", port_id);
 +			return CBM_FAILURE;
 +	}
-+	tmu_equeue_enable(res[0].tmu_q, 0);
-+	tmu_egress_port_enable(res[0].tmu_port, 0);
-+	qidt_set.ep = port_id;
-+	qidt_mask.ep_mask = 0;
-+	if ((!cbm_qtable[res[0].tmu_q].refcnt)) {
-+			LOGF_KLOG_INFO("guess first time\n");
++	if (num && res) {
++		pr_info("disabling q %d port %d\n", res[0].tmu_q, res[0].tmu_port);
++		tmu_equeue_enable(res[0].tmu_q, 0);
++		tmu_egress_port_enable(res[0].tmu_port, 0);
++		qidt_set.ep = port_id;
++		qidt_mask.ep_mask = 0;
++		if ((!cbm_qtable[res[0].tmu_q].refcnt)) {
++			LOGF_KLOG_INFO("first time LOOKUP prgrm\n");
 +			cbm_qidt_set(&qidt_set,
 +			&qidt_mask,
 +			res[0].tmu_q);
 +	}
 +	
 +	LOGF_KLOG_INFO("%d\n", cbm_qtable[res[0].tmu_q].refcnt);
++		kfree(res);
++	}
 +	return port_id;
 +}
 +EXPORT_SYMBOL(cbm_dp_port_alloc);
@@ -3183,6 +3256,9 @@ new file mode 100755
 +int cbm_get_wlan_umt_pid(u32 ep_id,  u32 *cbm_pid)
 +{
 +	uint32_t reg;
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	reg = cbm_ctrl_reg_shadow;
++#else
 +	reg = xrx500_cbm_r32(CBM_BASE + CBM_CTRL);
 +	LOGF_KLOG_INFO("0x%x 0x%x 0x%x 0x%x %d\r\n",
 +	((reg & 0xF00000) >> 20),
@@ -3190,6 +3266,8 @@ new file mode 100755
 +	((reg & 0xF00) >> 8),
 +	((reg & 0xF0) >> 4),
 +	ep_id);
++#endif
++
 +	if (((reg & 0xF00000) >> 20) == ep_id) {
 +		*cbm_pid = 0;
 +		return CBM_SUCCESS;
@@ -3244,7 +3322,7 @@ new file mode 100755
 +			}
 +		}
 +	}
-+#ifndef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
++
 +	local_entry = is_dp_allocated(CBM_PMAC_NOT_APPL, DP_F_CHECKSUM);
 +	if (local_entry) {
 +		for (j = 0; j < local_entry->qid_num; j++) {
@@ -3268,7 +3346,6 @@ new file mode 100755
 +			queue_number);
 +		}
 +	}
-+#endif
 +	return CBM_SUCCESS;
 +}
 +#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
@@ -3404,6 +3481,8 @@ new file mode 100755
 +		*/
 +		/*enable the queue for direcpath rx and checksum ports when a directpath port is enabled*/
 +		direct_dp_enable(port_id, flags, local_entry->egp_type);
++		if((local_entry->egp_type == DP_F_DIRECT) && (flags & CBM_PORT_F_DISABLE))
++			goto UNLOCK;
 +	}
 +	#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
 +	else if (local_entry && (local_entry->egp_type == DP_F_CHECKSUM))	{
@@ -3421,11 +3500,13 @@ new file mode 100755
 +	}
 +	/*Enable the TMU port, i*/
 +	tmu_egress_port_enable(res[0].tmu_port, (flags & CBM_PORT_F_DISABLE) ? 0 : 1);
++	UNLOCK:
 +	if (res)
 +		kfree(res);
 +	spin_unlock_irqrestore(&cbm_qidt_lock, sys_flag);
 +	return CBM_SUCCESS;
 +}
++EXPORT_SYMBOL(cbm_dp_enable);
 +
 +
 +#define CHECK_BIT(var, pos) ((var) & (1<<(pos)))
@@ -3482,7 +3563,8 @@ new file mode 100755
 +	}
 +}
 +
-+static int32_t cbm_empty_queue(int32_t cbm_port_id, uint32_t qocc, uint32_t port_type) {
++static int32_t cbm_empty_queue(int32_t cbm_port_id, uint32_t qocc, uint32_t port_type)
++{
 +	int i;
 +	int no_packet = 0;
 +	uint32_t reg = 0;
@@ -3608,8 +3690,7 @@ new file mode 100755
 +	#endif
 +	int chan;
 +	uint32_t wq, qrth, qocc, qavg;
-+	uint32_t qocc_temp, temp_reg = 0;
-+	uint32_t epoc[4];
++	uint32_t qocc_temp;
 +	cbm_debug_1("%s\r\n", __func__);
 +	if ((port_type == DQM_DMA_TYPE) || (port_type == DQM_LDMA_TYPE) || (port_type == DQM_WAVE_TYPE)) {
 +		chan = dqm_port_info[cbm_port_id].dma_ch;
@@ -3913,6 +3994,7 @@ new file mode 100755
 +	case DP_F_ENQ_CPU_2:
 +	case DP_F_ENQ_CPU_3:
 +	case DP_F_ENQ_WAVE:
++	case DP_F_ENQ_DL:
 +	break;
 +	default:
 +		LOGF_KLOG_ERROR("%s: Invalid flag for the port\r\n", __func__);
@@ -4018,12 +4100,16 @@ new file mode 100755
 +	uint32_t cbm_port[CBM_MAX_PHY_PORT_PER_EP];
 +	uint32_t local_flags = 0, local_num_ports = 0, result;
 +
-+	LOGF_KLOG_DEBUG("%s: dp %d\r\n", __func__, *dp_port);
-+	local_entry = is_dp_allocated(*dp_port, flags);
++	LOGF_KLOG_DEBUG("%s: flags 0x%x dp %d\r\n", __func__, flags, *dp_port);
++	if (dp_port) {
++		LOGF_KLOG_DEBUG("%s: dp %d\r\n", __func__, *dp_port);
++		local_entry = is_dp_allocated(*dp_port, flags);
++	} else {
++		local_entry = is_dp_allocated(0, flags);
++	}
 +	if (local_entry) {
 +		*num_tmu_ports = hweight_long(local_entry->egp_port_map);
-+		LOGF_KLOG_DEBUG("%s: number of tmu ports %d\r\n", __func__, *num_tmu_ports);
-+		if (*num_tmu_ports > 16)
++		if ((*num_tmu_ports > 16) || (*num_tmu_ports == 0))
 +			return -1;
 +		res = (cbm_tmu_res_t *)kmalloc(sizeof(cbm_tmu_res_t) * (*num_tmu_ports), GFP_ATOMIC);
 +		if (res) {
@@ -4043,13 +4129,9 @@ new file mode 100755
 +		} else {
 +			LOGF_KLOG_ERROR("%s error in allocating memory", __func__);
 +		}
-+	#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
-+	} else if ((!local_entry) && ((flags & DP_F_MPE_ACCEL) || (flags & DP_F_DIRECTPATH_RX) /*|| (flags & DP_F_CHECKSUM)*/)) {
-+	#else
 +	} else if ((!local_entry) && ((flags & DP_F_MPE_ACCEL) || (flags & DP_F_DIRECTPATH_RX) || (flags & DP_F_CHECKSUM))) {
-+	#endif
 +		return -1;
-+	} else if ((*dp_port <= 6) || (*dp_port == 15)) {
++	} else if (dp_port && ((*dp_port <= 6) || (*dp_port == 15))) {
 +		/*check if it is static pmac*/
 +			result = get_matching_pmac_noflags(cbm_port, *dp_port, &local_flags, &local_num_ports);
 +			if (result == CBM_SUCCESS) {
@@ -4581,8 +4663,8 @@ new file mode 100755
 +	uint32_t *deq_ctr,
 +	uint32_t flags)
 +{
-+	WARN_ON(!((cbm_port_id >= 5) && (cbm_port_id <= 23)));
-+	if ((cbm_port_id >= 5) && (cbm_port_id <= 23)) {
++	WARN_ON(!((cbm_port_id >= 4) && (cbm_port_id <= 26)));
++	if ((cbm_port_id >= 4) && (cbm_port_id <= 26)) {
 +		*deq_ctr = xrx500_cbm_r32(CBM_DQM_BASE
 +		+ CBM_DQM_CPU_PORT(cbm_port_id,
 +		dqpc));
@@ -4998,11 +5080,7 @@ new file mode 100755
 +			tmu_queue - SBID_START,
 +			tmu_queue,
 +			num_queue);
-+			#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
-+			if (/*(tmu_port == DQM_CHECKSUM_ID) ||*/ (tmu_port == DQM_DIRECTPATH_RX)) {
-+			#else
 +			if ((tmu_port == DQM_CHECKSUM_ID) || (tmu_port == DQM_DIRECTPATH_RX)) {
-+			#endif
 +				init_special_ports(tmu_port);
 +			}
 +			break;
@@ -5326,6 +5404,29 @@ new file mode 100755
 +			.port_type = port_enable;
 +			cbm_dma_vrx318_port_enable(tmu_port, CBM_PORT_F_STANDARD_BUF);
 +			break;
++		case EQM_DL_TYPE:
++			eqm_port_info[tmu_port]
++				.num_eq_ports = 1;
++			eqm_port_info[tmu_port].eq_info
++				.cbm_eq_port_base
++				= CBM_DMADESC_BASE + CBM_EQM_DMA_DESC(tmu_port, 0, 0);
++			eqm_port_info[tmu_port].eq_info
++				.port_no
++				= tmu_port;
++			eqm_port_info[tmu_port]
++				.port_type = port_enable;
++			eqm_port_info[tmu_port].eq_info
++				.num_desc
++				= num_desc;
++			eqm_port_info[tmu_port].eq_info
++				.dma_rx_chan_std
++				= dma_ctrl;
++			eqm_port_info[tmu_port]
++				.dma_dt_ctrl
++				= tmu_queue;
++			eqm_port_info[tmu_port]
++				.dma_dt_init_type
++				|= 255;
 +		default:
 +			LOGF_KLOG_ERROR("%s wrong key", __func__);
 +		}
@@ -5592,7 +5693,7 @@ diff --git a/drivers/net/ethernet/lantiq/cbm/cbm.h b/drivers/net/ethernet/lantiq
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/cbm/cbm.h
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,701 @@
 +#ifndef __CBM_COMMON_H__
 +#define __CBM_COMMON_H__
 +#include <linux/unistd.h>
@@ -5635,8 +5736,8 @@ new file mode 100755
 +#include "reg/fsqm.h"
 +#include <net/drv_tmu_ll.h>
 +
-+//#define CBM_DEBUG 1
-+//#define CBM_DEBUG_LVL_1 1
++/*#define CBM_DEBUG 1*/
++/*#define CBM_DEBUG_LVL_1 1*/
 +
 +/************************
 +* ENUM
@@ -5730,6 +5831,7 @@ new file mode 100755
 +	EQM_CPU_TYPE = 100,
 +	EQM_DMA_TYPE = 200,
 +	EQM_TOE_TYPE = 9,
++	EQM_DL_TYPE = 12,
 +	EQM_VRX318_TYPE = 15,
 +};
 +#if 0
@@ -52863,7 +52965,7 @@ diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
 new file mode 100755
 --- /dev/null
 +++ b/include/net/lantiq_cbm_api.h
-@@ -0,0 +1,1439 @@
+@@ -0,0 +1,1444 @@
 +#ifndef __CBM_API_H /* [ */
 +#define __CBM_API_H
 +/*! \file cbm_api.h
@@ -53049,6 +53151,7 @@ new file mode 100755
 +#define DP_F_ENQ_PAE 0x8
 +#define	DP_F_ENQ_TSO 0x9
 +#define	DP_F_ENQ_VRX318 0xa
++#define	DP_F_ENQ_DL 0xb
 +#define DP_F_DEQ_CPU 0x2
 +#define DP_F_DEQ_CPU1 0x3
 +#define DP_F_DEQ_MPE 0x4
@@ -54292,7 +54395,11 @@ new file mode 100755
 +	int32_t cbm_port_id,
 +	int32_t *delay
 +	);
-+extern int32_t cbm_port_quick_reset(int32_t cbm_port_id,uint32_t flags);
++extern int32_t cbm_port_quick_reset(int32_t cbm_port_id, uint32_t flags);
++
++extern uint32_t cbm_get_dptr_scpu_egp_count (uint32_t cbm_port_id, uint32_t flags);
++
++uint32_t cbm_get_std_free_count (void);
 +
 +/*
 + * cbm_eqm_ctrl_t

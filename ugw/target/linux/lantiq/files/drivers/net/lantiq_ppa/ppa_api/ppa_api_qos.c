@@ -66,7 +66,9 @@
 #define MAX_QOS_Q_CAPS 6 
 #if defined(WMM_QOS_CONFIG) && WMM_QOS_CONFIG
 
-int g_eth_class_prio_map[2][16] = {
+int g_eth_class_prio_map[4][16] = {
+					{0,1,2,3,4,5,6,7,7,7,7,7,7,7,7,7},
+					{0,1,2,3,4,5,6,7,7,7,7,7,7,7,7,7},
 					{0,1,2,3,4,5,6,7,7,7,7,7,7,7,7,7},
 					{0,1,2,3,4,5,6,7,7,7,7,7,7,7,7,7}
 				  };
@@ -93,6 +95,77 @@ static int32_t set_def_class2prio_map(uint8_t *class2prio)
 	return PPA_SUCCESS;
 }
 #endif
+
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+static uint32_t ppa_set_ingress_qos_generic(const char *ifname, uint32_t *flags)
+{
+	QOS_INGGRP_LIST_ITEM *p_item;
+	uint32_t ret;
+
+	if ((*flags & PPA_QOS_Q_F_INGRESS) || (*flags & PPA_QOS_OP_F_INGRESS))  {
+		ret = ppa_qos_inggrp_lookup(ifname, &p_item);
+		if (ret) {
+			ppa_debug(DBG_ENABLE_MASK_ERR, "%s:%d: ifname %s does not exist in qos inggrp list\n", __func__, __LINE__, ifname);
+			return ret;
+		}
+		ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s:%d: set ifname %s to ingress_group %d\n", __func__, __LINE__, ifname, p_item->ingress_group);
+		*flags |= inggrp2flags(p_item->ingress_group);
+		ppa_qos_inggrp_free_item(p_item); /* decrement reference counter */
+	}
+
+	return PPA_SUCCESS;
+}
+
+static uint32_t ppa_set_ingress_qos_classifier(PPA_CLASS_RULE *rule)
+{
+    QOS_INGGRP_LIST_ITEM *p_item;
+
+    if ((rule->action.flags & PPA_QOS_Q_F_INGRESS) != PPA_QOS_Q_F_INGRESS)
+        return PPA_SUCCESS;
+
+    if (ppa_qos_inggrp_lookup(rule->tx_if, &p_item) != PPA_SUCCESS) {
+        ppa_debug(DBG_ENABLE_MASK_ERR, "ifname %s does not exist in qos inggrp list\n", rule->rx_if);
+        return PPA_FAILURE;
+    }
+
+    /* TODO: verify groups 1-5 (see tmu_hal_set_ingress_grp_qmap logic) */
+    switch (p_item->ingress_group) {
+        case PPA_QOS_INGGRP0:
+            rule->action.fwd_action.processpath = 1; /* [MPE1|MPE2]=10 */
+            rule->action.qos_action.flowid = 0x0;    /* flowid[7:6]=00 */
+            break;
+        case PPA_QOS_INGGRP1:
+            rule->action.fwd_action.processpath = 3; /* [MPE1|MPE2]=11 */
+            rule->action.qos_action.flowid = 0x0;    /* flowid[7:6]=00 */
+            break;
+        case PPA_QOS_INGGRP2:
+            rule->action.fwd_action.processpath = 1; /* [MPE1|MPE2]=10 */
+            rule->action.qos_action.flowid = 0x40;   /* flowid[7:6]=01 */
+            break;
+        case PPA_QOS_INGGRP3:
+            rule->action.fwd_action.processpath = 3; /* [MPE1|MPE2]=11 */
+            rule->action.qos_action.flowid = 0x40;   /* flowid[7:6]=01 */
+            break;
+        case PPA_QOS_INGGRP4:
+        case PPA_QOS_INGGRP5:
+        default:
+            ppa_debug(DBG_ENABLE_MASK_ERR,"%s:%d: ingress group %d NOT supported!\n", __func__, __LINE__, p_item->ingress_group);
+            return PPA_FAILURE;
+    }
+
+    ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, "%s:%d: p_item->ingress_group=%d\n"
+					   "rule->action.qos_action.alt_trafficclass=%d\n"
+					   "rule->action.fwd_action.processpath=%d\n"
+					   "rule->action.qos_action.flowid=%d\n", __func__, __LINE__,
+					   p_item->ingress_group, rule->action.qos_action.alt_trafficclass,
+					   rule->action.fwd_action.processpath,
+					   rule->action.qos_action.flowid);
+    ppa_qos_inggrp_free_item(p_item); /* decrement reference counter */
+
+    return PPA_SUCCESS;
+}
+#endif
+
 static int32_t ppa_set_wlan_wmm_prio(PPA_IFNAME *ifname,int32_t port_id,int8_t caller_flag)
 {
     	struct netif_info *ifinfo;
@@ -112,6 +185,10 @@ static int32_t ppa_set_wlan_wmm_prio(PPA_IFNAME *ifname,int32_t port_id,int8_t c
 			port=0;
 			else if(!strcmp(ifname,"wlan1"))
 			port=1;
+			else if(!strcmp(ifname,"wlan2"))
+			port=2;
+			else if(!strcmp(ifname,"wlan3"))
+			port=3;
 			for(i=0;i<MAX_TC_NUM;i++)
 			{
 			//	c2p[i] = i;
@@ -156,6 +233,10 @@ static int32_t ppa_set_wlan_wmm_prio(PPA_IFNAME *ifname,int32_t port_id,int8_t c
 				port=0;
 				else if(!strcmp(ifname,"wlan1"))
 				port=1;
+				else if(!strcmp(ifname,"wlan2"))
+				port=2;
+				else if(!strcmp(ifname,"wlan3"))
+				port=3;
 				for(i=0;i<MAX_TC_NUM;i++)
 				{
 				//	cl2p[i] = i;
@@ -205,6 +286,8 @@ int32_t SCH_Q[] = {1,1,0,0};
 extern int32_t qosal_add_qos_queue(PPA_CMD_QOS_QUEUE_INFO *, QOS_QUEUE_LIST_ITEM **);
 extern int32_t qosal_modify_qos_queue(PPA_CMD_QOS_QUEUE_INFO *, QOS_QUEUE_LIST_ITEM **);
 extern int32_t qosal_delete_qos_queue(PPA_CMD_QOS_QUEUE_INFO *, QOS_QUEUE_LIST_ITEM *);
+extern int32_t qosal_set_qos_inggrp(PPA_CMD_QOS_INGGRP_INFO *inggrp_info, QOS_INGGRP_LIST_ITEM **pp_item);
+extern int32_t qosal_get_qos_inggrp(PPA_QOS_INGGRP inggrp, PPA_IFNAME ifnames[PPA_QOS_MAX_IF_PER_INGGRP][PPA_IF_NAME_SIZE]);
 extern int32_t qosal_set_qos_rate(PPA_CMD_RATE_INFO *, QOS_QUEUE_LIST_ITEM *,QOS_SHAPER_LIST_ITEM *);
 extern int32_t qosal_add_shaper(PPA_CMD_RATE_INFO *, QOS_SHAPER_LIST_ITEM **);
 extern int32_t qosal_eng_init_cfg();
@@ -217,41 +300,43 @@ extern void ppa_qos_queue_unlock_list(void);
 
 int32_t ppa_ioctl_add_qos_queue(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info)
 {
-    QOS_QUEUE_LIST_ITEM *p_item;
+	QOS_QUEUE_LIST_ITEM *p_item;
 
-    if ( copy_from_user( &cmd_info->qos_queue_info, (void *)arg, sizeof(cmd_info->qos_queue_info)) != 0 )
-        return PPA_FAILURE;
-    
-    if( qosal_add_qos_queue(&cmd_info->qos_queue_info,&p_item)!= PPA_SUCCESS)
-    {
-	return PPA_FAILURE;
-    }
-#if defined(WMM_QOS_CONFIG) && WMM_QOS_CONFIG
-    else
-    ppa_set_wlan_wmm_prio(cmd_info->qos_queue_info.ifname,-1,2);
+	if (copy_from_user(&cmd_info->qos_queue_info, (void *)arg, sizeof(cmd_info->qos_queue_info)) != 0)
+		return PPA_FAILURE;
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+	if (ppa_set_ingress_qos_generic(cmd_info->qos_queue_info.ifname, &cmd_info->qos_queue_info.flags)) 
+		return PPA_FAILURE;
 #endif
-    return PPA_SUCCESS;
-
+	if (qosal_add_qos_queue(&cmd_info->qos_queue_info,&p_item) != PPA_SUCCESS)
+		return PPA_FAILURE;
+#if defined(WMM_QOS_CONFIG) && WMM_QOS_CONFIG
+	else
+		ppa_set_wlan_wmm_prio(cmd_info->qos_queue_info.ifname,-1,2);
+#endif
+	return PPA_SUCCESS;
 }
 
 int32_t ppa_ioctl_modify_qos_queue(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info)
 {
-    QOS_QUEUE_LIST_ITEM *p_item;
-    int32_t ret;
+	QOS_QUEUE_LIST_ITEM *p_item;
+	int32_t ret;
 
-    if ( copy_from_user( &cmd_info->qos_queue_info, (void *)arg, sizeof(cmd_info->qos_queue_info)) != 0 )
-        return PPA_FAILURE;
-	
-    ppa_qos_queue_lock_list();
-    ret = ppa_qos_queue_lookup(cmd_info->qos_queue_info.queue_num,cmd_info->qos_queue_info.ifname,&p_item);
-    if( ret == PPA_QOS_QUEUE_NOT_FOUND )
-    return PPA_FAILURE;
-    else
-    ret = qosal_modify_qos_queue(&cmd_info->qos_queue_info,&p_item);
-    
-    ppa_qos_queue_unlock_list();
-    
-    return ret;
+	if (copy_from_user( &cmd_info->qos_queue_info, (void *)arg, sizeof(cmd_info->qos_queue_info)) != 0)
+		return PPA_FAILURE;
+
+	ppa_qos_queue_lock_list();
+	ret = ppa_qos_queue_lookup(cmd_info->qos_queue_info.queue_num,cmd_info->qos_queue_info.ifname,&p_item);
+	if (ret == PPA_QOS_QUEUE_NOT_FOUND)
+		return PPA_FAILURE;
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+	if (ppa_set_ingress_qos_generic(cmd_info->qos_queue_info.ifname, &cmd_info->qos_queue_info.flags)) 
+		return PPA_FAILURE;
+#endif
+	ret = qosal_modify_qos_queue(&cmd_info->qos_queue_info,&p_item);
+	ppa_qos_queue_unlock_list();
+
+	return ret;
 }
 
 int32_t ppa_ioctl_delete_qos_queue(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info)
@@ -260,13 +345,20 @@ int32_t ppa_ioctl_delete_qos_queue(unsigned int cmd, unsigned long arg, PPA_CMD_
     QOS_QUEUE_LIST_ITEM *p_item;
     QOS_SHAPER_LIST_ITEM *p_s_item;
     int32_t ret=0;
+
     if ( copy_from_user( &cmd_info->qos_queue_info, (void *)arg, sizeof(cmd_info->qos_queue_info)) != 0 )
         return PPA_FAILURE;
+
     ret = ppa_qos_queue_lookup(cmd_info->qos_queue_info.queue_num,cmd_info->qos_queue_info.ifname,&p_item);
-    if( ret == PPA_ENOTAVAIL )
-    return PPA_FAILURE;
-    else
-    ret = qosal_delete_qos_queue(&cmd_info->qos_queue_info,p_item);
+    if( ret == PPA_ENOTAVAIL ) {
+	    return PPA_FAILURE;
+    } else {
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+		if (ppa_set_ingress_qos_generic(cmd_info->qos_queue_info.ifname, &cmd_info->qos_queue_info.flags)) 
+			return PPA_FAILURE;
+#endif
+	    ret = qosal_delete_qos_queue(&cmd_info->qos_queue_info,p_item);
+    }
     /* Delete Shaper assigned to the Queue when the Queue is deleted */
 #if 1
     if(ret == PPA_SUCCESS)
@@ -1285,6 +1377,12 @@ int32_t ppa_ioctl_set_qos_rate(unsigned int cmd, unsigned long arg, PPA_CMD_DATA
     	else
     	phy_qid = p_item->p_entry;
     }
+
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+    if (ppa_set_ingress_qos_generic(cmd_info->qos_rate_info.ifname, &cmd_info->qos_rate_info.flags)) 
+		return PPA_FAILURE;
+#endif
+
     res = qosal_set_qos_rate(&cmd_info->qos_rate_info,p_item,p_s_item); 
 
     if ( res != PPA_SUCCESS )
@@ -1353,6 +1451,11 @@ int32_t ppa_ioctl_reset_qos_rate(unsigned int cmd, unsigned long arg, PPA_CMD_DA
     	else
     	phy_qid = p_item->p_entry;
     }
+
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+    if (ppa_set_ingress_qos_generic(cmd_info->qos_rate_info.ifname, &cmd_info->qos_rate_info.flags)) 
+		return PPA_FAILURE;
+#endif
 
     res = qosal_reset_qos_rate(&cmd_info->qos_rate_info,p_item,p_s_item); 
 
@@ -1669,7 +1772,11 @@ int32_t ppa_ioctl_add_class_rule (unsigned int cmd, unsigned long arg, PPA_CMD_D
    
     set_port_subifid(&cmd_info->class_info); 
 
-    ret=ppa_add_class_rule(&cmd_info->class_info);
+    ret = ppa_set_ingress_qos_classifier(&cmd_info->class_info);
+    if (ret != PPA_SUCCESS)
+        return ret;
+
+    ret = ppa_add_class_rule(&cmd_info->class_info);
     if ( ppa_copy_to_user( (void *)arg, &cmd_info->class_info, sizeof(cmd_info->class_info)) != 0 )
         return PPA_FAILURE;
 
@@ -1718,7 +1825,28 @@ int32_t ppa_ioctl_del_class_rule (unsigned int cmd, unsigned long arg, PPA_CMD_D
 
 }
 #endif
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+int32_t ppa_ioctl_set_qos_ingress_group(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *cmd_info)
+{
+    QOS_INGGRP_LIST_ITEM *p_item;
 
+    if (copy_from_user(&cmd_info->qos_inggrp_info, (void *)arg, sizeof(cmd_info->qos_inggrp_info)) != 0)
+        return PPA_FAILURE;
+
+    if (qosal_set_qos_inggrp(&cmd_info->qos_inggrp_info, &p_item) != PPA_SUCCESS)
+        return PPA_FAILURE;
+
+    return PPA_SUCCESS;
+}
+EXPORT_SYMBOL(ppa_ioctl_set_qos_ingress_group);
+
+int32_t ppa_ioctl_get_qos_ingress_group(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *cmd_info)
+{
+    /* Place Holder */
+    return PPA_SUCCESS;
+}
+EXPORT_SYMBOL(ppa_ioctl_get_qos_ingress_group);
+#endif
 EXPORT_SYMBOL(ppa_ioctl_add_qos_queue);
 EXPORT_SYMBOL(ppa_ioctl_modify_qos_queue);
 EXPORT_SYMBOL(ppa_ioctl_delete_qos_queue);

@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2006-2015 OpenWrt.org
+# Copyright (C) 2006-2014 OpenWrt.org
 #
 # This is free software, licensed under the GNU General Public License v2.
 # See /LICENSE for more information.
@@ -12,7 +12,7 @@ include $(INCLUDE_DIR)/feeds.mk
 PKG_NAME:=opkg
 PKG_REV:=9c97d5ecd795709c8584e972bfdf3aee3a5b846d
 PKG_VERSION:=$(PKG_REV)
-PKG_RELEASE:=9
+PKG_RELEASE:=8
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_VERSION:=$(PKG_REV)
@@ -116,9 +116,8 @@ define Package/opkg/Default/install
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_DATA) ./files/customfeeds.conf $(1)/etc/opkg/customfeeds.conf
 	$(INSTALL_DATA) ./files/opkg$(2).conf $(1)/etc/opkg.conf
-	#$(call FeedSourcesAppend,$(1)/etc/opkg/distfeeds.conf)
-	#$(VERSION_SED) $(1)/etc/opkg/distfeeds.conf
-	$(INSTALL_BIN) ./files/distfeeds.conf $(1)/etc/opkg/distfeeds.conf
+	$(call FeedSourcesAppend,$(1)/etc/opkg/distfeeds.conf)
+	$(VERSION_SED) $(1)/etc/opkg/distfeeds.conf
 	$(INSTALL_BIN) ./files/20_migrate-feeds $(1)/etc/uci-defaults/
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/opkg-cl $(1)/bin/opkg
 endef

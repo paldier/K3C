@@ -144,6 +144,7 @@ typedef enum{
     PPA_DIRECTPATH_EX_SEND_FN,
     PPA_DIRECTPATH_ALLOC_SKB_FN,
     PPA_DIRECTPATH_RECYCLE_SKB_FN,
+    PPA_GET_CT_STAT_FN,
     PPA_HOOK_FN_MAX,
 }PPA_EXPORT_FN_NO;
 
@@ -310,6 +311,10 @@ extern PPA_HOOK_INFO g_expfn_table[PPA_HOOK_FN_MAX];
     2. smp in function call and module unload
 */
 
+
+WRPFN_2(int32_t, ppa_get_ct_stats_rpfn,      PPA_SESSION*,   p_session, PPA_CT_COUNTER*, pCtCounter, PPA_GET_CT_STAT_FN)
+
+
 WRPFN_3(int32_t, ppa_enable_rpfn ,     uint32_t,   lan_rx_ppa_enable, uint32_t,  wan_rx_ppa_enable, uint32_t, flags, PPA_ENABLE_FN )
 WRPFN_3(int32_t, ppa_get_status_rpfn,  uint32_t*,  lan_rx_ppa_enable, uint32_t*, wan_rx_ppa_enable, uint32_t, flags, PPA_GET_STATUS_FN)
 
@@ -370,7 +375,7 @@ WRPFN_4(int32_t, ppa_register_for_qos_class2prio_rpfn,	int32_t,	port_id,	PPA_NET
 #ifdef CONFIG_LTQ_PPA_API_DIRECTPATH
 WRPFN_4(int32_t, ppa_directpath_register_dev_rpfn,  uint32_t*,  p_if_id,    PPA_NETIF*, netif,  PPA_DIRECTPATH_CB*,pDirectpathCb,   uint32_t,   flags, PPA_DIRECTPATH_REGISTER_DEV_FN)
 WRPFN_4(int32_t, ppa_directpath_ex_register_dev_rpfn,  PPA_SUBIF*,  subif,    PPA_NETIF*, netif,  PPA_DIRECTPATH_CB*,pDirectpathCb,   uint32_t,   flags, PPA_DIRECTPATH_EX_REGISTER_DEV_FN)
-WRPFN_4(int32_t, ppa_directpath_ex_send_rpfn,          PPA_SUBIF*,   subif,   PPA_BUF*,   skb,    int32_t,            len,            uint32_t,   flags, PPA_DIRECTPATH_EX_SEND_FN)
+WRPFN_4(int32_t, ppa_directpath_ex_send_rpfn,          PPA_SUBIF*,   subif,   PPA_SKBUF*,   skb,    int32_t,            len,            uint32_t,   flags, PPA_DIRECTPATH_EX_SEND_FN)
 WRPFN_2(int32_t, ppa_directpath_rx_stop_rpfn,       uint32_t,   if_id,      uint32_t,   flags,  PPA_DIRECTPATH_RX_STOP_FN)
 WRPFN_2(int32_t, ppa_directpath_ex_rx_stop_rpfn,       PPA_SUBIF*,   subif,      uint32_t,   flags,  PPA_DIRECTPATH_EX_RX_STOP_FN)
 WRPFN_2(int32_t, ppa_directpath_rx_restart_rpfn,    uint32_t,   if_id,      uint32_t,   flags,  PPA_DIRECTPATH_RX_RESTART_FN)
@@ -380,8 +385,8 @@ WRPFN_1(int32_t, ppa_get_ifid_for_netif_rpfn,       PPA_NETIF*, netif,      PPA_
 WRPFN_4(int32_t, ppa_directlink_register_dev_rpfn, int32_t*, p_if_id, PPA_DTLK_T*, dtlk, PPA_DIRECTPATH_CB*, pDirectpathCb, uint32_t,  flags, PPA_DTLK_REGISTER_DEV_FN)
 #endif /*CONFIG_ACCL_11AC*/
 
-WRPFN_3(PPA_BUF*, ppa_directpath_alloc_skb_rpfn, PPA_SUBIF*, psubif, int32_t,  len, uint32_t, flags, PPA_DIRECTPATH_ALLOC_SKB_FN);
-WRPFN_3(int32_t, ppa_directpath_recycle_skb_rpfn, PPA_SUBIF*, psubif, PPA_BUF*, skb, uint32_t, flags, PPA_DIRECTPATH_RECYCLE_SKB_FN);
+WRPFN_3(PPA_SKBUF*, ppa_directpath_alloc_skb_rpfn, PPA_SUBIF*, psubif, int32_t,  len, uint32_t, flags, PPA_DIRECTPATH_ALLOC_SKB_FN);
+WRPFN_3(int32_t, ppa_directpath_recycle_skb_rpfn, PPA_SUBIF*, psubif, PPA_SKBUF*, skb, uint32_t, flags, PPA_DIRECTPATH_RECYCLE_SKB_FN);
 
 #endif /* CONFIG_LTQ_PPA_API_DIRECTPATH */
 
@@ -400,11 +405,11 @@ WRPFN_1(uint32_t, ppa_hook_get_wan_seperate_flag_rpfn,uint32_t, flags,      PPA_
 #if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
 WRPFN_1(int32_t, ppa_hook_set_sw_fastpath_enable_rpfn, uint32_t, flags, PPA_ENABLE_SW_FASTPATH_FN)
 WRPFN_1(int32_t, ppa_hook_get_sw_fastpath_status_rpfn, uint32_t, flags, PPA_GET_SW_FASTPATH_STATUS_FN)
-WRPFN_1(int32_t, ppa_hook_sw_fastpath_send_rpfn, PPA_BUF*, skb, PPA_SW_FASTPATH_SEND_FN) 
+WRPFN_1(int32_t, ppa_hook_sw_fastpath_send_rpfn, PPA_SKBUF*, skb, PPA_SW_FASTPATH_SEND_FN) 
 #endif
 
 extern PPA_NETIF* ppa_get_netif_for_ppa_ifid_rpfn(uint32_t if_id);
-extern int32_t ppa_directpath_send_rpfn(uint32_t rx_if_id, PPA_BUF *skb, int32_t len, uint32_t flags);
+extern int32_t ppa_directpath_send_rpfn(uint32_t rx_if_id, PPA_SKBUF *skb, int32_t len, uint32_t flags);
 
 
 int32_t ppa_ioctl_set_value(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *cmd_info);

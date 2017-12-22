@@ -102,6 +102,7 @@
 #include <linux/if_tunnel.h>
 #include <net/ip6_tunnel.h>
 #include <linux/kallsyms.h>
+#include <linux/if_macvlan.h>
 /*Note, don't call any other PPA functions/varaible outside of stack adaption layer, like g_ppa_dbg_enable. The reason is the ppa
    stack layer is the first module loaded into kernel. All other PPA modules depend on it. */
 
@@ -205,8 +206,6 @@ static DEFINE_SPINLOCK(g_local_irq_save_flag_lock);
  *            Local Function
  * ####################################
  */
-static INLINE struct dst_entry *ppa_dst(const PPA_BUF *buf);
-static INLINE struct net_device *ppa_dev_get_by_name(const PPA_IFNAME *ifname);
 static INLINE int ppa_dev_is_br(PPA_NETIF *netif);
 static uint8_t *ppa_get_transport_header(const PPA_BUF *ppa_buf);
 
@@ -412,7 +411,15 @@ uint32_t ppa_is_ip_fragment(PPA_BUF *ppa_buf)
 }
 /*=====function above are special for ipv4 =====*/
 
-
+#ifdef CONFIG_PPA_PP_LEARNING
+uint16_t ppa_get_pkt_protocol(PPA_BUF *ppa_buf)
+{
+	if(ppa_buf)
+		return ppa_buf->protocol;
+	return 0;
+}
+EXPORT_SYMBOL(ppa_get_pkt_protocol);
+#endif
 
 uint8_t ppa_get_pkt_ip_proto(PPA_BUF *ppa_buf)
 {
@@ -438,16 +445,16 @@ uint8_t ppa_get_pkt_ip_tos(PPA_BUF *ppa_buf)
     return ppa_get_ip_tos(ppa_buf);
 }
 
-PPA_IPADDR ppa_get_pkt_src_ip(PPA_BUF *ppa_buf)
+void ppa_get_pkt_src_ip(PPA_IPADDR *ip, PPA_BUF *ppa_buf)
 {
 
 #if defined(CONFIG_LTQ_PPA_IPv6_ENABLE) && (defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE))
     if(ppa_is_pkt_ipv6(ppa_buf)){
-        return ppa_get_ipv6_saddr(ppa_buf);
-    }
+        *ip = ppa_get_ipv6_saddr(ppa_buf);
+    } else 
 #endif
 
-    return ppa_get_ip_saddr(ppa_buf);
+    *ip = ppa_get_ip_saddr(ppa_buf);
 }
 
 uint32_t ppa_get_pkt_ip_len(PPA_BUF *ppa_buf)
@@ -462,15 +469,15 @@ uint32_t ppa_get_pkt_ip_len(PPA_BUF *ppa_buf)
     return sizeof(uint32_t);
 }
 
-PPA_IPADDR ppa_get_pkt_dst_ip(PPA_BUF *ppa_buf)
+void ppa_get_pkt_dst_ip(PPA_IPADDR *ip, PPA_BUF *ppa_buf)
 {
 #if defined(CONFIG_LTQ_PPA_IPv6_ENABLE) && (defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE))
     if(ppa_is_pkt_ipv6(ppa_buf)){
-        return ppa_get_ipv6_daddr(ppa_buf);
-    }
+        *ip = ppa_get_ipv6_daddr(ppa_buf);
+    } else 
 #endif
 
-    return ppa_get_ip_daddr(ppa_buf);
+    *ip = ppa_get_ip_daddr(ppa_buf);
 }
 
 int8_t *ppa_get_pkt_ip_string(PPA_IPADDR ppa_ip, uint32_t flag, int8_t *strbuf)
@@ -561,6 +568,15 @@ uint16_t ppa_get_pkt_dst_port(PPA_BUF *ppa_buf)
     return (uint16_t)(((struct udphdr *)ppa_get_transport_header(ppa_buf))->dest);
 }
 
+uint8_t *ppa_get_pkt_src_mac_ptr(PPA_BUF *ppa_buf)
+{
+#ifdef CONFIG_MIPS
+    if ( (uint32_t)skb_mac_header(ppa_buf) < KSEG0 )
+        return NULL;
+#endif
+    return skb_mac_header(ppa_buf) + PPA_ETH_ALEN;
+}
+
 void ppa_get_pkt_rx_src_mac_addr(PPA_BUF *ppa_buf, uint8_t mac[PPA_ETH_ALEN])
 {
 #ifdef CONFIG_MIPS
@@ -576,6 +592,15 @@ void ppa_get_pkt_rx_dst_mac_addr(PPA_BUF *ppa_buf, uint8_t mac[PPA_ETH_ALEN])
 #endif
         ppa_memcpy(mac, skb_mac_header(ppa_buf), PPA_ETH_ALEN);
 }
+
+
+void ppa_get_src_mac_addr(PPA_BUF *ppa_buf, uint8_t mac[PPA_ETH_ALEN],const int offset)
+{
+        ppa_memcpy(mac, ((uint8_t*) (ppa_buf->data)) + offset + PPA_ETH_ALEN, PPA_ETH_ALEN);
+}
+
+
+
 
 /*
  *  If it is multicast packet, then return multicast dst & src ip address and success, otherwise return failure(-1).
@@ -689,13 +714,6 @@ PPA_NETIF *ppa_get_pkt_dst_if(PPA_BUF *ppa_buf)
     }
 }
 
-uint32_t ppa_get_pkt_priority(PPA_BUF *ppa_buf)
-{
-  if( ppa_buf ) return ppa_buf->priority;
-    
-  return 0;
-}
-
 #if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
 uint32_t ppa_get_session_priority(PPA_BUF *ppa_buf)
 {
@@ -753,31 +771,6 @@ uint32_t ppa_get_tcp_steady_offset(uint32_t flags)
 
 #endif
 
-uint32_t ppa_get_skb_mark(PPA_BUF *ppa_buf)
-{
-    if( ppa_buf ) return ppa_buf->mark;
-    else return 0;
-}
-
-#ifdef CONFIG_NETWORK_EXTMARK
-uint32_t ppa_get_skb_extmark(PPA_BUF *ppa_buf)
-{
-    if( ppa_buf ) return ppa_buf->extmark;
-    else return 0;
-}
-#endif
-
-uint32_t ppa_set_pkt_priority(PPA_BUF *ppa_buf, uint32_t new_pri)
-{
-    if( ppa_buf )
-    {
-        ppa_buf->priority = new_pri;
-        return ppa_buf->priority;
-    }
-    else
-        return 0;
-}
-
 #if (!defined(CONFIG_PPPOE) && !defined(CONFIG_PPPOE_MODULE)) || (!defined(CONFIG_LTQ_PPA_API) && !defined(CONFIG_LTQ_PPA_API_MODULE))
 int32_t ppa_pppoe_get_pppoe_addr(PPA_NETIF *netif, struct pppoe_addr *pa)
 {
@@ -830,8 +823,6 @@ int32_t ppa_pppol2tp_get_dst_addr(struct net_device *dev, uint32_t *outer_dstip)
     return PPA_EPERM;
 }
 #endif
-
-
 
 #if (defined(CONFIG_PPPOE) || defined(CONFIG_PPPOE_MODULE))
 
@@ -930,6 +921,15 @@ uint32_t ppa_check_is_pppol2tp_netif(PPA_NETIF *netif)
     return 0;
   }
   return ppa_pppol2tp_get_l2tp_addr(netif, &pa) == PPA_SUCCESS ? 1 : 0;
+#endif
+}
+
+static inline int ppa_dev_is_br(PPA_NETIF *netif)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
+    return (netif->hard_start_xmit == br_dev_xmit);
+#else
+    return (netif->netdev_ops->ndo_start_xmit == br_dev_xmit);
 #endif
 }
 
@@ -1168,21 +1168,6 @@ hwaddr_error:
   return PPA_ENOTAVAIL;
 }
 
-PPA_IFNAME *ppa_get_netif_name(PPA_NETIF *netif)
-{
-    return netif ? netif->name : NULL;
-}
-
-uint32_t ppa_is_netif_equal(PPA_NETIF *netif1, PPA_NETIF *netif2)
-{
-    return netif1 && netif2 && netif1->ifindex == netif2->ifindex ? 1 : 0;
-}
-
-uint32_t ppa_is_netif_name(PPA_NETIF *netif, PPA_IFNAME *ifname)
-{
-    return netif && ifname && strcmp(netif->name, ifname) == 0 ? 1 : 0;
-}
-
 //uint32_t ppa_is_netif_name_prefix(PPA_NETIF *netif, PPA_IFNAME *ifname_prefix, int n)
 //{
 //    return netif && strncmp(netif->name, ifname_prefix, n) == 0 ? 1 : 0;
@@ -1221,6 +1206,13 @@ int32_t ppa_get_physical_if(PPA_NETIF *netif, PPA_IFNAME *ifname, PPA_IFNAME phy
     }
 ppp_ret:        
     return ret;
+  }
+
+  if (netif_is_macvlan(netif)) {
+    netif = macvlan_dev_real_dev(netif);
+    if (netif != NULL)
+       return ppa_get_physical_if(netif, NULL, phy_ifname);
+    return PPA_FAILURE;
   }
 
   if( ppa_is_gre_netif(netif) ) {
@@ -1267,6 +1259,25 @@ ppp_ret:
   return PPA_SUCCESS;
 }
 
+int32_t ppa_get_lower_if(PPA_NETIF *netif, PPA_IFNAME *ifname, PPA_IFNAME lower_ifname[PPA_IF_NAME_SIZE])
+{
+  if ( !netif )
+    netif = ppa_get_netif(ifname);
+
+  if ( !netif )
+    return PPA_EINVAL;
+
+  lower_ifname[0] = '\0';
+
+  if (netif_is_macvlan(netif)) {
+    struct net_device *lowerdev = macvlan_dev_real_dev(netif);
+    if (lowerdev != NULL)
+       ppa_strncpy(lower_ifname, lowerdev->name, PPA_IF_NAME_SIZE);
+  }
+  return PPA_SUCCESS;
+}
+EXPORT_SYMBOL(ppa_get_lower_if);
+
 //int32_t ppa_get_underlying_vlan_if(PPA_NETIF *netif, PPA_IFNAME *ifname, PPA_IFNAME vlan_ifname[PPA_IF_NAME_SIZE])
 //{
 //    int ret = -1;
@@ -1301,8 +1312,9 @@ int32_t ppa_if_is_vlan_if(PPA_NETIF *netif, PPA_IFNAME *ifname)
     if ( !netif )
         return 0;  //  can not get interface
 
-    if ( (netif->priv_flags & IFF_802_1Q_VLAN) )
+    if ( (netif->priv_flags & IFF_802_1Q_VLAN) ) {
         return 1;
+    }
 
 #if defined(CONFIG_WAN_VLAN_SUPPORT)
     if ( (netif->priv_flags & IFF_BR2684_VLAN) )
@@ -1321,8 +1333,8 @@ int32_t ppa_is_macvlan_if(PPA_NETIF *netif, PPA_IFNAME *ifname)
 
     if ( !netif )
         return 0;  //  can not get interface
-    
-    if ( (netif->priv_flags & IFF_MACVLAN_PORT) )
+
+    if (netif_is_macvlan(netif))
         return 1;
 
     return 0;
@@ -1405,6 +1417,15 @@ uint32_t ppa_get_vlan_id(PPA_NETIF *netif)
 #endif
 
     return ~0;
+}
+
+uint16_t ppa_get_vlan_type(PPA_NETIF *netif)
+{
+#if defined(CONFIG_VLAN_8021Q) || defined(CONFIG_VLAN_8021Q_MODULE)
+    return (vlan_dev_priv(netif)->vlan_proto);
+# else
+    return 0;
+#endif
 }
 
 uint32_t ppa_get_vlan_tag(PPA_BUF *ppa_buf)
@@ -1623,13 +1644,9 @@ uint32_t ppa_get_session_helper(PPA_SESSION *p_session)
 #endif
 }
 
-static inline uint32_t ppa_get_nat_helper(PPA_SESSION *p_session)
+int32_t ppa_bypass_lro(PPA_SESSION *p_session)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0) && defined(CONFIG_IP_NF_NAT_NEEDED)
-    return p_session ? (uint32_t)(p_session->nat.info.helper) : 0;
-#else
-    return 0;
-#endif
+	return ((p_session->mark & 0x100) == 0x100 ? 1 : 0);
 }
 
 uint32_t ppa_check_is_special_session(PPA_BUF *ppa_buf, PPA_SESSION *p_session)
@@ -1651,44 +1668,12 @@ uint32_t ppa_check_is_special_session(PPA_BUF *ppa_buf, PPA_SESSION *p_session)
     return 0;
 }
 
-int32_t ppa_is_pkt_host_output(PPA_BUF *ppa_buf)
-{
-    return ppa_buf->dev == NULL || ppa_buf->pkt_type == PACKET_OUTGOING ? 1 : 0;
-}
-
-int32_t ppa_is_pkt_host_in(PPA_BUF *ppa_buf)
-{
-    return ppa_buf->dev == NULL || ppa_buf->pkt_type == PACKET_HOST ? 1 : 0;
-}
-
-int32_t ppa_is_pkt_broadcast(PPA_BUF *ppa_buf)
-{
-    return ppa_buf->pkt_type == PACKET_BROADCAST ? 1 : 0;
-}
-
-int32_t ppa_is_pkt_loopback(PPA_BUF *ppa_buf)
-{
-    return ppa_buf->pkt_type == PACKET_LOOPBACK ? 1 : 0;
-}
-
 int32_t ppa_is_pkt_local(PPA_BUF *ppa_buf)
 {
     /* XXX: Check this. What about ip_mc_forward */
     /* return ((uint32_t)ppa_buf->dst->input != (uint32_t)ip_forward); */
     struct dst_entry *dst = ppa_dst(ppa_buf);
     return dst != NULL && (uint32_t)(dst->input) == (uint32_t)ip_local_deliver ? 1 : 0;
-}
-
-int32_t ppa_is_tcp_established(PPA_SESSION *ppa_session)
-{
-    return ppa_session->proto.tcp.state == TCP_CONNTRACK_ESTABLISHED ? 1 : 0;
-}
-
-//  for backward compatible
-int32_t ppa_is_tcp_open(PPA_SESSION *ppa_session)
-{
-    //  return nonzero if the tcp state is not TIME_WAIT or error
-    return ppa_session->proto.tcp.state < TCP_CONNTRACK_TIME_WAIT ? 1 : 0;
 }
 
 int32_t ppa_lock_init(PPA_LOCK *p_lock)
@@ -1772,6 +1757,16 @@ void *ppa_malloc(uint32_t size)
         flags = GFP_KERNEL;
     return kmalloc(size, flags);
 }
+
+void *ppa_alloc_dma(uint32_t size)
+{
+    gfp_t flags;
+
+    flags = GFP_DMA;
+    return kmalloc(size, flags);
+}
+EXPORT_SYMBOL(ppa_alloc_dma);
+
 
 int32_t ppa_free(void *buf)
 {
@@ -2183,13 +2178,12 @@ PPA_SIZE_T  ppa_strlen(const uint8_t *s)
     return strlen(s);
 }
 
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
 int32_t ppa_str_cmp(char *str1,char *str2)
 {
     return ( (strcmp(str1,str2) == 0) ? 1 : 0);
 }
 
-
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
 session_type ppa_is_ipv4_ipv6(PPA_XFRM_STATE *x)
 {       
         switch (x->props.family) {
@@ -2200,13 +2194,13 @@ session_type ppa_is_ipv4_ipv6(PPA_XFRM_STATE *x)
                 return SESSION_IPV6;
         }
 }
-
-bool ppa_ipsec_addr_equal(xfrm_address_t *a, xfrm_address_t *b, sa_family_t family)
+//bool ppa_ipsec_addr_equal(xfrm_address_t *a, xfrm_address_t *b, sa_family_t family)
+bool ppa_ipsec_addr_equal(PPA_XFRM_ADDR *a, PPA_XFRM_ADDR *b, PPA_SA_FAMILY family)
 {
         switch (family) {
         default:
         case AF_INET:
-                return ((__force u32)a->a4 ^ (__force u32)b->a4) == 0;
+		return ((__force u32)a->a4 ^ (__force u32)b->a4) == 0;
         case AF_INET6:
                 return xfrm6_addr_equal(a, b);
         }
@@ -2351,25 +2345,6 @@ int ppa_get_hash_from_packet( PPA_BUF *ppa_buf,
 }
 EXPORT_SYMBOL(ppa_get_hash_from_packet);
 
-static INLINE struct dst_entry *ppa_dst(const PPA_BUF *buf)
-{
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
-    return buf->dst;
-#else
-    return skb_dst(buf);
-#endif
-}
-
-static INLINE struct net_device *ppa_dev_get_by_name(const PPA_IFNAME *ifname)
-{
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
-    return dev_get_by_name(ifname);
-#else
-    return dev_get_by_name(&init_net, ifname);
-#endif
-
-}
-
 #ifdef CONFIG_LTQ_MINI_JUMBO_FRAME_SUPPORT
 int  ppa_get_mtu(PPA_NETIF *netif)
 {
@@ -2418,6 +2393,14 @@ int  ppa_get_mtu(PPA_NETIF *netif)
 }
 #endif
 
+#if defined(CONFIG_LTQ_PPA_TCP_LITEPATH) && CONFIG_LTQ_PPA_TCP_LITEPATH
+int ppa_do_ip_route(PPA_BUF *skb, PPA_NETIF *netif)
+{
+    return ip_route_input_noref(skb, ip_hdr(skb)->daddr, ip_hdr(skb)->saddr, ip_hdr(skb)->tos, netif);	
+}
+EXPORT_SYMBOL(ppa_do_ip_route);
+#endif
+
 uint32_t cal_64_div(uint64_t t1, uint64_t t2)
 { /* cal the value of t1 divided by t2 */
     if( t1 == 0 ) return 0;
@@ -2435,15 +2418,29 @@ uint32_t cal_64_div(uint64_t t1, uint64_t t2)
     return (uint32_t)t1/(uint32_t)t2;
 }
 
-
-static INLINE int ppa_dev_is_br(PPA_NETIF *netif)
+extern int sysctl_ip_default_ttl;
+int32_t ppa_get_ip_ttl()
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
-    return (netif->hard_start_xmit == br_dev_xmit);
-#else
-    return (netif->netdev_ops->ndo_start_xmit == br_dev_xmit);
-#endif
+    return sysctl_ip_default_ttl;
 }
+
+
+void ppa_si_meminfo(PPA_SYSINFO *sysinfo)
+{
+    return si_meminfo(sysinfo);
+}
+#ifndef CONFIG_SWAP
+void ppa_si_swapinfo(PPA_SYSINFO *sysinfo)
+{
+    return si_swapinfo(sysinfo);
+}
+
+uint64_t ppa_si_freeram(PPA_SYSINFO *sysinfo)
+{
+    return sysinfo->freeram;
+} 
+
+#endif
 
 #ifdef CONFIG_LTQ_PPA_STANDALONE_AL
 int __init ppa_api_stack_init(void)
@@ -2472,15 +2469,12 @@ EXPORT_SYMBOL(ppa_get_pkt_dst_ip);
 EXPORT_SYMBOL(ppa_get_pkt_ip_string);
 EXPORT_SYMBOL(ppa_get_pkt_src_port);
 EXPORT_SYMBOL(ppa_get_pkt_dst_port);
+EXPORT_SYMBOL(ppa_get_pkt_src_mac_ptr);
 EXPORT_SYMBOL(ppa_get_pkt_rx_src_mac_addr);
+EXPORT_SYMBOL(ppa_get_src_mac_addr);
 EXPORT_SYMBOL(ppa_get_pkt_rx_dst_mac_addr);
 EXPORT_SYMBOL(ppa_get_pkt_src_if);
 EXPORT_SYMBOL(ppa_get_pkt_dst_if);
-EXPORT_SYMBOL(ppa_get_pkt_priority);
-EXPORT_SYMBOL(ppa_get_skb_mark);
-#ifdef CONFIG_NETWORK_EXTMARK
-EXPORT_SYMBOL(ppa_get_skb_extmark);
-#endif
 #if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS)
 EXPORT_SYMBOL(ppa_get_low_prio_thresh);
 EXPORT_SYMBOL(ppa_get_def_prio_thresh);
@@ -2495,7 +2489,6 @@ EXPORT_SYMBOL(ppa_get_tcp_steady_offset);
 EXPORT_SYMBOL(ppa_get_tcp_initial_offset);
 #endif
 
-EXPORT_SYMBOL(ppa_set_pkt_priority);
 #if !defined(CONFIG_PPPOE) && !defined(CONFIG_PPPOE_MODULE)
   EXPORT_SYMBOL(ppa_pppoe_get_pppoe_addr);
   EXPORT_SYMBOL(ppa_pppoe_get_pppoe_session_id);
@@ -2527,9 +2520,6 @@ EXPORT_SYMBOL(ppa_get_mtu);
 EXPORT_SYMBOL(ppa_put_netif);
 EXPORT_SYMBOL(ppa_get_netif_hwaddr);
 EXPORT_SYMBOL(ppa_get_br_dev);
-EXPORT_SYMBOL(ppa_get_netif_name);
-EXPORT_SYMBOL(ppa_is_netif_equal);
-EXPORT_SYMBOL(ppa_is_netif_name);
 //EXPORT_SYMBOL(ppa_is_netif_name_prefix);
 EXPORT_SYMBOL(ppa_get_physical_if);
 //EXPORT_SYMBOL(ppa_get_underlying_vlan_if);
@@ -2538,6 +2528,7 @@ EXPORT_SYMBOL(ppa_is_macvlan_if);
 EXPORT_SYMBOL(ppa_vlan_get_underlying_if);
 EXPORT_SYMBOL(ppa_vlan_get_physical_if);
 EXPORT_SYMBOL(ppa_get_vlan_id);
+EXPORT_SYMBOL(ppa_get_vlan_type);
 EXPORT_SYMBOL(ppa_get_vlan_tag);
 EXPORT_SYMBOL(ppa_is_bond_slave);
 EXPORT_SYMBOL(ppa_is_netif_bridged);
@@ -2559,12 +2550,9 @@ EXPORT_SYMBOL(ppa_is_session_equal);
 EXPORT_SYMBOL(ppa_get_session_helper);
 EXPORT_SYMBOL(ppa_check_is_special_session);
 EXPORT_SYMBOL(ppa_is_pkt_fragment);
-EXPORT_SYMBOL(ppa_is_pkt_host_output);
-EXPORT_SYMBOL(ppa_is_pkt_host_in);
-EXPORT_SYMBOL(ppa_is_pkt_broadcast);
 EXPORT_SYMBOL(ppa_get_pkt_mac_string);
 EXPORT_SYMBOL(ppa_is_pkt_multicast);
-EXPORT_SYMBOL(ppa_is_pkt_loopback);
+
 EXPORT_SYMBOL(ppa_is_pkt_local);
 EXPORT_SYMBOL(ppa_is_pkt_routing);
 EXPORT_SYMBOL(ppa_is_pkt_mc_routing);
@@ -2618,8 +2606,8 @@ EXPORT_SYMBOL(ppa_copy_to_user);
 EXPORT_SYMBOL(ppa_strcpy);
 EXPORT_SYMBOL(ppa_strncpy);
 EXPORT_SYMBOL(ppa_strlen);
-#if defined(CONFIG_LTQ_PPA_MPE_IP97)
 EXPORT_SYMBOL(ppa_str_cmp);
+#if defined(CONFIG_LTQ_PPA_MPE_IP97)
 EXPORT_SYMBOL(ppa_is_ipv4_ipv6);
 EXPORT_SYMBOL(ppa_ipsec_addr_equal);
 #endif
@@ -2643,4 +2631,11 @@ EXPORT_SYMBOL(ppa_vlan_dev_get_egress_qos_mask);
 EXPORT_SYMBOL(g_ppa_dbg_enable);
 EXPORT_SYMBOL(max_print_num);
 EXPORT_SYMBOL(cal_64_div);
+EXPORT_SYMBOL(ppa_get_ip_ttl);
 
+EXPORT_SYMBOL(ppa_si_meminfo);
+#ifndef CONFIG_SWAP
+EXPORT_SYMBOL(ppa_si_swapinfo);
+EXPORT_SYMBOL(ppa_si_freeram);
+#endif
+EXPORT_SYMBOL(ppa_bypass_lro);

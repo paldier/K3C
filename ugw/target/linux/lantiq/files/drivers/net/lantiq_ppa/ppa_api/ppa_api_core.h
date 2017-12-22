@@ -98,6 +98,7 @@ extern int mcast_helper_register_module(PPA_NETIF *mem_dev,struct module *mod_na
 #endif
 
 #if defined(CONFIG_LTQ_PPA_MPE_IP97)
+struct ipsec_tunnel_intf ipsec_tnl_info;
 extern uint32_t ppa_add_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction dir,uint32_t *tunnel_index );
 extern uint32_t ppa_get_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction *dir, uint32_t *tunnel_index );
 extern uint32_t ppa_add_ipsec_tunnel_tbl_update(sa_direction dir, uint32_t tunnel_index );

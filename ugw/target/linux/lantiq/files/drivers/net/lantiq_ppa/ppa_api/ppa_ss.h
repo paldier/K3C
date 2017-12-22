@@ -23,7 +23,7 @@
 *******************************************************************************/
 
 #define PPA_SUBSYSTEM_MAJOR     3
-#define PPA_SUBSYSTEM_MID       3 
+#define PPA_SUBSYSTEM_MID       4 
 #define PPA_SUBSYSTEM_MINOR     0
 #define PPA_SUBSYSTEM_TAG       0
 

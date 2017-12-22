@@ -62,16 +62,16 @@ ppa_drv_lpdp_directpath_flowctrl(PPA_SUBIF *subif, uint32_t flags)
 }
 EXPORT_SYMBOL(ppa_drv_lpdp_directpath_flowctrl);
 
-PPA_BUF *
+PPA_SKBUF *
 ppa_drv_lpdp_directpath_alloc_skb(PPA_SUBIF *subif, int32_t len, uint32_t flags)
 {
-    if (g_lpdp_cb.cb_alloc_skb == NULL) return (PPA_BUF *)PPA_EINVAL;
+    if (g_lpdp_cb.cb_alloc_skb == NULL) return (PPA_SKBUF *)PPA_EINVAL;
     return g_lpdp_cb.cb_alloc_skb(subif, len, flags);
 }
 EXPORT_SYMBOL(ppa_drv_lpdp_directpath_alloc_skb);
 
 int32_t
-ppa_drv_lpdp_directpath_recycle_skb(PPA_SUBIF *subif, PPA_BUF *skb, uint32_t flags)
+ppa_drv_lpdp_directpath_recycle_skb(PPA_SUBIF *subif, PPA_SKBUF *skb, uint32_t flags)
 {
     if (g_lpdp_cb.cb_recycle_skb == NULL) return PPA_EINVAL;
     return g_lpdp_cb.cb_recycle_skb(subif, skb, flags);

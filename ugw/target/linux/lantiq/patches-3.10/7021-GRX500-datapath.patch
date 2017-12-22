@@ -1,11 +1,11 @@
 # HG changeset patch
-# Parent 4e7d9d6ea7f81ea603106366ebbed75051530a91
+# Parent acf4ca50cb3cbc39a15eefeba3ec8e855a853d85
 
 diff --git a/drivers/net/ethernet/lantiq/datapath/Kconfig b/drivers/net/ethernet/lantiq/datapath/Kconfig
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/datapath/Kconfig
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,116 @@
 +#
 +# Datapath Lib
 +#
@@ -21,10 +21,11 @@ new file mode 100755
 +
 +config LTQ_DATAPATH_MIB
 +	bool "Datapath aggregated mib support"
-+	default n
++	depends on LTQ_DATAPATH
++	default y
 +	---help---
 +	   It is to aggregate GSWIP-L/R, TMU and driver's MIB counter
-+config LTQ_DATAPATH_MIB_TMU_MPW_MIB
++config LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +        bool "Support TMU-HAL mib API and MPE_HAL mib API"
 +        default y
 +        depends on LTQ_DATAPATH_MIB
@@ -33,30 +34,36 @@ new file mode 100755
 +config LTQ_DATAPATH_DUMMY_TMU_MIB
 +	bool "Dummy TMU-HAL mib API"
 +	default n
-+	depends on LTQ_DATAPATH_MIB_TMU_MPW_MIB
++	depends on LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	---help---
 +	  it is to provide dummpy TMU HAL mib api for standalone testing only
 +config LTQ_DATAPATH_DUMMY_MPE_MIB
 +        bool "Dummy MPE-HAL mib API"
 +        default n
-+        depends on LTQ_DATAPATH_MIB_TMU_MPW_MIB
++        depends on LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +        ---help---
 +          it is to provide dummpy MPE HAL mib api for standalone testing only
 +config LTQ_DATAPATH_OLD_TMU_HAL
 +        bool "Integrate with non-standard TMU HAL"
 +        default n
-+        depends on LTQ_DATAPATH_MIB_TMU_MPW_MIB
++        depends on LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +        ---help---
 +          it is to used to do integraion with non-standard TMU HAL. For testing only with old TMU HAL
 +config LTQ_DATAPATH_CPUFREQ
 +        bool "Datapath DFS(COC) support"
-+        default n
-+	depends on LTQ_CPUFREQ
++        depends on LTQ_DATAPATH && LTQ_CPUFREQ
++        default y
 +        ---help---
 +           It is to support DFS(COC) in Datapath
++config LTQ_DP_ACA_CSUM_WORKAROUND
++	bool "ACA Checksum Workaround"
++	default y
++	---help---
++	  It is to solve system bus hang hang issue 
 +
 +config LTQ_DATAPATH_MANUAL_PARSE
 +        bool "Datapath manual parse network protocol"
++        depends on LTQ_DATAPATH
 +        default y
 +        ---help---
 +           Manual parse network protocol for tcp offloading with some tunnel limit
@@ -77,6 +84,13 @@ new file mode 100755
 +	  Each flag can be enabled/disabled easily
 +	  Once this flag is enabled, the debugging information will be printed out
 +	  otherwise, no debugging information for this flag will be printed
++
++config LTQ_DATAPATH_DBG_PROTOCOL_PARSE
++        bool "Datapath Debug Tool for hw checksum's protocol parsing"
++        default n
++        depends on LTQ_DATAPATH_DBG
++        ---help---
++          Datapath Debug Tool for hw checksum's protocol parsing
 +
 +config LTQ_DATAPATH_LOOPETH
 +	bool "pseudo driver simulation"
@@ -138,7 +152,7 @@ diff --git a/drivers/net/ethernet/lantiq/datapath/datapath.h b/drivers/net/ether
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/datapath/datapath.h
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,302 @@
 +#ifndef DATAPATH_H
 +#define DATAPATH_H		/*! PMAC port informatin data */
 +
@@ -383,7 +397,6 @@ new file mode 100755
 +enum TEST_MODE {
 +	DP_RX_MODE_NORMAL = 0,
 +	DP_RX_MODE_LAN_WAN_BRIDGE,
-+	DP_RX_MODE_LOCALTCP_FAST,
 +	DPR_RX_MODE_MAX
 +};
 +extern u32 dp_rx_test_mode;
@@ -446,7 +459,7 @@ diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/e
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
-@@ -0,0 +1,2912 @@
+@@ -0,0 +1,2946 @@
 +#include<linux/init.h>
 +#include<linux/module.h>
 +#include <linux/kernel.h>	/* printk */
@@ -649,6 +662,13 @@ new file mode 100644
 +		{-1, 1, 238, 255}
 +};
 +
++#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
++static struct module aca_owner;
++static struct net_device aca_dev;
++static int aca_portid = -1;
++#endif
++
++
 +int get_dp_port_type_str_size(void)
 +{
 +	return ARRAY_SIZE(dp_port_type_str);
@@ -772,13 +792,12 @@ new file mode 100644
 +	pinfo[3].v = (v >> 6) & 0x3;
 +
 +	for (i = 0; i < ARRAY_SIZE(pinfo); i++) {
-+		if (verify) {
-+			if (pinfo[i].size != parser_size(pinfo[i].v))
-+				PR_ERR
-+				    ("Why local parser size pinfo[%d](%d) != register setting(%d)\n",
-+				     i, pinfo[i].size,
-+				     parser_size(pinfo[i].v));
-+		}
++		if (verify &&
++			(pinfo[i].size != parser_size(pinfo[i].v)))
++			PR_ERR
++			 ("Lcal parser pinfo[%d](%d) != register cfg(%d)??\n",
++			 i, pinfo[i].size,
++			 parser_size(pinfo[i].v));
 +
 +		/*force to update */
 +		pinfo[i].size = parser_size(pinfo[i].v);
@@ -866,7 +885,7 @@ new file mode 100644
 +			set_gsw_itf(ep, 1, itf_assign[i].start);
 +			return &itf_assign[i];
 +		}
-+		if ((itf_assign[i].ep == -1) && (free_id == -1))
++		if ((itf_assign[i].ep == (u8)-1) && (free_id == -1))
 +			free_id = i;
 +	}
 +	if (free_id != -1) {
@@ -977,7 +996,7 @@ new file mode 100644
 +	port_id = cbm_dp_port_alloc(owner, dev, dev_port, port_id, flags);
 +	if (port_id <= 0) {
 +		PR_ERR
-+		    ("cbm_dp_port_alloc allocation failed for module %s with dev_port %d\n",
++		    ("cbm_dp_port_alloc allocation fail for %s/dev_port %d\n",
 +		     owner->name, dev_port);
 +		return DP_FAILURE;
 +	}
@@ -1014,9 +1033,46 @@ new file mode 100644
 +	res =
 +	    dp_alloc_port_private(owner, dev, dev_port, port_id, NULL, flags);
 +	DP_LIB_UNLOCK(&dp_lock);
++
++#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
++	/*
++	For VRX518, it will always carry DP_F_FAST_WLAN flag for
++	* ACA HW resource purpose in CBM
++	*/
++	if ((res > 0) &&
++		(flags & DP_F_FAST_WLAN) &&
++		(aca_portid < 0)) {
++		dp_subif_t subif_id;
++		#define ACA_CSUM_NAME "aca_csum"
++
++		strcpy(aca_owner.name, ACA_CSUM_NAME);
++		strcpy(aca_dev.name, ACA_CSUM_NAME);
++		aca_portid = dp_alloc_port(&aca_owner, &aca_dev,
++				0, 0, NULL, DP_F_CHECKSUM);
++		if (aca_portid <= 0) {
++			PR_ERR("dp_alloc_port failed for %s\n", ACA_CSUM_NAME);
++			return res;
++		}
++		if (dp_register_dev(&aca_owner, aca_portid,
++			NULL, DP_F_CHECKSUM)) {
++			PR_ERR("dp_register_dev fail for %s\n", ACA_CSUM_NAME);
++			return res;
++		}
++		subif_id.port_id = aca_portid;
++		subif_id.subif = -1;
++		if (dp_register_subif(&aca_owner, &aca_dev,
++			ACA_CSUM_NAME, &subif_id,
++			DP_F_CHECKSUM)) {
++			PR_ERR("dp_register_subif fail for %s\n",
++				ACA_CSUM_NAME);
++			return res;
++		}
++	}
++#endif
 +	return res;
 +}
 +EXPORT_SYMBOL(dp_alloc_port);
++
 +
 +int32_t dp_register_dev(struct module *owner, uint32_t port_id,
 +			dp_cb_t *dp_cb, uint32_t flags)
@@ -1296,7 +1352,8 @@ new file mode 100644
 +	if (i < end)
 +		res = DP_SUCCESS;
 +	else
-+		DP_DEBUG(DP_DBG_FLAG_DBG, "register subif failed\n");
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			"register subif failed for no matched vap\n");
 +
 +	DP_LIB_UNLOCK(&dp_lock);
 +	return res;
@@ -1308,6 +1365,7 @@ new file mode 100644
 +** For DLS nas interface, must provide valid subif_data, otherwise set to NULL.
 +** Note: subif_data is mainly used for DSL WAN mode, esp ATM.
 +*/
++
 +int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
 +			     void *subif_data, uint8_t dst_mac[MAX_ETH_ALEN],
 +			     dp_subif_t *subif, uint32_t flags)
@@ -1318,13 +1376,12 @@ new file mode 100644
 +	int dst_subifid = -1;
 +	dp_get_netif_subifid_fn_t subifid_fn_t;
 +
-+	DP_DEBUG(DP_DBG_FLAG_DBG,
-+		 "dp_get_netif_subifid failed:dev=%s skb=0x%p subif_data=0x%p subif.port_id=%d(%s) flag=0x%x\n",
-+		 netif ? netif->name : "NULL", skb, subif_data,
-+		 subif->port_id,
-+		 (subif->port_id <=
-+		  0) ? "not specified portid" : "specified portid", flags);
-+
++	/*DP_DEBUG(DP_DBG_FLAG_DBG,
++	  "get_netif_subif:dev=%s skb=0x%p data=0x%p port=%d(%s) flag=0x%x\n",
++	  netif ? netif->name : "NULL", skb, subif_data,
++	  subif->port_id,
++	  (subif->port_id <= 0) ? "not portid" : "specified portid", flags);
++	*/
 +	if (!netif && !subif_data) {
 +		DP_DEBUG(DP_DBG_FLAG_DBG,
 +			 "dp_get_netif_subifid failed: netif=%p subif_data=%p\n",
@@ -1346,7 +1403,6 @@ new file mode 100644
 +	}
 +
 +	DP_LIB_LOCK(&dp_lock);
-+
 +	for (k = 0; k < PMAC_MAX_NUM; k++) {
 +		if (dp_port_info[k].status != PORT_SUBIF_REGISTERED)
 +			continue;
@@ -1376,12 +1432,10 @@ new file mode 100644
 +					    dp_port_info[k].subif_info[i].
 +					    subif;
 +				}
-+
 +				break;
 +			}
 +		}
 +	}
-+
 +	DP_LIB_UNLOCK(&dp_lock);
 +
 +	if ((dst_subifid < 0) || (port_id < 0)) {
@@ -1504,7 +1558,7 @@ new file mode 100644
 +
 +	DP_LIB_LOCK(&dp_lock);
 +	if (unlikely(!dp_init_ok)) {
-+		PR_ERR("dp_check_if_netif_fastpath_fn failed for datapath not init yet\n");
++		PR_ERR("dp_check_if_netif_fastpath_fn fail: dp not ready\n");
 +		return DP_FAILURE;
 +	}
 +	if (subif)
@@ -1714,12 +1768,12 @@ new file mode 100644
 +	       *(u32 *)desc_0, *(u32 *)desc_1,
 +	       *(u32 *)desc_2, *(u32 *)desc_3);
 +	PRINTK
-+	    ("  DW0:resv0=%d tunnel_id=%02d flow_id=%d eth_type=%d dest_sub_if_id=0x%04x\n",
++	    ("  DW0:resv0=%d tunl_id=%d flow_id=%d eth_type=%d subif=0x%04x\n",
 +	     desc_0->field.resv0, desc_0->field.tunnel_id,
 +	     desc_0->field.flow_id, desc_0->field.eth_type,
 +	     desc_0->field.dest_sub_if_id);
 +	PRINTK
-+	    ("  DW1:session_id=0x%03x tcp_err=%d nat=%d dec=%d enc=%d mpe2=%d mpe1=%d \n",
++	    ("  DW1:sess_id=%d tcp_err=%d nat=%d dec=%d enc=%d mpe2/1=%d/%d\n",
 +	     desc_1->field.session_id, desc_1->field.tcp_err,
 +	     desc_1->field.nat, desc_1->field.dec, desc_1->field.enc,
 +	     desc_1->field.mpe2, desc_1->field.mpe1);
@@ -1731,7 +1785,7 @@ new file mode 100644
 +	       desc_3->field.own, desc_3->field.c, desc_3->field.sop,
 +	       desc_3->field.eop, desc_3->field.dic, desc_3->field.pdu_type);
 +	PRINTK
-+	    ("      byte_offset=%d atm_qid=%d mpoa_pt=%d mpoa_mode=%d data_len=% 4d\n",
++	    ("      offset=%d atm_q=%d mpoa_pt=%d mpoa_mode=%d len=%d\n",
 +	     desc_3->field.byte_offset, desc_3->field.qid,
 +	     desc_3->field.mpoa_pt, desc_3->field.mpoa_mode,
 +	     desc_3->field.data_len);
@@ -1751,11 +1805,13 @@ new file mode 100644
 +	PRINTK(" DMA Descripotr:D0=0x%08x D1=0x%08x D2=0x%08x D3=0x%08x\n",
 +		*(u32 *)desc_0, *(u32 *)desc_1,
 +		*(u32 *)desc_2, *(u32 *)desc_3);
-+	PRINTK("  DW0:resv0=%d tunnel_id=%02d flow_id=%d eth_type=%d dest_sub_if_id=0x%04x\n",
++	PRINTK
++	  ("  DW0:resv0=%d tunl_id=%d flow_id=%d eth_type=%d subif=0x%04x\n",
 +		desc_0->field.resv0, desc_0->field.tunnel_id,
 +		desc_0->field.flow_id, desc_0->field.eth_type,
 +		desc_0->field.dest_sub_if_id);
-+	PRINTK("  DW1:session_id=0x%03x tcp_err=%d nat=%d dec=%d enc=%d mpe2=%d mpe1=%d \n",
++	PRINTK
++	  ("  DW1:sess_id=%d tcp_err=%d nat=%d dec=%d enc=%d mpe2/1=%d/%d\n",
 +		desc_1->field.session_id, desc_1->field.tcp_err,
 +		desc_1->field.nat, desc_1->field.dec, desc_1->field.enc,
 +		desc_1->field.mpe2, desc_1->field.mpe1);
@@ -1766,7 +1822,7 @@ new file mode 100644
 +	PRINTK("  DW3:own=%d c=%d sop=%d eop=%d dic=%d pdu_type=%d\n",
 +		desc_3->field.own, desc_3->field.c, desc_3->field.sop,
 +		desc_3->field.eop, desc_3->field.dic, desc_3->field.pdu_type);
-+	PRINTK("  byte_offset=%d atm_qid=%d mpoa_pt=%d mpoa_mode=%d data_len=% 4d\n",
++	PRINTK("  offset=%d atm_qid=%d mpoa_pt=%d mpoa_mode=%d len=%d\n",
 +		desc_3->field.byte_offset, desc_3->field.qid,
 +		desc_3->field.mpoa_pt, desc_3->field.mpoa_mode,
 +		desc_3->field.data_len);
@@ -1846,12 +1902,13 @@ new file mode 100644
 +	PRINTK("  byte 2:ppid=%d res=%d\n", pmac->sppid, pmac->res);
 +	/*byte 3 */
 +	PRINTK
-+	    ("  byte 3:port_map_en=%d res=%d time_dis=%d class_en=%d res=%d pkt_type=%d\n",
-+	     pmac->port_map_en, pmac->res2, pmac->time_dis, pmac->class_en,
-+	     pmac->res3, pmac->pkt_type);
++	 ("  byte 3:map_en=%d res=%d/%d time_dis=%d class_en=%d pkt_type=%d\n",
++	     pmac->port_map_en, pmac->res2, pmac->res3,
++	     pmac->time_dis, pmac->class_en,
++	     pmac->pkt_type);
 +	/*byte 4 */
 +	PRINTK
-+	    ("  byte 4:fcs_ins_dis=%d redirect=%d time_stmp=%d src_sub_inf_id=%d\n",
++	  ("  byte 4:fcs_ins_dis=%d redirect=%d time_stmp=%d subif=%d\n",
 +	     pmac->fcs_ins_dis, pmac->redirect, pmac->time_stmp,
 +	     pmac->src_sub_inf_id);
 +	/*byte 5 */
@@ -1978,40 +2035,44 @@ new file mode 100644
 +	struct net_device *dev;
 +	dp_rx_fn_t rx_fn;
 +	static unsigned long last_jiffies;
++	char decryp = 0;
 +#define K (1024)
 +#define M (K * K)
 +
-+	if (!skb) {
++	if (unlikely(!skb)) {
 +		PR_ERR("why skb NULL\n");
 +		return DP_FAILURE;
 +	}
-+
-+	if (!skb->data) {
++	if (unlikely(!skb->data)) {
 +		PR_ERR("skb->data NULL\n");
 +		dev_kfree_skb_any(skb);
 +		return DP_FAILURE;
 +	}
-+
 +	paser_exist = parser_enabled(port_id, desc_1);
++	if (paser_exist)
++		parser = skb->data;
++	pmac = (struct pmac_rx_hdr *)(skb->data + paser_exist);
 +
-+	if (dp_dbg_flag) {
++	if (unlikely(dp_dbg_flag)) {
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_RX,
 +			 "\ndp_rx:skb->data=%p Loc=%x offset=%d skb->len=%d\n",
 +			 skb->data, desc_2->field.data_ptr,
 +			 desc_3->field.byte_offset, skb->len);
-+
 +		if (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_DATA)
 +			dp_dump_raw_data(skb->data,
 +					 (skb->len >
 +					  print_len) ? skb->len : print_len,
 +					 "Original Data");
-+
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "parse hdr size = %d\n",
 +			 paser_exist);
++		if (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_DESCRIPTOR)
++			dump_rx_dma_desc(desc_0, desc_1, desc_2, desc_3);
++		if (paser_exist && (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_PASER))
++			dump_parser_flag(parser);
++		if (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_PMAC)
++			dump_rx_pmac(pmac);
 +	}
-+
 +	if (paser_exist) {
-+		parser = skb->data;
 +		skb_pull(skb, paser_exist);	/*remove parser */
 +#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
 +#if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
@@ -2019,26 +2080,22 @@ new file mode 100644
 +#endif
 +#endif
 +	}
-+
-+	pmac = (struct pmac_rx_hdr *)(skb->data);
-+
-+	if (((ep >= 1) && (ep <= 6)) || (ep == 15)) {
-+		PR_ERR("Wrong: why ep=%d\n", ep);
++	/*Sanity check */
++	if (unlikely(((ep >= 1) && (ep <= 6)) || (ep == 15))) {
++		DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "Wrong: why ep=%d??", ep);
 +		dump_rx_dma_desc(desc_0, desc_1, desc_2, desc_3);
 +		dp_dump_raw_data(skb->data,
 +				 (skb->len >
 +				  print_len) ? skb->len : print_len,
 +				 "Recv Data");
++		dev_kfree_skb_any(skb);
++		return DP_FAILURE;
 +	}
-+
-+	if (dp_pkt_size_check && ((skb->len < 60) || (skb->len > 0x600))) {
-+		PR_ERR("\n----dp_rx wrong packet size: %d ----??\n",
-+		       skb->len);
++	if (unlikely(dp_drop_all_tcp_err && desc_1->field.tcp_err)) {
++		DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "\n----dp_rx why tcp_err ???\n");
 +		dump_rx_dma_desc(desc_0, desc_1, desc_2, desc_3);
-+
 +		if (paser_exist)
 +			dump_parser_flag(parser);
-+
 +		dump_rx_pmac(pmac);
 +		dp_dump_raw_data(skb->data,
 +				 (skb->len >
@@ -2048,34 +2105,7 @@ new file mode 100644
 +		return DP_FAILURE;
 +	}
 +
-+	if (dp_drop_all_tcp_err && desc_1->field.tcp_err) {
-+		PR_ERR("\n----dp_rx why tcp_err ???\n");
-+		dump_rx_dma_desc(desc_0, desc_1, desc_2, desc_3);
-+
-+		if (paser_exist)
-+			dump_parser_flag(parser);
-+
-+		dump_rx_pmac(pmac);
-+		dp_dump_raw_data(skb->data,
-+				 (skb->len >
-+				  print_len) ? skb->len : print_len,
-+				 "Recv Data");
-+		dev_kfree_skb_any(skb);
-+		return DP_FAILURE;
-+	}
-+
-+	if (dp_dbg_flag) {
-+		if (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_DESCRIPTOR)
-+			dump_rx_dma_desc(desc_0, desc_1, desc_2, desc_3);
-+
-+		if (paser_exist && (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_PASER))
-+			dump_parser_flag(parser);
-+
-+		if (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_PMAC)
-+			dump_rx_pmac(pmac);
-+	}
 +#ifdef LTQ_TSO_SW_WORKAROUND
-+
 +	if (desc_1->field.mpe2 && desc_1->field.enc && desc_1->field.dec) {
 +		DP_DEBUG(DP_DBG_FLAG_DBG, "TSO LB\n");
 +		desc_1->field.mpe2 = 0;
@@ -2097,6 +2127,7 @@ new file mode 100644
 +			    get_vap((uint32_t)pmac->src_sub_inf_id2 +
 +				    (uint32_t)(pmac->src_sub_inf_id << 8));
 +			vap = 0;
++			decryp = 1;
 +		} else
 +			vap =
 +			    get_vap((uint32_t)pmac->src_sub_inf_id2 +
@@ -2106,7 +2137,8 @@ new file mode 100644
 +		vap = get_vap(desc_0->field.dest_sub_if_id);
 +	}
 +
-+	if (port_id == 0) {
++	if (unlikely(!port_id)) { /*Normally shouldnot go to here */
++		/*Note: Wrong if Ep and pmac src port both zero*/
 +		if (jiffies < last_jiffies) /* wraparuond */
 +			last_jiffies = 0;
 +		if (jiffies <= last_jiffies + dp_err_interval)
@@ -2132,20 +2164,15 @@ new file mode 100644
 +	}
 +
 +	rx_fn = dp_port_info[port_id].cb.rx_fn;
-+
-+	if (port_id >= PMAC_END_ID) {
-+		DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "%s=%d vap=%d\n",
-+			 (ep) ? "ep" : "port_id", port_id, vap);
-+		PR_ERR("Drop for wrong ep or soruce port id=%u ??\n",
++	if (unlikely(port_id >= PMAC_END_ID)) {
++		PR_ERR("Drop for wrong ep or src port id=%u ??\n",
 +		       port_id);
 +		goto RX_DROP;
-+	} else if (dp_port_info[port_id].status == PORT_FREE) {
-+		DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "%s=%d vap=%d\n",
-+			 (ep) ? "ep" : "port_id", port_id, vap);
++	} else if (unlikely(dp_port_info[port_id].status == PORT_FREE)) {
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "Drop for port %u free\n",
 +			 port_id);
 +		goto RX_DROP;
-+	} else if (!rx_fn) {
++	} else if (unlikely(!rx_fn)) {
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_RX,
 +			 "Drop for subif of port %u not registered yet\n",
 +			 port_id);
@@ -2154,13 +2181,17 @@ new file mode 100644
 +		DP_LIB_UNLOCK(&dp_lock);
 +		goto RX_DROP2;
 +	}
++
 +	/*Clear some fields as SWAS V3.7 required */
 +	desc_1->all &= dma_rx_desc_mask1.all;
 +	desc_3->all &= dma_rx_desc_mask3.all;
 +	skb->priority = desc_1->field.classid;
 +	skb->dev = dp_port_info[port_id].subif_info[vap].netif;
 +	dev = dp_port_info[port_id].subif_info[vap].netif;
-+
++	if (decryp) { /*for bypass xfrm policy check since it is decryped*/
++		desc_1->field.dec = 1;
++		desc_1->field.enc = 1;
++	}
 +	if (!dev &&
 +	    ((dp_port_info[port_id].alloc_flags & DP_F_FAST_DSL) == 0)) {
 +		DP_LIB_LOCK(&dp_lock);
@@ -2169,7 +2200,7 @@ new file mode 100644
 +		goto RX_DROP;
 +	}
 +
-+	if (dp_dbg_flag) {
++	if (unlikely(dp_dbg_flag)) {
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "%s=%d vap=%d\n",
 +			 (ep) ? "ep" : "port_id", port_id, vap);
 +
@@ -2178,50 +2209,34 @@ new file mode 100644
 +					 (skb->len >
 +					  print_len) ? skb->len : print_len,
 +					 "Data to top drivers");
++		if (dp_dbg_flag & DP_DBG_FLAG_DUMP_RX_DESCRIPTOR)
++			dump_rx_dma_desc(desc_0, desc_1, desc_2, desc_3);
 +	}
 +#ifdef CONFIG_LTQ_DP_MPE_FASTHOOK_TEST
-+
 +	if (unlikely(ltq_mpe_fasthook_rx_fn))
 +		ltq_mpe_fasthook_rx_fn(skb, 1, NULL);	/*with pmac */
-+
 +#endif
-+
-+	if (likely((enum TEST_MODE)dp_rx_test_mode == DP_RX_MODE_NORMAL)) {
-+		rx_fn((rx_tx_flag == 0) ? dev : NULL,
-+		      (rx_tx_flag == 1) ? dev : NULL, skb, skb->len);
-+	} else if ((enum TEST_MODE)dp_rx_test_mode == DP_RX_MODE_LAN_WAN_BRIDGE) {
++	if (unlikely((enum TEST_MODE)dp_rx_test_mode ==
++		DP_RX_MODE_LAN_WAN_BRIDGE))
 +		/*for datapath performance test only */
 +		dp_lan_wan_bridging(port_id, skb);
 +		/*return DP_SUCCESS;*/
-+	}
-+#ifdef CONFIG_LTQ_DATAPATH_LOCAL_SESSION
-+	else if ((enum TEST_MODE)dp_rx_test_mode == DP_RX_MODE_LOCALTCP_FAST) {
-+		/*for local TCP performance test only */
-+		if (!dp_tcp_fast_ok(ep, skb, pmac))
-+			rx_fn((rx_tx_flag == 0) ? dev : NULL,
-+			      (rx_tx_flag == 1) ? dev : NULL, skb, skb->len);
-+	} else
-+#else
 +	else
-+#endif
 +		rx_fn((rx_tx_flag == 0) ? dev : NULL,
 +		      (rx_tx_flag == 1) ? dev : NULL, skb, skb->len);
 +
 +	DP_LIB_LOCK(&dp_lock);
-+
 +	if (rx_tx_flag)
 +		dp_port_info[port_id].subif_info[vap].mib.rx_fn_txif_pkt++;
 +	else
 +		dp_port_info[port_id].subif_info[vap].mib.rx_fn_rxif_pkt++;
-+
 +	DP_LIB_UNLOCK(&dp_lock);
 +	return DP_SUCCESS;
-+ RX_DROP:
++RX_DROP:
 +	DP_LIB_LOCK(&dp_lock);
 +	dp_port_info[port_id].rx_err_drop++;
 +	DP_LIB_UNLOCK(&dp_lock);
-+	DP_DEBUG(DP_DBG_FLAG_DUMP_RX, "RX_DROP port_id=%d  ????\n", port_id);
-+ RX_DROP2:
++RX_DROP2:
 +	dev_kfree_skb_any(skb);
 +	return res;
 +}
@@ -2275,22 +2290,27 @@ new file mode 100644
 +
 +	if (info->ip_ver == DP_IP_VER4) {	/*ipv4 */
 +		ip_hdr_size = (p[0] & 0xf) << 2;
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
-+			 "IPV4 packet with protocol 0x%x with ip hdr size %d\n",
++			 "IPV4 pkt with protocol 0x%x with ip hdr size %d\n",
 +			 p[9], ip_hdr_size);
++#endif
 +		info->proto = p[9];
 +
 +		if ((info->proto == PROTOCOL_UDP) ||
 +			(info->proto == PROTOCOL_TCP)) {
 +			if ((iphdr->frag_off & IP_MF) ||
 +			    (iphdr->frag_off & IP_OFFSET)) {
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +				DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
-+					"fragmented packet with frag_off = %x, IP_MF = %x, IP_OFFSET = %x \n",
++				  "frag pkt:off=%x,IP_MF=%x,IP_OFFSET=%x\n",
 +					iphdr->frag_off, IP_MF, IP_OFFSET);
++#endif
 +				info->udp_tcp_offset = (p[0] & 0x0f) << 2;
 +				info->is_fragment = 1;
 +				return -1;
 +			}
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +			DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
 +				 "%s packet with src/dst port:%u/%u\n",
 +				 (p[9] ==
@@ -2300,6 +2320,7 @@ new file mode 100644
 +				 *(unsigned short *)(pdata +
 +						     ip_hdr_size +
 +						     2));
++#endif
 +			info->udp_tcp_offset = (p[0] & 0x0f) << 2;
 +			return 0;
 +		} else if (p[9] == PROTOCOL_ENCAPSULATED_IPV6) {
@@ -2307,8 +2328,10 @@ new file mode 100644
 +			info->next_ip_hdr_offset = (p[0] & 0x0f) << 2;
 +			return 0;
 +		}
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
 +			 "Not supported extension hdr:0x%x\n", p[9]);
++#endif
 +		return -1;
 +	} else if (info->ip_ver == DP_IP_VER6) {	/*ipv6 */
 +		int i;
@@ -2350,14 +2373,16 @@ new file mode 100644
 +					    IPV6_EXTENSION_SIZE + p[1];
 +
 +				info->udp_tcp_offset = udp_tcp_h_offset;
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +				DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
-+					 "IPV6 UDP: src/dst port:%u/%u udp_tcp_offset=%d\n",
++				 "IP6 UDP:src/dst port:%u/%u udp_tcp_off=%d\n",
 +					 *(unsigned short *)(pdata +
 +							     udp_tcp_h_offset),
 +					 *(unsigned short *)(pdata +
 +							     udp_tcp_h_offset
 +							     + 2),
 +					 udp_tcp_h_offset);
++#endif
 +				return 0;
 +			} else if (next_hdr == PROTOCOL_IPIP) {	/*dslite */
 +				if (!first_extension)
@@ -2371,8 +2396,10 @@ new file mode 100644
 +				info->is_fragment = 1;
 +				return -1;
 +			}
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +			DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
 +				 "Skip extension hdr:0x%x\n", next_hdr);
++#endif
 +			if ((next_hdr == PROTOCOL_NONE) ||
 +			    (next_hdr == PROTOCOL_ENCAPSULATED_IPV6))
 +				break;
@@ -2389,8 +2416,10 @@ new file mode 100644
 +			}
 +			next_hdr = p[0];
 +			if (udp_tcp_h_offset > len) {
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +				DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
 +				 "\n- Wrong IPV6 packet header ?\n");
++#endif
 +				break;
 +			}
 +		}
@@ -2414,7 +2443,9 @@ new file mode 100644
 +	u8 *p = p_l2_mac + TWO_MAC_SIZE;
 +	struct ip_hdr_info pkt_info[2];
 +	u8 ip_num = 0;
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +	int i;
++#endif
 +	int len;
 +
 +	if (skb->ip_summed != CHECKSUM_PARTIAL)
@@ -2423,9 +2454,11 @@ new file mode 100644
 +	*ip_offset = 0;
 +	*tcp_h_offset = 0;
 +
-+	if (dp_dbg_flag & DP_DBG_FLAG_DUMP_TX)
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
++	if (dp_dbg_flag)
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
 +			 "flags DP_TX_CAL_CHKSUM is set\n");
++#endif
 +
 +	while ((p[0] == 0x81) && (p[1] == 0x00))	/*skip vlan header */
 +		p += VLAN_HDR_SIZE;
@@ -2433,14 +2466,17 @@ new file mode 100644
 +	if ((p[0] == 0x88) && (p[1] == 0x64))	/*skip pppoe header */
 +		p += PPPOE_HDR_SIZE;
 +
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +	DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
-+		 "Try to find ip header:%02x %02x %02x %02x %02x %02x %02x %02x\n",
++		 "To find ip header:%02x %02x %02x %02x %02x %02x %02x %02x\n",
 +		 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-+
++#endif
 +	if (((p[0] != 0x08) || (p[1] != 0x00)) &&
 +	    ((p[0] != 0x86) && (p[1] != 0xdd))) {
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_TX, "None IP type:%02x%02x\n", p[0],
 +			 p[1]);
++#endif
 +	}
 +
 +	p += 2;			/* jump to ip header */
@@ -2471,22 +2507,22 @@ new file mode 100644
 +		} else {
 +			/*Not UDP/TCP and cannot do checksum calculation */
 +			pr_info_once
-+			    ("Not UDP/TCP and cannot do checksum calculation !\n");
++			    ("Not UDP/TCP and cannot do checksum cal!\n");
 +			return -1;
 +		}
 +	}
-+
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +	if (dp_dbg_flag & DP_DBG_FLAG_DUMP_TX) {
 +		for (i = 0; i < ip_num; i++) {
 +			DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
-+				 "Parsing: ip[%d]:ver=%d proto=%d ip_offset=%d udp_tcp_offset=%d, next_iphdr_offset=%d\n",
++			 "Parse:ip[%d]:v=%d prot=%d ip_off=%d udp_tcp_off=%d, n_hdr_off=%d\n",
 +				 i, pkt_info[i].ip_ver, pkt_info[i].proto,
 +				 pkt_info[i].ip_offset,
 +				 pkt_info[i].udp_tcp_offset,
 +				 pkt_info[i].next_ip_hdr_offset);
 +		}
 +	}
-+
++#endif
 +	if (ip_num == 1) {
 +		if (pkt_info[0].ip_ver == DP_IP_VER4) {
 +			*ip_offset = pkt_info[0].ip_offset;
@@ -2633,8 +2669,10 @@ new file mode 100644
 +	unsigned char *l4_p;
 +
 +	if (skb->ip_summed != CHECKSUM_PARTIAL) {
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_TX_SUM,
 +			 "No need HW checksum Support\n");
++#endif
 +		return -1;
 +	}
 +
@@ -2655,9 +2693,11 @@ new file mode 100644
 +		l4_p = skb_transport_header(skb);
 +	}
 +	if (((int)(ip_offset) <= 0) || ((int)(tcp_h_offset) <= 0)) {
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_TX_SUM,
 +			 "Wrong IP offset(%d) or TCP/UDP offset(%d)\n",
 +			 ((int)(ip_offset) <= 0), ((int)(tcp_h_offset) <= 0));
++#endif
 +		return -1;
 +	}
 +
@@ -2684,9 +2724,10 @@ new file mode 100644
 +		tcph = (struct tcphdr *)l4_p;
 +		tcph->check = 0;	/*clear original UDP checksum */
 +	}
-+
++#ifdef CONFIG_LTQ_DATAPATH_DBG_PROTOCOL_PARSE
 +	DP_DEBUG(DP_DBG_FLAG_DUMP_TX_SUM, "Found tcp_type=%u ip_offset=%u\n",
 +		 *tcp_type, *ip_offset);
++#endif
 +	return 0;
 +}
 +#endif				/* CONFIG_LTQ_DATAPATH_MANUAL_PARSE */
@@ -2808,7 +2849,7 @@ new file mode 100644
 +		skb_set_transport_header(new_skb, skb_transport_offset(skb));
 +	}
 +
-+	DP_DEBUG(DP_DBG_FLAG_DUMP_TX, "alloc new buffer succeed\n");
++	/*DP_DEBUG(DP_DBG_FLAG_DUMP_TX, "alloc new buffer succeed\n");*/
 +	/*free old skb */
 +	dev_kfree_skb_any(skb);
 +	return new_skb;
@@ -2951,14 +2992,15 @@ new file mode 100644
 +		DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
 +			 "skb->data=0x%p with pmac hdr size=%u\n", skb->data,
 +			 sizeof(struct pmac_tx_hdr));
++		if (insert_pmac_f) /*insert one pmac header */
++			DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
++				"flags DP_TX_INSERT_PMAC is set\n");
 +	}
 +
 +	if (insert_pmac_f) {	/*insert one pmac header */
-+		DP_DEBUG(DP_DBG_FLAG_DUMP_TX,
-+			 "flags DP_TX_INSERT_PMAC is set\n");
 +		clone_f = skb_cloned(skb);
 +		no_hdr_room_f =
-+		    skb_headroom(skb) < sizeof(struct pmac_tx_hdr) ? 1 : 0;
++			skb_headroom(skb) < sizeof(struct pmac_tx_hdr) ? 1 : 0;
 +
 +		if (clone_f && !skb_is_gso(skb)) {
 +			if (clone_f && (skb->data[0] & 1)) {
@@ -3056,10 +3098,16 @@ new file mode 100644
 +				pmac->sppid = PMAC_CPU_ID;
 +				SET_PMAC_SUBIF(pmac, rx_subif->subif);
 +			}
-+
++#if defined(CONFIG_ACCL_11AC_CS2) || defined(CONFIG_ACCL_11AC_CS2_MODULE)
++			/* CPU traffic to PAE via cbm to apply PCE rule */
++			desc_1->field.enc = 1;
++			desc_1->field.dec = 1;
++			desc_1->field.mpe2 = 0;
++#else
 +			desc_1->field.enc = 0;
 +			desc_1->field.dec = 0;
 +			desc_1->field.mpe2 = 0;
++#endif
 +		} else if (flags & (DP_TX_CAL_CHKSUM | DP_TX_DSL_FCS)) {
 +			/*checksum/fcs(bonding) queue */
 +			if (pmac) {
@@ -3076,8 +3124,14 @@ new file mode 100644
 +			desc_1->field.enc = 1;
 +			desc_1->field.dec = 1;
 +			desc_1->field.mpe2 = 1;
++#ifdef CONFIG_LTQ_DP_ACA_CSUM_WORKAROUND
++			if (aca_portid > 0)
++				desc_1->field.ep = aca_portid;
++#endif
 +		} else if (dp_port_info[ep].alloc_flags & DP_F_FAST_DSL) {
-+			/* VRX318 queue */
++			/* VRX318 queue without bonding
++			 If it is bondig, it should with DP_TX_DSL_FCS flag
++			*/
 +			desc_1->field.enc = 0;
 +			desc_1->field.dec = 0;
 +			desc_1->field.mpe2 = 0;
@@ -3168,14 +3222,9 @@ new file mode 100644
 +		desc_1->field.mpe2 = 1;
 +#else
 +		res = ltq_tso_xmit(skb, desc_1->field.ep, 0);
-+		if (likely(res >= 0)) {
-+			DP_LIB_LOCK(&dp_lock);
-+			dp_port_info[ep].subif_info[vap].mib.tx_tso_pkt++;
-+			DP_LIB_UNLOCK(&dp_lock);
-+		} else {
-+			pr_err("no available TSO ports !!\n");
-+		}
-+
++		DP_LIB_LOCK(&dp_lock);
++		dp_port_info[ep].subif_info[vap].mib.tx_tso_pkt++;
++		DP_LIB_UNLOCK(&dp_lock);
 +		return res;
 +#endif /* LTQ_TSO_SW_WORKAROUND */
 +	}
@@ -3183,19 +3232,17 @@ new file mode 100644
 +
 +	if (pmac)
 +		pmac->class_en = 1;
-+
-+	DP_LIB_LOCK(&dp_lock);
-+	dp_port_info[ep].subif_info[vap].mib.tx_cbm_pkt++;
-+	DP_LIB_UNLOCK(&dp_lock);
-+
 +	if (unlikely(!desc_1->field.ep)) {
++		/*Not allowed to send out pkt with ep zero */
 +		PR_ERR("Why ep zero in dp_xmit for device name %s\n",
 +		       skb->dev ? skb->dev->name : "NULL");
 +		dev_kfree_skb_any(skb);
 +		return DP_FAILURE;
 +	}
-+
 +	res = cbm_cpu_pkt_tx(skb, desc_1->field.ep, 0);
++	DP_LIB_LOCK(&dp_lock);
++	dp_port_info[ep].subif_info[vap].mib.tx_cbm_pkt++;
++	DP_LIB_UNLOCK(&dp_lock);
 +	return res;
 +}
 +EXPORT_SYMBOL(dp_xmit);
@@ -3363,7 +3410,7 @@ diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_coc.c b/drivers/net/e
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/datapath/datapath_coc.c
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,923 @@
 +/*
 + *
 + *			 Copyright (c) 2012, 2014, 2015
@@ -3383,20 +3430,21 @@ new file mode 100644
 +#include "datapath_pmac.h"
 +
 +#define DP_MODULE  LTQ_CPUFREQ_MODULE_DP
-+#define DP_ID 0			/* this ID should represent the Datapath interface No. */
++#define DP_ID 0	 /* this ID should represent the Datapath interface No. */
 +static struct timer_list dp_coc_timer;
 +static u32 polling_period;	/*seconds */
 +static int rmon_timer_en;
 +static spinlock_t dp_coc_lock;
 +
 +/* threshold data for D0:D3 */
-+struct ltq_cpufreq_threshold rmon_threshold = { 0, 30, 20, 10 };	/*packets */
++struct ltq_cpufreq_threshold rmon_threshold = { 0, 30, 20, 10 }; /*packets */
 +
 +/* driver is busy and needs highest performance */
 +static int dp_coc_init_stat;	/*DP COC is Initialized or not */
 +static int dp_coc_ena;		/*DP COC is enabled or not */
-+enum ltq_cpufreq_state dp_coc_ps_curr = LTQ_CPUFREQ_PS_UNDEF;	/*current state */
-+enum ltq_cpufreq_state dp_coc_ps_new = LTQ_CPUFREQ_PS_UNDEF;	/*new statue wanted to switch to */
++enum ltq_cpufreq_state dp_coc_ps_curr = LTQ_CPUFREQ_PS_UNDEF;/*current state*/
++/*new statue wanted to switch to */
++enum ltq_cpufreq_state dp_coc_ps_new = LTQ_CPUFREQ_PS_UNDEF;
 +
 +static GSW_RMON_Port_cnt_t rmon_last[PMAC_MAX_NUM];
 +static u64 last_rmon_rx;
@@ -3404,20 +3452,22 @@ new file mode 100644
 +/*meter */
 +#define PCE_OVERHD 20
 +static u32 meter_id;
-+static u32 meter_ncbs = 0x8000 + (1514 + PCE_OVERHD) * 3 + 200;	/*3 ~ 4 packet size */
-+static u32 meter_nebs = 0x8000 + (1514 + PCE_OVERHD) * 1 + 200;	/*1 ~ 2 packet size */
-+static u32 meter_nrate[4] = { 0 /*D0 */ , 700 /*D1 */ , 600 /*D2 */ , 500 /*D3 */  };	/*k bits */
++/*3 ~ 4 packet size */
++static u32 meter_ncbs = 0x8000 + (1514 + PCE_OVERHD) * 3 + 200;
++/*1 ~ 2 packet size */
++static u32 meter_nebs = 0x8000 + (1514 + PCE_OVERHD) * 1 + 200;
++/*k bits */
++static u32 meter_nrate[4] = { 0/*D0 */, 700/*D1*/, 600/*D2*/, 500/*D3*/};
 +
 +static int dp_coc_cpufreq_notifier(struct notifier_block *nb,
 +				   unsigned long val, void *data);
 +static int dp_coc_stateget(enum ltq_cpufreq_state *state);
 +static int dp_coc_fss_ena(int ena);
-+int dp_coc_new_stat_req(enum ltq_cpufreq_state new_state, uint32_t flag);
 +static int apply_meter_rate(u32 rate, enum ltq_cpufreq_state new_state);
 +static int enable_meter_interrupt(void);
 +static int clear_meter_interrupt(void);
 +int dp_set_meter_rate(enum ltq_cpufreq_state stat, unsigned int rate)
-+{				/*set the rate for upscaling to D0 from specified stat */
++{/*set the rate for upscaling to D0 from specified stat */
 +	if (stat == LTQ_CPUFREQ_PS_D1)
 +		meter_nrate[1] = rate;
 +	else if (stat == LTQ_CPUFREQ_PS_D2)
@@ -3459,6 +3509,7 @@ new file mode 100644
 +	.ltq_cpufreq_pwr_feature_switch = dp_coc_fss_ena,
 +};
 +
++#if defined(CONFIG_LTQ_DATAPATH_DBG) && CONFIG_LTQ_DATAPATH_DBG
 +static char *get_sub_module_str(uint32_t flag)
 +{
 +	if (flag == DP_COC_REQ_DP)
@@ -3470,6 +3521,7 @@ new file mode 100644
 +	else
 +		return "Unknown";
 +}
++#endif
 +
 +static char *get_coc_stat_string(enum ltq_cpufreq_state stat)
 +{
@@ -3521,46 +3573,43 @@ new file mode 100644
 +	}
 +	last_rmon_rx = rx;
 +	if (dp_coc_ps_curr != LTQ_CPUFREQ_PS_UNDEF	/*&&
-+							   dp_coc_ps_curr != LTQ_CPUFREQ_PS_D3 */) {
++		   dp_coc_ps_curr != LTQ_CPUFREQ_PS_D3 */) {
 +		if (rx < rmon_threshold.th_d3) {
 +			if (dp_coc_new_stat_req
 +			    (LTQ_CPUFREQ_PS_D3, DP_COC_REQ_DP) == 0) {
-+				/*succeed to request although may not confirm yet */
 +				coc_lock();
 +				rmon_timer_en = 0;
 +				coc_unlock();
 +				DP_DEBUG(DP_DBG_FLAG_COC,
-+					 "DP request to D3 since rx (%u) < th_d3 %d\n",
++					 "Request to D3:rx (%u) < th_d3 %d\n",
 +					 (unsigned int)rx,
 +					 rmon_threshold.th_d3);
 +			} else
 +				DP_DEBUG(DP_DBG_FLAG_COC,
-+					 "DP request to D3 failed for dp_coc_new_stat_req\n");
++				 "req to D3 fail for dp_coc_new_stat_req\n");
 +		} else if (rx < rmon_threshold.th_d2) {
 +			if (dp_coc_new_stat_req
 +			    (LTQ_CPUFREQ_PS_D2, DP_COC_REQ_DP) == 0) {
-+				/*succeed to request although may not confirm yet */
 +				DP_DEBUG(DP_DBG_FLAG_COC,
-+					 "DP request to D2 since rx (%u) < th_d2 %d\n",
++					 "req to D2: rx (%u) < th_d2 %d\n",
 +					 (unsigned int)rx,
 +					 rmon_threshold.th_d2);
 +			} else
 +				DP_DEBUG(DP_DBG_FLAG_COC,
-+					 "DP request to D2 failed for dp_coc_new_stat_req\n");
++				  "req to D2 fail for dp_coc_new_stat_req\n");
 +		} else if (rx < rmon_threshold.th_d1) {
 +			if (dp_coc_new_stat_req
 +			    (LTQ_CPUFREQ_PS_D1, DP_COC_REQ_DP) == 0) {
-+				/*succeed to request although may not confirm yet */
 +				DP_DEBUG(DP_DBG_FLAG_COC,
-+					 "DP request to D1 since rx (%u) < th_d1 %d\n",
++				  "req to D1 since rx (%u) < th_d1 %d\n",
 +					 (unsigned int)rx,
 +					 rmon_threshold.th_d1);
 +			} else
 +				DP_DEBUG(DP_DBG_FLAG_COC,
-+					 "DP request to D1 failed for dp_coc_new_stat_req\n");
++				  "req to D1 fail: dp_coc_new_stat_req\n");
 +		} else
 +			DP_DEBUG(DP_DBG_FLAG_COC,
-+				 "State no change since rx (%u) >= any thresholds %d_%d_%d\n",
++			  "Stat no change:rx(%u)>=any thresholds %d_%d_%d\n",
 +				 (unsigned int)rx, rmon_threshold.th_d3,
 +				 rmon_threshold.th_d2, rmon_threshold.th_d1);
 +	} else
@@ -3628,8 +3677,10 @@ new file mode 100644
 +			  jiffies + msecs_to_jiffies(polling_period * 1000));
 +		rmon_timer_en = 1;
 +
-+		/*enable meter */
-+		apply_meter_rate(0, 0);	/*disable first to solve red color issue if last time already triggered */
++		/*enable meter, but first disable to fix red color issue
++		  if last already triggered
++		*/
++		apply_meter_rate(0, 0);
 +		apply_meter_rate(-1, new_state);	/*enable again */
 +	} else if (new_state == LTQ_CPUFREQ_PS_D3) {
 +		/*disable rmon timer */
@@ -3638,7 +3689,10 @@ new file mode 100644
 +		last_rmon_rx = 0;
 +
 +		/*enable meter */
-+		apply_meter_rate(0, 0);	/*disable first to solve red color issue if last time already triggered */
++		/*enable meter, but first disable to fix red color issue
++		  if last already triggered
++		*/
++		apply_meter_rate(0, 0);
 +		apply_meter_rate(-1, new_state);	/*enable again */
 +	}
 +
@@ -3662,7 +3716,10 @@ new file mode 100644
 +	/*check whether can be switched or not */
 +	if (!dp_coc_init_stat || !dp_coc_ena)
 +		res = 0;
-+	else if ((flags & CPUFREQ_PM_NO_DENY) || (dp_coc_ps_curr == LTQ_CPUFREQ_PS_UNDEF) || (dp_coc_ps_new == LTQ_CPUFREQ_PS_UNDEF) || (dp_coc_ps_new == LTQ_CPUFREQ_PS_D0D3))	/*accept */
++	else if ((flags & CPUFREQ_PM_NO_DENY) ||
++		(dp_coc_ps_curr == LTQ_CPUFREQ_PS_UNDEF) ||
++		(dp_coc_ps_new == LTQ_CPUFREQ_PS_UNDEF) ||
++		(dp_coc_ps_new == LTQ_CPUFREQ_PS_D0D3)) /*accept */
 +		res = 0;
 +	else if (dp_coc_ps_new >= new_state) {
 +		/* Accept any upscale request */
@@ -3691,7 +3748,7 @@ new file mode 100644
 +	coc_lock();
 +	dp_coc_ps_curr = new_state;
 +	dp_coc_ps_new = LTQ_CPUFREQ_PS_UNDEF;
-+	update_coc_cfg(new_state, old_state, flags);	/*don't lock before it */
++	update_coc_cfg(new_state, old_state, flags);/*don't lock before it */
 +	coc_unlock();
 +
 +	return 0;
@@ -3708,7 +3765,7 @@ new file mode 100644
 +
 +	if (new_state == LTQ_CPUFREQ_PS_UNDEF) {
 +		DP_DEBUG(DP_DBG_FLAG_COC,
-+			 "dp_coc_cpufreq_notifier new_state=UNDEF with val=%u \n",
++		  "dp_coc_cpufreq_notifier new_state=UNDEF with val=%u\n",
 +			 (unsigned int)val);
 +		return NOTIFY_STOP_MASK | (DP_MODULE << 4);
 +	}
@@ -3717,7 +3774,7 @@ new file mode 100644
 +
 +	if (old_state == LTQ_CPUFREQ_PS_UNDEF) {
 +		DP_DEBUG(DP_DBG_FLAG_COC,
-+			 "dp_coc_cpufreq_notifier new_state=%s old_state=UNDEF with val=%u\n",
++		  "new_state=%s old_state=UNDEF with val=%u\n",
 +			 get_coc_stat_string(new_state), (unsigned int)val);
 +		return NOTIFY_STOP_MASK | (DP_MODULE << 4);
 +	}
@@ -3749,57 +3806,57 @@ new file mode 100644
 +{
 +	union gsw_var tmp;
 +
-+	SEQ_PRINTF(s, "Basic DP COC Info:\n");
-+	SEQ_PRINTF(s, "  dp_coc_ena=%d @ 0x%p (DP %s)\n", dp_coc_ena,
++	SEQ_PRINTF(s, "  Basic DP COC Info:\n");
++	SEQ_PRINTF(s, "    dp_coc_ena=%d @ 0x%p (DP %s)\n", dp_coc_ena,
 +		   &dp_coc_ena, dp_coc_ena ? "COC Enabled" : "COC Disabled");
-+	SEQ_PRINTF(s, "  Rmon timer interval: %u sec (Timer %s)\n",
++	SEQ_PRINTF(s, "    Rmon timer interval: %u sec (Timer %s)\n",
 +		   (unsigned int)polling_period,
 +		   rmon_timer_en ? "enabled" : "disabled");
-+	/*SEQ_PRINTF(s, "  RMON D0 Threshold: %d\n", rmon_threshold.th_d0); */
-+	SEQ_PRINTF(s, "  RMON D1 Threshold: %d\n", rmon_threshold.th_d1);
-+	SEQ_PRINTF(s, "  RMON D2 Threshold: %d\n", rmon_threshold.th_d2);
-+	SEQ_PRINTF(s, "  RMON D3 Threshold: %d\n", rmon_threshold.th_d3);
-+	SEQ_PRINTF(s, "  dp_coc_init_stat=%d @ %p (%s)\n", dp_coc_init_stat,
++	/*SEQ_PRINTF(s, "    RMON D0 Threshold: %d\n", rmon_threshold.th_d0); */
++	SEQ_PRINTF(s, "    RMON D1 Threshold: %d\n", rmon_threshold.th_d1);
++	SEQ_PRINTF(s, "    RMON D2 Threshold: %d\n", rmon_threshold.th_d2);
++	SEQ_PRINTF(s, "    RMON D3 Threshold: %d\n", rmon_threshold.th_d3);
++	SEQ_PRINTF(s, "    dp_coc_init_stat=%d @ %p (%s)\n", dp_coc_init_stat,
 +		   &dp_coc_init_stat,
 +		   dp_coc_init_stat ? "initialized ok" : "Not initialized");
-+	SEQ_PRINTF(s, "  dp_coc_ps_curr=%d (%s) @ 0x%p\n", dp_coc_ps_curr,
++	SEQ_PRINTF(s, "    dp_coc_ps_curr=%d (%s) @ 0x%p\n", dp_coc_ps_curr,
 +		   get_coc_stat_string(dp_coc_ps_curr), &dp_coc_ps_curr);
-+	SEQ_PRINTF(s, "  dp_coc_ps_new=%d (%s)@ 0x%p\n", dp_coc_ps_new,
++	SEQ_PRINTF(s, "    dp_coc_ps_new=%d (%s)@ 0x%p\n", dp_coc_ps_new,
 +		   get_coc_stat_string(dp_coc_ps_new), &dp_coc_ps_new);
-+	SEQ_PRINTF(s, "  last_rmon_rx=%llu pkts@ 0x%p (%s)\n", last_rmon_rx,
++	SEQ_PRINTF(s, "    last_rmon_rx=%llu pkts@ 0x%p (%s)\n", last_rmon_rx,
 +		   &last_rmon_rx, rmon_timer_en ? "Valid" : "Not valid");
 +
-+	SEQ_PRINTF(s, "Metering Info:\n");
++	SEQ_PRINTF(s, "    Metering Info:\n");
 +	/*PCE_OVERHD */
 +	memset(&tmp, 0, sizeof(tmp));
 +	tmp.reg.nRegAddr = 0x46C;	/*PCE_OVERHD */
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_GET, (u32) &tmp);
-+	SEQ_PRINTF(s, "  PCE_OVERHD=%d\n", tmp.reg.nData);
++	SEQ_PRINTF(s, "    PCE_OVERHD=%d\n", tmp.reg.nData);
 +
 +	tmp.meter_cfg.nMeterId = meter_id;
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_QOS_METER_CFG_GET, (u32) &tmp);
-+	SEQ_PRINTF(s, "  meter id=%u (%s)\n", meter_id,
++	SEQ_PRINTF(s, "    meter id=%u (%s)\n", meter_id,
 +		   tmp.meter_cfg.bEnable ? "Enabled" : "Disabled");
-+	SEQ_PRINTF(s, "  meter nCbs=%u \n", tmp.meter_cfg.nCbs);
-+	SEQ_PRINTF(s, "  meter nEbs=%u \n", tmp.meter_cfg.nEbs);
-+	SEQ_PRINTF(s, "  meter nRate=%u \n", tmp.meter_cfg.nRate);
-+	SEQ_PRINTF(s, "  meter nPiRate=%u \n", tmp.meter_cfg.nPiRate);
-+	SEQ_PRINTF(s, "  meter eMtrType=%u \n", (int)tmp.meter_cfg.eMtrType);
-+	SEQ_PRINTF(s, "  D1 nRate=%u\n", meter_nrate[1]);
-+	SEQ_PRINTF(s, "  D2 nRate=%u\n", meter_nrate[2]);
-+	SEQ_PRINTF(s, "  D3 nRate=%u\n", meter_nrate[3]);
++	SEQ_PRINTF(s, "    meter nCbs=%u\n", tmp.meter_cfg.nCbs);
++	SEQ_PRINTF(s, "    meter nEbs=%u\n", tmp.meter_cfg.nEbs);
++	SEQ_PRINTF(s, "    meter nRate=%u\n", tmp.meter_cfg.nRate);
++	SEQ_PRINTF(s, "    meter nPiRate=%u\n", tmp.meter_cfg.nPiRate);
++	SEQ_PRINTF(s, "    meter eMtrType=%u\n", (int)tmp.meter_cfg.eMtrType);
++	SEQ_PRINTF(s, "    D1 nRate=%u\n", meter_nrate[1]);
++	SEQ_PRINTF(s, "    D2 nRate=%u\n", meter_nrate[2]);
++	SEQ_PRINTF(s, "    D3 nRate=%u\n", meter_nrate[3]);
 +
 +	memset(&tmp, 0, sizeof(tmp));
 +	tmp.reg.nRegAddr = 0x489 + meter_id * 10;
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_GET, (u32) &tmp);
-+	SEQ_PRINTF(s, "  PCE_PISR(0x%x)=%u(0x%x)-interrupt %s\n",
++	SEQ_PRINTF(s, "    PCE_PISR(0x%x)=%u(0x%x)-interrupt %s\n",
 +		   tmp.reg.nRegAddr, tmp.reg.nData, tmp.reg.nData,
 +		   (tmp.reg.nData & 0x100) ? "on" : "off");
 +
 +	memset(&tmp, 0, sizeof(tmp));
 +	tmp.reg.nRegAddr = 0xE11;
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_GET, (u32) &tmp);
-+	SEQ_PRINTF(s, "  GSW_PCE_TCM_STAT(0x%x)=%u(0x%x)-backpress %s\n",
++	SEQ_PRINTF(s, "    GSW_PCE_TCM_STAT(0x%x)=%u(0x%x)-backpress %s\n",
 +		   tmp.reg.nRegAddr, tmp.reg.nData, tmp.reg.nData,
 +		   (tmp.reg.nData & 1) ? "on" : "off");
 +}
@@ -3902,7 +3959,7 @@ new file mode 100644
 +		} else
 +			PRINTK
 +			    ("Wrong COC state, it should be D1/D2/D3 only\n");
-+	} else if (dp_strcmpi(param_list[0], "interrupt") == 0) {	/*meter */
++	} else if (dp_strcmpi(param_list[0], "interrupt") == 0) {/*meter */
 +		enable_meter_interrupt();
 +		PRINTK("Enabled meter interurpt\n");
 +	} else if (dp_strcmpi(param_list[0], "clear") == 0) {	/*meter */
@@ -3919,15 +3976,15 @@ new file mode 100644
 +	PR_INFO("  echo <thresholdx> its_threshold_value > /proc/dp/coc\n");
 +	PR_INFO("       Note:Valid x of ranage: 1 2 3\n");
 +	PR_INFO
-+	    ("            For downscaling to D<x> if rmon < threshold<x>'s setting\n");
++	    ("            For downscale to D<x> if rmon<threshold<x>'s cfg\n");
 +	PR_INFO("            threshold1's >= threshold'2 > threshold'3\n");
 +	PR_INFO("  echo <ratex> <meter_rate_in_knps> /proc/dp/coc\n");
 +	PR_INFO("       Note:Valid x of ranage: 1 2 3\n");
 +	PR_INFO
-+	    ("            For upscaling to D0 from D<x> if rmon >= rate<x>'s setting\n");
++	  ("            For upscale to D0 from D<x> if rmon>=rate<x>'s cfg\n");
 +	PR_INFO("            Rate1's >= Rate2's > D3's threshold\n");
 +	PR_INFO
-+	    ("  echo interrupt > /proc/dp/coc  :enable/disable meter interrupt\n");
++	  ("  echo interrupt > /proc/dp/coc:enable/disable meter interrupt\n");
 +	PR_INFO("  echo clear > /proc/dp/coc  :clear meter interrupt\n");
 +	return count;
 +}
@@ -3957,28 +4014,28 @@ new file mode 100644
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_SET, (u32) &tmp);
 +
 +	/*#Enable PCE Port Interrupt
-+	*  switch_cli GSW_REGISTER_SET nRegAddr=0x465 nData=0x1 dev=1 */
++	*  switch_cli GSW_REGISTER_SET nRegAddr=0x465 nData=0x1 dev=1
++	*/
 +	memset(&tmp, 0, sizeof(tmp));
 +	tmp.reg.nRegAddr = 0x465;	/*PCE_IER_0 */
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_GET, (u32) &tmp);
-+	tmp.reg.nRegAddr |= 1 << 0 /*Enable PCE Port 0 */ ;
++	tmp.reg.nRegAddr |= 1 << 0; /*Enable PCE Port 0 */
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_SET, (u32) &tmp);
 +
 +	/*#Enable Meter Interrupt
-+	   switch_cli GSW_REGISTER_SET nRegAddr=0x488 nData=0x100 dev=1 */
++	   switch_cli GSW_REGISTER_SET nRegAddr=0x488 nData=0x100 dev=1
++	*/
 +	memset(&tmp, 0, sizeof(tmp));
 +	tmp.reg.nRegAddr = 0x488;	/*PCE_PIER */
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_GET, (u32) &tmp);
-+	tmp.reg.nRegAddr |= 1 << 8
-+	    /*Enable Metering Based Backpressure Status Change Interrupt Enable */
-+	    ;
++	/*Enable Metering Based Backpressure Status Change Interrupt Enable */
++	tmp.reg.nRegAddr |= 1 << 8;
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_SET, (u32) &tmp);
 +
 +	return 0;
 +}
 +
-+/*
-+*  rate      0: disable meter
++/* rate      0: disable meter
 +* -1: enable meter
 +* others: really change rate.
 +*/
@@ -4033,7 +4090,7 @@ new file mode 100644
 +#else
 +	memset(&tmp, 0, sizeof(tmp));
 +
-+	for (i = 0; i < PMAC_MAX_NUM; i++) {	/*copy green setting to yellow/red */
++	for (i = 0; i < PMAC_MAX_NUM; i++) {/*cp green setting to yellow/red*/
 +		tmp.wred_p.nPortId = i;
 +		dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_QOS_WRED_PORT_CFG_GET,
 +			      (u32) &tmp);
@@ -4048,7 +4105,8 @@ new file mode 100644
 +#endif
 +
 +	/*#Enable Meter 0, configure the rate
-+	* switch_cli GSW_QOS_METER_CFG_SET bEnable=1 nMeterId=0 nCbs=0xA000 nEbs=0x9000 nRate=500 dev=1
++	* switch_cli GSW_QOS_METER_CFG_SET bEnable=1
++		nMeterId=0 nCbs=0xA000 nEbs=0x9000 nRate=500 dev=1
 +	*/
 +	memset(&tmp, 0, sizeof(tmp));
 +	/*tmp.meter_cfg.bEnable = 1; */
@@ -4061,7 +4119,8 @@ new file mode 100644
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_QOS_METER_CFG_SET, (u32) &tmp);
 +
 +	/*#Assign Port0 ingress to Meter 0
-+	* switch_cli GSW_QOS_METER_PORT_ASSIGN nMeterId=0 eDir=1 nPortIngressId=0 dev=1
++	* switch_cli GSW_QOS_METER_PORT_ASSIGN nMeterId=0 eDir=1
++		nPortIngressId=0 dev=1
 +	*/
 +	memset(&tmp, 0, sizeof(tmp));
 +
@@ -4082,15 +4141,19 @@ new file mode 100644
 +	tmp.reg.nData |= 1 << 2;
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_REGISTER_SET, (u32) &tmp);
 +
-+	/*#Configure Red and Yellow watermark for each queue (Yellow and Red shall not be 0 in CoC case in order to avoid packet drop)
++	/*#Configure Red and Yellow watermark for each queue
++	*  (Yellow and Red shall not be 0 in CoC case in order to avoid
++	*  packet drop)
 +	*  i=0
 +	*  while [$i -lt 32]
 +	*  do
-+	*  switch_cli GSW_QOS_WRED_QUEUE_CFG_SET nQueueId=$i nRed_Min=0x40 nRed_Max=0x40 nYellow_Min=0x40 nYellow_Max=0x40 nGreen_Min=0x40 nGreen_Max=0x40 dev=1
++	*  switch_cli GSW_QOS_WRED_QUEUE_CFG_SET nQueueId=$i nRed_Min=0x40
++	*  nRed_Max=0x40 nYellow_Min=0x40 nYellow_Max=0x40 nGreen_Min=0x40
++	*  nGreen_Max=0x40 dev=1
 +	*  i=$(($i+1))
-+	*  done */
++	*  done
++	*/
 +	memset(&tmp, 0, sizeof(tmp));
-+
 +	for (i = 0; i < 32; i++) {	/*copy green setting to yellow/red */
 +		tmp.wred_q.nQueueId = i;
 +		dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_QOS_WRED_QUEUE_CFG_GET,
@@ -4104,9 +4167,10 @@ new file mode 100644
 +
 +	}
 +
-+	/*
-+	*  ##Configure Red and Yellow watermark for each queue (Yellow and Red shall not be 0 in CoC case in order to avoid packet drop)
-+	*  switch_cli GSW_QOS_WRED_CFG_SET nRed_Min=255 nRed_Max=255 nYellow_Min=255 nYellow_Max=255  nGreen_Min=255 nGreen_Max=255 dev=1
++	/*Configure Red and Yellow watermark for each queue (Yellow and Red
++	* shall not be 0 in CoC case in order to avoid packet drop)
++	* switch_cli GSW_QOS_WRED_CFG_SET nRed_Min=255 nRed_Max=255
++	* nYellow_Min=255 nYellow_Max=255  nGreen_Min=255 nGreen_Max=255 dev=1
 +	*/
 +	memset(&tmp, 0, sizeof(tmp));
 +	dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_QOS_WRED_CFG_GET, (u32) &tmp);
@@ -4162,7 +4226,8 @@ new file mode 100644
 +
 +	if (dp_coc_ps_curr == new_state) {
 +		/*Workaround: if no change but this API still is called,
-+		   it means need to update interrupt enable/disable status */
++		   it means need to update interrupt enable/disable status
++		*/
 +		DP_DEBUG(DP_DBG_FLAG_COC, "No change\n");
 +		update_coc_cfg(new_state, new_state, flag);
 +		coc_unlock();
@@ -4178,7 +4243,7 @@ new file mode 100644
 +
 +	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS) {
 +		DP_DEBUG(DP_DBG_FLAG_COC,
-+			 "Power state request to %d (%s) failed via ltq_cpufreq_state_req ??\n",
++		  "Power stat req to %d(%s) fail via ltq_cpufreq_state_req?\n",
 +			 new_state, get_coc_stat_string(new_state));
 +		DP_DEBUG(DP_DBG_FLAG_COC, "return value: %d ??\n", ret);
 +		return -1;
@@ -4207,8 +4272,7 @@ new file mode 100644
 +
 +	if (cpufreq_register_notifier
 +	    (&dp_coc_cpufreq_notifier_block, CPUFREQ_TRANSITION_NOTIFIER)) {
-+		PR_ERR
-+		    ("dp_coc_cpufreq_init failed:cpufreq_register_notifier failed ?\n");
++		PR_ERR("cpufreq_register_notifier failed?\n");
 +		return -1;
 +	}
 +
@@ -4254,7 +4318,7 @@ new file mode 100644
 +		if (ret)
 +			pr_err("The timer is still in use...\n");
 +
-+		dp_coc_new_stat_req(LTQ_CPUFREQ_PS_D0D3, 0);	/*dont care mode */
++		dp_coc_new_stat_req(LTQ_CPUFREQ_PS_D0D3, 0);/*dont care mode */
 +
 +		if (cpufreq_unregister_notifier
 +		    (&dp_coc_cpufreq_notifier_block,
@@ -5984,7 +6048,7 @@ diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_mib.c b/drivers/net/e
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/datapath/datapath_mib.c
-@@ -0,0 +1,2140 @@
+@@ -0,0 +1,2158 @@
 +/*
 + Reference: http://smartbear.lantiq.com/ui#review:id=1716
 +*/
@@ -6023,6 +6087,7 @@ new file mode 100644
 +#include <net/ltq_mpe_hal.h>
 +#else
 +#define CONFIG_LTQ_DATAPATH_DUMMY_TMU_MIB /*use local DUMMY TMU HAL MIB API */
++#define CONFIG_LTQ_DATAPATH_DUMMY_MPE_MIB
 +#endif
 +
 +#ifdef CONFIG_LTQ_DATAPATH_OLD_TMU_HAL
@@ -6035,15 +6100,15 @@ new file mode 100644
 +#endif
 +
 +
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +#ifdef CONFIG_LTQ_DATAPATH_DUMMY_TMU_MIB
 +struct tmu_hal_qos_stats {
-+uint32_t enqPkts; /* Enqueued packets Count */
-+uint32_t enqBytes; /* Enqueued Bytes Count */
-+uint32_t deqPkts; /* Dequeued packets Count */
-+uint32_t deqBytes; /* Dequeued Bytes Count */
-+uint32_t dropPkts; /* Dropped Packets Count */
-+uint32_t dropBytes; /* Dropped Bytes Count - UNUSED for now */
++uint64_t enqPkts; /* Enqueued packets Count */
++uint64_t enqBytes; /* Enqueued Bytes Count */
++uint64_t deqPkts; /* Dequeued packets Count */
++uint64_t deqBytes; /* Dequeued Bytes Count */
++uint64_t dropPkts; /* Dropped Packets Count */
++uint64_t dropBytes; /* Dropped Bytes Count - UNUSED for now */
 +uint32_t qOccPkts; /* Queue Occupancy Packets Count - Only at Queue level */
 +};
 +
@@ -6176,7 +6241,7 @@ new file mode 100644
 +	GSW_RMON_Port_cnt_t r;
 +	GSW_RMON_Redirect_cnt_t redir; /*only for ethernet WAN port */
 +	dp_drv_mib_t drv;
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	struct tmu_hal_qos_stats tmu_qos[MAX_SUBIF_PER_PORT];
 +	struct tmu_hal_qos_stats tmu_chksum;  /*only for ethernet WAN port */
 +	struct mpe_hal_if_stats mpe;
@@ -6185,7 +6250,7 @@ new file mode 100644
 +
 +struct mibs_low_lvl_vap {
 +	GSW_RMON_If_cnt_t gsw_if; /*for pae only since GSW-L not support interface mib*/
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	struct tmu_hal_qos_stats tmu_qos;
 +	struct mpe_hal_if_stats mpe;
 +#endif
@@ -6219,7 +6284,7 @@ new file mode 100644
 +static struct timer_list exp_timer;	/*timer setting */
 +#endif
 +
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +static int32_t(*tmu_hal_get_qos_mib_hook_fn_local)(struct net_device *dev,
 +	dp_subif_t *subif_id,
 +	int32_t queue_id,
@@ -6263,7 +6328,7 @@ new file mode 100644
 +#define RMON_PORT_WRAP(c, l, x) wraparound(c->x, l->x, sizeof(l->x))
 +	GSW_RMON_Port_cnt_t *curr_tmp;
 +	GSW_RMON_Port_cnt_t *last_tmp;
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	int i;
 +#endif
 +
@@ -6354,7 +6419,7 @@ new file mode 100644
 +		return 0;
 +	}
 +
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	/*TMU drop counters */
 +	for (i = 0; i < MAX_SUBIF_PER_PORT; i++)
 +		aggregate_mib[ep].curr.tx_tmu_drop_pkts +=
@@ -6446,7 +6511,7 @@ new file mode 100644
 +	    VAP_RMON_WRAP_ITF(curr, last, nTxPktsCount);
 +	aggregate_mib[ep].curr_vap[vap].tx_disc_pkts_itf +=
 +	    VAP_RMON_WRAP_ITF(curr, last, nTxDiscPktsCount);
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	aggregate_mib[ep].curr_vap[vap].tx_disc_pkts_tmu +=
 +	    VAP_RMON_WRAP_TMU(curr, last, dropPkts);
 +	aggregate_mib[ep].curr_vap[vap].tx_disc_pkts_mpe +=
@@ -6604,7 +6669,7 @@ new file mode 100644
 +	int ret;
 +	struct mibs_low_lvl_port *curr;
 +	dp_subif_t tmp;
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	int update_flag, i;
 +	struct pmac_port_info *port;
 +#endif
@@ -6652,7 +6717,7 @@ new file mode 100644
 +	if (ret)		/*workaroud */
 +		curr->r = last[tmp.port_id].r;
 +
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	/* collect all mib per VAP for TMU and MPE MIB */
 +	tmu_hal_get_qos_mib_hook_fn_local = tmu_hal_get_qos_mib_hook_fn;
 +	port = get_port_info(tmp.port_id);
@@ -6696,7 +6761,7 @@ new file mode 100644
 +					  &curr->redir);
 +		if (ret)	/*workaroud */
 +			curr->redir = last[tmp.port_id].redir;
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +		tmu_hal_get_csum_ol_mib_hook_fn_local = tmu_hal_get_csum_ol_mib_hook_fn;
 +		update_flag = 0;
 +		if (tmu_hal_get_csum_ol_mib_hook_fn_local) {
@@ -6794,7 +6859,7 @@ new file mode 100644
 +		PR_ERR("get_gsw_itf_rmon failed for port/vap(%d/%d)", port_id,
 +			vap);
 +	}
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	/*get TMU mib */
 +	tmu_hal_get_qos_mib_hook_fn_local = tmu_hal_get_qos_mib_hook_fn;
 +	if (!tmu_hal_get_qos_mib_hook_fn_local) {
@@ -6803,8 +6868,8 @@ new file mode 100644
 +		ret = tmu_hal_get_qos_mib_hook_fn_local(NULL, subif, -1, &curr->tmu_qos, 0);
 +		if (ret) {
 +			curr->tmu_qos = last_vap[port_id][vap].tmu_qos;
-+			PR_ERR("tmu_hal_get_qos_mib_hook_fn failed for port.vap(%d.%d):%d\n",
-+					port_id, vap, ret);
++			/*PR_ERR("tmu_hal_get_qos_mib_hook_fn failed for port.vap(%d.%d):%d\n",
++					port_id, vap, ret);*/
 +		}
 +	}
 +	/*get MPE mib */
@@ -6931,11 +6996,11 @@ new file mode 100644
 +		   last[pos].redir.nTxPktsCount);
 +	SEQ_PRINTF(s, "  %-45s=%40u\n", "last.redir.nTxDiscPktsCount",
 +		   last[pos].redir.nTxDiscPktsCount);
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	/*checksum */
-+	SEQ_PRINTF(s, "  %-45s=%40u\n", "last.tmu_chksum.deqPkts",
++	SEQ_PRINTF(s, "  %-45s=%40llu\n", "last.tmu_chksum.deqPkts",
 +		   last[pos].tmu_chksum.deqPkts);
-+	SEQ_PRINTF(s, "  %-45s=%40u\n", "last.tmu_chksum.deqBytes",
++	SEQ_PRINTF(s, "  %-45s=%40llu\n", "last.tmu_chksum.deqBytes",
 +		   last[pos].tmu_chksum.deqBytes);
 +#endif
 +	/*mib array */
@@ -7572,7 +7637,6 @@ new file mode 100644
 +
 +	if (!(flag & DP_F_STATS_SUBIF))
 +		return 0;
-+
 +	if (!subif) { /* clear all */
 +		start = 0;
 +		end = MAX_RMON_ITF;
@@ -7580,23 +7644,24 @@ new file mode 100644
 +		DP_DEBUG(DP_DBG_FLAG_MIB, "wrong port_id %d\n",
 +			subif->port_id);
 +		return -1;
++	} else {
++		port_info = get_port_info(subif->port_id);
++		if (!port_info || !port_info->itf_info)
++			return 0;
++		start = port_info->itf_info->start + get_vap(subif->subif);
++		end = start + 1;
 +	}
-+	port_info = get_port_info(subif->port_id);
-+	if (!port_info->itf_info)
-+		return 0;
-+	start = port_info->itf_info->start + get_vap(subif->subif);
-+	end = start + 1;
 +	tmp.rmon.eRmonType = GSW_RMON_IF_TYPE;
 +	for (i = start; i < end; i++) {
 +		tmp.rmon.nRmonId = i;
 +		if (tmp.rmon.nRmonId >= MAX_RMON_ITF) {
 +			PR_ERR("Why Port[%d]'s interface ID %d so big\n",
-+			       subif->port_id, tmp.rmon.nRmonId);
++			       subif ? subif->port_id : -1,
++			       tmp.rmon.nRmonId);
 +			return -1;
 +		}
 +		dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_RMON_CLEAR, (u32)&tmp);
 +	}
-+
 +	return 0;
 +}
 +
@@ -7612,7 +7677,7 @@ new file mode 100644
 +		gsw_mib_reset(1, 0);
 +		tmu_reset_mib_all(flag);
 +		dp_clear_all_mib_inside(flag);
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +		tmu_hal_clear_qos_mib_hook_fn_local =
 +			tmu_hal_clear_qos_mib_hook_fn;
 +		if (tmu_hal_clear_qos_mib_hook_fn_local)
@@ -7690,7 +7755,7 @@ new file mode 100644
 +		tmp.rmon.nRmonId = 0;
 +		dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_RMON_CLEAR, (u32)&tmp);
 +
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +		tmu_hal_clear_csum_ol_mib_hook_fn_local =
 +			tmu_hal_clear_csum_ol_mib_hook_fn;
 +		if (tmu_hal_clear_csum_ol_mib_hook_fn_local)
@@ -7708,7 +7773,7 @@ new file mode 100644
 +		tmp.rmon.nRmonId = port_id;
 +		dp_gsw_kioctl(GSWIP_R_DEV_NAME, GSW_RMON_CLEAR, (u32)&tmp);
 +	}
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	tmu_hal_clear_qos_mib_hook_fn_local = tmu_hal_clear_qos_mib_hook_fn;
 +	if (tmu_hal_clear_qos_mib_hook_fn_local)
 +		tmu_hal_clear_qos_mib_hook_fn_local(NULL, subif, -1, flag);
@@ -7883,11 +7948,10 @@ new file mode 100644
 +	return pos;
 +}
 +
-+
 +ssize_t proc_mib_port_write(struct file *file, const char *buf, size_t count,
-+		      loff_t *ppos)
++	loff_t *ppos)
 +{
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 +	int len;
 +	char str[64];
 +	int i, num, res;
@@ -7905,28 +7969,46 @@ new file mode 100644
 +		goto help;
 +	memset(&qos_stats, 0, sizeof(qos_stats));
 +	if (dp_strcmpi(param_list[0], "qos_mib") == 0) {
++		int32_t port_list[] = {15, 2, 3, 4, 5, 7, 8};
++		int k;
 +		tmu_hal_get_qos_mib_hook_fn_local = tmu_hal_get_qos_mib_hook_fn;
 +		if (!tmu_hal_get_qos_mib_hook_fn_local) {
-+			PRINTK("tmu_hal_get_qos_mib_hook_fn NULL\n");
++			/*PRINTK("tmu_hal_get_qos_mib_hook_fn NULL\n");*/
 +			return count;
 +		}
-+		tmp.port_id = 15;
-+		port = get_port_info(tmp.port_id);
-+		for (i = 0; i < MAX_SUBIF_PER_PORT; i++) {
-+			if (!port->subif_info[i].flags)
++		for (k = 0; k < ARRAY_SIZE(port_list); k++) {
++			tmp.port_id = port_list[k];
++			port = get_port_info(tmp.port_id);
++			if (!port)
 +				continue;
-+			else {
++			for (i = 0; i < MAX_SUBIF_PER_PORT; i++) {
++				if (!port->subif_info[i].flags)
++					continue;
 +				tmp.subif = set_vap(i);
-+				res = tmu_hal_get_qos_mib_hook_fn_local(NULL, &tmp, -1,
-+					&qos_stats, 0);
-+			}
-+			if (res)
-+				PRINTK("tmu_hal_get_qos_mib_hook_fn failed\n");
-+			else
-+				PRINTK("qos_mib[%d/%d]: drop_pkts=%u  drop_bytes=%u\n", tmp.port_id,
++				res = tmu_hal_get_qos_mib_hook_fn_local(NULL,
++					&tmp, -1, &qos_stats, 0);
++				if (res) {
++					/*PRINTK("tmu_hal_get_qos_mib_hook_fn failed for p[%d]\n",
++						tmp.port_id);*/
++					continue;
++				}
++				PRINTK("qos_mib[%d/%d]:drop_pkts=%llu bytes=%llu\n",
++					tmp.port_id,
 +					get_vap(tmp.subif),
 +					qos_stats.dropPkts,
 +					qos_stats.dropBytes);
++				PRINTK("qos_mib[%d/%d]:enqPkts=%llu Bytes=%llu\n",
++					tmp.port_id,
++					get_vap(tmp.subif),
++					qos_stats.enqPkts,
++					qos_stats.enqBytes);
++				PRINTK("qos_mib[%d/%d]:deqPkts=%llu Bytes=%llu\n",
++					tmp.port_id,
++					get_vap(tmp.subif),
++					qos_stats.deqPkts,
++					qos_stats.deqBytes);
++			}
++			PRINTK("\n");
 +		}
 +	} else if (dp_strcmpi(param_list[0], "csum_mib") == 0) {
 +		tmu_hal_get_csum_ol_mib_hook_fn_local = tmu_hal_get_csum_ol_mib_hook_fn;
@@ -7938,21 +8020,21 @@ new file mode 100644
 +		if (res)
 +			PRINTK("tmu_hal_get_csum_ol_mib_hook_fn failed\n");
 +		else
-+			PRINTK("csum_mib: deqPkts=%u  deqBytes=%u\n",
++			PRINTK("csum_mib: deqPkts=%llu  deqBytes=%llu\n",
 +			qos_stats.deqPkts,
 +			qos_stats.deqBytes);
 +
 +	} else if (dp_strcmpi(param_list[0], "qos_mib_clear") == 0) {
-+		mpe_hal_clear_if_mib_hook_fn_local = mpe_hal_clear_if_mib_hook_fn;
-+		if (!mpe_hal_clear_if_mib_hook_fn_local) {
-+			PRINTK("mpe_hal_clear_if_mib_hook_fn NULL\n");
++		tmu_hal_clear_qos_mib_hook_fn_local = tmu_hal_clear_qos_mib_hook_fn;
++		if (!tmu_hal_clear_qos_mib_hook_fn_local) {
++			PRINTK("tmu_hal_clear_qos_mib_hook_fn_local NULL ?\n");
 +			return count;
 +		}
-+		res = mpe_hal_clear_if_mib_hook_fn_local(NULL, NULL, -1);
++		res = tmu_hal_clear_qos_mib_hook_fn_local(NULL, NULL, -1, 0);
 +		if (res)
-+			PRINTK("mpe_hal_clear_if_mib_hook_fn failed\n");
++			PRINTK("tmu_hal_clear_qos_mib_hook_fn_local failed\n");
 +		else
-+			PRINTK("mpe_hal_clear_if_mib_hook_fn(NULL, NULL, -1) done\n");
++			PRINTK("tmu_hal_clear_qos_mib_hook_fn_local(NULL, NULL, -1, 0) done\n");
 +
 +	} else if (dp_strcmpi(param_list[0], "csum_mib_clear") == 0) {
 +		tmu_hal_clear_csum_ol_mib_hook_fn_local = tmu_hal_clear_csum_ol_mib_hook_fn;
@@ -7972,7 +8054,7 @@ new file mode 100644
 +	return count;
 +#endif
 +	return count;
-+#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPW_MIB
++#ifdef CONFIG_LTQ_DATAPATH_MIB_TMU_MPE_MIB
 + help:
 +	PRINTK("usage:\n");
 +	PRINTK("  test qos_mib  api:      echo qos_mib        > /proc/dp/mib_port\n");
@@ -8140,7 +8222,7 @@ diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_pmac.c b/drivers/net/
 new file mode 100755
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/datapath/datapath_pmac.c
-@@ -0,0 +1,443 @@
+@@ -0,0 +1,445 @@
 +#include <linux/kernel.h>	/* printk() */
 +#include <linux/types.h>	/* size_t */
 +#include <linux/etherdevice.h>
@@ -8217,6 +8299,8 @@ new file mode 100755
 +
 +		for (i = 0; i < dqport.num_deq_ports; i++) {
 +			igcfg.nTxDmaChanId = dqport.deq_info[i].dma_tx_chan;
++			if (igcfg.nTxDmaChanId == (u8)-1)
++			  igcfg.nTxDmaChanId = pmac_cfg->ig_pmac.tx_dma_chan;
 +			gsw_api_kioctl(gswr_r, GSW_PMAC_IG_CFG_GET,
 +				       (u32) &igcfg);
 +
@@ -8383,8 +8467,8 @@ new file mode 100755
 +
 +			if (pmac_cfg->eg_pmac_flags & EG_PMAC_F_MPE2FLG)
 +				egcfg.bMpe2Flag = pmac_cfg->eg_pmac.mpe2_flag;
-+
-+			if (dp_dbg_flag & DP_DBG_FLAG_DBG) {
++#if defined(CONFIG_LTQ_DATAPATH_DBG) && CONFIG_LTQ_DATAPATH_DBG
++			if (dp_dbg_flag) {
 +				DP_DEBUG(DP_DBG_FLAG_DBG,
 +					 "\nPMAC %d egcfg configuration:\n",
 +					 port);
@@ -8435,7 +8519,7 @@ new file mode 100755
 +					 "egcfg.bMpe2Flag=%d\n",
 +					 egcfg.bMpe2Flag);
 +			}
-+
++#endif
 +			gsw_api_kioctl(gswr_r, GSW_PMAC_EG_CFG_SET,
 +				       (u32) &egcfg);
 +			;
@@ -8497,22 +8581,22 @@ new file mode 100755
 +
 +	if (cpu) {
 +		*cpu = (v >> 0) & 0x3;
-+		DP_DEBUG(DP_DBG_FLAG_DBG, "  cpu=%d \n", *cpu);
++		DP_DEBUG(DP_DBG_FLAG_DBG, "  cpu=%d\n", *cpu);
 +	}
 +
 +	if (mpe1) {
 +		*mpe1 = (v >> 2) & 0x3;
-+		DP_DEBUG(DP_DBG_FLAG_DBG, "  mpe1=%d \n", *mpe1);
++		DP_DEBUG(DP_DBG_FLAG_DBG, "  mpe1=%d\n", *mpe1);
 +	}
 +
 +	if (mpe2) {
 +		*mpe2 = (v >> 4) & 0x3;
-+		DP_DEBUG(DP_DBG_FLAG_DBG, "  mpe2=%d \n", *mpe2);
++		DP_DEBUG(DP_DBG_FLAG_DBG, "  mpe2=%d\n", *mpe2);
 +	}
 +
 +	if (mpe3) {
 +		*mpe3 = (v >> 6) & 0x3;
-+		DP_DEBUG(DP_DBG_FLAG_DBG, "  mpe3=%d \n", *mpe3);
++		DP_DEBUG(DP_DBG_FLAG_DBG, "  mpe3=%d\n", *mpe3);
 +	}
 +}
 +EXPORT_SYMBOL(dp_get_gsw_parser);
@@ -8610,7 +8694,7 @@ diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c b/drivers/net/
 new file mode 100644
 --- /dev/null
 +++ b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
-@@ -0,0 +1,4040 @@
+@@ -0,0 +1,4297 @@
 +#include <linux/module.h>
 +#include <lantiq.h>
 +#include <net/datapath_proc_api.h>	/*for proc api */
@@ -8622,6 +8706,8 @@ new file mode 100644
 +#include <asm/ltq_vmb.h>	/*vmb */
 +#include <asm/ltq_itc.h>	/*mips itc */
 +#include <linux/list.h>
++#include <linux/of_device.h>
++#include <linux/of_platform.h>
 +#include <xway/switch-api/lantiq_gsw_api.h>
 +#include <xway/switch-api/lantiq_gsw_flow.h>
 +
@@ -8653,6 +8739,7 @@ new file mode 100644
 +#define DP_PROC_FILE_PCE  "pce"
 +#define DP_PROC_FILE_ROUTE  "route"
 +#define DP_PROC_FILE_PMAC  "pmac"
++#define DP_PROC_FILE_DT  "dt"
 +
 +
 +#undef NIPQUAD
@@ -8689,9 +8776,11 @@ new file mode 100644
 +
 +static ssize_t proc_port_write(struct file *file, const char *buf,
 +			       size_t count, loff_t *ppos);
++#if defined(CONFIG_LTQ_DATAPATH_DBG) && CONFIG_LTQ_DATAPATH_DBG
 +static void proc_dbg_read(struct seq_file *s);
-+static int proc_port_dump(struct seq_file *s, int pos);
 +static ssize_t proc_dbg_write(struct file *, const char *, size_t, loff_t *);
++#endif
++static int proc_port_dump(struct seq_file *s, int pos);
 +static void proc_parser_read(struct seq_file *s);
 +static ssize_t proc_parser_write(struct file *, const char *, size_t,
 +				 loff_t *);
@@ -8720,12 +8809,17 @@ new file mode 100644
 +static int inet_pton4(const char *src, u_char *dst);
 +static int inet_pton6(const char *src, u_char *dst);
 +static int proc_gsw_route_dump(struct seq_file *seq, int pos);
++static void print_device_tree_node(struct device_node *node, int depth);
++static ssize_t proc_dt_write(struct file *file, const char *buf,
++	size_t count, loff_t *ppos);
 +
 +static int rmon_display_tmu_mib = 1;
 +static int rmon_display_port_full;
 +static struct dp_proc_entry dp_proc_entries[] = {
 +	/*name single_callback_t multi_callback_t/_start write_callback_t */
++#if defined(CONFIG_LTQ_DATAPATH_DBG) && CONFIG_LTQ_DATAPATH_DBG
 +	{DP_PROC_FILE_DBG, proc_dbg_read, NULL, NULL, proc_dbg_write},
++#endif
 +	{DP_PROC_FILE_PORT, NULL, proc_port_dump, NULL, proc_port_write},
 +	{DP_PROC_FILE_PARSER, proc_parser_read, NULL, NULL,
 +	 proc_parser_write},
@@ -8760,6 +8854,7 @@ new file mode 100644
 +	 proc_gsw_route_write},
 +	 {DP_PROC_FILE_PMAC, NULL, NULL, NULL,
 +	 proc_gsw_pmac_write},
++	 {DP_PROC_FILE_DT, NULL, NULL, NULL, proc_dt_write},
 +
 +	/*the last place holder */
 +	{NULL, NULL, NULL, NULL, NULL}
@@ -9031,11 +9126,13 @@ new file mode 100644
 +	return count;
 +}
 +
++#if defined(CONFIG_LTQ_DATAPATH_DBG) && CONFIG_LTQ_DATAPATH_DBG
 +void proc_dbg_read(struct seq_file *s)
 +{
 +	int i;
 +
 +	SEQ_PRINTF(s, "dp_dbg_flag=0x%08x\n", dp_dbg_flag);
++
 +	SEQ_PRINTF(s, "Supported Flags =%d\n", get_dp_dbg_flag_str_size());
 +	SEQ_PRINTF(s, "Enabled Flags(0x%0x):", dp_dbg_flag);
 +
@@ -9053,10 +9150,8 @@ new file mode 100644
 +
 +	SEQ_PRINTF(s, "dp_rx_test_mode=%d @ 0x%p\n", dp_rx_test_mode,
 +		   &dp_rx_test_mode);
-+
 +	SEQ_PRINTF(s, "dp_dbg_err(flat to print error or not)=%d @ 0x%p\n", dp_dbg_err,
 +		   &dp_dbg_err);
-+
 +	print_parser_status(s);
 +}
 +
@@ -9109,6 +9204,7 @@ new file mode 100644
 +
 +	return count;
 +}
++#endif
 +
 +static void proc_parser_read(struct seq_file *s)
 +{
@@ -12650,7 +12746,253 @@ new file mode 100644
 +	goto exit;
 +}
 +
++ssize_t proc_dt_write(struct file *file, const char *buf,
++			     size_t count, loff_t *ppos)
++{
++	u16 len;
++	char str[64];
++	char *param_list[20 * 2];
++	unsigned int num;
++	struct device_node *node;
 +
++	len = (sizeof(str) > count) ? count : sizeof(str) - 1;
++	len -= copy_from_user(str, buf, len);
++	str[len] = 0;
++	num = dp_split_buffer(str, param_list, ARRAY_SIZE(param_list));
++	if (!param_list[0] || (strlen(param_list[0]) <= 1))
++		param_list[0] = "/";
++	node = of_find_node_by_path(param_list[0]);
++	if (!node)
++		node = of_find_node_by_name(NULL, param_list[0]);
++	if (!node) {
++		PRINTK("Cannot find node for %s\n", param_list[0]);
++		return count;
++	}
++	print_device_tree_node(node, 0);
++	return count;
++}
++
++struct property_info {
++	char *name;
++	int type;
++};
++
++enum PROPERTY_TYPE{
++	PROP_UNKNOWN = 0,
++	PROP_STRING,
++	PROP_REG,
++	PROP_RANGER,
++	PROP_U32_OCT,
++	PROP_U32_HEX,
++	PROP_HANDLE,
++	PROP_REFERENCE
++};
++
++struct property_info prop_info[] = {
++	{"compatible", PROP_STRING},
++	{"status", PROP_STRING},
++	{"name", PROP_STRING},
++	{"label", PROP_STRING},
++	{"model", PROP_STRING},
++	{"reg-names", PROP_STRING},
++	{"reg", PROP_REG},
++	{"interrupts", PROP_U32_OCT},
++	{"ranges", PROP_RANGER},
++	{"dma-ranges", PROP_RANGER},
++	{"phandle", PROP_HANDLE},
++	{"interrupt-parent", PROP_HANDLE}
++
++};
++
++int get_property_info(char *name)
++{
++	int i;
++
++	if (!name)
++		return PROP_UNKNOWN;
++	for (i = 0; i < ARRAY_SIZE(prop_info); i++) {
++		if (dp_strcmpi(name, prop_info[i].name) == 0)
++			return prop_info[i].type;
++	}
++
++	return PROP_UNKNOWN;
++}
++
++/*0--not string
++  1--is string
++*/
++/*#define LOCAL_STRING_PARSE*/
++int is_print_string(char *p, int len)
++{
++	int i;
++
++	if (!p || !len)
++		return 0;
++	if (p[len-1] != 0)
++		return 0;
++	for (i = 0; i < len - 1; i++) {
++#ifdef LOCAL_STRING_PARSE
++		if (!(((p[i] >= 'a') && (p[i] <= 'z')) ||
++			((p[i] >= 'A') && (p[i] <= 'Z')) ||
++			((p[i] >= '0') && (p[i] <= '9')) ||
++			(p[i] == '.') ||
++			(p[i] == '/')))
++#else
++		if (!isprint(p[i]) && p[i] != 0) /*string list */
++#endif
++			return 0;
++	}
++	if (p[0] == 0)
++		return 0;
++
++	return 1;
++}
++
++#define INDENT_BASE 3 /*3 Space */
++void print_property(struct device_node *node, struct property *p, char *indent)
++{
++	int type;
++	int k, times, i;
++
++	if (!p || !node)
++		return;
++	type = get_property_info(p->name);
++	if (type == PROP_UNKNOWN) {
++		if (is_print_string(p->value, p->length))
++			/*PRINTK("%s  %s=%s (length=%d)\n", indent, p->name,
++				(char *)p->value, p->length);*/
++			type = PROP_STRING;
++		else if ((p->length % 4) == 0)
++			type = PROP_U32_OCT;
++	}
++	if (type == PROP_STRING) {
++		char *s = (char *)p->value;
++		int k = 0;
++		PRINTK("%s  %s=", indent, p->name);
++		do {
++			PRINTK("\"%s\"", s);
++			k += strlen(s) + 1;
++			if (k < p->length) {
++				s += strlen(s) + 1;
++				PRINTK(",");
++				continue;
++			}
++			PRINTK("\n");
++			break;
++		} while (1);
++	} else if (type == PROP_U32_OCT) { /*each item is 4 bytes*/
++		PRINTK("%s  %s=<", indent, p->name);
++		times = p->length / 4;
++		if (times) {
++			for (k = 0; k < times; k++)
++				PRINTK("%d ", *(int *)(p->value + k * 4));
++		}
++		PRINTK(">\n");
++	} else if (type == PROP_U32_HEX) { /*each item is 4 bytes*/
++		PRINTK("%s  %s=<", indent, p->name);
++		times = p->length / 4;
++		if (times) {
++			for (k = 0; k < times; k++)
++				PRINTK("0x%x ", *(int *)(p->value + k * 4));
++		}
++		PRINTK(">\n");
++	} else if (type == PROP_REG) {/*two tuple: address and size */
++		int n = (of_n_addr_cells(node) + of_n_size_cells(node));
++		int j;
++		PRINTK("%s  %s=<", indent, p->name);
++		times = p->length / (4 * n);
++		if (times) {
++			for (k = 0; k < times; k++) {
++				if (k)
++					PRINTK("%s    ", indent);
++				for (j = 0; j < n; j++)
++					PRINTK("0x%x ",
++					  *(int *)(p->value + k * 8 + 4 * j));
++				if (k != (times - 1))
++					PRINTK("\n");
++			}
++		}
++		PRINTK(">\n");
++	} else if (type == PROP_RANGER) {
++		/*triple: child-bus-address, parent-bus-address, length */
++		PRINTK("%s  %s=<", indent, p->name);
++		times = p->length / (4 * 3);
++		if (times) {
++			for (k = 0; k < times; k++) {
++				if (!k)
++					PRINTK("0x%x 0x%x 0x%x",
++						*(int *)(p->value + k * 8),
++						*(int *)(p->value + k * 8 + 4),
++						*(int *)(p->value + k * 8 + 8));
++				else
++					PRINTK("%s    0x%x 0x%x 0x%x", indent,
++						*(int *)(p->value + k * 8),
++						*(int *)(p->value + k * 8 + 4),
++						*(int *)(p->value + k * 8 + 8));
++				if (k != (times - 1))
++					PRINTK("\n");
++			}
++		}
++		PRINTK(">\n");
++	} else if (type == PROP_HANDLE) {
++		struct device_node *tmp = of_find_node_by_phandle(be32_to_cpup((u32 *)p->value));
++		int offset = 0;
++		if (tmp) {
++			PRINTK("%s  %s=<&%s", indent, p->name, tmp->name);
++			offset = 1;
++		} else
++			PRINTK("%s  %s=<", indent, p->name);
++		if (p->length >= 4) {
++			int times = p->length / 4;
++			if (times) {
++				for (k = offset; k < times; k++)
++					PRINTK("%d ",
++						*(int *)(p->value + k * 4));
++			}
++		}
++		PRINTK(">\n");
++	} else {
++		PRINTK("%s  %s length=%d\n", indent, p->name, p->length);
++		if (p->length) {
++			char *s = (unsigned char *) p->value;
++			PRINTK("%s   ", indent);
++			for (i = 0; i < p->length; i++)
++				PRINTK("0x%02x ", s[i]);
++			PRINTK("\n");
++		}
++	}
++}
++
++
++void print_device_tree_node(struct device_node *node, int depth)
++{
++	int i = 0, len;
++	struct device_node *child;
++	struct property *p;
++	char *indent;
++
++	if (!node)
++		return;
++	len = (depth + 1) * 3;
++	indent = kmalloc(len, GFP_KERNEL);
++	if (!indent)
++		return;
++	for (i = 0; i < depth * 3; i++)
++		indent[i] = ' ';
++	indent[i] = '\0';
++	++depth;
++	PRINTK("%s{%s(%s)_cell addr/size=%d/%d\n",
++		indent, node->name, node->full_name,
++		of_n_addr_cells(node), of_n_size_cells(node));
++	for_each_property_of_node(node, p)
++		print_property(node, p, indent);
++	for_each_child_of_node(node, child)
++		print_device_tree_node(child, depth);
++
++	PRINTK("%s}\n", indent);
++	kfree(indent);
++}
+\ No newline at end of file
 diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_proc_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_proc_api.c
 new file mode 100755
 --- /dev/null
@@ -13093,7 +13435,7 @@ diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
 new file mode 100644
 --- /dev/null
 +++ b/include/net/datapath_api.h
-@@ -0,0 +1,957 @@
+@@ -0,0 +1,1000 @@
 +#ifndef DATAPATH_API_H
 +#define DATAPATH_API_H
 +
@@ -13108,7 +13450,7 @@ new file mode 100644
 +#endif /* CONFIG_LTQ_DATAPATH_CPUFREQ*/
 +
 +/*! \file datapath_api.h
-+\brief This file contains all the API for datapath library on the GRX500 system.
++\brief This file contains all the API for datapath library on the GRX500 system
 +This will actually be split into different header files,
 +but collected together for understanding here.
 +*/
@@ -13134,9 +13476,9 @@ new file mode 100644
 +#define UNUSED(x) ((void)(x))
 +
 +#define DP_TX_CAL_CHKSUM     1	/*! Need calculate PMAC. \n
-+				   Note, make sure pmac place holder already have \n
-+				   or set flag DP_TX_INSERT_PMAC to insert it
-+				 */
++			  Note, make sure pmac place holder already have \n
++			   or set flag DP_TX_INSERT_PMAC to insert it
++			 */
 +#define DP_TX_DSL_FCS        2	/*! Only for DSL FCS Checksum calculation */
 +#define DP_TX_INSERT_PMAC    4	/*! It only for special test purpose so far */
 +#define DP_TX_OAM            8	/*! OAM packet */
@@ -13150,21 +13492,36 @@ new file mode 100644
 +/*Note: per bit one variable */
 +#define DP_DBG_FLAG_LIST {\
 +	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DBG, 0x1, "dbg"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_DATA,   0x10, "rx_data"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_DESCRIPTOR,   0x20, "rx_desc"),\
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_PASER,      0x40, "rx_parse"),\
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_PMAC,       0x80, "rx_pmac"),\
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX,  (0x10 | 0x20 | 0x40 | 0x80), "rx"),\
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_DATA,         0x100, "tx_data"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_DESCRIPTOR,       0x200, "tx_desc"),\
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_PMAC,  0x400, "tx_pmac"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_SUM,   0x800, "tx_sum"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX,  (0x100 | 0x200 | 0x400 | 0x800), "tx"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_COC,       0x1000, "coc"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_MIB,       0x2000, "mib"),\
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_MIB_ALGO,  0x4000, "mib_algo"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_CBM_BUF,   0x8000, "cbm_buf"), \
-+	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_PAE,  0x10000, "pae") \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_DATA,\
++		0x10, "rx_data"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_DESCRIPTOR, \
++		0x20, "rx_desc"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_PASER, \
++		0x40, "rx_parse"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX_PMAC, \
++		0x80, "rx_pmac"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_RX, \
++		(0x10 | 0x20 | 0x40 | 0x80), "rx"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_DATA, \
++		0x100, "tx_data"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_DESCRIPTOR, \
++		0x200, "tx_desc"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_PMAC, \
++		0x400, "tx_pmac"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX_SUM, \
++		0x800, "tx_sum"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_DUMP_TX, \
++		(0x100 | 0x200 | 0x400 | 0x800), "tx"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_COC, \
++		0x1000, "coc"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_MIB, \
++		0x2000, "mib"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_MIB_ALGO, \
++		0x4000, "mib_algo"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_CBM_BUF, \
++		0x8000, "cbm_buf"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_PAE, \
++		0x10000, "pae") \
 +}
 +
 +enum DP_DBG_FLAG DP_DBG_FLAG_LIST;
@@ -13632,34 +13989,34 @@ new file mode 100644
 +	DP_F_ENUM_OR_STRING(DP_F_FAST_DSL,       0x00000010, "DSL"),\
 +	DP_F_ENUM_OR_STRING(DP_F_DIRECT,         0x00000020, "DirectPath"), \
 +	DP_F_ENUM_OR_STRING(DP_F_LOOPBACK,       0x00000040, "Tunne_loop"),\
-+	DP_F_ENUM_OR_STRING(DP_F_DIRECTPATH_RX,  0x00000080, "Directpath_RX"), \
++	DP_F_ENUM_OR_STRING(DP_F_DIRECTPATH_RX,  0x00000080, "Directpath_RX"),\
 +	DP_F_ENUM_OR_STRING(DP_F_MPE_ACCEL,      0x00000100, "MPE_FW"), \
 +	DP_F_ENUM_OR_STRING(DP_F_CHECKSUM,       0x00000200, "Checksum"),\
 +	DP_F_ENUM_OR_STRING(DP_F_DONTCARE,       0x00000400, "DontCare"),\
 +	DP_F_ENUM_OR_STRING(DP_F_DIRECTLINK,     0x00000800, "DirectLink"),\
 +	DP_F_ENUM_OR_STRING(DP_F_SUBIF_LOGICAL, 0x00001000, "LogicalIf"), \
 +	DP_F_ENUM_OR_STRING(DP_F_LRO,           0x00002000, "LRO"), \
-+	DP_F_ENUM_OR_STRING(DP_F_FAST_DSL_DOWNSTREAM, 0x00004000, "DSL_Down"), \
++	DP_F_ENUM_OR_STRING(DP_F_FAST_DSL_DOWNSTREAM, 0x00004000, "DSL_Down"),\
 +	DP_F_ENUM_OR_STRING(DP_F_DSL_BONDING, 0x00008000, "DSL_Bonding") \
 +}
 +
 +enum DP_F_FLAG DP_F_FLAG_LIST;
 +
++/*Note:CBM is using old macro DP_F_PORT_TUNNEL_DECAP */
++#define DP_F_PORT_TUNNEL_DECAP  DP_F_LOOPBACK
 +
-+#define DP_F_PORT_TUNNEL_DECAP  DP_F_LOOPBACK   /*Note:CBM is using old macro DP_F_PORT_TUNNEL_DECAP */
 +
-+
-+#define DP_COC_REQ_DP    	1 /*COC request from Datapath itself */
-+#define DP_COC_REQ_ETHERNET   	2 /*COC request from ethernet */
-+#define DP_COC_REQ_VRX318   	4 /*COC request from vrx318 */
++#define DP_COC_REQ_DP	1 /*COC request from Datapath itself */
++#define DP_COC_REQ_ETHERNET	2 /*COC request from ethernet */
++#define DP_COC_REQ_VRX318	4 /*COC request from vrx318 */
 +
 +typedef struct dp_subif {
-+	int32_t port_id;	/*!< Datapath Port Id corresponds to PMAC Port Id */
-+	int32_t subif:15;	/*!< Sub-interface Id info. In GRX500,
-+				   this is 15 bits, only 13 bits in PAE are handled [14, 11:0].\n
-+				   DMA subif format is mc_flag[14:14]  Res[13:12] VAP[11:8]
-+				   GRP[7:7] Index/StationID[6:0] \n
-+				 */
++	int32_t port_id; /*!< Datapath Port Id corresponds to PMAC Port Id */
++	int32_t subif:15; /*!< Sub-interface Id info. In GRX500,
++			   15 bits, only 13 bits in PAE handled [14, 11:0].\n
++			   subif format is mc_flag[14:14]  Res[13:12] VAP[11:8]
++			   GRP[7:7] Index/StationID[6:0] \n
++			 */
 +} dp_subif_t;
 +
 +typedef dp_subif_t PPA_SUBIF;
@@ -13670,23 +14027,34 @@ new file mode 100644
 +	u64 tx_drop_pkts;
 +	u64 tx_error_pkts;
 +	u64 tx_pkts; /* for VRX318 case. \n
-+				Note, for bonding tx, also difficult to get its mib counter from its shared queue mapping */
++			Note, for bonding tx, also difficult to get its
++			mib counter from its shared queue mapping
++			*/
 +	u64 tx_bytes; /* for for VRX318 case */
 +} dp_drv_mib_t;
 +
-+typedef int32_t(*dp_rx_fn_t)(struct net_device *rxif, struct net_device *txif, struct sk_buff *skb, int32_t len);	/*! Device Receive
-+															   Function callback for packets
-+															 */
-+typedef int32_t(*dp_stop_tx_fn_t)(struct net_device *dev);	/*! The Driver Stop
-+								   Tx function callback
-+								 */
++typedef int32_t(*dp_rx_fn_t)(struct net_device *rxif, struct net_device *txif,
++	struct sk_buff *skb, int32_t len);	/*! Device Receive
++					   Function callback for packets
++					 */
++typedef int32_t(*dp_stop_tx_fn_t)(struct net_device *dev);/*! The Driver Stop
++							   Tx function callback
++							*/
 +typedef int32_t(*dp_restart_tx_fn_t)(struct net_device *dev);	/*! Driver
-+								   Restart Tx function callback
-+								 */
-+typedef int32_t(*dp_reset_mib_fn_t)(dp_subif_t *subif, int32_t flag); /*! Driver reset its mib counter callback */
-+typedef int32_t(*dp_get_mib_fn_t)(dp_subif_t *subif, dp_drv_mib_t *, int32_t flag); /*! Driver get mib counter of the specified subif interface.*/
-+typedef int32_t(*dp_get_netif_subifid_fn_t)(struct net_device *netif, struct sk_buff *skb, void *subif_data, uint8_t dst_mac[MAX_ETH_ALEN], dp_subif_t *subif, uint32_t flags);	/*! get subifid */
-+typedef int32_t(*dp_coc_confirm_stat)(enum ltq_cpufreq_state new_state, enum ltq_cpufreq_state old_state, uint32_t flags); /*! Confirmed state by COC */
++						   Restart Tx function callback
++							 */
++typedef int32_t(*dp_reset_mib_fn_t)(dp_subif_t *subif, int32_t flag);/*! Driver
++						reset its mib counter callback
++						*/
++typedef int32_t(*dp_get_mib_fn_t)(dp_subif_t *subif, dp_drv_mib_t *,
++	int32_t flag); /*! Driver get mib counter of the
++			specified subif interface.
++			*/
++typedef int32_t(*dp_get_netif_subifid_fn_t)(struct net_device *netif,
++	struct sk_buff *skb, void *subif_data, uint8_t dst_mac[MAX_ETH_ALEN],
++	dp_subif_t *subif, uint32_t flags);	/*! get subifid */
++typedef int32_t(*dp_coc_confirm_stat)(enum ltq_cpufreq_state new_state,
++	enum ltq_cpufreq_state old_st, uint32_t f); /*! Confirm state by COC */
 +
 +/*!
 +\brief Datapath Library Registration Callback
@@ -13698,19 +14066,26 @@ new file mode 100644
 +*/
 +typedef struct dp_cb {
 +	dp_rx_fn_t rx_fn;	/*!< Rx function callback */
-+	dp_stop_tx_fn_t stop_fn;	/*!< Stop Tx function callback for
-+					   flow control
-+					 */
++	dp_stop_tx_fn_t stop_fn;/*!< Stop Tx function callback for
++				   flow control
++				 */
 +	dp_restart_tx_fn_t restart_fn;	/*!< Start Tx function callback
 +					   for flow control
 +					 */
-+	dp_get_netif_subifid_fn_t get_subifid_fn;	/*!< Get Sub Interface Id
-+							   of netif/netdevice
-+							 */
-+	dp_reset_mib_fn_t reset_mib_fn;  /*!< reset registered device's network mib counters */
-+	dp_get_mib_fn_t get_mib_fn;  /*!< reset registered device's network mib counters */
-+	dp_coc_confirm_stat dp_coc_confirm_stat_fn; /*!< once COC confirm the state changed, Datatpath will notify Ethernet/VRX318 driver.
-+							Ethernet/VRX318 driver need to enable/disable interrupt or change threshold accordingly */
++	dp_get_netif_subifid_fn_t get_subifid_fn; /*!< Get Sub Interface Id
++						   of netif/netdevice
++						 */
++	dp_reset_mib_fn_t reset_mib_fn;  /*!< reset registered device's network
++					mib counters
++					*/
++	dp_get_mib_fn_t get_mib_fn; /*!< reset registered device's
++					network mib counters
++					*/
++	dp_coc_confirm_stat dp_coc_confirm_stat_fn; /*!< once COC confirm the
++			state changed, Datatpath will notify Ethernet/VRX318
++			driver. and Ethernet/VRX318 driver need to enable/
++			disable interrupt or change threshold accordingly
++			*/
 +} dp_cb_t;
 +
 +/*!
@@ -13749,25 +14124,26 @@ new file mode 100644
 +					   for Tx DMA Channel
 +					 */
 +	uint32_t def_pmac_en_pmap:1;	/*!< Is PortMap Enable to be used from
-+					   Default PMAC hrd (else use Ingress PMAC hdr)
-+					 */
++				   Default PMAC hrd (else use Ingress PMAC hdr)
++				 */
 +	uint32_t def_pmac_tc:1;	/*!< Is TC (class) to be used from Default PMAC
 +				   hdr (else use Ingress PMAC hdr)
 +				 */
 +	uint32_t def_pmac_en_tc:1;	/*!< Are TC bits to be used for TC from
-+					   Default PMAC hdr (else use Ingress PMAC hdr)
-+					   Alternately, EN/DE/MPE1/MPE2 bits can be used for TC
-+					 */
-+	uint32_t def_pmac_subifid:1;	/*!< Is Sub-interfaceId to be taken from
-+					   Default PMAC hdr (else use Ingress PMAC hdr)
-+					 */
++				   Default PMAC hdr (else use Ingress PMAC hdr)
++				   Alternately, EN/DE/MPE1/MPE2 bits can
++				   be used for TC
++				 */
++	uint32_t def_pmac_subifid:1; /*!< Is Sub-interfaceId to be taken from
++				   Default PMAC hdr (else use Ingress PMAC hdr)
++				 */
 +	uint32_t def_pmac_src_port:1;	/*!< Packet Source Port determined from
-+					   Default PMAC hdr (else use Ingress PMAC hdr)
-+					 */
++				   Default PMAC hdr (else use Ingress PMAC hdr)
++				 */
 +	uint32_t res_ing:15;	/*!< Reserved bits */
 +	uint8_t def_pmac_hdr[PMAC_LEN];	/*!< Default PMAC header configuration
-+					   for the Tx DMA channel. Useful if Src Port
-+					   does not send PMAC header with packet
++				   for the Tx DMA channel. Useful if Src Port
++				   does not send PMAC header with packet
 +					 */
 +} ingress_pmac_t;
 +
@@ -13790,11 +14166,11 @@ new file mode 100644
 +				   configuration is to be done
 +				 */
 +	uint32_t rm_l2hdr:1;	/*!< If Layer 2 Header is to be removed
-+				   before Egress (for eg. for IP interfaces like LTE)
-+				 */
++			   before Egress (for eg. for IP interfaces like LTE)
++			 */
 +
 +	uint32_t num_l2hdr_bytes_rm:8;	/*!< If rm_l2hdr=1,
-+					   then number of L2 hdr bytes to be removed
++				   then number of L2 hdr bytes to be removed
 +					 */
 +	uint32_t fcs:1;		/*!< If FCS is enabled on the port */
 +	uint32_t pmac:1;	/*!< If PMAC header is enabled on the port */
@@ -13803,14 +14179,15 @@ new file mode 100644
 +	uint32_t res1_dw0:3;	/*!< reserved field in DMA descriptor - DW0*/
 +	uint32_t res2_dw0:2;	/*!< reserved field in DMA descriptor - DW0*/
 +	uint32_t tc_enable:1;	/*!<Selector for traffic class bits */
-+	uint32_t traffic_class:8;	/*!< If tc_enable=true,sets egress queue
-+					traffic class*/
-+	uint32_t flow_id:8;	/*!< flow id msb*/
-+	uint32_t dec_flag:1;	/*!< If tc_enable=false,sets decryption flag*/
-+	uint32_t enc_flag:1;	/*!< If tc_enable=false,sets encryption flag*/
-+	uint32_t mpe1_flag:1;	/*!< If tc_enable=false,mpe1 marked flag valid*/
-+	uint32_t mpe2_flag:1;	/*!< If tc_enable=false,mpe1 marked flag valid*/
-+	uint32_t res_eg:5;	/*!< Reserved bits */
++	uint32_t traffic_class:8;/*!< If tc_enable=true,sets egress queue
++					traffic class
++					*/
++	uint32_t flow_id:8; /*!< flow id msb*/
++	uint32_t dec_flag:1; /*!< If tc_enable=false,sets decryption flag*/
++	uint32_t enc_flag:1; /*!< If tc_enable=false,sets encryption flag*/
++	uint32_t mpe1_flag:1; /*!< If tc_enable=false,mpe1 marked flag valid*/
++	uint32_t mpe2_flag:1; /*!< If tc_enable=false,mpe1 marked flag valid*/
++	uint32_t res_eg:5; /*!< Reserved bits */
 +} egress_pmac_t;
 +
 +typedef struct dp_subif_stats_t {
@@ -13826,46 +14203,46 @@ new file mode 100644
 +
 +enum EG_PMAC_F {
 +	/*1 bit one flag */
-+	EG_PMAC_F_L2HDR_RM = 0x1,  /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.numBytesRem and bRemL2Hdr valid */
-+	EG_PMAC_F_FCS = 0x2, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.bFcsEna valid*/
-+	EG_PMAC_F_PMAC = 0x4, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.bPmacEna valid */
-+	EG_PMAC_F_RXID = 0x8, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.nRxDmaChanId valid */
-+	EG_PMAC_F_RESDW1 = 0x10, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.nResDW1 valid */
-+	EG_PMAC_F_RES1DW0 = 0x20, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.nRes1DW0 valid */
-+	EG_PMAC_F_RES2DW0 = 0x40, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.nRes2DW0 valid */
-+	EG_PMAC_F_TCENA = 0x80, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.bTCEnable valid */
-+	EG_PMAC_F_DECFLG = 0x100, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.bDecFlag valid */
-+	EG_PMAC_F_ENCFLG = 0x200, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.bEncFlag valid */
-+	EG_PMAC_F_MPE1FLG = 0x400, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.bMpe1Flag valid */
-+	EG_PMAC_F_MPE2FLG = 0x800, /*!< Once this bit is set in eg_pmac_flags,it means pmac_cfg.eg_pmac.bMpe2Flag valid */
++	EG_PMAC_F_L2HDR_RM = 0x1, /*!< eg_pmac.numBytesRem/bRemL2Hdr valid*/
++	EG_PMAC_F_FCS = 0x2, /*!< mean eg_pmac.bFcsEna valid*/
++	EG_PMAC_F_PMAC = 0x4, /*!< mean eg_pmac.bPmacEna valid */
++	EG_PMAC_F_RXID = 0x8, /*!< mean eg_pmac.nRxDmaChanId valid */
++	EG_PMAC_F_RESDW1 = 0x10, /*!< mean eg_pmac.nResDW1 valid */
++	EG_PMAC_F_RES1DW0 = 0x20, /*!< mean eg_pmac.nRes1DW0 valid */
++	EG_PMAC_F_RES2DW0 = 0x40, /*!< mean eg_pmac.nRes2DW0 valid */
++	EG_PMAC_F_TCENA = 0x80, /*!< mean eg_pmac.bTCEnable valid */
++	EG_PMAC_F_DECFLG = 0x100, /*!< mean eg_pmac.bDecFlag valid */
++	EG_PMAC_F_ENCFLG = 0x200, /*!< mean eg_pmac.bEncFlag valid */
++	EG_PMAC_F_MPE1FLG = 0x400, /*!< mean eg_pmac.bMpe1Flag valid */
++	EG_PMAC_F_MPE2FLG = 0x800, /*!< mean eg_pmac.bMpe2Flag valid */
 +};
 +
 +/*! EG_PMAC Flags */
 +enum IG_PMAC_F {
 +	/*1 bit one flag */
-+	IG_PMAC_F_ERR_DISC = 0x1, /*!< Once this bit is set in ig_pmac_flags, it means pmac_cfg.ig_pmac.bErrPktsDisc valid */
-+	IG_PMAC_F_PRESENT = 0x2,  /*!< Once this bit is set in ig_pmac_flags, it means pmac_cfg.ig_pmac.bPmacPresent valid */
-+	IG_PMAC_F_SUBIF = 0x4,  /*!< Once this bit is set in ig_pmac_flags, it means pmac_cfg.ig_pmac.bSubIdDefault valid */
-+	IG_PMAC_F_SPID = 0x8,  /*!< Once this bit is set in ig_pmac_flags, it means pmac_cfg.ig_pmac.bSpIdDefault valid */
-+	IG_PMAC_F_CLASSENA = 0x10,  /*!< Once this bit is set in ig_pmac_flags, it means pmac_cfg.ig_pmac.bClassEna valid */
-+	IG_PMAC_F_CLASS = 0x20,  /*!< Once this bit is set in ig_pmac_flags, it means pmac_cfg.ig_pmac.bClassDefault valid */
-+	IG_PMAC_F_PMAPENA = 0x40,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.bPmapEna valid */
-+	IG_PMAC_F_PMAP = 0x80,  /*!< Once this bit is set in ig_pmac_flags, it means pmac_cfg.ig_pmac.bPmapDefault valid */
-+	IG_PMAC_F_PMACHDR1 = 0x100,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[1] valid */
-+	IG_PMAC_F_PMACHDR2 = 0x200,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[2] valid */
-+	IG_PMAC_F_PMACHDR3 = 0x400,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[3] valid */
-+	IG_PMAC_F_PMACHDR4 = 0x800,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[4] valid */
-+	IG_PMAC_F_PMACHDR5 = 0x1000,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[5] valid */
-+	IG_PMAC_F_PMACHDR6 = 0x2000,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[6] valid */
-+	IG_PMAC_F_PMACHDR7 = 0x4000,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[7] valid */
-+	IG_PMAC_F_PMACHDR8 = 0x8000,  /*!< Once this bit is set in ig_pmac_flags,it means pmac_cfg.ig_pmac.defPmacHdr[8] valid */
++	IG_PMAC_F_ERR_DISC = 0x1, /*!< mean ig_pmac.bErrPktsDisc valid */
++	IG_PMAC_F_PRESENT = 0x2,  /*!< mean ig_pmac.bPmacPresent valid */
++	IG_PMAC_F_SUBIF = 0x4,  /*!< mean ig_pmac.bSubIdDefault valid */
++	IG_PMAC_F_SPID = 0x8,  /*!< mean ig_pmac.bSpIdDefault valid */
++	IG_PMAC_F_CLASSENA = 0x10,  /*!< mean ig_pmac.bClassEna valid */
++	IG_PMAC_F_CLASS = 0x20,  /*!< mean ig_pmac.bClassDefault valid */
++	IG_PMAC_F_PMAPENA = 0x40,  /*!< mean ig_pmac.bPmapEna valid */
++	IG_PMAC_F_PMAP = 0x80,  /*!< mean ig_pmac.bPmapDefault valid */
++	IG_PMAC_F_PMACHDR1 = 0x100,  /*!< mean ig_pmac.defPmacHdr[1] valid */
++	IG_PMAC_F_PMACHDR2 = 0x200,  /*!< mean ig_pmac.defPmacHdr[2] valid */
++	IG_PMAC_F_PMACHDR3 = 0x400,  /*!< mean ig_pmac.defPmacHdr[3] valid */
++	IG_PMAC_F_PMACHDR4 = 0x800,  /*!< mean ig_pmac.defPmacHdr[4] valid */
++	IG_PMAC_F_PMACHDR5 = 0x1000,  /*!< mean ig_pmac.defPmacHdr[5] valid */
++	IG_PMAC_F_PMACHDR6 = 0x2000,  /*!< mean ig_pmac.defPmacHdr[6] valid */
++	IG_PMAC_F_PMACHDR7 = 0x4000,  /*!< mean ig_pmac.defPmacHdr[7] valid */
++	IG_PMAC_F_PMACHDR8 = 0x8000,  /*!< mean ig_pmac.defPmacHdr[8] valid */
 +};
 +
 +enum PASER_FLAG {
-+	F_MPE_NONE = 0x1, /*Need set MPE1=0 and MPE2=0 case's parser header configuration */
-+	F_MPE1_ONLY = 0x2, /*Need set MPE1=1 and MPE2=0 case's parser header configuration  */
-+	F_MPE2_ONLY = 0x4, /*Need set MPE1=0 and MPE2=1 case's parser header configuration  */
-+	F_MPE1_MPE2 = 0x8, /*Need set MPE1=1 and MPE2=1 case's parser header configuration  */
++	F_MPE_NONE = 0x1, /*Need set MPE1=0 and MPE2=0*/
++	F_MPE1_ONLY = 0x2, /*Need set MPE1=1 and MPE2=0 */
++	F_MPE2_ONLY = 0x4, /*Need set MPE1=0 and MPE2=1 */
++	F_MPE1_MPE2 = 0x8, /*Need set MPE1=1 and MPE2=1 */
 +};
 +enum PASER_VALUE {
 +	DP_PARSER_F_DISABLE = 0,  /*Without Paser Header and Offset */
@@ -14030,18 +14407,26 @@ new file mode 100644
 +	DP_F_STATS_SUBIF = 1 << 0,
 +	DP_F_STATS_PAE_CPU = 1 << 1
 +};
-+extern void dp_set_gsw_parser(uint8_t flag, uint8_t cpu, uint8_t mpe1, uint8_t mpe2, uint8_t mpe3);
-+#define get_gsw_parser  dp_get_gsw_parser /*backcompatible since PPA is already calling it */
-+extern void dp_get_gsw_parser(uint8_t *cpu, uint8_t *mpe1, uint8_t *mpe2, uint8_t *mpe3);
++extern void dp_set_gsw_parser(uint8_t flag, uint8_t cpu, uint8_t mpe1,
++		uint8_t mpe2, uint8_t mpe3);
++/*backcompatible since PPA is already calling it */
++#define get_gsw_parser  dp_get_gsw_parser
++extern void dp_get_gsw_parser(uint8_t *cpu, uint8_t *mpe1, uint8_t *mpe2,
++	uint8_t *mpe3);
 +extern void dp_parser_info_refresh(u32 v, u32 verify);
 +extern int dp_reset_itf_mib(u32 flag);
-+extern int dp_get_netif_stats(struct net_device *dev, dp_subif_t *subif_id, struct rtnl_link_stats64 *path_stats, uint32_t flags);
-+int32_t dp_clear_netif_stats(struct net_device *dev, dp_subif_t *subif_id, uint32_t flag);
++extern int dp_get_netif_stats(struct net_device *dev, dp_subif_t *subif_id,
++		struct rtnl_link_stats64 *path_stats, uint32_t flags);
++int32_t dp_clear_netif_stats(struct net_device *dev, dp_subif_t *subif_id,
++		uint32_t flag);
 +extern int dp_get_port_subitf_via_ifname(char *ifname, dp_subif_t *subif);
-+extern int dp_get_port_subitf_via_dev(struct net_device *dev, dp_subif_t *subif);
++extern int dp_get_port_subitf_via_dev(struct net_device *dev,
++		dp_subif_t *subif);
 +#ifdef CONFIG_LTQ_DATAPATH_CPUFREQ
-+extern int dp_coc_new_stat_req(enum ltq_cpufreq_state new_state, uint32_t flag); /*DP's submodule to call it */
-+extern int dp_set_rmon_threshold(struct ltq_cpufreq_threshold *threshold, uint32_t flags);
++int dp_coc_new_stat_req(enum ltq_cpufreq_state new_state, uint32_t flag);
++/*DP's submodule to call it */
++extern int dp_set_rmon_threshold(struct ltq_cpufreq_threshold *threshold,
++	uint32_t flags);
 +#endif /* CONFIG_LTQ_DATAPATH_CPUFREQ*/
 +
 +enum ltq_cpufreq_state;

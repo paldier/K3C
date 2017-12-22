@@ -112,11 +112,14 @@
 
 #define PSEUDO_MC_ANY_SRC                          ~0
 
+
+#define  IP_HEADER_LEN                          0x5
+
 #if defined(CAP_WAP_CONFIG) && CAP_WAP_CONFIG
 
 #define  ETHER_TYPE                             0x0800
 #define  IP_VERSION                             0x4
-#define  IP_HEADER_LEN                          0x5
+//#define  IP_HEADER_LEN                          0x5
 #define  IP_TOTAL_LEN                           0x0
 #define  IP_IDENTIFIER                          0x0
 #define  IP_FLAG                                0x0
@@ -170,6 +173,7 @@ struct session_list_item {
     uint8_t                     dst_mac[PPA_ETH_ALEN];
     PPA_IPADDR                  nat_ip;         //  IP address to be replaced by NAT if NAT applies
     uint16_t                    nat_port;       //  Port to be replaced by NAT if NAT applies
+    uint8_t                     nat_src_mac[PPA_ETH_ALEN]; // l2nat new source mac
     uint16_t                    num_adds;       //  Number of attempts to add session
 #if defined(CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS) && CONFIG_LTQ_PPA_HANDLE_CONNTRACK_SESSIONS
     PPA_LIST_NODE               priority_list;
@@ -266,6 +270,9 @@ struct session_list_item {
     uint16_t            num_caps;
     PPA_HSEL_CAP_NODE   caps_list[MAX_RT_SESS_CAPS];
 #endif
+#ifdef CONFIG_PPA_PP_LEARNING
+	uint16_t 	protocol;
+#endif
     /*
      * Do not add any variables after this point. If required, care must 
      * be taken to resolve software acceleration issues.
@@ -279,6 +286,25 @@ struct session_list_item {
 };
 
 /* PPA session supporting routines/Macros */
+#if defined(CONFIG_LTQ_PPA_GRX500) && CONFIG_LTQ_PPA_GRX500
+static inline
+uint32_t inggrp2flags(PPA_QOS_INGGRP inggrp)
+{
+    /* TODO: verify groups 1-5 (see tmu_hal_set_ingress_grp_qmap logic) */
+    switch (inggrp) {
+        case PPA_QOS_INGGRP0: return PPA_QOS_Q_F_INGGRP1;
+        case PPA_QOS_INGGRP1: return PPA_QOS_Q_F_INGGRP2;
+        case PPA_QOS_INGGRP2: return PPA_QOS_Q_F_INGGRP3;
+        case PPA_QOS_INGGRP3: return PPA_QOS_Q_F_INGGRP4;
+        case PPA_QOS_INGGRP4:
+        case PPA_QOS_INGGRP5:
+        default: /* not supported in MPE FW (4 groups only) */
+            pr_err("%s:%d: INGGRP%d not supported!!!\n", __func__, __LINE__, inggrp);
+    }
+
+    return 0; /* ERROR */
+}
+#endif
 static inline
 uint32_t ppa_is_GreSession(struct session_list_item* const p_item)
 {
@@ -337,7 +363,9 @@ static inline
 uint32_t ppa_is_TunneledSession(struct session_list_item* const p_item)
 {
   return ((p_item->flags & SESSION_TUNNEL_CAPWAP) | (p_item->flags & SESSION_TUNNEL_DSLITE) | 
-			(p_item->flags & SESSION_TUNNEL_6RD) | (p_item->flag2 & SESSION_FLAG2_GRE)); 
+			(p_item->flags & SESSION_TUNNEL_6RD) | (p_item->flag2 & SESSION_FLAG2_GRE) | 
+			(p_item->flag2 &  SESSION_FLAG2_VALID_IPSEC_OUTBOUND) | (p_item->flag2 &  SESSION_FLAG2_VALID_IPSEC_OUTBOUND_SA) |
+			(p_item->flag2 &  SESSION_FLAG2_VALID_IPSEC_INBOUND)); 
 }
 
 
@@ -403,6 +431,7 @@ struct mc_group_list_item {
     uint16_t             num_caps;
     PPA_HSEL_CAP_NODE         caps_list[MAX_MC_SESS_CAPS];
 #endif
+    uint32_t                    flag2;          
 };
 
 /*!
@@ -430,6 +459,27 @@ typedef struct qos_queue_list_item {
     uint16_t                    		num_caps;/*!< Maximum number of capabilities set for specific Queue*/
 
 }QOS_QUEUE_LIST_ITEM;
+
+/*!
+    \brief QoS Ingress Group list item structure
+*/
+typedef struct qos_ingggrp_list_item {
+    struct qos_inggrp_list_item         *next;
+    PPA_ATOMIC                          count;
+    char                                ifname[16];/*!< Ingress Interface name corresponding to a Ingress QoS group*/
+    PPA_QOS_INGGRP                      ingress_group;/*!< Ingress QoS Group*/
+    uint32_t                            flowId;/*!< FlowId value for a particular ingress group*/
+    uint32_t                            flowId_en;/*!< FlowId enable/disable*/
+    uint32_t                            enc;/*!< Encrytption bit used to select particular ingress group*/
+    uint32_t                            dec;/*!< Decrytption bit used to select particular ingress group*/
+    uint32_t                            mpe1;/*!< MPE1 bit used to select particular ingress group*/
+    uint32_t                            mpe2;/*!< MPe2 bit used to select particular ingress group*/
+    uint32_t                            tc;/*!< Traffic class used to select queue in a particular ingress group*/
+    uint32_t                            ep;/*!< Egress port corresponding to a particular ingress flow*/
+    uint32_t                            flags;/*!< Flags for Future use*/
+
+}QOS_INGGRP_LIST_ITEM;
+
 
 /*!
     \brief QoS Shaper list item structure
@@ -719,12 +769,14 @@ int32_t __ppa_lookup_ipsec_group(PPA_XFRM_STATE *ppa_x, struct session_list_item
 int32_t ppa_ipsec_del_entry(struct session_list_item *p_item);
 int32_t ppa_ipsec_del_entry_outbound(uint32_t tunnel_index);
 
-extern int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item);
+//extern int32_t __ppa_update_ipsec_tunnelindex(struct session_list_item *pp_item);
+extern int32_t __ppa_update_ipsec_tunnelindex(PPA_BUF *ppa_buf,uint32_t* tunnel_index);
 
 extern uint32_t ppa_ipsec_tunnel_tbl_routeindex(uint32_t tunnel_index, uint32_t routing_entry);
 
 extern uint32_t ppa_get_ipsec_tunnel_tbl_entry(PPA_XFRM_STATE * entry,sa_direction *dir, uint32_t *tunnel_index );
 
+extern struct ipsec_tunnel_intf ipsec_tnl_info;
 #endif
 
 
@@ -741,6 +793,7 @@ unsigned int is_ip_allbit1(IP_ADDR_C *ip);
 int32_t __ppa_bridging_lookup_session(uint8_t *, uint16_t, PPA_NETIF *, struct bridging_session_list_item **);
 int32_t ppa_bridging_add_session(uint8_t *, uint16_t, PPA_NETIF *, struct bridging_session_list_item **, uint32_t);
 void ppa_bridging_remove_session(struct bridging_session_list_item *);
+int32_t ppa_bridging_flush_sessions();
 void dump_bridging_list_item(struct bridging_session_list_item *, char *);
 
 int32_t ppa_bridging_session_start_iteration(uint32_t *, struct bridging_session_list_item **);
@@ -789,6 +842,16 @@ void __ppa_qos_queue_add_item(QOS_QUEUE_LIST_ITEM *obj);
 void ppa_qos_queue_remove_item(int32_t q_num,PPA_IFNAME ifname [16],QOS_QUEUE_LIST_ITEM **pp_info);
 void ppa_qos_queue_free_list(void);
 int32_t ppa_qos_queue_lookup(int32_t q_num, PPA_IFNAME ifname [16],QOS_QUEUE_LIST_ITEM **pp_info);
+
+QOS_INGGRP_LIST_ITEM * ppa_qos_inggrp_alloc_item(void);
+void __ppa_qos_inggrp_add_item(QOS_INGGRP_LIST_ITEM *obj);
+void ppa_qos_inggrp_free_item(QOS_INGGRP_LIST_ITEM *obj);
+void ppa_qos_inggrp_lock_list(void);
+void ppa_qos_inggrp_unlock_list(void);
+void ppa_qos_inggrp_remove_item(PPA_IFNAME ifname[16], QOS_INGGRP_LIST_ITEM **pp_info);
+void ppa_qos_inggrp_free_list(void);
+int32_t __ppa_qos_inggrp_lookup(PPA_IFNAME ifname[16],QOS_INGGRP_LIST_ITEM **pp_info);
+int32_t ppa_qos_inggrp_lookup(PPA_IFNAME ifname[16],QOS_INGGRP_LIST_ITEM **pp_info);
 
 #if defined(WMM_QOS_CONFIG) && WMM_QOS_CONFIG
 int32_t ppa_qos_create_c2p_map_for_wmm(PPA_IFNAME ifname[16],uint8_t c2p[]);

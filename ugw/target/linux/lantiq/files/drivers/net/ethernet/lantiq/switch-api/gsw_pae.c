@@ -383,7 +383,7 @@ static int sw_ip_tbl_write(void *tstart, u16 *rcnt,
 			}
 		}
 	} else if (start == 1) {
-		for (i = 0; i < tnum/4; i += 4) {
+		for (i = 0; i < tnum; i += 4) {
 			/* entry is used, check if the entry content fits */
 			if (rcnt[i] > 0) {
 				if (memcmp((((char *)tstart) + i * ts),
@@ -394,19 +394,13 @@ static int sw_ip_tbl_write(void *tstart, u16 *rcnt,
 			}
 		}
 		/* find an empty entry and add information */
-		for (i = 0; i < tnum/4; i += 4) {
-			char *abc = ((char *)tstart + (i * sizeof(riptbl_t)));
-			riptbl_t *itbl = (riptbl_t *)abc;
-			if (((i % 4) == 0) && (itbl->itype == GSW_RT_IP_V4)
-				&& (itbl->valid == 1)) {
-				continue;
-			} else {
-				if (rcnt[i] == 0) {
-					memcpy((((char *)tstart) + i * ts),
-					rpar, (u8)ts);
-					rcnt[i]++;
-					return i;
-				}
+		for (i = 0; i < tnum; i += 4) {
+			if (rcnt[i] == 0 && rcnt[i+1] == 0
+				&& rcnt[i+2] == 0 && rcnt[i+3] == 0) {
+				memcpy((((char *)tstart) + i * ts),
+				rpar, (u8)ts);
+				rcnt[i]++;
+				return i;
 			}
 		}
 	}
@@ -759,6 +753,21 @@ static int rt_pppoe_tbl_delete(void *cdev,
 	return 0;
 }
 
+static int rt_rtptable_cnt_clr(void *cdev, int index)
+{
+	/*ethsw_api_dev_t *ethdev = (ethsw_api_dev_t *)cdev;*/
+	pctbl_prog_t ptable;
+
+	memset(&ptable, 0, sizeof(ptable));
+	ptable.table = PCE_R_RTP_INDEX;
+	ptable.pcindex = index;
+	ptable.op_mode = OPMOD_ADDRESS_WRITE;
+	ptable.val[0] = 0;
+	ptable.val[1] = 0;
+	route_table_write(cdev, &ptable);
+	return GSW_statusOk;
+}
+
 #if 0
 static int rt_rtptable_wr(void *cdev, int index,
 	rt_rtp_tbl_t *rtptableentry)
@@ -823,8 +832,8 @@ static int rt_rtptable_rd(void *cdev, int index,
 	ptable.pcindex	= index;
 	ptable.op_mode = OPMOD_ADDRESS_READ;
 	route_table_read(cdev, &ptable);
-	rtptableentry->rtpseqnum = ptable.val[0];
-	rtptableentry->rtpsespcnt = ptable.val[1];
+	rtptableentry->rtpseqnum = ptable.val[1]; //swapped in hw implementation 
+	rtptableentry->rtpsespcnt = ptable.val[0]; //swapped in hw impementation
 	return GSW_statusOk;
 }
 
@@ -1200,10 +1209,12 @@ int GSW_ROUTE_SessionEntryAdd(void *cdev, GSW_ROUTE_Entry_t *rpar)
 		}
 		if (rpar->routeEntry.action.bRTPMeasEna == 1) {
 			/*  Routing RTP Table Index */
+			rt_rtp_tbl_t rtp_tbl;
+			memset(&rtp_tbl, 0, sizeof(rt_rtp_tbl_t));
 #if 1
 			ptable.val[7] |= ((rpar->routeEntry.action.nRTPSeqNumber & 0x3F) << 8);
+			rt_rtptable_cnt_clr(cdev, (rpar->routeEntry.action.nRTPSeqNumber & 0x3F));
 #else
-			rt_rtp_tbl_t rtp_tbl;
 			rtp_tbl.rtpseqnum =
 			rpar->routeEntry.action.nRTPSeqNumber;
 			rtp_tbl.rtpsespcnt =

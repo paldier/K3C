@@ -79,33 +79,24 @@ ppp_generic_init_config() {
 	proto_config_add_int mtu
 	proto_config_add_string pppname
 	proto_config_add_string unnumbered
-	proto_config_add_boolean persist
-	proto_config_add_int maxfail
-	proto_config_add_int holdoff
 }
 
 ppp_generic_setup() {
 	local config="$1"; shift
 	local localip
 
-	json_get_vars ipv6 ip6table demand keepalive keepalive_adaptive username password pppd_options pppname unnumbered persist maxfail holdoff peerdns
+	json_get_vars ipv6 demand keepalive keepalive_adaptive username password pppd_options pppname unnumbered
 	if [ "$ipv6" = 0 ]; then
 		ipv6=""
 	elif [ -z "$ipv6" -o "$ipv6" = auto ]; then
 		ipv6=1
-		autoipv6=1
+		proto_export "AUTOIPV6=1"
 	fi
 
 	if [ "${demand:-0}" -gt 0 ]; then
 		demand="precompiled-active-filter /etc/ppp/filter demand idle $demand"
 	else
 		demand=""
-	fi
-	if [ -n "$persist" ]; then
-		[ "${persist}" -lt 1 ] && persist="nopersist" || persist="persist"
-	fi
-	if [ -z "$maxfail" ]; then
-		[ "$persist" = "persist" ] && maxfail=0 || maxfail=1
 	fi
 	[ -n "$mtu" ] || json_get_var mtu mtu
 	[ -n "$pppname" ] || pppname="${proto:-ppp}-$config"
@@ -135,18 +126,14 @@ ppp_generic_setup() {
 		${localip:+$localip:} \
 		${lcp_failure:+lcp-echo-interval $lcp_interval lcp-echo-failure $lcp_failure $lcp_adaptive} \
 		${ipv6:++ipv6} \
-		${autoipv6:+set AUTOIPV6=1} \
-		${ip6table:+set IP6TABLE=$ip6table} \
-		${peerdns:+set PEERDNS=$peerdns} \
 		nodefaultroute \
 		usepeerdns \
-		$demand $persist maxfail $maxfail \
-		${holdoff:+holdoff "$holdoff"} \
+		$demand maxfail 1 \
 		${username:+user "$username" password "$password"} \
 		${connect:+connect "$connect"} \
 		${disconnect:+disconnect "$disconnect"} \
 		ip-up-script /lib/netifd/ppp-up \
-		ipv6-up-script /lib/netifd/ppp6-up \
+		ipv6-up-script /lib/netifd/ppp-up \
 		ip-down-script /lib/netifd/ppp-down \
 		ipv6-down-script /lib/netifd/ppp-down \
 		${mtu:+mtu $mtu mru $mtu} \

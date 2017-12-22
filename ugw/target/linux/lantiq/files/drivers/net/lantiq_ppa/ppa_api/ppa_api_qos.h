@@ -78,6 +78,8 @@ extern int32_t ppa_ioctl_add_class_rule(unsigned int cmd, unsigned long arg, PPA
 extern int32_t ppa_ioctl_mod_class_rule(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
 extern int32_t ppa_ioctl_del_class_rule(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
 extern int32_t ppa_ioctl_get_class_rule(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
+extern int32_t ppa_ioctl_set_qos_ingress_group(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *cmd_info);
+extern int32_t ppa_ioctl_get_qos_ingress_group(unsigned int cmd, unsigned long arg, PPA_CMD_DATA *cmd_info);
 #endif
 
 extern int32_t ppa_ioctl_mod_subif_port_config(unsigned int cmd, unsigned long arg, PPA_CMD_DATA * cmd_info);
