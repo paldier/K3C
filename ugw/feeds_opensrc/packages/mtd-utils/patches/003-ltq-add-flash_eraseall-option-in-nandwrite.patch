@@ -1,0 +1,149 @@
+Index: mtd-utils-1.4.6/common.mk
+===================================================================
+--- mtd-utils-1.4.6.orig/common.mk	2011-09-21 12:05:04.000000000 +0530
++++ mtd-utils-1.4.6/common.mk	2012-10-30 19:51:17.000000000 +0530
+@@ -52,6 +52,9 @@
+ $(XPRINTF) '  %-7s %s\n' "$1" "$(subst $(BUILDDIR)/,,$@)"
+ endef
+ 
++nandwrite_BIN := $(addprefix $(BUILDDIR)/,nandwrite)
++nandwrite_FILES:= $(addprefix $(BUILDDIR)/,nandwrite.c flash_erase.c lib/libcrc32.o lib/libmtd.o lib/libmtd_legacy.o)
++
+ all:: $(TARGETS)
+ 
+ clean::
+@@ -70,6 +73,9 @@
+ 	$(call BECHO,LD)
+ 	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_$(notdir $@)) -g -o $@ $^ $(LDLIBS) $(LDLIBS_$(notdir $@))
+ 
++$(nandwrite_BIN): $(nandwrite_FILES)
++	$(CC) $(CFLAGS) $(LDFLAGS) $(LDLIBS) -DFLASH_ERASEALL_API $(nandwrite_FILES) -o $@
++
+ $(BUILDDIR)/%.a:
+ 	$(call BECHO,AR)
+ 	$(Q)$(AR) cr $@ $^
+Index: mtd-utils-1.4.6/flash_erase.c
+===================================================================
+--- mtd-utils-1.4.6.orig/flash_erase.c	2011-09-21 12:05:04.000000000 +0530
++++ mtd-utils-1.4.6/flash_erase.c	2012-10-30 19:50:25.000000000 +0530
+@@ -57,6 +57,7 @@
+ 	fflush(stdout);
+ }
+ 
++#if !defined(FLASH_ERASEALL_API)
+ static void display_help (void)
+ {
+ 	printf("Usage: %s [options] MTD_DEVICE <start offset> <block count>\n"
+@@ -87,8 +88,13 @@
+ 			"See the file `COPYING' for more information.\n",
+ 			PROGRAM_NAME);
+ }
++#endif
+ 
++#if defined(FLASH_ERASEALL_API)
++int flash_eraseall_api (int argc, char *argv[])
++#else
+ int main(int argc, char *argv[])
++#endif
+ {
+ 	libmtd_t mtd_desc;
+ 	struct mtd_dev_info mtd;
+@@ -96,9 +102,17 @@
+ 	unsigned long long start;
+ 	unsigned int eb, eb_start, eb_cnt;
+ 	int isNAND;
++#if !defined(FLASH_ERASEALL_API)
+ 	int error = 0;
++#endif
+ 	uint64_t offset = 0;
+ 
++#if defined(FLASH_ERASEALL_API)
++	mtd_device = argv[0];
++	quiet = atoi(argv[1]);
++	start = 0;
++	eb_cnt = 0;
++#else
+ 	/*
+ 	 * Process user arguments
+ 	 */
+@@ -169,6 +183,8 @@
+ 	if (error)
+ 		return errmsg("Try `--help' for more information");
+ 
++#endif /* FLASH_ERASEALL_API */
++
+ 	/*
+ 	 * Locate MTD and prepare for erasure
+ 	 */
+Index: mtd-utils-1.4.6/nandwrite.c
+===================================================================
+--- mtd-utils-1.4.6.orig/nandwrite.c	2011-09-21 12:05:04.000000000 +0530
++++ mtd-utils-1.4.6/nandwrite.c	2012-10-30 19:50:47.000000000 +0530
+@@ -43,6 +43,10 @@
+ #include "common.h"
+ #include <libmtd.h>
+ 
++#if defined(FLASH_ERASEALL_API)
++int flash_eraseall_api (int argc, char *argv[]);
++#endif
++
+ static void display_help(void)
+ {
+ 	printf(
+@@ -58,6 +62,7 @@
+ "  -s addr, --start=addr   Set start address (default is 0)\n"
+ "  -p, --pad               Pad to page size\n"
+ "  -b, --blockalign=1|2|4  Set multiple of eraseblocks to align to\n"
++"  -e, --eraseall          Erase all blocks before writing\n"
+ "  -q, --quiet             Don't display progress messages\n"
+ "      --help              Display this help and exit\n"
+ "      --version           Output version information and exit\n"
+@@ -92,6 +97,7 @@
+ static bool		noecc = false;
+ static bool		noskipbad = false;
+ static bool		pad = false;
++static bool		eraseall = false;
+ static int		blockalign = 1; /* default to using actual block size */
+ 
+ static void process_options(int argc, char * const argv[])
+@@ -100,7 +106,7 @@
+ 
+ 	for (;;) {
+ 		int option_index = 0;
+-		static const char *short_options = "b:mnNoOpqrs:";
++		static const char *short_options = "b:mnNoOpqrs:e";
+ 		static const struct option long_options[] = {
+ 			{"help", no_argument, 0, 0},
+ 			{"version", no_argument, 0, 0},
+@@ -114,6 +120,7 @@
+ 			{"quiet", no_argument, 0, 'q'},
+ 			{"raw", no_argument, 0, 'r'},
+ 			{"start", required_argument, 0, 's'},
++			{"eraseall", no_argument, 0, 'e'},
+ 			{0, 0, 0, 0},
+ 		};
+ 
+@@ -166,6 +173,9 @@
+ 			case 'b':
+ 				blockalign = atoi(optarg);
+ 				break;
++			case 'e':
++				eraseall = true;
++				break;
+ 			case '?':
+ 				error++;
+ 				break;
+@@ -348,6 +358,13 @@
+ 	oobbuf = xmalloc(mtd.oob_size);
+ 	erase_buffer(oobbuf, mtd.oob_size);
+ 
++#ifdef FLASH_ERASEALL_API
++	if (eraseall) {
++		char *farg[] = { mtd_device, quiet ? "1" : "0" };
++		flash_eraseall_api (2, farg);
++	}
++#endif
++
+ 	/*
+ 	 * Get data from input and write to the device while there is
+ 	 * still input to read and we are still within the device

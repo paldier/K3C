@@ -1,0 +1,295 @@
+From 102c9795f2cc04bf84b0a040a72afab78b2e8a31 Mon Sep 17 00:00:00 2001
+From: Marco A Vital Yep <marco.a.vital.yep@intel.com>
+Date: Thu, 11 Feb 2016 11:01:29 -0700
+Subject: [PATCH 259/441] Title: GBE performance optimizations Issue:
+ HSD:244984 IssueType: Defect Symptom: Throughput in the GMAC4 to GMAC5 link
+ limited to 1150Mbps RootCause: The parameters in the interrupt moderation
+ mechanism and the            interrupts handling logic in the GMAC5 driver
+ were not optimized            for this use case. Resolution: Optimize the
+ GMAC parameters and interrupts handling logic. Approvers: Emmanuel Jillela
+ Test: Tested by System Validation (results in HSD attachments)
+
+---
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c    | 63 ++++++++++--------
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c    |  8 ++-
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c    | 77 ++++++++++++++++++++--
+ .../net/ethernet/synopsys/DWC_ETH_QOS_yheader.h    |  7 +-
+ 4 files changed, 119 insertions(+), 36 deletions(-)
+
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
+@@ -2001,8 +2001,12 @@ static INT config_mmc_counters(void)
+ */
+ static VOID disable_rx_interrupt(UINT qInx)
+ {
+-  DMA_IER_RBUE_UdfWr(qInx, 0);
+-  DMA_IER_RIE_UdfWr(qInx, 0);
++	/* Disable Rx interrupts */
++	DMA_IER_RBUE_UdfWr(qInx, 0);
++	DMA_IER_RIE_UdfWr(qInx, 0);
++	/* Clear any Rx pending interrupt */
++	DMA_SR_RBU_UdfWr(qInx, 0);
++	DMA_SR_RI_UdfWr(qInx, 0);
+ }
+ 
+ /*!
+@@ -2011,8 +2015,8 @@ static VOID disable_rx_interrupt(UINT qI
+ */
+ static VOID enable_rx_interrupt(UINT qInx)
+ {
+-  DMA_IER_RBUE_UdfWr(qInx, 0x1);
+-  DMA_IER_RIE_UdfWr(qInx, 0x1);
++	DMA_IER_RBUE_UdfWr(qInx, 0x1);
++	DMA_IER_RIE_UdfWr(qInx, 0x1);
+ }
+ 
+ /*!
+@@ -2021,7 +2025,14 @@ static VOID enable_rx_interrupt(UINT qIn
+ */
+ static VOID disable_tx_interrupt(UINT qInx)
+ {
++	/* Disable and clear Tx interrupts */
++#ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++	DMA_IER_TIE_UdfWr(qInx, 0);
++	DMA_SR_TI_UdfWr(qInx, 0);
++#else
+ 	DMA_IER_TBUE_UdfWr(qInx, 0);
++	DMA_SR_TBU_UdfWr(qInx, 0);
++#endif
+ }
+ 
+ /*!
+@@ -2030,7 +2041,11 @@ static VOID disable_tx_interrupt(UINT qI
+ */
+ static VOID enable_tx_interrupt(UINT qInx)
+ {
++#ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++	DMA_IER_TIE_UdfWr(qInx, 1);
++#else
+ 	DMA_IER_TBUE_UdfWr(qInx, 1);
++#endif
+ }
+ 
+ 
+@@ -2895,39 +2910,33 @@ static INT start_mac_tx_rx(void)
+ 
+ static INT enable_dma_interrupts(UINT qInx)
+ {
+-	UINT tmp;
+ 	ULONG varDMA_SR;
+ 	ULONG varDMA_IER;
+ 
+-	/* clear all the interrupts which are set */
++	/* Clear any current set interrupt */
+ 	DMA_SR_RgRd(qInx, varDMA_SR);
+-	tmp = varDMA_SR;
+-	DMA_SR_RgWr(qInx, tmp);
+-	/* Enable following interrupts for Queue 0 */
+-	/* TXSE - Transmit Stoppped Enable */
+-	/* RIE - Receive Interrupt Enable */
+-	/* RBUE - Receive Buffer Unavailable Enable  */
+-	/* RSE - Receive Stoppped Enable */
+-	/* AIE - Abnormal Interrupt Summary Enable */
+-	/* NIE - Normal Interrupt Summary Enable */
+-	/* FBE - Fatal Bus Error Enable */
++	DMA_SR_RgWr(qInx, varDMA_SR);
++	/* Read current interrupt enable status register */
+ 	DMA_IER_RgRd(qInx, varDMA_IER);
+-	varDMA_IER = varDMA_IER & (ULONG) (0x2e00);
++	/* Reset all interrupts except CDEE(BIT9) and RWTE(BIT13) */
++	varDMA_IER &= ((1 << 9) | (1 << 13));
++	/* Enable required DMA interrupts */
++	varDMA_IER |= (1 << 1);  /* TXSE - Transmit Stoppped */
++	varDMA_IER |= (1 << 6);  /* RIE  - Receive Interrupt */
++	varDMA_IER |= (1 << 7);  /* RBUE - Receive Buffer Unavailable  */
++	varDMA_IER |= (1 << 8);  /* RSE - Receive Stoppped */
++	varDMA_IER |= (1 << 12); /* FBEE - Fatal Bus Error */
+ #ifdef DWC_ETH_QOS_VER_4_0
+-	varDMA_IER = varDMA_IER | ((0x1) << 1) |
+-	    ((0x1) << 6) | ((0x1) << 7) | ((0x1) << 8) | ((0x1) << 15) |
+-	    ((0x1) << 16) | ((0x1) << 12);
++	varDMA_IER |= (1 << 15); /* AIE - Abnormal Interrupt Summary */
++	varDMA_IER |= (1 << 16); /* NIE - Normal Interrupt Summary */
+ #else
+-	varDMA_IER = varDMA_IER | ((0x1) << 1) |
+-	    ((0x1) << 6) | ((0x1) << 7) | ((0x1) << 8) | ((0x1) << 14) |
+-	    ((0x1) << 15) | ((0x1) << 12);
++	varDMA_IER |= (1 << 14); /* AIE - Abnormal Interrupt Summary */
++	varDMA_IER |= (1 << 15); /* NIE - Normal Interrupt Summary */
+ #endif
+ #ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
+-	/* TBUE - Transmit Buffer Unavailable Enable */
+-	varDMA_IER |= ((0x1) << 2);
++	varDMA_IER |= (1 << 0);  /* TIE - Transmit Interrupt */
+ #else
+-	/* TIE - Transmit Interrupt Enable */
+-	varDMA_IER |= ((0x1) << 0);
++	varDMA_IER |= (1 << 2);  /* TBUE - Transmit Buffer Unavailable */
+ #endif
+ 	DMA_IER_RgWr(qInx, varDMA_IER);
+ 
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c
+@@ -505,7 +505,11 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_TI_LPOS, DMA_SR_TI_HPOS) & 1) {
+ 			pdata->xstats.tx_normal_irq_n[qInx]++;
++#ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++			sched_rx_napi |= LO_PRIORITY_INT;
++#else
+ 			DWC_ETH_QOS_tx_interrupt(dev, pdata, qInx);
++#endif
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_TPS_LPOS, DMA_SR_TPS_HPOS) & 1) {
+ 			pdata->xstats.tx_process_stopped_irq_n[qInx]++;
+@@ -515,6 +519,8 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 			pdata->xstats.tx_buf_unavailable_irq_n[qInx]++;
+ #ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
+ 			sched_rx_napi |= LO_PRIORITY_INT;
++#else
++			DWC_ETH_QOS_tx_interrupt(dev, pdata, qInx);
+ #endif
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_RPS_LPOS, DMA_SR_RPS_HPOS) & 1) {
+@@ -547,7 +553,7 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 			else
+ 				/* Delay schedule of NAPI */
+ 				hrtimer_start(&pdata->rx_itr_timer,
+-					ns_to_ktime(500000), HRTIMER_MODE_REL);
++					ns_to_ktime(pdata->itr_latency), HRTIMER_MODE_REL);
+ 		}
+ 	}
+ 
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
+@@ -38,6 +38,17 @@
+ #include "DWC_ETH_QOS_yregacc.h"
+ #include <linux/netip_subsystem.h>
+ 
++/**
++	Assuming an average packet size of 1522 bytes the total
++	number of packets in one second at 2Gbps would be:
++		Num of packets = 2000000000 / (1522 * 8) = 164258
++	To process an interrupt when there are 32 packets in queue:
++		Num interrupts per sec = 164258 / 32 = 5133
++*/
++#define DEFAULT_NUM_IPS (5133)
++#define ONE_SEC_TO_NS   (1000000000)
++
++
+ static int DWC_ETH_QOS_init_general_gbe(void __iomem **gbe_base,
+    unsigned int *mux_cfg)
+ {
+@@ -169,7 +180,7 @@ static ssize_t DWC_ETH_QOS_gbe_speed_sho
+ 	struct device_attribute *attr, char *buf)
+ {
+ 	struct DWC_ETH_QOS_prv_data *pdata = NULL;
+-	pdata = container_of(attr, struct DWC_ETH_QOS_prv_data, dev_attr);
++	pdata = container_of(attr, struct DWC_ETH_QOS_prv_data, rate_attr);
+ 	return sprintf(buf, "%d\n", DWC_ETH_QOS_gbe_config_to_speed(pdata->rate));
+ }
+ 
+@@ -178,20 +189,72 @@ static ssize_t DWC_ETH_QOS_gbe_speed_sto
+ {
+ 	unsigned int value = simple_strtoul(buf, NULL, 0);
+ 	struct DWC_ETH_QOS_prv_data *pdata = NULL;
+-	pdata = container_of(attr, struct DWC_ETH_QOS_prv_data, dev_attr);
++	pdata = container_of(attr, struct DWC_ETH_QOS_prv_data, rate_attr);
+ 	pdata->hw_if.set_speed(pdata, value);
+ 	return count;
+ }
+ 
++static ssize_t DWC_ETH_QOS_gbe_stats_show(struct device *dev,
++	struct device_attribute *attr, char *buf)
++{
++	struct DWC_ETH_QOS_prv_data *pdata = NULL;
++   uint32_t qInx = 0;
++   char *st = buf;
++	pdata = container_of(attr, struct DWC_ETH_QOS_prv_data, stats_attr);
++   for (qInx = 0; qInx < DWC_ETH_QOS_RX_QUEUE_CNT; qInx++) {
++      buf += sprintf(buf, "[%d]rx_irq    = %d\n", qInx, pdata->xstats.rx_normal_irq_n[qInx]);
++      buf += sprintf(buf, "[%d]rx_bu_irq = %d\n", qInx, pdata->xstats.rx_buf_unavailable_irq_n[qInx]);
++      buf += sprintf(buf, "[%d]rx_ps_irq = %d\n", qInx, pdata->xstats.rx_process_stopped_irq_n[qInx]);
++      buf += sprintf(buf, "[%d]tx_irq    = %d\n", qInx, pdata->xstats.tx_normal_irq_n[qInx]);
++      buf += sprintf(buf, "[%d]tx_bu_irq = %d\n", qInx, pdata->xstats.tx_buf_unavailable_irq_n[qInx]);
++      buf += sprintf(buf, "[%d]tx_ps_irq = %d\n", qInx, pdata->xstats.tx_process_stopped_irq_n[qInx]);
++   }
++	return (buf - st);
++}
++
++static ssize_t DWC_ETH_QOS_gbe_itr_ips_show(struct device *dev,
++	struct device_attribute *attr, char *buf)
++{
++	struct DWC_ETH_QOS_prv_data *pdata = NULL;
++	pdata = container_of(attr, struct DWC_ETH_QOS_prv_data, itr_lat_attr);
++	return sprintf(buf, "%d\n", ONE_SEC_TO_NS/pdata->itr_latency);
++}
++
++static ssize_t DWC_ETH_QOS_gbe_itr_ips_store(struct device *dev,
++	struct device_attribute *attr, const char *buf, size_t count)
++{
++	uint32_t max_ips = simple_strtoul(buf, NULL, 0);
++	struct DWC_ETH_QOS_prv_data *pdata = NULL;
++	pdata = container_of(attr, struct DWC_ETH_QOS_prv_data, itr_lat_attr);
++	pdata->itr_latency = ONE_SEC_TO_NS/max_ips;
++	return count;
++}
++
+ static void DWC_ETH_QOS_create_gbe_sysfs(struct DWC_ETH_QOS_prv_data *pdata)
+ {
+-	struct device_attribute *dev_attr = &pdata->dev_attr;
++	struct device_attribute *dev_attr = &pdata->rate_attr;
+ 	dev_attr->show = DWC_ETH_QOS_gbe_speed_show;
+ 	dev_attr->store = DWC_ETH_QOS_gbe_speed_store;
+-	dev_attr->attr.mode = 0644;
++	dev_attr->attr.mode = S_IRUGO | S_IWUSR;
+ 	dev_attr->attr.name = "rate";
+ 	if (device_create_file(&pdata->dev->dev, dev_attr)) {
+-		printk(KERN_ALERT "[GBE] Error creating sysfs attribute!\n");
++		printk(KERN_ALERT "[GBE] Error creating rate sysfs attribute!\n");
++	}
++	dev_attr = &pdata->stats_attr;
++	dev_attr->show = DWC_ETH_QOS_gbe_stats_show;
++	dev_attr->store = NULL;
++	dev_attr->attr.mode = S_IRUGO;
++	dev_attr->attr.name = "stats";
++	if (device_create_file(&pdata->dev->dev, dev_attr)) {
++		printk(KERN_ALERT "[GBE] Error creating stats sysfs attribute!\n");
++	}
++	dev_attr = &pdata->itr_lat_attr;
++	dev_attr->show = DWC_ETH_QOS_gbe_itr_ips_show;
++	dev_attr->store = DWC_ETH_QOS_gbe_itr_ips_store;
++	dev_attr->attr.mode = S_IRUGO | S_IWUSR;
++	dev_attr->attr.name = "itr_max_ips";
++	if (device_create_file(&pdata->dev->dev, dev_attr)) {
++		printk(KERN_ALERT "[GBE] Error creating itr_max_ips sysfs attribute!\n");
+ 	}
+ }
+ 
+@@ -315,7 +378,9 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 	pdata->rx_queue_cnt = rx_q_count;
+ 	pdata->gbe_base = gbe_base;
+ 	pdata->mux_cfg = gbe_mux_cfg;
+-
++	pdata->rate = (gbe_mux_cfg == GMCR_GMAC5_TO_PHY)?
++					GCR5_PHY_SPEED_1G : GCR5_PHY_SPEED_5G;
++	pdata->itr_latency = ONE_SEC_TO_NS/DEFAULT_NUM_IPS;
+ #ifdef DWC_ETH_QOS_CONFIG_DEBUGFS
+ 	/* to give prv data to debugfs */
+ 	DWC_ETH_QOS_get_pdata(pdata);
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
+@@ -1350,8 +1350,11 @@ struct DWC_ETH_QOS_prv_data {
+ 
+ 	void __iomem *gbe_base;
+ 	e_GBE_mux_config mux_cfg;
+-	unsigned int rate;
+-	struct device_attribute dev_attr;
++	uint32_t rate;
++	uint32_t itr_latency; /* In nano-seconds */
++	struct device_attribute rate_attr;
++	struct device_attribute stats_attr;
++	struct device_attribute itr_lat_attr;
+ #ifdef GBE_POLLING
+ 	struct hrtimer gbe_timer;
+ #endif

@@ -1,0 +1,329 @@
+Index: busybox-1.17.1/networking/Config.src
+===================================================================
+--- busybox-1.17.1.orig/networking/Config.src	2010-12-20 17:01:30.805851915 +0530
++++ busybox-1.17.1/networking/Config.src	2010-12-20 17:06:27.525850242 +0530
+@@ -480,6 +480,16 @@
+ 	help
+ 	  Support Sun-RPC based services
+ 
++config FEATURE_INETD_CLASS_SUPPORT
++	bool "Class Support"
++	default n
++	depends on INETD
++	help
++	  Lantiq enhancements for
++	  1. Categorize services into classes. Do not run more than one service from a class.
++	  2. Run services on specific interface
++	  3. Support for setting socket options
++
+ config IP
+ 	bool "ip"
+ 	default y
+Index: busybox-1.17.1/networking/inetd.c
+===================================================================
+--- busybox-1.17.1.orig/networking/inetd.c	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/inetd.c	2010-12-20 17:04:52.654599975 +0530
+@@ -156,6 +156,9 @@
+ 
+ #include <syslog.h>
+ #include <sys/un.h>
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++#include <net/if.h>
++#endif
+ 
+ #include "libbb.h"
+ 
+@@ -234,6 +237,14 @@
+ 	char *se_program;                     /* server program */
+ #define MAXARGV 20
+ 	char *se_argv[MAXARGV + 1];           /* program arguments */
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	int 	se_running;				/* indicates if this service is currently running */
++	int 	se_pid;					/* pid of the running service */
++	char 	*se_servicename;		/* the service name read from inetd.conf */
++	char 	*se_serviceclass;		/* the service class read from inetd.conf */
++	char 	*se_interface;			/* the network interface (if any specified) to listen to */
++	char 	*se_sockopts;			/* the socket options (if any specified) to configure */
++#endif
+ } servtab_t;
+ 
+ #ifdef INETD_BUILTINS_ENABLED
+@@ -263,6 +274,11 @@
+ static void FAST_FUNC chargen_dg(int, servtab_t *);
+ #endif
+ 
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++static void retry_network_setup(int);
++static int config_sockopts(servtab_t *);
++#endif
++
+ struct builtin {
+ 	/* NB: not necessarily NUL terminated */
+ 	char bi_service7[7];      /* internally provided service name */
+@@ -487,6 +503,9 @@
+ static void prepare_socket_fd(servtab_t *sep)
+ {
+ 	int r, fd;
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	struct ifreq interface;
++#endif
+ 
+ 	fd = socket(sep->se_family, sep->se_socktype, 0);
+ 	if (fd < 0) {
+@@ -495,6 +514,19 @@
+ 	}
+ 	setsockopt_reuseaddr(fd);
+ 
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	if(strcmp(sep->se_interface,"-") != 0) {
++		strcpy(interface.ifr_ifrn.ifrn_name, sep->se_interface);
++		if (setsockopt(sep->se_fd, SOL_SOCKET, SO_BINDTODEVICE,(char *)&interface, sizeof(interface)) < 0) {
++			bb_perror_msg("setsockopt (SO_BINDTODEVICE): %m");
++		}
++	}
++	if(strcmp(sep->se_sockopts,"-") != 0) {
++		config_sockopts(sep);
++	}
++#endif
++
++
+ #if ENABLE_FEATURE_INETD_RPC
+ 	if (is_rpc_service(sep)) {
+ 		struct passwd *pwd;
+@@ -570,6 +602,10 @@
+ 	free(cp->se_proto);
+ 	free(cp->se_user);
+ 	free(cp->se_group);
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	free(cp->se_servicename);
++	free(cp->se_serviceclass);
++#endif
+ 	free(cp->se_lsa); /* not a string in fact */
+ 	free(cp->se_program);
+ 	for (i = 0; i < MAXARGV; i++)
+@@ -609,7 +645,12 @@
+ static servtab_t *parse_one_line(void)
+ {
+ 	int argc;
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	int MAX_ENTRIES = 10;
++	char *token[MAX_ENTRIES+MAXARGV];
++#else
+ 	char *token[6+MAXARGV];
++#endif
+ 	char *p, *arg;
+ 	char *hostdelim;
+ 	servtab_t *sep;
+@@ -754,8 +795,18 @@
+ 		sep->se_group = xstrdup(arg);
+ 	}
+ 
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	sep->se_servicename = xstrdup(token[5]);
++	sep->se_serviceclass = xstrdup(token[6]);
++	sep->se_interface = xstrdup(token[7]);
++	sep->se_sockopts = xstrdup(token[8]);
++	sep->se_program = xstrdup(token[9]);
++#else
+ 	/* prog [args] */
+ 	sep->se_program = xstrdup(token[5]);
++
++#endif
++
+ #ifdef INETD_BUILTINS_ENABLED
+ 	if (strcmp(sep->se_program, "internal") == 0
+ 	 && strlen(sep->se_service) <= 7
+@@ -776,8 +827,13 @@
+ 	}
+ #endif
+ 	argc = 0;
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	while ((arg = token[10+argc]) != NULL && argc < MAXARGV)
++		sep->se_argv[argc++] = xstrdup(arg);
++#else
+ 	while ((arg = token[6+argc]) != NULL && argc < MAXARGV)
+ 		sep->se_argv[argc++] = xstrdup(arg);
++#endif
+ 
+ 	/* catch mixups. "<service> stream udp ..." == wtf */
+ 	if (sep->se_socktype == SOCK_STREAM) {
+@@ -839,6 +895,10 @@
+ 		return 0;
+ 	if (strcmp(old->se_proto, new->se_proto) != 0)
+ 		return 0;
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++	if (strcmp(old->se_interface, new->se_interface) != 0)
++		return 0;
++#endif
+ 	return 1;
+ }
+ 
+@@ -1037,13 +1097,64 @@
+ 				bb_error_msg("%s: exit signal %u",
+ 						sep->se_program, WTERMSIG(status));
+ 			sep->se_wait = 1;
++#ifndef ENABLE_FEATURE_INETD_CLASS_SUPPORT
+ 			add_fd_to_set(sep->se_fd);
++#endif
++			break;
++		}
++
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++		for (sep = serv_list; sep; sep = sep->se_next) {
++			if(sep->se_pid == pid) {
++				servtab_t *tsep = NULL;
++				printf("Child %s with pid %d %s exited signal %u \n",sep->se_servicename,pid,sep->se_program,WTERMSIG(status));
++				sep->se_running = 0;
++				sep->se_pid = 0;
++
++				for(tsep = serv_list; tsep; tsep = tsep->se_next) {
++					if(strcmp(tsep->se_servicename,sep->se_servicename) == 0) {
++						if(tsep->se_fd == -1) {
++							if(tsep->se_family == AF_UNIX)
++								(void)unlink(tsep->se_service);
++							printf ("not adding fd\n");
++							prepare_socket_fd(tsep);
++						} else {
++							printf ("adding fd %d and sep fd is %d\n",tsep->se_fd,sep->se_fd);
++							add_fd_to_set(tsep->se_fd);
++						}
++					}
++				}
+ 			break;
+ 		}
+ 	}
++#endif
++	}
+ 	errno = save_errno;
+ }
+ 
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++int config_sockopts(servtab_t *sep)
++{
++	int on = 1;
++	char sockopts[128];
++	char *ptemp = NULL;
++
++	memset(sockopts,0x00,sizeof(sockopts));
++	strncpy(sockopts,sep->se_sockopts,strlen(sep->se_sockopts));
++	ptemp = strtok(sockopts,",");
++	while(ptemp) {
++		if(strcmp(ptemp,"BROADCAST") == 0) {
++			if (setsockopt(sep->se_fd, SOL_SOCKET, SO_BROADCAST, (char *) &on, sizeof(on)) == -1)
++				bb_perror_msg("setsockopt (SO_BROADCAST): %m");
++		} else {
++			bb_perror_msg("setsockopt (UNRECOGNIZED): %m");
++		}
++		ptemp = strtok(NULL,",");
++	}
++	return 0;
++}
++#endif
++
+ static void retry_network_setup(int sig UNUSED_PARAM)
+ {
+ 	int save_errno = errno;
+@@ -1084,6 +1195,10 @@
+ 		}
+ 		if (ENABLE_FEATURE_CLEAN_UP)
+ 			close(sep->se_fd);
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++		if(sep->se_pid > 0)
++			kill(sep->se_pid,SIGTERM);
++#endif
+ 	}
+ 	remove_pidfile(_PATH_INETDPID);
+ 	exit(EXIT_SUCCESS);
+@@ -1166,15 +1281,28 @@
+ 		int ready_fd_cnt;
+ 		int ctrl, accepted_fd, new_udp_fd;
+ 		fd_set readable;
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++		struct timeval tmout;
++#endif
+ 
+ 		if (maxsock < 0)
+ 			recalculate_maxsock();
+ 
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++again:
++#endif
+ 		readable = allsock; /* struct copy */
++#ifndef ENABLE_FEATURE_INETD_CLASS_SUPPORT
++		tmout.tv_sec = 10;
++		ready_fd_cnt = select(maxsock + 1, &readable, (fd_set *)0, (fd_set *)0, &tmout);
++		if(ready_fd_cnt == 0)
++			goto again;
++#else
+ 		/* if there are no fds to wait on, we will block
+ 		 * until signal wakes us up (maxsock == 0, but readable
+ 		 * never contains fds 0 and 1...) */
+ 		ready_fd_cnt = select(maxsock + 1, &readable, NULL, NULL, NULL);
++#endif
+ 		if (ready_fd_cnt < 0) {
+ 			if (errno != EINTR) {
+ 				bb_perror_msg("select");
+@@ -1260,6 +1388,52 @@
+ 						sep->se_count = 0;
+ 					}
+ 				}
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++					{
++						servtab_t *tsep = NULL;
++						int match_found = 0;
++						for(tsep = serv_list; tsep; tsep = tsep->se_next) {
++							if(strcmp(tsep->se_serviceclass,sep->se_serviceclass) == 0 && 	/* Check if two service have same serviceid*/
++									/* Check if two services are the same. If they are same then wait should be specified */
++									((strcmp(tsep->se_service,sep->se_service) != 0) || (strcmp(tsep->se_service,sep->se_service) == 0 && sep->se_wait)) &&
++									/* Check if one of them is running */
++									tsep->se_running == 1) {
++								char *ErrMsg = "Error : Similar service is currently running. Please try after sometime\n";
++								if(sep->se_socktype == SOCK_STREAM) {
++									if(sep->se_wait)
++										ctrl = accepted_fd = accept(sep->se_fd, NULL, NULL);
++									send(ctrl, ErrMsg, strlen(ErrMsg), 0);
++								} else {
++									struct sockaddr remote_addr;
++									char buf[32];
++									int remlen;
++
++									memset(buf,0x00,sizeof(buf));
++									recvfrom(ctrl,buf,sizeof(buf) - 1, 0, (struct sockaddr *)&remote_addr, &remlen);
++									sendto(ctrl, ErrMsg, strlen(ErrMsg), 0, &remote_addr, sizeof(remote_addr));
++								}
++								close(ctrl);
++								printf(ErrMsg);
++								match_found = 1;
++								break;
++							}
++						}
++						if(match_found) {
++							restore_sigmask(&omask);
++							continue;
++						}
++						for(tsep = serv_list; tsep; tsep = tsep->se_next) {
++							if(strcmp(sep->se_servicename,tsep->se_servicename) == 0 && tsep->se_fd != -1)  {
++								if(sep != tsep) {
++									printf("inetd : closing socket %s for server %s\n",tsep->se_service,tsep->se_servicename);
++									remove_fd_from_set(tsep->se_fd);
++									close(tsep->se_fd);
++									tsep->se_fd = -1;
++								}
++							}
++						}
++					}
++#endif
+ 				/* on NOMMU, streamed chargen
+ 				 * builtin wouldn't work, but it is
+ 				 * not allowed on NOMMU (ifdefed out) */
+@@ -1289,6 +1463,10 @@
+ 					sep->se_wait = pid;
+ 					remove_fd_from_set(sep->se_fd);
+ 				}
++#if ENABLE_FEATURE_INETD_CLASS_SUPPORT
++				sep->se_running = 1;
++				sep->se_pid = pid;
++#endif
+ 				if (new_udp_fd >= 0) {
+ 					/* udp nowait: child connected the socket,
+ 					 * we created and will use new, unconnected one */

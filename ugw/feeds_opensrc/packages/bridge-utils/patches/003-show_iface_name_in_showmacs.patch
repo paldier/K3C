@@ -1,0 +1,131 @@
+diff -Naur open_bridge_utils/brctl/Makefile.in open_bridge_utils.lq_patched/brctl/Makefile.in
+--- open_bridge_utils/brctl/Makefile.in	2007-04-18 10:34:34.000000000 +0530
++++ open_bridge_utils.lq_patched/brctl/Makefile.in	2010-09-27 22:59:09.908851000 +0530
+@@ -2,7 +2,7 @@
+ KERNEL_HEADERS=-I@KERNEL_HEADERS@
+ 
+ CC=@CC@
+-CFLAGS= -Wall @CFLAGS@
++CFLAGS= -Wall @CFLAGS@ @LQ_CFLAGS@
+ LDFLAGS=@LDFLAGS@
+ INCLUDE=-I../libbridge $(KERNEL_HEADERS) 
+ LIBS= -L ../libbridge -lbridge @LIBS@
+diff -Naur open_bridge_utils/brctl/brctl_cmd.c open_bridge_utils.lq_patched/brctl/brctl_cmd.c
+--- open_bridge_utils/brctl/brctl_cmd.c	2007-04-18 10:34:34.000000000 +0530
++++ open_bridge_utils.lq_patched/brctl/brctl_cmd.c	2010-09-27 23:01:56.671323000 +0530
+@@ -358,6 +358,7 @@
+ 	int i, n;
+ 	struct fdb_entry *fdb = NULL;
+ 	int offset = 0;
++	char ifname[IFNAMSIZ];
+ 
+ 	for(;;) {
+ 		fdb = realloc(fdb, (offset + CHUNK) * sizeof(struct fdb_entry));
+@@ -381,7 +382,11 @@
+ 
+ 	qsort(fdb, offset, sizeof(struct fdb_entry), compare_fdbs);
+ 
++#ifdef FEATURE_LQ_BRCTL_SHOWMACS_IFNAME
++	printf("port no\tmac addr\t\tis local?\tageing timer\tiface\n");
++#else
+ 	printf("port no\tmac addr\t\tis local?\tageing timer\n");
++#endif
+ 	for (i = 0; i < offset; i++) {
+ 		const struct fdb_entry *f = fdb + i;
+ 		printf("%3i\t", f->port_no);
+@@ -390,6 +395,9 @@
+ 		       f->mac_addr[3], f->mac_addr[4], f->mac_addr[5]);
+ 		printf("%s\t\t", f->is_local?"yes":"no");
+ 		br_show_timer(&f->ageing_timer_value);
++#ifdef FEATURE_LQ_BRCTL_SHOWMACS_IFNAME
++		printf("\t\t%s", portno_to_iface(f->port_no, brname, ifname));
++#endif
+ 		printf("\n");
+ 	}
+ 	return 0;
+diff -Naur open_bridge_utils/configure.in open_bridge_utils.lq_patched/configure.in
+--- open_bridge_utils/configure.in	2007-04-18 10:34:34.000000000 +0530
++++ open_bridge_utils.lq_patched/configure.in	2010-09-27 22:51:58.255349000 +0530
+@@ -5,6 +5,9 @@
+ AC_ARG_WITH( linux-headers, [  --with-linux-headers     Location of the linux headers to use], 
+     KERNEL_HEADERS=$withval, KERNEL_HEADERS="/usr/src/linux/include")
+ 
++AC_ARG_WITH( lq-cflags, [  --with-lq-cflags  Add Lantiq Cflags],
++    LQ_CFLAGS=$withval, LQ_CFLAGS="")
++
+ dnl Checks for programs.
+ AC_PROG_CC
+ AC_PROG_INSTALL
+@@ -23,5 +26,6 @@
+ AC_CHECK_FUNCS(if_nametoindex if_indextoname)
+ 
+ AC_SUBST(KERNEL_HEADERS)
++AC_SUBST(LQ_CFLAGS)
+ 
+ AC_OUTPUT(doc/Makefile libbridge/Makefile brctl/Makefile Makefile bridge-utils.spec)
+diff -Naur open_bridge_utils/libbridge/Makefile.in open_bridge_utils.lq_patched/libbridge/Makefile.in
+--- open_bridge_utils/libbridge/Makefile.in	2009-08-19 16:14:38.000000000 +0530
++++ open_bridge_utils.lq_patched/libbridge/Makefile.in	2010-09-27 23:00:48.113242000 +0530
+@@ -5,7 +5,7 @@
+ RANLIB=@RANLIB@
+ 
+ CC=@CC@
+-CFLAGS = -Wall -g @CFLAGS@ $(KERNEL_HEADERS)
++CFLAGS = -Wall -g @CFLAGS@ @LQ_CFLAGS@ $(KERNEL_HEADERS)
+ 
+ prefix=@prefix@
+ exec_prefix=@exec_prefix@
+diff -Naur open_bridge_utils/libbridge/libbridge.h open_bridge_utils.lq_patched/libbridge/libbridge.h
+--- open_bridge_utils/libbridge/libbridge.h	2009-08-19 16:14:38.000000000 +0530
++++ open_bridge_utils.lq_patched/libbridge/libbridge.h	2010-09-27 23:03:07.390146000 +0530
+@@ -113,4 +113,9 @@
+ 			    int path_cost);
+ extern int br_read_fdb(const char *br, struct fdb_entry *fdbs, 
+ 		       unsigned long skip, int num);
++
++#ifdef FEATURE_LQ_BRCTL_SHOWMACS_IFNAME
++extern const char *portno_to_iface(int port_no, const char *brname, char *ifname);
++#endif
++
+ #endif
+diff -Naur open_bridge_utils/libbridge/libbridge_init.c open_bridge_utils.lq_patched/libbridge/libbridge_init.c
+--- open_bridge_utils/libbridge/libbridge_init.c	2009-08-19 16:14:38.000000000 +0530
++++ open_bridge_utils.lq_patched/libbridge/libbridge_init.c	2010-09-27 23:02:42.649327000 +0530
+@@ -207,3 +207,37 @@
+ 
+ 	return count;
+ }
++
++#ifdef FEATURE_LQ_BRCTL_SHOWMACS_IFNAME
++const char *portno_to_iface(int port_no, const char *brname, char *ifname)
++{
++	int i, count;
++	struct dirent **namelist;
++	char path[SYSFS_PATH_MAX];
++	struct port_info pinfo;
++
++	bzero(ifname, IFNAMSIZ);
++	snprintf(path, SYSFS_PATH_MAX, SYSFS_CLASS_NET "%s/brif", brname);
++	count = scandir(path, &namelist, 0, alphasort);
++	if (count >= 0) {
++		for (i = 0; i < count; i++) {
++			if (namelist[i]->d_name[0] == '.'
++		  	  && (namelist[i]->d_name[1] == '\0'
++				|| (namelist[i]->d_name[1] == '.'
++			   	 && namelist[i]->d_name[2] == '\0')))
++				continue;
++
++			if (!(br_get_port_info(brname, namelist[i]->d_name, &pinfo))) {
++				if (port_no == pinfo.port_no) {
++					strcpy(ifname, namelist[i]->d_name);
++					break;
++				}
++			}
++		}
++		for (i = 0; i < count; i++)
++			free(namelist[i]);
++		free(namelist);
++	}
++	return ifname;
++}
++#endif

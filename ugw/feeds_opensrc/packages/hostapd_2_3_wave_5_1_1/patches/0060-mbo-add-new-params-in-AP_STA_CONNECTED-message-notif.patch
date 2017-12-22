@@ -1,0 +1,177 @@
+From 4204fa694ddf9e3365dfc18ca4876bd4f15df779 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Tue, 1 Nov 2016 18:36:37 +0200
+Subject: [PATCH] mbo: add new params in AP_STA_CONNECTED message  notification
+
+the added parameters are:
+nr_enabled - flag that notify if the STA support neighbor report.
+btm_supported - flag that notify if the STA support BSS transition managment.
+cell_capa - the STA cell capability.
+non_pref_chan - the STA not preferred channels, it should look like this:
+non_pref_chan=<op_class>:<pref>:<reason_code>:<reason_detail>:<channel1>,<channel2>,...".
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ src/ap/drv_callbacks.c |  5 ++++-
+ src/ap/ieee802_11.c    |  5 +++++
+ src/ap/sta_info.c      | 61 +++++++++++++++++++++++++++++++++++++++++++++++---
+ src/ap/sta_info.h      |  1 +
+ 4 files changed, 68 insertions(+), 4 deletions(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index acb2fd9..0933201 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -182,7 +182,10 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 		sta->mb_ies = NULL;
+ #endif /* CONFIG_FST */
+ 
+-	mbo_ap_check_sta_assoc(hapd, sta, &elems);
++	if (elems.ext_capab && elems.ext_capab_len > 2) {
++		if (elems.ext_capab[2] & 0x08)
++			sta->btm_supported = 1;
++	}
+ 
+ 	ap_copy_sta_supp_op_classes(sta, elems.supp_op_classes,
+ 				    elems.supp_op_classes_len);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 31f0c3a..f3229f3 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -1538,6 +1538,11 @@ static u16 check_ext_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 	}
+ #endif /* CONFIG_INTERWORKING */
+ 
++	if (ext_capab_ie_len >= 3) {
++		if (ext_capab_ie[2] & 0x08)
++			sta->btm_supported = 1;
++	}
++
+ 	if (ext_capab_ie_len > 0)
+ 		sta->ecsa_supported = !!(ext_capab_ie[0] & BIT(2));
+ 
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 27a5c49..7b24f2f 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1180,7 +1180,9 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   int authorized)
+ {
+ 	const u8 *dev_addr = NULL;
+-	char buf[100];
++	char *buf, *pos, *end;
++	int buflen = 512;
++	int ret;
+ #ifdef CONFIG_P2P
+ 	u8 addr[ETH_ALEN];
+ 	u8 ip_addr_buf[4];
+@@ -1189,6 +1191,12 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 	if (!!authorized == !!(sta->flags & WLAN_STA_AUTHORIZED))
+ 		return;
+ 
++	buf = os_malloc(buflen);
++	if (!buf)
++		return;
++	pos = buf;
++	end = buf + buflen;
++
+ 	if (authorized)
+ 		sta->flags |= WLAN_STA_AUTHORIZED;
+ 	else
+@@ -1203,11 +1211,19 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		dev_addr = p2p_group_get_dev_addr(hapd->p2p_group, sta->addr);
+ 
+ 	if (dev_addr)
+-		os_snprintf(buf, sizeof(buf), MACSTR " p2p_dev_addr=" MACSTR,
++		ret = os_snprintf(pos, end - pos, MACSTR " p2p_dev_addr=" MACSTR,
+ 			    MAC2STR(sta->addr), MAC2STR(dev_addr));
++		if (os_snprintf_error(end - pos, ret))
++			goto free_alloc;
++		pos += ret;
+ 	else
+ #endif /* CONFIG_P2P */
+-		os_snprintf(buf, sizeof(buf), MACSTR, MAC2STR(sta->addr));
++	{
++		ret = os_snprintf(pos, end - pos, MACSTR, MAC2STR(sta->addr));
++		if (os_snprintf_error(end - pos, ret))
++			goto free_alloc;
++		pos += ret;
++	}
+ 
+ 	if (hapd->sta_authorized_cb)
+ 		hapd->sta_authorized_cb(hapd->sta_authorized_cb_ctx,
+@@ -1218,6 +1234,10 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		char signal_strength[30];
+ 		char *rates, *channels, *capabilities;
+ 		int i, ret, len = 0;
++#ifdef CONFIG_MBO
++		struct mbo_non_pref_chan_info *info;
++		unsigned int count = 0;
++#endif /* CONFIG_MBO */
+ 
+ 		/* 4 symbols per rate */
+ 		rates = os_malloc(WLAN_SUPP_RATES_MAX * 4);
+@@ -1295,6 +1315,38 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 			len += ret;
+ 		}
+ 
++		ret = os_snprintf(pos, end - pos,
++				" nr_enabled=%u btm_supported=%u ",
++				sta->rrm_enabled_capa[0] & WLAN_RRM_CAPS_NEIGHBOR_REPORT ? 1 : 0,
++				sta->btm_supported);
++		if (os_snprintf_error(end - pos, ret))
++			goto free_alloc;
++		pos += ret;
++
++#ifdef CONFIG_MBO
++		ret = os_snprintf(pos, end - pos, "cell_capa=%d ", sta->cell_capa);
++		if (os_snprintf_error(end - pos, ret))
++			goto free_alloc;
++		pos += ret;
++
++		for (info = sta->non_pref_chan; info; info = info->next) {
++			ret = os_snprintf(pos, end - pos, "non_pref_chan=%u:%u:%u:%u:",
++							  info->op_class, info->pref, info->reason_code,
++							  info->reason_detail);
++			count++;
++			if (os_snprintf_error(end - pos, ret))
++				break;
++			pos += ret;
++			for (i = 0; i < info->num_channels; i++) {
++				ret = os_snprintf(pos, end - pos, "%u%s", info->channels[i],
++						i + 1 < info->num_channels ? "," : " ");
++				if (os_snprintf_error(end - pos, ret))
++					break;
++				pos += ret;
++			}
++		}
++#endif
++ 		
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s",
+ 			buf, ip_addr, signal_strength, rates, capabilities);
+ 
+@@ -1323,6 +1375,9 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 						     sta->addr);
+ 	}
+ #endif /* CONFIG_FST */
++
++free_alloc:
++	os_free(buf);
+ }
+ 
+ 
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 24ed912..9c0fb69 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -113,6 +113,7 @@ struct sta_info {
+ 	unsigned int radius_das_match:1;
+ 	unsigned int ecsa_supported:1;
+ 	unsigned int added_unassoc:1;
++	unsigned int btm_supported:1;
+ 
+ 	u16 auth_alg;
+ 
+-- 
+2.7.4
+

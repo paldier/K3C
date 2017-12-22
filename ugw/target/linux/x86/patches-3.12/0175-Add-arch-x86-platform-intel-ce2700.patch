@@ -1,0 +1,130 @@
+From 329e3b1ac2f36f7e2b92c112102c704faf73ac0c Mon Sep 17 00:00:00 2001
+From: David Schollmeyer <david.a.schollmeyer@intel.com>
+Date: Tue, 29 Sep 2015 22:56:09 -0700
+Subject: [PATCH 175/441] Add arch/x86/platform/intel-ce2700
+
+Platform init code for CE2700 devices.
+---
+ arch/x86/Kconfig                              |  7 +++
+ arch/x86/platform/Makefile                    |  1 +
+ arch/x86/platform/intel-ce2700/Makefile       |  1 +
+ arch/x86/platform/intel-ce2700/intel-ce2700.c | 82 +++++++++++++++++++++++++++
+ 4 files changed, 91 insertions(+)
+ create mode 100644 arch/x86/platform/intel-ce2700/Makefile
+ create mode 100644 arch/x86/platform/intel-ce2700/intel-ce2700.c
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -536,6 +536,13 @@ config HW_MAILBOX
+ 	This is the HW Mailbox support for Intel CE2600 platform.
+ 	If unsure, say Y.
+ 
++config X86_INTEL_CE2700
++        tristate "Intel CE2700 Platform Support"
++        depends on ARCH_GEN3
++        default y
++	---help---
++	Select to build a kernel capable of supporting CE2700 platform drivers.
++
+ config X86_WANT_INTEL_MID
+ 	bool "Intel MID platform support"
+ 	depends on X86_32
+--- a/arch/x86/platform/Makefile
++++ b/arch/x86/platform/Makefile
+@@ -4,6 +4,7 @@ obj-y	+= efi/
+ obj-y	+= geode/
+ obj-y	+= goldfish/
+ obj-y	+= iris/
++obj-y	+= intel-ce2700/
+ obj-y	+= intel-mid/
+ obj-y	+= olpc/
+ obj-y	+= scx200/
+--- /dev/null
++++ b/arch/x86/platform/intel-ce2700/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_X86_INTEL_CE2700) += intel-ce2700.o
+--- /dev/null
++++ b/arch/x86/platform/intel-ce2700/intel-ce2700.c
+@@ -0,0 +1,82 @@
++/*
++ * intel-ce2700.c: Intel CE platform setup code
++ *
++ * (C) Copyright 2015 Intel Corporation
++ * Author: David Schollmeyer (david.a.schollmeyer@intel.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#define pr_fmt(fmt)    KBUILD_MODNAME ": " fmt
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/platform_data/intel-spi.h>
++
++#define CE2700_SOC_DEVICE_ID       0x2B80
++#define CE2700_PCU_DEVFN           PCI_DEVFN(31, 0)
++#define CE2700_PCU_SPI_BAR_BASE    0x54
++#define CE2700_PCU_SPI_BAR_SIZE    0x200
++
++static struct intel_spi_boardinfo ce2700_pcu_spi_plat_data = {
++	.type = INTEL_SPI_BYT,
++};
++
++static struct resource ce2700_pcu_spi_resources[] = {
++	{
++		.flags = IORESOURCE_MEM,
++	},
++};
++
++static struct platform_device_info ce2700_pcu_spi = {
++	.name = "intel-spi",
++	.id = -1,
++	.res = ce2700_pcu_spi_resources,
++	.num_res = ARRAY_SIZE(ce2700_pcu_spi_resources),
++	.data = &ce2700_pcu_spi_plat_data,
++	.size_data = sizeof(ce2700_pcu_spi_plat_data),
++};
++
++static int __init ce2700_register_spi(struct pci_bus *root_bus)
++{
++	u32 spi_base;
++
++	/* Get SPI BAR from PCU PCI device & update resource */
++	pci_bus_read_config_dword(root_bus, CE2700_PCU_DEVFN,
++	                          CE2700_PCU_SPI_BAR_BASE, &spi_base);
++	spi_base &= 0xfffffff0;
++	ce2700_pcu_spi_resources[0].start = spi_base;
++	ce2700_pcu_spi_resources[0].end = spi_base + CE2700_PCU_SPI_BAR_SIZE;
++
++	return platform_device_register_full(&ce2700_pcu_spi);
++}
++
++static int __init intel_ce_platform_init(void)
++{
++	struct pci_bus *root_bus;
++	u16 device_id;
++
++	// Get SOC Device ID from PCI device B0:D0:F0
++	root_bus = pci_find_bus(0, 0);
++	if (root_bus == NULL) {
++		pr_err("Cannot find PCI root bridge\n");
++		return -ENODEV;
++	}
++	pci_bus_read_config_word(root_bus, PCI_DEVFN(0,0), PCI_DEVICE_ID, &device_id);
++
++	switch (device_id) {
++	case CE2700_SOC_DEVICE_ID:
++		return ce2700_register_spi(root_bus);
++
++	default:
++		pr_err("Unknown SOC DEVID 0x%04x\n", device_id);
++		return -1;
++	}
++}
++device_initcall(intel_ce_platform_init);
++

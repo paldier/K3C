@@ -1,0 +1,2343 @@
+From 15ee972937fbf8c4efb6ea754e40e6aa3c981e54 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Tue, 16 Jun 2015 14:05:10 -0700
+Subject: [PATCH 137/441] NetIPsubsystem sysfs attrs, dualboot handshake,
+ runtimepm added.
+
+---
+ arch/x86/NetIP_SubSystem/Makefile                  |   4 +-
+ arch/x86/NetIP_SubSystem/netip_subsystem_defs.h    | 105 ++++
+ arch/x86/NetIP_SubSystem/netip_subsystem_lld.c     |  57 +-
+ arch/x86/NetIP_SubSystem/netip_subsystem_pm.c      | 673 ++++++++++++++++++++
+ drivers/net/Makefile                               |   2 +
+ drivers/net/NetIP_Subsystem_sysfs/Makefile         |   7 +
+ .../NetIP_Subsystem_sysfs/netip_subsystem_sysfs.c  | 416 +++++++++++++
+ include/linux/hw_mailbox.h                         | 189 ++++++
+ include/linux/hw_mbox_defs.h                       | 683 +++++++++++++++++++++
+ include/linux/netip_subsystem.h                    |  45 +-
+ 10 files changed, 2161 insertions(+), 20 deletions(-)
+ create mode 100644 arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
+ create mode 100644 arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
+ create mode 100644 drivers/net/NetIP_Subsystem_sysfs/Makefile
+ create mode 100644 drivers/net/NetIP_Subsystem_sysfs/netip_subsystem_sysfs.c
+ create mode 100644 include/linux/hw_mailbox.h
+ create mode 100644 include/linux/hw_mbox_defs.h
+
+--- a/arch/x86/NetIP_SubSystem/Makefile
++++ b/arch/x86/NetIP_SubSystem/Makefile
+@@ -17,4 +17,6 @@
+ #
+ 
+ ccflags-y += -DPUMA7_PRE_SILICON 
+-obj-$(CONFIG_NET_SUBSYSTEM) := netip_subsystem_lld.o
++obj-$(CONFIG_NET_SUBSYSTEM) := netip_subsystem.o
++netip_subsystem-objs += netip_subsystem_lld.o
++netip_subsystem-objs += netip_subsystem_pm.o
+--- /dev/null
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
+@@ -0,0 +1,105 @@
++/*
++ * netip_subsystem_defs.h
++ *
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++#ifndef LINUX_NETIP_SUBSYSTEM_DEFS_H
++#define LINUX_NETIP_SUBSYSTEM_DEFS_H
++#include  <linux/mutex.h>
++#include <linux/kthread.h>
++#include <linux/netip_subsystem.h>
++
++#define NETSS_DRV_DBG 1
++#ifdef NETSS_DRV_DBG
++#define NETSS_DBG_PRINT(fmt, args...) printk(fmt, ##args)
++#else
++#define NETSS_DBG_PRINT(fmt, args...) ; 
++#endif
++
++#define NETSS_POWER_STATE_MASK (3)
++typedef enum netss_power_state 
++{
++   NETIP_ACTIVE_ON_AC = 0,
++   NETIP_ACTIVE_ON_BATTERY = 1,
++   NETIP_STANDBY = 2,
++   NETIP_DEEP_STANDBY = 3,
++   NETIP_POWER_STATE_INVALID = 4,
++}netss_power_state_t;
++
++typedef struct netss_sysfs_attributes_info {
++   uint32_t service_level;        /**sysfs attrivute. it is a vector that represents the netip and its services power states  */
++   uint32_t runtime_state[13];    /**sysfs attibute, for configuring individual service power states */
++   struct mutex lock;            /**to synchronise between the thread that is writing to service_level and thread that is sending message
++                                  * This lock may be needed only during boot time. */
++} netss_sysfs_attributes_info_t;
++
++typedef struct netss_msg_info {
++   uint32_t type;         /**Netip properties or service status msg */
++   uint32_t len;          /**Payload length */
++   uint8_t payload[64];   /**Payload */
++   
++   struct mutex lock; 
++} netss_msg_info_t;
++
++typedef struct netss_service_status {
++   uint16_t id;
++   uint16_t state;
++}netss_service_status_t;
++ 
++typedef struct netss_configure_msg {
++   uint32_t opcode;          /**Opcode of the message */
++   //uint32_t num_ds_chan;     /**Number of QAM DS channels */
++   uint8_t  docsis_chan[32]; /** each byte if 1, indicates that it is a docsis channel */
++   uint32_t cm_mode;         /**Cable modem operational mode  */
++   uint32_t RCF_filter;      /** */
++   uint32_t RCE_floor;       /** */
++} netss_configure_msg_t;
++
++typedef struct netss_service_request_msg {
++   uint32_t opcode;          /**Opcode of the message */
++   uint32_t onBattery;       /**1 == system is on battery or 0 system is on AC power  */
++   uint32_t  netip_level;     /** ARM11 power state 0==Active, 2==low power, 3==disable */
++   netss_service_status_t service[0];
++}netss_service_request_msg_t;
++
++struct net_subsystem_drv_data {
++   uint32_t irq_num;          /* The irq number used for Net SubSystem driver */
++   bool netss_driver_initialized;
++   void __iomem *bridge_reg_base; /* Mapped io bridge register base address mmio region2 of Net-IP  */
++   netss_subdevice_mmio_t subdev_mmios[NETSS_SUBDEVICE_MAX];
++   netss_subdev_irq_info_t irqs[NETSS_SUBDEVICE_MAX];
++   struct pci_dev *dev;
++   struct mutex netss_lock;
++   struct task_struct * handshake_thread; /* Thread that exchange messages with netip during boot */
++   netss_msg_info_t netip_msg;
++   
++    
++}__attribute__((aligned(4)));
++
++
++#endif
++
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
+@@ -33,16 +33,34 @@
+ #include <linux/module.h>
+ #include <linux/sched.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/delay.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
+ #include <linux/netip_subsystem.h>
++#include "netip_subsystem_defs.h"
+ 
+ /* Time out if we cannot get a MUTEX within half minute */
+ #define NET_SUBSYSTEM_IRQ_NAME "netip_subsystem_irq"
++#ifdef CONFIG_PM_RUNTIME
++int netss_runtime_suspend(struct device *dev);
++int netss_runtime_resume(struct device *dev);
++int netss_runtime_idle(struct device *dev);
++static const struct dev_pm_ops netss_pm_ops = {
++        SET_RUNTIME_PM_OPS(netss_runtime_suspend, netss_runtime_resume,
++                           netss_runtime_idle)
++};
++#endif
+ 
+ static const struct pci_device_id net_subsystem_pci_tbl[] = {
+         { PCI_DEVICE( 0x8086, NET_SUBSYTEM_DEV_ID), .driver_data = 0 },
+         {0},
+ };
+ MODULE_DEVICE_TABLE(pci, net_subsystem_pci_tbl);
++/*This function creates boot handshake thread */
++void netss_manage_netip_services(void);
++
++void netss_stop_handshake_thread(void);
+ 
+ typedef struct net_ip_mmios {
+    unsigned long region1_base;
+@@ -52,8 +70,8 @@ typedef struct net_ip_mmios {
+ }net_ip_mmios_t;
+ 
+ net_ip_mmios_t net_ip_mmios;
+-
+ struct net_subsystem_drv_data *pnetss_drv_data;
++extern netss_sysfs_attributes_info_t g_netss_sysfs_attributes_info;
+ 
+ void netss_subdev_register_irq(netss_subdevices_t subdevice, netss_subdev_irq_info_t *irq_info)
+ {
+@@ -110,17 +128,17 @@ static irqreturn_t net_subsystem_isr(int
+    
+    reg_val = __raw_readl(pnet_ss->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET);
+ 
+-   printk("Net IP ISR called\n");
++   NETSS_DBG_PRINT("Net IP ISR called\n");
+    for(i=0; i<NETSS_SUBDEVICE_MAX; i++)
+    {
+       if((reg_val >> i) & 1)  {
+          if(pnet_ss->irqs[i].func != NULL) {
+-            printk("Interrupt of subdevice %d\n", i);
++            NETSS_DBG_PRINT("Interrupt of subdevice %d\n", i);
+             pnet_ss->irqs[i].func(irq, pnet_ss->irqs[i].args);
+             /*Prepare interrupt acknowledge mask */
+             ack_intr |= (1 << i);
+          } else {
+-            printk("No irq registered, ingoring interrupt of NetIP subdevice %d\n", i);
++            NETSS_DBG_PRINT("No irq registered, ingoring interrupt of NetIP subdevice %d\n", i);
+          }
+       }
+    }
+@@ -168,8 +186,8 @@ static int netss_probe(struct pci_dev *p
+    net_ip_mmios.region2_base = pci_resource_start(pdev,2);
+    net_ip_mmios.region2_size = pci_resource_len(pdev,2);
+ #endif
+-   printk(KERN_INFO "1: mem_iobase = 0x%x, mem_iosize = 0x%x\n",(unsigned int)net_ip_mmios.region1_base,(unsigned int)net_ip_mmios.region1_size);
+-   printk(KERN_INFO "2: mem_iobase = 0x%x, mem_iosize = 0x%x\n",(unsigned int)net_ip_mmios.region2_base,(unsigned int)net_ip_mmios.region2_size);
++   NETSS_DBG_PRINT(KERN_INFO "1: mem_iobase = 0x%x, mem_iosize = 0x%x\n",(unsigned int)net_ip_mmios.region1_base,(unsigned int)net_ip_mmios.region1_size);
++   NETSS_DBG_PRINT(KERN_INFO "2: mem_iobase = 0x%x, mem_iosize = 0x%x\n",(unsigned int)net_ip_mmios.region2_base,(unsigned int)net_ip_mmios.region2_size);
+    
+    if (pci_request_regions(pdev, "net-subsytem")){
+       dev_err(&pdev->dev, "Cannot obtain PCI resources\n");
+@@ -194,13 +212,13 @@ static int netss_probe(struct pci_dev *p
+    reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+    if(!(reg_val & NETIP_BRIDGE_IRQ_MASK)) {
+       __raw_writel((reg_val | NETIP_BRIDGE_IRQ_MASK), pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+-      printk("Enabling Net IP Bridge interrupts IER reg %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET));
++      NETSS_DBG_PRINT("Enabling Net IP Bridge interrupts IER reg %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET));
+    }
+    
+    reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
+    if((reg_val & NETIP_BRIDGE_IRQ_MASK)) {
+       __raw_writel((reg_val & ~NETIP_BRIDGE_IRQ_MASK) , pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET); 
+-      printk("Unmasking NetIP interrupts IMR = %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET));
++      NETSS_DBG_PRINT("Unmasking NetIP interrupts IMR = %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET));
+    }    
+ 
+    pnetss_drv_data->irq_num = pdev->irq;
+@@ -217,10 +235,19 @@ static int netss_probe(struct pci_dev *p
+       pnetss_drv_data->irqs[i].func = NULL;
+       pnetss_drv_data->irqs[i].args = NULL;
+    }
+-
++   mutex_init(&pnetss_drv_data->netss_lock);
++   mutex_init(&pnetss_drv_data->netip_msg.lock);
+    pci_set_drvdata(pnetss_drv_data->dev,pnetss_drv_data);
++   mutex_init(&g_netss_sysfs_attributes_info.lock);
+    pnetss_drv_data->netss_driver_initialized = true;
++#ifdef CONFIG_PM_RUNTIME
++   //pm_runtime_enable(&pdev->dev);
++   pm_runtime_allow(&pdev->dev);
++#endif
++   /*Register callbacks for messages from netip and send appropriate messages */
++   netss_manage_netip_services();
+    printk(KERN_INFO "Intel(R) NET SUBSYSTEM driver built on %s @ %s\n", __DATE__, __TIME__);
++
+    return 0;
+ 
+ free_iomem:
+@@ -243,21 +270,31 @@ static void netss_remove(struct pci_dev
+    struct net_subsystem_drv_data *pnetss_drv_data = pci_get_drvdata(pdev);
+    if (!pnetss_drv_data)
+       return;
++   mutex_destroy(&pnetss_drv_data->netss_lock);
++   mutex_destroy(&pnetss_drv_data->netip_msg.lock);
++   mutex_destroy(&g_netss_sysfs_attributes_info.lock);
++   /*wake up and stop the thread */
++   netss_stop_handshake_thread();
++   pm_runtime_disable(&pdev->dev);
+    kfree(pnetss_drv_data);
+    pci_release_regions(pdev);
+    //pci_disable_msi(pnetss_drv_data->dev); 
+    pci_disable_device(pdev);
+    //DEBUG_PRINT;
+-   printk(KERN_INFO "NET SubSytem driver: device exit \n");
++   NETSS_DBG_PRINT(KERN_INFO "NET SubSytem driver: device exit \n");
+  
+    return;
+ }
+ 
++
+ static struct pci_driver netss_driver = {
+    .name           = "ce-net-subsystem",
+    .id_table       = net_subsystem_pci_tbl,
+    .probe          = netss_probe,
+    .remove      = netss_remove,
++#ifdef CONFIG_PM_RUNTIME
++   .driver.pm = &netss_pm_ops,
++#endif
+ };
+ 
+ static int __init net_subsystem_lld_init (void)
+--- /dev/null
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
+@@ -0,0 +1,673 @@
++/*
++ * netip_subsystem_pm.c
++ *
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++#include <linux/kthread.h>
++#include <linux/wait.h>
++#include <linux/slab.h>
++#include <linux/pci.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
++#include <linux/hw_mailbox.h>
++#include <linux/netip_subsystem.h>
++#include "netip_subsystem_defs.h"
++
++
++void netss_sysfs_clean_up(uint32_t available_services);
++#define NETIP_MSG_NONE 0
++#define NETIP_PROPERTIES_MSG 1
++#define NETIP_STATUS_MSG 2
++/** Opcode Enumeration */
++typedef enum netss_opcodes {
++   NETSS_OPCODE_NETIP_PROPERTIES = 1,
++   NETSS_OPCODE_SERVICE_STATUS = 2,
++   NETSS_OPCODE_SERVICE_REQUEST_REPLY = 3,
++   NETSS_OPCODE_CONFIGURE = 4,
++   NETSS_OPCODE_SERVICE_REQUEST = 5,
++}netss_opcodes_t;
++
++/*External variables */
++extern struct net_subsystem_drv_data *pnetss_drv_data;
++netss_sysfs_attributes_info_t g_netss_sysfs_attributes_info;
++
++/*The variable when set indicates that a message is received from NetIP */
++static int g_netip_msg = 0;
++/*Bit mask representing available services
++ * set bit indicates the availablity of the corresponding service.
++ * bit 0 represents the availability of service id 1 
++ * bit 1 represents the availability of service id 2 and so on
++ * bit 11 represents the availability of service id 12
++ * As of now the maximum number of services is 12 */
++static uint16_t g_netip_services_available = 0;
++/*The variable indicates the services whose service status message is received. 
++ * if bit n is set, service id n-1's service status message is received */
++static uint16_t g_netip_services_status_received = 0;
++/* Netip services that are initialized and ready to move on */
++static uint16_t g_netip_services_status_ready = 0;
++
++/* Number of Netip services that are ready */
++static uint16_t g_num_netip_services_status_ready = 0;
++
++/*Current NetIP power state */
++static netss_power_state_t g_current_netip_power_state = NETIP_POWER_STATE_INVALID;
++
++/*Indicated if the bootime hand shake with NetIP is done or not */
++static bool g_netss_boot_handshake_done = false;
++
++static DECLARE_WAIT_QUEUE_HEAD(waitForNetIPMsgWQ);
++
++static int  netss_receive_netip_properties_msg(hw_mbox_Masters_e commander,
++                              Uint32 code,
++                              Uint8 *dataBuf, Uint32 dataLen,
++                              Uint32 *token)
++{
++   mutex_lock(&pnetss_drv_data->netip_msg.lock);
++   memcpy(pnetss_drv_data->netip_msg.payload, dataBuf, dataLen);
++   pnetss_drv_data->netip_msg.len = dataLen;
++   pnetss_drv_data->netip_msg.type = *((uint32_t *)&dataBuf[0]); 
++   /*Wake up thread, cleanup sysfs attributes */ 
++   g_netip_msg = 1;
++   mutex_unlock(&pnetss_drv_data->netip_msg.lock);
++   wake_up_all(&waitForNetIPMsgWQ);
++   return 0;
++}
++
++int  netss_receive_netip_status_msg(hw_mbox_Masters_e commander,
++                              Uint32 code,
++                              Uint8 *dataBuf, Uint32 dataLen,
++                              Uint32 *token)
++{
++   mutex_lock(&pnetss_drv_data->netip_msg.lock);
++   /*Wake up thread*/  
++   g_netip_msg = 2;
++   mutex_unlock(&pnetss_drv_data->netip_msg.lock);
++   wake_up_all(&waitForNetIPMsgWQ);
++   return 0;
++}
++int data;
++
++static void netss_send_reply_msg(void)
++{
++   uint8_t reply_msg[64];
++   uint32_t reply_code = 0;
++   memcpy(reply_msg, pnetss_drv_data->netip_msg.payload, pnetss_drv_data->netip_msg.len);
++   /* Sending what recieved */
++   hwMbox_sendReplyOpcode(HW_MBOX_MASTER_NP_CPU, reply_code, reply_msg, pnetss_drv_data->netip_msg.len);
++
++   return;
++}
++/** NetIP properties message format
++ * ---------------------------
++ * |   Opcode - 4bytes       |
++ * |-------------------------|
++ * |-------------------------|
++ * | service id  | service id|  
++ * | 2bytes      | 2bytes    |
++ * |-------------------------|
++ * | service id  | service id|  
++ * | 2bytes      | 2bytes    |
++ * |-------------------------|
++ * | And so on.........      |
++ * |-------------------------|
++ * | service id  | service id|  
++ * | 2bytes      | 2bytes    |
++ * |-------------------------|
++ * |           0             | 2 or 4 terminating bytes 
++ * |-------------------------|
++ */
++
++static void ness_process_netip_props_msg(void)
++{
++   uint16_t *data = (uint16_t  *)(&pnetss_drv_data->netip_msg.payload[4]);
++   
++   while(*data != 0 )
++   {
++      /*netip properties message is null terminated 
++       *set the bit n-1, for the service id n
++       *service id starts from 1  */
++      g_netip_services_available |= 1 << (*data-1);
++      
++      /*Check next two bytes */
++      data++;
++   } 
++   NETSS_DBG_PRINT("services that are available = %x\n", g_netip_services_available);
++  
++   /*Remove the sysfs attribute files of the services that are not available */
++   netss_sysfs_clean_up(g_netip_services_available);
++   return;
++}
++
++static void netss_send_configure_msg (void)
++{
++   int i, j=0, ret;
++   uint32_t docsis_channels = 0xF0F00000; /*Mask indicating the channels numbers configured as docsis channels */
++   netss_configure_msg_t cfg_msg;
++   uint32_t reply_code;
++   uint32_t reply_len;
++    
++   /*clear the message */
++    memset(&cfg_msg, 0, sizeof(netss_configure_msg_t));
++   
++   cfg_msg.opcode = NETSS_OPCODE_CONFIGURE;
++   /*These values should be read from platfom config files
++    *for now writing some default values  */
++   for(i=0; i < sizeof(uint32_t); i++)
++   {
++      if(docsis_channels & (1 << i)) {
++         cfg_msg.docsis_chan[j] = i+1;
++         j++;
++      }
++   }
++   /*Just write 0 to terminate the list */
++   cfg_msg.docsis_chan[j] = 0;
++  
++   cfg_msg.cm_mode = 0; 
++   cfg_msg.RCF_filter = 0;
++   cfg_msg.RCE_floor = 1;
++   ret = hwMbox_sendOpcode(HW_MBOX_MASTER_NP_CPU, 0xFE, &reply_code, (uint8_t*)&cfg_msg, sizeof(netss_configure_msg_t), 4, &reply_len);
++   if(ret)
++   {
++       printk(KERN_ERR "Send configure message failed ret %d reply_code %d\n", ret, reply_code);
++   }
++   /**Add some debug message on success */  
++   return; 
++}
++
++#define SERVICE_OFFSET 12
++/** service status /service request/service request reply message format
++ * ---------------------------
++ * |   Opcode - 4bytes       |
++ * |-------------------------|
++ * |   On Battery - 4bytes   |  valid in service request only
++ * |-------------------------|
++ * |  netip level - 4bytes   |
++ * |-------------------------|
++ * | service id  | level     |  
++ * | 2bytes      | 2bytes    |
++ * |-------------------------|
++ * | service id  | level     |  
++ * | 2bytes      | 2bytes    |
++ * |-------------------------|
++ * | And so on.........      |
++ * |-------------------------|
++ * | service id  | level     |  
++ * | 2bytes      | 2bytes    |
++ * |-------------------------|
++ * |           0             | terminating bytes 
++ * |-------------------------|
++ */
++static void ness_process_service_status_msg(void) 
++{
++   int i=0;
++   netss_service_request_msg_t *service_msg = &pnetss_drv_data->netip_msg.payload[0];
++   netss_sysfs_attributes_info_t *syfs_info = &g_netss_sysfs_attributes_info;
++   netss_service_status_t *service_status = &pnetss_drv_data->netip_msg.payload[SERVICE_OFFSET];
++   
++   //mutex_lock(&syfs_info->lock);
++   NETSS_DBG_PRINT("processing service status message opcode %d\n", service_msg->opcode);
++   syfs_info->runtime_state[0] = service_msg->netip_level;
++   while(service_status[i].id != 0) 
++   {
++      syfs_info->runtime_state[service_status[i].id] = service_status[i].state;
++      g_netip_services_status_received |= (1 << (service_status[i].id -1));
++
++      /*Services that are ready to request */
++      if(service_status[i].state == 2)  {
++         g_netip_services_status_ready |= (1 << (service_status[i].id -1));
++         g_num_netip_services_status_ready++;
++      }
++      i++;
++   }
++   //mutex_unlock(&syfs_info->lock);
++   
++   return;
++}
++
++static void netss_update_sysfs_attributes(netss_sysfs_attributes_info_t *syfs_info, netss_service_request_msg_t *service_msg)
++{
++   int i=0;
++   /*Upon successful reply process the reply and update sysfs attributes */
++   syfs_info->runtime_state[0] = service_msg->netip_level;
++
++   while(service_msg->service[i].id != 0) {
++
++     syfs_info->runtime_state[service_msg->service[i].id] = service_msg->service[i].state;
++     i++;
++   }
++   if(service_msg->netip_level == NETIP_ACTIVE_ON_AC) {
++      if(service_msg->onBattery) {
++         syfs_info->runtime_state[0] = NETIP_ACTIVE_ON_BATTERY;
++         g_current_netip_power_state = NETIP_ACTIVE_ON_BATTERY;
++      } else {
++         g_current_netip_power_state = NETIP_ACTIVE_ON_AC;
++      }
++   } else if(service_msg->netip_level == NETIP_STANDBY) {
++      g_current_netip_power_state = NETIP_STANDBY;
++   } else if(service_msg->netip_level == NETIP_DEEP_STANDBY) {
++      g_current_netip_power_state = NETIP_DEEP_STANDBY;
++   } else {
++      g_current_netip_power_state = NETIP_POWER_STATE_INVALID;
++   }
++   return;
++}
++/*Service request message format is same as service status message 
++ *sys/class/net/subsystem/power/service_level is set by PMP (power management policy)
++ *and it is interpreted as follows
++ * ---------------------------------------------
++ * |BITS |Service |                            |
++   |     |  ID    |      Interpretation        |
++ * |------------------------------------------ |
++ * |1:0  |   _    | NetIP 00 - Enable OnAC     |
++ * |     |        |       01 - Enable OnBattery|
++ * |     |        |       10 - Disable         |
++ * |     |        |       11 - Off deep stanby |
++ * |-------------------------------------------|
++ * |3:2  |   1    | Docsis                     |
++ * |5:4  |   2    | Spectral Analysis          |
++ * |7:6  |   3    | Video                      |
++ * |9:8  |   4    | Voice   00 - Enable/Active |
++ * |11:10|   5    | Moca    01 - Low           |
++ * |13:12|   7    | Wifi    10 - Off           |
++ * |15:14|   8    | ExSw                       |
++ * |17:16|   9    | RGMII0                     |
++ * |19:18|  10    | RGMII1                     |
++ * |21:20|  11    | SGMII2                     |
++ * |23:22|  12    | SGMII3                     |
++ * ---------------------------------------------
++ * service ID 6 is BBU which is always on if exists, so service_level has no representation
++ */
++static int ness_send_service_request_msg(uint32_t service_level)
++{
++   int i=0, j=0;
++   int ret = -1;
++   uint32_t reply_code;
++   uint32_t reply_len;
++   netss_service_request_msg_t *service_msg = NULL;
++   uint32_t service_msg_len;
++   netss_sysfs_attributes_info_t *syfs_info = &g_netss_sysfs_attributes_info;
++
++   /*Need one service for null termination */
++   service_msg_len = sizeof(netss_service_request_msg_t)+((g_num_netip_services_status_ready+1)*sizeof(netss_service_status_t));
++
++   /*Align the size to 4 byte boundary */
++   service_msg_len = (service_msg_len + 3) & ~3;
++   /* Alloc memory for service request message */
++   service_msg = kzalloc(service_msg_len, GFP_KERNEL);
++   if(!service_msg) {
++      printk(KERN_ERR "Could not allocate service request message\n");
++   } 
++   else 
++   {
++      //mutex_lock(&syfs_info->lock);
++      service_msg->opcode = NETSS_OPCODE_SERVICE_REQUEST;
++      if(0 == service_level) 
++      {
++         /*PMP has not set the service level, 
++          *assume Enable onAC power and enable all available services */
++         service_msg->netip_level = 0;
++         service_msg->onBattery = 0;
++         for(i=0; i < 12; i++)
++         {
++            /*BBU is always on if existed, so dont include in the message */
++            if(i==6) continue;
++
++            if(g_netip_services_status_ready & (1 << j)) {
++               service_msg->service[j].id = i;
++               service_msg->service[j].state = 0;
++               j++;
++            }
++         }
++      } 
++      else 
++      {
++         if(0 == (service_level & 3)) {
++            /*On AC power mode, enable all services */
++            service_msg->netip_level = 0;
++         } else if(1 == (service_level & 3)) {
++            /*On Battery mode, put voice in low power mode and disable all services */
++            service_msg->onBattery = 1;
++            service_msg->netip_level = 0;
++         } else if ( 2 == (service_level & 3)) {
++            /*standby mode, put ARM11 in low power mode and disable all services */
++            service_msg->netip_level = 2;
++         } else if ( 3 == (service_level & 3)) {
++            /*deep standby mode, ARM11 and all netip services are off, PCI device should go to PCI_D3hot state */
++            service_msg->netip_level = 3;
++         }
++         for(i=2; i<24; ) 
++         {
++            uint32_t id = i/2;
++            /*if that service is ready to be requested 
++             * BIT 0 represents SERVICE ID 1
++             * BIT 1 represents SERVICE ID 2 ... and so on
++             * BIT 5 represents SERVICE ID 6 (BBU) ... and so on
++             * BIT 11 represents SERVICE ID 12
++             */
++            if(g_netip_services_status_ready & (1 << ((id < 6)?(id-1):id))) {
++               if(id < 6) {
++                  service_msg->service[j].id = id;
++               } else {
++                  /*BBU is id 6 and service_level has no representation of BBU because 
++                   *PMP wont request its status, it is always on */
++                  service_msg->service[j].id = id+1;
++               }
++               service_msg->service[j].state = syfs_info->service_level & (3 << i);
++               j++;
++            } else {
++               NETSS_DBG_PRINT("Service id %d is not initialized, not including in the service request msg \n", 
++                       (id < 6)? id : id+1);
++            }
++            i += 2;
++         }
++      }
++      /*Null termination of the list */
++      service_msg->service[j].id = 0;
++      service_msg->service[j].state = 0;
++    
++      ret = hwMbox_sendOpcode(HW_MBOX_MASTER_NP_CPU, 0xFE, &reply_code, (uint8_t *)service_msg, service_msg_len, 4, &reply_len);
++      if(ret) {
++         printk(KERN_ERR "Send Sevice Request message failed ret %d reply_code %d\n", ret, reply_code);
++      } else {
++         netss_update_sysfs_attributes(syfs_info, service_msg);
++      }
++     // mutex_unlock(&syfs_info->lock);
++     /*Can free the message memory now */
++     kfree(service_msg_len);
++   }
++   
++   /**Add some debug message on success */   
++   
++   return ret;
++}
++static int ness_send_single_service_request_msg(uint32_t service_id, uint32_t state)
++{
++   int ret = -1;
++   uint32_t reply_code;
++   uint32_t reply_len;
++   netss_service_request_msg_t *service_msg = NULL;
++   uint32_t service_msg_len;
++   netss_sysfs_attributes_info_t *syfs_info = &g_netss_sysfs_attributes_info;
++
++   service_msg_len = sizeof(netss_service_request_msg_t)+sizeof(netss_service_status_t)+4;
++   /* Alloc memory for service request message */
++   service_msg = kzalloc(service_msg_len, GFP_KERNEL);
++   if(!service_msg) {
++      printk(KERN_ERR "Could not allocate service request message\n");
++   }
++   else
++   {
++      service_msg->opcode = NETSS_OPCODE_SERVICE_REQUEST;
++     
++      if(g_current_netip_power_state == NETIP_ACTIVE_ON_AC) {
++         service_msg->netip_level = 0;
++      } else if (g_current_netip_power_state == NETIP_ACTIVE_ON_BATTERY) {
++         service_msg->netip_level = 0;
++         service_msg->onBattery = 1;
++      } else if (g_current_netip_power_state == NETIP_STANDBY) {
++         service_msg->netip_level = 2;
++      } else if (g_current_netip_power_state == NETIP_DEEP_STANDBY) {
++         service_msg->netip_level = 3;
++      }
++      service_msg->service[0].id = service_id;
++      service_msg->service[0].state = state;
++      
++      service_msg->service[1].id = 0;
++      service_msg->service[1].state = 0;
++
++      ret = hwMbox_sendOpcode(HW_MBOX_MASTER_NP_CPU, 0xFE, &reply_code, (uint8_t *)service_msg, service_msg_len, 4, &reply_len);
++      if(ret) {
++         printk(KERN_ERR "Send Single Sevice Request message failed ret %d reply_code %d\n", ret, reply_code);
++      } else {
++         netss_update_sysfs_attributes(syfs_info, service_msg);
++      }
++
++      /*Can free the message memory now */
++      kfree(service_msg_len);
++   }   
++}
++static int netss_configure_and_setup_netip_services(void *data)
++{
++   int count=0;
++   while(1)
++   {
++      /*Wait for netip messages */
++      wait_event_interruptible(waitForNetIPMsgWQ, ((g_netip_msg != NETIP_MSG_NONE) || ((kthread_should_stop()))));
++      
++      mutex_lock(&pnetss_drv_data->netip_msg.lock);
++      if(kthread_should_stop()) {
++
++         mutex_unlock(&pnetss_drv_data->netip_msg.lock);
++         break;
++      };
++
++      NETSS_DBG_PRINT("Message from NetIP %d opcode %d \n", g_netip_msg, pnetss_drv_data->netip_msg.type);
++      /*Acquire sysfs lock */
++      mutex_lock(&g_netss_sysfs_attributes_info.lock);
++      if(pnetss_drv_data->netip_msg.type == NETSS_OPCODE_NETIP_PROPERTIES) {
++         /*send reply*/ 
++         netss_send_reply_msg();
++         /*process netip properties message */
++         ness_process_netip_props_msg();
++         /* send configure message */
++         netss_send_configure_msg();
++         
++      } else if(pnetss_drv_data->netip_msg.type == NETSS_OPCODE_SERVICE_STATUS) {
++         /*send reply*/
++         netss_send_reply_msg();
++         /*process service status message */
++         ness_process_service_status_msg();
++         /* send service request message */
++         ness_send_service_request_msg(g_netss_sysfs_attributes_info.service_level);
++      } else if (g_netip_msg == 5) {
++         NETSS_DBG_PRINT("EJ test wake up received %d\n", count++);
++      } else {
++         NETSS_DBG_PRINT("Unknown message received Opcode type %d\n", pnetss_drv_data->netip_msg.type);
++      }
++
++      /*We will get multiple service status message, one message per one subsystem
++       *LAN subsystem includes service status message for rgmii0, rgmii1, sgmii2, sgmii3 services/ports */
++
++      if((g_netip_services_available != 0) && (g_netip_services_available == g_netip_services_status_received)) {
++         /*received and requested status of all services */
++         g_netss_boot_handshake_done = true;
++
++#ifdef CONFIG_PM_RUNTIME
++         pm_runtime_get_noresume(&pnetss_drv_data->dev->dev);
++#endif
++         NETSS_DBG_PRINT("service status of all available services received \n");
++         /*This thread can exit here */
++      } else {
++         NETSS_DBG_PRINT("services available 0x status received %x\n", g_netip_services_available, g_netip_services_status_received);
++      }
++      /*Done processing the message */ 
++      g_netip_msg = NETIP_MSG_NONE;
++      /*Release sysfs lock */
++      mutex_unlock(&g_netss_sysfs_attributes_info.lock);
++      /*Release NetIP message lock */
++      mutex_unlock(&pnetss_drv_data->netip_msg.lock);
++     
++      /*send service request message */
++   }
++   return 0;
++}
++
++void netss_manage_netip_services(void) 
++{
++   /*Register netip properties message, update tage and token later */
++   hwMbox_registerRecvOpcode(HW_MBOX_MASTER_NP_CPU,
++                             netss_receive_netip_properties_msg,
++                             0xFE, 0x1); 
++   /*Register netip status message, update tage and token later */
++   hwMbox_registerRecvOpcode(HW_MBOX_MASTER_NP_CPU,
++                             netss_receive_netip_status_msg,
++                             0xFE, 0x2); 
++   pnetss_drv_data->handshake_thread = kthread_run(netss_configure_and_setup_netip_services, (void *)data, "netip_service_manager");
++   
++   if(!pnetss_drv_data->handshake_thread) {
++     printk(KERN_ERR "Failed to create netss boot hand shake thread\n");
++   }
++
++   return;
++}
++
++void netss_stop_handshake_thread(void)
++{
++   g_netip_msg = 3;
++   //wake_up_all(&waitForNetIPMsgWQ);
++   kthread_stop(pnetss_drv_data->handshake_thread);
++   return;
++}
++
++int netss_set_service_state(uint32_t service_id, uint32_t state)
++{
++   mutex_lock(&g_netss_sysfs_attributes_info.lock);
++   if(g_netss_boot_handshake_done) {
++      /*send message to netip and update the value based on reply*/
++      ness_send_single_service_request_msg(service_id, state);
++   } else {
++      g_netss_sysfs_attributes_info.runtime_state[service_id] = state;
++   }
++   mutex_unlock(&g_netss_sysfs_attributes_info.lock);
++   return 0;
++}
++EXPORT_SYMBOL(netss_set_service_state);
++uint32_t netss_get_service_state(uint32_t service_id, uint32_t state)
++{
++   uint32_t ret;
++   mutex_lock(&g_netss_sysfs_attributes_info.lock);
++   ret = g_netss_sysfs_attributes_info.runtime_state[service_id]; 
++   mutex_unlock(&g_netss_sysfs_attributes_info.lock); 
++   return ret;
++}
++EXPORT_SYMBOL(netss_get_service_state);
++int netss_set_service_level(uint32_t level)
++{
++   int ret = -1;
++   netss_power_state_t new_state = level & NETSS_POWER_STATE_MASK;
++   
++   mutex_lock(&g_netss_sysfs_attributes_info.lock); 
++
++   /*If Boot handshake is not done, just update the attribute and 
++    *boot handshake thread will send the message */
++   if(g_netss_boot_handshake_done) {
++      if(new_state == NETIP_DEEP_STANDBY) {
++         ness_send_service_request_msg(level);
++
++#ifdef CONFIG_PM_RUNTIME
++         pm_runtime_put(&pnetss_drv_data->dev->dev);
++#endif
++
++      } else if(new_state == NETIP_ACTIVE_ON_AC && g_current_netip_power_state == NETIP_DEEP_STANDBY) {
++         /* TODO
++          * 1. Call the platform driver api
++          */
++#ifdef CONFIG_PM_RUNTIME
++         pm_runtime_get(&pnetss_drv_data->dev->dev);
++#endif
++         /* Runtime resume will be called and resume message will be sent, so update sysfs */
++         g_netss_sysfs_attributes_info.service_level = level;
++      } else if(new_state > g_current_netip_power_state) {
++         /*Going to lower power state Ex: Active to BBU, Active to Standby
++          *BBU to standby */
++         ness_send_service_request_msg(level);
++         /* TODO 
++          * 1. Call the platform driver api
++          */
++      } else if(new_state < g_current_netip_power_state) {
++         /*Going to higher power state Ex: BBU to Active or Standby to Active */
++         /* TODO 
++          * 1. Call the platform driver api
++          */
++         ness_send_service_request_msg(level);
++      }
++   } else {
++      g_netss_sysfs_attributes_info.service_level = level;
++   }
++   mutex_unlock(&g_netss_sysfs_attributes_info.lock); 
++}
++EXPORT_SYMBOL(netss_set_service_level);
++uint32_t netss_get_service_level(void)
++{
++   uint32_t ret;
++   mutex_lock(&g_netss_sysfs_attributes_info.lock); 
++   ret = g_netss_sysfs_attributes_info.service_level;
++   mutex_unlock(&g_netss_sysfs_attributes_info.lock);
++   return ret; 
++}
++EXPORT_SYMBOL(netss_get_service_level);
++
++int netss_runtime_suspend(struct device *dev)
++{
++   int i=0;
++   struct pci_dev *pdev = to_pci_dev(dev);
++   struct net_subsystem_drv_data *pnetss_drv_data = pci_get_drvdata(pdev);
++
++   mutex_lock(&g_netss_sysfs_attributes_info.lock);
++   NETSS_DBG_PRINT("NETSS SUSPEND CALLED\n");
++   for(i=0;i<13;i++)
++   {
++      if(i==6) continue; /*SKIP BBU */
++      if(g_netss_sysfs_attributes_info.runtime_state[i] !=  NETIP_DEEP_STANDBY) {
++         printk(KERN_ERR "Service id %d is not in disable state, current state is %d\n", i, g_netss_sysfs_attributes_info.runtime_state[i]);
++      }
++   }
++   /*TODO
++    *1. Call the platform driver api */
++
++   mutex_unlock(&g_netss_sysfs_attributes_info.lock);
++   return 0;
++}
++
++int netss_runtime_resume(struct device *dev)
++{
++   struct pci_dev *pdev = to_pci_dev(dev);
++   uint32_t level;
++  
++   mutex_lock(&g_netss_sysfs_attributes_info.lock);
++   level = g_netss_sysfs_attributes_info.service_level; 
++   ness_send_service_request_msg(level); 
++   mutex_unlock(&g_netss_sysfs_attributes_info.lock);
++   return 0;
++}
++
++int netss_runtime_idle(struct device *dev)
++{
++   struct pci_dev *pdev = to_pci_dev(dev);
++
++   return 0;
++}
++
++void netss_wakeup_netip_manager_thread(void)
++{
++   mutex_lock(&pnetss_drv_data->netip_msg.lock);
++   /*Wake up thread, cleanup sysfs attributes */
++   g_netip_msg = 5;
++   mutex_unlock(&pnetss_drv_data->netip_msg.lock);
++   wake_up(&waitForNetIPMsgWQ);
++
++}
++EXPORT_SYMBOL(netss_wakeup_netip_manager_thread);
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -73,3 +73,5 @@ obj-$(CONFIG_USB_CDC_PHONET)   += usb/
+ 
+ obj-$(CONFIG_HYPERV_NET) += hyperv/
+ obj-$(CONFIG_NTB_NETDEV) += ntb_netdev.o
++obj-$(CONFIG_NET_SUBSYSTEM) += NetIP_Subsystem_sysfs/
++
+--- /dev/null
++++ b/drivers/net/NetIP_Subsystem_sysfs/Makefile
+@@ -0,0 +1,7 @@
++#
++# Makefile for creating dummy net devices for CE2700's NetIP subsystem
++#
++
++obj-$(CONFIG_NET_SUBSYSTEM) += netip_subsystem_sysfs.o
++
++
+--- /dev/null
++++ b/drivers/net/NetIP_Subsystem_sysfs/netip_subsystem_sysfs.c
+@@ -0,0 +1,416 @@
++/*  netip_subsystem_sysfs.c: 
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2014 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/netdevice.h>
++#include <linux/init.h>
++#include <linux/rtnetlink.h>
++#include <linux/string.h>
++
++static int netssdev_dummy_init(struct net_device *dev)
++{
++   return 0;
++}
++
++static void netssdev_dummy_uninit(struct net_device *dev)
++{
++   return;
++}
++
++static const struct net_device_ops dummy_netdev_ops = {
++   .ndo_init   = netssdev_dummy_init,
++   .ndo_uninit = netssdev_dummy_uninit,
++};
++
++static void dummy_setup(struct net_device *dev)
++{
++   /* Initialize the device structure. */
++   dev->netdev_ops = &dummy_netdev_ops;
++   dev->destructor = free_netdev;
++}
++#define NETSS_SERVICES_MAX 13
++typedef enum netss_service_id_t {
++   NETIP_SUBSYSTEM = 0,
++   DOCSIS,
++   SPECTRAL_ANALYSIS,
++   VIDEO,
++   VOICE,
++   MOCA,
++   BBU,
++   WIFI,
++   EXSW,
++   RGMII0,
++   RGMII1,
++   SGMII2,
++   SGMII3,
++} netss_service_id_t;
++
++struct netss_dev_priv_data_t {
++  netss_service_id_t service_id;
++};
++static struct net_device *g_netssdevs[NETSS_SERVICES_MAX];
++extern const char power_group_name[];
++extern uint32_t netss_get_service_state(uint32_t service_id);
++extern int netss_set_service_state(uint32_t service_id, uint32_t state);
++extern uint32_t netss_get_service_level(void);
++extern int netss_set_service_level(uint32_t level);
++
++static char * convert_level_to_string_and_show(netss_service_id_t id, uint32_t state)
++{
++   char *ret = NULL;
++   if(id == NETIP_SUBSYSTEM) 
++   {
++      switch(state)
++      {
++         case 0:
++            ret = "Active";
++            break;
++         case 1:
++            ret = "bbu";
++            break;
++         case 2:
++            ret = "standby";
++            break;
++         case 3:
++            ret = "off";
++            break;
++         default:
++            break;
++      }
++   }
++   else
++   {
++      switch(state)
++      {
++         case 0:
++            ret = "enabled";
++            break;
++         case 1:
++            ret = "low";
++            break;
++         case 2:
++            ret = "initialized";
++            break;
++         case 3:
++            ret = "disabled";
++            break;
++         case 4:
++            if(id != NETIP_SUBSYSTEM) {
++               ret = "unusable";
++            }
++            break;
++         default:
++            break;
++      }
++
++   }
++   return ret;
++}
++
++static ssize_t runtime_state_show(struct device * dev, struct device_attribute *attr, char *buf)
++{
++   struct net_device * pnetssdev;
++   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
++   char * string_state = NULL;
++   uint32_t state;
++   pnetssdev = to_net_dev(dev);
++   pnetss_dev_priv_data = netdev_priv(pnetssdev);
++   state = netss_get_service_state(pnetss_dev_priv_data->service_id); 
++   string_state = convert_level_to_string_and_show(pnetss_dev_priv_data->service_id, state);
++   if( string_state != NULL) {
++      strcpy(buf, string_state);
++      printk("showing runtime state of service id = %d current state %s\n", pnetss_dev_priv_data->service_id, string_state);
++      return strlen(string_state);
++   }
++   return 0;
++}
++
++static int convert_level_to_int_and_store(const char *buf, netss_service_id_t id)
++{
++   int ret = -1, i;
++#if 0
++   char active[] = "active";
++   char low[] = "low";
++   char disable[] = "disable";
++     
++   for(i=0; i<strlen(active);i++)
++   {
++     if(buf[i] != active[i]) {
++        ret = -1;
++        break;
++     } else {
++       ret = 0;
++     }
++   }
++
++   if(ret == 0) return 0;
++
++   for(i=0; i<strlen(low);i++)
++   {
++     if(buf[i] != low[i]) {
++        ret = -1;
++        break;
++     } else {
++       ret = 0;
++     }
++   }
++
++   if(ret == 0) {
++    if(id == NETIP_SUBSYSTEM) return 2;
++    return 1;
++   }
++
++   for(i=0; i<strlen(disable);i++)
++   {
++     if(buf[i] != disable[i]) {
++        ret = -1;
++        break;
++     } else {
++       ret = 0;
++     }
++   }
++
++   if(ret == 0) return 3;
++
++   printk("cmp4 -1 ret = %d len1 %d len2 %d\n", ret, strlen(buf), strlen(disable));
++#endif
++
++   if(id == NETIP_SUBSYSTEM)
++   {
++      if((strncmp(buf, "active", 6)) == 0) {
++         printk("buf is active\n");
++         ret = 0;
++      } else if (((strncmp(buf, "bbu", 3)) == 0)){
++         printk("buf is bbu\n");
++         ret = 1;
++      } else if ((strncmp(buf, "standby", 7)) == 0) {
++         printk("buf is disable\n");
++         ret = 2;
++      } else if ((strncmp(buf, "off", 3)) == 0) {
++         printk("buf is disable\n");
++         ret = 3;
++      }
++   }
++   else
++   {
++      if((strncmp(buf, "active", 6)) == 0) {
++         printk("buf is active\n");
++         ret = 0;
++      } else if (((strncmp(buf, "low", 3)) == 0) || ((strncmp(buf, "1x1", 3)) == 0)) {
++         printk("buf is low or 1x1\n");
++         ret = 1;
++      } else if ((strncmp(buf, "disable", 7)) == 0) {
++         printk("buf is disable\n");
++         ret = 3;
++      }
++
++   }
++   return ret;
++}
++
++static ssize_t runtime_state_store(struct device * dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++   struct net_device * pnetssdev;
++   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
++   int requested_state = -1;
++   pnetssdev = to_net_dev(dev);
++   pnetss_dev_priv_data = netdev_priv(pnetssdev);
++
++   requested_state = convert_level_to_int_and_store(buf,pnetss_dev_priv_data->service_id); 
++   if(requested_state > -1) {
++      /*call netss api to send mesage and update attribute value*/
++      netss_set_service_state(pnetss_dev_priv_data->service_id, requested_state);
++   }
++   printk("Writing to runtime_state of service id %d buf %s val %d \n", pnetss_dev_priv_data->service_id, buf, requested_state);
++   /*Return count on success otherwise return zero */
++   return count;
++}
++
++static ssize_t service_level_show(struct device * dev, struct device_attribute *attr, char *buf)
++{
++   uint32_t service_level;
++   service_level = netss_get_service_level();
++   return sprintf(buf, "0x%x\n", service_level);;
++}
++
++static ssize_t service_level_store(struct device * dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++   int ret;
++   uint32_t service_level;
++   ret = kstrtou32(buf,16,&service_level );
++
++   netss_set_service_level(service_level);
++   printk("Writing to service level ret  %d val = %x\n", ret, service_level);
++   return count;
++}
++static DEVICE_ATTR(runtime_state, 0644, runtime_state_show, runtime_state_store);
++static DEVICE_ATTR(service_level, 0644, service_level_show, service_level_store);
++
++char * get_netss_service_name(int i)
++{
++   switch(i) 
++   {
++      case NETIP_SUBSYSTEM:
++         return "subsystem";
++      case DOCSIS:
++         return "docsis";
++      case SPECTRAL_ANALYSIS:
++         return "spectraAnalysis";
++      case VIDEO:
++         return "video";
++      case VOICE:
++         return "voice"; case MOCA:
++         return "moca";
++      case BBU:
++         return "bbu";
++      case WIFI:
++         return "wifi";
++      case EXSW:
++         return "exSw";
++      case RGMII0:
++         return "rgmii0";
++      case RGMII1:
++         return "rgmii1";
++      case SGMII2:
++         return "sgmii2";
++      case SGMII3:
++         return "sgmii3";
++      default:
++	return "";
++   }
++}
++static int __init netss_sysfs_create_netip_attributes(void)
++{
++   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
++
++   int i,j, ret;
++
++   for(i=0; i < NETSS_SERVICES_MAX; i++) 
++   {
++      if(i==BBU) {
++         continue;
++      }
++      g_netssdevs[i] = alloc_netdev(sizeof(struct netss_dev_priv_data_t), get_netss_service_name(i), dummy_setup);
++      if (!g_netssdevs[i]) {
++         ret = -ENOMEM;
++         goto free_netdevs;
++      }
++   }
++
++   for(i=0; i < NETSS_SERVICES_MAX; i++)
++   {
++      if(i==BBU) {
++         continue;
++      }
++      pnetss_dev_priv_data = netdev_priv(g_netssdevs[i]);
++      pnetss_dev_priv_data->service_id = i;
++      ret = register_netdevice(g_netssdevs[i]);
++      if (ret < 0) {
++         goto unregister_netdevs;
++      }
++
++      if(i == NETIP_SUBSYSTEM) {
++         sysfs_add_file_to_group(&g_netssdevs[i]->dev.kobj, &dev_attr_service_level, power_group_name);
++      }
++      sysfs_add_file_to_group(&g_netssdevs[i]->dev.kobj, &dev_attr_runtime_state, power_group_name);
++   }
++   return 0;
++unregister_netdevs:
++   for(j=i-1; j>=0; j--)
++   {
++      if(g_netssdevs[j] != NULL) {
++         unregister_netdevice(g_netssdevs[j]);
++      }
++   }
++   for(j=0; j<NETSS_SERVICES_MAX; j++)
++   {
++      if(g_netssdevs[j] != NULL) {
++         free_netdev(g_netssdevs[j]);
++      }
++   }
++   return ret;
++free_netdevs:
++   for(j=i-1; j<=0; j--)
++   {
++      if(g_netssdevs[j] != NULL) {
++         free_netdev(g_netssdevs[j]);
++      }
++   }
++   return ret;
++}
++
++
++static int __init netss_sysfs_init_module(void)
++{
++   int i, err = 0;
++   for(i=0; i<NETSS_SERVICES_MAX; i++)
++   {
++      g_netssdevs[i] = NULL;
++   }
++   rtnl_lock();
++   err = netss_sysfs_create_netip_attributes();
++   rtnl_unlock();
++ 
++   return err;
++}
++
++static void __exit netss_sysfs_cleanup_module(void)
++{
++   int i;
++   for(i=0; i<NETSS_SERVICES_MAX; i++)
++   {
++      if(g_netssdevs[i] != NULL) {
++         unregister_netdevice(g_netssdevs[i]);
++         free_netdev(g_netssdevs[i]);
++         g_netssdevs[i] = NULL;
++     }
++   }
++}
++void netss_sysfs_clean_up(uint32_t available_services)
++{
++   int i = 1;
++   for(i=0; i<NETSS_SERVICES_MAX; i++)
++   {
++     if(!(available_services & (1 << i))) {
++        if(g_netssdevs[i] != NULL) {
++           unregister_netdevice(g_netssdevs[i]);
++           free_netdev(g_netssdevs[i]);
++           g_netssdevs[i] = NULL;
++        }
++     }
++   }
++
++   return;
++}
++EXPORT_SYMBOL(netss_sysfs_clean_up);
++
++module_init(netss_sysfs_init_module);
++module_exit(netss_sysfs_cleanup_module);
++MODULE_DESCRIPTION("Intel(R) NET SUBSYSTEM sysfs Driver");
++MODULE_AUTHOR("Intel Corporation");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/include/linux/hw_mailbox.h
+@@ -0,0 +1,189 @@
++/*
++ *  include/linux/hw_mailbox.h
++ *
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ *
++ */
++
++#include <linux/hw_mbox_defs.h>
++
++/*! \fn int hwMbox_isReady(void)
++ **************************************************************************
++ *  \brief Returns whether HW MBOX driver is initailized or not.
++ *  \return [ 0 on success / error -1 ].
++ **************************************************************************/
++int hwMbox_isReady(void);
++
++/**************************************************************************/
++/*! \fn int hwMbox_sendCommand(hw_mbox_Masters_e subject,
++                       Uint32 *cmd,
++                       Uint8 *dataBuf, Uint32 dataLen)
++ **************************************************************************
++ *  \brief Send a command to <subject> in a blocking manner using the HW_MBOX.
++ *  \attention will only return upon reply/ACK from <subject> (or error).
++ *  \param[in]     subject - To which Master should the opcode be sent.
++ *  \param[in,out] cmd - Command to send, upon returning will hold the reply.
++ *  \param[in,out] dataBuf - pointer to a Buffer containing more data to be 
++ *                           sent, upon returning will hold the reply data
++ *                           Buffer (copies as much as the buffer can hold). 
++ *  \param[in]     dataLen - Length in Bytes of buffer specified in <dataBuf>.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_sendCommand(hw_mbox_Masters_e subject,
++                       Uint32 *cmd,
++                       Uint8 *dataBuf, Uint32 dataLen);
++
++/**************************************************************************/
++/*! \fn int hwMbox_recvCommand(hw_mbox_Masters_e commander,
++                               Uint32 *cmd,
++                               Uint8 *dataBuf, Uint32 dataLen)
++ **************************************************************************
++ *  \brief Receive a command from <commander> using the HW_MBOX.
++ *  \attention will only return upon arrival of a command from <commander> 
++ *             (or error).
++ *  \note To reply call HW_MBOX_sendReply [if a meaningful response is expected].
++ *  \note To ACK call HW_MBOX_sendAck [to simply ACK the command].
++ *  \warning The subsequent call to HW_MBOX_sendReply/HW_MBOX_sendAck is extermely
++ *           important as until it is called the channel is not released!!!
++ *  \param[in]  commander - From which Master should a command be received.
++ *  \param[out] cmd - Command that was received.
++ *  \param[out] dataBuf - pointer to a Buffer containing more data that was sent.
++ *  \param[in]  dataLen - Length in Bytes of buffer specified in <dataBuf>.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_recvCommand(hw_mbox_Masters_e commander,
++                       Uint32 *cmd,
++                       Uint8 *dataBuf, Uint32 dataLen);
++
++/**************************************************************************/
++/*! \fn int hwMbox_sendReplyCommand(hw_mbox_Masters_e commander,
++                                    Uint32 reply,
++                                    Uint8 *dataBuf, Uint32 dataLen)
++ **************************************************************************
++ *  \brief Send back a reply to <commander>, from which a command has been
++ *         received using the HW_MBOX.
++ *  \note should be called when a meaningful response is expected.
++ *  \attention should only be used after a command has been received from
++ *             <commander> using hwMbox_recvCommand.
++ *  \param[in] commander - To which Master should the reply be sent.
++ *  \param[in] reply - reply to send.
++ *  \param[in] dataBuf - pointer to a Buffer containing more data to be sent.
++ *  \param[in] dataLen - Length in Bytes of buffer specified in <dataBuf>.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_sendReplyCommand(hw_mbox_Masters_e commander,
++                            Uint32 reply,
++                            Uint8 *dataBuf, Uint32 dataLen);
++
++/**************************************************************************/
++/*! \fn int hwMbox_sendAckCommand(hw_mbox_Masters_e commander)
++ **************************************************************************
++ *  \brief Send back an ACK to <commander>, from which a command has been
++ *         received using the HW_MBOX.
++ *  \note should be called when no meaningful response is expected in order
++ *        to simply ACK the command.
++ *  \note Using this function leaves the command registers value unchanged
++ *        (writes the same value that was received).
++ *  \attention should only be used after a command has been received from
++ *             <commander> using hwMbox_recvCommand.
++ *  \param[in] commander - To which Master should the reply be sent.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_sendAckCommand(hw_mbox_Masters_e commander);
++
++/**************************************************************************/
++/*! \fn int hwMbox_sendOpcode(hw_mbox_Masters_e subject,
++                              Uint32 tag,
++                              Uint32 *code,
++                              Uint8 *dataBuf, Uint32 *dataLen,
++                              Uint32 opcodeDataLen,
++                              Uint32 *replyDataLen)
++ **************************************************************************
++ *  \brief Send an opcode to <subject> in a blocking manner using the HW_MBOX.
++ *  \attention will only return upon reply from <subject> (or error).
++ *  \param[in]     subject - To which Master should the opcode be sent.
++ *  \param[in]     tag - indicates opcode destination.
++ *  \param[in,out] code - code to send, upon returning will hold the return
++ *                        code.
++ *                  NOTE: if generic error upon returning will hold the error
++ *                        code <hwMbox_opcodeReturnCode_e>.
++ *  \param[in,out] dataBuf - pointer to a Buffer containing more data to be sent,
++ *                           upon returning will hold the reply data Buffer.
++ *  \param[in]     dataLen - Length in Bytes of buffer specified in <dataBuf>.
++ *  \param[in]     opcodeDataLen - Length in Bytes of opcode data to send.
++ *  \param[out]    replyDataLen - upon returning will hold the length in Bytes
++ *                                of returned reply data.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_sendOpcode(hw_mbox_Masters_e subject,
++                      Uint32 tag,
++                      Uint32 *code,
++                      Uint8 *dataBuf, Uint32 dataLen,
++                      Uint32 opcodeDataLen,
++                      Uint32 *replyDataLen);
++
++/**************************************************************************/
++/*! \fn int hwMbox_sendReplyOpcode(hw_mbox_Masters_e commander,
++                                   Uint32 code,
++                                   Uint8 *dataBuf, Uint32 *dataLen)
++ **************************************************************************
++ *  \brief Send a reply to an opcode received from <commander> using the HW_MBOX.
++ *  \attention should only be used after an opcode has been received from <commander>.
++ *  \param[in] commander - To which Master should the reply be sent.
++ *  \param[in] code - reply code.
++ *  \param[in] dataBuf - pointer to a Buffer containing more data to be sent.
++ *  \param[in] dataLen - Length in Bytes of data to be sent from buffer
++ *                       specified in <dataBuf>.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_sendReplyOpcode(hw_mbox_Masters_e commander,
++                           Uint32 code,
++                           Uint8 *dataBuf, Uint32 dataLen);
++
++/**************************************************************************/
++/*! \fn int hwMbox_registerRecvOpcode(hw_mbox_Masters_e commander,
++                                      hwMboxRecvOpcodeCallback pOpcodeCallbackFunc,
++                                      Uint32 tag,
++                                      Uint32 token)
++ **************************************************************************
++ *  \brief Register for Receive Opcode from <commander> using the HW_MBOX.
++ *  \attention This function should be called once per tag.
++ *  \param[in] commander - From which Master should the opcode be received.
++ *  \param[in] pOpcodeCallbackFunc - pointer to the callback function to be 
++ *                                   invoked upon receiving an opcode from
++ *                                   <commander>.
++ *  \param[in] tag - indicates the destination.
++ *  \param[in] token - 32 bit value saved in DB that can be used by application.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_registerRecvOpcode(hw_mbox_Masters_e commander,
++                              hwMboxRecvOpcodeCallback pOpcodeCallbackFunc,
++                              Uint32 tag,
++                              Uint32 token);
++
++
++
++
+--- /dev/null
++++ b/include/linux/hw_mbox_defs.h
+@@ -0,0 +1,683 @@
++/*
++ *
++ * hw_mbox_defs.h
++ * Description:
++ * contains basic definitions puma7 HW_MBOX controller SW.
++ *
++ 
++  This file is provided under a dual BSD/GPLv2 license.  When using or 
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2014-2015 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify 
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but 
++  WITHOUT ANY WARRANTY; without even the implied warranty of 
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License 
++  along with this program; if not, write to the Free Software 
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution 
++  in the file called LICENSE.GPL.
++
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++  BSD LICENSE 
++
++  Copyright(c) 2014-2015 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without 
++  modification, are permitted provided that the following conditions 
++  are met:
++
++    * Redistributions of source code must retain the above copyright 
++      notice, this list of conditions and the following disclaimer.
++
++    * Redistributions in binary form must reproduce the above copyright 
++      notice, this list of conditions and the following disclaimer in 
++      the documentation and/or other materials provided with the 
++      distribution.
++
++    * Neither the name of Intel Corporation nor the names of its 
++      contributors may be used to endorse or promote products derived 
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++
++#ifndef _HW_MBOX_DEFS_H_
++#define _HW_MBOX_DEFS_H_
++
++/******************************************
++|                                         |
++|        HW_MBOX Basic Definitions        |
++|                                         |
++******************************************/
++
++/*! \def HW_MBOX_MASTER_COUNT 
++    \brief Count of HW_MBOX Masters. */
++#define HW_MBOX_MASTER_COUNT     16
++
++/*! \def HW_MBOX_CHANNEL_COUNT 
++    \brief Count of HW_MBOX Channel. */
++#define HW_MBOX_CHANNEL_COUNT    64
++
++#define HW_MBOX_CID_INVALID    0xFFFFFFFF
++
++/*! \def HW_MBOX_MID_VALIDITY_CHECK(paramMID) 
++    \brief evaluates as True if paramMID is a valid MID. */
++#define HW_MBOX_MID_VALIDITY_CHECK(paramMID)    (((paramMID) >= 0) && ((paramMID) < HW_MBOX_MASTER_COUNT))
++
++/*! \def HW_MBOX_CID_VALIDITY_CHECK(paramCID) 
++    \brief evaluates as True if paramCID is a valid CID. */
++#define HW_MBOX_CID_VALIDITY_CHECK(paramCID)    (((paramCID) >= 0) && ((paramCID) < HW_MBOX_CHANNEL_COUNT))
++
++/* HW_MBOX_MASTER_MID defines: */
++/* Note: should be kept in sync with HW_MBOX_IS_MASTER defines and with HW_MBOX_MASTER_TABLE */
++#define HW_MBOX_NP_CPU_MID          0  /*! MID of NP_CPU        */
++#define HW_MBOX_BBU_C_MID           1  /*! MID of BBU_C         */
++#define HW_MBOX_APP_CPU_MID         2  /*! MID of APP_CPU       */
++#define HW_MBOX_RCE_MID             3  /*! MID of RCE           */
++#define HW_MBOX_US_MAC_CPU_MID      4  /*! MID of US_MAC_CPU    */
++#define HW_MBOX_DS_PHY_CPU_MID      5  /*! MID of DS_PHY_CPU    */
++#define HW_MBOX_MOCA_C_MID          6  /*! MID of MOCA_C        */
++#define HW_MBOX_DS_MAC_C_MID        7  /*! MID of DS_MAC_C      */
++#define HW_MBOX_PP_NETSEC_MID       8  /*! MID of PP_NETSEC     */
++#define HW_MBOX_PP_RESEQ_MID        9  /*! MID of PP_RESEQ      */
++#define HW_MBOX_PP_STAGE1_MID      10  /*! MID of PP_STAGE1     */
++#define HW_MBOX_PP_QOS_MID         11  /*! MID of PP_QOS        */
++#define HW_MBOX_C55_MID            12  /*! MID of C55           */
++#define HW_MBOX_FREE0_MID          13  /*! MID of FREE0         */
++#define HW_MBOX_SEC_MID            14  /*! MID of SEC           */
++#define HW_MBOX_CSE_MID            15  /*! MID of CSE           */
++
++/*! \var typedef enum hw_mbox_type hw_mbox_type_e
++    \brief This enum denotes types of mboxs (protocols) that are supported. */
++typedef enum hw_mbox_type
++{
++    hw_mbox_command = 0,  /* Command */
++    hw_mbox_event,        /* Event   */
++    hw_mbox_opcode,       /* Opcode (generic HW MBOX command-response protocol) */
++
++    HW_MBOX_TYPE_COUNT    /* Should always be last... */
++} hw_mbox_type_e;
++
++/*! \def HW_MBOX_TYPE_STR(mboxType)
++    \brief gets a string according to <mboxType>
++    \attention <mboxType> should be a value from hw_mbox_type_e 
++*/
++#define HW_MBOX_TYPE_STR(mboxType)    ( (mboxType == hw_mbox_command)?("Command"): \
++                                        ((mboxType == hw_mbox_event)?("Event"):("Opcode")) )
++
++/*! \def HW_MBOX_DEFAULT_TIMEOUT_SEC
++    \brief Default timeout value in seconds.
++    \note can comment out define to set wait forever.
++    \attention wait forever setting should only be used for debug! 
++*/
++#define HW_MBOX_DEFAULT_TIMEOUT_SEC    10  /* 10 sec */
++
++/* Error Notification: */
++
++/* supervisor gets notified of access violation errors through a HW_MBOX interrupt.
++   To signal that there's an access violation error a Certain predetermined CID is
++   selected. This CID should not be allocaed to supervisor as a channel. */
++
++/*! \def HW_MBOX_ERROR_NOTIFY_CID_FOR_SUPERVISOR
++    \brief This CID gets signaled upon HW access violation errors.
++    \attention should only be used by supervisor.
++*/
++#define HW_MBOX_ERROR_NOTIFY_CID_FOR_SUPERVISOR    63
++
++/* Some General Macros we will use throughout the Code: */
++
++#define HW_MBOX_CONCAT2(a, b)          a ## b
++#define HW_MBOX_CONCAT3(a, b, c)       a ## b ## c
++
++#define HW_MBOX_STRINGIFY(x)    #x
++
++#ifndef BIT
++#define BIT( _i )       (1UL << ( _i ))
++#endif
++
++/**********************************************
++|                                             |
++|        HW_MBOX Package Configuration        |
++|                                             |
++**********************************************/
++
++/*! \def HW_MBOX_MONITOR    <MID_of_Monitor>
++    \brief MID of the Master to act as Monitor.
++    \attention use a value from HW_MBOX_MASTER_MID defines.
++    \note Feature is OPTIONAL, comment out define to disable.
++    \note Monitor gets an interrupt upon every HW_MBOX interrupt of any channel and should log the commands.
++    \note There's no lock on the command register value, this Monitoring feature is best effort only!
++*/
++//#define HW_MBOX_MONITOR    HW_MBOX_NP_CPU_MID
++
++/** --------------------------------------- **/
++
++/*! \def HW_MBOX_START_IN_HW_DEBUG_MODE
++    \brief Start HW_MBOX in HW Debug Mode.
++    \attention In HW Debug Mode access protection rules are not enforced and every Master access is permitted.
++    \note Feature is OPTIONAL, comment out define to disable.
++*/
++//#define HW_MBOX_START_IN_HW_DEBUG_MODE
++
++/** --------------------------------------- **/
++
++/*! \def __HW_MBOX_CHANGE_DEFAULT_SUPERVISOR_TO    <MID_of_new_Supervisor>
++    \brief MID of the Master to act as supervisor (instead of default one). 
++    \warning ONLY USE IF YOU ABSOULTLY KNOW WHAT YOU ARE DOING!!!
++    \attention use a value from HW_MBOX_MASTER_MID defines.
++    \note Feature is OPTIONAL, comment out define to disable.
++    \note This will change the default supervisor's MID (MID == 0) to the new value indicated here.
++    \note There has to be a special way to change it since only the supervisor can access the ctrl Register.
++*/
++//#define __HW_MBOX_CHANGE_DEFAULT_SUPERVISOR_TO    HW_MBOX_NP_CPU_MID
++
++/** --------------------------------------- **/
++
++/*! \def HW_MBOX_DEBUG
++    \brief Enable this flag for various debug operations of the HW_MBOX package. 
++    \note Feature is OPTIONAL, comment out define to disable.
++    \note Debug Features:
++    \note 1. Free access to the HW_MBOX registers and Memory via CLI.
++    \note 2. MID Disguise: enable the current Master to access the HW_MBOX "disguised" as a different Master.
++*/
++//#define HW_MBOX_DEBUG
++
++/******************************************************
++|                                                     |
++|        HW_MBOX Specific Master Configuration        |
++|                                                     |
++******************************************************/
++
++/*! \def HW_MBOX_MID    <MID_of_this_Master>
++    \brief MID of this Master, current Master, the one running this code. 
++    \attention use a value from HW_MBOX_MASTER_MID defines.
++    \note It is derived from which physical HW_MBOX interrupt line is connected to this Master.
++    \note Values for all Master are enumerated by hw_mbox_Masters_e, just pick the correct one.
++*/
++#define HW_MBOX_MID    HW_MBOX_APP_CPU_MID
++
++/*! \def HW_MBOX_OS_LINUX\HW_MBOX_OS_FLAT\HW_MBOX_OS_NONE
++    \brief Set one appropriate define according to Variant (OS). 
++    \attention Enable Exactly one of these!
++    \note HW_MBOX_OS_LINUX: U-services.
++    \note HW_MBOX_OS_FLAT:  F-services. 
++    \note HW_MBOX_OS_NONE:  N-services. 
++*/
++#define HW_MBOX_OS_LINUX     /* U-services */
++//#define HW_MBOX_OS_FLAT    /* F-services */
++//#define HW_MBOX_OS_NONE    /* N-services */
++
++/* Variant Selection Check: */
++#if ((defined(HW_MBOX_OS_LINUX) + defined(HW_MBOX_OS_FLAT) + defined(HW_MBOX_OS_NONE)) != 1)
++#   error "HW_MBOX defs: Enable ONE OS Variant exactly!"
++#endif
++
++/*! \var HW_MBOX_HARDCODED_MID
++    \brief Remember the HARDCODED MID of this Master.
++    \attention This is needed as under debug "MID Disguise Feature" undefs HW_MBOX_MID and redefines it as a dynamic field.
++    \note using enum to qualify as CONST.
++*/
++enum { HW_MBOX_HARDCODED_MID = HW_MBOX_MID };
++
++/* HW_MBOX_IS_MASTER defines (useful for #ifdef-ing include for instance): */
++/* Note: These should be kept in sync with HW_MBOX_MASTER_MID defines and with HW_MBOX_MASTER_TABLE  */
++#if (HW_MBOX_MID == HW_MBOX_NP_CPU_MID)
++#define HW_MBOX_IS_NP_CPU               /*! defined if current HW_MBOX Master is NP_CPU     */
++#elif (HW_MBOX_MID == HW_MBOX_BBU_C_MID)
++#define HW_MBOX_IS_BBU_C                /*! defined if current HW_MBOX Master is BBU_C      */
++#elif (HW_MBOX_MID == HW_MBOX_APP_CPU_MID)
++#define HW_MBOX_IS_APP_CPU              /*! defined if current HW_MBOX Master is APP_CPU    */
++#elif (HW_MBOX_MID == HW_MBOX_RCE_MID)
++#define HW_MBOX_IS_RCE                  /*! defined if current HW_MBOX Master is RCE        */
++#elif (HW_MBOX_MID == HW_MBOX_US_MAC_CPU_MID)
++#define HW_MBOX_IS_US_MAC_CPU           /*! defined if current HW_MBOX Master is US_MAC_CPU */
++#elif (HW_MBOX_MID == HW_MBOX_DS_PHY_CPU_MID)
++#define HW_MBOX_IS_DS_PHY_CPU           /*! defined if current HW_MBOX Master is DS_PHY_CPU */
++#elif (HW_MBOX_MID == HW_MBOX_MOCA_C_MID)
++#define HW_MBOX_IS_MOCA_C               /*! defined if current HW_MBOX Master is MOCA_C     */
++#endif
++
++/* Generic Primitive typedefs: */
++
++/* need typedefs of Uint32, Uint8 and Bool(True/False). */
++#if   defined HW_MBOX_IS_NP_CPU
++#include "_tistdtypes.h"
++#elif defined HW_MBOX_IS_APP_CPU
++typedef uint32_t Uint32;
++typedef int32_t  Int32;
++typedef uint8_t  Uint8;
++typedef bool     Bool;
++#define True true
++#define False false
++#include <linux/types.h> /* include file with generic typedefs for APP-CPU */
++#elif defined HW_MBOX_IS_DS_PHY_CPU
++#include "types.h"
++#endif
++
++/********************************************
++|                                           |
++|        HW_MBOX Master Declarations        |
++|                                           |
++********************************************/
++
++/*! \var typedef enum hw_mbox_support hw_mbox_support_e
++    \brief This enum denotes which SW support exists on each Master. */
++typedef enum hw_mbox_support
++{
++    hw_mbox_support_none = 0, /* No SW support on this Master */
++    hw_mbox_support_static,   /* only supports static channel allocation */
++    hw_mbox_support_dynamic   /* supports static and dynamic channel allocation */
++} hw_mbox_support_e;
++
++/*! \def HW_MBOX_SUPPORT_STR(mboxSupport)
++    \brief gets a string according to <mboxSupport>
++    \attention <mboxSupport> should be a value from hw_mbox_support_e 
++*/
++#define HW_MBOX_SUPPORT_STR(mboxSupport)    ( (mboxSupport == hw_mbox_support_dynamic)?("Dynamic"): \
++                                              ((mboxSupport == hw_mbox_support_static)?("Static"):("None")) )
++
++/*! \var typedefstruct hw_mbox_masterConfig hw_mbox_masterConfig_t
++    \brief Master configuration struct. */
++typedef struct hw_mbox_masterConfig
++{
++    hw_mbox_support_e   support;
++} hw_mbox_masterConfig_t;
++
++/*! \def HW_MBOX_MASTER_CONFIG_SIZE 
++    \brief Master configuration struct's size. */
++#define HW_MBOX_MASTER_CONFIG_SIZE    (sizeof(hw_mbox_masterConfig_t))
++
++/*! \def HW_MBOX_MASTER_TABLE(ENTRY)
++    \brief X-MACRO hardcoded table for HW_MBOX Master declarations.
++    \brief Position in the Table determines MID (Master ID) of the Master, a unique identifier
++           dictated by Hardware (HW_MBOX Interrupt Line Number which connects to the Master).
++    \attention Should be kept in sync with HW_MBOX_MASTER_MID defines and with HW_MBOX_IS_MASTER defines.
++    \note NP_CPU is generic name for ARM11.
++    \note APP_CPU is generic name for ATOM.
++    \note US_MAC_CPU is generic name for Upstream MAC CPU ARM9.
++    \note Interrupt line 13 is not physically connected, reserved for possible SW internal usage.
++*/
++#define HW_MBOX_MASTER_TABLE(ENTRY) \
++/* +------------------------------------------------------------+ */ \
++/* | MID |         | Name /        | HW_MBOX SW support         | */ \
++/* |     |         | Description   | [hw_mbox_support_e]        | */ \
++/* +------------------------------------------------------------+ */ \
++/* |  0  | */ ENTRY( NP_CPU        , hw_mbox_support_static     )    \
++/* |  1  | */ ENTRY( BBU_C         , hw_mbox_support_static     )    \
++/* |  2  | */ ENTRY( APP_CPU       , hw_mbox_support_static     )    \
++/* |  3  | */ ENTRY( RCE           , hw_mbox_support_none       )    \
++/* |  4  | */ ENTRY( US_MAC_CPU    , hw_mbox_support_none       )    \
++/* |  5  | */ ENTRY( DS_PHY_CPU    , hw_mbox_support_static     )    \
++/* |  6  | */ ENTRY( MOCA_C        , hw_mbox_support_static     )    \
++/* |  7  | */ ENTRY( DS_MAC_C      , hw_mbox_support_none       )    \
++/* |  8  | */ ENTRY( PP_NETSEC     , hw_mbox_support_none       )    \
++/* |  9  | */ ENTRY( PP_RESEQ      , hw_mbox_support_none       )    \
++/* | 10  | */ ENTRY( PP_STAGE1     , hw_mbox_support_none       )    \
++/* | 11  | */ ENTRY( PP_QOS        , hw_mbox_support_none       )    \
++/* | 12  | */ ENTRY( C55           , hw_mbox_support_none       )    \
++/* | 13  | */ ENTRY( FREE0         , hw_mbox_support_none       )    \
++/* | 14  | */ ENTRY( SEC           , hw_mbox_support_none       )    \
++/* | 15  | */ ENTRY( CSE           , hw_mbox_support_none       )
++
++/* Master Table Expanders: */
++
++/*! \def HW_MBOX_MASTER_TABLE_AS_ENUM( _desc, _support )
++    \brief use this as argument to HW_MBOX_MASTER_TABLE to expand table as enum.
++    \note Masters will be enumerated according to this template: HW_MBOX_MASTER_<_desc> 
++*/
++#define HW_MBOX_MASTER_TABLE_AS_ENUM( _desc, _support )      HW_MBOX_CONCAT2(HW_MBOX_MASTER_, _desc),
++
++/*! \def HW_MBOX_MASTER_TABLE_AS_STRS( _desc, _support )
++    \brief use this as argument to HW_MBOX_MASTER_TABLE to expand table as strings.
++    \note Strings are created according to this template: "<_desc>" 
++*/
++#define HW_MBOX_MASTER_TABLE_AS_STRS( _desc, _support )      HW_MBOX_STRINGIFY(_desc),
++
++/*! \def HW_MBOX_MASTER_TABLE_AS_COUNT( _desc, _support )
++    \brief use this as argument to HW_MBOX_MASTER_TABLE to expand table as entry count. */
++#define HW_MBOX_MASTER_TABLE_AS_COUNT( _desc, _support )     1+ 
++
++/*! \def HW_MBOX_MASTER_TABLE_AS_DB( _desc, _support )
++    \brief use this as argument to HW_MBOX_MASTER_TABLE to expand table as DB.
++    \note intializes an array of hw_mbox_masterConfig_t.
++    \attention only create inside c file.
++*/
++#define HW_MBOX_MASTER_TABLE_AS_DB( _desc, _support )    { .support = _support },
++
++/* Master Table Expander Wrappers: */
++
++/*! \def HW_MBOX_MASTER_TABLE_STRS
++    \brief Creates an string array with HW MBOX Masters names.
++    \note "<_desc0>", "<_desc1>", ... [so we need] '\0' for array syntax and proper array null termination.
++    \note creates and initializes a static char * array with name <_arrayName>.
++    \attention only use inside c file.
++*/
++#define HW_MBOX_MASTER_TABLE_STRS( _arrayName ) \
++    static const char *_arrayName[] =                      \
++    {                                                      \
++        HW_MBOX_MASTER_TABLE(HW_MBOX_MASTER_TABLE_AS_STRS) \
++        '\0'                                               \
++    }
++
++/*! \def HW_MBOX_MASTER_TABLE_DB( _arrayName )
++    \brief Creates a hw_mbox_masterConfig_t array with HW MBOX Masters Data.
++    \note creates and initializes a static hw_mbox_masterConfig_t array with name <_arrayName>.
++    \attention only use inside c file.
++*/
++#define HW_MBOX_MASTER_TABLE_DB( _arrayName ) \
++    static const hw_mbox_masterConfig_t _arrayName[] =     \
++    {                                                      \
++        HW_MBOX_MASTER_TABLE(HW_MBOX_MASTER_TABLE_AS_DB)   \
++    }
++
++/*! \def HW_MBOX_MASTER_TABLE_COUNT
++    \brief wrapper for HW_MBOX_MASTER_TABLE_AS_COUNT.
++    \note 1+ 1+ ... [so we need] 0 for syntax.
++*/
++#define HW_MBOX_MASTER_TABLE_COUNT    (HW_MBOX_MASTER_TABLE(HW_MBOX_MASTER_TABLE_AS_COUNT) 0)
++
++/* Basic Sanity Check for Master Table: */
++#if (HW_MBOX_MASTER_COUNT != (HW_MBOX_MASTER_TABLE_COUNT))
++#   error "HW_MBOX MASTER TABLE: entry count in the table must equal the total Master Count!"
++#endif
++
++/*! \var typedef enum hw_mbox_Masters hw_mbox_Masters_e 
++    \brief Enumerate all HW_MBOX Master with MID value.
++    \note name of the Masters is according to HW_MBOX_MASTER_TABLE_AS_ENUM Macro.
++*/
++typedef enum hw_mbox_Masters
++{
++    HW_MBOX_MID_INVALID = -1,
++    HW_MBOX_MASTER_TABLE(HW_MBOX_MASTER_TABLE_AS_ENUM)
++    HW_MBOX_MASTER_LAST_ENTRY
++} hw_mbox_Masters_e;
++
++/**********************************************
++|                                             |
++|        Variant Specific Declarations        |
++|                                             |
++**********************************************/
++
++#ifdef HW_MBOX_OS_LINUX
++/* Defines related to Kernel Driver: */
++
++/*! \def HW_MBOX_DRV_DEV_DIR_NAME
++    \brief directory under /dev containing the chnint char devices. */
++#define HW_MBOX_DRV_DEV_DIR_NAME    "hw_mbox_drv"
++
++/*! \def HW_MBOX_CHNINT_DEV_NAME
++    \brief Prefix name of the chnint char devices, these devices are used to extend interrupt signals from Kernel to User Space.
++    \note for channel XX the device is chnintXX [e.g. channel 8 -> chnint08].
++    \note devices located in directory /dev/<HW_MBOX_DRV_DEV_DIR_NAME> 
++*/
++#define HW_MBOX_CHNINT_DEV_NAME    "chnint"
++
++/** --------------------------------------- **/
++
++/*! \def HW_MBOX_RECENT_COMMAND_LOG    <Command_Count>
++    \brief How many recent commands should be saved.
++    \attention use a value > 0.
++    \note Feature is OPTIONAL, comment out define to disable.
++    \note Monitor Thread is in-charge of updating the Log.
++*/
++//#define HW_MBOX_RECENT_COMMAND_LOG    16
++
++#ifdef HW_MBOX_RECENT_COMMAND_LOG
++
++/* Argument Sanity Check: */
++#if (HW_MBOX_RECENT_COMMAND_LOG <= 0)
++#   error "HW_MBOX RECENT COMMAND LOG: Command Count Must be > 0!" 
++#endif
++
++/*! \def HW_MBOX_RECENT_COMMAND_LOG_INDEX_INVALID
++    \brief invalid index for the recent command log and snapshot log.
++*/
++#define HW_MBOX_RECENT_COMMAND_LOG_INDEX_INVALID    (-1)
++#endif /* HW_MBOX_RECENT_COMMAND_LOG */
++#endif /* HW_MBOX_OS_LINUX */
++
++/****************************************************
++|                                                   |
++|        HW_MBOX Opcode                             |
++|        (generic command-response protocol)        |
++|                                                   |
++****************************************************/
++
++/* HW MBOX OPCODE: a generic command-response protocol
++
++   OPCODE type channels exist to implement a generic command-response
++   sequence that can be used by package customers. The protocol predefines
++   the structure of the values that are to be written to command channel
++   register. While enabling less freedom to applications it enables the
++   construction of generic entities that can be used for message dispatching
++   without relying completely on application context. OPCODE type channels 
++   enable inherent support for several applications on the same channel.
++*/
++
++/* The Fields that OPCODE channel uses are:
++ 
++   TAG - indicates the application that is the destination of the code.
++         Note: TAG == 0xFF and 0xFE are reserved for HW MBOX usage.
++ 
++   CODE - code of the command (per TAG, defined by applicative context).
++ 
++   FLAG A/B - 2 reserved flags [for internal use].
++
++   LEN - How many words are to be read from SRAM (opcode Data).
++         [LEN is integral multiple of 4 Bytes so we can use word count].
++
++   exact Field division is defined in mem_access file.
++*/
++
++/*! \var typedef struct hwMbox_opcode hwMbox_opcode_t
++    \brief struct for opcode fields. 
++    \note the types used here sometimes have more capacity than actual max value. 
++*/
++typedef struct hwMbox_opcode
++{
++    Uint32  tag;
++    Uint32  code;
++    Bool    flagA;
++    Bool    flagB;
++    Uint32  lenInBytes;
++} hwMbox_opcode_t;
++
++/* Field Bit Length definitions:
++   [These are done here so max value can be calculated and used here...] 
++
++   Note: if value change please update also corresponding documentation 
++   in mem access.
++*/
++
++#define HW_MBOX_OPCODE_TAG_BITLEN    (8)
++
++#define HW_MBOX_OPCODE_CODE_BITLEN   (12)
++
++/*! \def HW_MBOX_OPCODE_TAG_MAX_VALUE 
++    \brief Max value available for tag field when using OPCODE. */
++#define HW_MBOX_OPCODE_TAG_MAX_VALUE    (BIT(HW_MBOX_OPCODE_TAG_BITLEN) - 1)
++
++/*! \def HW_MBOX_OPCODE_CODE_MAX_VALUE 
++    \brief Max value available for code field when using OPCODE. */
++#define HW_MBOX_OPCODE_CODE_MAX_VALUE   (BIT(HW_MBOX_OPCODE_CODE_BITLEN) - 1)
++
++#define HW_MBOX_OPCODE_TAG                0xFF /*! Reserved TAG value for Kernel HW MBOX */
++#define HW_MBOX_OPCODE_USER_SPACE_TAG     0xFE /*! Reserved TAG value for User-Space HW MBOX */
++
++/*! \var typedef enum hwMbox_code hwMbox_code_e
++    \brief This enum denotes codes of internal administrative HW MBOX 
++           commands to be sent on opcode channel.
++*/
++typedef enum hwMbox_code
++{
++    HW_MBOX_CODE_INIT_COMPLETE = 0,    /* init complete code [sent to other Masters by supervisor]. */
++    HW_MBOX_CODE_PING,                 /* ping SW support on other end */
++
++    HW_MBOX_CODE_COUNT    /* Should always be last... */
++} hwMbox_code_e;
++
++/*! \var typedef enum hwMbox_opcodeReturnCode hwMbox_opcodeReturnCode_e
++    \brief This enum denotes return codes of an opcode channel.
++*/
++typedef enum hwMbox_opcodeReturnCode
++{
++    HW_MBOX_OPCODE_RC_OK = 0,
++
++    HW_MBOX_OPCODE_RC_NOT_INITIALIZED_YET = 0x100,
++    HW_MBOX_OPCODE_RC_INVALID_TAG,
++    HW_MBOX_OPCODE_RC_INVALID_CODE,
++    HW_MBOX_OPCODE_RC_CALLBACK_FAILED,
++    HW_MBOX_OPCODE_RC_REPLY_TOO_LONG,
++
++    HW_MBOX_OPCODE_RC_NOK = HW_MBOX_OPCODE_CODE_MAX_VALUE /* this should be last... */
++} hwMbox_opcodeReturnCode_e;
++
++#define HW_MBOX_OPCODE_RECV_COUNT    10 /*! max amount of recv opcode channels per Master. */
++#define HW_MBOX_OPCODE_TAG_COUNT     10 /*! max amount of tags that can be registered per RecvOpcode channel. */
++
++/*! \typedef int (*hwMboxRecvOpcodeCallback)(hw_mbox_Masters_e commander,
++                                             Uint32 code,
++                                             Uint8 *dataBuf, Uint32 dataLen,
++                                             Uint32 *token)
++    \brief prototype for receive opcode channels callback function pointers, to be
++           invoked by Receive Opcode Listeners upon incoming opcode.
++    \param[in]     commander - Master from which the opcode has been received.
++    \param[in]     code - code of the opcode that has been received.
++    \param[in,out] dataBuf - data of the opcode that has been received.
++    \param[in]     dataLen - Length in bytes of <dataBuf>.
++    \param[in,out] token - 32 bit saved in DB upon registering the callback,
++                           modifiable by the callback.
++    \note return value (-1) is reserved to indicate generic error, use token
++          to output an error from <hwMbox_opcodeReturnCode_e>, it will be sent
++          to the commander and the sendOpcode service it invoked will fail.
++*/
++typedef int (*hwMboxRecvOpcodeCallback)(hw_mbox_Masters_e commander,
++                                        Uint32 code,
++                                        Uint8 *dataBuf, Uint32 dataLen,
++                                        Uint32 *token);
++
++/********************************************
++|                                           |
++|        HW_MBOX Channel Definitions        |
++|                                           |
++********************************************/
++
++/*! \var typedef struct hw_mbox_sram hw_mbox_sram_t
++    \brief struct for Channel's SRAM configuration. */
++typedef struct hw_mbox_sram
++{
++    Uint32 start; /* start Offset aligned and relvant to the 4KB of HW_MBOX SRAM */
++    Uint32 size;  /* size is in bytes */
++} hw_mbox_sram_t;
++
++#define HW_MBOX_SRAM_CHUNK    4  /*! Allocated SRAM size must be an integral Multiple of 4B */
++
++/*! \var typedef struct hw_mbox_channelConfig hw_mbox_channelConfig_t
++    \brief struct for Channel's configuration. */
++typedef struct hw_mbox_channelConfig
++{
++    Uint32              cid;
++    hw_mbox_type_e      mboxType;
++    hw_mbox_Masters_e   commander;
++    hw_mbox_Masters_e   subject;
++    hw_mbox_sram_t      memBuff;
++} hw_mbox_channelConfig_t;
++
++/*! \def HW_MBOX_CHANNEL_CONFIG_SIZE 
++    \brief channel configuration struct's size. */
++#define HW_MBOX_CHANNEL_CONFIG_SIZE    sizeof(hw_mbox_channelConfig_t)
++
++/********************************************
++|                                           |
++|        STATIC channel Declarations        |
++|                                           |
++********************************************/
++
++/*! \def HW_MBOX_STATIC_CHANNEL_TABLE
++    \brief X-MACRO hardcoded table for STATIC Channel declarations.
++    \attention SRAM size must be an integral Multiple of HW_MBOX_SRAM_CHUNK = 4B.
++    \attention An event channel must have SRAM allocated to accomdate the event buffer.
++    \attention An event channel SRAM size must be divisible to 2 equal sized valid individual SRAM buffers [for the double buffer] --> meaning it should be an integral multiple of 2 * HW_MBOX_SRAM_CHUNK = 8B.
++*/
++#define HW_MBOX_STATIC_CHANNEL_TABLE(ENTRY) \
++/*       +--------------------------------------------------------------------------------------------------------------------------+ */ \
++/*       |  CID  | Commander                           | Subject                             | HW_MBOX Channel Type     | SRAM size | */ \
++/*       |       | [hw_mbox_Masters_e]                 | [hw_mbox_Masters_e]                 | [hw_mbox_channel_type_e] | [Bytes]   | */ \
++/*       +--------------------------------------------------------------------------------------------------------------------------+ */ \
++    ENTRY(    0  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_BBU_C                , hw_mbox_command          , 0         )    \
++    ENTRY(    1  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_DS_PHY_CPU           , hw_mbox_command          , 0         )    \
++    ENTRY(    2  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_command          , 0         )    \
++    ENTRY(    3  , HW_MBOX_MASTER_BBU_C                , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
++    ENTRY(    4  , HW_MBOX_MASTER_DS_PHY_CPU           , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
++    ENTRY(    5  , HW_MBOX_MASTER_MOCA_C               , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
++    ENTRY(    6  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_BBU_C                , hw_mbox_opcode           , 8         )    \
++    ENTRY(    7  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_APP_CPU              , hw_mbox_opcode           , 8         )    \
++    ENTRY(    8  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_DS_PHY_CPU           , hw_mbox_opcode           , 8         )    \
++    ENTRY(    9  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_opcode           , 8         )    \
++    ENTRY(   10  , HW_MBOX_MASTER_APP_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_opcode           , 8         )
++
++/* static channel Table Expanders: */
++
++/*! \def HW_MBOX_STATIC_CHANNEL_TABLE_AS_COUNT( _cid, _commander, _subject, _mboxType, _sramSize )
++    \brief use this as argument to HW_MBOX_STATIC_CHANNEL_TABLE to expand table as entry count. */
++#define HW_MBOX_STATIC_CHANNEL_TABLE_AS_COUNT( _cid, _commander, _subject, _mboxType, _sramSize )    1+
++
++/*! \def HW_MBOX_STATIC_CHANNEL_TABLE_AS_DB(_cid, _commander, _subject, _mboxType, _sramSize)
++    \brief use this as argument to HW_MBOX_STATIC_CHANNEL_TABLE to expand table as DB.
++    \note intializes an array of hw_mbox_channelConfig_t.
++    \attention only create inside c file.
++*/
++#define HW_MBOX_STATIC_CHANNEL_TABLE_AS_DB(_cid, _commander, _subject, _mboxType, _sramSize) \
++{ .cid = _cid, .mboxType = _mboxType, .commander = _commander, .subject = _subject, .memBuff.start = 0 /* To be updated when SRAM is allocated */, .memBuff.size = _sramSize },
++
++/* static channel Table Expander Wrappers: */
++
++/*! \def HW_MBOX_STATIC_CHANNEL_TABLE_DB( _arrayName )
++    \brief Creates a hw_mbox_channelConfig_t array with HW MBOX static channels Data.
++    \note creates and initializes a static hw_mbox_channelConfig_t array with name <_arrayName>.
++    \attention only use inside c file.
++*/
++#define HW_MBOX_STATIC_CHANNEL_TABLE_DB( _arrayName ) \
++    static const hw_mbox_channelConfig_t _arrayName[] =                    \
++    {                                                                      \
++        HW_MBOX_STATIC_CHANNEL_TABLE(HW_MBOX_STATIC_CHANNEL_TABLE_AS_DB)   \
++    }
++
++/*! \def HW_MBOX_STATIC_CHANNEL_COUNT
++    \brief wrapper for HW_MBOX_STATIC_CHANNEL_TABLE_AS_COUNT.
++    \note 1+ 1+ ... [so we need] 0 for syntax.
++*/
++#define HW_MBOX_STATIC_CHANNEL_COUNT    (HW_MBOX_STATIC_CHANNEL_TABLE(HW_MBOX_STATIC_CHANNEL_TABLE_AS_COUNT) 0) /* 1+ ... 1+ [need] 0 for syntax */
++
++/* Basic Sanity Check for static channel Table */
++#if ((HW_MBOX_STATIC_CHANNEL_COUNT) > HW_MBOX_CHANNEL_COUNT)
++#   error "HW_MBOX STATIC CHANNELS: entry count in the table exceeds the total Channel Count!"
++#endif
++
++#endif /* ! _HW_MBOX_DEFS_H_ */
+--- a/include/linux/netip_subsystem.h
++++ b/include/linux/netip_subsystem.h
+@@ -1,3 +1,37 @@
++/*
++ *  include/linux/netip_subsystem.h
++ *
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ *
++ */
++
++#ifndef LINUX_NETIP_SUBSYSTEM_H
++#define LINUX_NETIP_SUBSYSTEM_H
++
++#include <linux/interrupt.h>
+ #define NET_SUBSYTEM_DEV_ID 0x2BE9
+ #define NETIP_BRIDGE_IIR_OFFSET 0x2020
+ #define NETIP_BRIDGE_IER_OFFSET 0x2024
+@@ -34,17 +68,10 @@ typedef struct netss_subdevice_mmio {
+    unsigned long size;
+ }netss_subdevice_mmio_t;
+ 
+-struct net_subsystem_drv_data {
+-   uint32_t irq_num;          /* The irq number used for Net SubSystem driver */
+-   bool netss_driver_initialized;
+-   void __iomem *bridge_reg_base; /* Mapped io bridge register base address mmio region2 of Net-IP  */
+-   netss_subdevice_mmio_t subdev_mmios[NETSS_SUBDEVICE_MAX];
+-   netss_subdev_irq_info_t irqs[NETSS_SUBDEVICE_MAX];
+-   struct pci_dev *dev;
+-    
+-}__attribute__((aligned(4)));
+ 
+ void netss_subdev_register_irq(netss_subdevices_t subdevice, netss_subdev_irq_info_t *irq_info);
+ bool netss_driver_ready(void);
+ int netss_get_subdevice_mmio_info(netss_subdevices_t subdevice, netss_subdevice_mmio_t *mmio);
+ 
++#endif
++

@@ -1,0 +1,69 @@
+#!/bin/sh
+
+EMMC_NVRAM_DEVICE="/dev/mmcblk0p15"
+
+uimage_start()
+{
+	if [ -e "/etc/uimage" ]; then
+		# (re)initialize /nvram/etc/passwd unless it already exists
+		# and passes minimal sanity testing.  At least the root, ugw & ftp
+		# entries must exist.
+		if [ -s "/nvram/etc/passwd" ] \
+		   && egrep '^root:' /nvram/etc/passwd > /dev/null 2>&1 \
+		   && egrep '^ugw:' /nvram/etc/passwd > /dev/null 2>&1 \
+		   && egrep '^ftp:' /nvram/etc/passwd > /dev/null 2>&1
+		then
+			echo Using existing /nvram/etc/passwd
+		else
+			echo Initializing /nvram/etc/passwd from /etc/passwd.orig
+			mkdir -p -m 755 /nvram/etc
+			cp -f /etc/passwd.orig /nvram/etc/passwd
+			chmod 644 /nvram/etc/passwd
+		fi
+		# (re)initialize /nvram/etc/group unless it already exists
+		# and passes minimal sanity testing.  At least the root, ftp & nogroup
+		# entries must exist.
+		if [ -s "/nvram/etc/group" ] \
+		   && egrep '^root:' /nvram/etc/group > /dev/null 2>&1 \
+		   && egrep '^nogroup:' /nvram/etc/group > /dev/null 2>&1 \
+		   && egrep '^ftp:' /nvram/etc/group > /dev/null 2>&1
+		then
+			echo Using existing /nvram/etc/group
+		else
+			echo Initializing /nvram/etc/group from /etc/group.orig
+			mkdir -p -m 755 /nvram/etc
+			cp -f /etc/group.orig /nvram/etc/group
+			chmod 644 /nvram/etc/group
+		fi
+	fi
+}
+
+mount_nvram()
+{
+	local target
+
+	fsck.ext4 -p $EMMC_NVRAM_DEVICE
+	case $? in
+		0|1)
+			mount -t ext4 $EMMC_NVRAM_DEVICE "/nvram" -o data=journal -o barrier=1
+			;;
+		2)
+			echo "System should be rebooted"
+			reboot
+			;;
+		*)
+			echo "Partition is not proper"
+			mkfs.ext4 -F $EMMC_NVRAM_DEVICE
+			mount -t ext4 $EMMC_NVRAM_DEVICE "/nvram" -o data=journal -o barrier=1
+	esac
+
+	if [ $? != 0 ]; then
+		echo "nvram mount failed !!"
+		return 1
+	fi
+	echo "$EMMC_NVRAM_DEVICE mounted as nvram"
+	uimage_start
+	return 0
+}
+
+boot_hook_add preinit_essential mount_nvram

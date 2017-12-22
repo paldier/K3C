@@ -1,0 +1,112 @@
+# HG changeset patch
+# Parent b1cb340359db66dc27d01cb85126dfcaa564ee64
+
+diff --git a/drivers/mtd/nand/xway_nand.c b/drivers/mtd/nand/xway_nand.c
+--- a/drivers/mtd/nand/xway_nand.c
++++ b/drivers/mtd/nand/xway_nand.c
+@@ -12,7 +12,8 @@
+ #include <linux/mtd/nand.h>
+ #include <linux/of_gpio.h>
+ #include <linux/of_platform.h>
+-
++#include <linux/gpio.h>
++#include <linux/delay.h>
+ #include <lantiq_soc.h>
+ 
+ /* nand registers */
+@@ -73,6 +74,12 @@
+ #define NAND_ALE_CLEAR		ltq_ebu_w32(ltq_ebu_r32(EBU_NAND_CON) & \
+ 							~(1 << 18), EBU_NAND_CON);
+ 
++#ifndef CONFIG_EVA
++#define NANDPHYSADDR(x)    CPHYSADDR(x)
++#else
++#define NANDPHYSADDR(x) RPHYSADDR(x)
++#endif /* CONFIG_EVA */
++
+ static u32 xway_latchcmd;
+ 
+ static void xway_reset_chip(struct nand_chip *chip)
+@@ -89,12 +96,12 @@ static void xway_reset_chip(struct nand_
+ 
+ 	spin_lock_irqsave(&ebu_lock, flags);
+ 	writeb(NAND_WRITE_CMD_RESET, (void __iomem *) nandaddr);
++	spin_unlock_irqrestore(&ebu_lock, flags);
+ 	do {
+ 		if ((ltq_ebu_r32(EBU_NAND_WAIT) & NAND_WAIT_WR_C) == 0)
+ 			break;
+ 		cond_resched();
+ 	} while (!time_after_eq(jiffies, timeout));
+-	spin_unlock_irqrestore(&ebu_lock, flags);
+ }
+ 
+ static void xway_select_chip(struct mtd_info *mtd, int chip)
+@@ -159,7 +166,7 @@ static unsigned char xway_read_byte(stru
+ 	spin_lock_irqsave(&ebu_lock, flags);
+ 	ret = ltq_r8((void __iomem *)(nandaddr | NAND_READ_DATA));
+ 	while ((ltq_ebu_r32(EBU_NAND_WAIT) & NAND_WAIT_WR_C) == 0)
+-		;
++	;
+ 	spin_unlock_irqrestore(&ebu_lock, flags);
+ 
+ 	return ret;
+@@ -206,18 +213,22 @@ static int xway_nand_probe(struct platfo
+ 	u32 cs_flag = 0;
+ 
+ 	/* load our CS from the DT. Either we find a valid 1 or default to 0 */
+-	if (cs && (*cs == 1))
++	if (cs && (*cs == 1)) {
+ 		cs_flag = NAND_CON_IN_CS1 | NAND_CON_OUT_CS1;
++	}
+ 
+ 	this->ecc.mode = NAND_ECC_SOFT;
+ 
+ 	/* setup the EBU to run in NAND mode on our base addr for different CS */
+ 	if (cs && (*cs  == 1)) {
+ 		if (of_machine_is_compatible("lantiq,vr9")) {
+-			ltq_ebu_w32(CPHYSADDR(nandaddr)
++			ltq_ebu_w32(NANDPHYSADDR(nandaddr)
+ 				| ADDSEL1_MASK(3) | ADDSEL1_REGEN, EBU_ADDSEL1);
++		} else if (of_machine_is_compatible("lantiq,grx500")) {
++			ltq_ebu_w32(NANDPHYSADDR(nandaddr)
++                | ADDSEL1_MASK(5) | ADDSEL1_REGEN, EBU_ADDSEL1);
+ 		} else {
+-			ltq_ebu_w32(CPHYSADDR(nandaddr)
++			ltq_ebu_w32(NANDPHYSADDR(nandaddr)
+ 				| ADDSEL1_MASK(2) | ADDSEL1_REGEN, EBU_ADDSEL1);
+ 		}
+ 
+@@ -227,9 +238,9 @@ static int xway_nand_probe(struct platfo
+ 
+ 		ltq_ebu_w32(NAND_CON_NANDM | NAND_CON_CSMUX | NAND_CON_CS_P
+ 			| NAND_CON_SE_P | NAND_CON_WP_P | NAND_CON_PRE_P
+-			| cs_flag, EBU_NAND_CON);
++			| cs_flag, EBU_NAND_CON);	
+ 	} else if (cs && (*cs == 0)) {
+-		ltq_ebu_w32(CPHYSADDR(nandaddr)
++		ltq_ebu_w32(NANDPHYSADDR(nandaddr)
+ 			|  ADDSEL1_MASK(1) | ADDSEL0_REGEN, EBU_ADDSEL0);
+ 
+ 		ltq_ebu_w32(BUSCON0_SETUP | BUSCON0_ALEC | BUSCON0_BCGEN_RES
+@@ -280,13 +291,19 @@ static int __init xway_register_nand(voi
+ 	struct platform_device *pdev;
+ 
+ 	node = of_find_compatible_node(NULL, NULL, "lantiq,nand-xway");
+-	if (!node)
++	if (!node) {
++		pr_err("Cannot find compatible string\n");
+ 		return -ENOENT;
++	}
+ 	pdev = of_find_device_by_node(node);
+-	if (!pdev)
++	if (!pdev) {
++		pr_err("Cannot find device in tree\n");
+ 		return -EINVAL;
++	}
+ 	pdev->dev.platform_data = &xway_nand_data;
+ 	of_node_put(node);
++
++	pr_err("Register xway nand done!\n");
+ 	return 0;
+ }
+ 

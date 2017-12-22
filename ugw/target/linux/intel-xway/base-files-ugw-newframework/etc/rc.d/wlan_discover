@@ -1,0 +1,210 @@
+#!/bin/sh
+
+# This script configures the mapping of physical WLAN interface to WLAN vendor in rc.conf.
+# Assumption: Only PCI interfaces need to be configured, because AHB is always Lantiq, 
+#             and will be set at compile time if it exists.
+
+if [ ! "$ENVLOADED" ]; then
+	if [ -r /etc/rc.conf ]; then
+		 . /etc/rc.conf 2> /dev/null
+		ENVLOADED="1"
+	fi
+fi
+
+if [ ! "$CONFIGLOADED" ]; then
+	if [ -r /etc/rc.d/config.sh ]; then
+		. /etc/rc.d/config.sh 2>/dev/null
+		CONFIGLOADED="1"
+	fi
+fi
+
+ATH_CODE="168c"
+LTQ_CODE="1a30"
+LTQ_CODE_WAVE500="1bef:0800"
+MDTK_CODE_RT5592="1814"
+MDTK_CODE_MT7603="14c3"
+
+
+PCI_FILENAME="/tmp/lspci.txt"
+
+ATH_HWNAME="9980"
+ATH_VENDOR="QCA"
+ATH_PREFIX="ath"
+
+LTQ_HWNAME="wave"
+LTQ_VENDOR="LANTIQ"
+LTQ_PREFIX="wave"
+
+MDTK_HWNAME_RT5592="5592"
+MDTK_HWNAME_MT7603="7603"
+MDTK_VENDOR="Ralink"
+MDTK_PREFIX="ra"
+
+QTN_HWNAME="QSR1000"
+QTN_VENDOR="Quantenna"
+QTN_PREFIX="qtn"
+
+PCI_DEVICES_COUNT=0
+AHB_WLAN_COUNT=0
+
+lspci  > $PCI_FILENAME
+PCI_DEVICES_COUNT=`cat $PCI_FILENAME | wc -l`
+PCI_ATH_COUNT=`grep -c $ATH_CODE $PCI_FILENAME`
+PCI_LTQ_COUNT_WAVE300=`grep -c $LTQ_CODE $PCI_FILENAME`
+PCI_LTQ_COUNT_WAVE500=`grep -c $LTQ_CODE_WAVE500 $PCI_FILENAME`
+PCI_LTQ_COUNT=`expr $PCI_LTQ_COUNT_WAVE300 + $PCI_LTQ_COUNT_WAVE500`
+PCI_MDTK_COUNT_RT5592=`grep -c $MDTK_CODE_RT5592 $PCI_FILENAME`
+PCI_MDTK_COUNT_MT7603=`grep -c $MDTK_CODE_MT7603 $PCI_FILENAME`
+PCI_MDTK_COUNT=`expr $PCI_MDTK_COUNT_RT5592 + $PCI_MDTK_COUNT_MT7603`
+PCI_WLAN_COUNT=`expr $PCI_ATH_COUNT + $PCI_LTQ_COUNT + $PCI_MDTK_COUNT`
+echo "wlan_discover: PCI_DEVICES COUNT: $PCI_DEVICES_COUNT "
+#echo "wlan_discover: PCI_ATH COUNT: $PCI_ATH_COUNT "
+#echo "wlan_discover: PCI_LTQ COUNT: $PCI_LTQ_COUNT "
+#echo "wlan_discover: PCI_MDTK COUNT: $PCI_MDTK_COUNT "
+
+if [ -e /sys/bus/platform/devices ]
+then
+	# Internal WLAN is identified as mtlk on AHB bus. This is "mtlk" before UGW-6.1, and "mtlk.0" in UGW-6.1
+   AHB_WLAN_COUNT=`ls /sys/bus/platform/devices | grep mtlk -c`
+
+	# If AHB wlan is supported on the bus, make sure it is supported in the driver too
+	if [ $AHB_WLAN_COUNT -gt 0 ]
+	then
+		# Wave driver location differs between 6.1.1 and 6.5
+		# Wave driver location in 6.5:
+		WAVE_DRIVER_PATH=/opt/lantiq/lib/modules/`uname -r`/net/mtlk.ko
+		# Wave driver location in 6.1.1:
+		[ -e /lib/modules/3.10.12/net/mtlk.ko ] && WAVE_DRIVER_PATH=/lib/modules/`uname -r`/net/mtlk.ko
+		AHB_WLAN_COUNT=`strings $WAVE_DRIVER_PATH | grep -c Ahb`
+		if [ $AHB_WLAN_COUNT -gt 0 ]; then AHB_WLAN_COUNT=1; fi
+	fi
+
+	# If more than 1 PCI card detected, don't use internal WLAN
+	if [ $PCI_WLAN_COUNT -gt 1 ] 
+	then 
+		AHB_WLAN_COUNT=0
+	fi
+
+	echo "wlan_discover: AHB_WLAN_COUNT: $AHB_WLAN_COUNT "
+fi
+
+# TODO: TOTAL_WLAN_COUNT should also take into account Quantenna RGMII
+# otherwise script may terminate prematurely if Quantenna exists and internal WLAN isn't used.
+# (probably not, because PCI WLAN count will be 0 in this configuration, but for correctness this should be fixed)
+TOTAL_WLAN_COUNT=`expr $PCI_WLAN_COUNT + $AHB_WLAN_COUNT`
+echo "wlan_discover: TOTAL WLAN COUNT: $TOTAL_WLAN_COUNT "
+
+# Save information to a file to be used by Wave init script
+echo "PCI_WLAN_COUNT=$PCI_WLAN_COUNT" > /tmp/wlan_discover.txt
+echo "PCI_LTQ_COUNT=$PCI_LTQ_COUNT" >> /tmp/wlan_discover.txt
+echo "AHB_WLAN_COUNT=$AHB_WLAN_COUNT" >> /tmp/wlan_discover.txt
+
+# Number of interfaces defined in rc.conf
+PHY_COUNT=`/usr/sbin/status_oper -f /flash/rc.conf GET "wlan_phy" "wlan_phy_Count" `
+echo "wlan_discover: VALID PHY_CNT: $PHY_COUNT "
+
+# TODO: Don't loop only if no WLAN. Loop from end of interfaces detected (TOTAL_WLAN_COUNT) to end of PHY_COUNT
+# and reset all the unused fields. Actually this is already done at the end of this script, so this can probably be removed, 
+# as long as we don't exit in this "if" statement.
+if [ "$TOTAL_WLAN_COUNT" = "0" ] 
+then
+	apIndex=0
+	while [ $apIndex -lt $PHY_COUNT ]
+	do
+		wlan_vendor_hwName=wlss_$apIndex'_hwName'
+		wlan_vendor_name=wlss_$apIndex'_vendor'
+		wlan_vendor_prefix=wlss_$apIndex'_prefixScript'
+		`/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "UNKNOWN" `
+		`/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "UNKNOWN" `
+		`/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "UNKNOWN" `
+      apIndex=`expr $apIndex + 1`
+	done
+   echo "wlan_discover: There are no wlan interfaces.... exit  "
+   exit 1
+fi
+
+
+apIndex=0
+# If AHB is enabled set first entry as internal WLAN
+if [ $AHB_WLAN_COUNT -gt 0 ]
+then
+   wlan_vendor_hwName=wlss_0_hwName
+   wlan_vendor_name=wlss_0_vendor
+   wlan_vendor_prefix=wlss_0_prefixScript
+   `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "" `
+   `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "$LTQ_VENDOR" `
+   `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "$LTQ_PREFIX" `
+    apIndex=`expr $apIndex + 1`
+fi
+
+pciIndex=0
+while [ $pciIndex -lt $PCI_DEVICES_COUNT ] && [ $apIndex -lt $PHY_COUNT ]
+do
+   VENDOR_STRING=""
+   lindex=`expr $pciIndex + 1`
+   eval lineindex=$lindex'p'
+   eval VENDOR_STRING=`sed -n $lineindex $PCI_FILENAME | cut -b 21-24`
+   eval VENDOR_STRING_WAVE500=`sed -n $lineindex $PCI_FILENAME | cut -b 21-29`
+   #echo " pciIndex=$pciIndex apIndex=$apIndex  VENDOR STRING: $VENDOR_STRING "
+
+   wlan_vendor_hwName=wlss_$apIndex'_hwName'
+   wlan_vendor_name=wlss_$apIndex'_vendor'
+   wlan_vendor_prefix=wlss_$apIndex'_prefixScript'
+   if [ "$VENDOR_STRING" = $ATH_CODE ]; then
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "$ATH_HWNAME" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "$ATH_VENDOR" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "$ATH_PREFIX" `
+      apIndex=`expr $apIndex + 1`
+   elif [ "$VENDOR_STRING" = $MDTK_CODE_RT5592 ]; then
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "$MDTK_HWNAME_RT5592" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "$MDTK_VENDOR" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "$MDTK_PREFIX" `
+      apIndex=`expr $apIndex + 1`
+   elif [ "$VENDOR_STRING" = $MDTK_CODE_MT7603 ]; then
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "$MDTK_HWNAME_MT7603" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "$MDTK_VENDOR" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "$MDTK_PREFIX" `
+      apIndex=`expr $apIndex + 1`
+   elif [ "$VENDOR_STRING" = $LTQ_CODE ]; then
+		echo "wlan_discover: WAVE300 detected on PCI"
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "$LTQ_HWNAME" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "$LTQ_VENDOR" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "$LTQ_PREFIX" `
+      apIndex=`expr $apIndex + 1`
+   elif [ "$VENDOR_STRING_WAVE500" = $LTQ_CODE_WAVE500 ]; then
+		echo "wlan_discover: WAVE500 detected on PCI"
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "$LTQ_HWNAME" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "$LTQ_VENDOR" `
+      `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "$LTQ_PREFIX" `
+      apIndex=`expr $apIndex + 1`
+   fi
+   pciIndex=`expr $pciIndex + 1`
+done
+
+k=`expr $PHY_COUNT - 1`
+echo "wlan_discover: highest discovered apIndex is $apIndex"
+while [ $apIndex -lt $PHY_COUNT ]
+do
+   wlan_vendor_hwName=wlss_$apIndex'_hwName'
+   wlan_vendor_name=wlss_$apIndex'_vendor'
+   wlan_vendor_prefix=wlss_$apIndex'_prefixScript'
+# For Quantenna 11ac (RGMII) integraton
+   if [ "$CONFIG_PACKAGE_QUANTENNA_TYPE_SINGLE_RGMII" = "1" ] || [ "$CONFIG_PACKAGE_QUANTENNA_TYPE_TWO_RGMII" = "1" ]; then
+        if [ "$k" = "$apIndex" ]; then
+                `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "$QTN_HWNAME" `
+                `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "$QTN_VENDOR" `
+                `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "$QTN_PREFIX" `
+        else
+                `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "UNKNOWN" `
+                `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "UNKNOWN" `
+                `/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "UNKNOWN" `
+        fi
+   else
+   	`/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_hwName" "UNKNOWN" `
+   	`/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_name" "UNKNOWN" `
+   	`/usr/sbin/status_oper -u -f /flash/rc.conf SET "wlan_ss" "$wlan_vendor_prefix" "UNKNOWN" `
+   fi
+   apIndex=`expr $apIndex + 1`
+done
+
+

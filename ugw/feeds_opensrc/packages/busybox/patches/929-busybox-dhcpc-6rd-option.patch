@@ -1,0 +1,183 @@
+diff -Naur busybox-1.17.1.orig/networking/udhcp/common.c busybox-1.17.1/networking/udhcp/common.c
+--- busybox-1.17.1.orig/networking/udhcp/common.c	2011-05-02 19:29:00.918809291 +0530
++++ busybox-1.17.1/networking/udhcp/common.c	2011-05-02 19:23:26.804809508 +0530
+@@ -62,6 +62,10 @@
+ 	{ OPTION_SIP_SERVERS                      , 0x78 }, /* DHCP_SIP_SERVERS   */
+ #endif
+ 	{ OPTION_STATIC_ROUTES                    , 0x79 }, /* DHCP_STATIC_ROUTES */
++#if ENABLE_FEATURE_UDHCP_RFC5969
++	{ OPTION_6RD                              , 0xd4 }, /* DHCP_6RD           */
++	{ OPTION_6RD                              , 0x96 }, /* DHCP_COMCAST_6RD   */
++#endif
+ 	{ OPTION_STRING                           , 0xfc }, /* DHCP_WPAD          */
+ 
+ 	/* Options below have no match in dhcp_option_strings[],
+@@ -126,6 +130,10 @@
+ // doesn't work in udhcpd.conf since OPTION_STATIC_ROUTES
+ // is not handled yet by "string->option" conversion code:
+ 	"staticroutes" "\0"/* DHCP_STATIC_ROUTES  */
++#if ENABLE_FEATURE_UDHCP_RFC5969
++	"sixrd" "\0"         /* DHCP_6RD            */
++	"comcast6rd" "\0"  /* DHCP_COMCAST_6RD    */
++#endif
+ 	"wpad" "\0"        /* DHCP_WPAD           */
+ #if ENABLE_FEATURE_DHCP_USER_CLASS
+ 	"requestip" "\0"	/* DHCP_REQUEST_IP	*/
+@@ -160,6 +168,9 @@
+ 	[OPTION_S32] =     4,
+ 	/* Just like OPTION_STRING, we use minimum length here */
+ 	[OPTION_STATIC_ROUTES] = 5,
++#if ENABLE_FEATURE_UDHCP_RFC5969
++	[OPTION_6RD] =    22,
++#endif
+ };
+ 
+ 
+diff -Naur busybox-1.17.1.orig/networking/udhcp/common.h busybox-1.17.1/networking/udhcp/common.h
+--- busybox-1.17.1.orig/networking/udhcp/common.h	2011-05-02 19:29:07.158684269 +0530
++++ busybox-1.17.1/networking/udhcp/common.h	2011-05-02 19:23:44.421684164 +0530
+@@ -100,6 +100,9 @@
+ 	OPTION_DNS_STRING,  /* RFC1035 compressed domain name list */
+ 	OPTION_SIP_SERVERS,
+ #endif
++#if ENABLE_FEATURE_UDHCP_RFC5969
++	OPTION_6RD,
++#endif
+ 
+ 	OPTION_TYPE_MASK = 0x0f,
+ 	/* Client requests this option by default */
+@@ -155,6 +158,8 @@
+ //#define DHCP_DOMAIN_SEARCH    0x77 /* RFC 3397. set of ASCIZ string, DNS-style compressed */
+ //#define DHCP_SIP_SERVERS      0x78 /* RFC 3361. flag byte, then: 0: domain names, 1: IP addrs */
+ //#define DHCP_STATIC_ROUTES    0x79 /* RFC 3442. (mask,ip,router) tuples */
++//#define DHCP_6RD              0xd4 /* RFC 5969 6RD option */
++//#define DHCP_COMCAST_6RD      0x96 /* Comcast ISP RFC 5969 compatible 6RD option */
+ //#define DHCP_WPAD             0xfc /* MSIE's Web Proxy Autodiscovery Protocol */
+ #define DHCP_END                0xff
+ 
+diff -Naur busybox-1.17.1.orig/networking/udhcp/Config.src busybox-1.17.1/networking/udhcp/Config.src
+--- busybox-1.17.1.orig/networking/udhcp/Config.src	2011-05-02 19:28:45.142809310 +0530
++++ busybox-1.17.1/networking/udhcp/Config.src	2011-05-02 19:23:12.981684471 +0530
+@@ -119,6 +119,13 @@
+ 	  search lists via option 119, specified in RFC 3397,
+ 	  and SIP servers option 120, specified in RFC 3361.
+ 
++config FEATURE_UDHCP_RFC5969
++	bool "Support for RFC5969 IPv6 Rapid Deployment (6RD)"
++	default y
++	depends on FEATURE_IPV6
++	help
++	  None.
++
+ config UDHCPC_DEFAULT_SCRIPT
+ 	string "Absolute path to config script"
+ 	default "/usr/share/udhcpc/default.script"
+diff -Naur busybox-1.17.1.orig/networking/udhcp/dhcpc.c busybox-1.17.1/networking/udhcp/dhcpc.c
+--- busybox-1.17.1.orig/networking/udhcp/dhcpc.c	2011-05-02 19:56:58.719684145 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpc.c	2011-05-02 19:56:55.970683895 +0530
+@@ -45,6 +45,9 @@
+ 	[OPTION_IP              ] = sizeof("255.255.255.255 "),
+ 	[OPTION_IP_PAIR         ] = sizeof("255.255.255.255 ") * 2,
+ 	[OPTION_STATIC_ROUTES   ] = sizeof("255.255.255.255/32 255.255.255.255 "),
++#if ENABLE_FEATURE_UDHCP_RFC5969
++	[OPTION_6RD             ] = sizeof("32 128 FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF:FFFF 255.255.255.255 "),
++#endif
+ 	[OPTION_STRING          ] = 1,
+ #if ENABLE_FEATURE_UDHCP_RFC3397
+ 	[OPTION_DNS_STRING      ] = 1, /* unused */
+@@ -68,6 +71,24 @@
+ 	return sprintf(dest, "%s%u.%u.%u.%u", pre, ip[0], ip[1], ip[2], ip[3]);
+ }
+ 
++#if ENABLE_FEATURE_UDHCP_RFC5969
++static int sprint_nip6(char *dest, const char *pre, const uint8_t *ip)
++{
++	int len = 0;
++	int off;
++	uint16_t word;
++
++	len += sprintf(dest, "%s", pre);
++	for (off = 0; off < 16; off += 2)
++	{
++		move_from_unaligned16(word, &ip[off]);
++		len += sprintf(dest+len, "%s%04X", off ? ":" : "", htons(word));
++	}
++
++	return len;
++}
++#endif
++
+ /* really simple implementation, just count the bits */
+ static int mton(uint32_t mask)
+ {
+@@ -215,6 +236,70 @@
+ 			}
+ 			return ret;
+ #endif
++#if ENABLE_FEATURE_UDHCP_RFC5969
++		case OPTION_6RD:
++			/* Option binary format:
++			*  0                   1                   2                   3
++			*  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++			*  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++			*  |  OPTION_6RD   | option-length |  IPv4MaskLen  |  6rdPrefixLen |
++			*  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++			*  |                                                               |
++			*  |                           6rdPrefix                           |
++			*  |                          (16 octets)                          |
++			*  |                                                               |
++			*  |                                                               |
++			*  |                                                               |
++			*  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++			*  |                     6rdBRIPv4Address(es)                      |
++			*  .                                                               .
++			*  .                                                               .
++			*  .                                                               .
++			*  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++			*
++			*  We convert it to a string "IPv4MaskLen 6rdPrefixLen 6rdPrefix 6rdBRIPv4Address"
++			*/
++ 
++			/* Sanity check: ensure that our length is at least 22 bytes, that
++			* IPv4MaskLen is <= 32, 6rdPrefixLen <= 128 and that the sum of
++			* (32 - IPv4MaskLen) + 6rdPrefixLen is less than or equal to 128.
++			* If any of these requirements is not fulfilled, return with empty
++			* value.
++			*/
++			if ((len >= 22) && (*option <= 32) && (*(option+1) <= 128) && (((32 - *option) + *(option+1)) <= 128))
++			{
++				/* IPv4MaskLen */
++				dest += sprintf(dest, "%u ", *option++);
++				len--;
++				
++				/* 6rdPrefixLen */
++				dest += sprintf(dest, "%u ", *option++);
++				len--;
++
++				/* 6rdPrefix */
++				dest += sprint_nip6(dest, "", option);
++				option += 16;
++				len -= 16;
++
++				/* 6rdBRIPv4Addresses */
++				while (len >= 4)
++				{	
++					dest += sprint_nip(dest, " ", option);
++					option += 4;
++					len -= 4;
++					
++					/* the code to determine the option size fails to work with
++ 					* lengths that are not a multiple of the minimum length,
++ 					* adding all advertised 6rdBRIPv4Addresses here would
++ 					* overflow the destination buffer, therefore skip the rest
++ 					* for now
++ 					*/
++					break;
++				}
++				
++			}
++			return ret;
++#endif
+ 		} /* switch */
+ 		option += optlen;
+ 		len -= optlen;

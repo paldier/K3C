@@ -1,0 +1,361 @@
+From 98f6c462eb5319a4dcb3830f902c48141f38cd12 Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Mon, 1 Apr 2013 20:10:30 -0700
+Subject: [PATCH 082/105] MIPS: Cache flush functions are reworked.
+
+This patch is a preparation for EVA support in kernel.
+
+However, it also fixes a bug then index cacheop was not ran
+on multiple CPUs with unsafe index cacheops (flush_cache_vmap,
+flush_icache_range, flush_cache_range, __flush_cache_all).
+
+Additionally, it optimizes a usage of index and address cacheops for
+address range flushes depending from address range size.
+
+Because of that reasons it is a separate patch from EVA support.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+(cherry picked from commit 6b05dd71da1136fbad0ce642790c4c99343f05e7)
+---
+ arch/mips/include/asm/cacheflush.h |    8 +-
+ arch/mips/mm/c-r4k.c               |  174 ++++++++++++++++++++++++++++++++----
+ arch/mips/mm/c-tx39.c              |    4 +-
+ arch/mips/mm/cache.c               |    4 +-
+ 4 files changed, 164 insertions(+), 26 deletions(-)
+
+diff --git a/arch/mips/include/asm/cacheflush.h b/arch/mips/include/asm/cacheflush.h
+index 0cf73ff..82cd13e 100644
+--- a/arch/mips/include/asm/cacheflush.h
++++ b/arch/mips/include/asm/cacheflush.h
+@@ -66,20 +66,20 @@ static inline void flush_icache_page(struct vm_area_struct *vma,
+ extern void (*flush_icache_range)(unsigned long start, unsigned long end);
+ extern void (*local_flush_icache_range)(unsigned long start, unsigned long end);
+ 
+-extern void (*__flush_cache_vmap)(void);
++extern void (*__flush_cache_vmap)(unsigned long start, unsigned long end);
+ 
+ static inline void flush_cache_vmap(unsigned long start, unsigned long end)
+ {
+ 	if (cpu_has_dc_aliases)
+-		__flush_cache_vmap();
++		__flush_cache_vmap(start,end);
+ }
+ 
+-extern void (*__flush_cache_vunmap)(void);
++extern void (*__flush_cache_vunmap)(unsigned long start, unsigned long end);
+ 
+ static inline void flush_cache_vunmap(unsigned long start, unsigned long end)
+ {
+ 	if (cpu_has_dc_aliases)
+-		__flush_cache_vunmap();
++		__flush_cache_vunmap(start,end);
+ }
+ 
+ extern void copy_to_user_page(struct vm_area_struct *vma,
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index a383b82..082b97b 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -44,6 +44,8 @@
+  *  o collapses to normal function call on systems with a single shared
+  *    primary cache.
+  *  o doesn't disable interrupts on the local CPU
++ *
++ *  Note: this function is used now for address cacheops only
+  */
+ static inline void r4k_on_each_cpu(void (*func) (void *info), void *info)
+ {
+@@ -56,13 +58,67 @@ static inline void r4k_on_each_cpu(void (*func) (void *info), void *info)
+ 	preempt_enable();
+ }
+ 
+-#if defined(CONFIG_MIPS_CMP)
++#if defined(CONFIG_MIPS_CMP) && defined(CONFIG_SMP)
+ #define cpu_has_safe_index_cacheops 0
+ #else
+ #define cpu_has_safe_index_cacheops 1
+ #endif
+ 
+ /*
++ * This variant of smp_call_function is used for index cacheops only.
++ */
++static inline void r4k_indexop_on_each_cpu(void (*func) (void *info), void *info)
++{
++	preempt_disable();
++
++#ifdef CONFIG_SMP
++	if (!cpu_has_safe_index_cacheops) {
++
++		if (smp_num_siblings > 1) {
++			cpumask_t tmp_mask = INIT_CPUMASK;
++			int cpu, this_cpu, n = 0;
++
++			/* If processor hasn't safe index cachops (likely)
++			   then run cache flush on other CPUs.
++			   But I assume that siblings have common L1 cache, so -
++			   - run cache flush only once per sibling group. LY22 */
++
++			this_cpu = smp_processor_id();
++			for_each_online_cpu(cpu) {
++
++				if (cpumask_test_cpu(cpu, (&cpu_sibling_map[this_cpu])))
++					continue;
++
++				if (cpumask_intersects(&tmp_mask, (&cpu_sibling_map[cpu])))
++					continue;
++				cpu_set(cpu, tmp_mask);
++				n++;
++			}
++			if (n)
++				smp_call_function_many(&tmp_mask, func, info, 1);
++		} else
++			smp_call_function(func, info, 1);
++	}
++#endif
++	func(info);
++	preempt_enable();
++}
++
++/*  Define a rough size where address cacheops are still more optimal than
++ *  index cacheops on whole cache (in D/I-cache size terms).
++ *  Value "2" reflects an expense of smp_call_function() on top of
++ *  whole cache flush via index cacheops.
++ */
++#ifndef CACHE_CPU_LATENCY
++#ifdef CONFIG_SMP
++#define CACHE_CPU_LATENCY   (2)
++#else
++#define CACHE_CPU_LATENCY   (1)
++#endif
++#endif
++
++
++/*
+  * Must die.
+  */
+ static unsigned long icache_size __read_mostly;
+@@ -366,7 +422,7 @@ static inline void local_r4k___flush_cache_all(void * args)
+ 
+ static void r4k___flush_cache_all(void)
+ {
+-	r4k_on_each_cpu(local_r4k___flush_cache_all, NULL);
++	r4k_indexop_on_each_cpu(local_r4k___flush_cache_all, NULL);
+ }
+ 
+ static inline int has_valid_asid(const struct mm_struct *mm)
+@@ -384,16 +440,61 @@ static inline int has_valid_asid(const struct mm_struct *mm)
+ #endif
+ }
+ 
+-static void r4k__flush_cache_vmap(void)
++
++static inline void local_r4__flush_dcache(void *args)
+ {
+ 	r4k_blast_dcache();
+ }
+ 
+-static void r4k__flush_cache_vunmap(void)
++struct vmap_args {
++	unsigned long start;
++	unsigned long end;
++};
++
++static inline void local_r4__flush_cache_vmap(void *args)
+ {
+-	r4k_blast_dcache();
++	blast_dcache_range(((struct vmap_args *)args)->start,((struct vmap_args *)args)->end);
++}
++
++static void r4k__flush_cache_vmap(unsigned long start, unsigned long end)
++{
++	unsigned long size = end - start;
++
++	if (cpu_has_safe_index_cacheops && size >= dcache_size) {
++		r4k_blast_dcache();
++	} else {
++		if (size >= (dcache_size * CACHE_CPU_LATENCY))
++			r4k_indexop_on_each_cpu(local_r4__flush_dcache, NULL);
++		else {
++			struct vmap_args args;
++
++			args.start = start;
++			args.end = end;
++			r4k_on_each_cpu(local_r4__flush_cache_vmap, (void *)&args);
++		}
++	}
+ }
+ 
++static void r4k__flush_cache_vunmap(unsigned long start, unsigned long end)
++{
++	unsigned long size = end - start;
++
++	if (cpu_has_safe_index_cacheops && size >= dcache_size)
++		r4k_blast_dcache();
++	else {
++		if (size >= (dcache_size * CACHE_CPU_LATENCY))
++			r4k_indexop_on_each_cpu(local_r4__flush_dcache, NULL);
++		else {
++			struct vmap_args args;
++
++			args.start = start;
++			args.end = end;
++			r4k_on_each_cpu(local_r4__flush_cache_vmap, (void *)&args);
++		}
++	}
++}
++
++
+ static inline void local_r4k_flush_cache_range(void * args)
+ {
+ 	struct vm_area_struct *vma = args;
+@@ -417,7 +518,7 @@ static void r4k_flush_cache_range(struct vm_area_struct *vma,
+ 	int exec = vma->vm_flags & VM_EXEC;
+ 
+ 	if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc))
+-		r4k_on_each_cpu(local_r4k_flush_cache_range, vma);
++		r4k_indexop_on_each_cpu(local_r4k_flush_cache_range, vma);
+ #endif
+ }
+ 
+@@ -450,7 +551,7 @@ static void r4k_flush_cache_mm(struct mm_struct *mm)
+ 	if (!cpu_has_dc_aliases)
+ 		return;
+ 
+-	r4k_on_each_cpu(local_r4k_flush_cache_mm, mm);
++	r4k_indexop_on_each_cpu(local_r4k_flush_cache_mm, mm);
+ }
+ 
+ struct flush_cache_page_args {
+@@ -584,11 +685,40 @@ static void r4k_flush_data_cache_page(unsigned long addr)
+ 		r4k_on_each_cpu(local_r4k_flush_data_cache_page, (void *) addr);
+ }
+ 
++
+ struct flush_icache_range_args {
+ 	unsigned long start;
+ 	unsigned long end;
+ };
+ 
++static inline void local_r4k_flush_icache(void *args)
++{
++	if (!cpu_has_ic_fills_f_dc)
++			r4k_blast_dcache();
++
++	wmb();
++
++	r4k_blast_icache();
++}
++
++static inline void local_r4k_flush_icache_range_ipi(void *args)
++{
++	struct flush_icache_range_args *fir_args = args;
++	unsigned long start = fir_args->start;
++	unsigned long end = fir_args->end;
++
++	if (!cpu_has_ic_fills_f_dc) {
++		R4600_HIT_CACHEOP_WAR_IMPL;
++		protected_blast_dcache_range(start, end);
++	}
++
++	wmb();
++
++	protected_blast_icache_range(start, end);
++
++}
++
++/* This function is used only for local CPU only while boot etc */
+ static inline void local_r4k_flush_icache_range(unsigned long start, unsigned long end)
+ {
+ 	if (!cpu_has_ic_fills_f_dc) {
+@@ -612,26 +742,31 @@ static inline void local_r4k_flush_icache_range(unsigned long start, unsigned lo
+ #endif
+ }
+ 
+-static inline void local_r4k_flush_icache_range_ipi(void *args)
+-{
+-	struct flush_icache_range_args *fir_args = args;
+-	unsigned long start = fir_args->start;
+-	unsigned long end = fir_args->end;
+-
+-	local_r4k_flush_icache_range(start, end);
+-}
+-
+ static void r4k_flush_icache_range(unsigned long start, unsigned long end)
+ {
+ 	struct flush_icache_range_args args;
++	unsigned long size = end - start;
+ 
+ 	args.start = start;
+ 	args.end = end;
+ 
+-	r4k_on_each_cpu(local_r4k_flush_icache_range_ipi, &args);
++	if (cpu_has_safe_index_cacheops &&
++	    (((size >= icache_size) && !cpu_has_ic_fills_f_dc) ||
++	     (size >= dcache_size)))
++		local_r4k_flush_icache((void *)&args);
++	else if (((size < (icache_size * CACHE_CPU_LATENCY)) && !cpu_has_ic_fills_f_dc) ||
++		 (size < (dcache_size * CACHE_CPU_LATENCY))) {
++		struct flush_icache_range_args args;
++
++		args.start = start;
++		args.end = end;
++		r4k_on_each_cpu(local_r4k_flush_icache_range_ipi, (void *)&args);
++	} else
++		r4k_indexop_on_each_cpu(local_r4k_flush_icache, NULL);
+ 	instruction_hazard();
+ }
+ 
++
+ #ifdef CONFIG_DMA_NONCOHERENT
+ 
+ static void r4k_dma_cache_wback_inv(unsigned long addr, unsigned long size)
+@@ -791,7 +926,10 @@ static void r4k_flush_kernel_vmap_range(unsigned long vaddr, int size)
+ 	args.vaddr = (unsigned long) vaddr;
+ 	args.size = size;
+ 
+-	r4k_on_each_cpu(local_r4k_flush_kernel_vmap_range, &args);
++	if (cpu_has_safe_index_cacheops && size >= dcache_size)
++		r4k_indexop_on_each_cpu(local_r4k_flush_kernel_vmap_range, &args);
++	else
++		r4k_on_each_cpu(local_r4k_flush_kernel_vmap_range, &args);
+ }
+ 
+ static inline void rm7k_erratum31(void)
+diff --git a/arch/mips/mm/c-tx39.c b/arch/mips/mm/c-tx39.c
+index ba9da27..2257dca 100644
+--- a/arch/mips/mm/c-tx39.c
++++ b/arch/mips/mm/c-tx39.c
+@@ -122,12 +122,12 @@ static inline void tx39_blast_icache(void)
+ 	local_irq_restore(flags);
+ }
+ 
+-static void tx39__flush_cache_vmap(void)
++static void tx39__flush_cache_vmap(unsigned long start, unsigned long end)
+ {
+ 	tx39_blast_dcache();
+ }
+ 
+-static void tx39__flush_cache_vunmap(void)
++static void tx39__flush_cache_vunmap(unsigned long start, unsigned long end)
+ {
+ 	tx39_blast_dcache();
+ }
+diff --git a/arch/mips/mm/cache.c b/arch/mips/mm/cache.c
+index e4b1ae1..25625f2 100644
+--- a/arch/mips/mm/cache.c
++++ b/arch/mips/mm/cache.c
+@@ -33,8 +33,8 @@ void (*flush_cache_page)(struct vm_area_struct *vma, unsigned long page,
+ void (*flush_icache_range)(unsigned long start, unsigned long end);
+ void (*local_flush_icache_range)(unsigned long start, unsigned long end);
+ 
+-void (*__flush_cache_vmap)(void);
+-void (*__flush_cache_vunmap)(void);
++void (*__flush_cache_vmap)(unsigned long start, unsigned long end);
++void (*__flush_cache_vunmap)(unsigned long start, unsigned long end);
+ 
+ void (*__flush_kernel_vmap_range)(unsigned long vaddr, int size);
+ void (*__invalidate_kernel_vmap_range)(unsigned long vaddr, int size);
+-- 
+1.7.1
+

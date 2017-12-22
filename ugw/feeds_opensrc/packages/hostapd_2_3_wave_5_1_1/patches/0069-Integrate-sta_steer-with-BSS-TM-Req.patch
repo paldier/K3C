@@ -1,0 +1,315 @@
+From 8be6093c027957f09439f5b99472c36654640d0a Mon Sep 17 00:00:00 2001
+From: Aaron Komisar <aaronx.komisar@intel.com>
+Date: Tue, 1 Nov 2016 19:13:28 +0200
+Subject: [PATCH] Integrate sta_steer with BSS TM Req
+
+Send BTM request for supporting stations instead of disconnectiong and
+black-listing them. Add support for bss_tm_req in multiple VAPs.
+
+Signed-off-by: Aaron Komisar <aaronx.komisar@intel.com>
+---
+ hostapd/ctrl_iface.c  | 201 +++++++++++++++++++++++++++++++-------------------
+ hostapd/hostapd_cli.c |  35 ++++++---
+ 2 files changed, 149 insertions(+), 87 deletions(-)
+
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -853,11 +853,11 @@ static int hostapd_ctrl_iface_bss_tm_req
+ 	u8 addr[ETH_ALEN];
+ 	const char *pos, *end;
+ 	int disassoc_timer = 0;
+-	struct sta_info *sta;
++	struct sta_info *sta = NULL;
+ 	u8 req_mode = 0, valid_int = 0x01;
+ 	u8 bss_term_dur[12];
+ 	char *url = NULL;
+-	int ret;
++	int i, ret;
+ 	u8 nei_rep[1000];
+ 	u8 *nei_pos = nei_rep;
+ 	u8 mbo[10];
+@@ -868,10 +868,17 @@ static int hostapd_ctrl_iface_bss_tm_req
+ 		return -1;
+ 	}
+ 
+-	sta = ap_get_sta(hapd, addr);
+-	if (sta == NULL) {
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta) {
+ 		wpa_printf(MSG_DEBUG, "Station " MACSTR
+-			   " not found for BSS TM Request message",
++			" not found for BSS TM Request message",
+ 			   MAC2STR(addr));
+ 		return -1;
+ 	}
+@@ -1066,59 +1073,70 @@ static int hostapd_ctrl_iface_bss_tm_req
+ #ifdef CONFIG_MBO
+ 	pos = os_strstr(cmd, "mbo=");
+ 	if (pos) {
+-		unsigned int mbo_reason, reassoc_delay;
+-		int cell_pref;
+-		u8 *mbo_pos = mbo;
+-
+-		ret = sscanf(pos, "mbo=%u:%u:%d", &mbo_reason,
+-			     &reassoc_delay, &cell_pref);
+-		if (ret < 3) {
+-			wpa_printf(MSG_DEBUG,
+-				   "MBO requires three arguments: mbo=<reason>:<reassoc_delay>:<cell_pref>");
+-			return -1;
+-		}
+ 
+-		if (mbo_reason > MBO_TRANSITION_REASON_PREMIUM_AP) {
+-			wpa_printf(MSG_DEBUG,
+-				   "Invalid MBO transition reason code %u",
+-				   mbo_reason);
+-			return -1;
+-		}
++		if (hapd->conf->mbo_enabled && sta->mbo_supported){
+ 
+-		/* Valid values for Cellular preference are: 0, 1, 255 */
+-		/* A value of -1 indicates that Cellular Data Connection Preference Attribute will not be added to MBO IE */
+-		if (cell_pref != -1 && cell_pref != MBO_CELL_PREF_EXCLUDED && cell_pref != MBO_CELL_PREF_NO_USE && cell_pref != MBO_CELL_PREF_USE) {
+-			wpa_printf(MSG_DEBUG,
+-				   "Invalid MBO cellular capability %u",
+-				   cell_pref);
+-			return -1;
+-		}
++			unsigned int mbo_reason, reassoc_delay;
++			int cell_pref;
++			u8 *mbo_pos = mbo;
++
++			ret = sscanf(pos, "mbo=%u:%u:%d", &mbo_reason,
++					 &reassoc_delay, &cell_pref);
++			if (ret < 3) {
++				wpa_printf(MSG_DEBUG,
++					   "BTM request: MBO requires three arguments: mbo=<reason>:<reassoc_delay>:<cell_pref>");
++				return -1;
++			}
+ 
+-		if (reassoc_delay > 65535 ||
+-		    (reassoc_delay &&
+-		     !(req_mode & WNM_BSS_TM_REQ_DISASSOC_IMMINENT))) {
+-			wpa_printf(MSG_DEBUG,
+-				   "MBO: Assoc retry delay is only valid in disassoc imminent mode");
+-			return -1;
+-		}
++			if (mbo_reason > MBO_TRANSITION_REASON_PREMIUM_AP) {
++				wpa_printf(MSG_DEBUG,
++					   "BTM request: Invalid MBO transition reason code %u",
++					   mbo_reason);
++				return -1;
++			}
++
++			/* Valid values for Cellular preference are: 0, 1, 255 */
++			/* A value of -1 indicates that Cellular Data Connection Preference Attribute will not be added to MBO IE */
++			if (cell_pref != -1 && cell_pref != MBO_CELL_PREF_EXCLUDED && cell_pref != MBO_CELL_PREF_NO_USE && cell_pref != MBO_CELL_PREF_USE) {
++				wpa_printf(MSG_DEBUG,
++					   "BTM request:Invalid MBO cellular capability %u",
++					   cell_pref);
++				return -1;
++			}
++
++			if (reassoc_delay > 65535 ||
++				(reassoc_delay &&
++				 !(req_mode & WNM_BSS_TM_REQ_DISASSOC_IMMINENT))) {
++				wpa_printf(MSG_DEBUG,
++					   "BTM request (MBO): Assoc retry delay is only valid in disassoc imminent mode");
++				return -1;
++			}
+ 
+-		*mbo_pos++ = MBO_ATTR_ID_TRANSITION_REASON;
+-		*mbo_pos++ = 1;
+-		*mbo_pos++ = mbo_reason;
+-		if (cell_pref != -1){
+-			*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
++			*mbo_pos++ = MBO_ATTR_ID_TRANSITION_REASON;
+ 			*mbo_pos++ = 1;
+-			*mbo_pos++ = cell_pref;
+-		}
++			*mbo_pos++ = mbo_reason;
++			if (cell_pref != -1){
++				if (!hapd->conf->mbo_cell_aware)
++					wpa_printf(MSG_DEBUG, "BTM request (MBO) Cell preference set, but VAP is not cellular aware");
++				else{
++					*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
++					*mbo_pos++ = 1;
++					*mbo_pos++ = cell_pref;
++				}
++			}
+ 
+-		if (reassoc_delay) {
+-			*mbo_pos++ = MBO_ATTR_ID_ASSOC_RETRY_DELAY;
+-			*mbo_pos++ = 2;
+-			WPA_PUT_LE16(mbo_pos, reassoc_delay);
+-			mbo_pos += 2;
+-		}
++			if (reassoc_delay) {
++				*mbo_pos++ = MBO_ATTR_ID_ASSOC_RETRY_DELAY;
++				*mbo_pos++ = 2;
++				WPA_PUT_LE16(mbo_pos, reassoc_delay);
++				mbo_pos += 2;
++			}
+ 
+-		mbo_len = mbo_pos - mbo;
++			mbo_len = mbo_pos - mbo;
++		} else{
++			wpa_printf(MSG_DEBUG,
++				   "BTM request: MBO set but VAP is not MBO enabled or STA does not support MBO.");
++		}
+ 	}
+ #endif /* CONFIG_MBO */
+ 
+@@ -2751,24 +2769,56 @@ int hostapd_ctrl_iface_deny_mac(struct h
+ int hostapd_ctrl_iface_sta_steer(struct hostapd_data *hapd, const char *cmd)
+ {
+   u8 sta_addr[ETH_ALEN], bssid[ETH_ALEN];
+-  const char *pos;
++  const char *pos, *btm_parameters = NULL;
+   struct hostapd_iface *iface = hapd->iface;
+   struct sta_info *sta = NULL;
+   int ret, i;
+ 
+-  if (hwaddr_aton(cmd, sta_addr))
++  if (hwaddr_aton(cmd, sta_addr)){
++    wpa_printf(MSG_DEBUG, "Steer STA, invalid station MAC Address.");
+     return -1;
++  }
+ 
+   os_memset(bssid, 0, sizeof(bssid));
+   pos = os_strchr(cmd, ' ');
+   if (pos && (pos+1) != '\0') {
+-    pos++;
+-    if (hwaddr_aton(pos, bssid))
+-      return -1;
++      pos++;
++    if (hwaddr_aton(pos, bssid)){
++      btm_parameters = pos;
++    } else{
++      btm_parameters = os_strchr(pos + 1, ' ');
++    }
++    }
++  for (i = 0; i < hapd->iface->num_bss; i++) {
++    sta = ap_get_sta(hapd->iface->bss[i], sta_addr);
++    if (sta) {
++      hapd = hapd->iface->bss[i];
++      break;
++    }
+   }
+-  ret = hostapd_drv_sta_steer(hapd, sta_addr, bssid);
+-  for (i = 0; i < iface->num_bss; i++) {
+-    struct hostapd_data *bss = iface->bss[i];
++
++  if (!sta || !sta->btm_supported) {
++    /*Station is not associated or does not support BSS Transition Management.
++    Use black list mechanism .*/
++
++    wpa_printf(MSG_DEBUG, "Steer STA " MACSTR " , station is not associated to BSS "
++         "or does not support BTM.", MAC2STR(sta_addr));
++
++    ret = hostapd_drv_sta_steer(hapd, sta_addr, bssid);
++  } else{
++    /* Station supports 802.11v BTM, send BSS Transition Management
++    Request instead of black listing station. */
++    char buf[2000];
++    wpa_printf(MSG_DEBUG, "Steer STA " MACSTR ", station supports BTM.", MAC2STR(sta_addr));
++
++    os_snprintf(buf, sizeof(buf), MACSTR " %s", MAC2STR(sta_addr), btm_parameters ? btm_parameters : "");
++
++    ret = hostapd_ctrl_iface_bss_tm_req(hapd, buf);
++
++  }
++
++    for (i = 0; i < iface->num_bss; i++) {
++      struct hostapd_data *bss = iface->bss[i];
+ 
+     /* remove STA from all BSS, except the specified one */
+     if (os_memcmp(bss->own_addr, bssid, sizeof(bssid))) {
+@@ -3406,12 +3456,12 @@ static int hostapd_ctrl_iface_set_neighb
+ 	char *tmp;
+ 	int ret;
+ 
+-        hapd = get_bss_index(buf, hapd->iface);
+-        if (!hapd) {
+-                wpa_printf(MSG_INFO,
+-                                "CTRL: SET_NEIGHBOR_PER_VAP - there is no iface with the given name");
+-                return -1;
+-        }
++	hapd = get_bss_index(buf, hapd->iface);
++	if (!hapd) {
++		wpa_printf(MSG_INFO,
++			"CTRL: SET_NEIGHBOR_PER_VAP - there is no iface with the given name");
++		return -1;
++	}
+ 
+ 	if (!(hapd->conf->radio_measurements[0] &
+ 	      WLAN_RRM_CAPS_NEIGHBOR_REPORT)) {
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1371,8 +1371,9 @@ static int hostapd_cli_cmd_sta_steer(str
+   int res;
+   char *tmp;
+   int total;
++  int i;
+ 
+-  if (argc < 1 || argc > 2) {
++  if (argc < 1) {
+     printf("Invalid STA_STEER command\n"
+            "usage: <addr> [BSSID]\n");
+     return -1;
+@@ -1384,15 +1385,16 @@ static int hostapd_cli_cmd_sta_steer(str
+     return -1;
+   }
+ 
+-  if (argc == 2) {
+-    total = res;
+-    tmp = cmd + total;
+-    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[1]);
+-    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
+-      printf("Too long STA_STEER command.\n");
+-      return -1;
+-    }
+-  }
++	total = res;
++
++	for (i = 1; i < argc; i++) {
++			tmp = &cmd[total];
++			res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[i]);
++			if (os_snprintf_error(sizeof(cmd) - total, res))
++				return -1;
++			total += res;
++ 		}
++
+   return wpa_ctrl_command(ctrl, cmd);
+ }
+ 
+@@ -1807,12 +1809,21 @@ static const struct hostapd_cli_cmd host
+ 	{ "deny_mac", hostapd_cli_cmd_deny_mac, NULL,
+ 	  "<addr> <[0]/1> 0-add;1-remove station to/from blacklist" },
+ 	{ "sta_steer", hostapd_cli_cmd_sta_steer, NULL,
+-	  "<addr> [BSSID] steer station to specified (V)AP" },
++	  "<addr> [BSSID] [pref=<1/0 is candidate list included>]\n"
++	  "[neighbor=<BSSID>,<BSSID Information>,<Operating Class>,\n"
++	  "<Channel Number>,<PHY Type>,<priority for this BSS>]\n"
++#ifdef CONFIG_MBO
++	  "[mbo==<reason>:<reassoc_delay>:<cell_pref, -1 indicates that\n"
++	  "cellular preference MBO IE should not be included>]\n"
++#endif /*CONFIG_MBO*/
++	  "[disassoc_imminent=<1/0>] [disassoc_timer=<value in milliseconds>]\n"
++	  "steer station to specified (V)AP" },
+ 	{ "sta_allow", hostapd_cli_cmd_sta_allow, NULL,
+ 	  "[addr1] [addr2] ... [addrX] add station(s) to whitelist"
+ 	  "without parameters will allow all STA's on this radio" },
+ 	{ "unconnected_sta", hostapd_cli_cmd_unconnected_sta, NULL,
+-	  "<addr> <freq> <center_freq1=> [center_freq2=] <bandwidth=> get unconnected station statistics" },
++	  "<addr> <freq> <center_freq1=> [center_freq2=] <bandwidth=>\n"
++	  "get unconnected station statistics" },
+ 	{ "sta_measurements", hostapd_cli_cmd_sta_measurements, NULL,
+ 	  "<BSS_name> <addr> get station measurements" },
+ 	{ "vap_measurements", hostapd_cli_cmd_vap_measurements, NULL,

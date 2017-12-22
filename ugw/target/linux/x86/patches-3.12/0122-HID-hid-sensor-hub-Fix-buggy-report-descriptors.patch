@@ -1,0 +1,147 @@
+From c487a32005c6136ae9e7aabaffe2b986a24d4a31 Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Tue, 14 Jan 2014 09:30:20 -0800
+Subject: [PATCH 122/441] HID: hid-sensor-hub: Fix buggy report descriptors
+
+This addresses regression caused by commit id "751d17e23a9f7"
+ iio: hid-sensors: Fix power and report state.
+This commit removed a quirk, to change the enumeration base
+to 1 from 0 based on an CONFIG paramter. There was objection to
+add more changes under this quirk, instead suggested to add an
+HID quirk. But there is no easy way to add HID qurik as the
+reports are not properly using collection class.
+
+The solution was to use logical minimum, which is a correct way.
+There were changes done in firmware to address this.
+
+Unfortunately some devices, still use old FW and can't be upgraded
+to newer version on Linux devices as there is no FW upgrade tool
+available for Linux devices. So we need to fix report descriptors,
+for such devices. This will not have any impact, if the FW uses
+logical 1 as minimum.
+
+In this patch we look for usage id for "power and report state", and
+modify logical minimum value to 1.
+
+Background on enum:
+In the original HID sensor hub firmwares all Named array enums were
+to 0-based. But the most recent hub implemented as 1-based,
+because of the implementation by one of the major OS vendor.
+Using logical minimum for the field as the base of enum. So we add
+logical minimum to the selector values before setting those fields.
+Some sensor hub FWs already changed logical minimum from 0 to 1
+to reflect this and hope every other vendor will follow.
+There is no easy way to add a common HID quirk for NAry elements,
+even if the standard specifies these field as NAry, the collection
+used to describe selectors is still just "logical".
+
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 875e36f8a2ce6cfc2010af6c91fb5351bd530d48)
+---
+ drivers/hid/hid-ids.h        |  4 ++++
+ drivers/hid/hid-sensor-hub.c | 45 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -463,6 +463,10 @@
+ #define USB_VENDOR_ID_ILITEK		0x222a
+ #define USB_DEVICE_ID_ILITEK_MULTITOUCH	0x0001
+ 
++#define USB_VENDOR_ID_INTEL_0		0x8086
++#define USB_VENDOR_ID_INTEL_1		0x8087
++#define USB_DEVICE_ID_INTEL_HID_SENSOR	0x09fa
++
+ #define USB_VENDOR_ID_ION		0x15e4
+ #define USB_DEVICE_ID_ICADE		0x0132
+ 
+--- a/drivers/hid/hid-sensor-hub.c
++++ b/drivers/hid/hid-sensor-hub.c
+@@ -26,6 +26,8 @@
+ #include <linux/hid-sensor-hub.h>
+ #include "hid-ids.h"
+ 
++#define HID_SENSOR_HUB_ENUM_QUIRK	0x01
++
+ /**
+  * struct sensor_hub_pending - Synchronous read pending information
+  * @status:		Pending status true/false.
+@@ -64,6 +66,7 @@ struct sensor_hub_data {
+ 	spinlock_t dyn_callback_lock;
+ 	struct mfd_cell *hid_sensor_hub_client_devs;
+ 	int hid_sensor_client_cnt;
++	unsigned long quirks;
+ };
+ 
+ /**
+@@ -500,6 +503,40 @@ void sensor_hub_device_close(struct hid_
+ }
+ EXPORT_SYMBOL_GPL(sensor_hub_device_close);
+ 
++static __u8 *sensor_hub_report_fixup(struct hid_device *hdev, __u8 *rdesc,
++		unsigned int *rsize)
++{
++	int index;
++	struct sensor_hub_data *sd =  hid_get_drvdata(hdev);
++	unsigned char report_block[] = {
++				0x0a,  0x16, 0x03, 0x15, 0x00, 0x25, 0x05};
++	unsigned char power_block[] = {
++				0x0a,  0x19, 0x03, 0x15, 0x00, 0x25, 0x05};
++
++	if (!(sd->quirks & HID_SENSOR_HUB_ENUM_QUIRK)) {
++		hid_dbg(hdev, "No Enum quirks\n");
++		return rdesc;
++	}
++
++	/* Looks for power and report state usage id and force to 1 */
++	for (index = 0; index < *rsize; ++index) {
++		if (((*rsize - index) > sizeof(report_block)) &&
++			!memcmp(&rdesc[index], report_block,
++						sizeof(report_block))) {
++			rdesc[index + 4] = 0x01;
++			index += sizeof(report_block);
++		}
++		if (((*rsize - index) > sizeof(power_block)) &&
++			!memcmp(&rdesc[index], power_block,
++						sizeof(power_block))) {
++			rdesc[index + 4] = 0x01;
++			index += sizeof(power_block);
++		}
++	}
++
++	return rdesc;
++}
++
+ static int sensor_hub_probe(struct hid_device *hdev,
+ 				const struct hid_device_id *id)
+ {
+@@ -523,6 +560,7 @@ static int sensor_hub_probe(struct hid_d
+ 		return -ENOMEM;
+ 	}
+ 	hid_set_drvdata(hdev, sd);
++	sd->quirks = id->driver_data;
+ 	sd->hsdev->hdev = hdev;
+ 	sd->hsdev->vendor_id = hdev->vendor;
+ 	sd->hsdev->product_id = hdev->product;
+@@ -622,6 +660,12 @@ static void sensor_hub_remove(struct hid
+ }
+ 
+ static const struct hid_device_id sensor_hub_devices[] = {
++	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_SENSOR_HUB, USB_VENDOR_ID_INTEL_0,
++			USB_DEVICE_ID_INTEL_HID_SENSOR),
++			.driver_data = HID_SENSOR_HUB_ENUM_QUIRK},
++	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_SENSOR_HUB, USB_VENDOR_ID_INTEL_1,
++			USB_DEVICE_ID_INTEL_HID_SENSOR),
++			.driver_data = HID_SENSOR_HUB_ENUM_QUIRK},
+ 	{ HID_DEVICE(HID_BUS_ANY, HID_GROUP_SENSOR_HUB, HID_ANY_ID,
+ 		     HID_ANY_ID) },
+ 	{ }
+@@ -634,6 +678,7 @@ static struct hid_driver sensor_hub_driv
+ 	.probe = sensor_hub_probe,
+ 	.remove = sensor_hub_remove,
+ 	.raw_event = sensor_hub_raw_event,
++	.report_fixup = sensor_hub_report_fixup,
+ #ifdef CONFIG_PM
+ 	.suspend = sensor_hub_suspend,
+ 	.resume = sensor_hub_resume,

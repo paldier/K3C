@@ -1,0 +1,154 @@
+--- a/networking/udhcp/common.c
++++ b/networking/udhcp/common.c
+@@ -18,6 +18,7 @@ unsigned dhcp_verbose;
+ uint8_t state[1];
+ #endif
+ 
++
+ const uint8_t MAC_BCAST_ADDR[6] ALIGN2 = {
+ 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+ };
+@@ -974,38 +975,49 @@ char subopt6[IFX_DEVM_DHCP_PARAM_SIZE];
+ 
+ void ifx_init_tr111_vars()
+ {
+-	int iRet = 0;
++	char* mac_addr = NULL;
++	char*  serial_num = NULL;
+ 	char sValue[IFX_DEVM_DHCP_PARAM_SIZE] = {0};
+-	void *dlHandle = NULL;
++	void *dlHandle = NULL, *dlHandle2 = NULL;
+ 	int (*func_ptr)(const char *, const char *, char *, char *) = NULL;
++	char* (*pupgrade_uAPI)(UPGRADE_OPT, char*) = NULL;
+ 	char *error = NULL;
+ 	char sVal[MAX_FILELINE_LEN]={0};
+ 	int iFD=-1;
+-    	char caBuff[32] = { 0 };
+-    	char *psTmp = NULL;
++	char caBuff[32] = { 0 };
++	char *psTmp = NULL;
+ 
+ 
+ 	dlHandle = dlopen("libifx_common.so",RTLD_LAZY);
+-	if(dlHandle) {
++	dlHandle2 = dlopen("libltq_utilAPIs.so",RTLD_LAZY);
++	if(dlHandle && dlHandle2) {
+ 		*(void **) &func_ptr = dlsym(dlHandle,"ifx_GetCfgData");
+ 		if((error = dlerror()) != NULL) {
+ 			log1( "could not find function ifx_GetCfgData in libifx_common.so\n");
+ 			log1( "dlopen failed !! taking backup values \n");
+ 			goto BACKUP;
+ 		}
++		pupgrade_uAPI = dlsym(dlHandle2,"upgrade_uAPI");
++		if ((error = dlerror()) != NULL)  {
++			log1( "could not find function upgrade_uAPI in libltq_utilAPIs.so\n");
++			log1( "dlopen failed !! taking backup values \n");
++			goto BACKUP;
++		}
++
+ 
+ 		if ( (int)(* func_ptr)(IFX_SYS_CONF, IFX_DEVICE_INFO_SECTION, "device_info_oui", sValue) == 1){
+ 
+ 			// frame the OUI from the MAC address - logic picked from IFXAPIs/src/mapi/ifx_api_dev_info.c:130
+ 			memset(sVal, 0x00, sizeof(sVal));
+-			system("upgrade mac_get 2 >/tmp/macget");
+-			iFD = open("/tmp/macget", O_RDONLY);
+-			if(iFD < 0)
++			mac_addr = pupgrade_uAPI(MAC_GET, NULL);
++			if(!mac_addr)
+ 			{
+-				bb_error_msg("failed to open /tmp/macget\n");
++				bb_error_msg("unable to retrive mac_address\n");
+ 				return -1;
+ 			}
+-			read(iFD, caBuff, sizeof(caBuff));
++			strncpy(caBuff, mac_addr, sizeof(caBuff)-1);
++			free(mac_addr);
++			
+ 			psTmp = strtok(caBuff, ":");
+ 			if(psTmp == NULL)
+ 			{
+@@ -1018,8 +1030,6 @@ void ifx_init_tr111_vars()
+ 			psTmp = strtok(NULL, ":");
+ 			strcat(sVal, psTmp);
+ 			close(iFD);
+-			system("rm /tmp/macget");
+-
+ 			if ((strlen(sVal) + 1) > IFX_DEVM_DHCP_PARAM_SIZE)
+ 			{
+ 				goto BACKUP;
+@@ -1034,29 +1044,18 @@ void ifx_init_tr111_vars()
+ 		}else{
+ 			goto BACKUP;
+ 		}
+-
+-/*		if ( (int)(* func_ptr)(IFX_SYS_CONF, IFX_DEVICE_INFO_SECTION, "device_info_sernum", sValue) == 1)*/
+-
+-        iFD = -1;
+-
+-        memset(caBuff, 0x00, sizeof(caBuff));
+-        memset(sVal, 0x00, sizeof(sVal));
+-        iFD = open("/tmp/sernumget", O_RDONLY);
+-        if(iFD < 0)
+-        {
+-            system("upgrade boardid_get 0 >/tmp/sernumget");
+-            iFD = open("/tmp/sernumget", O_RDONLY);
+-            if(iFD < 0)
+-            {
+-                bb_error_msg("failed to open /tmp/sernumget\n");
+-                return -1;
+-            }
+-        }
+-        read(iFD, caBuff, sizeof(caBuff));
+-        strncpy(sVal, caBuff, (sizeof(caBuff) - 1));
+-        close(iFD);
+-
+-        if(strlen(caBuff)) {
++		
++		iFD = -1;
++		memset(sVal, '\0', sizeof(sVal));
++		memset(caBuff, 0x00, sizeof(caBuff));
++		
++		serial_num = pupgrade_uAPI(SERNUM_GET, NULL);
++		if(!serial_num)
++			goto BACKUP;
++		
++		strncpy(sVal, serial_num, 18);
++		free(serial_num);
++        if(strlen(sVal)) {
+ #ifdef CONFIG_FEATURE_DEVM_DEVICE 	//  it is a device
+ 			strcpy(subopt2,sVal);
+ #else	// it is a gateway
+@@ -1094,6 +1093,7 @@ BACKUP :
+ 	}
+ 
+ 	dlclose(dlHandle);
++	dlclose(dlHandle2);
+ 	return;
+ }
+ #endif
+--- a/networking/udhcp/common.h
++++ b/networking/udhcp/common.h
+@@ -76,6 +76,13 @@ enum {
+ 	DHCP_SIZE        = sizeof(struct dhcp_packet) - CONFIG_UDHCPC_SLACK_FOR_BUGGY_SERVERS,
+ };
+ 
++typedef enum
++{
++	MAC_GET,
++	SERNUM_GET,
++	MAC_SET
++}UPGRADE_OPT;
++
+ /* Let's see whether compiler understood us right */
+ struct BUG_bad_sizeof_struct_ip_udp_dhcp_packet {
+ 	char c[IP_UPD_DHCP_SIZE == 576 ? 1 : -1];
+@@ -381,6 +388,8 @@ int udhcp_read_interface(const char *int
+ 
+ int udhcp_listen_socket(/*uint32_t ip,*/ int port, const char *inf) FAST_FUNC;
+ 
++char* upgrade_uAPI(UPGRADE_OPT, char*);
++
+ /* Returns 1 if no reply received */
+ int arpping(uint32_t test_nip,
+ 		const uint8_t *safe_mac,

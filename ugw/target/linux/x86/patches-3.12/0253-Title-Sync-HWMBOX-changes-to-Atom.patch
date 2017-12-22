@@ -1,0 +1,1121 @@
+From 6d6efa88f36cdecef21538b92faf5d024d2b5030 Mon Sep 17 00:00:00 2001
+From: Marco A Vital Yep <marco.a.vital.yep@intel.com>
+Date: Mon, 25 Jan 2016 08:44:23 -0700
+Subject: [PATCH 253/441] Title:      Sync HWMBOX changes to Atom IssueID:
+ 245147, 245148 IssueType:  BUG Symptom:    Race condition on RPC RootCause:
+ Atom was sending the RPC TAG to user space when there was             no a
+ Kernel handle registered for this TAG. Resolution: Return error from Atom
+ HWMBOX driver when there is no             TAG registered in Kernel. Test:
+    Unit test. Reviewer:   Noam Manor ReviewID:   NA
+
+---
+ arch/x86/hw_mailbox/hw_mbox_drv.c        | 187 ++++++++++++++++++++++++-----
+ arch/x86/hw_mailbox/hw_mbox_mem_access.h | 100 +++++++++-------
+ include/linux/hw_mailbox.h               | 177 ++++++++++++++++++++--------
+ include/linux/hw_mbox_defs.h             | 195 +++++++++++++++++++++----------
+ 4 files changed, 474 insertions(+), 185 deletions(-)
+
+--- a/arch/x86/hw_mailbox/hw_mbox_drv.c
++++ b/arch/x86/hw_mailbox/hw_mbox_drv.c
+@@ -7,22 +7,22 @@
+  *
+  * GPL LICENSE SUMMARY
+  *
+- *  Copyright(c) 2014-2015 Intel Corporation.
++ *  Copyright(c) 2014-2016 Intel Corporation.
+  *
+- *  This program is free software; you can redistribute it and/or modify 
++ *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of version 2 of the GNU General Public License as
+  *  published by the Free Software Foundation.
+  *
+- *  This program is distributed in the hope that it will be useful, but 
+- *  WITHOUT ANY WARRANTY; without even the implied warranty of 
+- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+  *  General Public License for more details.
+  *
+  *
+- *  You should have received a copy of the GNU General Public License 
+- *  along with this program; if not, write to the Free Software 
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
+  *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+- *  The full GNU General Public License is included in this distribution 
++ *  The full GNU General Public License is included in this distribution
+  *  in the file called LICENSE.GPL.
+  *
+  *  Contact Information:
+@@ -32,7 +32,7 @@
+  */
+ 
+ #define DRV_NAME    "Intel(R) HW Mailbox Controller Driver"
+-#define DRV_VERSION "0.0.1"
++#define DRV_VERSION "0.0.2"
+ 
+ /************************************************************************/
+ /*     INCLUDES                                                         */
+@@ -47,6 +47,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/device.h>
+ #include <linux/cdev.h>     /* cdev utilities */
++#include <linux/uaccess.h>  /* copy_(to,from)_user */
+ #include <linux/slab.h>
+ #include <linux/wait.h>
+ #include <linux/sched.h>
+@@ -56,6 +57,7 @@
+ #include <linux/delay.h>        /* for usleep_range */
+ 
+ #include <linux/hw_mbox_defs.h>        /* HW_MBOX definitions and configuration */
++#include <linux/hw_mailbox.h>
+ #include "hw_mbox_mem_access.h"  /* HW_MBOX Register and Memory Access    */
+ 
+ #ifdef HW_MBOX_IS_NP_CPU
+@@ -293,18 +295,18 @@ do{ \
+ 
+ #define IS_INITIALIZED()    ( isInitialized == true )
+ 
+-/*! \def CHECK_IS_DRV_INITIALIZED( __noNotInitialized )
++/*! \def CHECK_IS_DRV_INITIALIZED( __onNotInitialized )
+     \brief use to check if the driver is initialized, if it is not
+            execute __noNotInitialized.
+-    \param[in] __noNotInitialized - executed in case of driver not
++    \param[in] __onNotInitialized - executed in case of driver not
+                                     initialized.
+ */
+-#define CHECK_IS_DRV_INITIALIZED( __noNotInitialized ) \
++#define CHECK_IS_DRV_INITIALIZED( __onNotInitialized ) \
+ do{ \
+     if (!IS_INITIALIZED())                      \
+     {                                           \
+         DPRINTK("Driver not initialized yet!"); \
+-        __noNotInitialized;                     \
++        __onNotInitialized;                     \
+     }                                           \
+ } while (0)
+ 
+@@ -410,6 +412,8 @@ typedef struct chnint
+ */
+ #define RECV_OPCODE_INIT_INDEX      0
+ 
++#define IS_RECV_OPCODE_INIT_INDEX( _threadIdx )     ( ( _threadIdx ) == RECV_OPCODE_INIT_INDEX )
++
+ /*! \struct recvOpcodeListenerThreadData_t
+     \brief data relevant to the recieve opcode listener. */
+ typedef struct recvOpcodeListenerThreadData
+@@ -664,6 +668,7 @@ do{ \
+ static int chnint_open(struct inode *inode, struct file *filp);
+ static ssize_t chnint_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
+ static unsigned int chnint_poll(struct file *filp, struct poll_table_struct *wait);
++static long chnint_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+ static int chnint_release(struct inode *inode, struct file *filp);
+ 
+ static void chnint_cleanup(int count);
+@@ -689,11 +694,12 @@ static chnint_t *chnint_devices;
+ /*! \var static struct file_operations chnint_fops
+     \brief file operations structure for the channel interrupt devices. */
+ static struct file_operations chnint_fops = {
+-    .owner      = THIS_MODULE,
+-    .read       = chnint_read,
+-    .poll       = chnint_poll,
+-    .open       = chnint_open,
+-    .release    = chnint_release,
++    .owner          = THIS_MODULE,
++    .read           = chnint_read,
++    .poll           = chnint_poll,
++    .unlocked_ioctl = chnint_ioctl,
++    .open           = chnint_open,
++    .release        = chnint_release,
+ };
+ 
+ /************************************************************************/
+@@ -2995,10 +3001,24 @@ static int hwMbox_recvOpcodeListenerEntr
+ 
+     threadData = data;
+ 
+-    if ( IS_SUPERVISOR() || IS_INITIALIZED())
++    if ( IS_SUPERVISOR() || !IS_RECV_OPCODE_INIT_INDEX(threadData->index) )
+     {
+-        PRINTK_INFO("RECV OPCODE LISTENER#%d kernel thread on CID#%d started running...",
+-                    threadData->index, threadData->cid);
++        /* Supervisor should never have to create a Listener to be used for initialization
++           Non-supervisor should only have the first Listener be used for intialization
++        */
++
++        DPRINTK("start waiting for INITIALIZED [RECV OPCODE LISTENER#%d on CID#%d]",
++                threadData->index, threadData->cid);
++
++        if( wait_event_interruptible(waitForInitializedWq, IS_INITIALIZED()) )
++        {
++            PRINTK_ERR("*** wait on waitForInitializedWq interrupted by signal [RECV OPCODE LISTENER#%d on CID#%d] ***",
++                       threadData->index, threadData->cid);
++            return -ERESTARTSYS;
++        }
++
++        DPRINTK("RECV OPCODE LISTENER#%d kernel thread on CID#%d started running...",
++                threadData->index, threadData->cid);
+     }
+     else
+     {
+@@ -3008,10 +3028,16 @@ static int hwMbox_recvOpcodeListenerEntr
+            It should wait for INIT_COMPLETE notification,
+            It should then set its own configuration in DB...
+ 
++           IMPORTANT Note:
++           Non-supervisor should not use the IS_INIT_COMPLETE as indication of first listener
++           since there's a chance the interrupt is already waiting [and IS_INIT_COMPLETE is
++           already signaled] while the first listener is being created [we can use the index
++           to know if it's the first listener].
++
+            Thread sets its own configuration so that ISR can do the bare possible minimum...
+         */
+ 
+-        PRINTK_INFO("RECV OPCODE LISTENER#%d kernel thread used for initialization started running...",
++        PRINTK_INFO("First Listener thread used for INITIALIZATION started running... [RECV OPCODE LISTENER#%d]",
+                     threadData->index);
+ 
+         DPRINTK("start waiting for INIT_COMPLETE from supervisor");
+@@ -3173,6 +3199,7 @@ static int hwMbox_recvOpcodeListenerEntr
+ 
+                 /* Success! */
+                 LOG_RECVOP_LISTENER("INIT_COMPLETE! report back to supervisor...");
++                PRINTK_INFO("HW MBOX INITIALIZATION complete!");
+ 
+                 /* Prepare the response: */
+                 replyOpcodeMsg.msgData.msgStatus.status = HW_MBOX_STATUS_OK;
+@@ -3272,9 +3299,12 @@ static int hwMbox_recvOpcodeListenerEntr
+ 
+         if (recvOpCb == NULL)
+         {
+-            /* no registered kernel tag found...
+-               This means that if it's a valid tag it's for User-Space! */
+-            LOG_RECVOP_LISTENER("tag %u is not for kernel! send to User-Space...", opFlds.tag);
++            /* no registered kernel tag found... */
++            LOG_RECVOP_LISTENER("tag %u is not for kernel!", opFlds.tag);
++
++#ifndef HW_MBOX_IS_APP_CPU
++            /* This means that if it's a valid tag it's for User-Space! */
++            LOG_RECVOP_LISTENER("Send tag %u to User-Space...", opFlds.tag);
+ 
+             RECV_OP_APP_SET_STATE(threadData->cid, CHN_INTR_STATE_PENDING);
+             wake_up_interruptible(&RECV_OP_APP_WQ(threadData->cid));
+@@ -3282,6 +3312,17 @@ static int hwMbox_recvOpcodeListenerEntr
+             /* release Lock... */
+             up(&CHN_LOCK(threadData->cid));
+             continue;
++#else /* ! HW_MBOX_IS_APP_CPU */
++            /* APP-CPU does not support User-space HW MBOX SW,
++               so it must be an invalid tag! */
++            LOG_RECVOP_LISTENER("tag %u is invalid! send back internal error message...", opFlds.tag);
++
++            replyOpcodeMsg.msgData.msgStatus.status = HW_MBOX_STATUS_OPCODE_ERROR_INVALID_TAG;
++
++            /* release Lock... */
++            up(&CHN_LOCK(threadData->cid));
++            goto SEND_OP_REPLY;
++#endif /* HW_MBOX_IS_APP_CPU */
+         }
+ 
+         paramToken = RECV_OP_GET_TOKEN(threadData->cid, i);
+@@ -3458,6 +3499,80 @@ static unsigned int chnint_poll(struct f
+     return mask;
+ }
+ 
++static long chnint_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++    chnint_t *dev = filp->private_data; /* dev was stored in filp during open */
++
++    hw_mbox_Masters_e   peer;
++    HW_MBOX_STATUS_e    status;
++    int ret;
++
++    status = HW_MBOX_STATUS_OK;
++    ret = 0;
++
++    switch (cmd)
++    {
++        case HW_MBOX_CHN_DEV_IOCTL_LOCK_CMD:
++        {
++            DPRINTK("[CHN_DEV_CID%d]: Received HW_MBOX_CHN_DEV_IOCTL_LOCK_CMD",
++                    dev->chn_cid);
++
++            if (CHN_CFG_GET_COMMANDER(dev->chn_cid) == HW_MBOX_MID)
++            {
++                peer = CHN_CFG_GET_SUBJECT(dev->chn_cid);
++            }
++            else
++            {
++                peer = CHN_CFG_GET_COMMANDER(dev->chn_cid);
++            }
++
++            if (!IS_MASTER_INIT(peer))
++            {
++                DPRINTK("[CHN_DEV_CID%d]: peer %s(%d) is not initialized!",
++                        dev->chn_cid, HW_MBOX_MASTER_GET_NAME(peer), peer);
++                status = HW_MBOX_STATUS_PEER_NOT_INITIALIZED;
++                break;
++            }
++
++            /* seize channel lock */
++            if (down_interruptible(&CHN_LOCK(dev->chn_cid)))
++            {
++                DPRINTK("down interrupted by signal...");
++                ret = -ERESTARTSYS;
++                break;
++            }
++
++            break;
++        }
++        case HW_MBOX_CHN_DEV_IOCTL_UNLOCK_CMD:
++        {
++            DPRINTK("[CHN_DEV_CID%d]: Received HW_MBOX_CHN_DEV_IOCTL_UNLOCK_CMD",
++                    dev->chn_cid);
++
++            /* No need to check for Master initialized because the
++               channel was already successfully locked to get here... */
++
++            /* release Lock... */
++            up(&CHN_LOCK(dev->chn_cid));
++            break;
++        }
++        default:
++        {
++            PRINTK_ERR("Invalid IOCTL(0x%08x) has been received!", cmd);
++            ret = -1;
++            break;
++        }
++    }
++
++    if (copy_to_user((void __user *)arg, &status, sizeof(HW_MBOX_STATUS_e)))
++    {
++        PRINTK_ERR("Failed to copy to user!!!");
++        ret = -EFAULT;
++    }
++
++    return ret;
++}
++
+ static int chnint_release(struct inode *inode, struct file *filp)
+ {
+ #ifdef HW_MBOX_KDBG
+@@ -3824,7 +3939,7 @@ static int __init hwMbox_drv_init(void)
+         DPRINTK("Created device /dev/%s/%s%02d", HW_MBOX_DRV_DEV_DIR_NAME, HW_MBOX_CHNINT_DEV_NAME, i);
+     }
+ 
+-    PRINTK_INFO("Created %d /dev/%s/%sXX devices", HW_MBOX_CHANNEL_COUNT, HW_MBOX_DRV_DEV_DIR_NAME, HW_MBOX_CHNINT_DEV_NAME);
++    DPRINTK("Created %d /dev/%s/%sXX devices", HW_MBOX_CHANNEL_COUNT, HW_MBOX_DRV_DEV_DIR_NAME, HW_MBOX_CHNINT_DEV_NAME);
+ 
+     /* Create the Proc filesystem utilities ( /proc/<HW_MBOX_PROC_DIR_STR>/ ): */
+     {
+@@ -3851,7 +3966,7 @@ static int __init hwMbox_drv_init(void)
+         SEQ_PROC_CREATE("recvOpDb", proc_dump_recvOpDb, procDir);
+         SEQ_PROC_CREATE("tagsDb", proc_dump_recvOpTagsDb, procDir);
+     }
+-    PRINTK_INFO("Created proc directory: /proc/%s", HW_MBOX_PROC_DIR_STR);
++    DPRINTK("Created proc directory: /proc/%s", HW_MBOX_PROC_DIR_STR);
+ 
+     /* Get core version from HW_MBOX_ID register: */
+     CTRL_SET_CORE_VER_MAJ(HW_MBOX_ID_MAJOR_GET());
+@@ -3910,13 +4025,13 @@ static int __init hwMbox_drv_init(void)
+ 
+         /* Set Monitor Value in DB: */
+         CTRL_SET_MONITOR(HW_MBOX_MONITOR);
+-#else
++#else /* HW_MBOX_MONITOR */
+         /* Setup HW_MBOX Configuration registers: */
+         HW_MBOX_CTRL_MON_EXIST_SET(False); /* Default should be False, but it doesn't hurt to make sure */
+ 
+         /* Set Monitor Value in DB: */
+         CTRL_SET_MONITOR(HW_MBOX_MID_INVALID);
+-#endif /* HW_MBOX_MONITOR */
++#endif /* ! HW_MBOX_MONITOR */
+ 
+ #ifdef HW_MBOX_START_IN_HW_DEBUG_MODE
+         DPRINTK("Setting HW Debug Mode...");
+@@ -3924,10 +4039,10 @@ static int __init hwMbox_drv_init(void)
+         /* Setup HW_MBOX Configuration registers: */
+         HW_MBOX_CTRL_DEBUG_SET(True);
+         CTRL_SET_IS_HW_DEBUG_MODE(True);
+-#else
++#else /* HW_MBOX_START_IN_HW_DEBUG_MODE */
+         HW_MBOX_CTRL_DEBUG_SET(False); /* Default should be False, but it doesn't hurt to make sure */
+         CTRL_SET_IS_HW_DEBUG_MODE(False);
+-#endif /* HW_MBOX_START_IN_HW_DEBUG_MODE */
++#endif /* ! HW_MBOX_START_IN_HW_DEBUG_MODE */
+ 
+         /* INIT static channels: */
+         DPRINTK("Initializing %d static channels", HW_MBOX_STATIC_CHANNEL_COUNT);
+@@ -4144,12 +4259,20 @@ static int __init hwMbox_drv_init(void)
+             {
+                 if (paramMID == HW_MBOX_MID)
+                 {
+-                    MASTER_SET_INITIALIZED(HW_MBOX_MID, True);
++                    MASTER_SET_INITIALIZED(paramMID, True);
+ 
+                     /* no need to send to ourself */
+                     continue;
+                 }
+ 
++                if (MASTER_CFG_GET_SUPPORT(paramMID) == hw_mbox_support_static)
++                {
++                    MASTER_SET_INITIALIZED(paramMID, True);
++
++                    /* no need to send to Masters with static SW support */
++                    continue;
++                }
++
+                 paramCID = FIND_CID_IN_LUT(paramMID, hw_mbox_opcode, CID_LUT_PEER_IS_SUBJECT);
+                 if (paramCID != HW_MBOX_CID_INVALID)
+                 {
+--- a/arch/x86/hw_mailbox/hw_mbox_mem_access.h
++++ b/arch/x86/hw_mailbox/hw_mbox_mem_access.h
+@@ -5,27 +5,27 @@
+  * contains memory access functions for the puma7 HW_MBOX controller
+  * registers and SRAM.
+  *
+- 
+-  This file is provided under a dual BSD/GPLv2 license.  When using or 
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or
+   redistributing this file, you may do so under either license.
+ 
+   GPL LICENSE SUMMARY
+ 
+-  Copyright(c) 2014-2015 Intel Corporation.
++  Copyright(c) 2014-2016 Intel Corporation.
+ 
+-  This program is free software; you can redistribute it and/or modify 
++  This program is free software; you can redistribute it and/or modify
+   it under the terms of version 2 of the GNU General Public License as
+   published by the Free Software Foundation.
+ 
+-  This program is distributed in the hope that it will be useful, but 
+-  WITHOUT ANY WARRANTY; without even the implied warranty of 
+-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   General Public License for more details.
+ 
+-  You should have received a copy of the GNU General Public License 
+-  along with this program; if not, write to the Free Software 
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+-  The full GNU General Public License is included in this distribution 
++  The full GNU General Public License is included in this distribution
+   in the file called LICENSE.GPL.
+ 
+ 
+@@ -34,36 +34,36 @@
+   2200 Mission College Blvd.
+   Santa Clara, CA  97052
+ 
+-  BSD LICENSE 
++  BSD LICENSE
+ 
+   Copyright(c) 2014-2015 Intel Corporation. All rights reserved.
+ 
+-  Redistribution and use in source and binary forms, with or without 
+-  modification, are permitted provided that the following conditions 
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
+   are met:
+ 
+-    * Redistributions of source code must retain the above copyright 
++    * Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+ 
+-    * Redistributions in binary form must reproduce the above copyright 
+-      notice, this list of conditions and the following disclaimer in 
+-      the documentation and/or other materials provided with the 
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
+       distribution.
+ 
+-    * Neither the name of Intel Corporation nor the names of its 
+-      contributors may be used to endorse or promote products derived 
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
+       from this software without specific prior written permission.
+ 
+-  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
+-  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
+-  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
+-  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
+-  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
+-  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
+-  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
+-  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
+-  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
+-  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+ 
+@@ -284,21 +284,25 @@ extern volatile Uint32 __debug_HW_MBOX_M
+ #define HW_MBOX_REGDEFS_ERROR_OFFSET ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_CONTROL_GROUP_OFFSET + HW_MBOX_REGDEFS_ERROR_INTERNAL_OFFSET )
+ 
+ /* --- Master Registers --- */
+-#define HW_MBOX_REGDEFS_MASTER_INTR_STATUS_L_OFFSET ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_STATUS_L_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_INTR_STATUS_H_OFFSET ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_STATUS_H_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_INTR_MASK_L_OFFSET   ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_MASK_L_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_INTR_MASK_H_OFFSET   ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_MASK_H_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_L_OFFSET  ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_L_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_H_OFFSET  ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_H_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_COMMANDER_L_OFFSET   ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_COMMANDER_L_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_COMMANDER_H_OFFSET   ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_COMMANDER_H_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_SUBJECT_L_OFFSET     ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_SUBJECT_L_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_MASTER_SUBJECT_H_OFFSET     ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_SUBJECT_H_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(paramMID)    ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(paramMID) + HW_MBOX_REGDEFS_MASTER_GROUP_OFFSET + HW_MBOX_REGDEFS_MID_SUBGROUP_OFFSET(paramMID) )
++
++#define HW_MBOX_REGDEFS_MASTER_INTR_STATUS_L_OFFSET         ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_STATUS_L_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_INTR_STATUS_H_OFFSET         ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_STATUS_H_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_INTR_MASK_L_OFFSET           ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_MASK_L_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_INTR_MASK_H_OFFSET           ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_MASK_H_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_L_OFFSET          ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_L_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_H_OFFSET          ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_INTR_CLEAR_H_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_COMMANDER_L_OFFSET           ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_COMMANDER_L_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_COMMANDER_H_OFFSET           ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_COMMANDER_H_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_SUBJECT_L_OFFSET             ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_SUBJECT_L_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MASTER_SUBJECT_H_OFFSET             ( HW_MBOX_REGDEFS_MID_MASTER_REGS_OFFSET(HW_MBOX_MID) + HW_MBOX_REGDEFS_MASTER_SUBJECT_H_INTERNAL_OFFSET )
+ 
+ /* --- Channel Registers --- */
+-#define HW_MBOX_REGDEFS_CHN_CFG_OFFSET(paramCID)     ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_CHANNEL_GROUP_OFFSET + HW_MBOX_REGDEFS_CID_SUBGROUP_OFFSET(paramCID) + HW_MBOX_REGDEFS_CHN_CFG_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_CHN_COMMAND_OFFSET(paramCID) ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_CHANNEL_GROUP_OFFSET + HW_MBOX_REGDEFS_CID_SUBGROUP_OFFSET(paramCID) + HW_MBOX_REGDEFS_CHN_COMMAND_INTERNAL_OFFSET )
+-#define HW_MBOX_REGDEFS_CHN_STATE_OFFSET(paramCID)   ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_CHANNEL_GROUP_OFFSET + HW_MBOX_REGDEFS_CID_SUBGROUP_OFFSET(paramCID) + HW_MBOX_REGDEFS_CHN_STATE_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_MID_CHN_REGS_OFFSET(paramMID, paramCID)     ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(paramMID) + HW_MBOX_REGDEFS_CHANNEL_GROUP_OFFSET + HW_MBOX_REGDEFS_CID_SUBGROUP_OFFSET(paramCID) )
++
++#define HW_MBOX_REGDEFS_CHN_CFG_OFFSET(paramCID)                    ( HW_MBOX_REGDEFS_MID_CHN_REGS_OFFSET(HW_MBOX_MID, paramCID) + HW_MBOX_REGDEFS_CHN_CFG_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_CHN_COMMAND_OFFSET(paramCID)                ( HW_MBOX_REGDEFS_MID_CHN_REGS_OFFSET(HW_MBOX_MID, paramCID) + HW_MBOX_REGDEFS_CHN_COMMAND_INTERNAL_OFFSET )
++#define HW_MBOX_REGDEFS_CHN_STATE_OFFSET(paramCID)                  ( HW_MBOX_REGDEFS_MID_CHN_REGS_OFFSET(HW_MBOX_MID, paramCID) + HW_MBOX_REGDEFS_CHN_STATE_INTERNAL_OFFSET )
+ 
+ /* --- Memory Map Registers --- */
+ #define HW_MBOX_REGDEFS_MEMORY_MAP_OFFSET(paramCID) ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_REGDEFS_MEMORY_MAP_GROUP_OFFSET + HW_MBOX_REGDEFS_MMAP_SUBGROUP_OFFSET(paramCID) + HW_MBOX_REGDEFS_MEMORY_MAP_INTERNAL_OFFSET )
+@@ -310,7 +314,8 @@ extern volatile Uint32 __debug_HW_MBOX_M
+ /* These are defined for the purpose of accessing other Master's Master Registers.
+    Generally speaking each Master should only involve itself with its own Master Registers.
+    Still we should map these as we might need to read their values for research purposes.
+-   Unless In Package Debug We avoid mapping the interrupt status registers as access to them might prove to be disastrous.
++   We avoid mapping the interrupt status registers as access to them will trigger write
++   after read which will result in an access violation.
+ 
+    NOTE: The access is done from the MID associated with the current Master!
+ */
+@@ -330,11 +335,18 @@ extern volatile Uint32 __debug_HW_MBOX_M
+ 
+ #define HW_MBOX_MEMDEFS_SRAM_INTERNAL_OFFSET    (0x1000)  /*!  bit(12) = 1  */
+ 
++/*! \def HW_MBOX_MEMDEFS_MID_SRAM_OFFSET(internalByteOffset)
++    \brief Get HW_MBOX SRAM offset relative to HW_MBOX Base Address with paramMID as access modifier.
++    \param[in] paramMID - access modifier master id.
++    \param[in] ibo - offset in Bytes with regards to the SRAM's 4KB total actual size.
++*/
++#define HW_MBOX_MEMDEFS_MID_SRAM_OFFSET(paramMID, ibo)    ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(paramMID) + HW_MBOX_MEMDEFS_SRAM_INTERNAL_OFFSET + (ibo) )
++
+ /*! \def HW_MBOX_MEMDEFS_SRAM_OFFSET(internalByteOffset)
+     \brief Get HW_MBOX SRAM offset relative to HW_MBOX Base Address.
+     \param[in] internalByteOffset - offset in Bytes with regards to the SRAM's 4KB total actual size.
+ */
+-#define HW_MBOX_MEMDEFS_SRAM_OFFSET(internalByteOffset)    ( HW_MBOX_MEMDEFS_ACCESS_MODIFIER(HW_MBOX_MID) + HW_MBOX_MEMDEFS_SRAM_INTERNAL_OFFSET + (internalByteOffset) )
++#define HW_MBOX_MEMDEFS_SRAM_OFFSET(internalByteOffset)   ( HW_MBOX_MEMDEFS_MID_SRAM_OFFSET(HW_MBOX_MID, (internalByteOffset)) )
+ 
+ #define HW_MBOX_SRAM_SIZE    (0x1000)  /*! 4KB SRAM (total actual size) */
+ 
+--- a/include/linux/hw_mailbox.h
++++ b/include/linux/hw_mailbox.h
+@@ -1,54 +1,104 @@
+ /*
+- *  include/linux/hw_mailbox.h
+  *
+- *  GPL LICENSE SUMMARY
++ * hw_mbox_drv.h
++ * Description:
++ * HW_MBOX driver API.
+  *
+- *  Copyright(c) 2015 Intel Corporation. All rights reserved.
+- *
+- *  This program is free software; you can redistribute it and/or modify
+- *  it under the terms of version 2 of the GNU General Public License as
+- *  published by the Free Software Foundation.
+- *
+- *  This program is distributed in the hope that it will be useful, but
+- *  WITHOUT ANY WARRANTY; without even the implied warranty of
+- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- *  General Public License for more details.
+- *
+- *  You should have received a copy of the GNU General Public License
+- *  along with this program; if not, write to the Free Software
+- *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+- *  The full GNU General Public License is included in this distribution
+- *  in the file called LICENSE.GPL.
+- *
+- *  Contact Information:
+- *    Intel Corporation
+- *    2200 Mission College Blvd.
+- *    Santa Clara, CA  97052
+- *
+- *
+- */
+ 
+-#include <linux/hw_mbox_defs.h>
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
+ 
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2015-2016 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++  BSD LICENSE
++
++  Copyright(c) 2015 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#ifndef _HW_MBOX_DRV_H_
++#define _HW_MBOX_DRV_H_
++/************************************************************************/
++/*     INCLUDES                                                         */
++/************************************************************************/
++
++#include "hw_mbox_defs.h"   /* HW_MBOX definitions and configuration */
++
++#ifdef __KERNEL__
++/************************************************************************/
++/*     HW_MBOX Kernel INTERFACE FUNCTIONS Prototypes:                   */
++/************************************************************************/
++
++/**************************************************************************/
+ /*! \fn int hwMbox_isReady(void)
+  **************************************************************************
+  *  \brief Returns whether HW MBOX driver is initailized or not.
+- *  \return [ 0 on success / error -1 ].
++ *  \return [ 0 on initialized / -1 on NOT initialized ].
+  **************************************************************************/
+ int hwMbox_isReady(void);
+ 
+ /**************************************************************************/
+ /*! \fn int hwMbox_sendCommand(hw_mbox_Masters_e subject,
+-                       Uint32 *cmd,
+-                       Uint8 *dataBuf, Uint32 dataLen)
++                               Uint32 *cmd,
++                               Uint8 *dataBuf, Uint32 dataLen)
+  **************************************************************************
+  *  \brief Send a command to <subject> in a blocking manner using the HW_MBOX.
+  *  \attention will only return upon reply/ACK from <subject> (or error).
+  *  \param[in]     subject - To which Master should the opcode be sent.
+  *  \param[in,out] cmd - Command to send, upon returning will hold the reply.
+- *  \param[in,out] dataBuf - pointer to a Buffer containing more data to be 
++ *  \param[in,out] dataBuf - pointer to a Buffer containing more data to be
+  *                           sent, upon returning will hold the reply data
+- *                           Buffer (copies as much as the buffer can hold). 
++ *                           Buffer (copies as much as the buffer can hold).
+  *  \param[in]     dataLen - Length in Bytes of buffer specified in <dataBuf>.
+  *  \return [ 0 on success / error otherwise ].
+  **************************************************************************/
+@@ -62,7 +112,7 @@ int hwMbox_sendCommand(hw_mbox_Masters_e
+                                Uint8 *dataBuf, Uint32 dataLen)
+  **************************************************************************
+  *  \brief Receive a command from <commander> using the HW_MBOX.
+- *  \attention will only return upon arrival of a command from <commander> 
++ *  \attention will only return upon arrival of a command from <commander>
+  *             (or error).
+  *  \note To reply call HW_MBOX_sendReply [if a meaningful response is expected].
+  *  \note To ACK call HW_MBOX_sendAck [to simply ACK the command].
+@@ -105,7 +155,7 @@ int hwMbox_sendReplyCommand(hw_mbox_Mast
+  *         received using the HW_MBOX.
+  *  \note should be called when no meaningful response is expected in order
+  *        to simply ACK the command.
+- *  \note Using this function leaves the command registers value unchanged
++ *  \note Using this function leaves the command register’s value unchanged
+  *        (writes the same value that was received).
+  *  \attention should only be used after a command has been received from
+  *             <commander> using hwMbox_recvCommand.
+@@ -117,50 +167,48 @@ int hwMbox_sendAckCommand(hw_mbox_Master
+ /**************************************************************************/
+ /*! \fn int hwMbox_sendOpcode(hw_mbox_Masters_e subject,
+                               Uint32 tag,
+-                              Uint32 *code,
+                               Uint8 *dataBuf, Uint32 *dataLen,
+                               Uint32 opcodeDataLen,
+                               Uint32 *replyDataLen)
+  **************************************************************************
+  *  \brief Send an opcode to <subject> in a blocking manner using the HW_MBOX.
+  *  \attention will only return upon reply from <subject> (or error).
++ *  \attention specified buffer should be able to hold generic messages that
++ *             sent on opcode channels, meaning size should be at least
++ *             HW_MBOX_OPCODE_MINIMAL_SRAM_ALLOCATION_IN_BYTES.
+  *  \param[in]     subject - To which Master should the opcode be sent.
+  *  \param[in]     tag - indicates opcode destination.
+- *  \param[in,out] code - code to send, upon returning will hold the return
+- *                        code.
+- *                  NOTE: if generic error upon returning will hold the error
+- *                        code <hwMbox_opcodeReturnCode_e>.
+- *  \param[in,out] dataBuf - pointer to a Buffer containing more data to be sent,
++ *  \param[in,out] dataBuf - pointer to a Buffer containing opcode data to be sent,
+  *                           upon returning will hold the reply data Buffer.
+  *  \param[in]     dataLen - Length in Bytes of buffer specified in <dataBuf>.
+  *  \param[in]     opcodeDataLen - Length in Bytes of opcode data to send.
+  *  \param[out]    replyDataLen - upon returning will hold the length in Bytes
+  *                                of returned reply data.
++ *  \note if function returns -1, and replyDataLen outputs > 0 value then
++ *        the user supplied buffer is populated with a <hwMbox_opcodeMessage_t>
++ *        of type HW_MBOX_OPCODE_MESSAGE_TYPE_STATUS containing extended error
++ *        information.
+  *  \return [ 0 on success / error otherwise ].
+  **************************************************************************/
+ int hwMbox_sendOpcode(hw_mbox_Masters_e subject,
+                       Uint32 tag,
+-                      //Uint32 *code,
+                       Uint8 *dataBuf, Uint32 dataLen,
+                       Uint32 opcodeDataLen,
+                       Uint32 *replyDataLen);
+ 
+ /**************************************************************************/
+ /*! \fn int hwMbox_sendReplyOpcode(hw_mbox_Masters_e commander,
+-                                   Uint32 code,
+                                    Uint8 *dataBuf, Uint32 *dataLen)
+  **************************************************************************
+  *  \brief Send a reply to an opcode received from <commander> using the HW_MBOX.
+  *  \attention should only be used after an opcode has been received from <commander>.
+  *  \param[in] commander - To which Master should the reply be sent.
+- *  \param[in] code - reply code.
+- *  \param[in] dataBuf - pointer to a Buffer containing more data to be sent.
++ *  \param[in] dataBuf - pointer to a Buffer containing data to be sent.
+  *  \param[in] dataLen - Length in Bytes of data to be sent from buffer
+  *                       specified in <dataBuf>.
+  *  \return [ 0 on success / error otherwise ].
+  **************************************************************************/
+ int hwMbox_sendReplyOpcode(hw_mbox_Masters_e commander,
+-                           //Uint32 code,
+                            Uint8 *dataBuf, Uint32 dataLen);
+ 
+ /**************************************************************************/
+@@ -184,7 +232,7 @@ int hwMbox_sendAckOpcode(hw_mbox_Masters
+  *  \brief Register for Receive Opcode from <commander> using the HW_MBOX.
+  *  \attention This function should be called once per tag.
+  *  \param[in] commander - From which Master should the opcode be received.
+- *  \param[in] pOpcodeCallbackFunc - pointer to the callback function to be 
++ *  \param[in] pOpcodeCallbackFunc - pointer to the callback function to be
+  *                                   invoked upon receiving an opcode from
+  *                                   <commander>.
+  *  \param[in] tag - indicates the destination.
+@@ -195,7 +243,44 @@ int hwMbox_registerRecvOpcode(hw_mbox_Ma
+                               hwMboxRecvOpcodeCallback pOpcodeCallbackFunc,
+                               Uint32 tag,
+                               Uint32 token);
++#endif /* __KERNEL__ */
++/* IOCTL commands:
++
++   If you are adding new ioctl's to the kernel, you should use the _IO
++   macros defined in <linux/ioctl.h> _IO macros are used to create ioctl numbers:
++
++   _IO(type, nr)         - an ioctl with no parameter.
++   _IOW(type, nr, size)  - an ioctl with write parameters (copy_from_user), kernel would actually read data from user space
++   _IOR(type, nr, size)  - an ioctl with read parameters (copy_to_user), kernel would actually write data to user space
++   _IOWR(type, nr, size) - an ioctl with both write and read parameters
++
++   'Write' and 'read' are from the user's point of view, just like the
++   system calls 'write' and 'read'.  For example, a SET_FOO ioctl would
++   be _IOW, although the kernel would actually read data from user space;
++   a GET_FOO ioctl would be _IOR, although the kernel would actually write
++   data to user space.
++
++   The first argument to _IO, _IOW, _IOR, or _IOWR is an identifying letter
++   or number from the SoC_ModuleIds_e enum located in this file.
++
++   The second argument to _IO, _IOW, _IOR, or _IOWR is a sequence number
++   to distinguish ioctls from each other.
++
++   The third argument to _IOW, _IOR, or _IOWR is the type of the data going
++   into the kernel or coming out of the kernel (e.g.  'int' or 'struct foo').
++
++   NOTE!  Do NOT use sizeof(arg) as the third argument as this results in
++   your ioctl thinking it passes an argument of type size_t.
++*/
+ 
++#include <linux/ioctl.h>
+ 
++#define HW_MBOX_MODULE_ID                   (0x8C)
+ 
++/* IOCTL CMDs:
++   Note: All of them return a HW_MBOX_STATUS_e value.
++*/
++#define HW_MBOX_CHN_DEV_IOCTL_LOCK_CMD      _IOR(HW_MBOX_MODULE_ID, 1, int)
++#define HW_MBOX_CHN_DEV_IOCTL_UNLOCK_CMD    _IOR(HW_MBOX_MODULE_ID, 2, int)
+ 
++#endif /* ! _HW_MBOX_DRV_H_ */
+--- a/include/linux/hw_mbox_defs.h
++++ b/include/linux/hw_mbox_defs.h
+@@ -4,27 +4,27 @@
+  * Description:
+  * contains basic definitions puma7 HW_MBOX controller SW.
+  *
+- 
+-  This file is provided under a dual BSD/GPLv2 license.  When using or 
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or
+   redistributing this file, you may do so under either license.
+ 
+   GPL LICENSE SUMMARY
+ 
+-  Copyright(c) 2014-2015 Intel Corporation.
++  Copyright(c) 2014-2016 Intel Corporation.
+ 
+-  This program is free software; you can redistribute it and/or modify 
++  This program is free software; you can redistribute it and/or modify
+   it under the terms of version 2 of the GNU General Public License as
+   published by the Free Software Foundation.
+ 
+-  This program is distributed in the hope that it will be useful, but 
+-  WITHOUT ANY WARRANTY; without even the implied warranty of 
+-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   General Public License for more details.
+ 
+-  You should have received a copy of the GNU General Public License 
+-  along with this program; if not, write to the Free Software 
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+-  The full GNU General Public License is included in this distribution 
++  The full GNU General Public License is included in this distribution
+   in the file called LICENSE.GPL.
+ 
+ 
+@@ -33,36 +33,36 @@
+   2200 Mission College Blvd.
+   Santa Clara, CA  97052
+ 
+-  BSD LICENSE 
++  BSD LICENSE
+ 
+   Copyright(c) 2014-2015 Intel Corporation. All rights reserved.
+ 
+-  Redistribution and use in source and binary forms, with or without 
+-  modification, are permitted provided that the following conditions 
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
+   are met:
+ 
+-    * Redistributions of source code must retain the above copyright 
++    * Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+ 
+-    * Redistributions in binary form must reproduce the above copyright 
+-      notice, this list of conditions and the following disclaimer in 
+-      the documentation and/or other materials provided with the 
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
+       distribution.
+ 
+-    * Neither the name of Intel Corporation nor the names of its 
+-      contributors may be used to endorse or promote products derived 
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
+       from this software without specific prior written permission.
+ 
+-  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
+-  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
+-  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
+-  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
+-  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
+-  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
+-  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
+-  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
+-  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
+-  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+ 
+@@ -268,37 +268,65 @@ enum { HW_MBOX_HARDCODED_MID = HW_MBOX_M
+ 
+ /* STATUS (Return Codes): */
+ 
++/*! \def HW_MBOX_STATUS_TABLE( __ENTRY )
++    \brief X-macro table definition of the HW_MBOX_STATUS enum.
++    \param[in] __ENTRY - X-pander.
++*/
++#define HW_MBOX_STATUS_TABLE( __ENTRY ) \
++/* +------------------------------------------------------+ */ \
++/* |        HW_MBOX_STATUS_e name                         | */ \
++/* |                                                      | */ \
++/* |                                                      | */ \
++/* +------------------------------------------------------+ */ \
++    __ENTRY(HW_MBOX_STATUS_OK                             ) \
++    __ENTRY(HW_MBOX_STATUS_NOK                            ) \
++    __ENTRY(HW_MBOX_STATUS_INTERNAL_ERROR                 ) \
++    __ENTRY(HW_MBOX_STATUS_DRIVER_NOT_INITIALIZED         ) \
++    __ENTRY(HW_MBOX_STATUS_PEER_NOT_INITIALIZED           ) \
++    __ENTRY(HW_MBOX_STATUS_PEER_NOT_VALID                 ) \
++    __ENTRY(HW_MBOX_STATUS_NO_CHANNEL_FOUND               ) \
++    __ENTRY(HW_MBOX_STATUS_INTERRUPTED_BY_SIGNAL          ) \
++    __ENTRY(HW_MBOX_STATUS_ERROR                          ) \
++    __ENTRY(HW_MBOX_STATUS_ERROR_TIMEOUT_EXPIRED          ) \
++    __ENTRY(HW_MBOX_STATUS_OPCODE_ERROR                   ) \
++    __ENTRY(HW_MBOX_STATUS_OPCODE_ERROR_INVALID_TAG       ) \
++    __ENTRY(HW_MBOX_STATUS_OPCODE_ERROR_MESSAGE_TOO_LONG  ) \
++    __ENTRY(HW_MBOX_STATUS_OPCODE_ERROR_INVALID_MESSAGE   ) \
++    __ENTRY(HW_MBOX_STATUS_OPCODE_ERROR_ILLEGAL_MESSAGE   ) \
++    __ENTRY(HW_MBOX_STATUS_OPCODE_ERROR_CALLBACK_FAILED   )
++
++#define HW_MBOX_STATUS_TABLE_AS_ENUM( _enumName )       _enumName,
++#define HW_MBOX_STATUS_TABLE_AS_STRS( _enumName )       HW_MBOX_STRINGIFY( _enumName ),
++#define HW_MBOX_STATUS_TABLE_AS_COUNT( _enumName )      1+
++
++#define HW_MBOX_STATUS_TABLE_COUNT    ( HW_MBOX_STATUS_TABLE(HW_MBOX_STATUS_TABLE_AS_COUNT) 0 )
++
+ /*! \enum HW_MBOX_STATUS_e
+     \brief HW MBOX return codes.
+ */
+ typedef enum HW_MBOX_STATUS
+ {
+-    HW_MBOX_STATUS_NOK = -1,
+-    HW_MBOX_STATUS_OK = 0,
+-
+-    HW_MBOX_STATUS_INTERNAL_ERROR = 0x100,
+-    HW_MBOX_STATUS_DRIVER_NOT_INITIALIZED,
+-    HW_MBOX_STATUS_PEER_NOT_INITIALIZED,
+-    HW_MBOX_STATUS_PEER_NOT_VALID,
+-    HW_MBOX_STATUS_NO_CHANNEL_FOUND,
+-    HW_MBOX_STATUS_INTERRUPTED_BY_SIGNAL,
+-
+-    HW_MBOX_STATUS_ERROR = 0x200,
+-    HW_MBOX_STATUS_ERROR_TIMEOUT_EXPIRED,
+-
+-    HW_MBOX_STATUS_OPCODE_ERROR = 0x300,
+-    HW_MBOX_STATUS_OPCODE_ERROR_INVALID_TAG,
+-    HW_MBOX_STATUS_OPCODE_ERROR_MESSAGE_TOO_LONG,
+-    HW_MBOX_STATUS_OPCODE_ERROR_INVALID_MESSAGE,
+-    HW_MBOX_STATUS_OPCODE_ERROR_ILLEGAL_MESSAGE,
+-    HW_MBOX_STATUS_OPCODE_ERROR_CALLBACK_FAILED,
++    HW_MBOX_STATUS_TABLE(HW_MBOX_STATUS_TABLE_AS_ENUM)
+ 
+     /* Don't add any values after this line!!! */
+ 
+     HW_MBOX_STATUS_ONE_AFTER_LAST,
+-    HW_MBOX_STATUS_LAST = (HW_MBOX_STATUS_ONE_AFTER_LAST - 1)
++    HW_MBOX_STATUS_LAST = (HW_MBOX_STATUS_ONE_AFTER_LAST - 1),
++
++    HW_MBOX_STATUS_COUNT = HW_MBOX_STATUS_TABLE_COUNT
+ } HW_MBOX_STATUS_e;
+ 
++/*! \def HW_MBOX_STATUS_STRS
++    \brief Creates an string array with HW MBOX STATUS.
++    \attention only use inside c file.
++*/
++#define HW_MBOX_STATUS_STRS( _arrayName ) \
++    static const Char * _arrayName[] =                     \
++    {                                                      \
++        HW_MBOX_STATUS_TABLE(HW_MBOX_STATUS_TABLE_AS_STRS) \
++        NULL                                               \
++    }
++
+ /********************************************
+ |                                           |
+ |        HW_MBOX Master Declarations        |
+@@ -313,7 +341,7 @@ typedef enum hw_mbox_support
+ {
+     hw_mbox_support_none = 0, /* No SW support on this Master */
+     hw_mbox_support_static,   /* only supports static channel allocation */
+-    hw_mbox_support_dynamic   /* supports static and dynamic channel allocation */
++    hw_mbox_support_dynamic   /* supports static and Initialization protocol */
+ } hw_mbox_support_e;
+ 
+ /*! \def HW_MBOX_SUPPORT_STR(mboxSupport)
+@@ -323,7 +351,7 @@ typedef enum hw_mbox_support
+ #define HW_MBOX_SUPPORT_STR(mboxSupport)    ( (mboxSupport) == hw_mbox_support_none    ) ? ("None"   ) : \
+                                             ( (mboxSupport) == hw_mbox_support_static  ) ? ("Static" ) : \
+                                             ( (mboxSupport) == hw_mbox_support_dynamic ) ? ("Dynamic") : \
+-                                              ("ERROR_UNKNOWN_HW_MBOX_SUPPORT!")
++                                              ("__ERROR_UNKNOWN_HW_MBOX_SUPPORT__")
+ 
+ /*! \struct hw_mbox_masterConfig_t
+     \brief Master configuration struct. */
+@@ -351,14 +379,14 @@ typedef struct hw_mbox_masterConfig
+ /* | MID |         | Name /        | HW_MBOX SW support         | */ \
+ /* |     |         | Description   | [hw_mbox_support_e]        | */ \
+ /* +------------------------------------------------------------+ */ \
+-/* |  0  | */ ENTRY( NP_CPU        , hw_mbox_support_static     )    \
++/* |  0  | */ ENTRY( NP_CPU        , hw_mbox_support_dynamic    )    \
+ /* |  1  | */ ENTRY( BBU_C         , hw_mbox_support_static     )    \
+-/* |  2  | */ ENTRY( APP_CPU       , hw_mbox_support_static     )    \
+-/* |  3  | */ ENTRY( RCE           , hw_mbox_support_none       )    \
++/* |  2  | */ ENTRY( APP_CPU       , hw_mbox_support_dynamic    )    \
++/* |  3  | */ ENTRY( RCE           , hw_mbox_support_static     )    \
+ /* |  4  | */ ENTRY( US_MAC_CPU    , hw_mbox_support_none       )    \
+ /* |  5  | */ ENTRY( PHY_CPU       , hw_mbox_support_static     )    \
+ /* |  6  | */ ENTRY( MOCA_C        , hw_mbox_support_static     )    \
+-/* |  7  | */ ENTRY( DS_MAC_C      , hw_mbox_support_none       )    \
++/* |  7  | */ ENTRY( DS_MAC_C      , hw_mbox_support_static     )    \
+ /* |  8  | */ ENTRY( PP_NETSEC     , hw_mbox_support_none       )    \
+ /* |  9  | */ ENTRY( PP_RESEQ      , hw_mbox_support_none       )    \
+ /* | 10  | */ ENTRY( PP_STAGE1     , hw_mbox_support_none       )    \
+@@ -398,14 +426,14 @@ typedef struct hw_mbox_masterConfig
+ /*! \def HW_MBOX_MASTER_TABLE_STRS
+     \brief Creates an string array with HW MBOX Masters names.
+     \note "<_desc0>", "<_desc1>", ... [so we need] '\0' for array syntax and proper array null termination.
+-    \note creates and initializes a static char * array with name <_arrayName>.
++    \note creates and initializes a static Char * array with name <_arrayName>.
+     \attention only use inside c file.
+ */
+ #define HW_MBOX_MASTER_TABLE_STRS( _arrayName ) \
+-    static const char *_arrayName[] =                      \
++    static const Char * _arrayName[] =                     \
+     {                                                      \
+         HW_MBOX_MASTER_TABLE(HW_MBOX_MASTER_TABLE_AS_STRS) \
+-        '\0'                                               \
++        NULL                                               \
+     }
+ 
+ /*! \def HW_MBOX_MASTER_TABLE_DB( _arrayName )
+@@ -509,7 +537,7 @@ typedef enum hw_mbox_type
+ #define HW_MBOX_TYPE_STR(mboxType)    ( (mboxType) == hw_mbox_command ) ? ("Command"): \
+                                       ( (mboxType) == hw_mbox_event   ) ? ("Event"  ): \
+                                       ( (mboxType) == hw_mbox_opcode  ) ? ("Opcode" ): \
+-                                        ("ERROR_UNKNOWN_HW_MBOX_TYPE!")
++                                        ("__ERROR_UNKNOWN_HW_MBOX_TYPE__")
+ 
+ /*! \struct hw_mbox_sram_t
+     \brief struct for Channel's SRAM configuration. */
+@@ -536,6 +564,42 @@ typedef struct hw_mbox_channelConfig
+     \brief channel configuration struct's size. */
+ #define HW_MBOX_CHANNEL_CONFIG_SIZE    sizeof(hw_mbox_channelConfig_t)
+ 
++/*! \struct hw_mbox_masterPhyAddresses_t
++    \brief struct for master's phyisical addresses */
++typedef struct hw_mbox_masterPhyAddresses_t
++{
++    Uint32 intr_status_low_addr;
++    Uint32 intr_status_high_addr;
++    Uint32 intr_mask_low_addr;
++    Uint32 intr_mask_high_addr;
++    Uint32 intr_clear_low_addr;
++    Uint32 intr_clear_high_addr;
++    Uint32 commander_low_addr;
++    Uint32 commander_high_addr;
++    Uint32 subject_low_addr;
++    Uint32 subject_high_addr;
++} hw_mbox_masterPhyAddresses_t;
++
++/*! \def HW_MBOX_MASTER_PHY_ADDR_SIZE
++    \brief master's physical addresses struct's size. */
++#define HW_MBOX_MASTER_PHY_ADDR_SIZE    sizeof(hw_mbox_masterPhyAddresses_t)
++
++
++/*! \struct hw_mbox_channelPhyAddresses_t
++    \brief struct for channel's phyisical addresses */
++typedef struct hw_mbox_channelPhyAddresses
++{
++    Uint32 cfgRegAddr;
++    Uint32 commandRegAddr;
++    Uint32 stateRegAddr;
++    Uint32 sramAddr;
++    Uint32 sramSize;
++} hw_mbox_channelPhyAddresses_t;
++
++/*! \def HW_MBOX_CHANNEL_PHY_ADDR_SIZE
++    \brief master's physical addresses struct's size. */
++#define HW_MBOX_CHANNEL_PHY_ADDR_SIZE    sizeof(hw_mbox_channelPhyAddresses_t)
++
+ /****************************************************
+ |                                                   |
+ |        HW_MBOX Opcode                             |
+@@ -766,15 +830,20 @@ typedef Uint8 __hwMbox_opcodeMessageSize
+ /*       +--------------------------------------------------------------------------------------------------------------------------+ */ \
+     ENTRY(    0  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_BBU_C                , hw_mbox_command          , 0         )    \
+     ENTRY(    1  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_PHY_CPU              , hw_mbox_command          , 32        )    \
+-    ENTRY(    2  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_command          , 0         )    \
++    ENTRY(    2  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_opcode           , 8         )    \
+     ENTRY(    3  , HW_MBOX_MASTER_BBU_C                , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
+-    ENTRY(    4  , HW_MBOX_MASTER_PHY_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 136       )    \
++    ENTRY(    4  , HW_MBOX_MASTER_PHY_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 608       )    \
+     ENTRY(    5  , HW_MBOX_MASTER_MOCA_C               , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
+     ENTRY(    6  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_BBU_C                , hw_mbox_opcode           , 8         )    \
+-    ENTRY(    7  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_APP_CPU              , hw_mbox_opcode           , 128       )    \
++    ENTRY(    7  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_APP_CPU              , hw_mbox_opcode           , 64        )    \
+     ENTRY(    8  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_PHY_CPU              , hw_mbox_opcode           , 8         )    \
+     ENTRY(    9  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_opcode           , 8         )    \
+-    ENTRY(   10  , HW_MBOX_MASTER_APP_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_opcode           , 128       )
++    ENTRY(   10  , HW_MBOX_MASTER_APP_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_opcode           , 128       )    \
++    ENTRY(   11  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_RCE                  , hw_mbox_command          , 0         )    \
++    ENTRY(   12  , HW_MBOX_MASTER_RCE                  , HW_MBOX_MASTER_NP_CPU               , hw_mbox_command          , 0         )    \
++    ENTRY(   13  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_command          , 64        )    \
++    ENTRY(   14  , HW_MBOX_MASTER_MOCA_C               , HW_MBOX_MASTER_NP_CPU               , hw_mbox_command          , 64        )    \
++    ENTRY(   15  , HW_MBOX_MASTER_DS_MAC_C             , HW_MBOX_MASTER_PHY_CPU              , hw_mbox_command          , 24        )    \
+ 
+ /* static channel Table Expanders: */
+ 

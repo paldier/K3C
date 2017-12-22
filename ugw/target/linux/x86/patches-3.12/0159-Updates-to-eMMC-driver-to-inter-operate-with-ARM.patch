@@ -1,0 +1,683 @@
+From 8ba0ff426a11f6c002fe1e36b8b957357d0509d5 Mon Sep 17 00:00:00 2001
+From: Bryce Poole <Bryce.Poole@intel.com>
+Date: Mon, 14 Sep 2015 11:29:53 -0700
+Subject: [PATCH 159/441] Updates to eMMC driver to inter-operate with ARM
+
+-Added write register inhibit
+ -This caused interrupts to not be properly setup so added a power cycle
+to mmc_rescan to force initialization.
+ -Disabled Runtime PM inside the eMMC driver
+ -Added debug statements to assist in dual boot
+---
+ drivers/mmc/core/bus.c        | 20 ++++++++++++++++
+ drivers/mmc/core/core.c       | 25 +++++++++++++++++++-
+ drivers/mmc/core/mmc.c        | 39 ++++++++++++++++++++++++++++++
+ drivers/mmc/host/Kconfig      |  1 +
+ drivers/mmc/host/sdhci-acpi.c | 55 +++++++++++++++++++++++++++++++++++++++++++
+ drivers/mmc/host/sdhci-pci.c  |  1 +
+ drivers/mmc/host/sdhci.c      | 41 ++++++++++++++++++++++++++++++++
+ drivers/mmc/host/sdhci.h      |  2 ++
+ drivers/mmc/pm.h              |  9 +++++++
+ include/linux/mmc/host.h      |  1 +
+ include/linux/mmc/sdhci.h     |  4 ++++
+ 11 files changed, 197 insertions(+), 1 deletion(-)
+ mode change 100644 => 100755 drivers/mmc/host/Kconfig
+ create mode 100644 drivers/mmc/pm.h
+ mode change 100644 => 100755 include/linux/mmc/host.h
+ mode change 100644 => 100755 include/linux/mmc/sdhci.h
+
+--- a/drivers/mmc/core/bus.c
++++ b/drivers/mmc/core/bus.c
+@@ -25,6 +25,8 @@
+ #include "sdio_cis.h"
+ #include "bus.h"
+ 
++#include "../pm.h"
++
+ #define to_mmc_driver(d)	container_of(d, struct mmc_driver, drv)
+ 
+ static ssize_t type_show(struct device *dev,
+@@ -209,6 +211,24 @@ static int mmc_runtime_idle(struct devic
+ {
+ 	return 0;
+ }
++#else
++static int mmc_runtime_suspend(struct device *dev)
++{
++    mDBG("Disabled PM_RUNTIME");
++	return 0;
++}
++
++static int mmc_runtime_resume(struct device *dev)
++{
++    mDBG("Disabled PM_RUNTIME");
++	return 0;
++}
++
++static int mmc_runtime_idle(struct device *dev)
++{
++    mDBG("Disabled PM_RUNTIME");
++	return 0;
++}
+ 
+ #endif /* !CONFIG_PM_RUNTIME */
+ 
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -48,6 +48,7 @@
+ #include "mmc_ops.h"
+ #include "sd_ops.h"
+ #include "sdio_ops.h"
++#include "../pm.h"
+ 
+ #ifdef CONFIG_HW_MUTEXES
+ #include <linux/hw_mutex.h>
+@@ -1050,7 +1051,10 @@ int __mmc_claim_host(struct mmc_host *ho
+ 
+ 	if((host->claimer == current) && (host->claim_cnt == 1)) {
+ 	  spin_unlock_irqrestore(&host->lock, flags);
+-	  LOCK_EMMC_HW_MUTEX(host);
++      if ((host->caps2 & MMC_CAP2_DISABLE_HW_MUTEX_LOCK) == 0)
++      {
++          LOCK_EMMC_HW_MUTEX(host);
++      }
+ 	}
+ 	else {
+ 	  spin_unlock_irqrestore(&host->lock, flags);
+@@ -1092,7 +1096,10 @@ void mmc_release_host(struct mmc_host *h
+ 
+ #ifdef CONFIG_HW_MUTEXES
+ 
++      if ((host->caps2 & MMC_CAP2_DISABLE_HW_MUTEX_LOCK) == 0)
++      {
+ 		UNLOCK_EMMC_HW_MUTEX(host);
++      }
+ 
+ #endif
+ 
+@@ -1687,7 +1694,9 @@ void mmc_set_driver_type(struct mmc_host
+ void mmc_power_up(struct mmc_host *host, u32 ocr)
+ {
+ 	if (host->ios.power_mode == MMC_POWER_ON)
++    {
+ 		return;
++    }
+ 
+ 	mmc_host_clk_hold(host);
+ 
+@@ -1728,7 +1737,9 @@ void mmc_power_up(struct mmc_host *host,
+ void mmc_power_off(struct mmc_host *host)
+ {
+ 	if (host->ios.power_mode == MMC_POWER_OFF)
++    {
+ 		return;
++    }
+ 
+ 	mmc_host_clk_hold(host);
+ 
+@@ -2639,6 +2650,16 @@ void mmc_rescan(struct work_struct *work
+ 	}
+ 
+ 	mmc_claim_host(host);
++
++    printk(KERN_WARNING "DBG: %s():%d Disabling HW Mutex locking.\n", __FUNCTION__, __LINE__);
++    host->caps2 |= MMC_CAP2_DISABLE_HW_MUTEX_LOCK;
++    printk(KERN_WARNING "DBG: %s():%d Power on- emmc before freq rescan\n", __FUNCTION__, __LINE__);
++	mmc_power_up(host, host->ocr_avail);
++    printk(KERN_WARNING "DBG: %s():%d Done-Power on emmc before freq rescan\n", __FUNCTION__, __LINE__);
++    printk(KERN_WARNING "DBG: %s():%d Power cycling emmc before freq rescan\n", __FUNCTION__, __LINE__);
++	mmc_power_cycle(host, host->ocr_avail);
++    printk(KERN_WARNING "DBG: %s():%d Done-Power cycling emmc before freq rescan\n", __FUNCTION__, __LINE__);
++
+ 	for (i = 0; i < ARRAY_SIZE(freqs); i++) {
+ 		if (!mmc_rescan_try_freq(host, max(freqs[i], host->f_min))) {
+ 			extend_wakelock = true;
+@@ -2647,6 +2668,8 @@ void mmc_rescan(struct work_struct *work
+ 		if (freqs[i] <= host->f_min)
+ 			break;
+ 	}
++    host->caps2 &= ~MMC_CAP2_DISABLE_HW_MUTEX_LOCK;
++    printk(KERN_WARNING "DBG: %s():%d Enabling HW Mutex locking.\n", __FUNCTION__, __LINE__);
+ 	mmc_release_host(host);
+ 
+  out:
+--- a/drivers/mmc/core/mmc.c
++++ b/drivers/mmc/core/mmc.c
+@@ -23,6 +23,7 @@
+ #include "bus.h"
+ #include "mmc_ops.h"
+ #include "sd_ops.h"
++#include "../pm.h"
+ 
+ static const unsigned int tran_exp[] = {
+ 	10000,		100000,		1000000,	10000000,
+@@ -1700,6 +1701,43 @@ out:
+ 	return err;
+ }
+ 
++#if 1
++static int mmc_suspend(struct mmc_host *host)
++{
++    mDBG();
++	return 0;
++}
++static int _mmc_resume(struct mmc_host *host)
++{
++    mDBG();
++    return 0;
++}
++static int mmc_shutdown(struct mmc_host *host)
++{
++    mDBG();
++	return 0;
++}
++static int mmc_resume(struct mmc_host *host)
++{
++    mDBG();
++    return 0;
++}
++static int mmc_runtime_suspend(struct mmc_host *host)
++{
++    mDBG();
++    return 0;
++}
++static int mmc_runtime_resume(struct mmc_host *host)
++{
++    mDBG();
++    return 0;
++}
++static int mmc_power_restore(struct mmc_host *host)
++{
++    mDBG();
++    return 0;
++}
++#else
+ /*
+  * Suspend callback
+  */
+@@ -1825,6 +1863,7 @@ static int mmc_power_restore(struct mmc_
+ 
+ 	return ret;
+ }
++#endif
+ 
+ static const struct mmc_bus_ops mmc_ops = {
+ 	.remove = mmc_remove,
+--- a/drivers/mmc/host/Kconfig
++++ b/drivers/mmc/host/Kconfig
+@@ -84,6 +84,7 @@ config MMC_RICOH_MMC
+ config MMC_SDHCI_ACPI
+ 	tristate "SDHCI support for ACPI enumerated SDHCI controllers"
+ 	depends on MMC_SDHCI && ACPI
++	select MMC_SDHCI_IO_ACCESSORS
+ 	help
+ 	  This selects support for ACPI enumerated SDHCI controllers,
+ 	  identified by ACPI Compatibility ID PNP0D40 or specific
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@ -46,6 +46,7 @@
+ #include <linux/mmc/slot-gpio.h>
+ 
+ #include "sdhci.h"
++#include "../pm.h"
+ 
+ #ifdef CONFIG_HW_MUTEXES
+ #include <linux/hw_mutex.h>
+@@ -110,6 +111,51 @@ static void sdhci_acpi_int_hw_reset(stru
+ 	usleep_range(300, 1000);
+ }
+ 
++void cgm_write_l(struct sdhci_host *host, u32 val, int reg)
++{
++    if (!EMMC_HW_MUTEX_IS_LOCKED(host))
++    {
++        mDBG("----------------------------------------------------");
++        mDBG("WRITE CALLED WITHOUT HW_MUTEX BEING LOCKED!!!!!!!!!!");
++        mDBG("----------------------------------------------------");
++    }
++
++    if ((host->flags & SDHCI_DISABLE_REGISTER_WRITE) == 0)
++        writel(val, host->ioaddr + reg);
++    else
++        printk(KERN_WARNING "DBG: %s:%d Skipping write\n", __FUNCTION__, __LINE__);
++}
++
++void cgm_write_w(struct sdhci_host *host, u16 val, int reg)
++{
++    if (!EMMC_HW_MUTEX_IS_LOCKED(host))
++    {
++        mDBG("----------------------------------------------------");
++        mDBG("WRITE CALLED WITHOUT HW_MUTEX BEING LOCKED!!!!!!!!!!");
++        mDBG("----------------------------------------------------");
++    }
++
++    if ((host->flags & SDHCI_DISABLE_REGISTER_WRITE) == 0)
++        writew(val, host->ioaddr + reg);
++    else
++        printk(KERN_WARNING "DBG: %s:%d Skipping write\n", __FUNCTION__, __LINE__);
++}
++
++void cgm_write_b(struct sdhci_host *host, u8 val, int reg)
++{
++    if (!EMMC_HW_MUTEX_IS_LOCKED(host))
++    {
++        mDBG("----------------------------------------------------");
++        mDBG("WRITE CALLED WITHOUT HW_MUTEX BEING LOCKED!!!!!!!!!!");
++        mDBG("----------------------------------------------------");
++    }
++
++    if ((host->flags & SDHCI_DISABLE_REGISTER_WRITE) == 0)
++        writeb(val, host->ioaddr + reg);
++    else
++        printk(KERN_WARNING "DBG: %s:%d Skipping write\n", __FUNCTION__, __LINE__);
++}
++
+ static const struct sdhci_ops sdhci_acpi_ops_dflt = {
+ 	.enable_dma = sdhci_acpi_enable_dma,
+ };
+@@ -117,6 +163,9 @@ static const struct sdhci_ops sdhci_acpi
+ static const struct sdhci_ops sdhci_acpi_ops_int = {
+ 	.enable_dma = sdhci_acpi_enable_dma,
+ 	.hw_reset   = sdhci_acpi_int_hw_reset,
++    .write_l = cgm_write_l,
++    .write_w = cgm_write_w,
++    .write_b = cgm_write_b,
+ };
+ 
+ static const struct sdhci_acpi_chip sdhci_acpi_chip_int = {
+@@ -473,8 +522,14 @@ static int sdhci_acpi_probe(struct platf
+ 
+ 	LOCK_EMMC_HW_MUTEX(host->mmc);
+ 
++    host->flags |= SDHCI_DISABLE_REGISTER_WRITE;
++    printk(KERN_WARNING "DBG: %s():%d Disabling writes. Flags:0x%08X\n", __FUNCTION__, __LINE__, host->flags);
++
+ 	err = sdhci_add_host(host);
+ 
++    host->flags &= ~SDHCI_DISABLE_REGISTER_WRITE;
++    printk(KERN_WARNING "DBG: %s():%d Clearing disable write. Flags:0x%08X\n", __FUNCTION__, __LINE__, host->flags);
++
+ 	UNLOCK_EMMC_HW_MUTEX(host->mmc);
+ 
+ #else 
+--- a/drivers/mmc/host/sdhci-pci.c
++++ b/drivers/mmc/host/sdhci-pci.c
+@@ -29,6 +29,7 @@
+ #include <linux/hw_mutex.h>
+ #endif
+ #include "sdhci.h"
++#include "../pm.h"
+ #include "sdhci-pci.h"
+ 
+ /*****************************************************************************\
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -35,6 +35,8 @@
+ #endif
+ #include "sdhci.h"
+ 
++#include "../pm.h"
++
+ #define DRIVER_NAME "sdhci"
+ 
+ #define DBG(f, x...) \
+@@ -65,17 +67,21 @@ static void sdhci_runtime_pm_bus_off(str
+ #else
+ static inline int sdhci_runtime_pm_get(struct sdhci_host *host)
+ {
++    mDBG();
+ 	return 0;
+ }
+ static inline int sdhci_runtime_pm_put(struct sdhci_host *host)
+ {
++    mDBG();
+ 	return 0;
+ }
+ static void sdhci_runtime_pm_bus_on(struct sdhci_host *host)
+ {
++    mDBG();
+ }
+ static void sdhci_runtime_pm_bus_off(struct sdhci_host *host)
+ {
++    mDBG();
+ }
+ #endif
+ 
+@@ -156,6 +162,7 @@ static void sdhci_clear_set_irqs(struct
+ {
+ 	u32 ier;
+ 
++    mDBG("clear:0x%08x set:0x%08x", clear, set);
+ 	ier = sdhci_readl(host, SDHCI_INT_ENABLE);
+ 	ier &= ~clear;
+ 	ier |= set;
+@@ -193,11 +200,13 @@ static void sdhci_set_card_detection(str
+ 
+ static void sdhci_enable_card_detection(struct sdhci_host *host)
+ {
++    mDBG();
+ 	sdhci_set_card_detection(host, true);
+ }
+ 
+ static void sdhci_disable_card_detection(struct sdhci_host *host)
+ {
++    mDBG();
+ 	sdhci_set_card_detection(host, false);
+ }
+ 
+@@ -206,6 +215,7 @@ static void sdhci_reset(struct sdhci_hos
+ 	unsigned long timeout;
+ 	u32 uninitialized_var(ier);
+ 
++    mDBG("mask:0x%x\n", mask);
+ 	if (host->quirks & SDHCI_QUIRK_NO_CARD_NO_RESET) {
+ 		if (!(sdhci_readl(host, SDHCI_PRESENT_STATE) &
+ 			SDHCI_CARD_PRESENT))
+@@ -258,6 +268,7 @@ static void sdhci_set_ios(struct mmc_hos
+ 
+ static void sdhci_init(struct sdhci_host *host, int soft)
+ {
++    mDBG("soft:%d", soft);
+ 	if (soft)
+ 		sdhci_reset(host, SDHCI_RESET_CMD|SDHCI_RESET_DATA);
+ 	else
+@@ -278,6 +289,7 @@ static void sdhci_init(struct sdhci_host
+ 
+ static void sdhci_reinit(struct sdhci_host *host)
+ {
++    mDBG();
+ 	sdhci_init(host, 0);
+ 	/*
+ 	 * Retuning stuffs are affected by different cards inserted and only
+@@ -919,11 +931,13 @@ static void sdhci_set_transfer_mode(stru
+ 	u16 mode;
+ 	struct mmc_data *data = cmd->data;
+ 
++    mDBG();
+ 	if (data == NULL) {
+ 		/* clear Auto CMD settings for no data CMDs */
+ 		mode = sdhci_readw(host, SDHCI_TRANSFER_MODE);
+ 		sdhci_writew(host, mode & ~(SDHCI_TRNS_AUTO_CMD12 |
+ 				SDHCI_TRNS_AUTO_CMD23), SDHCI_TRANSFER_MODE);
++        mDBG("Clear Auto CMD: Transfer mode:0x%04x", mode);
+ 		return;
+ 	}
+ 
+@@ -953,6 +967,7 @@ static void sdhci_set_transfer_mode(stru
+ 	if (host->flags & SDHCI_REQ_USE_DMA)
+ 		mode |= SDHCI_TRNS_DMA;
+ 
++    mDBG("Normal: Transfer mode:0x%04x", mode);
+ 	sdhci_writew(host, mode, SDHCI_TRANSFER_MODE);
+ }
+ 
+@@ -1148,6 +1163,7 @@ static u16 sdhci_get_preset_value(struct
+ {
+ 	u16 ctrl, preset = 0;
+ 
++    mDBG();
+ 	ctrl = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+ 
+ 	switch (ctrl & SDHCI_CTRL_UHS_MASK) {
+@@ -1185,6 +1201,7 @@ static void sdhci_set_clock(struct sdhci
+ 	u16 clk = 0;
+ 	unsigned long timeout;
+ 
++    mDBG();
+ 	if (clock && clock == host->clock)
+ 		return;
+ 
+@@ -1298,6 +1315,7 @@ static inline void sdhci_update_clock(st
+ {
+ 	unsigned int clock;
+ 
++    mDBG();
+ 	clock = host->clock;
+ 	host->clock = 0;
+ 	sdhci_set_clock(host, clock);
+@@ -1307,6 +1325,7 @@ static int sdhci_set_power(struct sdhci_
+ {
+ 	u8 pwr = 0;
+ 
++    mDBG();
+ 	if (power != (unsigned short)-1) {
+ 		switch (1 << power) {
+ 		case MMC_VDD_165_195:
+@@ -1381,6 +1400,7 @@ static void sdhci_request(struct mmc_hos
+ 	unsigned long flags;
+ 	u32 tuning_opcode;
+ 
++    mDBG();
+ 	host = mmc_priv(mmc);
+ 
+ 	sdhci_runtime_pm_get(host);
+@@ -1514,6 +1534,7 @@ static void sdhci_do_set_ios(struct sdhc
+ 	int vdd_bit = -1;
+ 	u8 ctrl;
+ 
++    mDBG();
+ 	spin_lock_irqsave(&host->lock, flags);
+ 
+ 	if (host->flags & SDHCI_DEVICE_DEAD) {
+@@ -1528,6 +1549,7 @@ static void sdhci_do_set_ios(struct sdhc
+ 	 * Should clear out any weird states.
+ 	 */
+ 	if (ios->power_mode == MMC_POWER_OFF) {
++        mDBG("Requesting power off. Set Signal to 0.");
+ 		sdhci_writel(host, 0, SDHCI_SIGNAL_ENABLE);
+ 		sdhci_reinit(host);
+ 	}
+@@ -1727,6 +1749,7 @@ static void sdhci_set_ios(struct mmc_hos
+ {
+ 	struct sdhci_host *host = mmc_priv(mmc);
+ 
++    mDBG();
+ 	sdhci_runtime_pm_get(host);
+ 	sdhci_do_set_ios(host, ios);
+ 	sdhci_runtime_pm_put(host);
+@@ -1736,6 +1759,7 @@ static int sdhci_do_get_cd(struct sdhci_
+ {
+ 	int gpio_cd = mmc_gpio_get_cd(host->mmc);
+ 
++    mDBG();
+ 	if (host->flags & SDHCI_DEVICE_DEAD)
+ 		return 0;
+ 
+@@ -1757,6 +1781,7 @@ static int sdhci_get_cd(struct mmc_host
+ 	struct sdhci_host *host = mmc_priv(mmc);
+ 	int ret;
+ 
++    mDBG();
+ 	sdhci_runtime_pm_get(host);
+ 	ret = sdhci_do_get_cd(host);
+ 	sdhci_runtime_pm_put(host);
+@@ -1768,6 +1793,7 @@ static int sdhci_check_ro(struct sdhci_h
+ 	unsigned long flags;
+ 	int is_readonly;
+ 
++    mDBG();
+ 	spin_lock_irqsave(&host->lock, flags);
+ 
+ 	if (host->flags & SDHCI_DEVICE_DEAD)
+@@ -1791,6 +1817,7 @@ static int sdhci_do_get_ro(struct sdhci_
+ {
+ 	int i, ro_count;
+ 
++    mDBG();
+ 	if (!(host->quirks & SDHCI_QUIRK_UNSTABLE_RO_DETECT))
+ 		return sdhci_check_ro(host);
+ 
+@@ -1809,6 +1836,7 @@ static void sdhci_hw_reset(struct mmc_ho
+ {
+ 	struct sdhci_host *host = mmc_priv(mmc);
+ 
++    mDBG();
+ 	if (host->ops && host->ops->hw_reset)
+ 		host->ops->hw_reset(host);
+ }
+@@ -1818,6 +1846,7 @@ static int sdhci_get_ro(struct mmc_host
+ 	struct sdhci_host *host = mmc_priv(mmc);
+ 	int ret;
+ 
++    mDBG();
+ 	sdhci_runtime_pm_get(host);
+ 	ret = sdhci_do_get_ro(host);
+ 	sdhci_runtime_pm_put(host);
+@@ -1862,6 +1891,7 @@ static int sdhci_do_start_signal_voltage
+ 	u16 ctrl;
+ 	int ret;
+ 
++    mDBG();
+ 	/*
+ 	 * Signal Voltage Switching is only applicable for Host Controllers
+ 	 * v3.00 and above.
+@@ -1949,6 +1979,7 @@ static int sdhci_start_signal_voltage_sw
+ 	struct sdhci_host *host = mmc_priv(mmc);
+ 	int err;
+ 
++    mDBG();
+ 	if (host->version < SDHCI_SPEC_300)
+ 		return 0;
+ 	sdhci_runtime_pm_get(host);
+@@ -1962,6 +1993,7 @@ static int sdhci_card_busy(struct mmc_ho
+ 	struct sdhci_host *host = mmc_priv(mmc);
+ 	u32 present_state;
+ 
++    mDBG();
+ 	sdhci_runtime_pm_get(host);
+ 	/* Check whether DAT[3:0] is 0000 */
+ 	present_state = sdhci_readl(host, SDHCI_PRESENT_STATE);
+@@ -1980,6 +2012,7 @@ static int sdhci_execute_tuning(struct m
+ 	bool requires_tuning_nonuhs = false;
+ 	unsigned long flags;
+ 
++    mDBG();
+ 	host = mmc_priv(mmc);
+ 
+ 	sdhci_runtime_pm_get(host);
+@@ -2195,6 +2228,7 @@ static void sdhci_enable_preset_value(st
+ {
+ 	u16 ctrl;
+ 
++    mDBG();
+ 	/* Host Controller v3.00 defines preset value registers */
+ 	if (host->version < SDHCI_SPEC_300)
+ 		return;
+@@ -2406,6 +2440,7 @@ static void sdhci_timeout_timer(unsigned
+ 	struct sdhci_host *host;
+ 	unsigned long flags;
+ 
++    mDBG();
+ 	host = (struct sdhci_host*)data;
+ 
+ 	spin_lock_irqsave(&host->lock, flags);
+@@ -2437,6 +2472,7 @@ static void sdhci_tuning_timer(unsigned
+ 	struct sdhci_host *host;
+ 	unsigned long flags;
+ 
++    mDBG();
+ 	host = (struct sdhci_host *)data;
+ 
+ 	spin_lock_irqsave(&host->lock, flags);
+@@ -2661,6 +2697,7 @@ static irqreturn_t sdhci_irq(int irq, vo
+ 	
+ 	if (host->flags & SDHCI_SUPPORT_HW_MUTEX) {
+ 	  if (!EMMC_HW_MUTEX_IS_LOCKED(host->mmc)) {
++          mDBG("HW MUTEX NOT LOCKED. IGNORING INTERRUPT.");
+ 	      return IRQ_NONE;
+ 	  }
+ 	}
+@@ -2785,6 +2822,7 @@ void sdhci_enable_irq_wakeups(struct sdh
+ 	u8 val;
+ 	u8 mask = SDHCI_WAKE_ON_INSERT | SDHCI_WAKE_ON_REMOVE
+ 			| SDHCI_WAKE_ON_INT;
++    mDBG();
+ 
+ 	val = sdhci_readb(host, SDHCI_WAKE_UP_CONTROL);
+ 	val |= mask ;
+@@ -2801,6 +2839,7 @@ void sdhci_disable_irq_wakeups(struct sd
+ 	u8 mask = SDHCI_WAKE_ON_INSERT | SDHCI_WAKE_ON_REMOVE
+ 			| SDHCI_WAKE_ON_INT;
+ 
++    mDBG();
+ 	val = sdhci_readb(host, SDHCI_WAKE_UP_CONTROL);
+ 	val &= ~mask;
+ 	sdhci_writeb(host, val, SDHCI_WAKE_UP_CONTROL);
+@@ -2809,6 +2848,7 @@ EXPORT_SYMBOL_GPL(sdhci_disable_irq_wake
+ 
+ int sdhci_suspend_host(struct sdhci_host *host)
+ {
++    mDBG();
+ 	if (host->ops->platform_suspend)
+ 		host->ops->platform_suspend(host);
+ 
+@@ -2836,6 +2876,7 @@ int sdhci_resume_host(struct sdhci_host
+ {
+ 	int ret = 0;
+ 
++    mDBG();
+ 	if (host->flags & (SDHCI_USE_SDMA | SDHCI_USE_ADMA)) {
+ 		if (host->ops->enable_dma)
+ 			host->ops->enable_dma(host);
+--- a/drivers/mmc/host/sdhci.h
++++ b/drivers/mmc/host/sdhci.h
+@@ -20,6 +20,8 @@
+ 
+ #include <linux/mmc/sdhci.h>
+ 
++#include "../pm.h"
++
+ /*
+  * Controller registers
+  */
+--- /dev/null
++++ b/drivers/mmc/pm.h
+@@ -0,0 +1,9 @@
++#undef CONFIG_PM_RUNTIME
++
++#define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
++#define mDBG(M, ...)                                                                     \
++{                                                                                        \
++    printk(KERN_WARNING "pid:%d DBG: %s()-%d:%s " M "\n",                                \
++            current->pid,  __FUNCTION__, __LINE__,                                       \
++            __FILENAME__, ##__VA_ARGS__);                                                \
++}
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -293,6 +293,7 @@ struct mmc_host {
+ #define MMC_CAP2_HS400		(MMC_CAP2_HS400_1_8V | \
+ 				 MMC_CAP2_HS400_1_2V)
+ #define MMC_CAP2_CAN_DO_CMDQ	(1 << 19)
++#define MMC_CAP2_DISABLE_HW_MUTEX_LOCK (1 << 21)
+ 
+ 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
+ 
+--- a/include/linux/mmc/sdhci.h
++++ b/include/linux/mmc/sdhci.h
+@@ -144,6 +144,7 @@ struct sdhci_host {
+ #define SDHCI_SUPPORT_HW_MUTEX    (1<<15)
+   /* Two or more processors access the controller, HW mutex is needed to avoid control conflicts. */
+ #endif  
++#define SDHCI_DISABLE_REGISTER_WRITE  (1<<16)
+ 	unsigned int version;	/* SDHCI spec. version */
+ 
+ 	unsigned int max_clk;	/* Max possible freq (MHz) */
+@@ -208,8 +209,10 @@ void unlock_emmc_access(void);
+ #define LOCK_EMMC_HW_MUTEX(host) do{\
+   if (((struct sdhci_host *)host->private)->flags & SDHCI_SUPPORT_HW_MUTEX)\
+     {\
++      printk(KERN_WARNING "DBG: %s():%d pid:%d Locking HW Mutex\n", __FUNCTION__, __LINE__, current->pid); \
+       if (netss_driver_ready()) \
+         hw_mutex_lock(HW_MUTEX_EMMC);\
++      printk(KERN_WARNING "DBG: %s():%d pid:%d Locked HW Mutex\n", __FUNCTION__, __LINE__, current->pid); \
+       lock_emmc_access();\
+       enable_irq(((struct sdhci_host *)host->private)->irq);\
+     }\
+@@ -218,6 +221,7 @@ void unlock_emmc_access(void);
+ #define UNLOCK_EMMC_HW_MUTEX(host) do{\
+   if (((struct sdhci_host *)host->private)->flags & SDHCI_SUPPORT_HW_MUTEX)\
+     {\
++      printk(KERN_WARNING "DBG: %s():%d pid:%d Unlocking HW Mutex\n", __FUNCTION__, __LINE__, current->pid); \
+       disable_irq(((struct sdhci_host *)host->private)->irq);\
+       unlock_emmc_access();\
+       if (netss_driver_ready()) \

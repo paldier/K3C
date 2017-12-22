@@ -1,0 +1,343 @@
+From e6c87bfcf327a37528edda7551dc579c11f64518 Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Mon, 5 Sep 2016 16:21:21 +0300
+Subject: [PATCH 25/69] hostapd: radar simulation
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ hostapd/config_file.c   |   9 ++++
+ hostapd/main.c          |   3 ++
+ src/ap/ap_config.h      |   2 +
+ src/ap/dfs.c            | 113 ++++++++++++++++++++++++++++++++++++++++++++----
+ src/ap/dfs.h            |   3 +-
+ src/ap/drv_callbacks.c  |  20 +++++++++
+ src/ap/hostapd.c        |   5 ++-
+ src/common/ltq-vendor.h |   1 +
+ 8 files changed, 146 insertions(+), 10 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 3a6d371..75c5d47 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2701,6 +2701,15 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 				   line);
+ 			return 1;
+ 		}
++	} else if (os_strcmp(buf, "dfs_debug_chan") == 0) {
++		int val = atoi(pos);
++		if (val < 32 || val > 196)
++		{
++			wpa_printf(MSG_ERROR, "Line %d: invalid dfs debug channel %d",
++					 line, val);
++			return 1;
++		}
++		conf->dfs_debug_chan = val;
+ 	} else if (os_strcmp(buf, "beacon_int") == 0) {
+ 		int val = atoi(pos);
+ 		/* MIB defines range as 1..65535, but very small values
+diff --git a/hostapd/main.c b/hostapd/main.c
+index 97a3ce2..3297d6b 100644
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -24,6 +24,7 @@
+ #include "ap/hostapd.h"
+ #include "ap/ap_config.h"
+ #include "ap/ap_drv_ops.h"
++#include "ap/dfs.h"
+ #include "fst/fst.h"
+ #include "config_file.h"
+ #include "eap_register.h"
+@@ -857,6 +858,8 @@ int main(int argc, char *argv[])
+ 
+ 	hostapd_global_ctrl_iface_init(&interfaces);
+ 
++	hostapd_dfs_debug_channel_init(interfaces.iface[0]);
++
+ 	if (hostapd_global_run(&interfaces, daemonize, pid_file)) {
+ 		wpa_printf(MSG_ERROR, "Failed to start eloop");
+ 		goto out;
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 757f2ac..0151780 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -602,6 +602,8 @@ struct hostapd_config {
+ 	size_t num_bss;
+ 
+ 	u16 beacon_int;
++	u8  dfs_debug_chan;
++	u8  dfs_dbg_need_cac;
+ 	int rts_threshold;
+ 	int fragm_threshold;
+ 	u8 send_probe_response;
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 47adba7..4958322 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -13,6 +13,7 @@
+ #include "common/ieee802_11_defs.h"
+ #include "common/hw_features_common.h"
+ #include "common/wpa_ctrl.h"
++#include "common/ltq-vendor.h"
+ #include "hostapd.h"
+ #include "ap_drv_ops.h"
+ #include "drivers/driver.h"
+@@ -643,7 +644,7 @@ static unsigned int dfs_get_cac_time(struct hostapd_iface *iface,
+  * 0 - channel/ap setup will be continued after CAC
+  * -1 - hit critical error
+  */
+-int hostapd_handle_dfs(struct hostapd_iface *iface)
++int hostapd_handle_dfs(struct hostapd_iface *iface, Boolean *dfs_dbg_set_beacon)
+ {
+ 	struct hostapd_channel_data *channel;
+ 	int res, n_chans, n_chans1, start_chan_idx, start_chan_idx1;
+@@ -688,12 +689,25 @@ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ 		wpa_printf(MSG_DEBUG,
+ 			   "DFS all channels available, (SKIP CAC): %s",
+ 			   res ? "yes" : "no");
+-		if (res)
++		if (res) {
++			if (iface->conf->dfs_debug_chan && iface->bss[0]->started) {
++				wpa_printf(MSG_INFO, "DFS_DEBUG: Will set beacons and skip CAC");
++				*dfs_dbg_set_beacon = TRUE;
++			}
+ 			return 1;
++		}
+ 
+ 		/* Check if any of configured channels is unavailable */
+ 		res = dfs_check_chans_unavailable(iface, start_chan_idx,
+ 						  n_chans);
++
++		/* For radar simulation */
++		/* Allow to switch to the unavailable channel for dfs debug */
++		if (res && iface->conf->dfs_debug_chan) {
++			wpa_printf(MSG_INFO, "DFS_DEBUG: Forcing to stay on the channel %u", iface->conf->channel);
++			res = 0;
++		}
++
+ 		wpa_printf(MSG_DEBUG, "DFS %d chans unavailable - choose other channel: %s",
+ 			   res, res ? "yes": "no");
+ 		if (res) {
+@@ -775,6 +789,46 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 	return 0;
+ }
+ 
++static struct hostapd_channel_data *
++dfs_get_debug_dfs_chan(struct hostapd_iface *iface,
++											 int *secondary_channel,
++											 u8 *vht_oper_centr_freq_seg0_idx,
++											 u8 *vht_oper_centr_freq_seg1_idx)
++{
++	int i, found = 0;
++	struct hostapd_channel_data *channel;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++
++	for (i = 0; i < mode->num_channels; i++) {
++		channel = &mode->channels[i];
++
++		if (channel->chan == iface->conf->dfs_debug_chan) {
++			wpa_printf(MSG_INFO, "DFS_DEBUG: Selected ch. #%d", channel->chan);
++			found = 1;
++			break;
++		}
++	}
++
++	if (!found) {
++		wpa_printf(MSG_INFO, "DFS_DEBUG: Did not find ch. #%d", iface->conf->dfs_debug_chan);
++		return NULL;
++	}
++
++	if (iface->conf->secondary_channel)
++		*secondary_channel = 1;
++	else
++		*secondary_channel = 0;
++
++	dfs_adjust_vht_center_freq(iface, channel,
++					*secondary_channel,
++					vht_oper_centr_freq_seg0_idx,
++					vht_oper_centr_freq_seg1_idx);
++
++	if (channel->flag & HOSTAPD_CHAN_RADAR)
++		iface->conf->dfs_dbg_need_cac = TRUE;
++
++	return channel;
++}
+ 
+ static int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
+ {
+@@ -787,10 +841,15 @@ static int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
+ 
+ 	/* Radar detected during active CAC */
+ 	iface->cac_started = 0;
+-	channel = dfs_get_valid_channel(iface, &secondary_channel,
+-					&vht_oper_centr_freq_seg0_idx,
+-					&vht_oper_centr_freq_seg1_idx,
+-					skip_radar);
++	if (iface->conf->dfs_debug_chan)
++		channel = dfs_get_debug_dfs_chan(iface, &secondary_channel,
++						&vht_oper_centr_freq_seg0_idx,
++						&vht_oper_centr_freq_seg1_idx);
++	else
++		channel = dfs_get_valid_channel(iface, &secondary_channel,
++						&vht_oper_centr_freq_seg0_idx,
++						&vht_oper_centr_freq_seg1_idx,
++						skip_radar);
+ 
+ 	if (!channel) {
+ 		wpa_printf(MSG_ERROR, "No valid channel available");
+@@ -840,6 +899,15 @@ static int hostapd_dfs_start_channel_switch(struct hostapd_iface *iface)
+ 	if (iface->cac_started)
+ 		return hostapd_dfs_start_channel_switch_cac(iface);
+ 
++	/* For radar simulation */
++	if(iface->conf->dfs_debug_chan) {
++		channel = dfs_get_debug_dfs_chan(iface, &secondary_channel,
++																		 &vht_oper_centr_freq_seg0_idx,
++																		 &vht_oper_centr_freq_seg1_idx);
++		if (channel)
++			goto switch_chan;
++	}
++
+ 	/* Perform channel switch/CSA */
+ 	channel = dfs_get_valid_channel(iface, &secondary_channel,
+ 					&vht_oper_centr_freq_seg0_idx,
+@@ -877,6 +945,7 @@ static int hostapd_dfs_start_channel_switch(struct hostapd_iface *iface)
+ 		return 0;
+ 	}
+ 
++switch_chan:
+ 	wpa_printf(MSG_DEBUG, "DFS will switch to a new channel %d",
+ 		   channel->chan);
+ 	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, DFS_EVENT_NEW_CHANNEL
+@@ -934,6 +1003,32 @@ static int hostapd_dfs_start_channel_switch(struct hostapd_iface *iface)
+ 	return 0;
+ }
+ 
++void hostapd_dfs_debug_channel_init(struct hostapd_iface *iface)
++{
++	int i;
++	u8 dfs_required = 0;
++	u8 debug_chan = iface->conf->dfs_debug_chan;
++	struct hostapd_channel_data *channel;
++	struct hostapd_data *hapd = iface->bss[0];
++	struct hostapd_hw_modes *mode = iface->current_mode;
++
++	
++	if (iface->conf->dfs_debug_chan) {
++		for (i = 0; i < mode->num_channels; i++) {
++			channel = &mode->channels[i];
++
++			if (channel->chan == debug_chan) {
++				if (channel->flag & HOSTAPD_CHAN_RADAR)
++					dfs_required = 1;
++				break;
++			}
++		}
++	}
++	
++	if (hostapd_drv_vendor_cmd(hapd, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_DFS_DEBUG,
++														 &dfs_required, sizeof(dfs_required), NULL))
++		wpa_printf(MSG_INFO, "Failed to send driver vendor command LTQ_NL80211_VENDOR_SUBCMD_DFS_DEBUG");
++}
+ 
+ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+ 			       int ht_enabled, int chan_offset, int chan_width,
+@@ -985,8 +1080,10 @@ int hostapd_dfs_nop_finished(struct hostapd_iface *iface, int freq,
+ 		      cf1, cf2, HOSTAPD_CHAN_DFS_USABLE);
+ 
+ 	/* Handle cases where all channels were initially unavailable */
+-	if (iface->state == HAPD_IFACE_DFS && !iface->cac_started)
+-		hostapd_handle_dfs(iface);
++	if (iface->state == HAPD_IFACE_DFS && !iface->cac_started) {
++		Boolean dfs_dbg_set_beacon = FALSE;
++		hostapd_handle_dfs(iface, &dfs_dbg_set_beacon);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/src/ap/dfs.h b/src/ap/dfs.h
+index be8c0e6..d657265 100644
+--- a/src/ap/dfs.h
++++ b/src/ap/dfs.h
+@@ -9,7 +9,7 @@
+ #ifndef DFS_H
+ #define DFS_H
+ 
+-int hostapd_handle_dfs(struct hostapd_iface *iface);
++int hostapd_handle_dfs(struct hostapd_iface *iface, Boolean *dfs_dbg_set_beacon);
+ 
+ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 			     int ht_enabled, int chan_offset, int chan_width,
+@@ -26,5 +26,6 @@ int hostapd_dfs_start_cac(struct hostapd_iface *iface, int freq,
+ 			  int ht_enabled, int chan_offset, int chan_width,
+ 			  int cf1, int cf2);
+ int hostapd_handle_dfs_offload(struct hostapd_iface *iface);
++void hostapd_dfs_debug_channel_init(struct hostapd_iface *iface);
+ 
+ #endif /* DFS_H */
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 178d2a3..f7ab315 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -541,6 +541,26 @@ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 
+ 	is_dfs = ieee80211_is_dfs(freq);
+ 
++	/* For radar simulation */
++	if (hapd->iface->conf->dfs_debug_chan) {
++		int i;
++		struct hostapd_channel_data *ch = NULL;
++		for (i = 0; i < hapd->iface->current_mode->num_channels; i++) {
++			ch = &hapd->iface->current_mode->channels[i];
++			if (ch->freq == freq)
++				break;
++		}
++
++		/* Need to Do CAC if driver switched to DFS channel and it is not available*/
++		if (ch && (ch->flag & HOSTAPD_CHAN_RADAR) && hapd->iface->conf->dfs_dbg_need_cac) {
++			wpa_printf(MSG_INFO, "DFS_DEBUG: Starting CAC on DFS channel %d", channel);
++			hostapd_cleanup_cs_params(hapd);
++			hostapd_setup_interface_complete(hapd->iface, 0);
++			hapd->iface->conf->dfs_dbg_need_cac = FALSE;
++			return;
++		} 
++	}
++
+ 	if (hapd->csa_in_progress &&
+ 	    freq == hapd->cs_freq_params.freq) {
+ 		hostapd_cleanup_cs_params(hapd);
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index ab73cf9..61c5abf 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1707,12 +1707,15 @@ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
+ 		/* Handle DFS only if it is not offloaded to the driver */
+ 		if (!(iface->drv_flags & WPA_DRIVER_FLAGS_DFS_OFFLOAD)) {
+ 			/* Check DFS */
+-			res = hostapd_handle_dfs(iface);
++			Boolean dfs_dbg_set_beacon = FALSE;
++			res = hostapd_handle_dfs(iface, &dfs_dbg_set_beacon);
+ 			if (res <= 0) {
+ 				if (res < 0)
+ 					goto fail;
+ 				return res;
+ 			}
++			if (dfs_dbg_set_beacon)
++				return ieee802_11_set_beacon(hapd);
+ 		} else {
+ 			/* If DFS is offloaded to the driver */
+ 			res_dfs_offload = hostapd_handle_dfs_offload(iface);
+diff --git a/src/common/ltq-vendor.h b/src/common/ltq-vendor.h
+index 79c3aa2..7a4015f 100644
+--- a/src/common/ltq-vendor.h
++++ b/src/common/ltq-vendor.h
+@@ -36,6 +36,7 @@ enum ltq_nl80211_vendor_subcmds {
+ 	LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL = 3,
+ 	LTQ_NL80211_VENDOR_SUBCMD_COUNTRY_CODE = 4,
+   LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE = 5,
++	LTQ_NL80211_VENDOR_SUBCMD_DFS_DEBUG = 6,
+ };
+ 
+ enum ltq_nl80211_vendor_events {
+-- 
+1.8.3.4
+

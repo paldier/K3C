@@ -1,0 +1,707 @@
+#!/bin/sh
+CONFIG_SWITCH_DEVICE_ID=0
+CONFIG_TARGET_LANTIQ_XRX300=1
+CONFIGLOADED="1"
+CONFIG_FEATURE_BR_ACCEL_SUPPORT=1
+
+get_lan_wan_ports() {
+	local section=$1
+	local ports port
+	local device
+	local vlan
+
+	config_get ports $section ports
+	config_get device $section device
+	config_get vlan $section vlan
+
+	if [ $vlan -eq 0 ] #switch_lan_ports (LAN ports)
+	then
+		for port in $ports
+		do
+			#ignore the CPU port
+			if [ $port -ne 5 ]
+			then
+				port=$((port+1))
+				if [ "X$switch_lan_ports" = "X" ]; then
+					switch_lan_ports=$port
+				else
+					switch_lan_ports="$switch_lan_ports $port"
+				fi
+			fi
+		done
+	elif [ $vlan -eq 1 ] #switch_mii1_port (WAN ports)
+	then
+		#ignore the CPU port
+		for port in $ports
+		do
+			port=${port::1} #strip the TAG info
+			if [ $port -ne 5 ]
+			then
+				port=$((port+1))
+				if [ "X$switch_mii1_port" = "X" ]; then
+					switch_mii1_port=$port
+				else
+					switch_mii1_port="$switch_mii1_port $port"
+				fi
+			fi
+		done
+	fi
+}
+##Read the UCI section and assign the LAN ports and WAN ports
+find_switchports() {
+
+	config load network
+	config_foreach get_lan_wan_ports switch_vlan
+}
+
+find_switchports
+
+cpu_port="6"
+#wan_port="5 10 11"
+if [ "$1" = "eth" ]; then
+	if [ -n "$switch_lan_ports" ]; then
+		wan_port_mii1=$switch_mii1_port
+	else
+		wan_port_mii1="5"
+	fi
+elif [ "$1" = "dsl" ]; then
+	wan_port_xdsl="10 11"
+fi
+if [ "A$CONFIG_FEATURE_WWAN_LTE_SUPPORT" = "Ay" ]; then
+	wan_port_lte="7"
+fi
+wan_port="$wan_port_mii1 $wan_port_xdsl $wan_port_lte"
+if [ -n "$switch_lan_ports" ]; then
+	lan_port=$switch_lan_ports
+else
+	lan_port="4 2 3"
+fi
+
+if [ "A$CONFIG_FEATURE_WWAN_LTE_SUPPORT" = "Ay" ]; then
+	wlan_port="8 9"
+else
+	wlan_port="7 8 9"
+fi
+#wlan_port_all="7 8 9"
+#wlan_port_lte="8 9"
+#wlan_port_ext="10 11"
+pce_rule_start="50"
+bridge_accel_Order="20"
+lan_port_all="$lan_port $wlan_port"
+lan_port_1=$(echo ${lan_port} | awk '{ print $1 }')
+
+###############################################################################################################
+# *VLAN IDs used for LAN / WAN separation inside switch.
+# *501 = LAN side VLAN.
+#  -> All LAN ports (1,2,3,4), WLAN ports (7,8,9)  will have this as PVID
+#  -> LAN ports (1,2,3,4), WLAN ports (7,8,9) & CPU port (6) will be members of this VLAN
+#  -> This ensures that # Enables isolation of a specified port from the rest of the switch
+# Any packets from packets from LAN side is not flooded to wan side
+# *500 = CPU port VLAN.
+#  -> CPU port will have this as PVID
+#  -> LAN ports(1,2,3,4),  WLAN ports (7,8,9), WAN ports (5,10,11) will be members of this VLAN
+#  -> This ensures that packets from CPU reach LAN side as well as WAN side
+#  *502 = WAN side VLAN
+#  -> All WAN ports (5,10,11) will have this PVID
+#  -> WAN ports (5,10,11) and CPU port (6) will be members of this VLAN
+#  -> This ensures that packets from WAN side is not flooded to LAN side
+###############################################################################################################
+lan_vid_all=501
+cpu_vid=500
+wan_vid=502
+
+###############################################################################################################
+# *WAN and LAN VLAN needs to have different fids so that the swithc maintains two different set of
+# switch tables which helps in maintaining the LAN / WAN isolation.
+###############################################################################################################
+lan_fid=0
+cpu_fid=0
+wan_fid=1
+
+
+###############################################################################################################
+# *VLAN ids 2050-2053 will be used internally for LAN port separation
+###############################################################################################################
+lan_vid_port_start=2050
+
+###############################################################################################################
+# *VLAN ids 2-5 will be used for creating virtual interfaces eth0.2-etho.5
+###############################################################################################################
+software_vid_port_start=`expr $lan_vid_port_start \- 2048`
+
+###############################################################################################################
+# Function to create a VLAN id by calling IFX_ETHSW_VLAN_ID_CREATE
+# Arguements:
+# $1 VLANid to be created <1-4096>
+# $2 Fid to be sepcified. <1-256>
+###############################################################################################################
+create_vlanid() {
+	switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_VLAN_ID_CREATE nVId=$1 nFId=$2
+}
+
+###############################################################################################################
+# Function to delete a specified VLAN id by using IFX_ETHSW_VLAN_ID_DELETE
+# Arguements:
+# $1 vlan id to be deleted <1-4096>
+###############################################################################################################
+delete_vlanid() {
+	switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_VLAN_ID_DELETE nVId=$1
+}
+
+###############################################################################################################
+# Function to set pvid of a specified port
+# Arguements:
+# $1 Portid <0-11>
+# $2 VLANid <1-4096>
+# $3 TVM (Transparent VLAN Mode) <0/1>
+###############################################################################################################
+config_port_pvid() {
+	switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_VLAN_PORT_CFG_SET nPortId=$1 nPortVId=$2 bVLAN_UnknownDrop=0 bVLAN_ReAssign=0 eVLAN_MemberViolation=$4 eAdmitMode=0 bTVM=$3
+}
+
+###############################################################################################################
+# Function to set add a port as member to a specified VLAN
+# Arguements:
+# $1 VLANid <1-4096>
+# $2 Portid <0-11>
+# $3 Egress tagging <0/1>
+###############################################################################################################
+config_port_member() {
+	local vid=$1
+	local port=$2
+	local egress_tag=$3
+	switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_VLAN_PORT_MEMBER_ADD nVId=$vid nPortId=$port bVLAN_TagEgress=$egress_tag
+}
+
+###############################################################################################################
+# Function to set remove a port from a vlan membership
+# Arguements:
+# $1 VLANid <1-4096>
+# $2 Portid <0-11>
+###############################################################################################################
+reset_port_member() {
+
+      local vid=$1
+      local port=$2
+      switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_VLAN_PORT_MEMBER_REMOVE nVId=$vid nPortId=$port
+}
+
+##############################################################################################################
+# Function to separate LAN and WAN interrupts (DMA channels) i.e LAN : 129 and WAN : 64
+# Applicable to SMP models ONLY
+# By default all the ports are served by DMA 129. Here we set the traffic class of WAN and WLAN ports to 3,
+# this enabled the traffic to be served using DMA 64
+##############################################################################################################
+#split_lan_wan_dma_channel() {
+#if [ -n $1 -a $1 -eq 1 ]; then
+#	port_idx=58
+#	for i in $wlan_port; do
+#		switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=$port_idx pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$i action.eTrafficClassAction=2 action.nTrafficClassAlternate=3
+#		port_idx=`expr $port_idx + 1`
+#	done
+#
+#	port_idx=61
+#	for i in $wan_port; do
+#		switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=$port_idx pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$i action.eTrafficClassAction=2 action.nTrafficClassAlternate=3
+#		port_idx=`expr $port_idx + 1`
+#	done
+#else
+#	port_idx=58
+#	for i in $wlan_port; do
+#		switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=$port_idx
+#		port_idx=`expr $port_idx + 1`
+#	done
+#
+#	port_idx=61
+#	for i in $wan_port; do
+#		switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=$port_idx
+#		port_idx=`expr $port_idx + 1`
+#	done
+#fi
+#}
+
+###############################################################################################################
+# Function to reset the switch configurations done using switch_init
+###############################################################################################################
+switch_uninit() {
+	switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_DISABLE
+
+	#reset the switch to re-configure
+	switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_HW_INIT
+	delete_vlanid $lan_vid_all
+	delete_vlanid $cpu_vid
+	delete_vlanid $wan_vid
+	switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_ENABLE
+}
+
+###############################################################################################################
+# Function to return a switch portmap corresponding to a portlist
+# Combines each port bitmap from portlist together into a hex portmap
+# Arguments:
+# $@ = Portlist <0-11>
+###############################################################################################################
+switch_port_map() {
+	for port in "$@"
+	do
+		let "portmap |= $((1 << $port))"
+	done
+	printf '0x%x' $portmap
+}
+
+###############################################################################################################
+# Enables Bridging acceleration between LAN & WAN
+# The user needs to specify a LAN interface & bridged WAN interface name to enable the bridging of packets
+# between specified LAN port and WAN port
+# IMPORTANT NOTE: ATM WAN can be plain nasX
+# input arguements
+# $1 = wan interface name (eg: ptm0.800 or eth1.100 or nas2 )
+# $2 = lan interface names (eg: eth0.2,eth0.3)
+# $3 = bridge name (eg: br0 or br1)
+###############################################################################################################
+enable_bridge_accel() {
+	local waniface
+	local wanvlan
+
+	waniface=$(echo $1 | cut -d "_" -f1)
+	if [ "${waniface::3}" = "nas" ]; then
+		local vpivci=$(sed -n '/'$waniface'/,/vcc/p' /proc/net/atm/br2684|grep vcc|sed -e 's/.*vcc 0./\1/' -e 's/:.*/\1/')
+		if [ "A${vpivci}A" != "AA" ]; then
+			waniface=$1
+			if [ "$CONFIG_TARGET_LANTIQ_XRX300" = "1" -o "$CONFIG_TARGET_LANTIQ_XRX330" = "1" ]; then
+				wanvlan=$(grep $vpivci /proc/eth/vrx318/dsl_vlan | awk '{print $5}')
+			elif [ "$CONFIG_TARGET_LANTIQ_XRX200" = "1" ]; then
+				wanvlan=$(grep $vpivci /proc/eth/dsl_vlan | awk '{print $5}')
+			fi
+		fi
+	else
+		wanvlan=$(echo $1 | cut -d "_" -f2)
+	fi
+
+	#local bridgemac=$(/sbin/ifconfig $3 | sed -e's/^.*HWaddr \([^ ]*\) .*$/\1/;t;d')
+	local lan_ifs="$2"
+	local ifs=$( echo $lan_ifs | sed -n 1'p' | tr ',' '\n') 
+	local first_lan_if=$(echo $ifs | cut -d ' ' -f1)
+	local bridgemac=`uci get network.iface_$first_lan_if.macaddr`
+	#for handling non vlan wan interface ptm0 & eth1
+	if [ "${wanvlan::3}" = "wan" ] ; then
+		if [ "${waniface}" = "ptm0" -o "${waniface}" = "eth1" ]; then
+			wanvlan=$wan_vid
+		fi
+	fi
+
+	if [ "A${waniface}A" = "AA" -o "A${wanvlan}A" = "AA" ]; then
+		echo "WAN interface is not valid!!!"
+	elif [ "A${bridgemac}A" = "AA" ]; then
+		echo "Invalid bridge name!!!"
+	else
+		if [ "${waniface::3}" = "ptm" ]; then
+			# once the below statement is called all the routed wan connections on ptmX.* will stop working
+			# please ensure that all the routed wans calls add_wan_vlanif() while wan creation
+			# disable tvm on wan if
+			if [ "$wanvlan" -ne "$wan_vid" ]; then
+				create_vlanid $wanvlan $wan_fid
+			fi
+			for i in $wan_port_xdsl; do
+				config_port_pvid $i $wan_vid 0 3
+				if [ "$wanvlan" -ne "$wan_vid" ]; then
+					config_port_member $wanvlan $i 1
+				else
+					config_port_member $wanvlan $i 0
+				fi
+			done
+		elif [ "${waniface::3}" = "nas" ]; then
+			# for nas if vlan, fid should be 0
+			create_vlanid $wanvlan 0
+			# disable tvm, set memberviolation=2 on wan if
+			# disable learning on wan if
+			for i in $wan_port_xdsl; do
+				config_port_pvid $i $wan_vid 0 2
+				switch_cli PORT_CFG_SET nPortId=$i bLearning=1
+			done
+
+		elif [ "${waniface::3}" = "eth" ]; then
+		# once the below statement is called all the routed wan connections on ethX.* will stop working
+		# please ensure that all the routed wans calls add_wan_vlanif() while wan creation
+		# disable tvm on wan if
+			if [ "$wanvlan" -ne "$wan_vid" ]; then
+				create_vlanid $wanvlan $wan_fid
+			fi
+			for i in $wan_port_mii1; do
+				config_port_pvid $i $wan_vid 0 3
+				if [ "$wanvlan" -ne "$wan_vid" ]; then
+					config_port_member $wanvlan $i 1
+				else
+					config_port_member $wanvlan $i 0
+				fi
+			done
+		fi
+
+		k=0
+		m=0
+		for lan_if in $( echo $2 | sed -n 1'p' | tr ',' '\n'); do
+			# lan port
+			if [ "${lan_if::4}" = "eth0" ]; then
+				output=`switch_cli dev=$CONFIG_SWITCH_DEVICE_ID IFX_ETHSW_VLAN_PORT_CFG_GET nPortId=$lan_port_1| grep -w nPortVId | awk '{ print $2 }'`
+				if [ "${lan_if:4:1}" = "." ]; then
+					#vlan based port separation
+					if [ "1$CONFIG_FEATURE_BR_ACCEL_SUPPORT" = "11" ]; then
+						local lanvlan=$(echo $lan_if | cut -d "." -f2)
+						j=0
+
+						for i in $lan_port; do
+							tvlan=`expr $software_vid_port_start \+ $j`
+							if [ $tvlan = $lanvlan ]; then
+								nvlan_id=`expr $lan_vid_port_start \- $software_vid_port_start \+ $lanvlan`
+								nport_id=$i
+								break
+							fi
+							j=`expr $j \+ 1`
+							k=`expr $k \+ 3`
+						done
+					else
+						if [ "$output" != "$lan_vid_port_start" ]; then
+							echo "Ports not separated, can't proceed"
+							break
+						else
+							local lanvlan=$(echo $lan_if | cut -d "." -f2)
+							j=0
+
+							for i in $lan_port; do
+								tvlan=`expr $software_vid_port_start \+ $j`
+								if [ $tvlan = $lanvlan ]; then
+									nvlan_id=`expr $lan_vid_port_start \- $software_vid_port_start \+ $lanvlan`
+									nport_id=$i
+									break
+								fi
+								j=`expr $j \+ 1`
+								k=`expr $k \+ 3`
+							done
+						fi
+					fi
+				elif [ "${lan_if:4:1}" = "_" ]; then
+					#driver based lan port separation
+					if [ "1$CONFIG_FEATURE_BR_ACCEL_SUPPORT" = "11" ]; then
+						local lanvlan=$(echo $lan_if | cut -d "_" -f2)
+						j=1
+
+						for i in $lan_port; do
+							if [ $j = $lanvlan ]; then
+								nvlan_id=$lan_vid_all
+								nport_id=$i
+								break
+							fi
+							j=`expr $j \+ 1`
+							k=`expr $k \+ 3`
+						done
+					else
+						if [ "$output" = "$lan_vid_all" ]; then
+							local lanvlan=$(echo $lan_if | cut -d "_" -f2)
+							j=1
+
+							for i in $lan_port; do
+								if [ $j = $lanvlan ]; then
+									nvlan_id=$lan_vid_all
+									nport_id=$i
+									#<--break not required-->break
+								fi
+								j=`expr $j \+ 1`
+								k=`expr $k \+ 3`
+							done
+						else
+							echo "Ports are separated, cannot proceed"
+							break
+						fi
+					fi
+				else
+					#no lan port separation
+					if [ "$output" = "$lan_vid_all" ]; then
+						nvlan_id=$lan_vid_all
+						nport_id=$lan_port
+					else
+						echo "Ports are separated, cannot proceed"
+						break
+					fi
+				fi
+			echo "lan ports = $lan_port"
+			# wireless port
+			elif [ "${lan_if::4}" = "wlan" -o "${lan_if::3}" = "ath" -o "${lan_if::3}" = "ra" ]; then
+				#wireless ports needs to be read from ppa/api/directpath
+				#ifid + 4 = portid
+				nvlan_id=$lan_vid_all
+				nport_id=$(echo `sed -n '/'"$lan_if "'/,/rx_fn_rxif_pkt/p' /proc/ppa/api/directpath` | awk '{print $7}')
+				echo "wlan port id = $nport_id"
+				if [ $nport_id -gt 0 ]; then
+					nport_id=`expr $nport_id \+ 4`
+				else
+					echo "Invalid wireless interface!!!"
+					continue
+				fi
+			fi
+
+			if [ "A${nvlan_id}A" = "AA" -o "A${nport_id}A" = "AA" ]; then
+				echo "Invalid lan port!!!" $lan_if
+				break
+			else
+				if [ "${waniface::3}" = "nas" ]; then
+					#for ATM WAN upstream traffic still goes through CPU path.
+					for i in $nport_id; do
+						config_port_member $wanvlan $i 0
+					done
+				else
+					reset_port_member $wanvlan $cpu_port
+
+					for i in $nport_id; do
+						config_port_pvid $i $wanvlan 0 3
+						config_port_member $wanvlan $i 0
+						if [ "1$CONFIG_FEATURE_BR_ACCEL_SUPPORT" != "11" ]; then
+							switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ $k` pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$i pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=FF:FF:FF:FF:FF:FF action.eVLAN_Action=2 action.nVLAN_Id=$nvlan_id
+							switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ $k \+ 1` pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$i pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=$bridgemac action.eVLAN_Action=2 action.nVLAN_Id=$nvlan_id
+							switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ $k \+ 2` pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$i pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=01:00:5E:00:00:00 pattern.nMAC_DstMask=0x03F action.eVLAN_Action=2 action.nVLAN_Id=$nvlan_id
+							k=`expr $k + 3`
+						fi
+					done
+				fi
+				if [ "1$CONFIG_FEATURE_BR_ACCEL_SUPPORT" = "11" ]; then
+					eval pce_rule_start=$bridge_accel_Order
+					config_port_member $wanvlan $cpu_port 1
+					#packets coming from WAN with VLAN $wan_vlan shall be forwarded only to the LAN ports
+					#multicast packets from WAN needs to be forwarded to CPU for Learning
+					if [ "${waniface::3}" = "ptm" ]; then
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start` pattern.bEnable=1 pattern.bVid=1 pattern.nVid=$wanvlan pattern.bPortIdEnable=1 pattern.nPortId=11 pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=01:00:5E:00:00:00 pattern.nMAC_DstMask=0x03F action.ePortMapAction=4 action.nForwardPortMap=0x40
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ 1` pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=11 pattern.bVid=1 pattern.nVid=$wanvlan action.eVLAN_CrossAction=1 action.eVLAN_Action=2 action.nVLAN_Id=$wanvlan
+					elif [ "${waniface::3}" = "nas" ]; then
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start` pattern.bEnable=1 pattern.bVid=1 pattern.nVid=$wanvlan pattern.bPortIdEnable=1 pattern.nPortId=11 pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=01:00:5E:00:00:00 pattern.nMAC_DstMask=0x03F action.ePortMapAction=4 action.nForwardPortMap=0x40
+					elif [ "${waniface::3}" = "eth" ]; then
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start` pattern.bEnable=1 pattern.bVid=1 pattern.nVid=$wanvlan pattern.bPortIdEnable=1 pattern.nPortId=$wan_port_mii1 pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=01:00:5E:00:00:00 pattern.nMAC_DstMask=0x03F action.ePortMapAction=4 action.nForwardPortMap=0x40
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ 1` pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$wan_port_mii1 pattern.bVid=1 pattern.nVid=$wanvlan action.eVLAN_CrossAction=1 action.eVLAN_Action=2 action.nVLAN_Id=$wanvlan
+					fi
+
+					# packets from CPU with VLAN = $wan_vlan shall be forwarded only to the WAN ports.
+					if [ "${waniface::3}" = "ptm" -o "${waniface::3}" = "eth" ]; then
+						# get portmap for $wan_port list of existing platform
+						forward_portmap=$(switch_port_map $wan_port)
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ 2` pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$cpu_port pattern.bVid=1 pattern.nVid=$wanvlan action.ePortMapAction=4 action.nForwardPortMap=$forward_portmap action.eVLAN_Action=2 action.nVLAN_Id=$wanvlan
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ 3` pattern.bEnable=1 pattern.bVid=0 pattern.nVid=$wanvlan pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=FF:FF:FF:FF:FF:FF action.eVLAN_Action=2 action.nVLAN_Id=$nvlan_id
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ 4` pattern.bEnable=1 pattern.bVid=0 pattern.nVid=$wanvlan pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=$bridgemac action.eVLAN_Action=2 action.nVLAN_Id=$nvlan_id
+						switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ 5` pattern.bEnable=1 pattern.bVid=0 pattern.nVid=$wanvlan pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=01:00:5E:00:00:00 pattern.nMAC_DstMask=0x03F action.eVLAN_Action=2 action.nVLAN_Id=$nvlan_id
+					fi
+				fi
+			fi
+		done
+		switch_cli IFX_ETHSW_MAC_TABLE_CLEAR
+		# tbd: if we need to access the dut from bridged wan we have to add the below rule on the wan port
+		# switch_cli IFX_FLOW_PCE_RULE_WRITE pattern.nIndex=`expr $pce_rule_start \+ $k` pattern.bEnable=1 pattern.bPortIdEnable=1 pattern.nPortId=$wan_port pattern.bMAC_DstEnable=1 pattern.nMAC_Dst=$bridgemac action.eVLAN_Action=2 action.nVLAN_Id=$wanvlan
+	fi
+}
+
+###############################################################################################################
+# Disables Bridging acceleration between LAN & WAN
+# The user needs to specify a LAN port & bridged WAN interface name disable bridging acceleration between
+# specified LAN port and WAN port
+# input arguements
+# $1 = wan interface name (eg: ptm0.800 or eth1.100 or nas2 )
+# $2 = lan interface names (eg: eth0.2,eth0.3)
+###############################################################################################################
+disable_bridge_accel() {
+	local waniface
+	local wanvlan
+
+	waniface=$(echo $1 | cut -d "_" -f1)
+	if [ "${waniface::3}" = "nas" ]; then
+		local vpivci=$(sed -n '/'$waniface'/,/vcc/p' /proc/net/atm/br2684|grep vcc|sed -e 's/.*vcc 0./\1/' -e 's/:.*/\1/')
+		if [ "A${vpivci}A" != "AA" ]; then
+			waniface=$1
+			if [ "$CONFIG_TARGET_LANTIQ_XRX300" = "1" -o "$CONFIG_TARGET_LANTIQ_XRX330" = "1" ]; then
+				wanvlan=$(grep $vpivci /proc/eth/vrx318/dsl_vlan | awk '{print $5}')
+			elif [ "$CONFIG_TARGET_LANTIQ_XRX200" = "1" ]; then
+				wanvlan=$(grep $vpivci /proc/eth/dsl_vlan | awk '{print $5}')
+			fi
+		fi
+	else
+		wanvlan=$(echo $1 | cut -d "_" -f2)
+	fi
+
+	#for handling non vlan wan interface ptm0 & eth1
+	if [ "${wanvlan::3}" = "wan" ] ; then
+		if [ "${waniface}" = "ptm0" -o "${waniface}" = "eth1" ]; then
+			wanvlan=$wan_vid
+		fi
+	fi
+
+	if [ "A${waniface}A" = "AA" -o "A${wanvlan}A" = "AA" ]; then
+		echo "WAN interface is not valid!!!"
+	else
+		j=0
+		if [ "${waniface::3}" = "ptm" ]; then
+			for i in $wan_port_xdsl; do
+				config_port_pvid $i $wan_vid 1 3
+				done
+			if [ "$wanvlan" -ne "$wan_vid" ]; then
+				delete_vlanid $wanvlan
+			fi
+		fi
+
+		k=0
+		m=0
+		for lan_if in $( echo $2 | sed -n 1'p' | tr ',' '\n'); do
+			# lan port
+			if [ "${lan_if::4}" = "eth0" ]; then
+				if [ "${lan_if:4:1}" = "." ]; then
+					#vlan based port separation
+					local lanvlan=$(echo $lan_if | cut -d "." -f2)
+					j=0
+
+					for i in $lan_port; do
+						tvlan=`expr $software_vid_port_start \+ $j`
+						if [ $tvlan = $lanvlan ]; then
+							nvlan_id=`expr $lan_vid_port_start \- $software_vid_port_start \+ $lanvlan`
+							nport_id=$i
+							break
+						fi
+						j=`expr $j \+ 1`
+						k=`expr $k \+ 3`
+					done
+				elif [ "${lan_if:4:1}" = "_" ]; then
+					#driver based lan port separation
+					local lanvlan=$(echo $lan_if | cut -d "_" -f2)
+					j=1
+
+					for i in $lan_port; do
+						if [ $j = $lanvlan ]; then
+							nvlan_id=$lan_vid_all
+							nport_id=$i
+							break
+						fi
+						j=`expr $j \+ 1`
+						k=`expr $k \+ 3`
+					done
+				else
+					#no lan port separation
+					nvlan_id=$lan_vid_all
+					nport_id=$lan_port
+				fi
+			# wireless port
+			elif [ "${lan_if::4}" = "wlan" -o "${lan_if::3}" = "ath" -o "${lan_if::3}" = "ra" ]; then
+				#wireless ports needs to be read from ppa/api/directpath
+				#ifid + 4 = portid
+				nvlan_id=$lan_vid_all
+				nport_id=$(echo `sed -n '/'"$lan_if "'/,/rx_fn_rxif_pkt/p' /proc/ppa/api/directpath` | awk '{print $7}')
+				if [ $nport_id -gt 0 ]; then
+					nport_id=`expr $nport_id \+ 4`
+				else
+					echo "Invalid wireless interface!!!"
+					continue
+				fi
+			fi
+
+			if [ "A${nvlan_id}A" = "AA" -o "A${nport_id}A" = "AA" ]; then
+				echo "Invalid lan port!!!" $lan_if
+				break
+			else
+				if [ "$wanvlan" -ne "$wan_vid" ]; then
+					config_port_member $wanvlan $cpu_port 1
+				else
+					config_port_member $wanvlan $cpu_port 0
+				fi
+
+				for i in $nport_id; do
+					reset_port_member $wanvlan $i
+					config_port_pvid $i $nvlan_id 1 3
+					if [ "1$CONFIG_FEATURE_BR_ACCEL_SUPPORT" != "11" ]; then
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ $k`
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ $k \+ 1`
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ $k \+ 2`
+						k=`expr $k + 3`
+					fi
+				done
+
+				if [ "1$CONFIG_FEATURE_BR_ACCEL_SUPPORT" = "11" ]; then
+					eval pce_rule_start=$bridge_accel_Order
+	
+					switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start`
+					if [ "${waniface::3}" = "ptm" -o "${waniface::3}" = "eth" ]; then
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ 1`
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ 2`
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ 3`
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ 4`
+						switch_cli IFX_FLOW_PCE_RULE_DELETE nIndex=`expr $pce_rule_start \+ 5`
+					fi
+				fi
+
+			fi
+		done
+
+		# nas wan if vlan was used by flow table, ok to delete now
+		if [ "${waniface::3}" = "nas" ]; then
+			# reset tvm, memberviolation=3 back on wan if
+			# enable learning back on wan if
+			for i in $wan_port_xdsl; do
+				config_port_pvid $i $wan_vid 1 3
+				switch_cli PORT_CFG_SET nPortId=$i bLearning=0
+			done
+			delete_vlanid $wanvlan
+		fi
+
+		switch_cli IFX_ETHSW_MAC_TABLE_CLEAR
+	fi
+}
+
+###############################################################################################################
+# Function to config GPHY LED
+###############################################################################################################
+config_led()
+{
+
+	[ "$CONFIG_TARGET_LANTIQ_XRX300" = "1" -o "$CONFIG_TARGET_LANTIQ_XRX330" = "1" ] && {
+		# AR10 and EASY330 platfrom
+		for port in $lan_port; do
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=$port nAddressReg=0x1F01e2 nData=0x42
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=$port nAddressReg=0x1F01e3 nData=0x10
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=$port nAddressReg=0x1F01e4 nData=0x70
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=$port nAddressReg=0x1F01e5 nData=0x03
+		done
+		[ "$CONFIG_TARGET_LANTIQ_XRX330" = "1" ] && {
+			# EASY330 platfrom
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=0x2 nAddressReg=0x1F01e2 nData=0x70
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=0x2 nAddressReg=0x1F01e3 nData=0x03
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=0x2 nAddressReg=0x1F01e4 nData=0x42
+			switch_cli IFX_ETHSW_MMD_DATA_WRITE nAddressDev=0x2 nAddressReg=0x1F01e5 nData=0x10
+		}
+	}
+}
+
+####################################################################################################################
+# This function initializes switch buffers for GRX300 platform.
+# Default configuration on this platform is different from other platforms where in,
+# 512 switch buffers are available on GRX300 (GSWIP 2.2 and above) compared to 256 on the rest (GSWIP-2.1 and below)
+# This configuration is required to address congestion problems due to bursty traffic.
+# Buffers reserved for each queue can be tuned for different scenarios.
+# Given configuration is based on test cases and scenarios executed by switch team.
+####################################################################################################################
+init_sw_cfg_for_grx330_plat() {
+	if [ "A$CONFIG_TARGET_LANTIQ_XRX330" = "A1" ]; then # [ GRX330 config starts
+		# Enable Flow Control eFlowCtrl=3
+		i=0
+		while [ $i -le 5 ]
+		do
+			switch_cli IFX_ETHSW_PORT_CFG_SET nPortId=$i eEnable=1 eFlowCtrl=3
+			switch_cli IFX_ETHSW_QOS_FLOWCTRL_PORT_CFG_SET nPortId=$i nFlowCtrl_Min=18 nFlowCtrl_Max=30
+			i=`expr $i + 1`
+		done
+
+		# Configure Buffer reservation of each queue to 24 for i 0 31
+		i=0
+		while [ $i -le 31 ]
+		do
+			switch_cli IFX_ETHSW_QOS_QUEUE_BUFFER_RESERVE_CFG_SET nQueueId=$i nBufferReserved=24
+			i=`expr $i + 1`
+		done
+		# Configure Global buffer threshold
+		switch_cli IFX_ETHSW_QOS_WRED_CFG_SET eProfile=0 nRed_Min=0x3ff nRed_Max=0x3ff nYellow_Min=0x3ff nYellow_Max=0x3ff nGreen_Min=0x180 nGreen_Max=0x180
+
+		# Configure Global flowcontrol threshold buffer
+		switch_cli IFX_ETHSW_QOS_FLOWCTRL_CFG_SET nFlowCtrlNonConform_Min=0x3ff nFlowCtrlNonConform_Max=0x3ff nFlowCtrlConform_Min=0x3ff nFlowCtrlConform_Max=0x3ff
+	fi # GRX330 config ends ]
+}
+
+

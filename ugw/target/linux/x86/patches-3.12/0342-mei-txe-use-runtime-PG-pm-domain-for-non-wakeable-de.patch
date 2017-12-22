@@ -1,0 +1,101 @@
+From 18f5e4135c16628be38c34adb3968797d62ad4b2 Mon Sep 17 00:00:00 2001
+From: Alexander Usyskin <alexander.usyskin@intel.com>
+Date: Tue, 18 Mar 2014 22:52:06 +0200
+Subject: [PATCH 342/441] mei: txe: use runtime PG pm domain for non wakeable
+ devices
+
+For non wakeable devices we can't use pci runtime framework
+as we are not able to wakeup from D3 states.
+Instead we create new pg runtime domain that only drives TXE power
+gating protocol to reduce the power consumption.
+
+Change-Id: I027d3cd9894ba224f5c5f3d101aaa61e2090791e
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 72d4974058d1f4d45bdfb0b32f1d1f7e362f8083)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/pci-txe.c | 49 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+--- a/drivers/misc/mei/pci-txe.c
++++ b/drivers/misc/mei/pci-txe.c
+@@ -41,6 +41,13 @@ static const struct pci_device_id mei_tx
+ };
+ MODULE_DEVICE_TABLE(pci, mei_txe_pci_tbl);
+ 
++#ifdef CONFIG_PM_RUNTIME
++static inline void mei_txe_set_pm_domain(struct mei_device *dev);
++static inline void mei_txe_unset_pm_domain(struct mei_device *dev);
++#else
++static inline void mei_txe_set_pm_domain(struct mei_device *dev) {}
++static inline void mei_txe_unset_pm_domain(struct mei_device *dev) {}
++#endif /* CONFIG_PM_RUNTIME */
+ 
+ static void mei_txe_pci_iounmap(struct pci_dev *pdev, struct mei_txe_hw *hw)
+ {
+@@ -147,6 +154,14 @@ static int mei_txe_probe(struct pci_dev
+ 
+ 	pci_set_drvdata(pdev, dev);
+ 
++	/*
++	* For not wake-able HW runtime pm framework
++	* can't be used on pci device level.
++	* Use domain runtime pm callbacks instead.
++	*/
++	if (!pci_dev_run_wake(pdev))
++		mei_txe_set_pm_domain(dev);
++
+ 	pm_runtime_put_noidle(&pdev->dev);
+ 
+ 	return 0;
+@@ -199,6 +214,9 @@ static void mei_txe_remove(struct pci_de
+ 
+ 	mei_stop(dev);
+ 
++	if (!pci_dev_run_wake(pdev))
++		mei_txe_unset_pm_domain(dev);
++
+ 	/* disable interrupts */
+ 	mei_disable_interrupts(dev);
+ 	free_irq(pdev->irq, dev);
+@@ -350,6 +368,37 @@ static int mei_txe_pm_runtime_resume(str
+ 
+ 	return ret;
+ }
++
++/**
++ * mei_txe_set_pm_domain - fill and set pm domian stucture for device
++ *
++ * @dev: mei_device
++ */
++static inline void mei_txe_set_pm_domain(struct mei_device *dev)
++{
++	struct pci_dev *pdev  = dev->pdev;
++
++	if (pdev->dev.bus && pdev->dev.bus->pm) {
++		dev->pg_domain.ops = *pdev->dev.bus->pm;
++
++		dev->pg_domain.ops.runtime_suspend = mei_txe_pm_runtime_suspend;
++		dev->pg_domain.ops.runtime_resume = mei_txe_pm_runtime_resume;
++		dev->pg_domain.ops.runtime_idle = mei_txe_pm_runtime_idle;
++
++		pdev->dev.pm_domain = &dev->pg_domain;
++	}
++}
++
++/**
++ * mei_txe_unset_pm_domain - clean pm domian stucture for device
++ *
++ * @dev: mei_device
++ */
++static inline void mei_txe_unset_pm_domain(struct mei_device *dev)
++{
++	/* stop using pm callbacks if any */
++	dev->pdev->dev.pm_domain = NULL;
++}
+ #endif /* CONFIG_PM_RUNTIME */
+ 
+ #ifdef CONFIG_PM

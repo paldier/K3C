@@ -1,0 +1,159 @@
+# HG changeset patch
+# Parent ecb77f9fa4dc8961483832a9175bbc2c04748bd3
+
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -19,6 +19,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/capability.h>
+ #include <linux/errno.h>
+@@ -56,6 +57,9 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#include <net/ppa_stack_al.h>
++#endif
+ /*
+    This version of net/ipv6/sit.c is cloned of net/ipv4/ip_gre.c
+ 
+@@ -76,6 +80,15 @@ static bool check_6rd(struct ip_tunnel *
+ 		      __be32 *v4dst);
+ static struct rtnl_link_ops sit_link_ops __read_mostly;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++extern int (*ppa_get_6rd_dmac_fn)(struct net_device *, struct sk_buff *skb,
++				  uint8_t *mac);
++extern struct net_device * (*ppa_get_6rd_phyif_fn)(struct net_device *);
++static int ppa_get_6rd_dmac(struct net_device *dev, struct sk_buff *skb,
++			    uint8_t *mac);
++static  struct net_device *ppa_get_6rd_phyif(struct net_device *dev);
++#endif
++
+ static int sit_net_id __read_mostly;
+ struct sit_net {
+ 	struct ip_tunnel __rcu *tunnels_r_l[HASH_SIZE];
+@@ -1637,6 +1650,11 @@ static int __init sit_init(void)
+ 		pr_info("%s: can't add protocol\n", __func__);
+ 		goto xfrm_tunnel_failed;
+ 	}
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++	ppa_get_6rd_dmac_fn = ppa_get_6rd_dmac;
++	ppa_get_6rd_phyif_fn = ppa_get_6rd_phyif;
++#endif
+ 	err = rtnl_link_register(&sit_link_ops);
+ 	if (err < 0)
+ 		goto rtnl_link_failed;
+@@ -1651,6 +1669,106 @@ xfrm_tunnel_failed:
+ 	goto out;
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++int ppa_get_6rd_dmac(struct net_device *dev, struct sk_buff *skb, uint8_t *mac)
++{
++	struct ip_tunnel *tunnel;
++	struct iphdr *iph;
++	struct rtable *rt = NULL;
++	struct dst_entry *dst = NULL;
++	struct hh_cache *hh;
++	struct neighbour *neigh;
++
++	tunnel = netdev_priv(dev);
++	iph = &tunnel->parms.iph;
++
++	if (iph->daddr) {
++		struct flowi4 fl = {0};
++		fl.flowi4_tos = RT_TOS(iph->tos);
++		fl.flowi4_oif = tunnel->parms.link;
++		fl.flowi4_proto = IPPROTO_IPV6;
++		fl.daddr = iph->daddr;
++		fl.saddr = iph->saddr;
++
++		rt = ip_route_output_key(dev_net(dev), &fl);
++		if (rt == NULL)
++			return -1;
++		else
++			dst = &rt->dst;
++	}
++	if (!dst) {
++		ip_rt_put(rt);
++		return -1;
++	}
++
++	neigh = dst_neigh_lookup(dst, &daddr);
++	if (neigh == NULL) {
++		ip_rt_put(rt);
++		return -1;
++	}
++
++	ppa_neigh_hh_init(neigh, dst);
++	ppa_neigh_update_hhs(neigh);
++
++	hh = &neigh->hh;
++	if (!hh) {
++		if (neigh->ha[0] != 0
++		    || neigh->ha[1] != 0
++		    || neigh->ha[2] != 0
++		    || neigh->ha[3] != 0
++		    || neigh->ha[4] != 0
++		    || neigh->ha[5] != 0)
++			memcpy(mac, (uint8_t *)neigh->ha, ETH_ALEN);
++		else
++			goto MAC_ERROR;
++	} else {
++		unsigned int seq;
++		do {
++			seq = read_seqbegin(&hh->hh_lock);
++			if (hh->hh_len != ETH_HLEN)
++				goto MAC_ERROR;
++			else
++				memcpy(mac, (uint8_t *)hh->hh_data + HH_DATA_ALIGN(hh->hh_len) - hh->hh_len, ETH_ALEN);
++		} while (read_seqretry(&hh->hh_lock, seq));
++	}
++	neigh_release(neigh);
++	ip_rt_put(rt);
++	return 0;
++
++MAC_ERROR:
++	neigh_release(neigh);
++	ip_rt_put(rt);
++	return -1;
++}
++
++static  struct net_device *ppa_get_6rd_phyif(struct net_device *dev)
++{
++	struct ip_tunnel *tunnel;
++	struct iphdr *iph;
++	struct rtable *rt = NULL;
++	struct net_device *phydev = NULL;
++
++	tunnel = netdev_priv(dev);
++	iph = &tunnel->parms.iph;
++
++	if (iph->daddr) {
++		struct flowi4 fl;
++		fl.flowi4_tos = RT_TOS(iph->tos);
++		fl.flowi4_oif = tunnel->parms.link;
++		fl.flowi4_proto = IPPROTO_IPV6;
++		fl.daddr = iph->daddr;
++		fl.saddr = iph->saddr;
++
++		rt = ip_route_output_key(dev_net(dev), &fl);
++		if (rt) {
++			phydev = rt->dst.dev;
++			ip_rt_put(rt);
++		}
++	}
++	return phydev;
++}
++#endif
++
+ module_init(sit_init);
+ module_exit(sit_cleanup);
+ MODULE_LICENSE("GPL");

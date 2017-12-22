@@ -1,0 +1,56 @@
+#!/bin/sh
+
+# Command line arguments:
+#   $1 event that happened:
+#          BIND:     Successfully claimed address
+#          CONFLICT: An IP address conflict happened
+#          UNBIND:   The IP address is no longer needed
+#          STOP:     The daemon is terminating
+#   $2 interface name
+#   $3 IP adddress
+
+#PATH="$PATH:/usr/bin:/usr/sbin:/bin:/sbin"
+
+# Use a different metric for each interface, so that we can set
+# identical routes to multiple interfaces.
+
+METRIC=$((1000 + `cat "/sys/class/net/$2/ifindex" 2>/dev/null || echo 0`))
+
+if [ ! "$CONFIGLOADED" ]; then
+	if [ -r /etc/rc.d/config.sh ]; then
+		. /etc/rc.d/config.sh 2>/dev/null
+		CONFIGLOADED="1"
+	fi
+fi
+
+if [ "$1x" = "x" ]; then
+	echo "Error: should be called from avahi-autoipd"
+else #[
+
+	eval search_str="lan_main_[0-9+]_interface=\\\"$2\\\""
+	lan_idx=`grep $search_str /etc/rc.conf`
+	lan_idx=${lan_idx%_*}
+	lan_idx=${lan_idx##*_}
+
+	# lan autoip config
+	case "$1" in
+		BIND)
+			/sbin/ifconfig "$2:avahi" inet "$3" netmask 255.255.0.0 broadcast 169.254.255.255 up
+			/sbin/route add default dev "$2:avahi" metric "$METRIC" ||:
+			/usr/sbin/status_oper SET "Lan${lan_idx}_AUTOIF_Info" STATUS CONNECTED AUTOIP "$3"
+			;;
+
+		CONFLICT|STOP|UNBIND)
+			/sbin/route del default dev "$2:avahi" metric "$METRIC" ||:
+			/sbin/ifconfig "$2:avahi" down
+			/usr/sbin/status_oper SET "Lan${lan_idx}_AUTOIF_Info" STATUS DISCONNECTED AUTOIP "0.0.0.0"
+			;;
+
+		*)
+			echo "Unknown event $1" >&2
+			exit 1
+			;;
+	esac
+fi
+
+exit 0

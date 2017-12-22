@@ -1,0 +1,123 @@
+From c6eff552a3c0ce97fd93bbcb6857ab1b4d6355dc Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Thu, 8 Sep 2016 16:04:41 +0300
+Subject: [PATCH] mbo: pmf bypass
+
+enable hostapd to work with mbo and without pmf.
+to enable the bypass, add the following to the conf file:
+mbo_pmf_bypass=1
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/config_file.c  |  2 ++
+ src/ap/ap_config.c     | 14 ++++++++------
+ src/ap/ap_config.h     |  1 +
+ src/ap/drv_callbacks.c | 15 ++++++++-------
+ src/ap/ieee802_11.c    | 15 ++++++++-------
+ 5 files changed, 27 insertions(+), 20 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 67f4570..7ba2dbb 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3731,6 +3731,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		bss->mbo_enabled = atoi(pos);
+ 	} else if (os_strcmp(buf, "mbo_cell_aware") == 0) {
+ 		bss->mbo_cell_aware = atoi(pos);	
++	} else if (os_strcmp(buf, "mbo_pmf_bypass") == 0) {
++		bss->mbo_pmf_bypass = atoi(pos);
+ #endif /* CONFIG_MBO */
+ #ifdef CONFIG_TESTING_OPTIONS
+ #define PARSE_TEST_PROBABILITY(_val)				\
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 6d66572..ffb073c 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -1010,12 +1010,14 @@ static int hostapd_config_check_bss(struct hostapd_bss_config *bss,
+ #endif /* CONFIG_HS20 */
+ 
+ #ifdef CONFIG_MBO
+-	if (full_config && bss->mbo_enabled && (bss->wpa & 2) &&
+-	    bss->ieee80211w == NO_MGMT_FRAME_PROTECTION) {
+-		wpa_printf(MSG_ERROR,
+-			   "MBO: PMF needs to be enabled whenever using WPA2 with MBO");
+-		return -1;
+-	}
++	if (!bss->mbo_pmf_bypass)
++		if (full_config && bss->mbo_enabled && (bss->wpa & 2) &&
++			bss->ieee80211w == NO_MGMT_FRAME_PROTECTION) {
++			wpa_printf(MSG_ERROR,
++				   "MBO: PMF needs to be enabled whenever using WPA2 with MBO");
++			return -1;
++		}
++
+ #endif /* CONFIG_MBO */
+ 
+ 	return 0;
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 0463825..a5f1ca3 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -594,6 +594,7 @@ struct hostapd_bss_config {
+ #ifdef CONFIG_MBO
+ 	int mbo_enabled;
+ 	int mbo_cell_aware;
++	int mbo_pmf_bypass;
+ #endif /* CONFIG_MBO */
+ 
+ 	int ftm_responder;
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 44bf8f3..a753a05 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -373,13 +373,14 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 		return WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+ 	}
+ 
+-	if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
+-	    elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
+-	    hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
+-		wpa_printf(MSG_INFO,
+-			   "MBO: Reject WPA2 association without PMF");
+-		return WLAN_STATUS_UNSPECIFIED_FAILURE;
+-	}
++	if (!hapd->conf->mbo_pmf_bypass)
++		if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
++			elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
++			hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
++			wpa_printf(MSG_INFO,
++				   "MBO: Reject WPA2 association without PMF");
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++		}
+ #endif /* CONFIG_MBO */
+ 
+ #ifdef CONFIG_WPS
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 22ec83a..81f2368 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -1845,13 +1845,14 @@ static u16 check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 		return WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+ 	}
+ 
+-	if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
+-	    elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
+-	    hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
+-		wpa_printf(MSG_INFO,
+-			   "MBO: Reject WPA2 association without PMF");
+-		return WLAN_STATUS_UNSPECIFIED_FAILURE;
+-	}
++	if (!hapd->conf->mbo_pmf_bypass)
++		if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
++			elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
++			hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
++			wpa_printf(MSG_INFO,
++				   "MBO: Reject WPA2 association without PMF");
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++		}
+ #endif /* CONFIG_MBO */
+ 
+ 	ap_copy_sta_supp_op_classes(sta, elems.supp_op_classes,
+-- 
+2.7.4
+

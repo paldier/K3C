@@ -1,0 +1,155 @@
+From 81c2945e9e6bdec07c2739eef7097e00b0c7f6a2 Mon Sep 17 00:00:00 2001
+From: Aaron Komisar <aaronx.komisar@intel.com>
+Date: Tue, 30 Aug 2016 18:23:31 +0300
+Subject: [PATCH 67/69] BTM Disassociation timer
+
+Add indication to AP_STA_DISCONNECTED event that the stations
+was disconnected following BTM Request timer expiration.
+---
+ src/ap/drv_callbacks.c |  1 +
+ src/ap/ieee802_11.c    |  3 +++
+ src/ap/ieee802_1x.c    |  1 +
+ src/ap/sta_info.c      | 14 +++++++++++++-
+ src/ap/sta_info.h      |  1 +
+ src/ap/wnm_ap.c        |  1 +
+ 6 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index df974ea..44bf8f3 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -462,6 +462,7 @@ void hostapd_notif_disassoc(struct hostapd_data *hapd, const u8 *addr)
+ 		return;
+ 	}
+ 
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC);
+ 	wpa_auth_sm_event(sta->wpa_sm, WPA_DISASSOC);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 7b96e48..2cc9799 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -2386,6 +2386,7 @@ static void handle_disassoc(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->last_seq_ctrl = WLAN_INVALID_MGMT_SEQ;
+ 	sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
+@@ -2448,6 +2449,7 @@ static void handle_deauth(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->last_seq_ctrl = WLAN_INVALID_MGMT_SEQ;
+ 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC |
+@@ -2931,6 +2933,7 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
+ 		 */
+ 		ap_sta_set_authorized(hapd, sta, 1);
+ 	} else {
++		sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 		ap_sta_set_authorized(hapd, sta, 0);
+ 	}
+ 
+diff --git a/src/ap/ieee802_1x.c b/src/ap/ieee802_1x.c
+index 42b0299..aa48d0d 100644
+--- a/src/ap/ieee802_1x.c
++++ b/src/ap/ieee802_1x.c
+@@ -109,6 +109,7 @@ void ieee802_1x_set_sta_authorized(struct hostapd_data *hapd,
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE8021X,
+ 			       HOSTAPD_LEVEL_DEBUG, "authorizing port");
+ 	} else {
++		sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 		ap_sta_set_authorized(hapd, sta, 0);
+ 		res = hostapd_set_authorized(hapd, sta, 0);
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE8021X,
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index edd9394..0d257b8 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -162,6 +162,8 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	accounting_sta_stop(hapd, sta);
+ 
+ 	/* just in case */
++	if (sta)
++		sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 
+ 	if (sta->flags & WLAN_STA_WDS)
+@@ -792,6 +794,7 @@ void ap_sta_disassociate(struct hostapd_data *hapd, struct sta_info *sta,
+ 		   hapd->conf->iface, MAC2STR(sta->addr));
+ 	sta->last_seq_ctrl = WLAN_INVALID_MGMT_SEQ;
+ 	sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->timeout_next = STA_DEAUTH;
+ 	wpa_printf(MSG_DEBUG, "%s: reschedule ap_handle_timer timeout "
+@@ -833,6 +836,7 @@ void ap_sta_deauthenticate(struct hostapd_data *hapd, struct sta_info *sta,
+ 		   hapd->conf->iface, MAC2STR(sta->addr));
+ 	sta->last_seq_ctrl = WLAN_INVALID_MGMT_SEQ;
+ 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->timeout_next = STA_REMOVE;
+ 	wpa_printf(MSG_DEBUG, "%s: reschedule ap_handle_timer timeout "
+@@ -1207,7 +1211,13 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 	else
+ #endif /* CONFIG_P2P */
+ 	{
+-		ret = os_snprintf(pos, end - pos, MACSTR, MAC2STR(sta->addr));
++		//Report dis-association  following expired BSS Transition Management Request timeout
++		//in case STA didn't dis-associate on its own
++		if (!authorized && (sta->timeout_next == STA_DISASSOC_FROM_CLI) &&
++			(sta->flags & WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT))
++			ret = os_snprintf(pos, end - pos, MACSTR " DISASSOC_TIMER_EXPIRED", MAC2STR(sta->addr));
++		else
++			ret = os_snprintf(pos, end - pos, MACSTR, MAC2STR(sta->addr));
+ 		if (os_snprintf_error(end - pos, ret))
+ 			goto free_alloc;
+ 		pos += ret;
+@@ -1309,6 +1319,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		os_free(rates);
+ 		os_free(channels);
+ 	} else {
++
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_DISCONNECTED "%s", buf);
+ 
+ 		if (hapd->msg_ctx_parent &&
+@@ -1352,6 +1363,7 @@ void ap_sta_disconnect(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ 	if (sta == NULL)
+ 		return;
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	wpa_auth_sm_event(sta->wpa_sm, WPA_DEAUTH);
+ 	ieee802_1x_notify_port_enabled(sta->eapol_sm, 0);
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index ef50960..33378a7 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -38,6 +38,7 @@
+ #define WLAN_STA_WNM_SLEEP_MODE BIT(19)
+ #define WLAN_STA_VHT_OPMODE_ENABLED BIT(20)
+ #define WLAN_STA_VENDOR_VHT BIT(21)
++#define WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT BIT(25)
+ #define WLAN_STA_PENDING_DISASSOC_CB BIT(29)
+ #define WLAN_STA_PENDING_DEAUTH_CB BIT(30)
+ #define WLAN_STA_NONERP BIT(31)
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 3b7ffe7..4e77652 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -730,6 +730,7 @@ static void set_disassoc_timer(struct hostapd_data *hapd, struct sta_info *sta,
+ 		   " set to %d ms", MAC2STR(sta->addr), timeout);
+ 
+ 	sta->timeout_next = STA_DISASSOC_FROM_CLI;
++	sta->flags |= WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	eloop_cancel_timeout(ap_handle_timer, hapd, sta);
+ 	eloop_register_timeout(timeout / 1000,
+ 			       timeout % 1000 * 1000,
+-- 
+1.8.3.4
+

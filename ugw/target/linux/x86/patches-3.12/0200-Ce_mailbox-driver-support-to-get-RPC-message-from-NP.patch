@@ -1,0 +1,493 @@
+From 0afc29b0622431a61b4e9dfab86c3055c70afa84 Mon Sep 17 00:00:00 2001
+From: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+Date: Mon, 2 Nov 2015 10:33:03 -0800
+Subject: [PATCH 200/441] Ce_mailbox driver support to get RPC message from
+ NPCPU
+
+Change-Id: I8042d4c25b55b2604f0efc374135b66d8ae33520
+---
+ drivers/misc/Kconfig       |  10 ++
+ drivers/misc/Makefile      |   1 +
+ drivers/misc/ce_mailbox.c  | 369 +++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/ce_mailbox.h |  76 ++++++++++
+ 4 files changed, 456 insertions(+)
+ create mode 100644 drivers/misc/ce_mailbox.c
+ create mode 100644 include/linux/ce_mailbox.h
+
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -528,6 +528,16 @@ config SRAM
+ 	  the genalloc API. It is supposed to be used for small on-chip SRAM
+ 	  areas found on many SoCs.
+ 
++config  CE_MAILBOX
++        tristate "CE Mailbox support for Intel Puma7 platform"
++        depends on ARCH_GEN3
++        depends on HW_MAILBOX
++        default y
++        help
++         This is a simple CE mailbox driver support for communication
++         between NPCPU and APPCPU processor. If unsure, say Y.
++
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -54,3 +54,4 @@ obj-$(CONFIG_INTEL_ISS)		+= heci/
+ obj-$(CONFIG_VMWARE_VMCI)	+= vmw_vmci/
+ obj-$(CONFIG_LATTICE_ECP3_CONFIG)	+= lattice-ecp3-config.o
+ obj-$(CONFIG_SRAM)		+= sram.o
++obj-$(CONFIG_CE_MAILBOX)        += ce_mailbox.o
+--- /dev/null
++++ b/drivers/misc/ce_mailbox.c
+@@ -0,0 +1,369 @@
++/*
++ * drivers/misc/ce_mailbox.c
++ *
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/fs.h>
++#include <linux/device.h>
++#include <asm/uaccess.h>
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/err.h>
++#include <linux/jiffies.h>
++#include <linux/proc_fs.h>
++#include <linux/hw_mutex.h>
++#include <linux/types.h>
++#include <linux/socket.h>
++#include <linux/in.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/ce_mailbox.h>
++#include <linux/hw_mailbox.h>
++#include <linux/delay.h>
++
++static struct proc_dir_entry   *mbx_proc_dir;
++static struct npcpu_appcpu_mbx_user    mbx_usr_info;
++struct npcpu_rpc_info rpc_info;
++volatile bool is_mbx_received_callback_from_NPCPU = false;
++bool glob_mbx_is_initialized = false;
++#define NPCPU_IP_START_BYTE 0
++#define APPCPU_IP_START_BYTE 4
++#define NETMASK_START_BYTE 8
++#define VLAN_ID_START_BYTE 12
++#define MAX_NO_BYTE 4
++#define BYTE_SIZE 8
++
++/* 30 seconds max delay */
++#define MBX_MAX_POLLING_DELAY          (msecs_to_jiffies(30000))
++
++/* Translate IP address */
++#define NIPQUAD(addr) \
++        ((unsigned char*)&addr)[0], \
++        ((unsigned char*)&addr)[1], \
++        ((unsigned char*)&addr)[2], \
++        ((unsigned char*)&addr)[3]
++
++static unsigned int ref = 0;
++
++static void ce_mailbox_send_reply_ack(void)
++{
++        int ret = 0;
++        ret = hwMbox_sendAckOpcode(HW_MBOX_MASTER_NP_CPU);
++        if(ret) {
++            printk(KERN_ERR "CE_MAILBOX: Failed to send Ack to msg ret %d\n", ret);
++        }
++        return;
++}
++
++static unsigned int get_4bytevalue_fromIndex( Uint8 *dataBuf, int index){
++        unsigned int ret = 0;
++        unsigned int loopcount = 0;
++        Uint8 *databuff = dataBuf;
++        for (; loopcount < MAX_NO_BYTE; loopcount++){
++            ret = ((ret<<BYTE_SIZE) | databuff[index]);
++            index++;
++        }
++        return ret;
++}
++
++static void set_callback_received_from_npcpu(bool iscallback_recived){
++        is_mbx_received_callback_from_NPCPU = iscallback_recived;
++}
++
++static bool get_callback_received_from_npcpu(){
++        return is_mbx_received_callback_from_NPCPU;
++}
++
++
++static int  ce_mailbox_receive_msg(hw_mbox_Masters_e commander,
++                                                                                Uint8 *dataBuf, Uint32 dataLen,
++                                                                                 Uint32 *token)
++{
++        /*process rpc message and send ack to HW mail box*/
++        printk("CE_MAILBOX: Received Rpc message from Mailbox\n");
++        mbx_usr_info.parameter.npcpu_ipv4_addr = be32_to_cpu(get_4bytevalue_fromIndex(dataBuf, NPCPU_IP_START_BYTE));
++        mbx_usr_info.parameter.appcpu_ipv4_addr = be32_to_cpu(get_4bytevalue_fromIndex(dataBuf, APPCPU_IP_START_BYTE));
++        mbx_usr_info.parameter.netmask = be32_to_cpu(get_4bytevalue_fromIndex(dataBuf, NETMASK_START_BYTE));
++        mbx_usr_info.parameter.vlan_id = le32_to_cpu(get_4bytevalue_fromIndex(dataBuf, VLAN_ID_START_BYTE));
++
++        printk("CE_MAILBOX: npcpu ip %u.%u.%u.%u\n",NIPQUAD(mbx_usr_info.parameter.npcpu_ipv4_addr));
++        printk("CE_MAILBOX: App cpu ip%u.%u.%u.%u\n",NIPQUAD(mbx_usr_info.parameter.appcpu_ipv4_addr));
++        printk("CE_MAILBOX: Netmask %u.%u.%u.%u\n",NIPQUAD(mbx_usr_info.parameter.netmask));
++        ce_mailbox_send_reply_ack();
++        set_callback_received_from_npcpu(true);
++        return 0;
++}
++
++static int npcpu_ip_proc_show(struct seq_file *m, void *v)
++{
++        seq_printf(m, "%u.%u.%u.%u\n",NIPQUAD(mbx_usr_info.parameter.npcpu_ipv4_addr));
++        return 0;
++}
++static int appcpu_ip_proc_show(struct seq_file *m, void *v)
++{
++        seq_printf(m, "%u.%u.%u.%u\n",NIPQUAD(mbx_usr_info.parameter.appcpu_ipv4_addr));
++        return 0;
++}
++static int netmask_proc_show(struct seq_file *m, void *v)
++{
++        seq_printf(m, "%u.%u.%u.%u\n",NIPQUAD(mbx_usr_info.parameter.netmask));
++        return 0;
++}
++static int vlan_proc_show(struct seq_file *m, void *v)
++{
++        seq_printf(m, "%u\n",mbx_usr_info.parameter.vlan_id);
++        return 0;
++}
++
++static int npcpu_ip_proc_open(struct inode *inode, struct file *file)
++{
++        return single_open(file, npcpu_ip_proc_show, PDE_DATA(inode));
++}
++static int appcpu_ip_proc_open(struct inode *inode, struct file *file)
++{
++        return single_open(file, appcpu_ip_proc_show, PDE_DATA(inode));
++}
++
++static int netmask_proc_open(struct inode *inode, struct file *file)
++{
++        return single_open(file, netmask_proc_show, PDE_DATA(inode));
++}
++static int vlan_proc_open(struct inode *inode, struct file *file)
++{
++        return single_open(file, vlan_proc_show, PDE_DATA(inode));
++}
++
++static int mbx_open(struct inode *inode, struct file *filp)
++{
++
++        printk(KERN_DEBUG "CE_MAILBOX: npcpu_appcpu_mbx driver open ref %d\n", ++ref);
++        return 0;
++}
++
++static int mbx_close(struct inode *inode, struct file *filp)
++{
++        printk(KERN_DEBUG "CE_MAILBOX: npcpu_appcpu_mbx driver close ref %d\n", --ref);
++        return 0;
++}
++/* Polloing on specivec callback from mailbox - max timeout is 4 sec */
++static int mbx_wait_till_ready()
++{
++        unsigned long timeout = jiffies + MBX_MAX_POLLING_DELAY;
++         do{
++                if(!(get_callback_received_from_npcpu())) {
++                     continue;
++                } else {
++                     return 0;  /* Normal exit */
++                }
++
++         }while(time_after(timeout, jiffies));
++
++         printk( "*****************************************************************\n" );
++        printk( "*** CE_MAILBOX: mbx_wait_till_ready Wait for callback msg Fail on timeout     **\n" );
++        printk( "*****************************************************************\n" );
++
++        return 1;
++}
++
++ /* * npcpu_appcpu_mbx_receive_callback
++ *
++ * Wait for callback from the NPCPU - indicates NPCPU got this event
++ * polling the APPCPU Mbx ce_mailbox_receive_msg - DO not wait forever exit on timeout
++ * Returns 0 if success, negative if error / timeout
++ */
++long npcpu_appcpu_mbx_receive_specific_callback()
++{
++         if (!glob_mbx_is_initialized) {
++                   printk("CE_MAILBOX: ERROR : Intel(R) CE Mailbox driver is not installed \n");
++                   return -ENODEV;
++         }
++        if (mbx_wait_till_ready()) {
++                printk("CE_MAILBOX: APPCPU-NPCPU MBX is stuck - ce_mailbox_receive_msg from NPCPU is NOT arrived\n" );
++                return -ENOSYS;
++        }
++        printk( "CE_MAILBOX: GOT callback from NPCPU \n" );
++         return 0;
++}
++
++
++static long mbx_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++         int err = 0;
++
++         /*
++         * Extract the type and number bitfields, and don't decode
++         * wrong cmds
++         */
++         if (_IOC_TYPE(cmd) != MBX_MODULE_ID) return -ENOTTY;
++         if (_IOC_NR(cmd) > MBX_IOC_MAXNR) return -ENOTTY;
++
++        /*
++            * Verify the user space pointer
++         */
++        if (_IOC_DIR(cmd) & _IOC_READ)
++               err = !access_ok(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
++        else if (_IOC_DIR(cmd) & _IOC_WRITE)
++                   err =  !access_ok(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
++         if (err) return -EFAULT;
++
++         /* copy from the user the event ID and if need to copy parameter */
++        if ( ( arg != 0 ) && (copy_from_user(&mbx_usr_info, (struct npcpu_appcpu_mbx_user *)arg,
++                                   sizeof(struct npcpu_appcpu_mbx_user)) )) {
++                return -EFAULT;
++         }
++
++        switch (cmd) {
++
++                   case MBX_GET_EVENT_CMD:
++                           /*register callbacks for RPC messages */
++                           hwMbox_registerRecvOpcode(HW_MBOX_MASTER_NP_CPU,
++                                   ce_mailbox_receive_msg,
++                                   NPCPU_APPCPU_HW_MBOX_TAG_RPC, 0x1);
++                         err = npcpu_appcpu_mbx_receive_specific_callback();
++                           if(mbx_usr_info.isParamRequired) {
++                               if (copy_to_user((struct npcpu_appcpu_mbx_user *)arg,&mbx_usr_info,sizeof(struct npcpu_appcpu_mbx_user)))
++                                       return -EFAULT;
++                         }
++                         break;
++                 case MBX_SEND_EVENT_CMD:
++                 default:
++                           printk(KERN_ERR "CE_MAILBOX: NPCPU/APPCPU Mailbox driver receive Wrong IOCTL command = 0x%x \n",cmd);
++                           return -EFAULT;
++                          break;
++        }
++
++         return err;
++}
++
++static struct file_operations mbx_fops = {
++        .owner          = THIS_MODULE,
++        .unlocked_ioctl   = mbx_unlocked_ioctl,
++        .open           = mbx_open,
++        .release        = mbx_close,
++};
++
++static struct file_operations npcpu_ip_fops = {
++       .owner          = THIS_MODULE,
++       .open           = npcpu_ip_proc_open,
++       .read           = seq_read,
++       .llseek         = seq_lseek,
++       .release        = single_release,
++};
++static struct file_operations appcpu_ip_fops = {
++       .owner          = THIS_MODULE,
++       .open           = appcpu_ip_proc_open,
++       .read           = seq_read,
++       .llseek         = seq_lseek,
++       .release        = single_release,
++};
++static struct file_operations netmask_fops = {
++       .owner          = THIS_MODULE,
++       .open           = netmask_proc_open,
++       .read           = seq_read,
++       .llseek         = seq_lseek,
++       .release        = single_release,
++};
++static struct file_operations vlan_fops = {
++       .owner          = THIS_MODULE,
++       .open           = vlan_proc_open,
++       .read           = seq_read,
++       .llseek         = seq_lseek,
++       .release        = single_release,
++};
++
++static int  remove_mbx_proc(struct proc_dir_entry *mbx_dir)
++{
++         if (!mbx_dir)
++                return -EIO;
++          remove_proc_entry(CE_MAILBOX_DEVICE_NAME, mbx_dir);
++          remove_proc_entry("npcpu_ip", mbx_dir);
++          remove_proc_entry("appcpu_ip", mbx_dir);
++          remove_proc_entry("netmask", mbx_dir);
++         remove_proc_entry("vlan_id", mbx_dir);
++          remove_proc_entry(CE_MAILBOX_DEVICE_NAME,NULL);
++         return 0;
++}
++
++static struct proc_dir_entry * __init create_mbx_proc(void)
++{
++          /* create /proc/ce_mailbox */
++         struct proc_dir_entry *mbx_dir = proc_mkdir(CE_MAILBOX_DEVICE_NAME, NULL);
++         if (!mbx_dir)
++               return NULL;
++
++          /* create /proc/ce_mailbox/ce_mailbox */
++        if (!proc_create_data(CE_MAILBOX_DEVICE_NAME, S_IRUSR|S_IWUSR | S_IRGRP |S_IWGRP |S_IROTH |S_IWOTH, mbx_dir,
++                                   &mbx_fops, NULL))
++                  return NULL;
++        /* create /proc/ce_mailbox/npcpu_ipv4_addr */
++         if (!proc_create_data("npcpu_ip", S_IRUSR|S_IRGRP|S_IROTH, mbx_dir,
++                                   &npcpu_ip_fops, NULL))
++                 return NULL;
++
++         /* create /proc/ce_mailbox/appcpu_ipv4_addr */
++        if (!proc_create_data("appcpu_ip", S_IRUSR|S_IRGRP|S_IROTH, mbx_dir,
++                                   &appcpu_ip_fops, NULL))
++                return NULL;
++
++          /* create /proc/ce_mailbox/network_mask */
++          if (!proc_create_data("netmask", S_IRUSR|S_IRGRP|S_IROTH, mbx_dir,
++                                   &netmask_fops, NULL))
++                   return NULL;
++          /* create /proc/ce_mailbox/vlan_id */
++       if (!proc_create_data("vlan_id", S_IRUSR|S_IRGRP|S_IROTH, mbx_dir,
++                                   &vlan_fops, NULL))
++                 return NULL;
++
++          return mbx_dir;
++}
++
++static int  ce_mailbox_init(void)
++{
++
++         mbx_proc_dir = create_mbx_proc();
++         if (!mbx_proc_dir)
++                   printk("CE_MAILBOX: ERROR - %s initialization- can not create proc fs\n",CE_MAILBOX_DEVICE_NAME);
++
++        glob_mbx_is_initialized = true;
++        set_callback_received_from_npcpu(false);
++        printk(KERN_INFO "CE_MAILBOX: Intel(R) NPCPU <-> APPCPU CE Mailbox Device Driver built on %s @ %s\n", __DATE__, __TIME__);
++        return 0;
++}
++
++static void __exit ce_mailbox_exit(void)
++{
++           remove_mbx_proc(mbx_proc_dir);
++         glob_mbx_is_initialized = false;
++         set_callback_received_from_npcpu(false);
++         printk(KERN_INFO "CE_MAILBOX: Intel(R) NPCPU <-> APPCPU CE Mailbox Device Driver removed\n");
++}
++module_init(ce_mailbox_init);
++module_exit(ce_mailbox_exit);
++
++MODULE_AUTHOR("Intel Corporation");
++MODULE_DESCRIPTION("Intel(R) CE mailbox exchange between ARM and ATOM");
++MODULE_LICENSE("GPL v2");
++
+--- /dev/null
++++ b/include/linux/ce_mailbox.h
+@@ -0,0 +1,76 @@
++/*
++ *  include/linux/ce_mailbox.h
++ *
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *
++ */
++#ifndef _CE_MBX_H_
++#define _CE_MBX_H_
++
++#include <linux/ioctl.h>               /* needed for the _IOW etc stuff used later */
++
++#define CE_MAILBOX_DEVICE_NAME "ce_mailbox"
++#define DIGITS 80
++
++/* RPC-IF structure */
++struct npcpu_rpc_info
++{
++        unsigned int npcpu_ipv4_addr;
++        unsigned int appcpu_ipv4_addr;
++        unsigned int netmask;
++        unsigned int vlan_id;
++}__attribute__((packed));
++
++
++struct npcpu_appcpu_mbx_user
++{
++       unsigned short  eventId;
++       unsigned short  isParamRequired;
++       struct npcpu_rpc_info parameter;
++       unsigned int resv[2];           /* Reserved */
++}__attribute__((packed));
++
++enum npcpu_mbx_event_id
++{
++    NPCPU_EVENT_GPIO_INIT_EXIT   = 0x0001,
++    NPCPU_EVENT_SPI_INIT_EXIT    = 0x0002,
++    NPCPU_EVENT_EMMC_INIT_EXIT   = 0x0004,
++    NPCPU_EVENT_RPC_IF_OBTAIN_ADDR = 0x0008,
++    NPCPU_EVENT_EMMC_ADVANCE_INIT_EXIT = 0x0010
++};
++
++enum appcpu_mbx_event_id
++{
++    APPCPU_EVENT_RSVD   = 0x0001,
++    APPCPU_EVENT_SPI_ADVANCE_EXIT    = 0x0002,
++    APPCPU_EVENT_EMMC_ADVANCE_EXIT   = 0x0004
++};
++
++#define        MBX_MODULE_ID 1
++#define        MBX_SEND_EVENT_CMD           _IOW(MBX_MODULE_ID, 1, struct npcpu_appcpu_mbx_user )
++#define        MBX_GET_EVENT_CMD            _IOR(MBX_MODULE_ID, 2, struct npcpu_appcpu_mbx_user )
++
++#define MBX_IOC_MAXNR  3
++
++#define NPCPU_APPCPU_HW_MBOX_TAG_RPC 3
++
++long npcpu_appcpu_mbx_receive_specific_callback();
++#endif /* _NPCPU_APPCPU_MBX_H_ */

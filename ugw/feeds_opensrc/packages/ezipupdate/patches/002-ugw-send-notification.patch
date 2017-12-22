@@ -1,0 +1,1370 @@
+Index: ez-ipupdate-3.0.11b8/ez-ipupdate.c
+===================================================================
+--- ez-ipupdate-3.0.11b8.orig/ez-ipupdate.c
++++ ez-ipupdate-3.0.11b8/ez-ipupdate.c
+@@ -33,7 +33,7 @@
+  * tested under Linux and Solaris.
+  * 
+  */
+-
++#include "ugw_notify_defs.h"
+ #ifdef HAVE_CONFIG_H
+ #  include <config.h>
+ #endif
+@@ -219,6 +219,12 @@
+ 
+ /**************************************************/
+ 
++struct name_value_t{
++  char param_name[256];
++  char param_value[256];
++};
++struct name_value_t notif_name_value[3];
++
+ struct service_t
+ {
+   char *title;
+@@ -258,6 +264,7 @@ char *url = NULL;
+ char *host = NULL;
+ char *cloak_title = NULL;
+ char *interface = NULL;
++char *obj_name = NULL;
+ int ntrys = 1;
+ int update_period = DEFAULT_UPDATE_PERIOD;
+ int resolv_period = DEFAULT_RESOLV_PERIOD;
+@@ -283,6 +290,8 @@ static char *NULL_fields_used[] = { NULL
+ 
+ int EZIP_update_entry(void);
+ int EZIP_check_info(void);
++void send_commandline_notification(struct name_value_t * ptr_name_value, int count);
++void update_status_error(char* status , char* error);
+ static char *EZIP_fields_used[] = { "server", "user", "address", "wildcard", "mx", "url", "host", NULL };
+ 
+ int PGPOW_update_entry(void);
+@@ -557,6 +566,7 @@ enum { 
+   CMD_pid_file,
+   CMD_offline,
+   CMD_partner,
++  CMD_obj_name,
+   CMD__end
+ };
+ 
+@@ -591,6 +601,7 @@ static struct conf_cmd conf_commands[] =
+   { CMD_connection_type, "connection-type", CONF_NEED_ARG, 1, conf_handler, "%s=<connection type>" },
+   { CMD_request,         "request",         CONF_NEED_ARG, 1, conf_handler, "%s=<request uri>" },
+   { CMD_partner,         "partner",         CONF_NEED_ARG, 1, conf_handler, "%s=<easydns partner>" },
++  { CMD_obj_name,        "obj_name",        CONF_NEED_ARG, 1, conf_handler, "%s=<object name>" },
+   { 0, 0, 0, 0, 0 }
+ };
+ 
+@@ -656,6 +667,7 @@ void print_usage( void )
+   fprintf(stdout, "  -u, --user <user[:passwd]>\tuser ID and password, if either is left blank \n\t\t\t\tthey will be prompted for\n");
+   fprintf(stdout, "  -w, --wildcard\t\tset your domain to have a wildcard alias\n");
+   fprintf(stdout, "  -z, --partner <partner>\tspecify easyDNS partner (for easydns-partner \n\t\t\t\tservices)\n");
++  fprintf(stdout, "  -O, --obj_name <object name>\tspecify TR181 object name of client \n\t\t\t\tobject name)\n");
+   fprintf(stdout, "      --help\t\t\tdisplay this help and exit\n");
+   fprintf(stdout, "      --version\t\t\toutput version information and exit\n");
+   fprintf(stdout, "      --credits\t\t\tprint the credits and exit\n");
+@@ -1142,6 +1154,13 @@ int option_handler(int id, char *optarg)
+       dprintf((stderr, "cache_file: %s\n", cache_file));
+       break;
+ 
++    case CMD_obj_name:
++      if(obj_name) { free(obj_name); }
++      obj_name = strdup(optarg);
++      dprintf((stderr, "obj_name: %s\n", obj_name));
++      break;
++
++
+     default:
+       dprintf((stderr, "case not handled: %d\n", id));
+       break;
+@@ -1198,6 +1217,7 @@ void parse_args( int argc, char **argv )
+       {"version",         no_argument,            0, 'V'},
+       {"credits",         no_argument,            0, 'C'},
+       {"signalhelp",      no_argument,            0, 'Z'},
++      {"obj_name",       required_argument,      0, 'O'},
+       {0,0,0,0}
+   };
+ #else
+@@ -1205,7 +1225,7 @@ void parse_args( int argc, char **argv )
+ #endif
+   int opt;
+ 
+-  while((opt=xgetopt(argc, argv, "a:b:c:dDe:fF:g:h:i:L:m:M:N:o:p:P:qQ:r:R:s:S:t:T:U:u:wHVCZz:", 
++  while((opt=xgetopt(argc, argv, "a:b:c:dDe:fF:g:h:i:L:m:M:N:o:O:p:P:qQ:r:R:s:S:t:T:U:u:wHVCZz:", 
+           long_options, NULL)) != -1)
+   {
+     switch (opt)
+@@ -1336,6 +1356,10 @@ void parse_args( int argc, char **argv )
+         option_handler(CMD_wildcard, optarg);
+         break;
+ 
++      case 'O':
++        option_handler(CMD_obj_name, optarg);
++        break;
++
+       case 'H':
+         print_usage();
+         exit(0);
+@@ -1793,6 +1817,8 @@ int EZIP_update_entry(void)
+     case -1:
+       if(!(options & OPT_QUIET))
+       {
++        update_status_error("Error" , "MISCONFIGURATION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
+       return(UPDATERES_ERROR);
+@@ -1801,6 +1827,8 @@ int EZIP_update_entry(void)
+     case 200:
+       if(!(options & OPT_QUIET))
+       {
++          update_status_error("Updated" , "NO_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+         printf("request successful\n");
+       }
+       break;
+@@ -1808,6 +1836,8 @@ int EZIP_update_entry(void)
+     case 401:
+       if(!(options & OPT_QUIET))
+       {
++          update_status_error("Error" , "AUTHENTICATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+         show_message("authentication failure\n");
+       }
+       return(UPDATERES_SHUTDOWN);
+@@ -1822,6 +1852,8 @@ int EZIP_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         fprintf(stderr, "server response: %s\n", auth);
+       }
++      update_status_error("Error" , "PROTOCOL_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+@@ -1880,6 +1912,19 @@ int DYNDNS_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -1976,6 +2021,8 @@ int DYNDNS_update_entry(void)
+     case -1:
+       if(!(options & OPT_QUIET))
+       {
++        update_status_error("Error" , "MISCONFIGURATION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
+       retval = UPDATERES_ERROR;
+@@ -1986,6 +2033,8 @@ int DYNDNS_update_entry(void)
+       {
+         if(!(options & OPT_QUIET))
+         {
++          update_status_error("Updated" , "NO_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           printf("request successful\n");
+         }
+       }
+@@ -1993,21 +2042,29 @@ int DYNDNS_update_entry(void)
+       {
+         if(strstr(buf, "\nnohost") != NULL)
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("invalid hostname: %s\n", host);
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\nnotfqdn") != NULL)
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("malformed hostname: %s\n", host);
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\n!yours") != NULL)
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++         send_commandline_notification(notif_name_value, 3);
+           show_message("host \"%s\" is not under your control\n", host);
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\nabuse") != NULL)
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("host \"%s\" has been blocked for abuse\n", host);
+           retval = UPDATERES_SHUTDOWN;
+         }
+@@ -2020,30 +2077,42 @@ int DYNDNS_update_entry(void)
+           {
+             last_update = time(NULL) - max_interval/2;
+           }
++          update_status_error("Updated" , "NO_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           retval = UPDATERES_OK;
+         }
+         else if(strstr(buf, "\nbadauth") != NULL)
+         {
++          update_status_error("Error" , "AUTHENTICATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("authentication failure\n");
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\nbadsys") != NULL)
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("invalid system parameter\n");
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\nbadagent") != NULL)
+         {
++          update_status_error("Error" , "AUTHENTICATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("this useragent has been blocked\n");
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\nnumhost") != NULL)
+         {
++          update_status_error("Error" , "AUTHENTICATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("Too many or too few hosts found\n");
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\ndnserr") != NULL)
+         {
++          update_status_error("Error" , "DNS_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           char *p = strstr(buf, "\ndnserr");
+           show_message("dyndns internal error, please report this number to "
+               "their support people: %s\n", N_STR(p));
+@@ -2051,16 +2120,22 @@ int DYNDNS_update_entry(void)
+         }
+         else if(strstr(buf, "\n911") != NULL)
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("Ahhhh! call 911!\n");
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\n999") != NULL)
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("Ahhhh! call 999!\n");
+           retval = UPDATERES_SHUTDOWN;
+         }
+         else if(strstr(buf, "\n!donator") != NULL)
+         {
++          update_status_error("Updated" , "NO_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           show_message("a feature requested is only available to donators, please donate.\n", host);
+           retval = UPDATERES_OK;
+         }
+@@ -2099,6 +2174,8 @@ int DYNDNS_update_entry(void)
+               format_time(howlong));
+           show_message("Wait response reason: %d\n", N_STR(reason));
+           sleep(howlong);
++          update_status_error("Error" , "TIMEOUT_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           retval = UPDATERES_ERROR;
+         }
+         else
+@@ -2108,6 +2185,8 @@ int DYNDNS_update_entry(void)
+           {
+             fprintf(stderr, "==== server output: ====\n%s\n", buf);
+           }
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           retval = UPDATERES_ERROR;
+         }
+       }
+@@ -2118,6 +2197,8 @@ int DYNDNS_update_entry(void)
+       {
+         show_message("authentication failure\n");
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       retval = UPDATERES_SHUTDOWN;
+       break;
+ 
+@@ -2129,7 +2210,9 @@ int DYNDNS_update_entry(void)
+         sscanf(buf, " HTTP/1.%*c %*3d %255[^\r\n]", auth);
+         show_message("unknown return code: %d\n", ret);
+         fprintf(stderr, "server response: %s\n", auth);
+-      }
++      }    
++      update_status_error("Error" , "PROTOCOL_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       retval = UPDATERES_ERROR;
+       break;
+   }
+@@ -2170,6 +2253,19 @@ int PGPOW_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -2187,6 +2283,8 @@ int PGPOW_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2214,6 +2312,8 @@ int PGPOW_update_entry(void)
+       show_message("error talking to server:\n\t%s\n", buf);
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2231,6 +2331,8 @@ int PGPOW_update_entry(void)
+     {
+       show_message("error talking to server:\n\t%s\n", buf);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     close(client_sockfd);
+     return(UPDATERES_ERROR);
+   }
+@@ -2250,6 +2352,8 @@ int PGPOW_update_entry(void)
+       show_message("error talking to server:\n\t%s\n", buf);
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2268,6 +2372,8 @@ int PGPOW_update_entry(void)
+       show_message("error talking to server:\n\t%s\n", buf);
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2286,6 +2392,8 @@ int PGPOW_update_entry(void)
+       show_message("error talking to server:\n\t%s\n", buf);
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2306,6 +2414,8 @@ int PGPOW_update_entry(void)
+         show_message("error talking to server:\n\t%s\n", buf);
+       }
+       close(client_sockfd);
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+     }
+   }
+@@ -2325,6 +2435,8 @@ int PGPOW_update_entry(void)
+       show_message("error talking to server:\n\t%s\n", buf);
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2334,6 +2446,8 @@ int PGPOW_update_entry(void)
+   }
+ 
+   close(client_sockfd);
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ 
+@@ -2369,6 +2483,19 @@ int DHS_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -2405,6 +2532,8 @@ int DHS_update_entry(void)
+     {
+       show_message("error parsing hostname from host %s\n", host);
+     }
++    update_status_error("Error" , "MISCONFIGURATION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+   *p = '\0';
+@@ -2415,6 +2544,8 @@ int DHS_update_entry(void)
+     {
+       show_message("error parsing domain from host %s\n", host);
+     }
++    update_status_error("Error" , "MISCONFIGURATION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+   domain = strdup(p);
+@@ -2427,6 +2558,8 @@ int DHS_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2518,6 +2651,8 @@ int DHS_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "MISCONFIGURATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       retval = UPDATERES_ERROR;
+       break;
+ 
+@@ -2526,6 +2661,8 @@ int DHS_update_entry(void)
+       {
+         printf("request successful\n");
+       }
++      update_status_error("Updated" , "NO_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       break;
+ 
+     case 401:
+@@ -2534,6 +2671,8 @@ int DHS_update_entry(void)
+         show_message("authentication failure\n");
+       }
+       retval = UPDATERES_SHUTDOWN;
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       break;
+ 
+     default:
+@@ -2545,6 +2684,8 @@ int DHS_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         show_message("server response: %s\n", auth);
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       retval = UPDATERES_ERROR;
+       break;
+   }
+@@ -2564,6 +2705,8 @@ int DHS_update_entry(void)
+       {
+         show_message("error connecting to %s:%s\n", server, port);
+       }
++      update_status_error("Error" , "MISCONFIGURATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+     }
+ 
+@@ -2655,6 +2798,8 @@ int DHS_update_entry(void)
+         {
+           show_message("strange server response, are you connecting to the right server?\n");
+         }
++        update_status_error("Error" , "MISCONFIGURATION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         retval = UPDATERES_ERROR;
+         break;
+ 
+@@ -2663,6 +2808,8 @@ int DHS_update_entry(void)
+         {
+           printf("request successful\n");
+         }
++        update_status_error("Updated" , "NO_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         break;
+ 
+       case 401:
+@@ -2670,6 +2817,8 @@ int DHS_update_entry(void)
+         {
+           show_message("authentication failure\n");
+         }
++        update_status_error("Error" , "AUTHENTICATION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         retval = UPDATERES_SHUTDOWN;
+         break;
+ 
+@@ -2682,6 +2831,8 @@ int DHS_update_entry(void)
+           show_message("unknown return code: %d\n", ret);
+           show_message("server response: %s\n", auth);
+         }
++        update_status_error("Error" , "AUTHENTICATION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         retval = UPDATERES_ERROR;
+         break;
+     }
+@@ -2719,6 +2870,19 @@ int ODS_check_info(void)
+     address = strdup("");
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -2737,6 +2901,8 @@ int ODS_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2745,6 +2911,8 @@ int ODS_update_entry(void)
+   {
+     show_message("strange server response, are you connecting to the right server?\n");
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2764,6 +2932,8 @@ int ODS_update_entry(void)
+       show_message("error talking to server\n");
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2782,6 +2952,8 @@ int ODS_update_entry(void)
+       show_message("error talking to server\n");
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2802,6 +2974,8 @@ int ODS_update_entry(void)
+       show_message("error talking to server\n");
+     }
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2811,6 +2985,8 @@ int ODS_update_entry(void)
+   }
+ 
+   close(client_sockfd);
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ 
+@@ -2847,6 +3023,19 @@ int TZO_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -2868,6 +3057,8 @@ int TZO_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -2917,6 +3108,8 @@ int TZO_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -2925,6 +3118,8 @@ int TZO_update_entry(void)
+       {
+         printf("request successful\n");
+       }
++      update_status_error("Updated" , "NO_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       break;
+ 
+     case 302:
+@@ -2963,6 +3158,8 @@ int TZO_update_entry(void)
+           show_message("unknown error\n");
+         }
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -2975,6 +3172,8 @@ int TZO_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         show_message("server response: %s\n", auth);
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+@@ -3015,6 +3214,19 @@ int EASYDNS_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -3036,6 +3248,8 @@ int EASYDNS_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -3092,6 +3306,8 @@ int EASYDNS_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3100,6 +3316,8 @@ int EASYDNS_update_entry(void)
+       {
+         if(!(options & OPT_QUIET))
+         {
++          update_status_error("Updated" , "NO_ERROR");
++         send_commandline_notification(notif_name_value, 3);
+           printf("request successful\n");
+         }
+       }
+@@ -3110,6 +3328,8 @@ int EASYDNS_update_entry(void)
+         {
+           fprintf(stderr, "server output: %s\n", buf);
+         }
++        update_status_error("Error" , "CONNECTION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         return(UPDATERES_ERROR);
+       }
+       break;
+@@ -3119,6 +3339,8 @@ int EASYDNS_update_entry(void)
+       {
+         show_message("authentication failure\n");
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_SHUTDOWN);
+       break;
+ 
+@@ -3131,10 +3353,14 @@ int EASYDNS_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         show_message("server response: %s\n", auth);
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+ 
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ 
+@@ -3185,6 +3411,19 @@ int EASYDNS_PARTNER_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -3206,6 +3445,8 @@ int EASYDNS_PARTNER_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Updated" , "NO_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -3260,6 +3501,8 @@ int EASYDNS_PARTNER_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3278,6 +3521,8 @@ int EASYDNS_PARTNER_update_entry(void)
+         {
+           fprintf(stderr, "server output: %s\n", buf);
+         }
++        update_status_error("Error" , "CONNECTION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         return(UPDATERES_ERROR);
+       }
+       break;
+@@ -3287,6 +3532,8 @@ int EASYDNS_PARTNER_update_entry(void)
+       {
+         show_message("authentication failure\n");
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_SHUTDOWN);
+       break;
+ 
+@@ -3297,6 +3544,8 @@ int EASYDNS_PARTNER_update_entry(void)
+       }
+       show_message("sleeping for %s\n", format_time(MAX_WAITRESPONSE_WAIT));
+       sleep(MAX_WAITRESPONSE_WAIT);
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3305,6 +3554,8 @@ int EASYDNS_PARTNER_update_entry(void)
+       {
+         show_message("no dynamic service for this host/domain\n");
+       }
++      update_status_error("Error" , "MISCONFIGURATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_SHUTDOWN);
+       break;
+ 
+@@ -3313,6 +3564,8 @@ int EASYDNS_PARTNER_update_entry(void)
+       {
+         show_message("partner not supported\n");
+       }
++      update_status_error("Error" , "MISCONFIGURATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_SHUTDOWN);
+       break;
+ 
+@@ -3325,9 +3578,13 @@ int EASYDNS_PARTNER_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         show_message("server response: %s\n", auth);
+       }
++      update_status_error("Error" , "MISCONFIGURATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+ 
+   return(UPDATERES_OK);
+ }
+@@ -3374,6 +3631,19 @@ int GNUDIP_check_info(void)
+     }
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -3400,6 +3670,8 @@ int GNUDIP_update_entry(void)
+   if(*p != '\0') { p++; }
+   if(*p == '\0')
+   {
++      update_status_error("Error" , "MISCONFIGURATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+   domainname = p;
+@@ -3410,12 +3682,16 @@ int GNUDIP_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+   if((bytes=read_input(buf, BUFFER_SIZE)) <= 0)
+   {
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+   buf[bytes] = '\0';
+@@ -3451,6 +3727,8 @@ int GNUDIP_update_entry(void)
+   if((bytes=read_input(buf, BUFFER_SIZE)) <= 0)
+   {
+     close(client_sockfd);
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+   buf[bytes] = '\0';
+@@ -3472,6 +3750,8 @@ int GNUDIP_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3487,6 +3767,8 @@ int GNUDIP_update_entry(void)
+       {
+         show_message("invalid login attempt\n");
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3502,10 +3784,14 @@ int GNUDIP_update_entry(void)
+       {
+         show_message("unknown return code: %d\n", ret);
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+ 
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ #endif
+@@ -3542,6 +3828,19 @@ int JUSTL_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -3563,6 +3862,8 @@ int JUSTL_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -3613,7 +3914,9 @@ int JUSTL_update_entry(void)
+       if(!(options & OPT_QUIET))
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+-      }
++      } 
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3632,6 +3935,8 @@ int JUSTL_update_entry(void)
+         {
+           fprintf(stderr, "server output: %s\n", buf);
+         }
++        update_status_error("Error" , "CONNECTION_ERROR");
++       send_commandline_notification(notif_name_value, 3);
+         return(UPDATERES_ERROR);
+       }
+       break;
+@@ -3641,6 +3946,8 @@ int JUSTL_update_entry(void)
+       {
+         show_message("authentication failure\n");
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_SHUTDOWN);
+       break;
+ 
+@@ -3653,10 +3960,14 @@ int JUSTL_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         show_message("server response: %s\n", auth);
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+ 
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ 
+@@ -3692,6 +4003,19 @@ int DYNS_check_info(void)
+     option_handler(CMD_interface, buf);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -3713,6 +4037,8 @@ int DYNS_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -3764,6 +4090,8 @@ int DYNS_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3780,6 +4108,8 @@ int DYNS_update_entry(void)
+       {
+         if(!(options & OPT_QUIET))
+         {
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           printf("bad request\n");
+         }
+       }
+@@ -3807,6 +4137,8 @@ int DYNS_update_entry(void)
+         }
+         return(UPDATERES_ERROR);
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+ 
+       break;
+ 
+@@ -3816,6 +4148,8 @@ int DYNS_update_entry(void)
+         show_message("authentication failure\n");
+       }
+       return(UPDATERES_ERROR);
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       break;
+ 
+     default:
+@@ -3827,9 +4161,13 @@ int DYNS_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         show_message("server response: %s\n", auth);
+       }
++      update_status_error("Error" , "MISCONFIGURATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+ 
+   return(UPDATERES_OK);
+ }
+@@ -3856,7 +4194,9 @@ int HN_update_entry(void)
+     if(!(options & OPT_QUIET))
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+-    }
++    } 
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -3907,6 +4247,8 @@ int HN_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -3932,6 +4274,8 @@ int HN_update_entry(void)
+           {
+             show_message("strange server response, are you connecting to the right server?\n");
+           }
++          update_status_error("Error" , "CONNECTION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           return(UPDATERES_ERROR);
+           break;
+ 
+@@ -3944,21 +4288,29 @@ int HN_update_entry(void)
+ 
+         case 201:
+           show_message("Last update was less than %d seconds ago.\n", 300);
++          update_status_error("Error" , "MISCONFIGURATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           return(UPDATERES_ERROR);
+           break;
+ 
+         case 202:
+           show_message("Server error.\n");
++          update_status_error("Error" , "CONNECTION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           return(UPDATERES_ERROR);
+           break;
+ 
+         case 203:
+           show_message("Failure because account is frozen (by admin).\n");
++          update_status_error("Error" , "AUTHENTICATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           return(UPDATERES_SHUTDOWN);
+           break;
+ 
+         case 204:
+           show_message("Failure because account is locked (by user).\n");
++          update_status_error("Error" , "AUTHENTICATION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           return(UPDATERES_SHUTDOWN);
+           break;
+ 
+@@ -3968,6 +4320,8 @@ int HN_update_entry(void)
+             show_message("unknown return code: %d\n", ret);
+             fprintf(stderr, "server response: %s\n", buf);
+           }
++          update_status_error("Error" , "CONNECTION_ERROR");
++          send_commandline_notification(notif_name_value, 3);
+           return(UPDATERES_ERROR);
+           break;
+       }
+@@ -3978,6 +4332,8 @@ int HN_update_entry(void)
+       {
+         show_message("authentication failure\n");
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_SHUTDOWN);
+       break;
+ 
+@@ -3990,10 +4346,14 @@ int HN_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         fprintf(stderr, "server response: %s\n", auth);
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+ 
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ 
+@@ -4015,6 +4375,19 @@ int ZONEEDIT_check_info(void)
+     chomp(host);
+   }
+ 
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  }
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -4036,6 +4409,8 @@ int ZONEEDIT_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -4088,7 +4463,9 @@ int ZONEEDIT_update_entry(void)
+       if(!(options & OPT_QUIET))
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+-      }
++       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+ 
+@@ -4107,6 +4484,8 @@ int ZONEEDIT_update_entry(void)
+         {
+           fprintf(stderr, "server output: %s\n", buf);
+         }
++        update_status_error("Error" , "CONNECTION_ERROR");
++        send_commandline_notification(notif_name_value, 3);
+         return(UPDATERES_ERROR);
+       }
+       break;
+@@ -4116,6 +4495,8 @@ int ZONEEDIT_update_entry(void)
+       {
+         show_message("authentication failure\n");
+       }
++      update_status_error("Error" , "AUTHENTICATION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_SHUTDOWN);
+       break;
+ 
+@@ -4128,10 +4509,14 @@ int ZONEEDIT_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         show_message("server response: %s\n", auth);
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+ 
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ 
+@@ -4153,6 +4538,20 @@ int HEIPV6TB_check_info(void)
+     chomp(buf);
+     option_handler(CMD_interface, buf);
+   }
++
++  if(obj_name == NULL)
++  {
++    if(options & OPT_DAEMON)
++    {
++      fprintf(stderr, "you must provide TR181 object name to be updated\n");
++      return(-1);
++    }
++    *buf = '\0';
++    fgets(buf, BUFSIZ, stdin);
++    chomp(buf);
++    option_handler(CMD_obj_name, buf);
++  } 
++
+   warn_fields(service->fields_used);
+ 
+   return 0;
+@@ -4174,6 +4573,8 @@ int HEIPV6TB_update_entry(void)
+     {
+       show_message("error connecting to %s:%s\n", server, port);
+     }
++    update_status_error("Error" , "CONNECTION_ERROR");
++    send_commandline_notification(notif_name_value, 3);
+     return(UPDATERES_ERROR);
+   }
+ 
+@@ -4222,6 +4623,8 @@ int HEIPV6TB_update_entry(void)
+       {
+         show_message("strange server response, are you connecting to the right server?\n");
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+     case 200:
+@@ -4239,10 +4642,14 @@ int HEIPV6TB_update_entry(void)
+         show_message("unknown return code: %d\n", ret);
+         fprintf(stderr, "server response: %s\n", auth);
+       }
++      update_status_error("Error" , "CONNECTION_ERROR");
++      send_commandline_notification(notif_name_value, 3);
+       return(UPDATERES_ERROR);
+       break;
+   }
+ 
++  update_status_error("Updated" , "NO_ERROR");
++  send_commandline_notification(notif_name_value, 3);
+   return(UPDATERES_OK);
+ }
+ 
+@@ -4573,6 +4980,14 @@ int main(int argc, char **argv)
+       }
+     }
+ 
++    fprintf(stderr, "PID [%d]\n",getpid());
++/*Update the PID ez-ipupdate*/
++  strcpy(notif_name_value[0].param_name , "obj_name");
++  strcpy(notif_name_value[0].param_value , obj_name);
++  strcpy(notif_name_value[1].param_name , "Pid");
++  snprintf(notif_name_value[1].param_value, 256, "%d", getpid());
++  send_commandline_notification(notif_name_value, 2);
++
+     for(;;)
+     {
+ #if HAVE_SIGNAL_H
+@@ -4898,3 +5313,33 @@ int main(int argc, char **argv)
+   return(retval);
+ }
+ 
++void update_status_error(char* status , char* error)
++{
++  strcpy(notif_name_value[0].param_name , "obj_name");
++  strcpy(notif_name_value[0].param_value , obj_name);
++  strcpy(notif_name_value[1].param_name , "Status");
++  strcpy(notif_name_value[1].param_value , status);
++  strcpy(notif_name_value[2].param_name , "LastError");
++  strcpy(notif_name_value[2].param_value , error);
++}
++
++void send_commandline_notification(struct name_value_t * ptr_name_value, int count)
++{
++
++    char command[1024];
++    char buf[1024];
++    int i =0;
++
++    sprintf(command, "ubus call servd notify \'\{\"nid\":  %d , \"type\": false, ",NOTIFY_DYNDNS_STATUS_UPDATE);
++    for(i=0 ; i < count ; i++)
++    {
++        sprintf(buf, " \"pn%d\": \"%s\", \"pv%d\": \"%s\" ", (i+1), ptr_name_value[i].param_name ,(i+1), ptr_name_value[i].param_value);
++        strcat(command,buf);
++        if(i != (count - 1))
++            strcat(command," , ");
++    }
++    strcat(command," }'");
++    show_message("Executing [%s]\n",command);
++    fprintf(stderr, "\n\nExecuting: %s\n\n\n", command);
++    exec_cmd(command);    
++}

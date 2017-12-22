@@ -1,0 +1,1382 @@
+From d6810af1c111c5a0f8e09821b3fb551ca44d53ac Mon Sep 17 00:00:00 2001
+From: Daniel Drubin <daniel.drubin@intel.com>
+Date: Wed, 14 Jan 2015 14:59:11 +0200
+Subject: [PATCH 129/441] Large HECI patchset from IMIN
+
+- Changed ISH -> ISS names in comments, kernel config files
+- Incorporates fix "heci: add the device to device list before register it to system"
+  (submitted by MCG SI as https://android.intel.com/#/c/315575/)
+- Incorporates fix "before unregister the device check if the device has been registered"
+  (submitted by MCG SI as https://android.intel.com/#/c/312883/)
+- Incorporates fix "ish_remove: only flush ish's related workqueue"
+  (submitted by MCG SI as https://android.intel.com/#/c/315010/)
+- Incorporates fix "heci-hid.c: fix memory leak"
+  (submitted by MCG SI as https://android.intel.com/#/c/316841/)
+- Fixes regression in IMIN tree (AOS crash when connecting to SMHI client)
+- Fixes IMIN regression (exposing right sensors properties moved not to interfere with other HID devices)
+- Added Cx Si support
+- Fixed double-free issue in hid-sensor-hub driver
+
+Change-Id: I9be2bb8f695272ec361fad4c9b5c689a86801939
+Signed-off-by: Daniel Drubin <daniel.drubin@intel.com>
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-14110
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-16554
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-16444
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-14915
+Reviewed-on: https://android.intel.com:443/319163
+Signed-off-by: Fabien Marotte <fabien.marotte@intel.com>
+(cherry picked from commit aea84393f4e1c3356ad49aa99f93cc9297af31d0)
+---
+ drivers/hid/hid-sensor-hub.c         | 479 +++++++++++++++++++++++------------
+ drivers/misc/Makefile                |   2 +-
+ drivers/misc/heci/Kconfig            |  31 ++-
+ drivers/misc/heci/Makefile           |   4 +-
+ drivers/misc/heci/bus.c              |   6 +-
+ drivers/misc/heci/bus.h              |  14 +
+ drivers/misc/heci/client.c           |   2 +-
+ drivers/misc/heci/client.h           |   2 +-
+ drivers/misc/heci/debugfs.c          |   2 +-
+ drivers/misc/heci/hbm.c              |   6 +-
+ drivers/misc/heci/hbm.h              |   2 +-
+ drivers/misc/heci/heci-api.c         |  12 +-
+ drivers/misc/heci/heci-api.h         |   4 +-
+ drivers/misc/heci/heci-hid-client.c  |  13 +-
+ drivers/misc/heci/heci-hid.c         |   3 +-
+ drivers/misc/heci/heci-hid.h         |  16 +-
+ drivers/misc/heci/heci_dev.h         |   2 +-
+ drivers/misc/heci/hid-strings-def.h  |   4 +-
+ drivers/misc/heci/hw-ish-regs.h      |  12 +-
+ drivers/misc/heci/hw-ish.c           |  39 ++-
+ drivers/misc/heci/hw-ish.h           |   4 +-
+ drivers/misc/heci/init.c             |   7 +-
+ drivers/misc/heci/pci-ish.c          |  38 ++-
+ drivers/misc/heci/platform-config.h  |   6 +-
+ drivers/misc/heci/senscol-core.c     |  11 +
+ drivers/misc/heci/utils.h            |  14 +
+ include/linux/senscol/senscol-core.h |  15 ++
+ 27 files changed, 511 insertions(+), 239 deletions(-)
+
+--- a/drivers/hid/hid-sensor-hub.c
++++ b/drivers/hid/hid-sensor-hub.c
+@@ -17,18 +17,34 @@
+  *
+  */
+ 
+-/*#define CONFIG_ISH_PATH_SENSCOL*/
++
++#include <linux/device.h>
++#include <linux/hid.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <linux/hid-sensor-ids.h>
++#include <linux/hid-sensor-hub.h>
++#include <linux/sched.h>
++#include "hid-ids.h"
++
++/*SENSCOL*/
++#include <linux/senscol/senscol-core.h>
++/*IIO*/
++#include <linux/mfd/core.h>
++
++/*#define CONFIG_ISS_PATH_SENSCOL*/
+ 
+ /***************************************/
+ #if 1
+ 
+-#ifdef CONFIG_ISH_PATH_SENSCOL
++#ifdef CONFIG_ISS_PATH_SENSCOL
+ #define SENSCOL		1
+ #else
+ #define SENSCOL		0	
+ #endif
+ 
+-#ifdef CONFIG_ISH_PATH_IIO
++#ifdef CONFIG_ISS_PATH_IIO
+ #define IIO 		1
+ #else
+ #define IIO 		0	
+@@ -42,22 +58,6 @@
+ #endif
+ /***************************************/
+ 
+-
+-#include <linux/device.h>
+-#include <linux/hid.h>
+-#include <linux/module.h>
+-#include <linux/slab.h>
+-#include <linux/list.h>
+-#include <linux/hid-sensor-ids.h>
+-#include <linux/hid-sensor-hub.h>
+-#include <linux/sched.h>
+-#include "hid-ids.h"
+-
+-/*SENSCOL*/
+-#include <linux/senscol/senscol-core.h>
+-/*IIO*/
+-#include <linux/mfd/core.h>
+-
+ #define HID_SENSOR_HUB_ENUM_QUIRK	0x01
+ 
+ /**
+@@ -457,10 +457,12 @@ static bool is_supported(int physical)
+ 
+ static int	senscol_impl_added;
+ static int	is_sens_data_field(unsigned usage);
+-static int get_field_index(struct hid_device *hdev, unsigned report_id, unsigned usage, int report_idx);	//???
++static int get_field_index(struct hid_device *hdev, unsigned report_id,
++	unsigned usage, int report_idx);
+ 
+ /* Get sensor's property by name */
+-static struct sens_property	*get_prop_by_name(struct sensor_def *sensor, char *name)
++static struct sens_property *get_prop_by_name(struct sensor_def *sensor,
++	char *name)
+ {
+ 	int	i;
+ 
+@@ -472,7 +474,8 @@ static struct sens_property	*get_prop_by
+ }
+ 
+ /* Get sensor's data field by name */
+-static struct data_field	*get_data_field_by_name(struct sensor_def *sensor, char *name)
++static struct data_field *get_data_field_by_name(struct sensor_def *sensor,
++	char *name)
+ {
+ 	int	i;
+ 
+@@ -483,7 +486,8 @@ static struct data_field	*get_data_field
+ 	return	NULL;
+ }
+ 
+-static int get_field_index(struct hid_device *hdev, unsigned report_id, unsigned usage, int report_type)	//???
++static int get_field_index(struct hid_device *hdev, unsigned report_id,
++	unsigned usage, int report_type)
+ {
+ 	int i = 0;
+ 	struct hid_report *report;
+@@ -539,7 +543,7 @@ static bool hid_is_string_property(uint3
+ }
+ 
+ /* Get sensor hub device by index */
+-static struct sensor_hub_data	*get_sensor_hub_by_index(unsigned idx)						//???
++static struct sensor_hub_data	*get_sensor_hub_by_index(unsigned idx)
+ {
+ 	int	i;
+ 	struct sensor_hub_data	*sd;
+@@ -926,7 +930,7 @@ static int sensor_hub_probe(struct hid_d
+ 		goto err_stop_hw;
+ 	}
+ 
+-#if IIO													//???
++#if IIO
+ 	/* filter the unknown sensors */
+ 	list_for_each_entry(report, &inp_report_enum->report_list, list) {
+ 		dev_dbg(&hdev->dev, "Checking Report id:%x\n", report->id);
+@@ -936,14 +940,16 @@ static int sensor_hub_probe(struct hid_d
+ 				dev_cnt--;
+ 		}
+ 	}
+-	dev_dbg(&hdev->dev, "%s(): Dev Count after  is %d\n", __func__, dev_cnt);
++	dev_dbg(&hdev->dev, "%s(): Dev Count after  is %d\n",
++		__func__, dev_cnt);
+ #endif
+ 
+ #if SENSCOL
+ 	/* Register senscol impl */
+ 	if (!senscol_impl_added) {
+ 		rv = add_senscol_impl(&hid_senscol_impl);
+-		dev_dbg(&hdev->dev, "%s(): add_senscol_impl() returned %d\n", __func__, rv);
++		dev_dbg(&hdev->dev, "%s(): add_senscol_impl() returned %d\n",
++			__func__, rv);
+ 		if (!rv)
+ 			senscol_impl_added = 1;
+ 	}
+@@ -956,12 +962,43 @@ static int sensor_hub_probe(struct hid_d
+ 			ret = -ENOMEM;
+ 			goto err_stop_hw;
+ 	}
++
++/* #if SENSCOL */
++	/* Translate properties logical->physical if needed here,
++	 * instead of hid-core */
++	list_for_each_entry(freport, &feat_report_enum->report_list, list) {
++		int	j;
++
++		for (j = 0; j < freport->maxfield; ++j) {
++			feat_field = freport->field[j];
++			if (!(feat_field->flags & HID_MAIN_ITEM_VARIABLE))
++				for (i = 0; i < feat_field->maxusage; ++i)
++					feat_field->usage[i].hid =
++						feat_field->logical;
++		}
++	}
++
++	/* Translate  input fields logical->physical if needed here,
++	 * instead of hid-core */
++	list_for_each_entry(report, &inp_report_enum->report_list, list) {
++		int	j;
++
++		for (j = 0; j < report->maxfield; ++j) {
++			field = report->field[j];
++			if (!(field->flags & HID_MAIN_ITEM_VARIABLE))
++				for (i = 0; i < field->maxusage; ++i)
++					field->usage[i].hid = field->logical;
++		}
++	}
++/* #endif */
++
+ 	list_for_each_entry(report, &inp_report_enum->report_list, list) {
+ 		hid_dbg(hdev, "Report id:%x\n", report->id);
+ 		field = report->field[0];
++
+ 		if (report->maxfield && field &&
+ 					field->physical) {
+-			if (is_supported(field->physical)) {						//???
++			if (is_supported(field->physical)) {
+ 				name = kasprintf(GFP_KERNEL, "HID-SENSOR-%x",
+ 						field->physical);
+ 				if (name == NULL) {
+@@ -984,152 +1021,268 @@ static int sensor_hub_probe(struct hid_d
+ 			}
+ 		}
+ #if SENSCOL
+-			/* Create senscol sensor from each report, regardles of is_supported() */
+-			do {
+-				struct sensor_def	*senscol_sensor;
+-				int	j;
+-				const char	*usage_name;
+-
+-				senscol_sensor = alloc_senscol_sensor();
+-				if (!senscol_sensor) {
+-					printk(KERN_ERR "%s(): failed to allocate senscol_sensor\n", __func__);
++		/* Create senscol sensor from each report,
++		 * regardles of is_supported() */
++		do {
++			struct sensor_def	*senscol_sensor;
++			int	j;
++			const char	*usage_name;
++
++			senscol_sensor = alloc_senscol_sensor();
++			if (!senscol_sensor) {
++				dev_err(&hdev->dev,
++					"%s(): failed to allocate sensor\n",
++					__func__);
++				break;
++			}
++			init_senscol_sensor(senscol_sensor);
++			usage_name = senscol_usage_to_name(field->physical &
++				0xFFFF);
++			if (usage_name)
++				senscol_sensor->name = kasprintf(GFP_KERNEL,
++					"%s", usage_name);
++			else
++				senscol_sensor->name = kasprintf(GFP_KERNEL,
++					"custom-%X", field->physical);
++			if (!senscol_sensor->name) {
++				dev_err(&hdev->dev,
++					"%s(): failed to allocate name\n",
++					__func__);
++				kfree(senscol_sensor);
++				break;
++			}
++			senscol_sensor->usage_id = field->physical;
++			senscol_sensor->id = sd->sensor_hub_index << 16 |
++				report->id & 0xFFFF;
++			senscol_sensor->impl = &hid_senscol_impl;
++			senscol_sensor->sample_size = 0;
++
++			/* Add properties */
++			/* 1. find matching feature report */
++			list_for_each_entry(freport,
++					&feat_report_enum->report_list,
++					list) {
++				feat_field = freport->field[0];
++				if (freport->maxfield && feat_field &&
++						feat_field->physical &&
++						(feat_field->physical ==
++						senscol_sensor->usage_id))
+ 					break;
+-				}
+-				init_senscol_sensor(senscol_sensor);
+-				/* TODO: for known sensors from HID usages should appear known name */
+-				usage_name = senscol_usage_to_name(field->physical & 0xFFFF);
++			}
++
++			/*2. dump each prop field */
++			for (i = 0; i < freport->maxfield; ++i) {
++				struct sens_property	prop_field;
++
++				dev_dbg(&hdev->dev,
++					"%d collection_index:%x hid:%x sz:%x ",
++					i,
++					freport->field[i]->usage->
++						collection_index,
++					freport->field[i]->usage->hid,
++					freport->field[i]->report_size / 8);
++
++				dev_dbg(&hdev->dev, "report count: %u\n",
++					freport->field[i]->report_count);
++
++				memset(&prop_field, 0,
++					sizeof(struct sens_property));
++				prop_field.usage_id =
++					freport->field[i]->usage->hid;
++				usage_name = senscol_usage_to_name(
++					prop_field.usage_id & 0xFFFF);
+ 				if (usage_name)
+-					senscol_sensor->name = kasprintf(GFP_KERNEL, "%s", usage_name);
+-				else
+-					senscol_sensor->name = kasprintf(GFP_KERNEL, "custom-%X", field->physical);
+-				if (!senscol_sensor->name) {
+-					printk(KERN_ERR "%s(): failed to allocate memory for senscol_sensor->name\n", __func__);
+-					kfree(senscol_sensor);
+-					break;
+-				}
+-				senscol_sensor->usage_id = field->physical;
+-				senscol_sensor->id = sd->sensor_hub_index << 16 | report->id & 0xFFFF;
+-				senscol_sensor->impl = &hid_senscol_impl;
+-				senscol_sensor->sample_size = 0;
+-
+-				/* Add properties */
+-				/* 1 find matching feature report */
+-				list_for_each_entry(freport, &feat_report_enum->report_list, list) {
+-					feat_field = freport->field[0];
+-					if (freport->maxfield && feat_field && feat_field->physical && (feat_field->physical == senscol_sensor->usage_id))
+-						break;
++					prop_field.name = kasprintf(GFP_KERNEL,
++						"%s", usage_name);
++				/* there is  a special case when the property
++				 * is related to specific data field/
++				 * set of fields */
++				else {
++					uint32_t modifier =
++						prop_field.usage_id & 0xF000;
++					uint32_t data_hid =
++						prop_field.usage_id & 0x0FFF;
++					usage_name = senscol_usage_to_name(
++						data_hid);
++					dev_dbg(&hdev->dev,
++						"%s(): DATANAME %s\n",
++						__func__, usage_name);
++					if (!usage_name)
++						prop_field.name =
++							kasprintf(GFP_KERNEL,
++							"unknown-%X",
++							prop_field.usage_id);
++					else {
++						const char *modif_name =
++							senscol_get_modifier(
++								modifier);
++						dev_dbg(&hdev->dev,
++							"%s(): MODIFNAME %s\n",
++							__func__, modif_name);
++						prop_field.name =
++							kasprintf(GFP_KERNEL,
++							"%s_%s", usage_name,
++							modif_name);
++					}
+ 				}
++				prop_field.is_numeric =
++					(freport->field[i]->flags &
++					HID_MAIN_ITEM_VARIABLE) &&
++					(!hid_is_string_property(
++					prop_field.usage_id));
++
++				rv = add_sens_property(senscol_sensor,
++					&prop_field);
++				dev_dbg(&hdev->dev, "%s(): ", __func__);
++				dev_dbg(&hdev->dev, "adding prop %s %s %d\n",
++					prop_field.name, "returned",  rv);
+ 
+-				/*2 . dump each prop field */
+-				for (i = 0; i < freport->maxfield; ++i) {
+-					struct sens_property	prop_field;
+-
+-					dev_dbg(&hdev->dev, "ZZZ %d collection_index:%x hid:%x sz:%x order: %x\n",
+-							i, freport->field[i]->usage->collection_index,
+-							freport->field[i]->usage->hid,
+-							freport->field[i]->report_size/8,
+-							freport->field[i]->report_count);
+-
+-					memset(&prop_field, 0, sizeof(struct sens_property));
+-					prop_field.usage_id = freport->field[i]->usage->hid;
+-					usage_name = senscol_usage_to_name(prop_field.usage_id  & 0xFFFF);
+-					if (usage_name)
+-						prop_field.name = kasprintf(GFP_KERNEL, "%s", usage_name);
+-					else /* there is  a special case when the property is related to specific data field/ set of fields */ {
+-						uint32_t modifier = prop_field.usage_id & 0xF000;
+-						uint32_t data_hid  = prop_field.usage_id & 0x0FFF;
+-						usage_name = senscol_usage_to_name(data_hid);
+-						dev_dbg(&hdev->dev, "%s(): DATANAME %s \n", __func__, usage_name);
+-						if (!usage_name)
+-							prop_field.name = kasprintf(GFP_KERNEL, "unknown-%X", prop_field.usage_id);
+-						else {
+-							const char *modif_name = senscol_get_modifier(modifier);
+-							dev_dbg(&hdev->dev, "%s(): MODIFNAME %s \n", __func__, modif_name);
+-							prop_field.name = kasprintf(GFP_KERNEL, "%s_%s", usage_name, modif_name);
+-						}
+-					}
+-					prop_field.is_numeric = (freport->field[i]->flags  & HID_MAIN_ITEM_VARIABLE) && (!hid_is_string_property(prop_field.usage_id));
+ 
+-					rv = add_sens_property(senscol_sensor, &prop_field);
+-					dev_dbg(&hdev->dev, "%s(): add_prop_field() for prop %s returned %d\n", __func__, prop_field.name, rv);
++			}
+ 
++			/* Add data fields; Dump fields in this report.
++			`maxfield' is upper-bound NON-INCLUSIVE */
++			for (j = 0; j < report->maxfield; ++j) {
++				int	k;
++				bool need_internal_index = false;
++
++				dev_dbg(&hdev->dev, "%s(): ", __func__);
++				dev_dbg(&hdev->dev,
++					"%s=%d %s=%08X %s=%08X %s=%u %s=%u ",
++					"field", j,
++					"physical",  report->field[j]->physical,
++					"logical", report->field[j]->logical,
++					"maxusage", report->field[j]->maxusage,
++					"report_type",
++					report->field[j]->report_type);
++				dev_dbg(&hdev->dev, "%s=%u %s=%d %s=%d %s=%d ",
++					"report_size",
++					report->field[j]->report_size >> 3,
++					"logic_min",
++					report->field[j]->logical_minimum,
++					"logic_max",
++					report->field[j]->logical_maximum,
++					"phys_min",
++					report->field[j]->physical_minimum);
++				dev_dbg(&hdev->dev, "%s=%d %s=%d %s=%u %s=%d\n",
++					"phys_max",
++					report->field[j]->physical_maximum,
++					"exp",
++					report->field[j]->unit_exponent,
++					"unit",
++					report->field[j]->unit,
++					"report_count",
++					report->field[j]->report_count);
++				dev_dbg(&hdev->dev, "%s(): usages --\n",
++					__func__);
++
++				if (report->field[j]->report_count > 1) {
++					int instancesCnt = 0;
++for (k = 0; k < report->field[j]->maxusage; ++k)
++	if (is_sens_data_field(report->field[j]->usage[k].hid & 0xFFFF))
++							instancesCnt++;
+ 
++					if (instancesCnt > 1)
++						need_internal_index = true;
+ 				}
+ 
+-				/* Add data fields; Dump fields in this report. `maxfield' is upper-bound NON-INCLUSIVE */
+-				for (j = 0; j < report->maxfield; ++j) {
+-					int	k;
+-					bool need_internal_index = false;
+-
+-					dev_dbg(&hdev->dev, "%s(): field:%d physical=%08X logical=%08X maxusage=%u report_type=%u "
+-						"report_size=%u (bytes) logic_min=%d logic_max=%d phys_min=%d phys_max=%d exp=%d unit=%u rep cnt=%d\n",
+-						__func__, j, report->field[j]->physical, report->field[j]->logical,
+-						report->field[j]->maxusage, report->field[j]->report_type,
+-						report->field[j]->report_size >> 3,
+-						report->field[j]->logical_minimum, report->field[j]->logical_maximum,
+-						report->field[j]->physical_minimum, report->field[j]->physical_maximum,
+-						report->field[j]->unit_exponent, report->field[j]->unit,
+-						report->field[j]->report_count);
+-					dev_dbg(&hdev->dev, "%s(): usages --\n", __func__);
+-
+-					if (report->field[j]->report_count > 1) {
+-						int instancesCnt = 0;
+-						for (k = 0; k < report->field[j]->maxusage; ++k)
+-							if (is_sens_data_field(report->field[j]->usage[k].hid & 0xFFFF))
+-								instancesCnt++;
+-
+-						if (instancesCnt > 1)
+-							need_internal_index = true;
+-					}
+-
+-					for (k = 0; k < report->field[j]->maxusage; ++k) {
+-						dev_dbg(&hdev->dev, "	%s(): usage:%d hid=%08X\n", __func__,
+-							k, report->field[j]->usage[k].hid);
+-
+-						/* Add data fields */
+-						if (is_sens_data_field(report->field[j]->usage[k].hid & 0xFFFF)) {
+-							struct data_field	data_field;
+-
+-							memset(&data_field, 0, sizeof(struct data_field));
+-
+-							usage_name = senscol_usage_to_name(report->field[j]->usage[k].hid & 0xFFFF);
+-							if (usage_name)
+-								data_field.name = need_internal_index	? kasprintf(GFP_KERNEL, "%s_%d", usage_name, k)
+-																		: kasprintf(GFP_KERNEL, "%s", usage_name);
+-							else {
+-								printk(KERN_ERR "%s():got problematic name for usage  %08X\n", __func__, report->field[j]->usage[k].hid);
+-								data_field.name = need_internal_index	? kasprintf(GFP_KERNEL, "data-%X_%d", report->field[j]->usage[k].hid, k)
+-																		: kasprintf(GFP_KERNEL, "data-%X", report->field[j]->usage[k].hid);
+-							}
+-							if (!data_field.name) {
+-								printk(KERN_ERR "%s(): Failed to allocated data field for usage %08X\n", __func__, report->field[j]->usage[k].hid);
+-								continue;
+-							}
+-
+-							data_field.usage_id = report->field[j]->usage[k].hid;
+-							data_field.is_numeric = (report->field[j]->flags  & HID_MAIN_ITEM_VARIABLE);
+-							if (data_field.is_numeric) {
+-								if (report->field[j]->unit_exponent > 7 || report->field[j]->unit_exponent < -8)
+-									data_field.exp = 0xFF;
+-								else if (report->field[j]->unit_exponent >= 0)
+-									data_field.exp = report->field[j]->unit_exponent;
+-								else
+-									data_field.exp = 0x10 - report->field[j]->unit_exponent;
+-								data_field.unit = report->field[j]->unit;
+-							}
+-							
+-							data_field.len = (report->field[j]->report_size >> 3) * report->field[j]->report_count;
+-							rv = add_data_field(senscol_sensor, &data_field);
+-							dev_dbg(&hdev->dev, "%s(): add_data_field() returned %d\n", __func__, rv);
+-							senscol_sensor->sample_size += report->field[j]->report_size >> 3;
+-						}
++				for (k = 0; k < report->field[j]->maxusage;
++						++k) {
++					dev_dbg(&hdev->dev,
++					"	%s(): usage:%d hid=%08X\n",
++						__func__, k,
++						report->field[j]->usage[k].hid);
++
++					/* Add data fields */
++					if (is_sens_data_field(report->
++							field[j]->usage[k].hid &
++							0xFFFF)) {
++						struct data_field data_field;
++
++						memset(&data_field, 0, sizeof(
++							struct data_field));
++
++						usage_name =
++							senscol_usage_to_name(
++							report->field[j]->
++							usage[k].hid & 0xFFFF);
++if (usage_name)
++							data_field.name =
++							need_internal_index ?
++							kasprintf(GFP_KERNEL,
++							"%s_%d", usage_name,
++							k) : kasprintf(
++							GFP_KERNEL, "%s",
++							usage_name);
++else {
++							data_field.name =
++							need_internal_index ?
++							kasprintf(GFP_KERNEL,
++							"data-%X_%d",
++							report->field[j]->
++							usage[k].hid, k) :
++							kasprintf(GFP_KERNEL,
++							"data-%X", report->
++							field[j]->usage[k].hid);
++}
++if (!data_field.name) {
++							dev_err(&hdev->dev,
++	"%s(): Failed to allocated data field for usage %08X\n", __func__,
++							report->field[j]->
++							usage[k].hid);
++							continue;
++}
++
++						data_field.usage_id = report->
++							field[j]->usage[k].hid;
++						data_field.is_numeric =
++							(report->field[j]->
++							flags &
++							HID_MAIN_ITEM_VARIABLE);
++if (data_field.is_numeric) {
++	if (report->field[j]->unit_exponent > 7 || report->
++								field[j]->
++								unit_exponent <
++									-8)
++								data_field.exp =
++									0xFF;
++	else if (report->field[j]->unit_exponent >= 0)
++								data_field.exp =
++								report->
++								field[j]->
++								unit_exponent;
++	else
++								data_field.exp =
++								0x10 - report->
++								field[j]->
++								unit_exponent;
++							data_field.unit =
++								report->
++								field[j]->
++								unit;
++}
++
++						data_field.len =
++							(report->field[j]->
++							report_size >> 3) *
++							report->field[j]->
++							report_count;
++						rv = add_data_field(
++							senscol_sensor,
++							&data_field);
++						senscol_sensor->sample_size +=
++							report->field[j]->
++							report_size >> 3;
+ 					}
+ 				}
++			}
+ 
+-				/* Add senscol_sensor */
+-				rv = add_senscol_sensor(senscol_sensor);
+-				dev_dbg(&hdev->dev, "%s(): add_senscol_sensor() returned %d\n", __func__, rv);
+-			} while (0);
++			/* Add senscol_sensor */
++			rv = add_senscol_sensor(senscol_sensor);
++			dev_dbg(&hdev->dev,
++				"%s(): add_senscol_sensor() returned %d\n",
++				__func__, rv);
++		} while (0);
+ #endif
+ 	}
+ #if IIO
+@@ -1147,9 +1300,9 @@ err_free_names:
+ err_stop_hw:
+ 	hid_hw_stop(hdev);
+ err_free:
+-	kfree(sd->hsdev);
++	/*kfree(sd->hsdev);*/
+ err_free_hub:
+-	kfree(sd);
++	/*kfree(sd);*/
+ 
+ 	return ret;
+ }
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -50,7 +50,7 @@ obj-y				+= carma/
+ obj-$(CONFIG_USB_SWITCH_FSA9480) += fsa9480.o
+ obj-$(CONFIG_ALTERA_STAPL)	+=altera-stapl/
+ obj-$(CONFIG_INTEL_MEI)		+= mei/
+-obj-$(CONFIG_INTEL_ISH)		+= heci/
++obj-$(CONFIG_INTEL_ISS)		+= heci/
+ obj-$(CONFIG_VMWARE_VMCI)	+= vmw_vmci/
+ obj-$(CONFIG_LATTICE_ECP3_CONFIG)	+= lattice-ecp3-config.o
+ obj-$(CONFIG_SRAM)		+= sram.o
+--- a/drivers/misc/heci/Kconfig
++++ b/drivers/misc/heci/Kconfig
+@@ -1,13 +1,26 @@
+-config INTEL_ISH
+-	tristate "Intel Integrated Sensors Hub"
++config INTEL_ISS
++	tristate "Intel Integrated Sensors Solution"
+ 	depends on X86 && PCI
+ 	help
+-	  ISH enabled sensors hub functionality on SoC/chipset level.
++	  ISS enabled sensors hub functionality on SoC/chipset level.
++	  Placeholder for description line 2.
++	  Placeholder for description line 3.
++	  Placeholder for description line 4.
+ 
+-config ISH_PATH_SENSCOL
+-	tristate "ISH path through sensor-collection"
+-	depends on INTEL_ISH
++config ISS_PATH_SENSCOL
++	tristate "ISS path through sensor-collection"
++	depends on INTEL_ISS
++	help
++	  Enables sensor-collection path for hid-sensor-hub.
++	  Placeholder for description line 2.
++	  Placeholder for description line 3.
++	  Placeholder for description line 4.
+ 
+-config ISH_PATH_IIO
+-	tristate "ISH path through IIO"
+-	depends on INTEL_ISH
++config ISS_PATH_IIO
++	tristate "ISS path through IIO"
++	depends on INTEL_ISS
++	help
++	  Enables IIO path for hid-sensor-hub.
++	  Placeholder for description line 2.
++	  Placeholder for description line 3.
++	  Placeholder for description line 4.
+--- a/drivers/misc/heci/Makefile
++++ b/drivers/misc/heci/Makefile
+@@ -1,6 +1,6 @@
+ #
+-# Makefile - Intel HECI (ISH implementation)
+-# Copyright (c) 2010-2014, Intel Corporation.
++# Makefile - Intel HECI and ISS implementation
++# Copyright (c) 2010-2015, Intel Corporation.
+ #
+ obj-m += heci.o
+ heci-objs := init.o
+--- a/drivers/misc/heci/bus.c
++++ b/drivers/misc/heci/bus.c
+@@ -1,7 +1,7 @@
+ /*
+  * HECI bus driver
+  *
+- * Copyright (c) 2012-2014, Intel Corporation.
++ * Copyright (c) 2012-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -196,9 +196,11 @@ struct heci_cl_device *heci_bus_add_devi
+ 	device->fw_client = &dev->me_clients[dev->me_client_presentation_num - 1];
+ 
+ 	dev_set_name(&device->dev, "%s", name);
++	list_add_tail(&device->device_link, &dev->device_list);
+ 
+ 	status = device_register(&device->dev);
+ 	if (status) {
++		list_del(&device->device_link);
+ 		dev_err(&dev->pdev->dev, "Failed to register HECI device\n");
+ 		kfree(device);
+ 		return NULL;
+@@ -563,8 +565,6 @@ int	heci_bus_new_client(struct heci_devi
+ 		return	-ENOENT;
+ 	}
+ 
+-	list_add_tail(&cl_device->device_link, &dev->device_list);
+-
+ 	/* Export several properties per client device */
+ 	device_create_file(&cl_device->dev, &max_msg_length);
+ 	device_create_file(&cl_device->dev, &protocol_version);
+--- a/drivers/misc/heci/bus.h
++++ b/drivers/misc/heci/bus.h
+@@ -1,3 +1,17 @@
++/*
++ * HECI bus definitions
++ *
++ * Copyright (c) 2014-2015, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
+ #ifndef _LINUX_HECI_CL_BUS_H
+ #define _LINUX_HECI_CL_BUS_H
+ 
+--- a/drivers/misc/heci/client.c
++++ b/drivers/misc/heci/client.c
+@@ -1,7 +1,7 @@
+ /*
+  * HECI client logic (for both HECI bus driver and user-mode API)
+  *
+- * Copyright (c) 2003-2014, Intel Corporation.
++ * Copyright (c) 2003-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+--- a/drivers/misc/heci/client.h
++++ b/drivers/misc/heci/client.h
+@@ -1,7 +1,7 @@
+ /*
+  * HECI client logic
+  *
+- * Copyright (c) 2003-2014, Intel Corporation.
++ * Copyright (c) 2003-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+--- a/drivers/misc/heci/debugfs.c
++++ b/drivers/misc/heci/debugfs.c
+@@ -1,7 +1,7 @@
+ /*
+  * DebugFS for HECI driver
+  *
+- * Copyright (c) 2012-2014, Intel Corporation.
++ * Copyright (c) 2012-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+--- a/drivers/misc/heci/hbm.c
++++ b/drivers/misc/heci/hbm.c
+@@ -1,7 +1,7 @@
+ /*
+  * HECI bus layer messages handling
+  *
+- * Copyright (c) 2003-2014, Intel Corporation.
++ * Copyright (c) 2003-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -244,7 +244,9 @@ static int heci_hbm_prop_req(struct heci
+ 		dev->hbm_state = HECI_HBM_WORKING;
+ 		dev->dev_state = HECI_DEV_ENABLED;
+ 
+-		for (dev->me_client_presentation_num = 0; dev->me_client_presentation_num < client_num; ++dev->me_client_presentation_num)
++		for (dev->me_client_presentation_num = 1;
++			dev->me_client_presentation_num < client_num + 1;
++				++dev->me_client_presentation_num)
+ 			/* Add new client device */
+ 			heci_bus_new_client(dev);
+ 
+--- a/drivers/misc/heci/hbm.h
++++ b/drivers/misc/heci/hbm.h
+@@ -1,7 +1,7 @@
+ /*
+  * HECI bus layer messages handling
+  *
+- * Copyright (c) 2003-2014, Intel Corporation.
++ * Copyright (c) 2003-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+--- a/drivers/misc/heci/heci-api.c
++++ b/drivers/misc/heci/heci-api.c
+@@ -1,7 +1,7 @@
+ /*
+  * User-mode HECI API
+  *
+- * Copyright (c) 2014, Intel Corporation.
++ * Copyright (c) 2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -466,9 +466,10 @@ static long heci_ioctl(struct file *file
+ 	dev = cl->dev;
+ 	dev_dbg(&dev->pdev->dev, "IOCTL cmd = 0x%x", cmd);
+ 
+-	/* Test API for triggering host-initiated IPC reset to ISH */
++	/* Test API for triggering host-initiated IPC reset to ISS */
+ 	if (cmd == 0x12345678) {
+-		ISH_DBG_PRINT(KERN_ALERT "%s(): ISH FW reset is requested\n", __func__);
++		ISH_DBG_PRINT(KERN_ALERT "%s(): ISS FW reset is requested\n",
++			__func__);
+ 		/* Re-init */
+ 		dev->dev_state = HECI_DEV_INITIALIZING;
+ 		heci_reset(dev, 1);
+@@ -497,8 +498,9 @@ err:
+ 
+ 	/* Test API for triggering host disabling */
+ 	if (cmd == 0xAA55AA55) {
+-		ISH_DBG_PRINT(KERN_ALERT "%s(): ISH host stop is requested\n", __func__);
+-		/* Handle ISH reset against upper layers */
++		ISH_DBG_PRINT(KERN_ALERT "%s(): ISS host stop is requested\n",
++			__func__);
++		/* Handle ISS reset against upper layers */
+ 		heci_bus_remove_all_clients(dev);			/* Remove all client devices */
+ 		dev->dev_state = HECI_DEV_DISABLED;
+ 		return	0;
+--- a/drivers/misc/heci/heci-api.h
++++ b/drivers/misc/heci/heci-api.h
+@@ -6,7 +6,7 @@
+  *
+  * GPL LICENSE SUMMARY
+  *
+- * Copyright(c) 2003 - 2012 Intel Corporation. All rights reserved.
++ * Copyright(c) 2003 - 2015 Intel Corporation. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of version 2 of the GNU General Public License as
+@@ -32,7 +32,7 @@
+  *
+  * BSD LICENSE
+  *
+- * Copyright(c) 2003 - 2014 Intel Corporation. All rights reserved.
++ * Copyright(c) 2003 - 2015 Intel Corporation. All rights reserved.
+  * All rights reserved.
+  *
+  * Redistribution and use in source and binary forms, with or without
+--- a/drivers/misc/heci/heci-hid-client.c
++++ b/drivers/misc/heci/heci-hid-client.c
+@@ -1,7 +1,7 @@
+ /*
+- * HECI client driver for HID (ISH)
++ * HECI client driver for HID (ISS)
+  *
+- * Copyright (c) 2014, Intel Corporation.
++ * Copyright (c) 2014-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -36,9 +36,10 @@ void	heci_hid_remove(void);
+ 
+ 
+ /* Global vars, may eventually end up in a structure */
+-struct heci_cl	*hid_heci_cl = NULL;			/* ISH HECI client */
++struct heci_cl	*hid_heci_cl = NULL;			/* ISS HECI client */
+ 
+-int	hid_heci_client_found;		/* Set when ISH HECI client is successfully probed */
++/* Set when ISS HECI client is successfully probed */
++int	hid_heci_client_found;
+ int	may_send;				/* Global flag that determines if sender thread can safely send something or it should wait more */
+ int	enum_devices_done;			/* Enum devices response complete flag */
+ int	hid_descr_done;			/* Get HID descriptor complete flag */
+@@ -565,7 +566,7 @@ static int __init ish_init(void)
+ /*----------------------*/
+ 	init_waitqueue_head(&init_wait);
+ 
+-	/* Register HECI client device driver - ISH */
++	/* Register HECI client device driver - ISS */
+ 	rv = heci_cl_driver_register(&hid_heci_cl_driver);
+ 
+ 	/* 7/7/2014: in order to not stick Android boot, from here & below needs to run in work queue and here we should return rv */
+@@ -594,7 +595,7 @@ static void __exit ish_exit(void)
+ module_init(ish_init);
+ module_exit(ish_exit);
+ 
+-MODULE_DESCRIPTION("ISH HECI client driver");
++MODULE_DESCRIPTION("ISS HECI client driver");
+ MODULE_AUTHOR("Intel Corporation");
+ MODULE_LICENSE("GPL");
+ 
+--- a/drivers/misc/heci/heci-hid.c
++++ b/drivers/misc/heci/heci-hid.c
+@@ -1,7 +1,7 @@
+ /*
+  * HECI-HID glue driver.
+  *
+- * Copyright (c) 2012-2014, Intel Corporation.
++ * Copyright (c) 2012-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -111,6 +111,7 @@ static void heci_hid_request(struct hid_
+ 	/* for(;i < len; i++) */
+ 	/*   ISH_DBG_PRINT("\n%d %d\n", i, (int) buf[i]); */
+ 		hid_heci_set_feature(hid, buf, len, rep->id);
++		kfree(buf);
+ 		break;
+ 	}
+ 
+--- a/drivers/misc/heci/heci-hid.h
++++ b/drivers/misc/heci/heci-hid.h
+@@ -1,8 +1,22 @@
++/*
++ * HECI-HID glue driver's definitions.
++ *
++ * Copyright (c) 2014-2015, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
+ #ifndef HECI_HID__H
+ #define	HECI_HID__H
+ 
+ /*
+- * Constraint 1: currently we support only 1 ISH in a system
++ * Constraint 1: currently we support only 1 ISS HW controller in a system
+  */
+ 
+ const static	uuid_le ish_heci_guid = UUID_LE(0x33AECD58, 0xB679, 0x4E54, 0x9B, 0xD9, 0xA0, 0x4D, 0x34, 0xF0, 0xC2, 0x26);
+--- a/drivers/misc/heci/heci_dev.h
++++ b/drivers/misc/heci/heci_dev.h
+@@ -1,7 +1,7 @@
+ /*
+  * Most HECI provider device and HECI logic declarations
+  *
+- * Copyright (c) 2003-2014, Intel Corporation.
++ * Copyright (c) 2003-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+--- a/drivers/misc/heci/hid-strings-def.h
++++ b/drivers/misc/heci/hid-strings-def.h
+@@ -1,7 +1,7 @@
+ /*
+- * some HID constants
++ * HID sensor-related constants and names translations
+  *
+- * Copyright (c) 2014, Intel Corporation.
++ * Copyright (c) 2014-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+--- a/drivers/misc/heci/hw-ish-regs.h
++++ b/drivers/misc/heci/hw-ish-regs.h
+@@ -1,7 +1,7 @@
+ /*
+  * ISH registers definitions
+  *
+- * Copyright (c) 2012-2014, Intel Corporation.
++ * Copyright (c) 2012-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -46,18 +46,22 @@
+ #define IPC_DRBL_BUSY_BIT               (1<<IPC_DRBL_BUSY_OFFS) /* bit corresponds busy bit in doorbell registers */
+ 
+ #define	IPC_HOST_OWNS_MSG_OFFS		(30)
+-#define	IPC_HOST_OWNS_MSG_BIT		(1<<IPC_HOST_OWNS_MSG_OFFS)	/* A0: bit means that host owns MSGnn registers and is reading them. ISH may not write to them */
++
++/* A0: bit means that host owns MSGnn registers and is reading them.
++ISS FW may not write to them */
++#define	IPC_HOST_OWNS_MSG_BIT		(1<<IPC_HOST_OWNS_MSG_OFFS)
+ 
+ #define IPC_HOST_READY_OFFS		(7)
+ #define IPC_HOST_READY_BIT              (1<<IPC_HOST_READY_OFFS) /* bit corresponds host ready bit in Host Status Register (HOST_COMM) */
+ 
+-#define IPC_ISH_READY_OFFS              (1) /* bit corresponds host ready bit in ISH Status Register */
++/* bit corresponds host ready bit in ISS FW Status Register */
++#define IPC_ISH_READY_OFFS              (1)
+ #define IPC_ISH_READY_BIT               (1<<IPC_ISH_READY_OFFS)
+ 
+ #define	IPC_HOSTCOMM_INT_EN_OFFS	(31)
+ #define	IPC_HOSTCOMM_INT_EN_BIT		(1<<IPC_HOSTCOMM_INT_EN_OFFS)
+ 
+-/* as of now, both Host and ISH have ILUP at bit 0 */
++/* as of now, both Host and ISS have ILUP at bit 0 */
+ #define IPC_ILUP_OFFS					(0)
+ #define IPC_ILUP_BIT					(1<<IPC_ILUP_OFFS) /* bit corresponds host ready bit in both status registers */
+ 
+--- a/drivers/misc/heci/hw-ish.c
++++ b/drivers/misc/heci/hw-ish.c
+@@ -1,7 +1,7 @@
+ /*
+- * H/W layer of HECI provider device (ISH)
++ * H/W layer of HECI provider device (ISS)
+  *
+- * Copyright (c) 2014, Intel Corporation.
++ * Copyright (c) 2014-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -41,7 +41,7 @@ static int	ipc_send_heci_msg(struct heci
+ static u32 ish_read_hdr(const struct heci_device *dev);
+ 
+ /**
+- * ish_reg_read - reads 32bit data from the ISH BAR
++ * ish_reg_read - reads 32bit register
+  *
+  * @dev: the device structure
+  * @offset: offset from which to read the data
+@@ -53,7 +53,7 @@ static inline u32 ish_reg_read(const str
+ }
+ 
+ /**
+- * ish_reg_write - Writes 32bit data to the ISH BAR
++ * ish_reg_write - Writes 32bit register
+  *
+  * @dev: the device structure
+  * @offset: offset from which to write the data
+@@ -111,7 +111,7 @@ static int ish_read(struct heci_device *
+ }
+ 
+ /**
+- * ish_is_input_ready - check if ISH is ready for receiving data
++ * ish_is_input_ready - check if ISS FW is ready for receiving data
+  *
+  * @dev: the device structure
+  */
+@@ -135,7 +135,11 @@ void ish_intr_enable(struct heci_device
+ 	dev_dbg(&dev->pdev->dev, "ish_intr_enable\n");
+ 	if (dev->pdev->revision == REVISION_ID_CHT_A0 || (dev->pdev->revision & REVISION_ID_SI_MASK) == REVISION_ID_CHT_A0_SI)
+ 		ish_reg_write(dev, IPC_REG_HOST_COMM, 0x81);
+-	else if (dev->pdev->revision == REVISION_ID_CHT_B0 || (dev->pdev->revision & REVISION_ID_SI_MASK) == REVISION_ID_CHT_Bx_SI) {
++	else if (dev->pdev->revision == REVISION_ID_CHT_B0 ||
++			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++			REVISION_ID_CHT_Bx_SI ||
++			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++			REVISION_ID_CHT_Kx_SI) {
+ 		uint32_t	host_comm_val;
+ 
+ 		host_comm_val = ish_reg_read(dev, IPC_REG_HOST_COMM);
+@@ -154,7 +158,11 @@ void ish_intr_disable(struct heci_device
+ 	dev_dbg(&dev->pdev->dev, "ish_intr_disable\n");
+ 	if (dev->pdev->revision == REVISION_ID_CHT_A0 || (dev->pdev->revision & REVISION_ID_SI_MASK) == REVISION_ID_CHT_A0_SI)
+ 		/*ish_reg_write(dev, IPC_REG_HOST_COMM, 0xC1)*/;
+-	else if (dev->pdev->revision == REVISION_ID_CHT_B0 || (dev->pdev->revision & REVISION_ID_SI_MASK) == REVISION_ID_CHT_Bx_SI) {
++	else if (dev->pdev->revision == REVISION_ID_CHT_B0 ||
++			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++			REVISION_ID_CHT_Bx_SI ||
++			(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++			REVISION_ID_CHT_Kx_SI) {
+ 		uint32_t	host_comm_val;
+ 
+ 		host_comm_val = ish_reg_read(dev, IPC_REG_HOST_COMM);
+@@ -305,7 +313,7 @@ static int	ish_fw_reset_handler(struct h
+ 	/* Clear HOST2ISH.ILUP (what's it?) */
+ 	/*ish_clr_host_rdy(dev);*/
+ 
+-	/* Handle ISH reset against upper layers */
++	/* Handle ISS FW reset against upper layers */
+ 	heci_bus_remove_all_clients(dev);			/* Remove all client devices */
+ 
+ 	/* Send RESET_NOTIFY_ACK (with reset_id) */
+@@ -313,7 +321,7 @@ static int	ish_fw_reset_handler(struct h
+ 	if (!ish_is_input_ready(dev))
+ 		timed_wait_for_timeout(WAIT_FOR_SEND_SLICE, ish_is_input_ready(dev), (2 * HZ));
+ 
+-	/* ISH is dead (?) */
++	/* ISS FW is dead (?) */
+ 	if (!ish_is_input_ready(dev)) {
+ 		return	-EPIPE;
+ 	} else {
+@@ -323,12 +331,14 @@ static int	ish_fw_reset_handler(struct h
+ 	}
+ /*####################################*/
+ 
+-	/* Wait for ISH'es ILUP and HECI_READY */
++	/* Wait for ISS FW'es ILUP and HECI_READY */
+ 	timed_wait_for_timeout(WAIT_FOR_SEND_SLICE, ish_hw_is_ready(dev), (2 * HZ));
+ 	if (!ish_hw_is_ready(dev)) {
+-		/* ISH is dead */
++		/* ISS FW is dead */
+ 		uint32_t	ish_status = ish_reg_read(dev, IPC_REG_ISH_HOST_FWSTS);
+-		printk(KERN_ERR "[heci-ish]: completed reset sequence, ISH is dead (FWSTS = %08X)\n", ish_status);
++		dev_err(&dev->pdev->dev,
++		"[heci-ish]: completed reset, ISS is dead (FWSTS = %08X)\n",
++		ish_status);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -345,7 +355,7 @@ static void	fw_reset_work_fn(struct work
+ 	ISH_DBG_PRINT(KERN_ALERT "%s(): +++\n", __func__);
+ 	rv = ish_fw_reset_handler(heci_dev);
+ 	if (!rv) {
+-		/* ISH is ILUP & HECI-ready. Restart HECI */
++		/* ISS is ILUP & HECI-ready. Restart HECI */
+ 		heci_dev->recvd_hw_ready = 1;
+ 		if (waitqueue_active(&heci_dev->wait_hw_ready))
+ 			wake_up(&heci_dev->wait_hw_ready);
+@@ -622,7 +632,8 @@ static int ish_hw_start(struct heci_devi
+ 	ISH_DBG_PRINT(KERN_ALERT "[heci-ish] %s(): writing DMA_ENABLED\n", __func__);
+ 	writel(IPC_RMP2_DMA_ENABLED, hw->mem_addr + IPC_REG_ISH_RMP2);
+ 
+-	/* Send 0 IPC message so that ISH FW wakes up if it was already asleep */
++	/* Send 0 IPC message so that ISS FW wakes up if it was already
++	 asleep */
+ 	writel(IPC_DRBL_BUSY_BIT, hw->mem_addr + IPC_REG_HOST2ISH_DRBL);
+ #endif
+ 	ish_intr_enable(dev);
+--- a/drivers/misc/heci/hw-ish.h
++++ b/drivers/misc/heci/hw-ish.h
+@@ -1,7 +1,7 @@
+ /*
+- * H/W layer of HECI provider device (ISH)
++ * H/W layer of HECI provider device (ISS)
+  *
+- * Copyright (c) 2014, Intel Corporation.
++ * Copyright (c) 2014-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+--- a/drivers/misc/heci/init.c
++++ b/drivers/misc/heci/init.c
+@@ -1,7 +1,7 @@
+ /*
+  * Initialization protocol for HECI driver
+  *
+- * Copyright (c) 2003-2014, Intel Corporation.
++ * Copyright (c) 2003-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -108,7 +108,10 @@ int heci_start(struct heci_device *dev)
+ #ifdef FORCE_FW_INIT_RESET
+ 	/* wait for FW-initiated reset flow, indefinitely */
+ 	heci_hw_start(dev);
+-	/* 16/6/2014: changed this 2->5 seconds following MCG assertion. Once this was 10 seconds, lowered to 2. TODO: check out all FW ISH/SEC path how much it should be */
++	/* 16/6/2014: changed this 2->5 seconds following MCG assertion.
++	 * Once this was 10 seconds, lowered to 2.
++	 * TODO: check out all FW ISS/SEC path how much it should be */
++
+ 	/*timed_wait_for_timeout(WAIT_FOR_CONNECT_SLICE, dev->recvd_hw_ready, (10*HZ));*/
+ 	if (!dev->recvd_hw_ready)
+ 		wait_event_timeout(dev->wait_hw_ready, dev->recvd_hw_ready, 10*HZ);
+--- a/drivers/misc/heci/pci-ish.c
++++ b/drivers/misc/heci/pci-ish.c
+@@ -1,7 +1,7 @@
+ /*
+- * PCI glue for HECI provider device (ISH) driver
++ * PCI glue for HECI provider device (ISS) driver
+  *
+- * Copyright (c) 2014, Intel Corporation.
++ * Copyright (c) 2014-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -67,10 +67,12 @@ static DEFINE_PCI_DEVICE_TABLE(ish_pci_t
+ MODULE_DEVICE_TABLE(pci, ish_pci_tbl);
+ 
+ static DEFINE_MUTEX(heci_mutex);
++struct workqueue_struct *workqueue_for_init;
+ 
+ #ifdef TIMER_POLLING
+ /*
+- * DD -- ISH timer-polling workaround for H-FPGA (and other platforms that fail to deliver interrupts)
++ * DD -- ISS timer-polling workaround for H-FPGA
++ * (and other platforms that fail to deliver interrupts)
+  * NOTE: currently this will break (crash) if driver is unloaded
+  */
+ 
+@@ -139,7 +141,7 @@ static ssize_t ishdbg_write(struct file
+ 	int     addr, count, sscanf_match, i, cur_index;
+ 	volatile uint32_t *reg_data;
+ 
+-       	if (length > sizeof(dbg_req_buf))
++	if (length > sizeof(dbg_req_buf))
+ 		length = sizeof(dbg_req_buf);
+ 	rv = copy_from_user(dbg_req_buf, ubuf, length);
+ 	if (rv)
+@@ -463,8 +465,15 @@ void workqueue_init_function(struct work
+ 
+ 	dev->print_log(dev, "[heci-ish]: %s():+++ [Build "BUILD_ID "]\n", __func__);
+ 	dev->print_log(dev, "[heci-ish] %s() running on %s revision [%02X]\n", __func__,
+-		dev->pdev->revision == REVISION_ID_CHT_A0 || (dev->pdev->revision & REVISION_ID_SI_MASK) == REVISION_ID_CHT_A0_SI ? "CHT A0" :
+-		dev->pdev->revision == REVISION_ID_CHT_B0 || (dev->pdev->revision & REVISION_ID_SI_MASK) == REVISION_ID_CHT_Bx_SI ? "CHT B0" : "Unknown", dev->pdev->revision);
++		dev->pdev->revision == REVISION_ID_CHT_A0 ||
++		(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++		REVISION_ID_CHT_A0_SI ? "CHT Ax" :
++		dev->pdev->revision == REVISION_ID_CHT_B0 ||
++		(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++		REVISION_ID_CHT_Bx_SI ? "CHT Bx" :
++		(dev->pdev->revision & REVISION_ID_SI_MASK) ==
++		REVISION_ID_CHT_Kx_SI ? "CHT Kx/Cx" : "Unknown",
++		dev->pdev->revision);
+ 
+ #endif /*ISH_LOG*/
+ 
+@@ -509,7 +518,6 @@ static int ish_probe(struct pci_dev *pde
+ 	struct ish_hw *hw;
+ 	int err;
+ 	int	rv;
+-	struct workqueue_struct *workqueue_for_init;
+ 	my_work_t *work;
+ 
+ 	ISH_INFO_PRINT(KERN_ERR "[heci-ish]: %s():+++ [Build "BUILD_ID "]\n", __func__);
+@@ -563,7 +571,9 @@ static int ish_probe(struct pci_dev *pde
+ 	ishdbg_misc_device.parent = &pdev->dev;
+ 	rv = misc_register(&ishdbg_misc_device);
+ 	if (rv)
+-		dev_err(&pdev->dev, "error starting ISH debugger (misc_register failed): %d\n", rv);
++		dev_err(&pdev->dev,
++			"error starting ISS debugger (misc_register): %d\n",
++			rv);
+ 	hw_dbg = hw;
+ #endif
+ 
+@@ -592,7 +602,7 @@ static int ish_probe(struct pci_dev *pde
+ 	/* Init & prepare workqueue */
+ 	INIT_WORK(&ish_poll_work, ish_poll_work_fn);
+ 
+-	/* Create and schedule ISH polling timer */
++	/* Create and schedule ISS polling timer */
+ 	init_timer(&ish_poll_timer);
+ 	ish_poll_timer.data = 0;
+ 	ish_poll_timer.function = ish_poll_timer_fn;
+@@ -600,7 +610,7 @@ static int ish_probe(struct pci_dev *pde
+ 	timer_data = dev;
+ 	add_timer(&ish_poll_timer);
+ 
+-	/* Init ISH polling timers workqueue */
++	/* Init ISS polling timers workqueue */
+ #endif
+ 
+ 	/* PCI quirk: prevent from being put into D3 state */
+@@ -669,7 +679,11 @@ static void ish_remove(struct pci_dev *p
+ 	pci_disable_msi(pdev);
+ 	pci_iounmap(pdev, hw->mem_addr);
+ 	heci_pci_device = NULL;
+-	flush_scheduled_work();
++	if (workqueue_for_init) {
++		flush_workqueue(workqueue_for_init);
++		destroy_workqueue(workqueue_for_init);
++		workqueue_for_init = NULL;
++	}
+ 	pci_set_drvdata(pdev, NULL);
+ 	heci_deregister(dev);
+ 	kfree(dev);
+@@ -694,6 +708,6 @@ static struct pci_driver ish_driver = {
+ module_pci_driver(ish_driver);
+ 
+ MODULE_AUTHOR("Intel Corporation");
+-MODULE_DESCRIPTION("Intel(R) Integrated Sensor Hub IPC");
++MODULE_DESCRIPTION("Intel(R) Integrated Sensor Hub PCI Device Driver");
+ MODULE_LICENSE("GPL v2");
+ 
+--- a/drivers/misc/heci/platform-config.h
++++ b/drivers/misc/heci/platform-config.h
+@@ -1,7 +1,7 @@
+ /*
+- * ISH platform-specific definitions
++ * ISS platform-specific definitions
+  *
+- * Copyright (c) 2012-2014, Intel Corporation.
++ * Copyright (c) 2012-2015, Intel Corporation.
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms and conditions of the GNU General Public License,
+@@ -17,7 +17,7 @@
+ #define PLATFORM_CONFIG__H
+ 
+ /* Build ID string */
+-#define	BUILD_ID	"0117-imin-support-hid-client-startup-fix"
++#define	BUILD_ID	"imin-0127-fixes-c0"
+ 
+ #define	ISH_DEBUG	0
+ #if ISH_DEBUG
+--- a/drivers/misc/heci/senscol-core.c
++++ b/drivers/misc/heci/senscol-core.c
+@@ -1,5 +1,16 @@
+ /*
+  * Sensor collection framework core
++ *
++ * Copyright (c) 2014-2015, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
+  */
+ 
+ #include <linux/module.h>
+--- a/drivers/misc/heci/utils.h
++++ b/drivers/misc/heci/utils.h
+@@ -1,3 +1,17 @@
++/*
++ * Utility macros of ISS
++ *
++ * Copyright (c) 2014-2015, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
+ #ifndef UTILS__H
+  #define UTILS__H
+ 
+--- a/include/linux/senscol/senscol-core.h
++++ b/include/linux/senscol/senscol-core.h
+@@ -1,3 +1,18 @@
++/*
++ * Sensor collection framework header
++ *
++ * Copyright (c) 2014-2015, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
+ #ifndef	SENSCOL_CORE__
+ #define	SENSCOL_CORE__
+ 

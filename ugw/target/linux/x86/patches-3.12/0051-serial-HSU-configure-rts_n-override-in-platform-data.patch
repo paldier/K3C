@@ -1,0 +1,124 @@
+From a9f3c41aceea201f1d09b79b263567644ffdf527 Mon Sep 17 00:00:00 2001
+From: Huiquan Zhong <huiquan.zhong@intel.com>
+Date: Tue, 10 Mar 2015 00:23:00 +0800
+Subject: [PATCH 051/441] serial: HSU: configure rts_n override in platform
+ data
+
+Set rts_n override when configuring termios, only while
+auto-flow control is not enabled.
+
+Change-Id: I35e1c15ebef3535eafcf8b9cef3188a8de60497c
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-26377
+Signed-off-by: jbelloua <jean-marie.bellouard@intel.com>
+Signed-off-by: Huiquan Zhong <huiquan.zhong@intel.com>
+Reviewed-on: https://android.intel.com:443/339933
+(cherry picked from commit 3e9a978990b88c4b645ebc8b4acee89884401586)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/tty/serial/hsu/hsu.h      |  2 ++
+ drivers/tty/serial/hsu/hsu_core.c | 15 +++++++++++++--
+ drivers/tty/serial/hsu/hsu_plat.c | 30 ++++++++++++++++++++++++++++--
+ 3 files changed, 43 insertions(+), 4 deletions(-)
+
+--- a/drivers/tty/serial/hsu/hsu.h
++++ b/drivers/tty/serial/hsu/hsu.h
+@@ -300,5 +300,7 @@ void serial_hsu_dma_free(void);
+ int serial_hsu_do_suspend(struct uart_hsu_port *up);
+ int serial_hsu_do_resume(struct uart_hsu_port *up);
+ int serial_hsu_do_runtime_idle(struct uart_hsu_port *up);
++void serial_hsu_do_set_termios(struct uart_port *port, struct ktermios *termios,
++	struct ktermios *old);
+ 
+ #endif
+--- a/drivers/tty/serial/hsu/hsu_core.c
++++ b/drivers/tty/serial/hsu/hsu_core.c
+@@ -1024,8 +1024,8 @@ static void serial_hsu_shutdown(struct u
+ 	mutex_unlock(&lock);
+ }
+ 
+-static void
+-serial_hsu_set_termios(struct uart_port *port, struct ktermios *termios,
++void
++serial_hsu_do_set_termios(struct uart_port *port, struct ktermios *termios,
+ 		       struct ktermios *old)
+ {
+ 	struct uart_hsu_port *up =
+@@ -1256,6 +1256,17 @@ serial_hsu_set_termios(struct uart_port
+ 	serial_sched_sync(up);
+ 	pm_runtime_put(up->dev);
+ }
++EXPORT_SYMBOL(serial_hsu_do_set_termios);
++
++static void
++serial_hsu_set_termios(struct uart_port *port, struct ktermios *termios,
++		       struct ktermios *old)
++{
++	if (port->set_termios)
++		port->set_termios(port, termios, old);
++	else
++		serial_hsu_do_set_termios(port, termios, old);
++}
+ 
+ static void
+ serial_hsu_pm(struct uart_port *port, unsigned int state,
+--- a/drivers/tty/serial/hsu/hsu_plat.c
++++ b/drivers/tty/serial/hsu/hsu_plat.c
+@@ -179,6 +179,31 @@ void cht_hsu_set_clk(unsigned int m, uns
+ 	writel(param, addr + CHT_HSU_CLOCK);
+ }
+ 
++static void hsu_set_termios(struct uart_port *p, struct ktermios *termios,
++				struct ktermios *old)
++{
++	u32 reg;
++
++	/*
++	 * If auto-handshake mechanism is enabled,
++	 * disable rts_n override
++	 */
++	reg = readl(p->membase + CHT_GENERAL_REG);
++	reg &= ~CHT_GENERAL_DIS_RTS_N_OVERRIDE;
++	if (!(termios->c_cflag & CRTSCTS))
++		reg |= CHT_GENERAL_DIS_RTS_N_OVERRIDE;
++	writel(reg, p->membase + CHT_GENERAL_REG);
++
++	serial_hsu_do_set_termios(p, termios, old);
++}
++
++static void hsu_serial_setup(struct uart_hsu_port *up)
++{
++	struct uart_port *p = &up->port;
++
++	p->set_termios = hsu_set_termios;
++}
++
+ unsigned int cht_hsu_get_uartclk(struct uart_hsu_port *up)
+ {
+ 	struct clk *clk;
+@@ -307,7 +332,7 @@ static int serial_hsu_plat_port_probe(st
+ 
+ #ifdef CONFIG_ACPI
+ 	if (!ACPI_HANDLE(&pdev->dev) ||
+-	    acpi_bus_get_device(ACPI_HANDLE(&pdev->dev), &adev))
++		acpi_bus_get_device(ACPI_HANDLE(&pdev->dev), &adev))
+ 		return -ENODEV;
+ 
+ 	id = acpi_match_device(pdev->dev.driver->acpi_match_table, &pdev->dev);
+@@ -352,6 +377,7 @@ static int serial_hsu_plat_port_probe(st
+ 	}
+ 
+ 	platform_set_drvdata(pdev, up);
++	hsu_serial_setup(up);
+ 
+ 	if (!pdev->dev.dma_mask) {
+ 		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
+@@ -400,7 +426,7 @@ static struct platform_driver hsu_plat_d
+ 		.owner	= THIS_MODULE,
+ /* Disable PM only when kgdb(poll mode uart) is enabled */
+ #if defined(CONFIG_PM) && !defined(CONFIG_CONSOLE_POLL)
+-		.pm     = &serial_hsu_plat_pm_ops,
++		.pm	 = &serial_hsu_plat_pm_ops,
+ #endif
+ #ifdef CONFIG_ACPI
+ 		.acpi_match_table = ACPI_PTR(hsu_acpi_ids),

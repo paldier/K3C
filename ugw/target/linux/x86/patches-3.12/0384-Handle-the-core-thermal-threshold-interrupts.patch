@@ -1,0 +1,510 @@
+From b2324098dd62a9998f41e9306eddc9ab71553106 Mon Sep 17 00:00:00 2001
+From: Vinay Patel <vinay.r.patel@intel.com>
+Date: Mon, 18 Apr 2016 15:04:01 -0700
+Subject: [PATCH 384/441] Handle the core thermal threshold interrupts
+
+Description: Puma thermal driver to register the callback handler to handle the
+core thermal threshould interrupt events and notify the power manager.
+---
+ drivers/platform/x86/puma_acpi.c | 127 ++++++++++++++++++++++++++++++++++++---
+ drivers/thermal/puma_thermal.c   | 126 ++++++++++++++++++++++++--------------
+ 2 files changed, 201 insertions(+), 52 deletions(-)
+
+--- a/drivers/platform/x86/puma_acpi.c
++++ b/drivers/platform/x86/puma_acpi.c
+@@ -201,6 +201,16 @@ enum puma_acpi_pmic_type {
+    PUMA7_ACPI_PMIC_ROHM,
+ };
+ 
++enum puma_lpm_interface {
++   PUMA_LPM_USB,
++   PUMA_LPM_SATA,      
++};
++
++enum puma_lpm_operation {
++   PUMA_LPM_GET,
++   PUMA_LPM_SET,      
++};
++
+ struct puma_acpi_data {
+    char name[20]; //name of the task
+    unsigned char notify_state_type;
+@@ -259,7 +269,7 @@ static ssize_t show_system_state(struct
+    struct acpi_device *acpi = to_acpi_device(dev);
+    struct puma_acpi_data *data = acpi_driver_data(acpi);
+ 
+-   return snprintf(buf, PAGE_SIZE, "%d\n", data->current_state);
++   return sprintf(buf, "%d\n", data->current_state);
+ }
+ 
+ static ssize_t show_netip_state(struct device *dev, struct device_attribute *attr, char *buf)
+@@ -267,7 +277,7 @@ static ssize_t show_netip_state(struct d
+    struct acpi_device *acpi = to_acpi_device(dev);
+    struct puma_acpi_data *data = acpi_driver_data(acpi);
+ 
+-   return snprintf(buf, PAGE_SIZE, "%d\n", data->netip_state);
++   return sprintf(buf, "%d\n", data->netip_state);
+ }
+ 
+ static ssize_t show_pmc_state(struct device *dev, struct device_attribute *attr, char *buf)
+@@ -275,7 +285,7 @@ static ssize_t show_pmc_state(struct dev
+    struct acpi_device *acpi = to_acpi_device(dev);
+    struct puma_acpi_data *data = acpi_driver_data(acpi);
+ 
+-   return snprintf(buf, PAGE_SIZE, "%d\n", data->pmc_state);
++   return sprintf(buf, "%d\n", data->pmc_state);
+ }
+ 
+ static ssize_t show_platform_resource(struct device *dev, struct device_attribute *attr, char *buf)
+@@ -287,7 +297,7 @@ static ssize_t show_platform_resource(st
+       pr_err("puma_acpi_get_data PPRS failed!\n");
+    } 
+ 
+-   return snprintf(buf, PAGE_SIZE, "%d :: 0x%x\n", ((data->acpi_resource_indication) ? 0:1), data->acpi_resource_state_vector);
++   return sprintf(buf, "%d :: 0x%x\n", ((data->acpi_resource_indication) ? 0:1), data->acpi_resource_state_vector);
+ }
+ 
+ static ssize_t show_device_power_state(struct device *dev, struct device_attribute *attr, char *buf)
+@@ -304,7 +314,7 @@ static ssize_t show_device_power_state(s
+    if(ret_value < 0) {
+       return -EIO;
+    } else {
+-      return snprintf(buf, PAGE_SIZE, "D3_STS_0 0x%x D3_STS_1 0x%x\n", reg_value0, reg_value1);
++      return sprintf(buf, "D3_STS_0 0x%x D3_STS_1 0x%x\n", reg_value0, reg_value1);
+    }
+ }
+ 
+@@ -322,8 +332,107 @@ static ssize_t show_function_disable_sta
+    if(ret_value < 0) {
+       return -EIO;
+    } else {
+-      return snprintf(buf, PAGE_SIZE, "FUNC_DIS_0 0x%x FUNC_DIS_1 0x%x\n", reg_value0, reg_value1);
++      return sprintf(buf, "FUNC_DIS_0 0x%x FUNC_DIS_1 0x%x\n", reg_value0, reg_value1);
++   }
++}
++
++static acpi_status update_lpm( acpi_handle handle, int xface, int operation, int *lpm_bbu)
++{
++   union acpi_object param[3];
++   struct acpi_object_list input;
++   struct acpi_buffer buf;
++   union acpi_object out_obj;
++   acpi_status status;
++
++   param[0].type = ACPI_TYPE_INTEGER;
++   param[0].integer.value = xface;
++   param[1].type = ACPI_TYPE_INTEGER;
++   param[1].integer.value = operation;
++   param[2].type = ACPI_TYPE_INTEGER;
++   param[2].integer.value = *lpm_bbu;
++
++   input.count = 3;
++   input.pointer = param;
++
++   buf.pointer = &out_obj;
++   buf.length = sizeof(out_obj);
++
++   status = acpi_evaluate_object(handle, "LPMC", &input, &buf);
++	if (ACPI_FAILURE(status)) {
++		return status;
++   } else if (operation == PUMA_LPM_GET){
++      *lpm_bbu = out_obj.integer.value;
++   }
++   
++   return 0;
++}
++
++static ssize_t show_usb_lpm(struct device *dev, struct device_attribute *attr, char *buf)
++{
++   int usb_lpm_bbu;
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++   
++   //Get the data from ACPI
++   if(update_lpm(data->acpi_dev->handle, PUMA_LPM_USB, PUMA_LPM_GET, &usb_lpm_bbu) != 0) {
++      return -EIO;
++   }
++
++   return sprintf(buf, "%d\n", usb_lpm_bbu);
++}
++
++static ssize_t store_usb_lpm(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++   int usb_lpm_bbu;
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++
++   if(sscanf(buf, "%d", &usb_lpm_bbu) != 1) {
++      return -EINVAL;
++   } else if(usb_lpm_bbu < 0 || usb_lpm_bbu > 1){
++      return -EINVAL;
++   } 
++      
++   //Update the ACPI data 
++   if(update_lpm(data->acpi_dev->handle, PUMA_LPM_USB, PUMA_LPM_SET, &usb_lpm_bbu) != 0) {
++      return -EIO;
++   }
++   
++   return count;
++}
++
++static ssize_t show_sata_lpm(struct device *dev, struct device_attribute *attr, char *buf)
++{
++   int sata_lpm_bbu;
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++
++   //Get the data from ACPI
++   if(update_lpm(data->acpi_dev->handle, PUMA_LPM_SATA, PUMA_LPM_GET, &sata_lpm_bbu) != 0) {
++      return -EIO;
++   }
++
++   return sprintf(buf, "%d\n", sata_lpm_bbu);
++}
++
++static ssize_t store_sata_lpm(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++   int sata_lpm_bbu;
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++
++   if(sscanf(buf, "%d", &sata_lpm_bbu) != 1) {
++      return -EINVAL;
++   } else if(sata_lpm_bbu < 0 || sata_lpm_bbu > 1){
++      return -EINVAL;
++   }
++      
++   //Update the ACPI data 
++   if(update_lpm(data->acpi_dev->handle, PUMA_LPM_SATA, PUMA_LPM_SET, &sata_lpm_bbu) != 0) {
++      return -EIO;
+    }
++
++   return count;
+ }
+ 
+ static DEVICE_ATTR(system_state, S_IRUGO, show_system_state, NULL);
+@@ -332,6 +441,8 @@ static DEVICE_ATTR(pmc_state, S_IRUGO, s
+ static DEVICE_ATTR(platform_resource, S_IRUGO, show_platform_resource, NULL);
+ static DEVICE_ATTR(device_power_state, S_IRUGO, show_device_power_state, NULL);
+ static DEVICE_ATTR(function_disable_state, S_IRUGO, show_function_disable_state, NULL);
++static DEVICE_ATTR(usb_lpm, S_IRUGO | S_IWUSR, show_usb_lpm, store_usb_lpm);
++static DEVICE_ATTR(sata_lpm, S_IRUGO | S_IWUSR, show_sata_lpm, store_sata_lpm);
+ 
+ static struct attribute_group *puma_acpi_sysfs_entries[] = {
+    &dev_attr_system_state.attr,
+@@ -340,6 +451,8 @@ static struct attribute_group *puma_acpi
+    &dev_attr_platform_resource.attr,
+    &dev_attr_device_power_state.attr,
+    &dev_attr_function_disable_state.attr,
++   &dev_attr_usb_lpm.attr,
++   &dev_attr_sata_lpm.attr,
+    NULL,
+ };
+ 
+@@ -509,7 +622,7 @@ void puma_acpi_button_release(struct pum
+    button_press_duration = data->button_release_time - data->button_press_time;
+    pr_debug("Puma ACPI button press duration %u ms\n", jiffies_to_msecs(button_press_duration));
+    if((data->timer_state != PUMA_ACPI_TIMER_STOPPED) && (data->timer_state != PUMA_ACPI_TIMER_NOT_STARTED)) {
+-      del_timer(&data->timer);
++      del_timer_sync(&data->timer);
+    }
+    switch(data->current_state) {
+       case PUMA_ACPI_STATE_ACTIVE:
+--- a/drivers/thermal/puma_thermal.c
++++ b/drivers/thermal/puma_thermal.c
+@@ -37,15 +37,16 @@
+ #include <asm/cpu_device_id.h>
+ #include <asm/iosf_mbi.h>
+ #include <asm/processor.h>
+-
++#include <asm/mce.h>
++#include <asm/atomic.h>
+ 
+ /* SOC DTS Registers */
+-#define PUMA_THERMAL_SENSORS	3
++#define PUMA_THERMAL_SENSORS  3
+ #define PUMA_CORE0_DTS_INDEX  0
+ #define PUMA_CORE1_DTS_INDEX  1
+ #define PUMA_SOC_DTS_INDEX    2
+ #define CPU_THERMAL_TRPIS     1
+-#define SOC_THERMAL_TRIPS	   4
++#define SOC_THERMAL_TRIPS     4
+ #define SOC_TRIP_MASK         0xF
+ #define CPU0_TRIP_MASK        0
+ #define CPU1_TRIP_MASK        1
+@@ -53,10 +54,10 @@
+ #define DTS_DISABLE           0x0
+ 
+ #if IS_ENABLED(CONFIG_IOSF_PRIMARY)
+-#define SOC_DTS_CONTROL		   0x0200
+-#define DTS_ENABLE_REG		   0x02C0
+-#define PUNIT_TEMP_REG		   0x02C4
+-#define PUNIT_AUX_REG		   0x02C8
++#define SOC_DTS_CONTROL       0x0200
++#define DTS_ENABLE_REG        0x02C0
++#define PUNIT_TEMP_REG        0x02C4
++#define PUNIT_AUX_REG         0x02C8
+ #define PUMA_PUNIT_PTTS       0x02CC
+ #define PUMA_PUNIT_PTTSS      0x02D0
+ #define TE_AUX0               0x02D4
+@@ -64,12 +65,12 @@
+ #define TE_AUX2               0x02DC
+ #define TE_AUX3               0x02E0
+ #define TTE_SLM0              0x02F0
+-#define INT_ENABLE		      (1 << 11)
++#define INT_ENABLE            (1 << 11)
+ #else
+-#define SOC_DTS_CONTROL		   0x80
+-#define DTS_ENABLE_REG		   0xB0
+-#define PUNIT_TEMP_REG		   0xB1
+-#define PUNIT_AUX_REG		   0xB2
++#define SOC_DTS_CONTROL       0x80
++#define DTS_ENABLE_REG        0xB0
++#define PUNIT_TEMP_REG        0xB1
++#define PUNIT_AUX_REG         0xB2
+ #define PUMA_PUNIT_PTTS       0xB3
+ #define PUMA_PUNIT_PTTSS      0xB4
+ #define TE_AUX0               0xB5
+@@ -77,17 +78,17 @@
+ #define TE_AUX2               0xB7
+ #define TE_AUX3               0xB8
+ #define TTE_SLM0              0xBC
+-#define INT_ENABLE		      (1 << 9)
++#define INT_ENABLE            (1 << 9)
+ #endif
+ 
+ #define PUNIT_PORT            0x04
+ #define PUNIT_WRITE_OPCODE    0x07
+ #define PUNIT_READ_OPCODE     0x06
+ 
+-#define TJMAX_CODE		      0x7F
++#define TJMAX_CODE            0x7F
+ 
+ /* Max hysteresis values in C */
+-#define MAX_HYST		         7
++#define MAX_HYST              7
+ 
+ #define PUMA_MSR_THERM_INT       0x19B
+ #define HI_TEMP_INT_EN           0x1
+@@ -115,8 +116,8 @@
+ #define PUMA_CORE1_ABOVE_TH2     (1 << 10)
+ #define PUMA_CORE1_BELOW_TH2     (1 << 11)
+ 
+-#define MSR_THERM_CFG1		      0x673
+-#define MSR_THERM_CFG2		      0x674
++#define MSR_THERM_CFG1           0x673
++#define MSR_THERM_CFG2           0x674
+ 
+ #define ENABLE_CPU_TT            (1 << 16)
+ 
+@@ -126,11 +127,11 @@
+ #define PUMA_SOC_THERMAL_TRIP0   1
+ 
+ #define PUMA_THERMAL_CLASS       "thermal"
+-#define PUMA_DEVICE_NAME	      "puma_dts"
++#define PUMA_DEVICE_NAME         "puma_dts"
+ 
+ struct thermal_device_info {
+-	struct mutex lock;
+-	int sensor_index;
++   struct mutex lock;
++   int sensor_index;
+    int trips;
+    int mask;
+    enum thermal_device_mode mode;   
+@@ -138,9 +139,12 @@ struct thermal_device_info {
+ };
+ 
+ struct thermal_soc_data {
+-	struct thermal_zone_device *tzd[PUMA_THERMAL_SENSORS];
++   struct thermal_zone_device *tzd[PUMA_THERMAL_SENSORS];
+    struct thermal_device_info tdi[PUMA_THERMAL_SENSORS];
+    struct work_struct twq;
++   struct mutex event_lock;
++   atomic_t cpu_therm_event;
++   atomic_t soc_therm_event; 
+    unsigned int cpu_therm_status;
+    unsigned int soc_therm_status;
+ };
+@@ -207,23 +211,13 @@ static int puma_get_tj_max(u32 *tj_max)
+ 
+ static int puma_configure_dts(void)
+ {
+-   u32 eax, edx;
+    int ret;
+   /*
+    * Enable the SOC DTS 
+-   * Enable low to high and high to low trip interrupt for both cores 
+    */
+    
+    if((ret = puma_write_punit_reg(DTS_ENABLE_REG, DTS_ENABLE)) < 0) {
+       pr_err("PUMA Failed to enable SOC DTS: %d\n", ret);
+-   } else if((ret = rdmsr_safe_on_cpu(0, PUMA_MSR_THERM_INT, &eax, &edx)) < 0) {
+-      pr_err("PUMA read PUMA_MSR_THERM_INT failed for CPU 0: %d\n", ret);
+-   } else if((ret = wrmsr_safe_on_cpu(0, PUMA_MSR_THERM_INT, (eax | CPU_INT_EN), edx)) < 0) {
+-      pr_err("PUMA write PUMA_MSR_THERM_INT failed for CPU 0: %d\n", ret);
+-   } else if((ret = rdmsr_safe_on_cpu(1, PUMA_MSR_THERM_INT, &eax, &edx)) < 0) {
+-      pr_err("PUMA read PUMA_MSR_THERM_INT failed for CPU 1: %d\n", ret);
+-   } else if((ret = wrmsr_safe_on_cpu(1, PUMA_MSR_THERM_INT, (eax | CPU_INT_EN), edx)) < 0) {
+-      pr_err("PUMA write PUMA_MSR_THERM_INT failed for CPU 1: %d\n", ret);
+    }
+ 
+    return ret;
+@@ -365,7 +359,7 @@ static int puma_show_temp(struct thermal
+ static int puma_get_mode(struct thermal_zone_device *tzd,
+          enum thermal_device_mode *mode)
+ {
+-	struct thermal_device_info *td_info = tzd->devdata;
++   struct thermal_device_info *td_info = tzd->devdata;
+ 
+    mutex_lock(&td_info->lock);
+ 
+@@ -379,9 +373,9 @@ static int puma_get_mode(struct thermal_
+ static int puma_set_mode(struct thermal_zone_device *tzd,
+          enum thermal_device_mode mode)
+ {
+-	struct thermal_device_info *td_info = tzd->devdata;
++   struct thermal_device_info *td_info = tzd->devdata;
+    int ret = 0;
+-	u32 val;
++   u32 val, eax, edx;
+ 
+    mutex_lock(&td_info->lock);
+ 
+@@ -396,10 +390,18 @@ static int puma_set_mode(struct thermal_
+                pr_err("PUMA SOC_DTS_CONTROL read failed: %d\n", ret);
+             } else if((ret = puma_write_punit_reg(SOC_DTS_CONTROL, ((mode == THERMAL_DEVICE_ENABLED) ? (val | ENABLE_CPU_TT) : (val & ~ENABLE_CPU_TT)))) < 0) {
+                pr_err("PUMA SOC_DTS_CONTROL write failed: %d\n", ret);
+-	    } else if((ret = puma_read_punit_reg(TTE_SLM0, &val)) < 0) {
+-	       pr_err("PUMA TTE_SLM0 read failed: %d\n", ret);
+-	    } else if((ret = puma_write_punit_reg(TTE_SLM0, ((mode == THERMAL_DEVICE_ENABLED) ? (val | INT_ENABLE) : (val & ~INT_ENABLE)))) < 0) {
+-	       pr_err("PUMA TTE_SLM0 write failed: %d\n", ret);
++            } else if((ret = puma_read_punit_reg(TTE_SLM0, &val)) < 0) {
++               pr_err("PUMA TTE_SLM0 read failed: %d\n", ret);
++            } else if((ret = puma_write_punit_reg(TTE_SLM0, ((mode == THERMAL_DEVICE_ENABLED) ? (val | INT_ENABLE) : (val & ~INT_ENABLE)))) < 0) {
++               pr_err("PUMA TTE_SLM0 write failed: %d\n", ret);
++            } else if((ret = rdmsr_safe_on_cpu(0, PUMA_MSR_THERM_INT, &eax, &edx)) < 0) {
++               pr_err("PUMA read PUMA_MSR_THERM_INT failed for CPU 0: %d\n", ret);
++            } else if((ret = wrmsr_safe_on_cpu(0, PUMA_MSR_THERM_INT, ((mode == THERMAL_DEVICE_ENABLED) ? (eax | CPU_INT_EN) : (eax & ~CPU_INT_EN)), edx)) < 0) {
++               pr_err("PUMA write PUMA_MSR_THERM_INT failed for CPU 0: %d\n", ret);
++            } else if((ret = rdmsr_safe_on_cpu(1, PUMA_MSR_THERM_INT, &eax, &edx)) < 0) {
++               pr_err("PUMA read PUMA_MSR_THERM_INT failed for CPU 1: %d\n", ret);
++            } else if((ret = wrmsr_safe_on_cpu(1, PUMA_MSR_THERM_INT, ((mode == THERMAL_DEVICE_ENABLED) ? (eax | CPU_INT_EN) : (eax & ~CPU_INT_EN)), edx)) < 0) {
++               pr_err("PUMA write PUMA_MSR_THERM_INT failed for CPU 1: %d\n", ret);
+             }
+             break;
+          default:   
+@@ -427,7 +429,7 @@ static int puma_show_trip_temp(struct th
+ 				int trip, long *trip_temp)
+ {
+    struct thermal_device_info *td_info = tzd->devdata;
+-   u32 aux_value, eax, edx;
++   u32 aux_value, eax, edx; 
+    int ret = 0;
+ 
+    mutex_lock(&td_info->lock);
+@@ -580,6 +582,13 @@ static const struct x86_cpu_id puma_ids[
+ };
+ MODULE_DEVICE_TABLE(x86cpu, puma_ids);
+ 
++static int puma_thermal_callback(__u64 msr_val)
++{
++   atomic_set(&pdata_therm->cpu_therm_event, 1);
++   schedule_work(&pdata_therm->twq);
++   return 0;
++}
++
+ static int puma_thermal_init(void)
+ {
+    int i, ret = 0;
+@@ -621,9 +630,14 @@ static int puma_thermal_init(void)
+    }
+ 
+    if(ret == 0) {
+-   	/* Configure DTS */
+-	   if((ret = puma_configure_dts()) != 0) {
+-			pr_err("PUMA configure DTS failed: %d\n", ret);
++      /* Configure DTS */
++      if((ret = puma_configure_dts()) != 0) {
++         pr_err("PUMA configure DTS failed: %d\n", ret);
++      } else {
++         mutex_init(&pdata_therm->event_lock);
++         atomic_set(&pdata_therm->cpu_therm_event, 0);
++         atomic_set(&pdata_therm->soc_therm_event, 0);
++         platform_thermal_notify = &puma_thermal_callback;
+       }
+    }
+ 
+@@ -644,6 +658,8 @@ static void puma_thermal_exit(void)
+    int i;
+    struct thermal_device_info *tdi_ptr;
+ 
++   mutex_destroy(&pdata_therm->event_lock);
++
+    tdi_ptr = &pdata_therm->tdi[0];
+ 
+    /* Destroy mutex and unregister each sensor with the generic thermal framework */
+@@ -653,6 +669,8 @@ static void puma_thermal_exit(void)
+       tdi_ptr++;
+    }
+ 
++   platform_thermal_notify = NULL;
++
+    kfree(pdata_therm);
+ }
+ 
+@@ -661,6 +679,19 @@ static void puma_thermal_do_wq(struct wo
+    struct thermal_soc_data *data = container_of(twq, struct thermal_soc_data, twq);
+    unsigned int i;
+    u32 eax, edx;
++   int cpu_thermal_event = 0, soc_thermal_event = 0;
++
++   mutex_lock(&data->event_lock);
++
++   if(atomic_read(&data->cpu_therm_event)) {
++      atomic_set(&data->cpu_therm_event, 0);
++      cpu_thermal_event = 1;
++   }
++   
++   if(atomic_read(&data->soc_therm_event)) {
++      atomic_set(&data->soc_therm_event, 0);
++      soc_thermal_event = 1;
++   }
+ 
+    data->cpu_therm_status = 0;
+    for(i = 0; i < PUMA_CPU_CORES; i++) {
+@@ -685,9 +716,6 @@ static void puma_thermal_do_wq(struct wo
+             data->cpu_therm_status |= ((i == 0) ? PUMA_CORE0_BELOW_TH2 : PUMA_CORE1_BELOW_TH2);
+          }
+       }
+-      if((wrmsr_safe_on_cpu(i, PUMA_MSR_THERM_STATUS, 0, 0)) < 0) {
+-         pr_err("Puma ACPI ERROR: wrmsr_safe_on_cpu %d failed\n", i);
+-      } 
+    }     
+    
+    if((puma_read_punit_reg(PUMA_PUNIT_PTTS, &eax)) < 0) {
+@@ -698,16 +726,24 @@ static void puma_thermal_do_wq(struct wo
+       pr_err("puma_write_punit_reg PTTSS failed\n");
+    } else {
+       data->soc_therm_status = eax & 0xF;
++   }
++
++   if(cpu_thermal_event){
++      acpi_bus_generate_netlink_event(PUMA_THERMAL_CLASS, PUMA_DEVICE_NAME, PUMA_ACPI_NOTIFY_CPU_DTS_TRIP, ((data->soc_therm_status << 16) | data->cpu_therm_status));
++   } 
+    
++   if(soc_thermal_event){
+       acpi_bus_generate_netlink_event(PUMA_THERMAL_CLASS, PUMA_DEVICE_NAME, PUMA_ACPI_NOTIFY_SOC_DTS_TRIP, ((data->soc_therm_status << 16) | data->cpu_therm_status));
+    }
+ 
++   mutex_unlock(&data->event_lock);
+ }
+ 
+ static irqreturn_t puma_thermal_isr(int irq, void *data)
+ {
+    struct thermal_soc_data *td = data;
+ 
++   atomic_set(&td->soc_therm_event, 1);
+    schedule_work(&td->twq);
+    
+    return IRQ_HANDLED;

@@ -1,0 +1,186 @@
+From 9a0f57b6e4bb1d5f9b69f474266c773815e856bd Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Wed, 27 Apr 2016 11:44:11 -0700
+Subject: [PATCH 387/441] NetIP SubSystem Drv: Fix interrupt enable/disable
+
+To disable NetIP interrupts, unset the corresponding bit in NetIP bridge
+interrupt enable register and set the bit in interrupt mask register.
+Otherwise the interrupt indicate register would still indicate the
+interrupt if the interrupt is asserted. It will cause handling of un-wa
+nted interrupts.
+Solution is to disable and mask the interrupts so that they are not shown
+in interrupt indicate register.
+netip-pm: Allow to unregister callbacks by passing NULL func ptrs.
+---
+ arch/x86/NetIP_SubSystem/netip_subsystem_defs.h |  2 ++
+ arch/x86/NetIP_SubSystem/netip_subsystem_lld.c  | 41 +++++++++++++++----------
+ arch/x86/NetIP_SubSystem/netip_subsystem_pm.c   | 17 +++++++++-
+ include/linux/netip_subsystem.h                 | 10 +++---
+ 4 files changed, 48 insertions(+), 22 deletions(-)
+
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
+@@ -50,6 +50,8 @@ struct net_subsystem_drv_data {
+    uint32_t irq_num;          /* The irq number used for Net SubSystem driver */
+    uint32_t pending_interrupts;
+    uint32_t pending_arm11_interrupts;
++   uint32_t ier_reg;  /**NetIP bridge interrupt enable register */
++   uint32_t imr_reg;  /**NetIP bridge interrupt mask register */
+    bool netss_driver_initialized;
+    void __iomem *bridge_reg_base; /* Mapped io bridge register base address mmio region2 of Net-IP  */
+    netss_dev_info_t subdev_mmios[NETSS_DEV_MAX];
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
+@@ -130,7 +130,6 @@ void netss_interrupt_register(netss_inte
+                                                                      pnetss_drv_data->pending_arm11_interrupts);
+             }
+         }
+-        netss_interrupt_enable(intrpt);
+     }
+     spin_unlock(&pnetss_drv_data->irq_lock);
+ }
+@@ -218,33 +217,41 @@ EXPORT_SYMBOL(netss_device_get_info);
+ 
+ void netss_interrupt_enable(netss_interrupt_t intrpt)
+ {
+-   uint32_t reg_val;
+    if(intrpt > NETSS_INTERUPT_MAX)
+    {
+       printk("Invalid NetIP interrupt %d\n", intrpt);
+       return;
+    }
+-   reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+-   if(!(reg_val & (1 << intrpt))) {
+-      __raw_writel((reg_val | (1<<intrpt)), pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+-      NETSS_DBG_PRINT("Enabling Net IP subdevice %d interrupts reg %x\n", intrpt, __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET));
++   if(!(pnetss_drv_data->ier_reg & (1 << intrpt))) {
++      pnetss_drv_data->ier_reg |= (1<<intrpt);
++      __raw_writel(pnetss_drv_data->ier_reg, pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
++      NETSS_DBG_PRINT("Enabling Net IP subdevice %d IER reg %x\n", intrpt, __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET));
++   }
++   if((pnetss_drv_data->imr_reg & (1 << intrpt))) {
++      pnetss_drv_data->imr_reg &= ~(1 << intrpt);
++      __raw_writel(pnetss_drv_data->imr_reg, pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
++      NETSS_DBG_PRINT(KERN_INFO "Unmasking NetIP subdevice %d IMR reg = %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET));
+    }
+ }
+ EXPORT_SYMBOL(netss_interrupt_enable);
+ 
+ void netss_interrupt_disable(netss_interrupt_t intrpt)
+ {
+-   uint32_t reg_val;
+    if(intrpt > NETSS_INTERUPT_MAX)
+    {
+       printk("Invalid NetIP interrupt %d\n", intrpt);
+       return;
+    }
+-   reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+-   if(reg_val & (1 << intrpt)) {
+-      __raw_writel((reg_val & ~(1<<intrpt)), pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
++   if(pnetss_drv_data->ier_reg & (1 << intrpt)) {
++      pnetss_drv_data->ier_reg &= ~(1<<intrpt);
++      __raw_writel(pnetss_drv_data->ier_reg, pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+       NETSS_DBG_PRINT("Disabling Net IP interrupt id %d interrupts reg %x\n", intrpt, __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET));
+    }
++   if(!(pnetss_drv_data->imr_reg & (1 << intrpt))) {
++      pnetss_drv_data->imr_reg |= (1 << intrpt);
++      __raw_writel(pnetss_drv_data->imr_reg, pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
++      NETSS_DBG_PRINT(KERN_INFO "Masking NetIP subdevice %d IMR reg = %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET));
++   }
+ }
+ EXPORT_SYMBOL(netss_interrupt_disable);
+ 
+@@ -339,9 +346,7 @@ static int netss_probe(struct pci_dev *p
+                        const struct pci_device_id *id)
+ {
+    int ret = -ENODEV;
+-   unsigned int reg_val;
+    int i;
+-   //DEBUG_PRINT;
+ 
+    ret = pci_enable_device(pdev);
+    if (ret) {
+@@ -389,13 +394,15 @@ static int netss_probe(struct pci_dev *p
+       goto free_mem;
+    }
+ 
+-   reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+-   __raw_writel((reg_val | 0xFF), pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
++   pnetss_drv_data->ier_reg = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
++   pnetss_drv_data->ier_reg |= 0xFF;
++   __raw_writel(pnetss_drv_data->ier_reg, pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
+    printk(KERN_INFO "Enabling Net IP interrupts except GBE reg %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET));
+ 
+-   reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
+-   if((reg_val & NETIP_BRIDGE_IRQ_MASK)) {
+-      __raw_writel((reg_val & ~NETIP_BRIDGE_IRQ_MASK) , pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
++   pnetss_drv_data->imr_reg = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
++   if((pnetss_drv_data->imr_reg & NETIP_BRIDGE_IRQ_MASK)) {
++      pnetss_drv_data->imr_reg &= ~NETIP_BRIDGE_IRQ_MASK;
++      __raw_writel(pnetss_drv_data->imr_reg, pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
+       printk(KERN_INFO "Unmasking NetIP interrupts IMR = %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET));
+    }
+ 
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
+@@ -370,7 +370,9 @@ static void netss_send_configure_msg (vo
+       }
+    }
+    /*Just write 0 to terminate the list */
+-   cfg_msg.docsis_chan[j] = 0;
++   if(j < 32) {
++      cfg_msg.docsis_chan[j] = 0;
++   }
+ 
+    cfg_msg.cm_mode = cm_mode;
+    cfg_msg.RCE_floor = RCE_Floor;
+@@ -1219,6 +1221,12 @@ EXPORT_SYMBOL(netss_wakeup_netip_manager
+ int netss_power_state_change_callback_register(netss_dev_t subdevice, netss_power_state_callback_info_t *cbinfo)
+ {
+    int ret = -1;
++
++   /**Validate the parametrs */
++   if( (cbinfo == NULL) || (subdevice < 0) || (subdevice >= NETSS_DEV_MAX) )
++   {
++      return ret;
++   }
+    /**Regiser NetIP power state change handler callback for the subdevice driver*/
+    if(cbinfo->func != NULL)
+    {
+@@ -1233,6 +1241,13 @@ int netss_power_state_change_callback_re
+          printk(KERN_ERR "NetSS power state callback already registered for subdevice %d \n", subdevice);
+       }
+    }
++   else
++   {
++      /**Unregistering the callback */
++      pnetss_drv_data->power_state_change_cbinfo[subdevice].func = cbinfo->func;
++      pnetss_drv_data->power_state_change_cbinfo[subdevice].args = cbinfo->args;
++      ret = 0;
++   }
+ 
+    return ret;
+ }
+--- a/include/linux/netip_subsystem.h
++++ b/include/linux/netip_subsystem.h
+@@ -144,14 +144,16 @@ void netss_interrupt_disable(netss_inter
+ void netss_interrupt_ack(netss_interrupt_t intrpt);
+ 
+ /**************************************************************************/
+-/*! \fn int hwMbox_handle_suspend_resume(void * args, netss_power_state_t state)
++/*! \fn int netss_power_state_change_callback_register(netss_dev_t subdevice 
++                                 ,netss_power_state_callback_info_t *cbinfo)
+  **************************************************************************
+- *  \brief NetSS driver API to register callback function that handles
+- *         netip power state changes.
++ *  \brief NetSS driver API to register/unregister callback function that 
++ *         handles netip power state changes. 
+  *  \param[in] subdevice - Enum of NetIP subdevice
+  *  \param[in] cbinfo - structure holding power management callback function
+                         and its argument.
+- *  \return 0, always success.
++ *  \return 0, success. -1 failure if a callback is already registered for a
++ *          subdevice.
+  **************************************************************************/
+ int netss_power_state_change_callback_register(netss_dev_t subdevice, netss_power_state_callback_info_t *cbinfo);
+ 

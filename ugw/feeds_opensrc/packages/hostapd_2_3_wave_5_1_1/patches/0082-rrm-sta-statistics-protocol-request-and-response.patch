@@ -1,0 +1,1289 @@
+From df63762a5fdef3104d6bf4897bb293f2105f2991 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Mon, 14 Nov 2016 14:29:46 +0200
+Subject: [PATCH 2/6] rrm: sta statistics protocol - request and response
+
+To enable the support of STA statistics from the conf file:
+rrm_sta_statistics=1
+
+To enable the support of manipulate the STA statistics from conf file:
+rrm_manipulate_measurement=1
+if this flag is enabled, then upon STA statistics request from the STA,
+the AP will make the measurements and notify the "AP-Manager"
+instead of sending the response.
+
+Request from AP to STA:
+req_sta_statistics <dst> <num_of_repetitions> <measurement_req_mode>
+<peer_mac_addr> <rand_int> <duration> <group_identity>
+[trig_rep_sta_counters=<measurement_count>,<trigger_timeout>,
+<sta_counter_trigger_condition>[,<dot11FailedCountThreshold>,
+<dot11FCSErrorCountThreshold>,<dot11MultipleRetryCountThreshold>,
+<dot11FrameDuplicateCountThreshold>,<dot11RTSFailureCountThreshold>,
+<dot11AckFailureCountThreshold>,<dot11RetryCountThreshold>]]
+[trig_rep_qos_sta_counters=<measurement_count>,<trigger_timeout>,
+<qos_sta_counter_trigger_condition>[,<dot11QoSFailedCountThreshold>,
+<dot11QoSRetryCountThreshold>,<dot11QoSMultipleRetryCountThreshold>,
+<dot11QoSFrameDuplicateCountThreshold>,<dot11QoSRTSCountFailureThreshold>,
+<dot11QoSAckFailureCountThreshold>,<dot11QoSDiscardedCountThreshold>]]
+[trig_rep_rsna_counters=<measurement_count>,<trigger_timeout>,
+<rsna_counter_trigger_condition>[,<dot11RSNAStatsCMACICVErrorsThreshold>,
+<dot11RSNAStatsCMACReplaysThreshold>,
+<dot11RSNAStatsRobustMgmtCCMPReplaysThreshold>,
+<dot11RSNAStatsTKIPICVErrorsThreshold>,
+<dot11RSNAStatsTKIPReplaysThreshold>,
+<dot11RSNAStatsCCMPDecryptErrorsThreshold>,
+<dot11RSNAStatsCCMPReplaysThreshold>]]
+
+Response from STA to AP:
+RRM-STA-STATISTICS-RECEIVED <ifname> <sta_mac_addr>
+measurement_rep_mode=<measurement_rep_mode> duration=<duration>
+group_identity=<group_identity>
+statistics_group_data=<statistics_group_data
+(different data for each group identity,
+4 octets counters with commas between them)>
+[rep_reason=<rep_reason_data(1 byte of bitmap data -
+different data for each group identity)>]
+
+Request from AP to STA:
+RRM-STA-STATISTICS-REQUEST-RECEIVED <ifname> <sta_mac_addr>
+dialog_token=<dialog_token> measurement_token=<measurement_token>
+measurement_rep_mode=<measurement_rep_mode> duration=<duration>
+group_identity=<group_identity>
+statistics_group_data=<statistics_group_data
+(different data for each group identity,
+4 octets counters with commas between them)>
+[rep_reason=<rep_reason_data(1 byte of bitmap data -
+different data for each group identity)>]
+
+Response from AP to STA:
+report_sta_statistics <dst> <dialog_token> <measurement_token>
+<measurement_rep_mode> <duration> <group_identity>
+<statistics_group_data(different data for each group identity,
+4 octets counters with commas between them)>
+[rep_reason=<rep_reason_data(1 byte of bitmap data -
+different data for each group identity)>]
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/config_file.c        |   3 +
+ hostapd/ctrl_iface.c         | 496 +++++++++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c        |  24 +++
+ src/ap/hostapd.h             |   1 +
+ src/ap/rrm.c                 | 448 +++++++++++++++++++++++++++++++++++++-
+ src/ap/rrm.h                 |  14 ++
+ src/common/ieee802_11_defs.h |   9 +
+ src/common/wpa_ctrl.h        |   4 +
+ src/drivers/driver.h         |  21 ++
+ 9 files changed, 1017 insertions(+), 3 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 0d5a87a..b107654 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3921,6 +3921,9 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			bss->radio_measurements[0] |= WLAN_RRM_CAPS_LINK_MEASUREMENT;
+ 	} else if (os_strcmp(buf, "rrm_manipulate_measurement") == 0) {
+ 		bss->rrm_manipulate_measurement = atoi(pos);
++	} else if (os_strcmp(buf, "rrm_sta_statistics") == 0) {
++		if (atoi(pos))
++			bss->radio_measurements[1] |= WLAN_RRM_CAPS_STATISTICS_MEASUREMENT;
+ 	} else if (os_strcmp(buf, "gas_address3") == 0) {
+ 		bss->gas_address3 = atoi(pos);
+ 	} else if (os_strcmp(buf, "ftm_responder") == 0) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 5b0c4e7..fac4714 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2855,6 +2855,370 @@ static int hostapd_ctrl_iface_link_measurement_report(struct hostapd_data *hapd,
+ 			dmg_margin_p, dmg_ack_p);
+ }
+ 
++/* return -1 = error
++ * return 1 = optional element exist
++ * return 0 = optional element does not exist
++ */
++static int parse_trigger_reporting_counters(char *token, char *pos, char *str,
++		struct rrm_trig_rep_counters *trig_rep_counters)
++{
++	pos = os_strstr(token, str);
++	if (pos) {
++		int i;
++		char *end, *comma1, *comma2, *counter_pos;
++		pos += 22;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_STA_STATISTICS - trig_rep_counters format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_STA_STATISTICS - trig_rep_counters format is invalid");
++			return -1;
++		}
++		comma2++;
++		(*trig_rep_counters).measurement_count = atoi(pos);
++		if ((*trig_rep_counters).measurement_count < 0
++				|| (*trig_rep_counters).measurement_count > 0xffffffff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_STA_STATISTICS - measurement_count is invalid");
++			return -1;
++		}
++		(*trig_rep_counters).trigger_timeout = atoi(comma1);
++		if ((*trig_rep_counters).trigger_timeout < 0
++				|| (*trig_rep_counters).trigger_timeout > 0xffff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_STA_STATISTICS - trigger_timeout is invalid");
++			return -1;
++		}
++		(*trig_rep_counters).counters_trigger_condition = atoi(comma2);
++		if ((*trig_rep_counters).counters_trigger_condition < 0
++				|| (*trig_rep_counters).counters_trigger_condition > 0xffff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_STA_STATISTICS - counter_trigger_condition is invalid");
++			return -1;
++		}
++
++		counter_pos = comma2;
++		for (i = 0; i < 7; i++) {
++			if (((*trig_rep_counters).counters_trigger_condition >> i) & 1) {
++				counter_pos = os_strchr(counter_pos, ',');
++				if (!counter_pos || counter_pos == pos || counter_pos >= end) {
++					wpa_printf(MSG_ERROR,
++							"CTRL: REQ_STA_STATISTICS - rep_sta_counters.counters format is invalid");
++					return -1;
++				}
++				counter_pos++;
++				(*trig_rep_counters).counters[i] = atoi(counter_pos);
++				(*trig_rep_counters).num_of_counters++;
++			}
++		}
++
++		return 1;
++	}
++
++	return 0;
++}
++
++static int hostapd_ctrl_iface_req_sta_statistics(struct hostapd_data *hapd, char *cmd)
++{
++	u8 addr[ETH_ALEN], peer_addr[ETH_ALEN];
++	char *token, *context = NULL;
++	int group_identity, random_interval, measurement_duration;
++	int num_of_repetitions, measurement_request_mode, ret;
++	char *pos, *cmd_end;
++
++	struct rrm_trig_rep_counters trig_rep_sta_counters;
++	struct rrm_trig_rep_counters *trig_rep_sta_counters_p = NULL;
++	struct rrm_trig_rep_counters trig_rep_qos_sta_counters;
++	struct rrm_trig_rep_counters *trig_rep_qos_sta_counters_p = NULL;
++	struct rrm_trig_rep_counters trig_rep_rsna_counters;
++	struct rrm_trig_rep_counters *trig_rep_rsna_counters_p = NULL;
++
++	os_memset(&trig_rep_sta_counters, 0, sizeof(trig_rep_sta_counters));
++	os_memset(&trig_rep_qos_sta_counters, 0, sizeof(trig_rep_qos_sta_counters));
++	os_memset(&trig_rep_rsna_counters, 0, sizeof(trig_rep_rsna_counters));
++
++	cmd_end = cmd + strlen(cmd);
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_STA_STATISTICS - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - number of repetitions is missing");
++		return -1;
++	}
++	num_of_repetitions = atoi(token);
++	if (num_of_repetitions < 0 || num_of_repetitions > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - number of repetitions is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - measurement request mode is missing");
++		return -1;
++	}
++	measurement_request_mode = atoi(token);
++	if (measurement_request_mode < 0 || measurement_request_mode > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - measurement request mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, peer_addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_STA_STATISTICS - Bad peer address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - random interval is missing");
++		return -1;
++	}
++	random_interval = atoi(token);
++	if (random_interval < 0 || random_interval > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - random interval out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REQ_STA_STATISTICS - measurement duration out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_STA_STATISTICS - channel is missing");
++		return -1;
++	}
++	group_identity = atoi(token);
++	if (group_identity < 0 || group_identity > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_STA_STATISTICS - group_identity value is out of range");
++		return -1;
++	}
++
++	/* optional tokens */
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		/* we've reached the end of command (no optinal arguments) */
++		goto exit;
++	}
++
++	ret = parse_trigger_reporting_counters(token, pos, "trig_rep_sta_counters=",
++				&trig_rep_sta_counters);
++	if (ret == -1)
++		return ret;
++	else if (ret == 1)
++		trig_rep_sta_counters_p = &trig_rep_sta_counters;
++
++	ret = parse_trigger_reporting_counters(token, pos, "trig_rep_qos_sta_counters=",
++			&trig_rep_qos_sta_counters);
++	if (ret == -1)
++		return ret;
++	else if (ret == 1)
++		trig_rep_qos_sta_counters_p = &trig_rep_qos_sta_counters;
++
++	ret = parse_trigger_reporting_counters(token, pos, "trig_rep_rsna_counters=",
++			&trig_rep_rsna_counters);
++	if (ret == -1)
++		return ret;
++	else if (ret == 1)
++		trig_rep_rsna_counters_p = &trig_rep_rsna_counters;
++
++exit:
++	return hostapd_send_sta_statistics_req(hapd, addr, num_of_repetitions,
++			measurement_request_mode, peer_addr, random_interval,
++			measurement_duration, group_identity, trig_rep_sta_counters_p,
++			trig_rep_qos_sta_counters_p, trig_rep_rsna_counters_p);
++}
++
++static int hostapd_ctrl_iface_report_sta_statistics(struct hostapd_data *hapd,
++		char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	char *token, *context = NULL;
++	char *pos, *cmd_end, *counter_pos;
++	int group_identity, measurement_duration, i;
++	int dialog_token, measurement_token, measurement_rep_mode;
++	u32 statistics_group_data[RRM_STA_STATISTICS_GROUP_DATA_SIZE] = {};
++	u32 statistics_group_data_len = 0;
++
++	u8 rep_reason = 0, *rep_reason_p = NULL;
++
++	cmd_end = cmd + strlen(cmd);
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REPORT_STA_STATISTICS - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - dialog_token is missing");
++		return -1;
++	}
++	dialog_token = atoi(token);
++	if (dialog_token <= 0 || dialog_token > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - dialog_token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - measurement_token is missing");
++		return -1;
++	}
++	measurement_token = atoi(token);
++	if (measurement_token <= 0 || measurement_token > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - measurement_token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - measurement_rep_mode is missing");
++		return -1;
++	}
++	measurement_rep_mode = atoi(token);
++	if (measurement_rep_mode < 0 || measurement_rep_mode > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - measurement_rep_mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REPORT_STA_STATISTICS - measurement duration out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - group_identity is missing");
++		return -1;
++	}
++	group_identity = atoi(token);
++	if (group_identity < 0 || group_identity > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - group_identity is out of range");
++		return -1;
++	}
++
++	statistics_group_data_len =
++			hostapd_get_statistics_group_data_len(group_identity);
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - statistics_group_data[0] is missing");
++		return -1;
++	}
++	statistics_group_data[0] = atoi(token);
++	if ((statistics_group_data[0] < 0)
++			|| (statistics_group_data[0] > 0xffffffff)) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_STA_STATISTICS - statistics_group_data[0] is out of range");
++		return -1;
++	}
++
++	counter_pos = token;
++	for (i = 1; i < statistics_group_data_len; i++) {
++		counter_pos = os_strchr(counter_pos, ',');
++		if (!counter_pos) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_STA_STATISTICS - statistics_group_data[%d] is missing", i);
++			return -1;
++		}
++		counter_pos++;
++		if (((group_identity == 11) && ((i == 4) || (i == 8)))
++		  ||((group_identity == 12) && ((i == 2) || (i == 6)))) {
++			u64 tmp_counter = strtoull(counter_pos, NULL, 10);
++			os_memcpy(&statistics_group_data[i], &tmp_counter,
++					sizeof(tmp_counter));
++			i++;
++		} else {
++			statistics_group_data[i] = atoi(counter_pos);
++			if ((statistics_group_data[i] < 0)
++					|| (statistics_group_data[i] > 0xffffffff)) {
++				wpa_printf(MSG_ERROR,
++					   "CTRL: REPORT_STA_STATISTICS - statistics_group_data[%d] is out of range", i);
++				return -1;
++			}
++		}
++	}
++
++	/* optional tokens */
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		/* we've reached the end of command (no optinal arguments) */
++		goto exit;
++	}
++
++	pos = os_strstr(token, "rep_reason=");
++	if (pos) {
++		char *end;
++		pos += 11;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		rep_reason = atoi(pos);
++		if (rep_reason < 0 || rep_reason > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_STA_STATISTICS - rep_reason is invalid");
++			return -1;
++		}
++		rep_reason_p = &rep_reason;
++	}
++
++exit:
++	return hostapd_send_sta_statistics_report(hapd, addr, dialog_token,
++			measurement_token, measurement_rep_mode, measurement_duration,
++			group_identity, statistics_group_data, statistics_group_data_len,
++			rep_reason_p);
++}
++
+ static int hostapd_ctrl_iface_set_neighbor(struct hostapd_data *hapd, char *buf)
+ {
+ 	struct wpa_ssid_value ssid;
+@@ -3491,6 +3855,132 @@ int hostapd_ctrl_iface_get_vap_measurements(struct hostapd_data *hapd,
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "RTSSuccessCount=%d\n",
++    vap_stats.RTSSuccessCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "RTSFailureCount=%d\n",
++    vap_stats.RTSFailureCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "TransmittedAMSDUCount=%d\n",
++    vap_stats.TransmittedAMSDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "FailedAMSDUCount=%d\n",
++    vap_stats.FailedAMSDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "TransmittedOctetsInAMSDUCount=%lld\n",
++    vap_stats.TransmittedOctetsInAMSDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "AMSDUAckFailureCount=%d\n",
++    vap_stats.AMSDUAckFailureCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "ReceivedAMSDUCount=%d\n",
++    vap_stats.ReceivedAMSDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "ReceivedOctetsInAMSDUCount=%lld\n",
++    vap_stats.ReceivedOctetsInAMSDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "TransmittedAMPDUCount=%d\n",
++    vap_stats.TransmittedAMPDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "TransmittedMPDUsInAMPDUCount=%d\n",
++    vap_stats.TransmittedMPDUsInAMPDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "TransmittedOctetsInAMPDUCount=%lld\n",
++    vap_stats.TransmittedOctetsInAMPDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "AMPDUReceivedCount=%d\n",
++    vap_stats.AMPDUReceivedCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "MPDUInReceivedAMPDUCount=%d\n",
++    vap_stats.MPDUInReceivedAMPDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "ReceivedOctetsInAMPDUCount=%lld\n",
++    vap_stats.ReceivedOctetsInAMPDUCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "ImplicitBARFailureCount=%d\n",
++    vap_stats.ImplicitBARFailureCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "ExplicitBARFailureCount=%d\n",
++    vap_stats.ExplicitBARFailureCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "TwentyMHzFrameTransmittedCount=%d\n",
++    vap_stats.TwentyMHzFrameTransmittedCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "FortyMHzFrameTransmittedCount=%d\n",
++    vap_stats.FortyMHzFrameTransmittedCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "SwitchChannel20To40=%d\n",
++    vap_stats.SwitchChannel20To40);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "SwitchChannel40To20=%d\n",
++    vap_stats.SwitchChannel40To20);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "FrameDuplicateCount=%d\n",
++    vap_stats.FrameDuplicateCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
+ 
+   return len;
+ }
+@@ -4577,6 +5067,12 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "LINK_MEASUREMENT_REPORT ", 24) == 0) {
+ 		if (hostapd_ctrl_iface_link_measurement_report(hapd, buf + 24))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "REQ_STA_STATISTICS ", 19) == 0) {
++		if (hostapd_ctrl_iface_req_sta_statistics(hapd, buf + 19))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "REPORT_STA_STATISTICS ", 22) == 0) {
++		if (hostapd_ctrl_iface_report_sta_statistics(hapd, buf + 22))
++			reply_len = -1;
+ 	} else if (os_strcmp(buf, "DRIVER_FLAGS") == 0) {
+ 		reply_len = hostapd_ctrl_driver_flags(hapd->iface, reply,
+ 						      reply_size);
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 4ed4f7d..c322017 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1353,6 +1353,28 @@ static int hostapd_cli_cmd_link_measurement_report(struct wpa_ctrl *ctrl, int ar
+ 	return hostapd_cli_cmd(ctrl, "LINK_MEASUREMENT_REPORT", 7, argc, argv);
+ }
+ 
++static int hostapd_cli_cmd_req_sta_statistics(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 7) {
++		printf("Invalid req_sta_statistics command: needs at least 7 arguments: - dest address, number of repetitions, measurement request mode, peer mac address, random interval, measurement duration, group identity, + some optional arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REQ_STA_STATISTICS", 7, argc, argv);
++}
++
++static int hostapd_cli_cmd_report_sta_statistics(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 7) {
++		printf("Invalid req_sta_statistics command: needs at least 7 arguments: - dest address, dialog_token, measurement_token, measurement_rep_mode, duration, group identity, sta statistics + some optional arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REPORT_STA_STATISTICS", 7, argc, argv);
++}
++
+ static int hostapd_cli_cmd_driver_flags(struct wpa_ctrl *ctrl, int argc,
+ 					char *argv[])
+ {
+@@ -1838,6 +1860,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "req_beacon", hostapd_cli_cmd_req_beacon, NULL, NULL },
+ 	{ "req_link_measurement", hostapd_cli_cmd_req_link_measurement, NULL, NULL },
+ 	{ "link_measurement_report", hostapd_cli_cmd_link_measurement_report, NULL, NULL },
++	{ "req_sta_statistics", hostapd_cli_cmd_req_sta_statistics, NULL, NULL },
++	{ "report_sta_statistics", hostapd_cli_cmd_report_sta_statistics, NULL, NULL },
+ 	{ "driver_flags", hostapd_cli_cmd_driver_flags, NULL, NULL },
+ 	{ "deny_mac", hostapd_cli_cmd_deny_mac, NULL,
+ 	  "<addr> <[0]/1> 0-add;1-remove station to/from blacklist" },
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 7d53a47..fa12382 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -306,6 +306,7 @@ struct hostapd_data {
+ 	u8 range_req_token;
+ 	u8 beacon_req_token;
+ 	u8 link_measurement_token;
++	u8 sta_statistics_token;
+ 	unsigned int lci_req_active:1;
+ 	unsigned int range_req_active:1;
+ 	unsigned int beacon_req_active:1;
+diff --git a/src/ap/rrm.c b/src/ap/rrm.c
+index 31ed3fb..fcfa5e5 100644
+--- a/src/ap/rrm.c
++++ b/src/ap/rrm.c
+@@ -22,6 +22,9 @@
+ 
+ #define HOSTAPD_RRM_REQUEST_TIMEOUT 5
+ 
++#define REP_MODE_INCAPBLE_BIT BIT(1)
++#define REP_MODE_REFUSED_BIT  BIT(2)
++#define REP_MODE_LATE_BIT     BIT(3)
+ 
+ static void hostapd_lci_rep_timeout_handler(void *eloop_data, void *user_ctx)
+ {
+@@ -82,6 +85,35 @@ static void hostapd_beacon_rep_timeout_handler(void *eloop_data, void *user_ctx)
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_BEACON_REP_FAILED);
+ }
+ 
++static void hostapd_send_general_rrm_incapble_report(struct hostapd_data *hapd,
++		const u8 *sta_addr,u8 dialog_token, u8 measurement_token,
++		u8 measurement_rep_mode, enum measure_type measure_type)
++{
++	struct wpabuf *buf;
++
++	/* Measurement report (3) + Measurement element(5) */
++	buf = wpabuf_alloc(3 + 5);
++	if (!buf) {
++		wpa_printf(MSG_ERROR, "send general rrm report - can't allocate buffer");
++		return;
++	}
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.3 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REPORT);
++	wpabuf_put_u8(buf, dialog_token);
++
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REPORT);
++	wpabuf_put_u8(buf, 3); /* Length */
++
++	wpabuf_put_u8(buf, measurement_token);
++	wpabuf_put_u8(buf, measurement_rep_mode);
++	wpabuf_put_u8(buf, measure_type);
++
++	hostapd_drv_send_action(hapd, hapd->iface->freq, 0, sta_addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++}
+ 
+ static void hostapd_handle_beacon_report(struct hostapd_data *hapd, u8 token,
+ 					const u8 *pos, size_t len)
+@@ -122,6 +154,216 @@ static void hostapd_handle_beacon_report(struct hostapd_data *hapd, u8 token,
+ 			rcpi, rsni, MAC2STR(bssid), ant_id, parent_tsf);
+ }
+ 
++static void build_statistics_group_str(char *statistics_group_data_str,
++		u32 *statistics_group_data, int statistics_group_data_len)
++{
++	char *cur, *end;
++	int ret, i;
++	cur = statistics_group_data_str;
++	end = statistics_group_data_str + 128;
++	ret = os_snprintf(cur, end - cur, " statistics_group_data=");
++	cur += ret;
++
++	for (i = 0; i < statistics_group_data_len; i++) {
++		ret = os_snprintf(cur, end - cur, "%d%s", statistics_group_data[i],
++				i + 1 < statistics_group_data_len ? "," : " ");
++		cur += ret;
++	}
++}
++
++static void hostapd_handle_sta_statistics_request(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr,
++		u16 num_of_repetition)
++{
++	u8 peer_addr[ETH_ALEN];
++	u8 measurement_token, group_identity, measurement_rep_mode = 0;
++	u16 measurement_duration_report = 0;
++	u32 statistics_group_data[RRM_STA_STATISTICS_GROUP_DATA_SIZE] = {};
++	u32 statistics_group_data_len = 0;
++	char statistics_group_data_str[128] = {};
++	struct mtlk_wssa_drv_tr181_vap_stats vap_stats;
++
++	measurement_token = pos[0];
++	hwaddr_compact_aton((const char *) &pos[3], peer_addr);
++	group_identity = pos[12];
++
++	if (!(hapd->conf->radio_measurements[1] & WLAN_RRM_CAPS_STATISTICS_MEASUREMENT)) {
++		wpa_printf(MSG_ERROR, "sta statistics in RRM is not supported");
++		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_STA_STATISTICS);
++		return;
++	}
++
++	if (hostapd_drv_get_vap_measurements(hapd, &vap_stats)) {
++		wpa_printf(MSG_ERROR, "failed to get vap measurements");
++		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_STA_STATISTICS);
++		return;
++	}
++
++	statistics_group_data_len =
++			hostapd_get_statistics_group_data_len(group_identity);
++	if (group_identity == 1) {
++		statistics_group_data[0] = vap_stats.RetryCount;
++		statistics_group_data[1] = vap_stats.MultipleRetryCount;
++		statistics_group_data[2] = vap_stats.FrameDuplicateCount;
++		statistics_group_data[3] = vap_stats.RTSSuccessCount;
++		statistics_group_data[4] = vap_stats.RTSFailureCount;
++		statistics_group_data[5] = vap_stats.ACKFailureCount;
++		build_statistics_group_str(statistics_group_data_str,
++				statistics_group_data, statistics_group_data_len);
++	} else if (group_identity == 11) {
++		statistics_group_data[0] = vap_stats.TransmittedAMSDUCount;
++		statistics_group_data[1] = vap_stats.FailedAMSDUCount;
++		statistics_group_data[2] = vap_stats.RetryCount;
++		statistics_group_data[3] = vap_stats.MultipleRetryCount;
++		os_memcpy(&statistics_group_data[4],
++				&vap_stats.TransmittedOctetsInAMSDUCount,
++				sizeof(vap_stats.TransmittedOctetsInAMSDUCount));
++		statistics_group_data[6] = vap_stats.AMSDUAckFailureCount;
++		statistics_group_data[7] = vap_stats.ReceivedAMSDUCount;
++		os_memcpy(&statistics_group_data[8],
++				&vap_stats.ReceivedOctetsInAMSDUCount,
++				sizeof(vap_stats.ReceivedOctetsInAMSDUCount));
++		build_statistics_group_str(statistics_group_data_str,
++						statistics_group_data, statistics_group_data_len);
++	} else if (group_identity == 12) {
++		statistics_group_data[0] = vap_stats.TransmittedAMPDUCount;
++		statistics_group_data[1] = vap_stats.TransmittedMPDUsInAMPDUCount;
++		os_memcpy(&statistics_group_data[2],
++				&vap_stats.TransmittedOctetsInAMPDUCount,
++				sizeof(vap_stats.TransmittedOctetsInAMPDUCount));
++		statistics_group_data[4] = vap_stats.AMPDUReceivedCount;
++		statistics_group_data[5] = vap_stats.MPDUInReceivedAMPDUCount;
++		os_memcpy(&statistics_group_data[6],
++				&vap_stats.ReceivedOctetsInAMPDUCount,
++				sizeof(vap_stats.ReceivedOctetsInAMPDUCount));
++		statistics_group_data[8] = 0; /* AMPDUDelimiterCRCErrorCount unknown */
++		build_statistics_group_str(statistics_group_data_str,
++						statistics_group_data, statistics_group_data_len);
++	} else if (group_identity == 13) {
++		statistics_group_data[0] = vap_stats.ImplicitBARFailureCount;
++		statistics_group_data[1] = vap_stats.ExplicitBARFailureCount;
++		statistics_group_data[2] = vap_stats.SwitchChannel20To40
++								 + vap_stats.SwitchChannel40To20;
++		statistics_group_data[3] = vap_stats.TwentyMHzFrameTransmittedCount;
++		statistics_group_data[4] = vap_stats.FortyMHzFrameTransmittedCount;
++		statistics_group_data[5] = 0; /* TwentyMHzFrameReceivedCount unknown */
++		statistics_group_data[6] = 0; /* FortyMHzFrameReceivedCount unknown */
++		statistics_group_data[7] = 0; /* PSMPUTTGrantDuration unknown */
++		statistics_group_data[8] = 0; /* PSMPUTTUsedDuration unknown */
++		build_statistics_group_str(statistics_group_data_str,
++						statistics_group_data, statistics_group_data_len);
++	} else {
++		wpa_printf(MSG_ERROR, "group_identity number %d is not supported",
++				group_identity);
++		measurement_rep_mode |= REP_MODE_REFUSED_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_STA_STATISTICS);
++		return;
++	}
++
++	if (!hapd->conf->rrm_manipulate_measurement)
++		hostapd_send_sta_statistics_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				measurement_duration_report, group_identity,
++				statistics_group_data, statistics_group_data_len, NULL);
++	else
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_STA_STATISTICS_REQUEST_RXED MACSTR
++			" dialog_token=%d measurement_token=%d measurement_rep_mode=%d duration=%d group_identity=%d%s",
++			MAC2STR(sta_addr), token, measurement_token, measurement_rep_mode,
++			measurement_duration_report, group_identity,
++			statistics_group_data_str);
++}
++
++static void hostapd_handle_sta_statistics_report(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr)
++{
++	u8 group_identity, measurement_rep_mode;
++	u16 measurement_duration;
++	char statistics_group_data[128], rep_reason[30];
++	char *cur, *end;
++	int i, ret, statistics_group_data_len;
++
++	wpa_printf(MSG_DEBUG, "sta statistics token %u len %zu", token, len);
++
++	measurement_rep_mode = pos[1];
++	if (measurement_rep_mode != 0) {
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_STA_STATISTICS_RXED MACSTR
++				" measurement_rep_mode=%d duration=%d group_identity=%d statistics_group_data=0,0,0,0,0,0,0",
++				MAC2STR(sta_addr), measurement_rep_mode, 0, 0);
++		return;
++	}
++
++	measurement_duration = WPA_GET_BE16(&pos[3]);
++	group_identity = pos[5];
++
++	statistics_group_data_len =
++			hostapd_get_statistics_group_data_len(group_identity);
++
++	cur = statistics_group_data;
++	end = statistics_group_data + 128;
++	ret = os_snprintf(cur, end - cur, " statistics_group_data=");
++	cur += ret;
++
++	for (i = 0; i < statistics_group_data_len; i++) {
++		ret = os_snprintf(cur, end - cur, "%d%s", pos[6 + i],
++				i + 1 < statistics_group_data_len ? "," : " ");
++		cur += ret;
++	}
++
++	rep_reason[0] = '\0';
++	if ((pos[6 + statistics_group_data_len] == 1)
++			&& (pos[7 + statistics_group_data_len] == 1))
++		os_snprintf(rep_reason, sizeof(rep_reason),
++			" rep_reason=%d", pos[8 + statistics_group_data_len]);
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_STA_STATISTICS_RXED MACSTR
++			" measurement_rep_mode=%d duration=%d group_identity=%d%s%s",
++			MAC2STR(sta_addr), measurement_rep_mode, measurement_duration,
++			group_identity, statistics_group_data, rep_reason);
++}
++
++static void hostapd_handle_radio_msmt_request(struct hostapd_data *hapd,
++					     const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	const u8 *pos, *ie, *end;
++	u8 token;
++	u16 num_of_repetition;
++
++	end = buf + len;
++	token = mgmt->u.action.u.rrm.dialog_token;
++	num_of_repetition = WPA_GET_BE16(mgmt->u.action.u.rrm.variable);
++	pos = mgmt->u.action.u.rrm.variable;
++
++	while ((ie = get_ie(pos, end - pos, WLAN_EID_MEASURE_REQUEST))) {
++		if (ie[1] < 3) {
++			wpa_printf(MSG_DEBUG, "Bad Measurement Request element");
++			break;
++		}
++
++		wpa_printf(MSG_DEBUG, "Measurement request type %u", ie[4]);
++
++		switch (ie[4]) {
++		case MEASURE_TYPE_STA_STATISTICS:
++			hostapd_handle_sta_statistics_request(hapd, token, ie + 2, ie[1],
++					mgmt->sa, num_of_repetition);
++			break;
++		default:
++			wpa_printf(MSG_DEBUG,
++				   "Measurement request type %u is not supported", ie[4]);
++			break;
++		}
++
++		pos = ie + ie[1] + 2;
++	}
++}
+ 
+ static void hostapd_handle_radio_msmt_report(struct hostapd_data *hapd,
+ 					     const u8 *buf, size_t len)
+@@ -135,7 +377,7 @@ static void hostapd_handle_radio_msmt_report(struct hostapd_data *hapd,
+ 	pos = mgmt->u.action.u.rrm.variable;
+ 
+ 	while ((ie = get_ie(pos, end - pos, WLAN_EID_MEASURE_REPORT))) {
+-		if (ie[1] < 5) {
++		if (ie[1] < 3) {
+ 			wpa_printf(MSG_DEBUG, "Bad Measurement Report element");
+ 			break;
+ 		}
+@@ -149,13 +391,16 @@ static void hostapd_handle_radio_msmt_report(struct hostapd_data *hapd,
+ 		case MEASURE_TYPE_FTM_RANGE:
+ 			hostapd_handle_range_report(hapd, token, ie + 2, ie[1]);
+ 			break;
++		case MEASURE_TYPE_STA_STATISTICS:
++			hostapd_handle_sta_statistics_report(hapd, token, ie + 2, ie[1],
++					mgmt->sa);
++			break;
+ 		case MEASURE_TYPE_BEACON:
+ 			hostapd_handle_beacon_report(hapd, token, ie + 2, ie[1]);
+ 			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG,
+-				   "Measurement report type %u is not supported",
+-				   ie[4]);
++				   "Measurement report type %u is not supported", ie[4]);
+ 			break;
+ 		}
+ 
+@@ -508,6 +753,9 @@ void hostapd_handle_radio_measurement(struct hostapd_data *hapd,
+ 		   mgmt->u.action.u.rrm.action, MAC2STR(mgmt->sa));
+ 
+ 	switch (mgmt->u.action.u.rrm.action) {
++	case WLAN_RRM_RADIO_MEASUREMENT_REQUEST:
++		hostapd_handle_radio_msmt_request(hapd, buf, len);
++		break;
+ 	case WLAN_RRM_RADIO_MEASUREMENT_REPORT:
+ 		hostapd_handle_radio_msmt_report(hapd, buf, len);
+ 		break;
+@@ -1014,6 +1262,200 @@ int hostapd_send_link_measurement_report(struct hostapd_data *hapd,
+ 	return ret;
+ }
+ 
++int hostapd_get_statistics_group_data_len(u8 group_identity)
++{
++	int statistics_group_data_len = 0;
++
++	if ((group_identity == 0) || (group_identity == 16))
++		statistics_group_data_len = 7;
++	else if (group_identity == 1)
++		statistics_group_data_len = 6;
++	else if ((group_identity >= 2) && (group_identity <= 9))
++		statistics_group_data_len = 13;
++	else if (group_identity == 10)
++		statistics_group_data_len = 2;
++	else if (group_identity == 11)
++		statistics_group_data_len = 10;
++	else if ((group_identity >= 12) && (group_identity <= 14))
++		statistics_group_data_len = 9;
++	else if (group_identity == 15)
++		statistics_group_data_len = 5;
++
++	return statistics_group_data_len;
++}
++
++static void fill_trig_rep_counters(struct wpabuf *buf,
++		struct rrm_trig_rep_counters *trig_rep_counters)
++{
++	int i;
++	if (trig_rep_counters) {
++		wpabuf_put_u8(buf, 1);
++		wpabuf_put_u8(buf, 8 + (4 * (*trig_rep_counters).num_of_counters));
++		wpabuf_put_be32(buf, (*trig_rep_counters).measurement_count);
++		wpabuf_put_be16(buf, (*trig_rep_counters).trigger_timeout);
++		wpabuf_put_be16(buf, (*trig_rep_counters).counters_trigger_condition);
++		for (i = 0; i < 7; i++)
++			if ((*trig_rep_counters).counters[i] != 0)
++				wpabuf_put_be32(buf, (*trig_rep_counters).counters[i]);
++	}
++}
++
++int hostapd_send_sta_statistics_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode,
++		const u8 *peer_addr, u16 random_interval, u16 measurement_duration,
++		u8 group_identity, struct rrm_trig_rep_counters *trig_rep_sta_counters,
++		struct rrm_trig_rep_counters *trig_rep_qos_sta_counters,
++		struct rrm_trig_rep_counters *trig_rep_rsna_counters)
++{
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	u8 *len;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "request sta statistics: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "request sta statistics: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[1] & WLAN_RRM_CAPS_STATISTICS_MEASUREMENT)) {
++		wpa_printf(MSG_ERROR,
++			   "request sta statistics: Destination station does not support sta statistics in RRM");
++		return -1;
++	}
++
++	/* Measurement request (5) + Measurement element with sta statistics (16) + optional sub-elements (255)*/
++	buf = wpabuf_alloc(5 + 16 + 255);
++	if (!buf)
++		return -1;
++
++	hapd->sta_statistics_token++;
++	if (!hapd->sta_statistics_token) /* For wraparounds */
++		hapd->sta_statistics_token++;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.2 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REQUEST);
++	wpabuf_put_u8(buf, hapd->sta_statistics_token); /* Dialog Token */
++	wpabuf_put_be16(buf, num_of_repetitions); /* Number of Repetitions */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.21 */
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REQUEST);
++	len = wpabuf_put(buf, 1); /* Length will be set later */
++
++	wpabuf_put_u8(buf, hapd->sta_statistics_token); /* Measurement Token */
++	wpabuf_put_u8(buf, measurement_request_mode); /* Measurement Request Mode */
++	wpabuf_put_u8(buf, MEASURE_TYPE_STA_STATISTICS); /* Measurement Type */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.21.9 */
++	wpabuf_put_data(buf, (const void *) peer_addr, ETH_ALEN); /* peer mac addr */
++	wpabuf_put_be16(buf, random_interval); /* Randomization Interval */
++	wpabuf_put_be16(buf, measurement_duration); /* Measurement Duration */
++	wpabuf_put_u8(buf, group_identity); /* group identity */
++
++	fill_trig_rep_counters(buf, trig_rep_sta_counters);
++	fill_trig_rep_counters(buf, trig_rep_qos_sta_counters);
++	fill_trig_rep_counters(buf, trig_rep_rsna_counters);
++
++	/* category + Action + measurement type + token + reps + EID + len = 7 */
++	*len = wpabuf_len(buf) - 7;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++	return ret;
++}
++
++int hostapd_send_sta_statistics_report(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u16 measurement_duration, u8 group_identity,
++		const u32 *statistics_group_data, u8 statistics_group_data_len,
++		u8 *rep_reason)
++{
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	u8 *len;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "sta statistics report: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "sta statistics report: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[1] & WLAN_RRM_CAPS_STATISTICS_MEASUREMENT)) {
++		wpa_printf(MSG_ERROR,
++			   "sta statistics report: Destination station does not support sta statistics in RRM");
++		return -1;
++	}
++
++	/* Measurement report (3) + Measurement element with sta statistics (18) + optional sub-elements (255)*/
++	buf = wpabuf_alloc(3 + 60 + 255);
++	if (!buf)
++		return -1;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.3 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REPORT);
++	wpabuf_put_u8(buf, dialog_token); /* Dialog Token */
++
++	/* IEEE P802.11-REVmc/D5.0, 9.4.2.22 */
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REPORT);
++	len = wpabuf_put(buf, 1); /* Length will be set later */
++
++	wpabuf_put_u8(buf, measurement_token); /* Measurement Token */
++	wpabuf_put_u8(buf, measurement_rep_mode); /* Measurement Report Mode */
++	wpabuf_put_u8(buf, MEASURE_TYPE_STA_STATISTICS); /* Measurement Type */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.22.9 */
++	wpabuf_put_be16(buf, measurement_duration); /* Measurement Duration */
++	wpabuf_put_u8(buf, group_identity); /* group_identity */
++	for (i = 0; i < statistics_group_data_len; i++)
++		if (((group_identity == 11) && ((i == 4) || (i == 8)))
++		  ||((group_identity == 12) && ((i == 2) || (i == 6)))) {
++			wpabuf_put_data(buf, &statistics_group_data[i], 8);
++			i++;
++		} else {
++			wpabuf_put_be32(buf, statistics_group_data[i]);
++		}
++
++	if (rep_reason) {
++		wpabuf_put_u8(buf, 1); /* reporting reason sub element id */
++		wpabuf_put_u8(buf, 1);   /* sub element length */
++		wpabuf_put_u8(buf, *rep_reason);
++	}
++
++	/* Action + measurement type + token + EID + len = 5 */
++	*len = wpabuf_len(buf) - 5;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++	return ret;
++}
++
+ void hostapd_clean_rrm(struct hostapd_data *hapd)
+ {
+ 	hostpad_free_neighbor_db(hapd);
+diff --git a/src/ap/rrm.h b/src/ap/rrm.h
+index d14c15f..d6374e3 100644
+--- a/src/ap/rrm.h
++++ b/src/ap/rrm.h
+@@ -17,6 +17,8 @@
+  */
+ #define RRM_RANGE_REQ_MAX_RESPONDERS 16
+ 
++#define RRM_STA_STATISTICS_GROUP_DATA_SIZE 13
++
+ void hostapd_handle_radio_measurement(struct hostapd_data *hapd,
+ 				      const u8 *buf, size_t len, int ssi_signal);
+ int hostapd_send_lci_req(struct hostapd_data *hapd, const u8 *addr);
+@@ -35,6 +37,18 @@ int hostapd_send_link_measurement_report(struct hostapd_data *hapd,
+ 		const u8 *addr, struct rrm_link_measurement_report link_msmt_report,
+ 		struct dmg_link_margin *dmg_margin,
+ 		struct dmg_link_adaptation_ack *dmg_ack);
++int hostapd_get_statistics_group_data_len(u8 group_identity);
++int hostapd_send_sta_statistics_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode,
++		const u8 *peer_addr, u16 random_interval, u16 measurement_duration,
++		u8 group_identity, struct rrm_trig_rep_counters *trig_rep_sta_counters,
++		struct rrm_trig_rep_counters *trig_rep_qos_sta_counters,
++		struct rrm_trig_rep_counters *trig_rep_rsna_counters);
++int hostapd_send_sta_statistics_report(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u16 measurement_duration, u8 group_identity,
++		const u32 *statistics_group_data, u8 statistics_group_data_len,
++		u8 *rep_reason);
+ void hostapd_clean_rrm(struct hostapd_data *hapd);
+ 
+ #endif /* RRM_H */
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 968d248..1d7bc2e 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -373,6 +373,7 @@
+ #define WLAN_RRM_CAPS_BEACON_REPORTING_CONDITIONS_MEASUREMENT BIT(7)
+ #define WLAN_RRM_CAPS_NEIGHBOR_REPORT BIT(1)
+ /* byte 2 (out of 5) */
++#define WLAN_RRM_CAPS_STATISTICS_MEASUREMENT BIT(3)
+ #define WLAN_RRM_CAPS_LCI_MEASUREMENT BIT(4)
+ /* byte 5 (out of 5) */
+ #define WLAN_RRM_CAPS_FTM_RANGE_REPORT BIT(2)
+@@ -1610,6 +1611,14 @@ struct rrm_link_measurement_report {
+ 	u8 variable[0];
+ } STRUCT_PACKED;
+ 
++struct rrm_trig_rep_counters {
++	u32 measurement_count;
++	u16 trigger_timeout;
++	u16 counters_trigger_condition;
++	u8 num_of_counters;
++	u32 counters[7];
++} STRUCT_PACKED;
++
+ /* IEEE Std 802.11-2012, 9.4.2.142.1 - DMG link margin element frame format */
+ struct dmg_link_margin {
+ 	u8 eid;
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index 98b9253..a21b5da 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -250,6 +250,10 @@ extern "C" {
+ #define RRM_EVENT_LINK_MEASUREMENT_REQUEST_RXED \
+ 	"RRM-LINK-MEASUREMENT-REQUEST-RECEIVED "
+ 
++#define RRM_EVENT_STA_STATISTICS_RXED "RRM-STA-STATISTICS-RECEIVED "
++#define RRM_EVENT_STA_STATISTICS_REQUEST_RXED \
++	"RRM-STA-STATISTICS-REQUEST-RECEIVED "
++
+ /* hostapd control interface - fixed message prefixes */
+ #define WPS_EVENT_PIN_NEEDED "WPS-PIN-NEEDED "
+ #define WPS_EVENT_NEW_AP_SETTINGS "WPS-NEW-AP-SETTINGS "
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index f0b9796..284652b 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1454,6 +1454,10 @@ typedef struct mtlk_sta_info {
+ struct mtlk_wssa_drv_tr181_vap_stats {
+   struct mtlk_wssa_driver_traffic_stats traffic_stats;
+   struct mtlk_wssa_peer_error_stats error_stats;
++  u64 TransmittedOctetsInAMSDUCount;
++  u64 ReceivedOctetsInAMSDUCount;
++  u64 TransmittedOctetsInAMPDUCount;
++  u64 ReceivedOctetsInAMPDUCount;
+   u32 RetransCount;
+   u32 FailedRetransCount;
+   u32 RetryCount;
+@@ -1461,6 +1465,23 @@ struct mtlk_wssa_drv_tr181_vap_stats {
+   u32 ACKFailureCount;
+   u32 AggregatedPacketCount;
+   u32 UnknownProtoPacketsReceived;
++  u32 RTSSuccessCount;
++  u32 RTSFailureCount;
++  u32 TransmittedAMSDUCount;
++  u32 FailedAMSDUCount;
++  u32 AMSDUAckFailureCount;
++  u32 ReceivedAMSDUCount;
++  u32 TransmittedAMPDUCount;
++  u32 TransmittedMPDUsInAMPDUCount;
++  u32 AMPDUReceivedCount;
++  u32 MPDUInReceivedAMPDUCount;
++  u32 ImplicitBARFailureCount;
++  u32 ExplicitBARFailureCount;
++  u32 TwentyMHzFrameTransmittedCount;
++  u32 FortyMHzFrameTransmittedCount;
++  u32 SwitchChannel20To40;
++  u32 SwitchChannel40To20;
++  u32 FrameDuplicateCount;
+ } __attribute__ ((packed));
+ 
+ struct mtlk_wssa_drv_tr181_hw {
+-- 
+2.10.1
+

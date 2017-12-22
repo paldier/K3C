@@ -1,0 +1,272 @@
+--- mini_httpd-1.19/mini_httpd.c	2011-01-19 20:05:39.054643625 +0530
++++ mini_httpd-1.19.bk/mini_httpd.c	2011-01-19 20:04:31.474642066 +0530
+@@ -282,7 +282,7 @@
+ static void auth_check( char* dirname );
+ static void send_authenticate( char* realm );
+ static char* virtual_file( char* file );
+-static void send_error( int s, char* title, char* extra_header, char* text );
++static int send_error( int s, char* title, char* extra_header, char* text );
+ static void send_error_body( int s, char* title, char* text );
+ static int send_error_file( char* filename );
+ static void send_error_tail( void );
+@@ -361,6 +361,23 @@
+ 	}
+ }
+ 
++/* Set the FD_CLOEXEC  flag of desc if value is nonzero,
++ *            or clear the flag if value is 0.           Return 0 on success, or
++ *            -1 on error with errno  set. */ 
++int set_cloexec_flag (int desc, int value)        
++   {
++	    int oldflags = fcntl (desc, F_GETFD, 0);
++	    /* If reading the flags failed, return error indication now.*/
++	    if (oldflags < 0)            
++		    return oldflags;
++	    /* Set just the flag we want to set. */
++	    if (value != 0)  
++		    oldflags |= FD_CLOEXEC;   
++	    else
++		    oldflags &= ~FD_CLOEXEC;
++	    /* Store modified flag word in the descriptor. */      
++	    return fcntl (desc, F_SETFD, oldflags);
++   }	    
+ 
+ int
+ main( int argc, char** argv )
+@@ -583,11 +600,17 @@
+     ** v4, but in Linux if you bind a v4 socket first then the v6 bind fails.
+     */
+     if ( gotv6 )
++        {	     
+ 	listen6_fd = initialize_listen_socket( &host_addr6 );
++	set_cloexec_flag (listen6_fd,1);
++	}
+     else
+ 	listen6_fd = -1;
+     if ( gotv4 )
++        {	    
+ 	listen4_fd = initialize_listen_socket( &host_addr4 );
++	set_cloexec_flag (listen4_fd,1);
++	}
+     else
+ 	listen4_fd = -1;
+     /* If we didn't get any valid sockets, fail. */
+@@ -948,6 +971,7 @@
+ 		(void) close( listen4_fd );
+ 	    if ( listen6_fd != -1 )
+         	(void) close( listen6_fd );*/
++	    set_cloexec_flag (conn_fd,1);
+ 	    handle_request();
+ 	    /*exit( 0 );*/
+ 	    }
+@@ -1312,15 +1336,15 @@
+     /* Parse the first line of the request. */
+     method_str = get_request_line();
+     if ( method_str == (char*) 0 )
+-	send_error( 400, "Bad Request", "", "Can't parse request." );
++	return send_error( 400, "Bad Request", "", "Can't parse request." );
+     path = strpbrk( method_str, " \t\012\015" );
+     if ( path == (char*) 0 )
+-	send_error( 400, "Bad Request", "", "Can't parse request." );
++	return send_error( 400, "Bad Request", "", "Can't parse request." );
+     *path++ = '\0';
+     path += strspn( path, " \t\012\015" );
+     protocol = strpbrk( path, " \t\012\015" );
+     if ( protocol == (char*) 0 )
+-	send_error( 400, "Bad Request", "", "Can't parse request." );
++	return send_error( 400, "Bad Request", "", "Can't parse request." );
+     *protocol++ = '\0';
+     protocol += strspn( protocol, " \t\012\015" );
+     query = strchr( path, '?' );
+@@ -1364,7 +1388,7 @@
+ 	    cp += strspn( cp, " \t" );
+ 	    host = cp;
+ 	    if ( strchr( host, '/' ) != (char*) 0 || host[0] == '.' )
+-		send_error( 400, "Bad Request", "", "Can't parse request." );
++		return send_error( 400, "Bad Request", "", "Can't parse request." );
+ 	    }
+ 	else if ( strncasecmp( line, "If-Modified-Since:", 18 ) == 0 )
+ 	    {
+@@ -1393,11 +1417,11 @@
+     else if ( strcasecmp( method_str, get_method_str( METHOD_POST ) ) == 0 )
+ 	method = METHOD_POST;
+     else
+-	send_error( 501, "Not Implemented", "", "That method is not implemented." );
++	return send_error( 501, "Not Implemented", "", "That method is not implemented." );
+ 
+     strdecode( path, path );
+     if ( path[0] != '/' )
+-	send_error( 400, "Bad Request", "", "Bad filename." );
++	return send_error( 400, "Bad Request", "", "Bad filename." );
+     file = &(path[1]);
+     de_dotdot( file );
+     if ( file[0] == '\0' )
+@@ -1405,7 +1429,7 @@
+     if ( file[0] == '/' ||
+ 	 ( file[0] == '.' && file[1] == '.' &&
+ 	   ( file[2] == '\0' || file[2] == '/' ) ) )
+-	send_error( 400, "Bad Request", "", "Illegal filename." );
++	return send_error( 400, "Bad Request", "", "Illegal filename." );
+     if ( vhost )
+ 	file = virtual_file( file );
+ 
+@@ -1449,7 +1473,7 @@
+ 	    else
+ 		(void) snprintf(
+ 		    location, sizeof(location), "Location: %s/", path );
+-	    send_error( 302, "Found", location, "Directories must end with a slash." );
++	    return send_error( 302, "Found", location, "Directories must end with a slash." );
+ 	    }
+ 
+ 	/* Check for an index file. */
+@@ -1582,7 +1606,7 @@
+ 	syslog(
+ 	    LOG_NOTICE, "%.80s URL \"%.80s\" tried to retrieve an auth file",
+ 	    ntoa( &client_addr ), path );
+-	send_error( 403, "Forbidden", "", "File is protected." );
++	return send_error( 403, "Forbidden", "", "File is protected." );
+ 	}
+ 
+     /* Referer check. */
+@@ -1595,7 +1619,7 @@
+ 	return;
+ 	}
+     else if ( pathinfo != (char*) 0 )
+-	send_error( 404, "Not Found", "", "File not found." );
++	return send_error( 404, "Not Found", "", "File not found." );
+ 
+     fd = open( file, O_RDONLY );
+     if ( fd < 0 )
+@@ -1603,7 +1627,7 @@
+ 	syslog(
+ 	    LOG_INFO, "%.80s File \"%.80s\" is protected",
+ 	    ntoa( &client_addr ), path );
+-	send_error( 403, "Forbidden", "", "File is protected." );
++	return send_error( 403, "Forbidden", "", "File is protected." );
+ 	}
+     mime_type = figure_mime( file, mime_encodings, sizeof(mime_encodings) );
+     (void) snprintf(
+@@ -1690,7 +1714,7 @@
+ #endif /* HAVE_SCANDIR */
+ 
+     if ( pathinfo != (char*) 0 )
+-	send_error( 404, "Not Found", "", "File not found." );
++	return send_error( 404, "Not Found", "", "File not found." );
+ 
+     /* Check authorization for this directory. */
+     auth_check( file );
+@@ -1705,7 +1729,7 @@
+ 	syslog(
+ 	    LOG_INFO, "%.80s Directory \"%.80s\" is protected",
+ 	    ntoa( &client_addr ), path );
+-	send_error( 403, "Forbidden", "", "Directory is protected." );
++	return send_error( 403, "Forbidden", "", "Directory is protected." );
+ 	}
+ #endif /* HAVE_SCANDIR */
+ 
+@@ -1826,7 +1850,7 @@
+     char* directory;
+ 
+     if ( method != METHOD_GET && method != METHOD_POST )
+-	send_error( 501, "Not Implemented", "", "That method is not implemented for CGI." );
++	return send_error( 501, "Not Implemented", "", "That method is not implemented for CGI." );
+ 
+     /* If the socket happens to be using one of the stdin/stdout/stderr
+     ** descriptors, move it to another descriptor so that the dup2 calls
+@@ -1865,10 +1889,10 @@
+ 	int r;
+ 
+ 	if ( pipe( p ) < 0 )
+-	    send_error( 500, "Internal Error", "", "Something unexpected went wrong making a pipe." );
++	    return send_error( 500, "Internal Error", "", "Something unexpected went wrong making a pipe." );
+ 	r = fork();
+ 	if ( r < 0 )
+-	    send_error( 500, "Internal Error", "", "Something unexpected went wrong forking an interposer." );
++	    return send_error( 500, "Internal Error", "", "Something unexpected went wrong forking an interposer." );
+ 	if ( r == 0 )
+ 	    {
+ 	    /* Interposer process. */
+@@ -1886,7 +1910,7 @@
+ 		if(ifx_psendGoform)
+ 			(*ifx_psendGoform)(file,get_method_str(method),query,content_length,cookie, content_type,host,p[0],p[1]);
+ 		else
+-			send_error( 403, "Forbidden", "", "You must supply a local referer." );
++			return send_error( 403, "Forbidden", "", "You must supply a local referer." );
+ 	}
+ 	
+ 	if ( p[0] != STDIN_FILENO )
+@@ -1919,10 +1943,10 @@
+ 	int r;
+ 
+ 	if ( pipe( p ) < 0 )
+-	    send_error( 500, "Internal Error", "", "Something unexpected went wrong making a pipe." );
++	    return send_error( 500, "Internal Error", "", "Something unexpected went wrong making a pipe." );
+ 	r = fork();
+ 	if ( r < 0 )
+-	    send_error( 500, "Internal Error", "", "Something unexpected went wrong forking an interposer." );
++	    return send_error( 500, "Internal Error", "", "Something unexpected went wrong forking an interposer." );
+ 	if ( r == 0 )
+ 	    {
+ 	    /* Interposer process. */
+@@ -1993,7 +2017,7 @@
+     (void) execve( binary, argp, envp );
+ 
+     /* Something went wrong. */
+-    send_error( 500, "Internal Error", "", "Something unexpected went wrong running a CGI program." );
++    return send_error( 500, "Internal Error", "", "Something unexpected went wrong running a CGI program." );
+     }
+ 
+ 
+@@ -2068,7 +2092,7 @@
+ #endif /* USE_SSL */
+ 
+     set_ndelay( conn_fd );
+-    (void) read( conn_fd, buf, MAX_MEMORY_BUFF );
++    (void) read( conn_fd, buf,sizeof(buf));
+     clear_ndelay( conn_fd );
+     }
+ 
+@@ -2405,7 +2429,7 @@
+ 	syslog(
+ 	    LOG_ERR, "%.80s auth file %.80s could not be opened - %m",
+ 	    ntoa( &client_addr ), authpath );
+-	send_error( 403, "Forbidden", "", "File is protected." );
++	return send_error( 403, "Forbidden", "", "File is protected." );
+ 	}
+ 
+     /* Read it. */
+@@ -2451,7 +2475,7 @@
+ 
+     (void) snprintf(
+ 	header, sizeof(header), "WWW-Authenticate: Basic realm=\"%s\"", realm );
+-    send_error( 401, "Unauthorized", header, "Authorization required." );
++    return send_error( 401, "Unauthorized", header, "Authorization required." );
+     }
+ 
+ 
+@@ -2482,7 +2506,7 @@
+     }
+ 
+ 
+-static void
++static int
+ send_error( int s, char* title, char* extra_header, char* text )
+     {
+     add_headers(
+@@ -2498,6 +2522,7 @@
+     SSL_free( ssl );
+ #endif /* USE_SSL */
+     /*exit( 1 );*/
++    return -1;
+     }
+ 
+ 
+@@ -2695,7 +2720,7 @@
+     {
+     int i;
+     char c;
+-
++   
+     for ( i = request_idx; request_idx < request_len; ++request_idx )
+ 	{
+ 	c = request[request_idx];

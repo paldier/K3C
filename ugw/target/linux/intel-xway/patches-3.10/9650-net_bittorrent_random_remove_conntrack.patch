@@ -1,0 +1,117 @@
+Patch allows new connections (conntracks) to be created eventhough # of conntracks are more than nf_conntrack_max. This was a requirement from one of our customers.
+
+Normal behaviour is to NOT allow any new connections (conntracks) if the # of contracks are more than nf_conntrack_max and dump a print as "nf_conntrack: table full, dropping packet".
+
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -723,6 +723,84 @@ void init_nf_conntrack_hash_rnd(void)
+ 	cmpxchg(&nf_conntrack_hash_rnd, 0, rand);
+ }
+ 
++//#define LTQ_IP_CONNTRACK_REPLACEMENT
++
++#undef LTQ_IP_CONNTRACK_REPLACEMENT_DEBUG
++
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
++static inline int drop_decision(void)
++{ /*return value: 1-drop currnet nf_conn, 0-not drop current nf_conntrack */
++
++               /*Later we need to optimize here, like how to keep sip ALG,
++                * voice RTP and so on */
++               return 1;
++}
++
++
++/* Enhance : need to traverse reverse in the list , right now implementation is
++ * similiar as early_drop*/
++static int FindReplacement(struct net *net)
++{
++       /* Traverse backwards: gives us oldest, which is roughly LRU */
++       struct nf_conntrack_tuple_hash *h;
++       int dropped = 0;
++	unsigned int i;
++	struct hlist_nulls_node *n;
++       static unsigned int hash_next=0 ; //save for next replacement
++       struct nf_conn *ct = NULL, *tmp;
++
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT_DEBUG
++	printk(KERN_WARNING "iptables full:ip_conntrack_max(%d)_ip_conntrack_count(%d)_hash_next(%d)\n", nf_conntrack_max, atomic_read(&net->ct.count),hash_next );
++#endif
++       rcu_read_lock();
++
++       for (i=0; i < net->ct.htable_size; i++)  /*control loop times*/ {
++                hash_next =  (hash_next + 1) % net->ct.htable_size;
++               hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[hash_next],hnnode)
++               {
++                       tmp = nf_ct_tuplehash_to_ctrack(h);
++                       if ((tmp != NULL) && drop_decision() && (atomic_read(&tmp->ct_general.use) == 1)) {
++                                       ct = tmp;
++                       		break;
++                       }
++		}
++
++		if (ct != NULL) 
++			break;
++        }
++
++	rcu_read_unlock();
++
++        if (!ct) {
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT_DEBUG
++                printk(KERN_WARNING "Not found replacemnet ???\n");
++#endif
++                return dropped;
++        }
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT_DEBUG
++        printk(KERN_WARNING "replace ok:%d\n", hash_next);
++#endif
++        if (del_timer(&ct->timeout)) {
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++                atomic_inc(&g_ppa_force_timeout);
++#endif
++                death_by_timeout((unsigned long)ct);
++
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++                atomic_dec(&g_ppa_force_timeout);
++#endif
++		if (test_bit(IPS_DYING_BIT, &ct->status)) {
++               		dropped = 1;
++			NF_CT_STAT_INC_ATOMIC(net, early_drop);
++		}
++        }
++       nf_ct_put(ct);
++        return dropped;
++}
++
++#endif
++
++
+ static struct nf_conn *
+ __nf_conntrack_alloc(struct net *net, u16 zone,
+ 		     const struct nf_conntrack_tuple *orig,
+@@ -743,12 +821,24 @@ static struct nf_conn *
+ 	if (nf_conntrack_max &&
+ 	    unlikely(atomic_read(&net->ct.count) > nf_conntrack_max)) {
+ 		if (!early_drop(net, hash_bucket(hash, net))) {
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
++               if( FindReplacement(net) )
++               {
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT_DEBUG
++                       printk(KERN_WARNING "inside nf_conntrack_alloc ok\n");
++#endif
++                       goto SUCCESS_REPLACEMENT;
++               }
++#endif
+ 			atomic_dec(&net->ct.count);
+ 			net_warn_ratelimited("nf_conntrack: table full, dropping packet\n");
+ 			return ERR_PTR(-ENOMEM);
+ 		}
+ 	}
+ 
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
++SUCCESS_REPLACEMENT:
++#endif
+ 	/*
+ 	 * Do not use kmem_cache_zalloc(), as this cache uses
+ 	 * SLAB_DESTROY_BY_RCU.

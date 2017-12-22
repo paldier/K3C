@@ -1,0 +1,1130 @@
+# HG changeset patch
+# Parent ff6db02299702c780b0c1b4fce6385be991ed3bd
+From:
+Date: Thu, 24 Sep 2013 17:38:48 +0100
+Subject: Lantiq multicast bridge snooping support
+
+diff --git a/include/uapi/linux/sockios.h b/include/uapi/linux/sockios.h
+--- a/include/uapi/linux/sockios.h
++++ b/include/uapi/linux/sockios.h
+@@ -124,6 +124,13 @@
+ #define SIOCBRADDIF	0x89a2		/* add interface to bridge      */
+ #define SIOCBRDELIF	0x89a3		/* remove interface from bridge */
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++/* bridge snooping */
++#define SIOCBRADDMGREC     0x89ab
++#define SIOCBRDELMGREC     0x89ac
++#define SIOCBRSETROUTERPORT    0x89ad
++#endif
++
+ /* hardware time stamping: parameters in linux/net_tstamp.h */
+ #define SIOCSHWTSTAMP   0x89b0
+ 
+diff --git a/include/uapi/linux/sysctl.h b/include/uapi/linux/sysctl.h
+--- a/include/uapi/linux/sysctl.h
++++ b/include/uapi/linux/sysctl.h
+@@ -778,6 +778,13 @@ enum {
+ 	NET_SCTP_RCVBUF_POLICY		 = 17,
+ };
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++enum {
++   NET_BRIDGE_IGMP_SNOOPING = 1,
++   NET_BRIDGE_MLD_SNOOPING = 2,
++};
++#endif
++
+ /* /proc/sys/net/bridge */
+ enum {
+ 	NET_BRIDGE_NF_CALL_ARPTABLES = 1,
+diff --git a/net/bridge/Kconfig b/net/bridge/Kconfig
+--- a/net/bridge/Kconfig
++++ b/net/bridge/Kconfig
+@@ -59,3 +59,16 @@ config BRIDGE_VLAN_FILTERING
+ 	  Say N to exclude this support and reduce the binary size.
+ 
+ 	  If unsure, say Y.
++
++config LTQ_MCAST_PROXY
++        tristate "MCAST Proxy support"
++        depends on m
++        default n
++        help
++          Lantiq Multicast Proxy support
++
++config LTQ_MCAST_SNOOPING
++        tristate "MCAST Snooping support"
++        default y
++        help
++          Lantiq Multicast Snooping support
+diff --git a/net/bridge/Makefile b/net/bridge/Makefile
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@ -10,6 +10,8 @@ bridge-y	:= br.o br_device.o br_fdb.o br
+ 
+ bridge-$(CONFIG_SYSFS) += br_sysfs_if.o br_sysfs_br.o
+ 
++bridge-$(CONFIG_LTQ_MCAST_SNOOPING) += ltq_br_mcast_snooping.o
++
+ bridge-$(CONFIG_BRIDGE_NETFILTER) += br_netfilter.o
+ 
+ bridge-$(CONFIG_BRIDGE_IGMP_SNOOPING) += br_multicast.o br_mdb.o
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -66,6 +66,10 @@ static int __init br_init(void)
+ 	br_fdb_test_addr_hook = br_fdb_test_addr;
+ #endif
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++	br_mcast_snoop_init();
++#endif
++
+ 	return 0;
+ err_out4:
+ 	unregister_netdevice_notifier(&br_device_notifier);
+@@ -98,6 +102,10 @@ static void __exit br_deinit(void)
+ #endif
+ 
+ 	br_fdb_fini();
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++	br_mcast_snoop_deinit();
++#endif
++
+ }
+ 
+ module_init(br_init)
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -31,6 +31,10 @@ extern int nf_ebt_queue(struct sk_buff *
+   #include <net/ppa_api.h>
+ #endif
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++#define IS_MCAST_ADDR 0x1
++#endif
++
+ static int deliver_clone(const struct net_bridge_port *prev,
+ 			 struct sk_buff *skb,
+ 			 void (*__packet_hook)(const struct net_bridge_port *p,
+@@ -196,6 +200,17 @@ static struct net_bridge_port *maybe_del
+ 	if (!prev)
+ 		goto out;
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++		if ((bridge_igmp_snooping || bridge_mld_snooping) && 
++			(eth_hdr(skb)->h_dest[0] & IS_MCAST_ADDR) && 
++			(br_selective_flood(prev, skb) == 0)) {
++				prev = p;
++				return p;
++		}
++#endif
++			
++
++
+ 	err = deliver_clone(prev, skb, __packet_hook);
+ 	if (err)
+ 		return ERR_PTR(err);
+@@ -229,9 +244,27 @@ static void __ebt_optimized br_flood(str
+ 		goto out;
+ 
+ 	if (skb0)
++	{
++	#ifdef CONFIG_LTQ_MCAST_SNOOPING
++		if ((bridge_igmp_snooping || bridge_mld_snooping) && 
++			(eth_hdr(skb)->h_dest[0] & IS_MCAST_ADDR) && 
++			(br_selective_flood(prev, skb) == 0)){}
++//			kfree_skb(skb);
++		else
++	#endif
+ 		deliver_clone(prev, skb, __packet_hook);
++	}
+ 	else
++	{
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++		if ((bridge_igmp_snooping || bridge_mld_snooping) && 
++			(eth_hdr(skb)->h_dest[0] & IS_MCAST_ADDR) && 
++			(br_selective_flood(prev, skb) == 0))
++			kfree_skb(skb);
++		else
++#endif	
+ 		__packet_hook(prev, skb);
++	}
+ 	return;
+ 
+ out:
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -131,6 +131,10 @@ static void del_nbp(struct net_bridge_po
+ 	struct net_bridge *br = p->br;
+ 	struct net_device *dev = p->dev;
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++	br_mcast_port_cleanup(p);
++#endif
++
+ 	sysfs_remove_link(br->ifobj, p->dev->name);
+ 
+ 	dev_set_promiscuity(dev, -1);
+@@ -223,6 +227,13 @@ static struct net_bridge_port *new_nbp(s
+ 	p->port_no = index;
+ 	p->flags = 0;
+ 	br_init_port(p);
++
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++	br_mcast_port_init(p);
++	spin_lock_init(&p->mghash_lock);
++#endif
++
++	
+ 	p->state = BR_STATE_DISABLED;
+ 	br_stp_port_timer_init(p);
+ 	br_multicast_add_port(p);
+@@ -402,6 +413,10 @@ int br_add_if(struct net_bridge *br, str
+ 
+ 	kobject_uevent(&p->kobj, KOBJ_ADD);
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++		br_ifinfo_notify(RTM_NEWLINK, p);
++#endif
++
+ 	return 0;
+ 
+ err5:
+@@ -445,6 +460,10 @@ int br_del_if(struct net_bridge *br, str
+ 		call_netdevice_notifiers(NETDEV_CHANGEADDR, br->dev);
+ 
+ 	netdev_update_features(br->dev);
++	
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++	br_ifinfo_notify(RTM_DELLINK, p);
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/net/bridge/br_ioctl.c b/net/bridge/br_ioctl.c
+--- a/net/bridge/br_ioctl.c
++++ b/net/bridge/br_ioctl.c
+@@ -103,6 +103,108 @@ static int add_del_if(struct net_bridge 
+ 
+ 	return ret;
+ }
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++
++/* Set router port ioctl request */
++static int mcast_snoop_set_router_port(struct net_bridge *br, struct ifreq *rq)
++{
++	struct router_port rp;
++	struct net_bridge_port *port;
++	struct net_device *dev;
++
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	if (copy_from_user((void *)&rp, rq->ifr_data, sizeof(struct router_port)))
++		return -EFAULT;
++
++	dev = dev_get_by_index(dev_net(br->dev), rp.if_index);
++	if (dev == NULL)
++		return -EINVAL;
++
++	port = br_port_get_rtnl(dev);
++   if (port == NULL) {
++		dev_put(dev);
++		return -ENODEV;
++	}
++
++	if (rp.type == IPV4) {
++		port->igmp_router_port = 1;
++		mod_timer(&port->igmp_router_timer, jiffies + rp.expires * HZ);
++	} else if (rp.type == IPV6) {
++		port->mld_router_port = 1;
++		mod_timer(&port->mld_router_timer, jiffies + rp.expires * HZ);
++	} else {
++		dev_put(dev);
++		return -EINVAL;
++	}
++
++	dev_put(dev);
++	return 0;
++}
++
++/* Add / delete multicast entry */
++static int add_del_mg_entry(struct net_bridge *br, struct ifreq *rq, int isadd)
++{
++    struct net_device *dev;
++    struct net_bridge_port *port;
++    struct br_grp_rec recbuf, *rec;
++    char *buf;
++    int nsrc = 0;
++    int ret;
++    int ifindex;
++
++    if (!capable(CAP_NET_ADMIN))
++        return -EPERM;
++
++    /* Step 1. get src count from record */
++    if (copy_from_user((void *)&recbuf, rq->ifr_data, sizeof(struct br_grp_rec)))
++        return -EFAULT;
++
++    ifindex = recbuf.if_index;
++    nsrc = recbuf.nsrc;
++
++    /* allocate buffer large enough to accommodate the src list also */
++    buf = kmalloc(sizeof(struct br_grp_rec) + nsrc * sizeof(ipaddr_t), GFP_KERNEL);
++    if(buf == NULL)
++        return -ENOMEM;
++
++    /* Step 2. now copy the entire record */
++    if (copy_from_user(buf, rq->ifr_data, sizeof(struct br_grp_rec) + nsrc * sizeof(ipaddr_t))){
++	kfree(buf);
++        return -EFAULT;
++    }
++
++    rec = (struct br_grp_rec *)buf;
++
++    dev = dev_get_by_index(dev_net(br->dev), ifindex);
++    if (dev == NULL){
++	kfree(buf);
++        return -EINVAL;
++    }
++
++    port = br_port_get_rtnl(dev);
++	
++    if (port == NULL) {
++		dev_put(dev);
++		kfree(buf);
++		return -ENODEV;
++    }
++
++   
++
++    if(isadd)
++        ret = br_mg_add_entry(port, &rec->gaddr, rec->filter_mode, rec->compat, rec->nsrc, rec->slist);
++    else
++        ret = br_mg_del_record(port, &rec->gaddr);
++
++    dev_put(dev);
++    kfree(buf);
++    return ret;
++}
++#endif /* CONFIG_LTQ_MCAST_SNOOPING */
++
++
+ 
+ /*
+  * Legacy ioctl's through SIOCDEVPRIVATE
+@@ -388,6 +490,13 @@ int br_dev_ioctl(struct net_device *dev,
+ 	case SIOCBRADDIF:
+ 	case SIOCBRDELIF:
+ 		return add_del_if(br, rq->ifr_ifindex, cmd == SIOCBRADDIF);
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++	case SIOCBRADDMGREC:
++	case SIOCBRDELMGREC:
++		return add_del_mg_entry(br, rq, cmd == SIOCBRADDMGREC);
++	case SIOCBRSETROUTERPORT:
++		return mcast_snoop_set_router_port(br, rq);
++#endif /* CONFIG_LTQ_MCAST_SNOOPING */
+ 
+ 	}
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -124,6 +124,65 @@ struct net_bridge_mdb_htable
+ 	u32				secret;
+ 	u32				ver;
+ };
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++
++typedef enum {
++	IPV4 = 0,
++	IPV6,
++} ptype_t;
++
++struct ipaddr {
++	ptype_t type;
++	union {
++		struct in_addr ip4;
++		struct in6_addr ip6;
++	} addr;
++};
++
++typedef struct ipaddr ipaddr_t;
++
++enum igmp_ver {
++    IGMPV1 = 1,
++    IGMPV2,
++    IGMPV3,
++};
++
++enum mld_ver {
++    MLDV1 = 1,
++    MLDV2,
++};
++
++/* Set router port ioctl request */
++struct router_port {
++	ptype_t type;
++    u32 if_index; /* interface index */
++    u32 expires; /* expiry time */
++};
++
++/* Multicast group record ioctl request */
++struct br_grp_rec {
++    u32 if_index;   /* interface index */
++    ipaddr_t gaddr;          /* Group address */
++    u32 filter_mode;    /* Filter mode */
++    u32 compat;    /* Compatibility mode */
++    u32 nsrc;       /* number of sources */
++    ipaddr_t slist[0];   /* source list */
++};
++
++struct net_bridge_mg_entry
++{
++    struct hlist_node		hlist;
++    ipaddr_t				gaddr;              /* Group ipaddr */
++    u8						filter_mode;        /* 0 = EX, 1 = IN */
++    u8						compat_mode;   /* 1 = v1, 2 = v2, 3 = v3 */
++    struct net_bridge_port	*port;
++    struct rcu_head			rcu;
++    u32						saddr_cnt;
++    ipaddr_t				saddr[0];           /* Array of src ipaddr */
++};
++
++#endif /* CONFIG_LTQ_MCAST_SNOOPING */
++
+ 
+ struct net_bridge_port
+ {
+@@ -159,6 +218,17 @@ struct net_bridge_port
+ #define BR_ADMIN_COST		0x00000010
+ #define BR_ISOLATE_MODE		0x00000020
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++        u32                                     mghash_secret;
++        u32                                     mghash_secret6;
++        spinlock_t                      mghash_lock;
++        struct hlist_head       mghash[BR_HASH_SIZE];
++        u8                                      igmp_router_port;
++        struct timer_list       igmp_router_timer;
++        u8                                      mld_router_port;
++        struct timer_list       mld_router_timer;
++#endif /* CONFIG_LTQ_MCAST_SNOOPING */
++
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	u32				multicast_startup_queries_sent;
+ 	unsigned char			multicast_router;
+@@ -775,6 +845,20 @@ extern int br_dellink(struct net_device 
+ extern int br_getlink(struct sk_buff *skb, u32 pid, u32 seq,
+ 		      struct net_device *dev, u32 filter_mask);
+ 
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++/* br_mcast_snooping.c */
++extern void br_mcast_port_init(struct net_bridge_port *port);
++extern void br_mcast_port_cleanup(struct net_bridge_port *port);
++extern int br_mg_del_record(struct net_bridge_port *port, ipaddr_t *gaddr);
++extern int br_mg_add_entry(struct net_bridge_port *port, ipaddr_t *gaddr, u8 filter, u8 compat, u32 saddr_cnt, ipaddr_t *saddr);
++extern int br_selective_flood(struct net_bridge_port *p, struct sk_buff *skb);
++
++extern int bridge_igmp_snooping;
++extern int bridge_mld_snooping;
++extern void br_mcast_snoop_init(void);
++extern void br_mcast_snoop_deinit(void);
++#endif
++
+ #ifdef CONFIG_SYSFS
+ /* br_sysfs_if.c */
+ extern const struct sysfs_ops brport_sysfs_ops;
+diff --git a/net/bridge/ltq_br_mcast_snooping.c b/net/bridge/ltq_br_mcast_snooping.c
+new file mode 100644
+--- /dev/null
++++ b/net/bridge/ltq_br_mcast_snooping.c
+@@ -0,0 +1,657 @@
++/*
++ * Bridge multicast snooping.
++ *
++ * Copyright (c) 2013 Lantiq Deutschland GMBH 
++ *
++ *
++ *
++ *
++ *
++ *
++ */
++#include <linux/kernel.h>
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
++#include <linux/if_vlan.h>
++#include <linux/netfilter_bridge.h>
++#include <linux/in.h>
++#include <net/ipv6.h>
++#include <linux/ip.h>
++#include <linux/igmp.h>
++#include <linux/jhash.h>
++#include <linux/timer.h>
++#include <net/addrconf.h>
++#ifdef CONFIG_SYSCTL
++#include <linux/sysctl.h>
++#endif
++#include "br_private.h"
++
++int bridge_igmp_snooping = 0;
++int bridge_mld_snooping = 0;
++int bridge_igmp_snooping_dbg = 0;
++
++
++
++#ifdef CONFIG_SYSCTL
++static struct ctl_table_header *br_mcast_sysctl_header;
++
++static
++int br_mcast_sysctl_call_tables(ctl_table * ctl, int write,
++			    void __user * buffer, size_t * lenp, loff_t * ppos)
++{
++	int ret;
++
++	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
++
++	if (write && *(int *)(ctl->data))
++		*(int *)(ctl->data) = 1;
++	return ret;
++}
++
++
++static struct ctl_table br_mcast_table[] = {
++	{
++
++		.procname	= "bridge-igmp-snooping",
++		.data		= &bridge_igmp_snooping,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= br_mcast_sysctl_call_tables,
++	},
++	{
++
++		.procname	= "bridge-mld-snooping",
++		.data		= &bridge_mld_snooping,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= br_mcast_sysctl_call_tables,
++	},
++    { }
++
++};
++
++#endif
++
++
++static char *__printip(ipaddr_t *addr)
++{
++	static char ipstr[64];
++
++	memset(ipstr, 0, 64);
++	if (addr->type == IPV4) {
++		sprintf(ipstr, "%08X", addr->addr.ip4.s_addr);
++	} else if (addr->type == IPV6) {
++		sprintf(ipstr, "%04X:%04X:%04X:%04X:%04X:%04X:%04X:%04X", 
++		                addr->addr.ip6.s6_addr16[0],
++		                addr->addr.ip6.s6_addr16[1],
++		                addr->addr.ip6.s6_addr16[2],
++		                addr->addr.ip6.s6_addr16[3],
++		                addr->addr.ip6.s6_addr16[4],
++		                addr->addr.ip6.s6_addr16[5],
++		                addr->addr.ip6.s6_addr16[6],
++		                addr->addr.ip6.s6_addr16[7]);
++	} else
++		ipstr[0] = '\0';
++
++	return ipstr;
++}
++
++static struct proc_dir_entry *g_mcast_proc_dir = NULL;
++static int br_mcast_proc_show(struct seq_file *m, void *v)
++{
++	int len = 0, i, j;
++	struct net_bridge *br = NULL;
++	struct net_device *dev = NULL;
++	struct net_bridge_port *p;
++
++	dev = dev_get_by_name(dev_net(br->dev), "br0");
++	if (!dev)
++		return len;
++
++	br = netdev_priv(dev);
++	list_for_each_entry_rcu(p, &br->port_list, list) {
++		spin_lock(&p->mghash_lock);
++
++		seq_printf(m,"%s\n", p->dev->name);
++
++		for (i = 0; i < BR_HASH_SIZE; i++) {
++			struct net_bridge_mg_entry *entry;
++			struct hlist_node *n;
++
++			hlist_for_each_entry_safe(entry, n, &p->mghash[i], hlist) {
++				seq_printf(m, "\t%s", __printip(&entry->gaddr));
++				seq_printf(m, "\t%s\n", entry->filter_mode ? "IN" : "EX");
++				for (j = 0; j < entry->saddr_cnt; j++)
++					seq_printf(m, "\t\t\t%s\n", __printip(&entry->saddr[j]));
++			}
++		}
++		spin_unlock(&p->mghash_lock);
++	}
++	dev_put(dev);
++
++	return len;
++
++
++}
++
++static int br_mcast_proc_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, br_mcast_proc_show, NULL);
++}
++
++static const struct file_operations br_mcast_proc_fops = {
++	.open		= br_mcast_proc_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++
++void br_mcast_snoop_init(void)
++{
++	struct proc_dir_entry *res;
++
++#ifdef CONFIG_SYSCTL
++	br_mcast_sysctl_header = register_net_sysctl(&init_net, "net/bridge", br_mcast_table);
++	if (br_mcast_sysctl_header == NULL) {
++		printk(KERN_WARNING "Failed to register bridge mcast snoop sysctl table.\n");
++		return;
++	}
++
++	
++#endif
++
++	g_mcast_proc_dir = proc_mkdir("swmcastsnoop", NULL);
++
++	res = proc_create("brgrptable", 0,g_mcast_proc_dir, &br_mcast_proc_fops);
++	if (!res)
++		printk("FATAL ERROR: Can not add proc entry.\n");
++}
++
++void br_mcast_snoop_deinit(void)
++{
++#ifdef CONFIG_SYSCTL
++	unregister_sysctl_table(br_mcast_sysctl_header);
++#endif
++}
++
++static void igmp_router_timer_handler(unsigned long data)
++{
++	struct net_bridge_port *port = (struct net_bridge_port *)data;
++
++	port->igmp_router_port = 0;
++}
++
++static void mld_router_timer_handler(unsigned long data)
++{
++	struct net_bridge_port *port = (struct net_bridge_port *)data;
++
++	port->mld_router_port = 0;
++}
++
++void br_mcast_port_init(struct net_bridge_port *port)
++{
++	/* init mghash secret */
++	get_random_bytes(&port->mghash_secret, sizeof(port->mghash_secret));
++	get_random_bytes(&port->mghash_secret6, sizeof(port->mghash_secret6));
++
++	/* init router port timer */
++	port->igmp_router_timer.function = igmp_router_timer_handler;
++	port->igmp_router_timer.data = (unsigned int)port;
++	init_timer(&port->igmp_router_timer);
++
++	port->mld_router_timer.function = mld_router_timer_handler;
++	port->mld_router_timer.data = (unsigned int)port;
++	init_timer(&port->mld_router_timer);
++}
++
++void br_mcast_port_cleanup(struct net_bridge_port *port)
++{
++	del_timer(&port->igmp_router_timer);
++	del_timer(&port->mld_router_timer);
++}
++
++static void init_ipaddr(ipaddr_t *addr, ptype_t type, void *addrp)
++{
++    if (addr == NULL)
++        return;
++
++    if (type == IPV4) {
++        addr->type = IPV4;
++        if (addrp)
++            addr->addr.ip4.s_addr = *((unsigned int *)addrp);
++        else
++            addr->addr.ip4.s_addr = 0;
++    }
++    else if (type == IPV6) {
++        struct in6_addr *in6 = (struct in6_addr *)addrp;
++        addr->type = IPV6;
++        if (in6) {
++			addr->addr.ip6.s6_addr32[0] = in6->s6_addr32[0];
++			addr->addr.ip6.s6_addr32[1] = in6->s6_addr32[1];
++			addr->addr.ip6.s6_addr32[2] = in6->s6_addr32[2];
++			addr->addr.ip6.s6_addr32[3] = in6->s6_addr32[3];
++        } else {
++			addr->addr.ip6.s6_addr32[0] = 0;
++			addr->addr.ip6.s6_addr32[1] = 0;
++			addr->addr.ip6.s6_addr32[2] = 0;
++			addr->addr.ip6.s6_addr32[3] = 0;
++		}
++	}
++}
++
++static int is_same_ipaddr(ipaddr_t *addr1, ipaddr_t *addr2)
++{
++    if (addr1 == NULL || addr2 == NULL)
++        return false;
++
++    if (addr1->type == IPV4 && addr2->type == IPV4) {
++        return addr1->addr.ip4.s_addr == addr2->addr.ip4.s_addr;
++    }
++    else if (addr1->type == IPV6 && addr2->type == IPV6) {
++        return addr1->addr.ip6.s6_addr32[0] == addr2->addr.ip6.s6_addr32[0] &&
++		       addr1->addr.ip6.s6_addr32[1] == addr2->addr.ip6.s6_addr32[1] &&
++			   addr1->addr.ip6.s6_addr32[2] == addr2->addr.ip6.s6_addr32[2] &&
++			   addr1->addr.ip6.s6_addr32[3] == addr2->addr.ip6.s6_addr32[3];
++    }
++
++    return 0;
++}
++
++static void copy_ipaddr(ipaddr_t *to, ipaddr_t *from)
++{
++    if (to == NULL || from == NULL)
++        return;
++
++    memcpy(to, from, sizeof(ipaddr_t));
++}
++
++static int IS_ADDR_UNSPECIFIED(ipaddr_t *addr)
++{
++    if (addr->type == IPV4)
++        return addr->addr.ip4.s_addr == 0;
++    else if (addr->type == IPV6)
++        return (addr->addr.ip6.s6_addr32[0] == 0) && 
++		       (addr->addr.ip6.s6_addr32[1] == 0) && 
++		       (addr->addr.ip6.s6_addr32[2] == 0) && 
++		       (addr->addr.ip6.s6_addr32[3] == 0);
++
++    return 0;
++}
++
++static inline u32 br_gaddr_hash(struct net_bridge_port *port, ipaddr_t *gaddr)
++{
++	u32 hash = -1;
++
++	if (gaddr->type == IPV4) {
++		u32 initval = gaddr->addr.ip4.s_addr;
++		hash = jhash_1word(initval, port->mghash_secret) & (BR_HASH_SIZE - 1);
++	} else if (gaddr->type == IPV6) {
++		u32 *k = (u32 *)&gaddr->addr.ip6.s6_addr32[0];
++		hash = jhash2(k, 4, port->mghash_secret6) & (BR_HASH_SIZE - 1);
++	}
++
++	return hash;
++}
++
++static inline struct net_bridge_mg_entry *_br_mg_get_entry(struct hlist_head *head, 
++                                                           ipaddr_t *gaddr)
++{
++	struct net_bridge_mg_entry *entry;
++
++	hlist_for_each_entry_rcu(entry, head, hlist) {
++		if(is_same_ipaddr(&entry->gaddr, gaddr))
++			return entry;
++	}
++
++	return NULL;
++}
++
++/* Search multicast group table for a group */
++struct net_bridge_mg_entry *br_mg_get_entry(struct net_bridge_port *port, ipaddr_t *gaddr)
++{
++	struct hlist_head *head;
++	unsigned int hash;
++
++	hash = br_gaddr_hash(port, gaddr);
++	head = &port->mghash[hash];
++
++	return _br_mg_get_entry(head, gaddr);
++}
++
++static void _br_mg_free_entry(struct rcu_head *head)
++{
++	struct net_bridge_mg_entry *entry = 
++		container_of(head, struct net_bridge_mg_entry, rcu);
++
++	kfree(entry);
++}
++
++static void br_mg_delete_entry(struct net_bridge_mg_entry *entry)
++{
++	hlist_del_rcu(&entry->hlist);
++	call_rcu(&entry->rcu, _br_mg_free_entry);
++}
++
++static int br_mg_update_entry(struct net_bridge_port *port, struct net_bridge_mg_entry *old, 
++                              struct hlist_head *head, ipaddr_t *gaddr, u8 filter, 
++                              u8 compat, u32 saddr_cnt, ipaddr_t *saddr)
++{
++	struct net_bridge_mg_entry *new;
++	int i;
++
++	/* prepare a new temporary group entry */
++	new = kzalloc(sizeof(struct net_bridge_mg_entry) + saddr_cnt * sizeof(ipaddr_t), 
++	              GFP_ATOMIC);
++
++	if(unlikely(!new))
++		return -1;
++
++	copy_ipaddr(&new->gaddr, gaddr);
++	new->port = port;
++	new->filter_mode = filter;
++	new->compat_mode = compat;
++	new->saddr_cnt = saddr_cnt;
++	for(i = 0; i < saddr_cnt; i++)
++		copy_ipaddr(&new->saddr[i], &saddr[i]);
++
++	/* delete old entry */
++	br_mg_delete_entry(old);
++
++	/* add new entry */
++	hlist_add_head_rcu(&new->hlist, head);
++
++	return 0;
++}
++
++static void br_mg_del_table(struct net_bridge_port *port)
++{
++	int i;
++
++	for (i = 0; i < BR_HASH_SIZE; i++) {
++		struct net_bridge_mg_entry *entry;
++		struct hlist_node *n;
++
++		hlist_for_each_entry_safe(entry, n, &port->mghash[i], hlist) {
++			br_mg_delete_entry(entry);
++		}
++	}
++}
++
++/*Delete a group from multicast group table*/
++int br_mg_del_record(struct net_bridge_port *port, ipaddr_t *gaddr)
++{
++	struct net_bridge_mg_entry *entry;
++	struct hlist_head *head;
++	unsigned int hash;
++
++	spin_lock(&port->mghash_lock);
++
++	hash = br_gaddr_hash(port, gaddr);
++	head = &port->mghash[hash];
++
++	if (!IS_ADDR_UNSPECIFIED(gaddr)) {
++		entry = _br_mg_get_entry(head, gaddr);
++		if (entry) br_mg_delete_entry(entry);
++	} else {
++		br_mg_del_table(port);
++	}
++
++	spin_unlock(&port->mghash_lock);
++
++	return 0;
++}
++
++/* Add a group to multicast group table */
++int br_mg_add_entry(struct net_bridge_port *port, 
++					ipaddr_t *gaddr, u8 filter, u8 compat, u32 saddr_cnt, ipaddr_t *saddr)
++{
++	struct net_bridge_mg_entry *entry;
++	struct hlist_head *head;
++	unsigned int hash;
++	int i;
++
++	spin_lock(&port->mghash_lock);
++
++	hash = br_gaddr_hash(port, gaddr);
++	head = &port->mghash[hash];
++
++	entry = _br_mg_get_entry(head, gaddr);
++	if(!entry) {
++		/* Create new mg entry */
++		entry = kzalloc(sizeof(*entry) + saddr_cnt * sizeof(ipaddr_t), GFP_ATOMIC);
++		if(unlikely(!entry)) {
++			spin_unlock(&port->mghash_lock);
++			return -1;
++		}
++
++		entry->port = port;
++		copy_ipaddr(&entry->gaddr, gaddr);
++		entry->filter_mode = filter;
++		entry->compat_mode = compat;
++		entry->saddr_cnt = saddr_cnt;
++		for(i = 0; i < saddr_cnt; i++)
++			copy_ipaddr(&entry->saddr[i], &saddr[i]);
++
++		hlist_add_head_rcu(&entry->hlist, head);
++	}
++	else {
++		/* Update existing entry */
++		br_mg_update_entry(port, entry, head, gaddr, filter, compat, saddr_cnt, saddr);
++	}
++
++	spin_unlock(&port->mghash_lock);
++
++	return 0;
++}
++
++/* Handle IGMP / MLD query */
++static int br_forward_query(struct net_bridge_port *port, ipaddr_t *gaddr, int ver)
++{
++	struct net_bridge_mg_entry *entry;
++	u8 compat_mode;
++
++	/* Handle Group specific query */
++	if(NULL == (entry = br_mg_get_entry(port, gaddr))) {
++		/* no matching group found */
++		return 0;
++	}
++
++	rcu_read_lock();	// XXX: needed ???
++	compat_mode = entry->compat_mode;
++	rcu_read_unlock();
++	if (compat_mode == ver)
++		return 1;
++	else
++		return 0;
++}
++
++/* Handle multicast data */
++static int br_snoop_multicast_data(struct net_bridge_port *port, ipaddr_t *gaddr, 
++                                   ipaddr_t *saddr)
++{
++	struct net_bridge_mg_entry *entry;
++	int i, found = 0, filter_mode = 1, ret = 1;
++
++	if(NULL == (entry = br_mg_get_entry(port, gaddr))) {
++		/* no matching group found */
++		return 0;
++	}
++
++	rcu_read_lock();	// XXX: needed ???
++	filter_mode = entry->filter_mode;
++
++	for (i = 0; i < entry->saddr_cnt; i++) {
++		if(is_same_ipaddr(&entry->saddr[i], saddr)) {
++			found = 1;
++			break;
++		}
++	}
++	rcu_read_unlock();
++
++	if(found) {
++		ret = filter_mode == 1 ? 1 : 0;
++	}
++	else {
++		ret = filter_mode == 0 ? 1 : 0;
++	}
++
++	return ret;
++}
++
++struct mld2_query {
++    __u8 type;
++    __u8 code;
++    __sum16 csum;
++    __be16 mrc;
++    __be16 resv1;
++    struct in6_addr mca;
++#if defined(__LITTLE_ENDIAN_BITFIELD)
++    __u8 qrv:3,
++         suppress:1,
++         resv2:4;
++#elif defined(__BIG_ENDIAN_BITFIELD)
++    __u8 resv2:4,
++         suppress:1,
++         qrv:3;
++#else
++#error "Please fix <asm/byteorder.h>"
++#endif
++    __u8 qqic;
++    __be16 nsrcs;
++    struct in6_addr srcs[0];
++};
++
++#define IN6_IS_ADDR_MULTICAST(a) (((__const uint8_t *) (a))[0] == 0xff)
++
++static int br_selective_flood6(struct net_bridge_port *p, struct sk_buff *skb)
++{
++	struct ipv6hdr *iph;
++	ipaddr_t daddr, gaddr, saddr;
++	int mldlen;
++	int ver = 3;
++
++	iph = (struct ipv6hdr *)skb_network_header(skb);
++
++	/* Also not interested if IP dest address is not a multicast address */
++	if(!IN6_IS_ADDR_MULTICAST(&iph->daddr))
++		return 1;
++
++	/* Allow all node multicast address */
++	if (ipv6_addr_is_ll_all_nodes(&iph->daddr))
++	{
++		return 1;
++	}
++               
++
++	init_ipaddr(&daddr, IPV6, &iph->daddr);
++	init_ipaddr(&saddr, IPV6, &iph->saddr);
++
++	if(iph->nexthdr == IPPROTO_HOPOPTS) {
++		struct ipv6_opt_hdr *opt = (struct ipv6_opt_hdr *)((void *)iph + sizeof(struct ipv6hdr));
++
++		if (opt->nexthdr == IPPROTO_ICMPV6) {
++			struct mld2_query *query = NULL;
++			struct icmp6hdr *icmp6h = (struct icmp6hdr *) ((void *)opt + ipv6_optlen(opt));
++
++			switch(icmp6h->icmp6_type) {
++				case ICMPV6_MGM_QUERY:
++					if (p->mld_router_port) {
++						return 0;
++					}
++					query = (struct mld2_query *)icmp6h;
++					mldlen = ntohs(iph->payload_len) - ipv6_optlen(opt);
++					if (mldlen == 24) {
++						ver = MLDV1;
++					} else if (mldlen >= 28) {
++						ver = MLDV2;
++					} else
++						return 1; /* Do not handle malformed MLD query packet */
++					init_ipaddr(&gaddr, IPV6, &query->mca);
++					return br_forward_query(p, &gaddr, ver);
++				case ICMPV6_MGM_REPORT:
++				case ICMPV6_MGM_REDUCTION:
++				case ICMPV6_MLD2_REPORT:
++					return 1;	/* Allow control packets */
++				default:
++					break;
++			}
++		}
++	}
++	else if (iph->nexthdr == IPPROTO_ICMPV6) {
++		return 1;       /* Allow all other ICMPv6 packets  */
++	}
++
++	return br_snoop_multicast_data(p, &daddr, &saddr);
++}
++
++static int br_selective_flood4(struct net_bridge_port *p, struct sk_buff *skb)
++{
++	struct iphdr *iph;
++	struct igmphdr *igmph;
++	struct igmpv3_query *igmph3;
++	ipaddr_t daddr, gaddr, saddr;
++	int ret = 1;
++	int igmplen;
++	int ver = 3;
++
++	iph = (struct iphdr *)skb_network_header(skb);
++	/* Skip snooping 224.0.0.x and 239.x.x.x */
++	if((ntohl(iph->daddr) & 0xffffff00U) == 0xe0000000U ||
++		(ntohl(iph->daddr) & 0xff000000U) == 0xef000000U)
++		return 1;
++
++	/* Also not interested if IP dest address is not a multicast address */
++	if(!IN_MULTICAST(ntohl(iph->daddr)))
++		return 1;
++
++	init_ipaddr(&daddr, IPV4, &iph->daddr);
++	init_ipaddr(&saddr, IPV4, &iph->saddr);
++
++	if(iph->protocol == IPPROTO_IGMP) {
++		igmph = (struct igmphdr *) ((void *)iph + 4 * (int)iph->ihl);
++
++		switch(igmph->type) {
++		case IGMP_HOST_MEMBERSHIP_QUERY:
++			if (p->igmp_router_port) 
++				return 0;
++			igmph3 = (struct igmpv3_query *)igmph;
++			igmplen = ntohs((int)iph->tot_len) - 4 * (int)iph->ihl; 
++			if(igmplen == 8) {
++				ver = igmph->code == 0 ? 1 : 2;
++			}
++			else if(igmplen > 8 && igmplen < 12)
++				return 1;	/* Do not handle malformed IGMP query packet */
++			init_ipaddr(&gaddr, IPV4, &igmph->group);
++			return br_forward_query(p, &gaddr, ver);
++		case IGMP_HOST_MEMBERSHIP_REPORT:
++		case IGMPV2_HOST_MEMBERSHIP_REPORT:
++		case IGMPV3_HOST_MEMBERSHIP_REPORT:
++		case IGMP_HOST_LEAVE_MESSAGE:
++			return 1;	/* Allow control packets */
++		default:
++			break;
++		}
++
++		return ret;
++	}
++
++
++	return br_snoop_multicast_data(p, &daddr, &saddr);
++}
++
++int br_selective_flood(struct net_bridge_port *p, struct sk_buff *skb)
++{
++	if (skb->protocol == htons(ETH_P_IP)) {
++		if (bridge_igmp_snooping)
++			return br_selective_flood4(p, skb);
++		else
++			return 1;
++	} else if (skb->protocol == htons(ETH_P_IPV6)) {
++		if (bridge_mld_snooping)
++			return br_selective_flood6(p, skb);
++		else
++			return 1;
++	} else
++		return 1;
++}
+diff --git a/net/core/dev_ioctl.c b/net/core/dev_ioctl.c
+--- a/net/core/dev_ioctl.c
++++ b/net/core/dev_ioctl.c
+@@ -326,6 +326,11 @@ static int dev_ifsioc(struct net *net, s
+ 		    cmd == SIOCSMIIREG ||
+ 		    cmd == SIOCBRADDIF ||
+ 		    cmd == SIOCBRDELIF ||
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++                    cmd == SIOCBRADDMGREC ||
++                    cmd == SIOCBRDELMGREC ||
++                    cmd == SIOCBRSETROUTERPORT ||
++#endif
+ 		    cmd == SIOCSHWTSTAMP ||
+ 		    cmd == SIOCWANDEV) {
+ 			err = -EOPNOTSUPP;
+@@ -520,6 +525,11 @@ int dev_ioctl(struct net *net, unsigned 
+ 	case SIOCBONDCHANGEACTIVE:
+ 	case SIOCBRADDIF:
+ 	case SIOCBRDELIF:
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++        case SIOCBRADDMGREC:
++        case SIOCBRDELMGREC:
++        case SIOCBRSETROUTERPORT:
++#endif
+ 	case SIOCSHWTSTAMP:
+ 		if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
+ 			return -EPERM;

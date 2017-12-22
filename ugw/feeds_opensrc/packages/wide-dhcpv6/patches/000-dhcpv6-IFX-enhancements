@@ -1,0 +1,1025 @@
+diff -Nur wide-dhcpv6-20080615.org/Makefile.in wide-dhcpv6-20080615/Makefile.in
+--- wide-dhcpv6-20080615.org/Makefile.in	2007-03-21 15:22:58.000000000 +0530
++++ wide-dhcpv6-20080615/Makefile.in	2009-10-29 18:59:07.312129000 +0530
+@@ -36,11 +36,13 @@
+ user= @user@
+ group= @group@
+ 
+-CFLAGS=	@CFLAGS@ @DEFS@ -DSYSCONFDIR=\"${sysconfdir}\" \
++CFLAGS=	@CFLAGS@ @DEFS@ -DADDR_POOL_PREFIX_SUPPORT -DADDR_PREFIX_SUPPORT \
++	-DADDR_OVERRIDE_HOST_CONF -DUPDATE_PD_IN_RADVD \
++	-DSYSCONFDIR=\"${sysconfdir}\" \
+ 	-DLOCALDBDIR=\"${localdbdir}\"
+ LDFLAGS=@LDFLAGS@
+ LIBOBJS=@LIBOBJS@
+-LIBS=	@LIBS@ @LEXLIB@
++LIBS=	@LIBS@ @LEXLIB@ -lfl
+ CC=	@CC@
+ TARGET=	dhcp6c dhcp6s dhcp6relay dhcp6ctl
+ 
+diff -Nur wide-dhcpv6-20080615.org/addrconf.c wide-dhcpv6-20080615/addrconf.c
+--- wide-dhcpv6-20080615.org/addrconf.c	2008-06-15 13:18:40.000000000 +0530
++++ wide-dhcpv6-20080615/addrconf.c	2009-10-29 18:59:07.320130000 +0530
+@@ -169,9 +169,17 @@
+ 	sa->addr.pltime = addr->pltime;
+ 	sa->addr.vltime = addr->vltime;
+ 	sa->dhcpif = dhcpifp;
++
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	sa->addr.plen = addr->plen;
++	dprintf(LOG_DEBUG, FNAME, "%s an address %s/%d pltime=%lu, vltime=%lu",
++	        sacreate ? "create" : "update",
++	        in6addr2str(&addr->addr, 0), addr->plen, addr->pltime, addr->vltime);
++	#else	
+ 	dprintf(LOG_DEBUG, FNAME, "%s an address %s pltime=%lu, vltime=%lu",
+ 	    sacreate ? "create" : "update",
+ 	    in6addr2str(&addr->addr, 0), addr->pltime, addr->vltime);
++	#endif 
+ 
+ 	if (sa->addr.vltime != 0)
+ 		if (na_ifaddrconf(IFADDRCONF_ADD, sa) < 0)
+@@ -394,6 +402,11 @@
+ #endif
+ 	sin6.sin6_addr = addr->addr;
+ 
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	return (ifaddrconf(cmd, sa->dhcpif->ifname, &sin6, addr->plen,
++	    addr->pltime, addr->vltime));
++	#else
+ 	return (ifaddrconf(cmd, sa->dhcpif->ifname, &sin6, 128,
+ 	    addr->pltime, addr->vltime));
++	#endif 
+ }
+diff -Nur wide-dhcpv6-20080615.org/cfparse.y wide-dhcpv6-20080615/cfparse.y
+--- wide-dhcpv6-20080615.org/cfparse.y	2007-03-21 15:22:55.000000000 +0530
++++ wide-dhcpv6-20080615/cfparse.y	2009-10-29 18:59:07.344130000 +0530
+@@ -747,7 +747,8 @@
+ 	;
+ 
+ rangeparam:
+-		STRING TO STRING
++	 /* #ifdef ADDR_POOL_PREFIX_SUPPORT */  /* Added by Sundar */
++		STRING TO STRING SLASH NUMBER 
+ 		{
+ 			struct dhcp6_range range0, *range;		
+ 
+@@ -766,7 +767,42 @@
+ 			}
+ 			free($1);
+ 			free($3);
++			
++			range0.prefix_length = $5;	
++			
++			if ((range = malloc(sizeof(*range))) == NULL) {
++				yywarn("can't allocate memory");
++				return (-1);
++			}
++			*range = range0;
++
++			$$ = range;
++		}
++		
++	|	
++	/* #endif */
++		STRING TO STRING
++		{
++			struct dhcp6_range range0, *range;		
+ 
++			memset(&range0, 0, sizeof(range0));
++			if (inet_pton(AF_INET6, $1, &range0.min) != 1) {
++				yywarn("invalid IPv6 address: %s", $1);
++				free($1);
++				free($3);
++				return (-1);
++			}
++			if (inet_pton(AF_INET6, $3, &range0.max) != 1) {
++				yywarn("invalid IPv6 address: %s", $3);
++				free($1);
++				free($3);
++				return (-1);
++			}
++			free($1);
++			free($3);
++			
++			range0.prefix_length = 128;	
++			
+ 			if ((range = malloc(sizeof(*range))) == NULL) {
+ 				yywarn("can't allocate memory");
+ 				return (-1);
+@@ -778,6 +814,73 @@
+ 	;
+ 
+ addressparam:
++	/* #ifdef ADDR_PREFIX_SUPPORT */   /* Added by Sundar */
++		STRING SLASH NUMBER duration
++		{
++			struct dhcp6_prefix pconf0, *pconf;		
++
++			memset(&pconf0, 0, sizeof(pconf0));
++			if (inet_pton(AF_INET6, $1, &pconf0.addr) != 1) {
++				yywarn("invalid IPv6 address: %s", $1);
++				free($1);
++				return (-1);
++			}
++			free($1);
++			/* validate other parameters later */
++			
++			pconf0.plen = $3;
++
++			if ($4 < 0)
++				pconf0.pltime = DHCP6_DURATION_INFINITE;
++			else
++				pconf0.pltime = (u_int32_t)$4;
++
++			pconf0.vltime = pconf0.pltime;
++
++			if ((pconf = malloc(sizeof(*pconf))) == NULL) {
++				yywarn("can't allocate memory");
++				return (-1);
++			}
++			*pconf = pconf0;
++
++			$$ = pconf;
++		}
++		
++	|	STRING SLASH NUMBER duration duration
++		{
++			struct dhcp6_prefix pconf0, *pconf;		
++
++			memset(&pconf0, 0, sizeof(pconf0));
++			if (inet_pton(AF_INET6, $1, &pconf0.addr) != 1) {
++				yywarn("invalid IPv6 address: %s", $1);
++				free($1);
++				return (-1);
++			}
++			free($1);
++			/* validate other parameters later */
++
++			pconf0.plen = $3;
++
++			if ($4 < 0)
++				pconf0.pltime = DHCP6_DURATION_INFINITE;
++			else
++				pconf0.pltime = (u_int32_t)$4;
++			if ($5 < 0)
++				pconf0.vltime = DHCP6_DURATION_INFINITE;
++			else
++				pconf0.vltime = (u_int32_t)$5;
++
++			if ((pconf = malloc(sizeof(*pconf))) == NULL) {
++				yywarn("can't allocate memory");
++				return (-1);
++			}
++			*pconf = pconf0;
++
++			$$ = pconf;
++		}
++		
++	|	
++	/* #endif */
+ 		STRING duration
+ 		{
+ 			struct dhcp6_prefix pconf0, *pconf;		
+@@ -790,11 +893,14 @@
+ 			}
+ 			free($1);
+ 			/* validate other parameters later */
+-			pconf0.plen = 128; /* XXX this field is ignored */
++			
++			pconf0.plen = 128;  /* XXX this field is ignored */
++			
+ 			if ($2 < 0)
+ 				pconf0.pltime = DHCP6_DURATION_INFINITE;
+ 			else
+ 				pconf0.pltime = (u_int32_t)$2;
++
+ 			pconf0.vltime = pconf0.pltime;
+ 
+ 			if ((pconf = malloc(sizeof(*pconf))) == NULL) {
+@@ -805,6 +911,7 @@
+ 
+ 			$$ = pconf;
+ 		}
++		
+ 	|	STRING duration duration
+ 		{
+ 			struct dhcp6_prefix pconf0, *pconf;		
+@@ -817,7 +924,8 @@
+ 			}
+ 			free($1);
+ 			/* validate other parameters later */
+-			pconf0.plen = 128; /* XXX */
++
++			pconf0.plen = 128;  /* XXX */
+ 			if ($2 < 0)
+ 				pconf0.pltime = DHCP6_DURATION_INFINITE;
+ 			else
+diff -Nur wide-dhcpv6-20080615.org/common.c wide-dhcpv6-20080615/common.c
+--- wide-dhcpv6-20080615.org/common.c	2008-06-15 13:18:41.000000000 +0530
++++ wide-dhcpv6-20080615/common.c	2009-10-29 18:59:07.356136000 +0530
+@@ -273,6 +273,8 @@
+ 	lv->type = type;
+ 	TAILQ_INIT(&lv->sublist);
+ 
++	dprintf(LOG_DEBUG, FNAME, "*** type: %d *** \n", type);
++	
+ 	switch(type) {
+ 	case DHCP6_LISTVAL_NUM:
+ 		lv->val_num = *(int *)val;
+@@ -2057,10 +2059,18 @@
+ 			memcpy(&ia_addr.addr, &opt_ia_addr.dh6_ia_addr_addr,
+ 			    sizeof(ia_addr.addr));
+ 
++			#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++			ia_addr.plen = opt_ia_addr.dh6_ia_addr_prefix_len;
++			dprintf(LOG_DEBUG, FNAME, "  IA_NA address: "
++			        "%s/%d pltime=%lu vltime=%lu",
++					in6addr2str(&ia_addr.addr, 0), ia_addr.plen,
++					ia_addr.pltime, ia_addr.vltime);
++			#else
+ 			dprintf(LOG_DEBUG, FNAME, "  IA_NA address: "
+ 			    "%s pltime=%lu vltime=%lu",
+ 			    in6addr2str(&ia_addr.addr, 0),
+ 			    ia_addr.pltime, ia_addr.vltime);
++			#endif
+ 
+ 			if (dhcp6_find_listval(list,
+ 			    DHCP6_LISTVAL_STATEFULADDR6, &ia_addr, 0)) {
+@@ -2757,7 +2767,16 @@
+ 		    htonl(optval->val_statefuladdr6.pltime);
+ 		ia_addr.dh6_ia_addr_valid_time =
+ 		    htonl(optval->val_statefuladdr6.vltime);
++			
++		#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++		ia_addr.dh6_ia_addr_prefix_len = 
++			optval->val_statefuladdr6.plen;
++		memcpy(&ia_addr.dh6_ia_addr_addr, &optval->val_statefuladdr6.addr,
++			   sizeof(struct in6_addr));
++		#else
+ 		ia_addr.dh6_ia_addr_addr = optval->val_statefuladdr6.addr;
++		#endif
++
+ 		break;
+ 	case DHCP6_LISTVAL_STCODE:
+ 		stcodeopt.dh6_stcode_code = htons(optval->val_num16);
+diff -Nur wide-dhcpv6-20080615.org/config.c wide-dhcpv6-20080615/config.c
+--- wide-dhcpv6-20080615.org/config.c	2008-06-15 13:18:41.000000000 +0530
++++ wide-dhcpv6-20080615/config.c	2009-10-29 18:59:07.367132000 +0530
+@@ -1743,6 +1743,12 @@
+ 		dprintf(LOG_ERR, FNAME, "invalid prefix: %d", oprefix.plen);
+ 		return (-1);
+ 	}
++	
++	#ifdef ADDR_PREFIX_SUPPORT /* Added by Sundar */
++	if(type != DHCP6_LISTVAL_STATEFULADDR6) 
++	#endif
++	{
++	
+ 	/* clear trailing bits */
+ 	prefix6_mask(&oprefix.addr, oprefix.plen);
+ 	if (!IN6_ARE_ADDR_EQUAL(&prefix0->addr, &oprefix.addr)) {
+@@ -1752,7 +1758,7 @@
+ 		    name, in6addr2str(&oprefix.addr, 0), oprefix.plen);
+ 		/* ignore the error */
+ 	}
+-
++	}
+ 	/* avoid invalid prefix addresses */
+ 	if (IN6_IS_ADDR_MULTICAST(&oprefix.addr) ||
+ 	    IN6_IS_ADDR_LINKLOCAL(&oprefix.addr) ||
+@@ -1951,7 +1957,7 @@
+ 		}
+ 		if ((pool = create_pool(plp->name, range)) == NULL) {
+ 			dprintf(LOG_ERR, FNAME,
+-				"faled to craete pool '%s'", plp->name);
++				"failed to create pool '%s'", plp->name);
+ 			goto bad;
+ 		}
+ 		pool->next = pool_conflist0;
+@@ -2097,8 +2103,20 @@
+ 		return (NULL);
+ 	}
+ 
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	/* validate prefix length */
++	if((range->prefix_length < 0) || (range->prefix_length > 128)) {
++		dprintf(LOG_ERR, FNAME, "invalid prefix: %d", range->prefix_length);
++		return (NULL);
++	}
++	
++	dprintf(LOG_DEBUG, FNAME, "name=%s, range=%s->%s/%d", name,
++		    in6addr2str(&range->min, 0), in6addr2str(&range->max, 0), 
++		    range->prefix_length);
++	#else
+ 	dprintf(LOG_DEBUG, FNAME, "name=%s, range=%s->%s", name,
+ 		in6addr2str(&range->min, 0), in6addr2str(&range->max, 0));
++	#endif
+ 
+ 	if (in6_addr_cmp(&range->min, &range->max) > 0) {
+ 		dprintf(LOG_ERR, FNAME, "invalid address range %s->%s",
+@@ -2119,6 +2137,10 @@
+ 	pool->min = range->min;
+ 	pool->max = range->max;
+ 
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	pool->prefix_length = range->prefix_length;
++	#endif
++
+ 	return (pool);
+ }
+ 
+diff -Nur wide-dhcpv6-20080615.org/config.h wide-dhcpv6-20080615/config.h
+--- wide-dhcpv6-20080615.org/config.h	2008-06-15 13:18:41.000000000 +0530
++++ wide-dhcpv6-20080615/config.h	2009-10-29 18:59:07.371131000 +0530
+@@ -40,8 +40,11 @@
+ };
+ 
+ struct dhcp6_range {
+-	struct in6_addr min;
+-	struct in6_addr max;
++	struct    in6_addr min;
++	struct    in6_addr max;
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	u_int8_t  prefix_length;
++	#endif
+ };
+ 
+ struct pool_conf {
+@@ -51,6 +54,9 @@
+ 
+ 	struct in6_addr min;
+ 	struct in6_addr max;
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	u_int8_t  prefix_length;
++	#endif
+ };
+ 
+ /* per-interface information */
+diff -Nur wide-dhcpv6-20080615.org/configure wide-dhcpv6-20080615/configure
+--- wide-dhcpv6-20080615.org/configure	2008-06-15 13:18:41.000000000 +0530
++++ wide-dhcpv6-20080615/configure	2009-10-29 18:59:07.384138000 +0530
+@@ -2027,7 +2027,7 @@
+ GCC=`test $ac_compiler_gnu = yes && echo yes`
+ ac_test_CFLAGS=${CFLAGS+set}
+ ac_save_CFLAGS=$CFLAGS
+-CFLAGS="-g"
++CFLAGS=""
+ echo "$as_me:$LINENO: checking whether $CC accepts -g" >&5
+ echo $ECHO_N "checking whether $CC accepts -g... $ECHO_C" >&6
+ if test "${ac_cv_prog_cc_g+set}" = set; then
+@@ -2085,13 +2085,13 @@
+   CFLAGS=$ac_save_CFLAGS
+ elif test $ac_cv_prog_cc_g = yes; then
+   if test "$GCC" = yes; then
+-    CFLAGS="-g -O2"
++    CFLAGS="-Os"
+   else
+-    CFLAGS="-g"
++    CFLAGS=""
+   fi
+ else
+   if test "$GCC" = yes; then
+-    CFLAGS="-O2"
++    CFLAGS="-Os"
+   else
+     CFLAGS=
+   fi
+@@ -5061,6 +5061,7 @@
+   fi
+ fi
+ 
++ac_cv_func_setpgrp_void=yes
+ echo "$as_me:$LINENO: checking whether setpgrp takes no argument" >&5
+ echo $ECHO_N "checking whether setpgrp takes no argument... $ECHO_C" >&6
+ if test "${ac_cv_func_setpgrp_void+set}" = set; then
+diff -Nur wide-dhcpv6-20080615.org/configure.in wide-dhcpv6-20080615/configure.in
+--- wide-dhcpv6-20080615.org/configure.in	2008-06-15 13:18:41.000000000 +0530
++++ wide-dhcpv6-20080615/configure.in	2009-10-29 18:59:07.396128000 +0530
+@@ -152,10 +152,6 @@
+ 		 pred_func_id=no])
+ fi
+ case $pred_func_id in
+-	ansi)
+-		AC_DEFINE(HAVE_ANSI_FUNC)
+-		;;
+-	gcc)
+ 		AC_DEFINE(HAVE_GCC_FUNCTION)
+ 		;;
+ esac
+diff -Nur wide-dhcpv6-20080615.org/dhcp6.h wide-dhcpv6-20080615/dhcp6.h
+--- wide-dhcpv6-20080615.org/dhcp6.h	2007-03-21 15:22:53.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6.h	2009-10-29 18:59:07.404128000 +0530
+@@ -137,6 +137,10 @@
+ 	u_int32_t pltime;
+ 	u_int32_t vltime;
+ 	struct in6_addr addr;
++	
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	int plen;
++	#endif
+ };
+ 
+ /* Internal data structure */
+@@ -351,9 +355,12 @@
+ struct dhcp6opt_ia_addr {
+ 	u_int16_t dh6_ia_addr_type;
+ 	u_int16_t dh6_ia_addr_len;
+-	struct in6_addr dh6_ia_addr_addr;
+ 	u_int32_t dh6_ia_addr_preferred_time;
+ 	u_int32_t dh6_ia_addr_valid_time;
++	#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++	u_int8_t  dh6_ia_addr_prefix_len;
++	#endif
++	struct    in6_addr dh6_ia_addr_addr;
+ } __attribute__ ((__packed__));
+ 
+ /* IA_PD Prefix */
+diff -Nur wide-dhcpv6-20080615.org/dhcp6c.c wide-dhcpv6-20080615/dhcp6c.c
+--- wide-dhcpv6-20080615.org/dhcp6c.c	2008-06-15 13:18:41.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6c.c	2009-10-29 18:59:07.426133000 +0530
+@@ -258,13 +258,16 @@
+ 	struct addrinfo hints, *res;
+ 	static struct sockaddr_in6 sa6_allagent_storage;
+ 	int error, on = 1;
+-
++	unsigned char ipv6[INET6_ADDRSTRLEN];
++	
+ 	/* get our DUID */
+ 	if (get_duid(DUID_FILE, &client_duid)) {
+ 		dprintf(LOG_ERR, FNAME, "failed to get a DUID");
+ 		exit(1);
+ 	}
+ 
++	dprintf(LOG_NOTICE, FNAME, "*** initialize control message authentication... ***");
++	
+ 	if (dhcp6_ctl_authinit(ctlkeyfile, &ctlkey, &ctldigestlen) != 0) {
+ 		dprintf(LOG_NOTICE, FNAME,
+ 		    "failed initialize control message authentication");
+@@ -276,12 +279,23 @@
+ 	hints.ai_socktype = SOCK_DGRAM;
+ 	hints.ai_protocol = IPPROTO_UDP;
+ 	hints.ai_flags = AI_PASSIVE;
+-	error = getaddrinfo(NULL, DH6PORT_DOWNSTREAM, &hints, &res);
++
++	
++    error = getaddrinfo(NULL, DH6PORT_DOWNSTREAM, &hints, &res);
++
+ 	if (error) {
+ 		dprintf(LOG_ERR, FNAME, "getaddrinfo: %s",
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res->ai_family, res->ai_socktype, res->ai_protocol, res->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res->ai_addrlen,
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++
+ 	sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+ 	if (sock < 0) {
+ 		dprintf(LOG_ERR, FNAME, "socket");
+@@ -349,15 +363,26 @@
+ 	hints.ai_socktype = SOCK_DGRAM;
+ 	hints.ai_protocol = IPPROTO_UDP;
+ 	error = getaddrinfo(DH6ADDR_ALLAGENT, DH6PORT_UPSTREAM, &hints, &res);
++
+ 	if (error) {
+ 		dprintf(LOG_ERR, FNAME, "getaddrinfo: %s",
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res->ai_family, res->ai_socktype, res->ai_protocol, res->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res->ai_addrlen,
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++
+ 	memcpy(&sa6_allagent_storage, res->ai_addr, res->ai_addrlen);
+ 	sa6_allagent = (const struct sockaddr_in6 *)&sa6_allagent_storage;
+ 	freeaddrinfo(res);
+ 
++	dprintf(LOG_NOTICE, FNAME, "*** set up control socket ***");
++
+ 	/* set up control socket */
+ 	if (ctlkey == NULL)
+ 		dprintf(LOG_NOTICE, FNAME, "skip opening control port");
+@@ -1154,9 +1179,11 @@
+ 	struct dhcp6_optinfo optinfo;
+ 	ssize_t optlen, len;
+ 	struct dhcp6_eventdata *evd;
++	int idx;
+ 
+ 	ifp = ev->ifp;
+ 
++printf ("inside client6_send \n");
+ 	dh6 = (struct dhcp6 *)buf;
+ 	memset(dh6, 0, sizeof(*dh6));
+ 
+@@ -1347,6 +1374,25 @@
+ 	dst = *sa6_allagent;
+ 	dst.sin6_scope_id = ifp->linkid;
+ 
++printf ("inside client6_send before send %s and %d\n", buf, len);
++
++printf (" before sendto dst->fam %d , port %d , %d and %s \n", dst.sin6_family, dst.sin6_port, dst.sin6_flowinfo, dst.sin6_addr.s6_addr );
++
++	/* dump routine */
++	printf("\n*** Message dump *** msg len: %d \n", len);
++	idx = 0;
++	for(; idx < len; idx++)
++	{
++		//if(!(idx%2) && (idx%16))
++		//	printf(" ");
++		//else if(!(idx%16))
++		//	printf("\n%04x: ", idx);
++
++		printf("%.2X ", buf[idx]);
++		
++	}
++    printf("\n************************************\n");
++	
+ 	if (sendto(sock, buf, len, 0, (struct sockaddr *)&dst,
+ 	    sysdep_sa_len((struct sockaddr *)&dst)) == -1) {
+ 		dprintf(LOG_ERR, FNAME,
+@@ -1354,6 +1400,7 @@
+ 		goto end;
+ 	}
+ 
++printf ("after sendto \n");
+ 	dprintf(LOG_DEBUG, FNAME, "send %s to %s",
+ 	    dhcp6msgstr(dh6->dh6_msgtype), addr2str((struct sockaddr *)&dst));
+ 
+diff -Nur wide-dhcpv6-20080615.org/dhcp6c.conf wide-dhcpv6-20080615/dhcp6c.conf
+--- wide-dhcpv6-20080615.org/dhcp6c.conf	1970-01-01 05:30:00.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6c.conf	2009-10-29 18:59:07.430134000 +0530
+@@ -0,0 +1,21 @@
++# The followings are a sample configuration for requiring the "stateless"
++# DHCPv6 service.
++#interface ne0 {
++#	information-only;
++#};
++
++
++# The followings are a sample configuration to be delegated an IPv6 prefix
++# from an upstream service provider.  With this configuration dhcp6c will
++# send solicit messages containing an IA_PD option, with an IAID 0, on to
++# an upstream PPP link, ppp0.  After receiving some prefixes from a server,
++# dhcp6c will then configure derived IPv6 prefixes with the SLA ID 1 on a
++# local ethernet interface, ne0.  Note that the IAID for the id-assoc
++# statement is 0 according to the default.
++
++interface ppp0 {
++   send ia-na 1;
++   send ia-pd 0;
++   send domain-name-servers,domain-name;
++};
++
+diff -Nur wide-dhcpv6-20080615.org/dhcp6s.c wide-dhcpv6-20080615/dhcp6s.c
+--- wide-dhcpv6-20080615.org/dhcp6s.c	2008-06-15 13:21:57.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6s.c	2009-10-29 18:59:07.509136000 +0530
+@@ -366,7 +366,8 @@
+ 	static struct iovec iov;
+ 	static struct sockaddr_in6 sa6_any_downstream_storage;
+ 	static struct sockaddr_in6 sa6_any_relay_storage;
+-
++	unsigned char ipv6[INET6_ADDRSTRLEN];
++	
+ 	TAILQ_INIT(&dhcp6_binding_head);
+ 	if (lease_init() != 0) {
+ 		dprintf(LOG_ERR, FNAME, "failed to initialize the lease table");
+@@ -414,12 +415,26 @@
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++
++	memset(ipv6, 0, INET6_ADDRSTRLEN);
++	printf("*** AF_INET6: %d, SOCK_DGRAM: %d, IPPROTO_UDP: %d *** \n", 
++		   AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res->ai_family, res->ai_socktype, res->ai_protocol, res->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d port: %u *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res->ai_addrlen, 
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++
+ 	insock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+ 	if (insock < 0) {
+ 		dprintf(LOG_ERR, FNAME, "socket(insock): %s",
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++	
++	dprintf(LOG_DEBUG, FNAME, "*** insock (%d) created *** \n", insock);
++	
+ 	if (setsockopt(insock, SOL_SOCKET, SO_REUSEPORT, &on,
+ 		       sizeof(on)) < 0) {
+ 		dprintf(LOG_ERR, FNAME, "setsockopt(insock, SO_REUSEPORT): %s",
+@@ -440,6 +455,7 @@
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++	dprintf(LOG_DEBUG, FNAME, "*** setsockopt(IPV6_RECVPKTINFO) ***\n ");
+ #else
+ 	if (setsockopt(insock, IPPROTO_IPV6, IPV6_PKTINFO, &on,
+ 		       sizeof(on)) < 0) {
+@@ -448,6 +464,7 @@
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++	dprintf(LOG_DEBUG, FNAME, "*** setsockopt(IPV6_PKTINFO) ***\n ");
+ #endif
+ #ifdef IPV6_V6ONLY
+ 	if (setsockopt(insock, IPPROTO_IPV6, IPV6_V6ONLY,
+@@ -456,11 +473,13 @@
+ 		    "setsockopt(inbound, IPV6_V6ONLY): %s", strerror(errno));
+ 		exit(1);
+ 	}
++	dprintf(LOG_DEBUG, FNAME, "*** setsockopt(IPV6_V6ONLY) ***\n");
+ #endif
+ 	if (bind(insock, res->ai_addr, res->ai_addrlen) < 0) {
+ 		dprintf(LOG_ERR, FNAME, "bind(insock): %s", strerror(errno));
+ 		exit(1);
+ 	}
++	dprintf(LOG_DEBUG, FNAME, "*** bind(insock) ***\n");
+ 	freeaddrinfo(res);
+ 
+ 	hints.ai_flags = 0;
+@@ -470,6 +489,13 @@
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res2->ai_family, res2->ai_socktype, res2->ai_protocol, res2->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res2->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res2->ai_addrlen,
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++
+ 	memset(&mreq6, 0, sizeof(mreq6));
+ 	mreq6.ipv6mr_interface = ifidx;
+ 	memcpy(&mreq6.ipv6mr_multiaddr,
+@@ -482,6 +508,10 @@
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++	printf("*** address: %s *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res2->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN));
++	dprintf(LOG_DEBUG, FNAME, "*** setsockopt(insock, IPV6_JOIN_GROUP) *** \n");
+ 	freeaddrinfo(res2);
+ 
+ 	hints.ai_flags = 0;
+@@ -492,6 +522,13 @@
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res2->ai_family, res2->ai_socktype, res2->ai_protocol, res2->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res2->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res2->ai_addrlen,
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++
+ 	memset(&mreq6, 0, sizeof(mreq6));
+ 	mreq6.ipv6mr_interface = ifidx;
+ 	memcpy(&mreq6.ipv6mr_multiaddr,
+@@ -504,6 +541,10 @@
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++	printf("*** address: %s *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res2->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN));
++	dprintf(LOG_DEBUG, FNAME, "*** setsockopt(insock, IPV6_JOIN_GROUP) *** \n");
+ 	freeaddrinfo(res2);
+ 
+ 	hints.ai_flags = 0;
+@@ -513,12 +554,22 @@
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res->ai_family, res->ai_socktype, res->ai_protocol, res->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res->ai_addrlen,
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++
+ 	outsock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+ 	if (outsock < 0) {
+ 		dprintf(LOG_ERR, FNAME, "socket(outsock): %s",
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++
++	dprintf(LOG_DEBUG, FNAME, " *** socket(outsock): %d ***", outsock);
++	
+ 	/* set outgoing interface of multicast packets for DHCP reconfig */
+ 	if (setsockopt(outsock, IPPROTO_IPV6, IPV6_MULTICAST_IF,
+ 	    &ifidx, sizeof(ifidx)) < 0) {
+@@ -527,6 +578,8 @@
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++	dprintf(LOG_DEBUG, FNAME, "*** setsockopt(outsock, IPV6_MULTICAST_IF) *** \n");
++
+ #if !defined(__linux__) && !defined(__sun__)
+ 	/* make the socket write-only */
+ 	if (shutdown(outsock, 0)) {
+@@ -547,6 +600,13 @@
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res->ai_family, res->ai_socktype, res->ai_protocol, res->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res->ai_addrlen, 
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++
+ 	memcpy(&sa6_any_downstream_storage, res->ai_addr, res->ai_addrlen);
+ 	sa6_any_downstream =
+ 		(const struct sockaddr_in6*)&sa6_any_downstream_storage;
+@@ -562,6 +622,13 @@
+ 		    gai_strerror(error));
+ 		exit(1);
+ 	}
++	printf("Line: %d *** family: %d, socktype: %d, protocol: %d, flags: %d, ", 
++		   __LINE__, res->ai_family, res->ai_socktype, res->ai_protocol, res->ai_flags);
++	printf("(sockaddr) address: %s, address len: %d *** \n", inet_ntop(AF_INET6, 
++		   &(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr), 
++		   ipv6, INET6_ADDRSTRLEN), res->ai_addrlen,
++		   ((struct sockaddr_in6 *)res->ai_addr)->sin6_port);
++		   
+ 	memcpy(&sa6_any_relay_storage, res->ai_addr, res->ai_addrlen);
+ 	sa6_any_relay =
+ 		(const struct sockaddr_in6*)&sa6_any_relay_storage;
+@@ -602,6 +669,8 @@
+ 	fd_set r;
+ 	int maxsock;
+ 
++		FD_ZERO(&r);                                                            
++        FD_SET(insock, &r); 
+ 	
+ 	while (1) {
+ 		if (sig_flags)
+@@ -609,16 +678,22 @@
+ 
+ 		w = dhcp6_check_timer();
+ 
++		if (w == NULL)
++			printf ("dhcp6_check_timer is NULL\n");
++
+ 		FD_ZERO(&r);
+ 		FD_SET(insock, &r);
+ 		maxsock = insock;
++
+ 		if (ctlsock >= 0) {
+ 			FD_SET(ctlsock, &r);
+ 			maxsock = (insock > ctlsock) ? insock : ctlsock;
+ 			(void)dhcp6_ctl_setreadfds(&r, &maxsock);
+ 		}
+ 
+-		ret = select(maxsock + 1, &r, NULL, NULL, w);
++		printf ("before select \n");
++		ret = select((maxsock + 1), &r,0,0, w);
++		printf ("after  select %d is ret\n");
+ 		switch (ret) {
+ 		case -1:
+ 			if (errno != EINTR) {
+@@ -633,8 +708,11 @@
+ 			break;
+ 		}
+ 
+-		if (FD_ISSET(insock, &r))
++		dprintf(LOG_DEBUG, FNAME, "*** check for messages *** \n");
++		if (FD_ISSET(insock, &r)) {
++			dprintf(LOG_NOTICE, FNAME, "*** received msg on socket ***\n");
+ 			server6_recv(insock);
++		}
+ 		if (ctlsock >= 0) {
+ 			if (FD_ISSET(ctlsock, &r)) {
+ 				(void)dhcp6_ctl_acceptcommand(ctlsock,
+@@ -1374,6 +1452,16 @@
+ 			goto fail;
+ 		}
+ 
++	#ifdef ADDR_OVERRIDE_HOST_CONF /* Added by Sundar */
++		if((!client_conf->pool.name) && (ifp->pool.name)) {
++			dprintf(LOG_DEBUG, FNAME, "Add pool name %s to client_conf", 
++				    ifp->pool.name);
++			client_conf->pool.name = strdup(ifp->pool.name);
++			client_conf->pool.pltime = ifp->pool.pltime;
++			client_conf->pool.vltime = ifp->pool.vltime;
++		}
++	#endif
++
+ 		for (iana = TAILQ_FIRST(&optinfo->iana_list); iana;
+ 		    iana = TAILQ_NEXT(iana, link)) {
+ 			/*
+@@ -2858,6 +2946,8 @@
+ 	struct dhcp6_ia ia;
+ 	int found = 0;
+ 
++	dprintf(LOG_DEBUG, FNAME, "called");
++
+ 	/*
+ 	 * If we happen to have a binding already, update the binding and
+ 	 * return it.  Perhaps the request is being retransmitted.
+@@ -2903,6 +2993,9 @@
+ 	if (TAILQ_EMPTY(conflist)) {
+ 		if (spec->type != DHCP6_LISTVAL_IANA ||
+ 			client_conf->pool.name == NULL) {
++			dprintf(LOG_DEBUG, FNAME, "(return 0) \
++			        spec->type: %d client_conf->pool.name: %s", 
++				    spec->type,  client_conf->pool.name);
+ 			return (0);
+ 		}
+ 	}
+@@ -2923,6 +3016,7 @@
+ 		}
+ 	}
+ 	if (found == 0) {
++		dprintf(LOG_DEBUG, FNAME, "found == 0");
+ 		if (!TAILQ_EMPTY(conflist)) {
+ 			struct dhcp6_listval *v;
+ 
+@@ -2934,6 +3028,7 @@
+ 					break;
+ 			}
+ 			if (v && dhcp6_add_listval(&ialist, v->type, &v->uv, NULL)) {
++				dprintf(LOG_DEBUG, FNAME, "v->type: %d added in the list", v->type);
+ 				found = 1;
+ 				TAILQ_REMOVE(conflist, v, link);
+ 				dhcp6_clear_listval(v);
+@@ -2964,10 +3059,13 @@
+ 			if (dhcp6_add_listval(retlist, spec->type,
+ 			    &ia, &ialist) == NULL)
+ 				found = 0;
++			dprintf(LOG_DEBUG, FNAME, "found=1, spec->type: %d added in the list", spec->type);
+ 		}
+ 		dhcp6_clear_list(&ialist);
+ 	}
+ 
++	dprintf(LOG_DEBUG, FNAME, "returns (found=%d)", found);
++	
+ 	return (found);
+ }
+ 
+@@ -2979,6 +3077,8 @@
+ 	struct dhcp6_listval *match;
+ 	int matched = 0;
+ 
++	dprintf(LOG_DEBUG, FNAME, "called");
++
+ 	/* do we have the exact value specified? */
+ 	match = dhcp6_find_listval(conflist, spec->type, &spec->uv, 0);
+ 
+@@ -3013,6 +3113,8 @@
+ 		}
+ 	}
+ 
++	dprintf(LOG_DEBUG, FNAME, "returns (match=%d)", match);
++
+ 	return (matched);
+ }
+ 
+@@ -3024,6 +3126,7 @@
+ 	struct dhcp6_list *retlist;
+ {
+ 	struct dhcp6_statefuladdr saddr;
++
+ 	struct pool_conf *pool;
+ 	int found = 0;
+ 
+@@ -3049,6 +3152,10 @@
+ 		saddr.pltime = poolspec->pltime;
+ 		saddr.vltime = poolspec->vltime;
+ 
++		#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
++		saddr.plen = pool->prefix_length;
++		#endif
++
+ 		if (!dhcp6_add_listval(retlist, DHCP6_LISTVAL_STATEFULADDR6,
+ 			&saddr, NULL)) {
+ 			return (0);
+diff -Nur wide-dhcpv6-20080615.org/dhcp6s.conf wide-dhcpv6-20080615/dhcp6s.conf
+--- wide-dhcpv6-20080615.org/dhcp6s.conf	1970-01-01 05:30:00.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6s.conf	2009-10-29 18:59:07.513132000 +0530
+@@ -0,0 +1,25 @@
++# The followings are a sample configuration to provide a DNS server address
++# for every client as well as to delegate a permanent IPv6 prefix
++# 2001:db8:1111::/48 to a client whose DUID is 00:01:00:01:aa:bb.
++
++option domain-name-servers 2001:db8::35;
++
++host kame {
++	duid 00:01:00:01:aa:bb;
++	prefix 2001:db8:1111::/48 infinity;
++};
++
++# The followings are a sample configuration to provide an IPv6 address
++# from an address pool 2001:db8:1:2::1000-2000 for 3600[s].
++# Note. You have to send an RA to fxp0; otherwise a client cannot be sure 
++# about the prefix-length and the default router.  If you want to prevent
++# stateless address configuration via RA, please set the autonomous-flag to
++# OFF in your RA configuration.
++
++interface fxp0 {
++	address-pool pool1 3600;
++};
++
++pool pool1 {
++	range 2001:db8:1:2::1000 to 2001:db8:1:2::2000;
++};
+diff -Nur wide-dhcpv6-20080615.org/dhcp6s.conf.sample wide-dhcpv6-20080615/dhcp6s.conf.sample
+--- wide-dhcpv6-20080615.org/dhcp6s.conf.sample	2007-03-21 15:22:56.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6s.conf.sample	2009-10-29 18:59:07.521130000 +0530
+@@ -21,5 +21,5 @@
+ };
+ 
+ pool pool1 {
+-	range 2001:db8:1:2::1000 to 2001:db8:1:2::2000 ;
++	range 2001:db8:1:2::1000 to 2001:db8:1:2::2000;
+ };
+Binary files test/wide-dhcpv6-20080615.org/libfl.a and updated_dhcpv6_03March/wide-dhcpv6-20080615/libfl.a differ
+diff -Nur test/wide-dhcpv6-20080615.org/prefixconf.c updated_dhcpv6_03March/wide-dhcpv6-20080615/prefixconf.c
+--- wide-dhcpv6-20080615.org/prefixconf.c	2007-03-21 15:22:55.000000000 +0530
++++ wide-dhcpv6-20080615/prefixconf.c	2009-10-30 11:42:55.204325000 +0530
+@@ -53,6 +53,11 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
++#if 1 /* Added by Sundar */
++#include <sys/stat.h>
++#include <fcntl.h>
++#endif
++
+ #include "dhcp6.h"
+ #include "config.h"
+ #include "common.h"
+@@ -118,6 +123,39 @@
+ extern struct dhcp6_timer *client6_timo __P((void *));
+ static int pd_ifaddrconf __P((ifaddrconf_cmd_t, struct dhcp6_ifprefix *ifpfx));
+ 
++#ifdef UPDATE_PD_IN_RADVD /* Added by Sundar */
++static int 
++update_radvd_conf(pinfo, pif)
++	struct dhcp6_prefix  *pinfo;
++	struct prefix_ifconf *pif;
++{
++	int fd;
++	char buf[100];
++
++	if((fd = open("/var/radvd.conf", O_RDWR|O_CREAT)) == -1) {
++		dprintf(LOG_NOTICE, FNAME, "couldn't create/open file \"radvd.conf\"");
++		return -1;
++	}
++
++	if(lseek(fd, 0, SEEK_END) == -1) {
++		dprintf(LOG_NOTICE, FNAME, "error moving to EOF in radvd.conf");
++		return -1;
++	}
++
++	memset(buf, 0, 100);
++	sprintf(buf, "\ninterface %s {\n\tprefix %s/%d\n}\n", pif->ifname, 
++		    in6addr2str(&pinfo->addr, 0), pinfo->plen);
++			
++	if(write(fd, buf, strlen(buf)) == -1) {
++		dprintf(LOG_NOTICE, FNAME, "error writing prefix in radvd.conf");
++	}
++
++	close(fd);
++
++	return 0;
++}
++#endif 
++
+ int
+ update_prefix(ia, pinfo, pifc, dhcpifp, ctlp, callback)
+ 	struct ia *ia;
+@@ -216,6 +254,7 @@
+ 			}
+ 
+ 			add_ifprefix(sp, pinfo, pif);
++			
+ 		}
+ 	}
+ 
+@@ -488,6 +527,12 @@
+ 	if (pd_ifaddrconf(IFADDRCONF_ADD, ifpfx))
+ 		goto bad;
+ 
++#ifdef UPDATE_PD_IN_RADVD /* Added by Sundar */
++	dprintf(LOG_DEBUG, FNAME, "Adding prefix %s/%d in radvd.conf",
++			in6addr2str(&prefix->addr, 0), prefix->plen);
++	update_radvd_conf(prefix, pconf);
++#endif
++
+ 	/* TODO: send a control message for other processes */
+ 
+ 	TAILQ_INSERT_TAIL(&siteprefix->ifprefix_list, ifpfx, plink);

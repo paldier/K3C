@@ -1,0 +1,568 @@
+From 7650a37f02deef2ce5911725cdc751176dfab54b Mon Sep 17 00:00:00 2001
+From: chandrap <prakash1.chandra@intel.com>
+Date: Thu, 20 Aug 2015 16:01:56 -0700
+Subject: [PATCH 147/441] added functionality for ATOM_INTC interrupt
+ conteoller in Netss driver
+
+---
+ arch/x86/NetIP_SubSystem/Makefile               |   1 +
+ arch/x86/NetIP_SubSystem/avalanche_intc.c       | 177 ++++++++++++++++++++++++
+ arch/x86/NetIP_SubSystem/avalanche_intc.h       | 172 +++++++++++++++++++++++
+ arch/x86/NetIP_SubSystem/netip_subsystem_defs.h |  11 +-
+ arch/x86/NetIP_SubSystem/netip_subsystem_lld.c  | 108 +++++++--------
+ 5 files changed, 414 insertions(+), 55 deletions(-)
+ create mode 100644 arch/x86/NetIP_SubSystem/avalanche_intc.c
+ create mode 100644 arch/x86/NetIP_SubSystem/avalanche_intc.h
+
+--- a/arch/x86/NetIP_SubSystem/Makefile
++++ b/arch/x86/NetIP_SubSystem/Makefile
+@@ -20,3 +20,4 @@ ccflags-y += -DPUMA7_PRE_SILICON
+ obj-$(CONFIG_NET_SUBSYSTEM) := netip_subsystem.o
+ netip_subsystem-objs += netip_subsystem_lld.o
+ netip_subsystem-objs += netip_subsystem_pm.o
++netip_subsystem-objs += avalanche_intc.o
+--- /dev/null
++++ b/arch/x86/NetIP_SubSystem/avalanche_intc.c
+@@ -0,0 +1,177 @@
++/*
++ *
++ * avalanche_intd.h 
++ * Description:
++ * interrupt distributor header file
++ *
++ *
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or 
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2008-2015 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify 
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but 
++  WITHOUT ANY WARRANTY; without even the implied warranty of 
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License 
++  along with this program; if not, write to the Free Software 
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution 
++  in the file called LICENSE.GPL.
++
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++  BSD LICENSE 
++
++  Copyright(c) 2008-2015 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without 
++  modification, are permitted provided that the following conditions 
++  are met:
++
++    * Redistributions of source code must retain the above copyright 
++      notice, this list of conditions and the following disclaimer.
++
++    * Redistributions in binary form must reproduce the above copyright 
++      notice, this list of conditions and the following disclaimer in 
++      the documentation and/or other materials provided with the 
++      distribution.
++
++    * Neither the name of Intel Corporation nor the names of its 
++      contributors may be used to endorse or promote products derived 
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++
++/****************/
++/**  Includes  **/
++/****************/
++#include <linux/kernel.h>
++#include <asm/io.h>
++#include <linux/netip_subsystem.h>
++#include "netip_subsystem_defs.h"
++#include "avalanche_intc.h"
++
++/***************/
++/**  Defines  **/
++/***************/
++
++#define ATOM_INTC_BASE 0xF00E0000 
++
++/***************/
++/**  Globals  **/
++/***************/
++
++/* AVALANCHE_INTC_BASE  IOPHYTOVIRT(0xF00E0000) */
++void*  AVALANCHE_INTC_BASE = NULL;  
++struct avalanche_ictrl_regs  *avalanche_hw0_icregs;
++extern net_ip_mmios_t net_ip_mmios;
++
++/*****************************************************************************
++ * Utility Functions
++ ****************************************************************************/
++inline unsigned char  get_bit_position ( unsigned int irq )
++{
++    return((unsigned char)( irq % NUM_INTS_PER_REG ));
++}
++
++inline unsigned char  get_reg_index( unsigned int irq )
++{
++    return((unsigned char )( irq / NUM_INTS_PER_REG ));
++}
++
++
++/********************************/
++/**  functions Implementation  **/
++/********************************/
++int avalanche_intc_clear_status( unsigned int irq )
++{
++    unsigned char irq_index, irq_bit;
++    unsigned int status_reg;
++    irq_index =  get_reg_index(irq);
++    irq_bit = get_bit_position(irq);
++
++    /* Got ARM11 interrupt status regsiter */
++    /* ARM11 big endian to CPU native endianness */
++    status_reg = be32_to_cpu(__raw_readl(avalanche_hw0_icregs->icestar[irq_index]));
++    if ( (status_reg & (1<<irq_bit)) == 0)
++    {
++        /* Requested interrupt is enabled */
++        status_reg =  (status_reg | (1<<irq_bit));
++        /* write value back to controller register */
++        __raw_writel( avalanche_hw0_icregs->icestar[irq_index], cpu_to_be32(status_reg));
++    }
++
++    /* else need not to do anything */
++    return(1);
++}
++int avalanche_intc_get_status( unsigned int irq )
++{
++    unsigned char irq_index, irq_bit;
++    unsigned int status_reg;
++    irq_index =  get_reg_index(irq);
++    irq_bit = get_bit_position(irq);
++
++    /* ARM11 big endian to CPU native endianness */
++    /* got ARM11 interrupt status regsiter */
++    status_reg = be32_to_cpu(__raw_readl(avalanche_hw0_icregs->icestar[irq_index]));
++    if ( (status_reg & (1<<irq_bit)) == 0)
++    {
++        /* Requested interrupt is enable */
++        return(1);
++    }
++    return (0);
++}
++
++int avalanche_intc_init(void)
++{
++
++    unsigned int cntrl_ver;
++    /* ioremap ATM_INTC IO memory */
++    AVALANCHE_INTC_BASE = ioremap_nocache( (net_ip_mmios.region1_base + (ATOM_INTC_BASE & 0x0FFFFFFF)), sizeof(struct avalanche_ictrl_regs));
++    if(!AVALANCHE_INTC_BASE)
++    {
++         printk(" ATOM_INTC_BASE memory map fail : %x\n",ATOM_INTC_BASE );
++         return -1;
++    }
++    /*setting up ATOM_INTC base address */
++    avalanche_hw0_icregs =   (struct avalanche_ictrl_regs *)AVALANCHE_INTC_BASE;
++    
++    /* read ATOM_INTC revision register */
++    cntrl_ver = *(volatile unsigned int*)(AVALANCHE_INTC_BASE);
++    /**ARM11 big endian to CPU  read register and call the corresponding value */
++    cntrl_ver = be32_to_cpu(__raw_readl(cntrl_ver));
++    printk("ATOM_INTC Interrupt controller revision : %x\n", cntrl_ver);
++
++}
++
++void avalanche_intc_cleanup(void)
++{
++    iounmap(AVALANCHE_INTC_BASE);
++}
++
+--- /dev/null
++++ b/arch/x86/NetIP_SubSystem/avalanche_intc.h
+@@ -0,0 +1,172 @@
++/*
++ *
++ * avalanche_intd.h 
++ * Description:
++ * interrupt distributor header file
++ *
++ *
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or 
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2008-2015 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify 
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but 
++  WITHOUT ANY WARRANTY; without even the implied warranty of 
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License 
++  along with this program; if not, write to the Free Software 
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution 
++  in the file called LICENSE.GPL.
++
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++  BSD LICENSE 
++
++  Copyright(c) 2008-2015 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without 
++  modification, are permitted provided that the following conditions 
++  are met:
++
++    * Redistributions of source code must retain the above copyright 
++      notice, this list of conditions and the following disclaimer.
++
++    * Redistributions in binary form must reproduce the above copyright 
++      notice, this list of conditions and the following disclaimer in 
++      the documentation and/or other materials provided with the 
++      distribution.
++
++    * Neither the name of Intel Corporation nor the names of its 
++      contributors may be used to endorse or promote products derived 
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#ifndef _AVALANCHE_INTC_H
++#define _AVALANCHE_INTC_H
++
++#ifndef NUM_INTS_PER_REG
++#define NUM_INTS_PER_REG                    (32)
++#endif
++
++/* 
++ * Interrupt Distributor relies on the below structure for SoC related 
++ * information 
++ */
++
++
++/***************************************************************************/
++/* avalanche_intc 
++
++ ***************************************************************************/
++
++/****************************************************************************
++ * Avalanche interrupt controller register base 
++ ****************************************************************************/
++
++/* NOTE: Read "ICTRL" as 'interrupt Controller' */
++struct avalanche_ictrl_pacer_regs /* Avalanche Interrupt control pacer regs*/
++{
++    volatile unsigned long icpparamr; /* ICTRL Pacer Parameter Reg */
++    volatile unsigned long icpdecr;   /* ICTRL Pacing Decrement Reg */
++    volatile unsigned long icpmap;    /* ICTRL Pacer map Reg */
++    volatile unsigned long reserved;  /* unused Reg */
++};
++typedef struct avalanche_ictrl_pacer_regs ICTRL_PACER_REGS;
++
++struct avalanche_ictrl_regs /* Avalanche Interrupt control registers */
++{
++    volatile unsigned long icrevr;      /* ICTRL Revision Reg 0x00*/
++    volatile unsigned long iccntlr;     /* ICTRL Control Reg  0x04*/
++    volatile unsigned long unused1;     /* 0x08 */
++    volatile unsigned long ichcntlr;    /* ICTRL Host control Reg 0x0C */
++    volatile unsigned long icglber;     /* ICTRL Global Enable Reg 0x10 */
++    volatile unsigned long unused2[2];  /* 0x14  to 0x18*/
++    volatile unsigned long icglbnlr;    /* ICTRL Global Nesting Level Reg 0x1C */
++    volatile unsigned long icsisr;      /* ICTRL Status index Set Reg 0x20 */
++    volatile unsigned long icsicr;      /* ICTRL Status index Clear Reg 0x24 */
++    volatile unsigned long iceisr;      /* ICTRL enable index Set Reg 0x28*/
++    volatile unsigned long iceicr;      /* ICTRL enable  index Clear Reg 0x2C */
++    volatile unsigned long icgwer;      /* ICTRL Global Wakeup Enable Reg 0x30 */
++    volatile unsigned long ichinteisr;  /* ICTRL host interrupt enable index 
++                                           Set  Reg 0x34 */
++    volatile unsigned long ichinteicr;  /* ICTRL host interrupt enable index 
++                                           Clear Reg 0x38 */
++    volatile unsigned long unused4;     /* 0x3c */
++    volatile unsigned long icpprer;     /* ICTRL Pacer Prescale  Reg 0x40 */
++    volatile unsigned long unused5[3];  /* 0x44  to 0x4C */
++    volatile unsigned long icvbr;       /* ICTRL Vector Base Reg 0x50 */
++    volatile unsigned long icvszr;      /* ICTRL Vector Size Reg 0x54*/
++    volatile unsigned long icvnullr;    /* ICTRL Vector Null Reg 0x58 */
++    volatile unsigned long unused7[9];  /* 0x5c  to 0x7c */
++    volatile unsigned long icgpir;      /* ICTRL Global Priority Index Reg 0x80 */
++    volatile unsigned long icgpvr;      /* ICTRL Global Priority vector Reg0x84 */
++    volatile unsigned long unused17[2]; /* 0x88  to 0x8c */
++    volatile unsigned long icgsecinter; /* ICTRL Global security Interrupt 
++                                           Enable Reg 0x90 */
++    volatile unsigned long icsecpir;    /* ICTRL Secure prioritised Index Reg 0x94 */
++    volatile unsigned long unused19[26];/* 0x098  to 0x0FC */
++    ICTRL_PACER_REGS  icpacer [16];        /* ICTRL pacing Regs array 0x100 */
++    volatile unsigned long icrstar[32];    /* ICTRL Raw status  Reg 0x200 */
++    volatile unsigned long icestar[32];    /* ICTRL Enabled Status Reg 0x280 */
++    volatile unsigned long icenbsr[32];    /* ICTRL Enabler set Reg 0x300 */
++    volatile unsigned long icenbcr[32];    /* ICTRL Enabler Clear Reg 0x380*/
++    volatile unsigned long icchnlmpr[256]; /* ICTRL Channel Map Reg 0x400 */
++    volatile unsigned long ichmpr[64];     /* ICTRL Host Map Reg 0x800 */
++    volatile unsigned long ichintpir[256]; /* ICTRL Host Interrupt
++                                              Priotrized Index  Reg 0x900 */
++    volatile unsigned long icpolr[32];     /* ICTRL polarity Reg 0xD00 */
++    volatile unsigned long ictypr[32];     /* ICTRL type Reg 0xD80 */
++    volatile unsigned long icwuper[64];    /* ICTRL Wakeup Enable Reg 0xE00 */
++    volatile unsigned long icdbgsetr[64];  /* ICTRL Debug Set Reg 0xF00*/
++    volatile unsigned long icsecer[64];    /* ICTRL secure Enble Reg 0x1000 */
++    volatile unsigned long ichintnlr[256]; /* ICTRL Host Interrupt 
++                                              Nesting level Reg 0x1100 */
++    volatile unsigned long ichinter[8];    /* ICTRL Host Interrupt
++                                              Enable Reg 0x1500 */
++    volatile unsigned long unused45[184];  /* 0x1520  to 0x1800 */
++};
++
++/*****************************************************************************
++ * Status  Register Read/Clear APIs.
++ ****************************************************************************/
++/* Clear Interrupt Status Register bit for irq */
++int avalanche_intc_clear_status( unsigned int irq );
++/* Check Interrupt Status  Registerbit for irq */
++int avalanche_intc_get_status( unsigned int irq );
++
++/*****************************************************************************
++ *  General and Global Regsiters INIT APIs
++ ****************************************************************************/
++/* INTI controller memory map Registers */
++int avalanche_intc_init(void);
++void avalanche_intc_cleanup(void);
++
++
++#endif /* _AVALANCHE_INTD_H */
++
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
+@@ -41,6 +41,7 @@
+ #endif
+ 
+ #define NETSS_POWER_STATE_MASK (3)
++#define NETSS_MAX_ARM11_INTR 64
+ typedef enum netss_power_state 
+ {
+    NETIP_ACTIVE_ON_AC = 0,
+@@ -92,7 +93,7 @@ struct net_subsystem_drv_data {
+    void __iomem *bridge_reg_base; /* Mapped io bridge register base address mmio region2 of Net-IP  */
+    netss_subdevice_mmio_t subdev_mmios[NETSS_SUBDEVICE_MAX];
+    netss_subdev_irq_info_t irqs[NETSS_SUBDEVICE_MAX];
+-   netss_subdev_irq_info_t arm11_irqs[64];
++   netss_subdev_irq_info_t arm11_irqs[NETSS_MAX_ARM11_INTR];
+    struct pci_dev *dev;
+    struct mutex netss_lock;
+    struct task_struct * handshake_thread; /* Thread that exchange messages with netip during boot */
+@@ -101,6 +102,14 @@ struct net_subsystem_drv_data {
+     
+ }__attribute__((aligned(4)));
+ 
++typedef struct net_ip_mmios {
++    unsigned long region1_base;
++    unsigned long region1_size;
++    unsigned long region2_base;
++    unsigned long region2_size;
++}net_ip_mmios_t;
++
++
+ 
+ #endif
+ 
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
+@@ -39,6 +39,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/netip_subsystem.h>
+ #include "netip_subsystem_defs.h"
++#include "avalanche_intc.h"
+ 
+ /* Time out if we cannot get a MUTEX within half minute */
+ #define NET_SUBSYSTEM_IRQ_NAME "netip_subsystem_irq"
+@@ -56,20 +57,15 @@ static const struct pci_device_id net_su
+         { PCI_DEVICE( 0x8086, NET_SUBSYTEM_DEV_ID), .driver_data = 0 },
+         {0},
+ };
++
++net_ip_mmios_t net_ip_mmios;
++
+ MODULE_DEVICE_TABLE(pci, net_subsystem_pci_tbl);
+ /*This function creates boot handshake thread */
+ void netss_manage_netip_services(void);
+ 
+ void netss_stop_handshake_thread(void);
+ 
+-typedef struct net_ip_mmios {
+-   unsigned long region1_base;
+-   unsigned long region1_size;
+-   unsigned long region2_base;
+-   unsigned long region2_size;
+-}net_ip_mmios_t;
+-
+-net_ip_mmios_t net_ip_mmios;
+ struct net_subsystem_drv_data *pnetss_drv_data;
+ extern netss_sysfs_attributes_info_t g_netss_sysfs_attributes_info;
+ 
+@@ -77,13 +73,13 @@ void netss_subdev_register_irq(netss_sub
+ {
+     if(subdevice != NETSS_ARM11) 
+     {
+-       pnetss_drv_data->irqs[subdevice].func = irq_info->func;
+-       pnetss_drv_data->irqs[subdevice].args = irq_info->args;
++        pnetss_drv_data->irqs[subdevice].func = irq_info->func;
++        pnetss_drv_data->irqs[subdevice].args = irq_info->args;
+     }
+     else
+-    {
+-       pnetss_drv_data->arm11_irqs[arm11_int_id].func = irq_info->func;
+-       pnetss_drv_data->arm11_irqs[arm11_int_id].args = irq_info->args;
++    {   
++        pnetss_drv_data->arm11_irqs[arm11_int_id].func = irq_info->func;
++        pnetss_drv_data->arm11_irqs[arm11_int_id].args = irq_info->args;
+     }
+ }
+ 
+@@ -137,50 +133,52 @@ EXPORT_SYMBOL(netss_get_subdevice_mmio_i
+  */
+ static irqreturn_t net_subsystem_isr(int irq, void *dev_id)
+ {
+-   struct net_subsystem_drv_data *pnet_ss = (struct net_subsystem_drv_data *)dev_id;
+-   irqreturn_t ret = IRQ_NONE;
+-   int i;
+-   uint32_t volatile reg_val = 0;
+-   uint32_t ack_intr = 0;
+-   
+-   reg_val = __raw_readl(pnet_ss->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET);
++    struct net_subsystem_drv_data *pnet_ss = (struct net_subsystem_drv_data *)dev_id;
++    irqreturn_t ret = IRQ_NONE;
++    int i;
++    uint32_t volatile reg_val = 0;
++    uint32_t ack_intr = 0;
+ 
+-   NETSS_DBG_PRINT("Net IP ISR called\n");
+-   for(i=0; i<NETSS_SUBDEVICE_MAX; i++)
+-   {
+-      if((reg_val >> i) & 1)  {
+-         /*Prepare interrupt acknowledge mask */
+-         ack_intr |= (1 << i);
+-	 if(i != NETSS_ARM11) {
+-            if(pnet_ss->irqs[i].func != NULL) {
+-               NETSS_DBG_PRINT("Interrupt of subdevice %d\n", i);
+-               pnet_ss->irqs[i].func(irq, pnet_ss->irqs[i].args);
++    reg_val = __raw_readl(pnet_ss->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET);
++
++    NETSS_DBG_PRINT("Net IP ISR called\n");
++    for(i=0; i<NETSS_SUBDEVICE_MAX; i++)
++    {
++        if((reg_val >> i) & 1)  {
++            /*Prepare interrupt acknowledge mask */
++            ack_intr |= (1 << i);
++            if(i != NETSS_ARM11) {
++                if(pnet_ss->irqs[i].func != NULL) {
++                    NETSS_DBG_PRINT("Interrupt of subdevice %d\n", i);
++                    pnet_ss->irqs[i].func(irq, pnet_ss->irqs[i].args);
++                } else {
++                    NETSS_DBG_PRINT("No irq registered, ingoring interrupt of NetIP subdevice %d\n", i);
++                }
+             } else {
+-               NETSS_DBG_PRINT("No irq registered, ingoring interrupt of NetIP subdevice %d\n", i);
++                int j;
++                for( j = 0 ; j< NETSS_MAX_ARM11_INTR; j++) 
++                {
++                    if(avalanche_intc_get_status(j))
++                    {
++                        if(pnet_ss->arm11_irqs[j].func != NULL) 
++                        {
++                            pnet_ss->arm11_irqs[j].func(irq, pnet_ss->arm11_irqs[j].args);
++
++                        }
++                        avalanche_intc_clear_status(j);
++                    }
++
++                }
+             }
+-         } else {
+-               void __iomem *reg_ptr;
+-               reg_ptr = (void __iomem *)ioremap_nocache(net_ip_mmios.region1_base + 0x3C22040, 4);
+-               if(reg_ptr != NULL) { 
+-                  /**ARM11 is bundle of 64 interrupts, to find out the cause for the interrupt
+-                   * read those register and call the corresponding interrupt handler  */
+-                  reg_val = be32_to_cpu(__raw_readl(reg_ptr));
+-                  /*May need to read register, and call corresponding arm11_irq */
+-                  if(pnet_ss->arm11_irqs[0].func != NULL) {
+-                     pnet_ss->arm11_irqs[0].func(irq, pnet_ss->arm11_irqs[0].args);
+-                  }
+-                  iounmap(reg_ptr);
+-               }
+-         }
+-      }
+-   }
+-   /* Acknowledge the interrupts that are processed */
+-   if(ack_intr != 0) {
+-      __raw_writel(reg_val|ack_intr, pnet_ss->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET); 
+-   }
+-   
+-   ret = IRQ_HANDLED;
+-   return ret;
++        }
++    }
++    /* Acknowledge the interrupts that are processed */
++    if(ack_intr != 0) {
++        __raw_writel(reg_val|ack_intr, pnet_ss->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET); 
++    }
++
++    ret = IRQ_HANDLED;
++    return ret;
+ }
+ 
+ /* 
+@@ -284,6 +282,8 @@ static int netss_probe(struct pci_dev *p
+    netss_manage_netip_services();
+    printk(KERN_INFO "Intel(R) NET SUBSYSTEM driver built on %s @ %s\n", __DATE__, __TIME__);
+ 
++   /* initilize ATOM_INTC IO memory map */
++   avalanche_intc_init();
+    return 0;
+ 
+ free_iomem:

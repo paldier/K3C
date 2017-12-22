@@ -1,0 +1,603 @@
+From c748cc843d0cbf6a3f039ba0d082c8865c48ef01 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Mon, 1 Aug 2016 12:45:44 +0300
+Subject: [PATCH 06/69] hostapd get and free aid
+
+---
+ src/ap/ieee802_11.c                |  39 +++++++
+ src/ap/sta_info.c                  |  10 +-
+ src/common/ltq-vendor.h            |  41 +++++++
+ src/drivers/driver.h               |  24 ++++
+ src/drivers/driver_nl80211.c       | 225 ++++++++++++++-----------------------
+ src/drivers/driver_nl80211.h       |   4 -
+ src/drivers/driver_nl80211_event.c |  26 +++++
+ 7 files changed, 221 insertions(+), 148 deletions(-)
+ create mode 100644 src/common/ltq-vendor.h
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index eb1818e..280bfd8 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -1374,10 +1374,49 @@ static void handle_auth(struct hostapd_data *hapd,
+ 	}
+ }
+ 
++static void ap_sta_remove_in_other_bss_now(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	size_t i;
++
++	for (i = 0; i < iface->num_bss; i++) {
++		struct hostapd_data *bss = iface->bss[i];
++		struct sta_info *sta2;
++		/* bss should always be set during operation, but it may be
++		 * NULL during reconfiguration. Assume the STA is not
++		 * associated to another BSS in that case to avoid NULL pointer
++		 * dereferences. */
++		if (bss == hapd || bss == NULL)
++			continue;
++
++		sta2 = ap_get_sta(bss, sta->addr);
++		if (!sta2)
++			continue;
++
++		wpa_printf(MSG_DEBUG, "Removing station " MACSTR
++				   " with AID=%d from kernel driver.", MAC2STR(sta2->addr), sta2->aid);
++
++		if (hostapd_drv_sta_remove(bss, sta2->addr))
++			wpa_printf(MSG_DEBUG, "Could not remove station " MACSTR
++					   " from kernel driver.", MAC2STR(sta2->addr));
++
++		if (sta2->aid > 0) {
++			if (bss->driver->free_aid)
++				(*bss->driver->free_aid)(bss->drv_priv, &sta2->aid);
++		}
++		else
++			wpa_printf(MSG_DEBUG, "Can't remove AID, (AID=%d)", sta2->aid);
++	}
++}
+ 
+ int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ 	int i, j = 32, aid;
++	
++	if (hapd->driver->get_aid) {
++		ap_sta_remove_in_other_bss_now(hapd, sta);
++		return (*hapd->driver->get_aid)(hapd->drv_priv, &sta->aid, sta->addr);
++	}
+ 
+ 	/* get a unique AID */
+ 	if (sta->aid > 0) {
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index c99e79e..a39140f 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -179,9 +179,13 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	ap_sta_hash_del(hapd, sta);
+ 	ap_sta_list_del(hapd, sta);
+ 
+-	if (sta->aid > 0)
+-		hapd->sta_aid[(sta->aid - 1) / 32] &=
+-			~BIT((sta->aid - 1) % 32);
++	if (sta->aid > 0) {
++		if (hapd->driver->free_aid)
++			(*hapd->driver->free_aid)(hapd->drv_priv, &sta->aid);
++		else
++			hapd->sta_aid[(sta->aid - 1) / 32]
++				&= ~BIT((sta->aid - 1) % 32);
++	}
+ 
+ 	hapd->num_sta--;
+ 	if (sta->nonerp_set) {
+diff --git a/src/common/ltq-vendor.h b/src/common/ltq-vendor.h
+new file mode 100644
+index 0000000..c846bae
+--- /dev/null
++++ b/src/common/ltq-vendor.h
+@@ -0,0 +1,41 @@
++/*
++ * Lantiq OUI and vendor specific assignments
++ * Copyright (c) 2014, Lantiq
++ */
++
++#ifndef LTQ_VENDOR_H
++#define LTQ_VENDOR_H
++
++/*
++ * This file is a registry of identifier assignments from the Lantiq
++ * OUI AC:9A:96 for purposes other than MAC address assignment. New identifiers
++ * can be assigned through normal review process for changes to the upstream
++ * hostap.git repository.
++ */
++
++#define OUI_LTQ 0xAC9A96
++
++/**
++ * enum ltq_nl80211_vendor_subcmds - LTQ nl80211 vendor command identifiers
++ *
++ * @LTQ_NL80211_VENDOR_SUBCMD_UNSPEC: Reserved value 0
++ *
++ * @LTQ_NL80211_VENDOR_SUBCMD_GET_AID: Get AID request. 
++ *  
++ * @LTQ_NL80211_VENDOR_SUBCMD_FREE_AID: Free AID request. 
++ *  
++ * @LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL: Send EAPoL request.
++ */
++enum ltq_nl80211_vendor_subcmds {
++	LTQ_NL80211_VENDOR_SUBCMD_UNSPEC = 0,
++	LTQ_NL80211_VENDOR_SUBCMD_GET_AID = 1,
++	LTQ_NL80211_VENDOR_SUBCMD_FREE_AID = 2,
++	LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL = 3,
++};
++
++enum ltq_nl80211_vendor_events {
++	LTQ_NL80211_VENDOR_EVENT_RX_EAPOL = 0,
++};
++
++#endif /* LTQ_VENDOR_H */
++
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index d53aea7..5b31f93 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3262,6 +3262,30 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*status)(void *priv, char *buf, size_t buflen);
+ 
++  /**
++   * get_aid - Receive a new association ID for a station
++   * @priv: Private driver interface data
++   * @aid: Memory address for storing the received AID
++   * @addr: MAC address of the station
++   * Returns: 0 on success, -1 on failure
++   *
++   * This function is used to receive a new AID from the kernel driver,
++   * which may in turn ask it from the FW, and that from the HW.
++   * This AID is tied to SID and will need to be freed eventually.
++   */
++  int (*get_aid)(void *priv, u16 *aid, const u8 *addr);
++
++  /**
++   * free_aid - Release an association ID
++   * @priv: Private driver interface data
++   * @aid: AID to release
++   * Returns: 0 on success, -1 on failure
++   *
++   * This function is used to release an AID back to the kernel driver,
++   * which may release it to the FW, and that to the HW.
++   */
++  int (*free_aid)(void *priv, u16 *aid);
++
+ 	/**
+ 	 * roaming - Set roaming policy for driver-based BSS selection
+ 	 * @priv: Private driver interface data
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 716ccf4..d23a647 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -27,6 +27,7 @@
+ #include "eloop.h"
+ #include "common/qca-vendor.h"
+ #include "common/qca-vendor-attr.h"
++#include "common/ltq-vendor.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/ieee802_11_common.h"
+ #include "l2_packet/l2_packet.h"
+@@ -82,6 +83,10 @@ static void nl80211_handle_destroy(struct nl_handle *handle)
+ #endif /* CONFIG_LIBNL20 */
+ 
+ 
++static int nl80211_vendor_cmd(void *priv, unsigned int vendor_id,
++							  unsigned int subcmd, const u8 *data,
++							  size_t data_len, struct wpabuf *buf);
++
+ #ifdef ANDROID
+ /* system/core/libnl_2 does not include nl_socket_set_nonblocking() */
+ #undef nl_socket_set_nonblocking
+@@ -1578,65 +1583,6 @@ static void wpa_driver_nl80211_rfkill_unblocked(void *ctx)
+ }
+ 
+ 
+-static void wpa_driver_nl80211_handle_eapol_tx_status(int sock,
+-						      void *eloop_ctx,
+-						      void *handle)
+-{
+-	struct wpa_driver_nl80211_data *drv = eloop_ctx;
+-	u8 data[2048];
+-	struct msghdr msg;
+-	struct iovec entry;
+-	u8 control[512];
+-	struct cmsghdr *cmsg;
+-	int res, found_ee = 0, found_wifi = 0, acked = 0;
+-	union wpa_event_data event;
+-
+-	memset(&msg, 0, sizeof(msg));
+-	msg.msg_iov = &entry;
+-	msg.msg_iovlen = 1;
+-	entry.iov_base = data;
+-	entry.iov_len = sizeof(data);
+-	msg.msg_control = &control;
+-	msg.msg_controllen = sizeof(control);
+-
+-	res = recvmsg(sock, &msg, MSG_ERRQUEUE);
+-	/* if error or not fitting 802.3 header, return */
+-	if (res < 14)
+-		return;
+-
+-	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg))
+-	{
+-		if (cmsg->cmsg_level == SOL_SOCKET &&
+-		    cmsg->cmsg_type == SCM_WIFI_STATUS) {
+-			int *ack;
+-
+-			found_wifi = 1;
+-			ack = (void *)CMSG_DATA(cmsg);
+-			acked = *ack;
+-		}
+-
+-		if (cmsg->cmsg_level == SOL_PACKET &&
+-		    cmsg->cmsg_type == PACKET_TX_TIMESTAMP) {
+-			struct sock_extended_err *err =
+-				(struct sock_extended_err *)CMSG_DATA(cmsg);
+-
+-			if (err->ee_origin == SO_EE_ORIGIN_TXSTATUS)
+-				found_ee = 1;
+-		}
+-	}
+-
+-	if (!found_ee || !found_wifi)
+-		return;
+-
+-	memset(&event, 0, sizeof(event));
+-	event.eapol_tx_status.dst = data;
+-	event.eapol_tx_status.data = data + 14;
+-	event.eapol_tx_status.data_len = res - 14;
+-	event.eapol_tx_status.ack = acked;
+-	wpa_supplicant_event(drv->ctx, EVENT_EAPOL_TX_STATUS, &event);
+-}
+-
+-
+ static int nl80211_init_bss(struct i802_bss *bss)
+ {
+ 	bss->nl_cb = nl_cb_alloc(NL_CB_DEFAULT);
+@@ -1728,7 +1674,6 @@ static void * wpa_driver_nl80211_drv_init(void *ctx, const char *ifname,
+ 	drv->global = global_priv;
+ 	drv->ctx = ctx;
+ 	drv->hostapd = !!hostapd;
+-	drv->eapol_sock = -1;
+ 
+ 	/*
+ 	 * There is no driver capability flag for this, so assume it is
+@@ -1753,7 +1698,6 @@ static void * wpa_driver_nl80211_drv_init(void *ctx, const char *ifname,
+ 	os_strlcpy(bss->ifname, ifname, sizeof(bss->ifname));
+ 	drv->monitor_ifidx = -1;
+ 	drv->monitor_sock = -1;
+-	drv->eapol_tx_sock = -1;
+ 	drv->ap_scan_as_station = NL80211_IFTYPE_UNSPECIFIED;
+ 
+ 	if (nl80211_init_bss(bss))
+@@ -1762,26 +1706,11 @@ static void * wpa_driver_nl80211_drv_init(void *ctx, const char *ifname,
+ 	if (wpa_driver_nl80211_finish_drv_init(drv, set_addr, 1, driver_params))
+ 		goto failed;
+ 
+-	drv->eapol_tx_sock = socket(PF_PACKET, SOCK_DGRAM, 0);
+-	if (drv->eapol_tx_sock < 0)
+-		goto failed;
+-
+ 	if (drv->data_tx_status) {
+-		int enabled = 1;
+-
+-		if (setsockopt(drv->eapol_tx_sock, SOL_SOCKET, SO_WIFI_STATUS,
+-			       &enabled, sizeof(enabled)) < 0) {
+-			wpa_printf(MSG_DEBUG,
+-				"nl80211: wifi status sockopt failed\n");
+-			drv->data_tx_status = 0;
+-			if (!drv->use_monitor)
+-				drv->capa.flags &=
+-					~WPA_DRIVER_FLAGS_EAPOL_TX_STATUS;
+-		} else {
+-			eloop_register_read_sock(drv->eapol_tx_sock,
+-				wpa_driver_nl80211_handle_eapol_tx_status,
+-				drv, NULL);
+-		}
++		drv->data_tx_status = 0;
++		if (!drv->use_monitor)
++			drv->capa.flags &=
++				~WPA_DRIVER_FLAGS_EAPOL_TX_STATUS;
+ 	}
+ 
+ 	if (drv->global) {
+@@ -2420,10 +2349,6 @@ static void wpa_driver_nl80211_deinit(struct i802_bss *bss)
+ 		   bss->ifname, drv->disabled_11b_rates);
+ 
+ 	bss->in_deinit = 1;
+-	if (drv->data_tx_status)
+-		eloop_unregister_read_sock(drv->eapol_tx_sock);
+-	if (drv->eapol_tx_sock >= 0)
+-		close(drv->eapol_tx_sock);
+ 
+ 	if (bss->nl_preq)
+ 		wpa_driver_nl80211_probe_req_report(bss, 0);
+@@ -2453,11 +2378,6 @@ static void wpa_driver_nl80211_deinit(struct i802_bss *bss)
+ 	if (is_ap_interface(drv->nlmode))
+ 		wpa_driver_nl80211_del_beacon(drv);
+ 
+-	if (drv->eapol_sock >= 0) {
+-		eloop_unregister_read_sock(drv->eapol_sock);
+-		close(drv->eapol_sock);
+-	}
+-
+ 	if (drv->if_indices != drv->default_if_indices)
+ 		os_free(drv->if_indices);
+ 
+@@ -4422,30 +4342,34 @@ static void nl80211_teardown_ap(struct i802_bss *bss)
+ }
+ 
+ 
+-static int nl80211_send_eapol_data(struct i802_bss *bss,
+-				   const u8 *addr, const u8 *data,
+-				   size_t data_len)
++static int nl80211_send_eapol_data(void *priv,
++								   const u8 *addr, const u8 *own_addr,
++								   const u8 *data, size_t data_len)
+ {
+-	struct sockaddr_ll ll;
+ 	int ret;
++	struct l2_ethhdr *eth;
++	int eth_len = sizeof(struct l2_ethhdr) + data_len;
+ 
+-	if (bss->drv->eapol_tx_sock < 0) {
+-		wpa_printf(MSG_DEBUG, "nl80211: No socket to send EAPOL");
++	eth = os_zalloc(eth_len);
++	if (!eth)
++	{
++		wpa_printf(MSG_DEBUG, "nl80211: No memory to allocate EAPOL buffer");
+ 		return -1;
+ 	}
+ 
+-	os_memset(&ll, 0, sizeof(ll));
+-	ll.sll_family = AF_PACKET;
+-	ll.sll_ifindex = bss->ifindex;
+-	ll.sll_protocol = htons(ETH_P_PAE);
+-	ll.sll_halen = ETH_ALEN;
+-	os_memcpy(ll.sll_addr, addr, ETH_ALEN);
+-	ret = sendto(bss->drv->eapol_tx_sock, data, data_len, 0,
+-		     (struct sockaddr *) &ll, sizeof(ll));
++	os_memcpy(eth->h_dest, addr, ETH_ALEN);
++	os_memcpy(eth->h_source, own_addr, ETH_ALEN);
++	eth->h_proto = htons(ETH_P_PAE);
++	os_memcpy(eth + 1, data, data_len);
++	ret = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL,
++							 (const u8 *) eth, eth_len, NULL);
++
+ 	if (ret < 0)
+ 		wpa_printf(MSG_ERROR, "nl80211: EAPOL TX: %s",
+ 			   strerror(errno));
+ 
++	os_free(eth);
++
+ 	return ret;
+ }
+ 
+@@ -4465,7 +4389,7 @@ static int wpa_driver_nl80211_hapd_send_eapol(
+ 	int qos = flags & WPA_STA_WMM;
+ 
+ 	if (drv->device_ap_sme || !drv->use_monitor)
+-		return nl80211_send_eapol_data(bss, addr, data, data_len);
++		return nl80211_send_eapol_data(priv, addr, own_addr, data, data_len);
+ 
+ 	len = sizeof(*hdr) + (qos ? 2 : 0) + sizeof(rfc1042_header) + 2 +
+ 		data_len;
+@@ -5587,6 +5511,59 @@ static int i802_read_sta_data(struct i802_bss *bss,
+ }
+ 
+ 
++int nl80211_get_aid(void *priv, u16 *aid, const u8 *addr)
++{
++	int res = 0;
++	struct wpabuf *rsp_aid;
++	int aid_size = sizeof(u16);
++
++	rsp_aid = wpabuf_alloc(8); /* aid_size + NLA_HDRLEN + NLA_ALLIGN */
++	if (!rsp_aid) {
++		return -ENOBUFS;
++	}
++
++	if (*aid) {
++		wpa_printf(MSG_DEBUG, "Reusing old AID %hu", *aid);
++		return 0;
++	}
++
++	res = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_GET_AID,
++							 addr, ETH_ALEN, (struct wpabuf *) rsp_aid);
++	if (res) {
++		wpa_printf(MSG_ERROR, "nl80211: sending/receiving GET_AID failed: %i "
++			   "(%s)", res, strerror(-res));
++		*aid = 0;
++	} else {
++		memcpy(aid, rsp_aid->buf, aid_size);
++		wpa_printf(MSG_DEBUG, "Received a new AID %hu", *aid);
++	}
++
++	return res;
++}
++
++
++int nl80211_free_aid(void *priv, u16 *aid)
++{
++	int res = 0;
++
++	if (0 == *aid) {
++		return 0;
++	}
++
++	res = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_FREE_AID,
++							 (u8*) aid, sizeof(*aid), NULL);
++	if (res) {
++		wpa_printf(MSG_ERROR, "nl80211: sending FREE_AID failed: %i "
++				   "(%s)", res, strerror(-res));
++	} else {
++		wpa_printf(MSG_DEBUG, "AID %hu released", *aid);
++		*aid = 0;
++	}
++
++	return res;
++}
++
++
+ static int i802_set_tx_queue_params(void *priv, int queue, int aifs,
+ 				    int cw_min, int cw_max, int burst_time)
+ {
+@@ -5923,28 +5900,6 @@ static int i802_set_wds_sta(void *priv, const u8 *addr, int aid, int val,
+ 	}
+ }
+ 
+-
+-static void handle_eapol(int sock, void *eloop_ctx, void *sock_ctx)
+-{
+-	struct wpa_driver_nl80211_data *drv = eloop_ctx;
+-	struct sockaddr_ll lladdr;
+-	unsigned char buf[3000];
+-	int len;
+-	socklen_t fromlen = sizeof(lladdr);
+-
+-	len = recvfrom(sock, buf, sizeof(buf), 0,
+-		       (struct sockaddr *)&lladdr, &fromlen);
+-	if (len < 0) {
+-		wpa_printf(MSG_ERROR, "nl80211: EAPOL recv failed: %s",
+-			   strerror(errno));
+-		return;
+-	}
+-
+-	if (have_ifidx(drv, lladdr.sll_ifindex, IFIDX_ANY))
+-		drv_event_eapol_rx(drv->ctx, lladdr.sll_addr, buf, len);
+-}
+-
+-
+ static int i802_check_bridge(struct wpa_driver_nl80211_data *drv,
+ 			     struct i802_bss *bss,
+ 			     const char *brname, const char *ifname)
+@@ -6085,19 +6040,6 @@ static void *i802_init(struct hostapd_data *hapd,
+ 	}
+ #endif /* CONFIG_LIBNL3_ROUTE */
+ 
+-	drv->eapol_sock = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_PAE));
+-	if (drv->eapol_sock < 0) {
+-		wpa_printf(MSG_ERROR, "nl80211: socket(PF_PACKET, SOCK_DGRAM, ETH_P_PAE) failed: %s",
+-			   strerror(errno));
+-		goto failed;
+-	}
+-
+-	if (eloop_register_read_sock(drv->eapol_sock, handle_eapol, drv, NULL))
+-	{
+-		wpa_printf(MSG_INFO, "nl80211: Could not register read socket for eapol");
+-		goto failed;
+-	}
+-
+ 	if (linux_get_ifhwaddr(drv->global->ioctl_sock, bss->ifname,
+ 			       params->own_addr))
+ 		goto failed;
+@@ -7832,7 +7774,6 @@ static int wpa_driver_nl80211_status(void *priv, char *buf, size_t buflen)
+ 			  "monitor_ifidx=%d\n"
+ 			  "monitor_refcount=%d\n"
+ 			  "last_mgmt_freq=%u\n"
+-			  "eapol_tx_sock=%d\n"
+ 			  "%s%s%s%s%s%s%s%s%s%s%s%s%s",
+ 			  drv->phyname,
+ 			  MAC2STR(drv->perm_addr),
+@@ -7849,7 +7790,6 @@ static int wpa_driver_nl80211_status(void *priv, char *buf, size_t buflen)
+ 			  drv->monitor_ifidx,
+ 			  drv->monitor_refcount,
+ 			  drv->last_mgmt_freq,
+-			  drv->eapol_tx_sock,
+ 			  drv->ignore_if_down_event ?
+ 			  "ignore_if_down_event=1\n" : "",
+ 			  drv->scan_complete_events ?
+@@ -9397,6 +9337,8 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.hapd_init = i802_init,
+ 	.hapd_deinit = i802_deinit,
+ 	.set_wds_sta = i802_set_wds_sta,
++	.get_aid = nl80211_get_aid,
++	.free_aid = nl80211_free_aid,
+ 	.get_seqnum = i802_get_seqnum,
+ 	.flush = i802_flush,
+ 	.get_inact_sec = i802_get_inact_sec,
+@@ -9453,6 +9395,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ #endif /* !ANDROID_LIB_STUB */
+ #endif /* ANDROID */
+ 	.vendor_cmd = nl80211_vendor_cmd,
++	.vendor_cmd = nl80211_vendor_cmd,
+ 	.set_qos_map = nl80211_set_qos_map,
+ 	.set_wowlan = nl80211_set_wowlan,
+ 	.set_mac_addr = nl80211_set_mac_addr,
+diff --git a/src/drivers/driver_nl80211.h b/src/drivers/driver_nl80211.h
+index 283dfd9..1d1c7fc 100644
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -174,10 +174,6 @@ struct wpa_driver_nl80211_data {
+ 
+ 	struct i802_bss *first_bss;
+ 
+-	int eapol_tx_sock;
+-
+-	int eapol_sock; /* socket for EAPOL frames */
+-
+ 	struct nl_handle *rtnl_sk; /* nl_sock for NETLINK_ROUTE */
+ 
+ 	int default_if_indices[16];
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 762e3ac..4a5471e 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -15,8 +15,10 @@
+ #include "utils/eloop.h"
+ #include "common/qca-vendor.h"
+ #include "common/qca-vendor-attr.h"
++#include "common/ltq-vendor.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/ieee802_11_common.h"
++#include "l2_packet/l2_packet.h"
+ #include "driver_nl80211.h"
+ 
+ 
+@@ -1946,6 +1948,27 @@ static void nl80211_vendor_event_qca(struct wpa_driver_nl80211_data *drv,
+ 	}
+ }
+ 
++static void ltq_nl80211_handle_eapol(struct wpa_driver_nl80211_data *drv,
++										const u8 *data, size_t len)
++{
++       struct l2_ethhdr *eth = (struct l2_ethhdr *)data;
++       int ethhdr_len = sizeof(struct l2_ethhdr);
++
++       drv_event_eapol_rx(drv->ctx, eth->h_source, data + ethhdr_len, len - ethhdr_len);
++}
++
++static void nl80211_vendor_event_ltq(struct wpa_driver_nl80211_data *drv,
++										u32 subcmd, u8 *data, size_t len)
++{       
++	switch (subcmd) {
++       case LTQ_NL80211_VENDOR_EVENT_RX_EAPOL:
++			ltq_nl80211_handle_eapol(drv, data, len);
++			break;
++       default:
++			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported LTQ vendor event %u", subcmd);
++			break;
++	}
++}
+ 
+ static void nl80211_vendor_event(struct wpa_driver_nl80211_data *drv,
+ 				 struct nlattr **tb)
+@@ -1982,6 +2005,9 @@ static void nl80211_vendor_event(struct wpa_driver_nl80211_data *drv,
+ 	}
+ 
+ 	switch (vendor_id) {
++		case OUI_LTQ:
++		nl80211_vendor_event_ltq(drv, subcmd, data, len);
++		break;
+ 	case OUI_QCA:
+ 		nl80211_vendor_event_qca(drv, subcmd, data, len);
+ 		break;
+-- 
+1.8.3.4
+

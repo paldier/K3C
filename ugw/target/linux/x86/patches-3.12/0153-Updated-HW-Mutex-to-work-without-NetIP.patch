@@ -1,0 +1,1096 @@
+From 34281e34ca4aa38d033183104888abfc9ad5274f Mon Sep 17 00:00:00 2001
+From: Bryce Poole <Bryce.Poole@intel.com>
+Date: Thu, 27 Aug 2015 14:10:34 -0700
+Subject: [PATCH 153/441] Updated HW Mutex to work without NetIP
+
+ -Modified to allow the HW Mutex to start up without the NetIP being
+available.
+ -Added support for recursive locking.
+ -General cleanup to reflect the original style.
+ -Fixed a bug to only realease the irq if the driver isn't in POLLING
+mode.
+---
+ arch/x86/hw_mutex/hw_mutex_lld.c | 147 ++++++-----
+ arch/x86/hw_mutex/hw_mutex_lld.h |   2 +
+ include/linux/hw_mutex.h         |   5 +-
+ kernel/hwmutex.c                 | 526 ++++++++++++++++++++++-----------------
+ kernel/hwmutex.h                 |   4 +
+ 5 files changed, 389 insertions(+), 295 deletions(-)
+ mode change 100755 => 100644 arch/x86/hw_mutex/hw_mutex_lld.c
+ mode change 100755 => 100644 arch/x86/hw_mutex/hw_mutex_lld.h
+ mode change 100755 => 100644 include/linux/hw_mutex.h
+ mode change 100755 => 100644 kernel/hwmutex.c
+ mode change 100755 => 100644 kernel/hwmutex.h
+
+--- a/arch/x86/hw_mutex/hw_mutex_lld.c
++++ b/arch/x86/hw_mutex/hw_mutex_lld.c
+@@ -52,9 +52,9 @@ MODULE_DEVICE_TABLE(pci, hw_mutex_pci_tb
+ 
+ static inline struct hw_master*hw_mutex_to_master(struct hw_mutex *hmutex)
+ {
+-
+ 	return container_of(hmutex, struct hw_master, hw_mutexes[hmutex->lock_name]);
+ }
++
+ /* __hw_mutex_clear_interrupt_status
+  * Write 1 to clear the interrupts
+  */
+@@ -86,7 +86,6 @@ static inline uint8_t __hw_mutex_is_lock
+ 	return hw_mutex_read_and_test_bits(pmaster->reg_base + hw_mutex_owns[pmaster->master], BIT(hmutex->lock_name));
+ }
+ 
+-
+ /*
+   * __lock_hw_mutex - low level function to lock HW mutex
+   *
+@@ -99,10 +98,11 @@ static inline int __lock_hw_mutex(struct
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+ 	int retval = 0;
+-	if (!force){
++	if (!force) {
+ 		if (unlikely(__hw_mutex_is_waiting(hmutex))) return 0;
+ 		else if (unlikely(__hw_mutex_is_locked(hmutex))) return 1;
+ 	}
++
+ 	/* Make sure we're doing a new request */
+  	retval = hw_mutex_read_and_test_bits(pmaster->reg_base + hw_mutex_locks[pmaster->master] + (hmutex->lock_name<<2),HW_MUTEX_MTX_UNLOCK_BIT);
+ 
+@@ -110,6 +110,7 @@ static inline int __lock_hw_mutex(struct
+ 		atomic_set(&hmutex->status,HW_MUTEX_REQUESTING);
+ 	else 
+ 		atomic_set(&hmutex->status,HW_MUTEX_LOCKED);
++
+ 	return retval;
+ }
+ 
+@@ -119,33 +120,34 @@ static inline int __lock_hw_mutex(struct
+ static inline void __unlock_hw_mutex(struct hw_mutex *hmutex)
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
++
+ 	if (unlikely(!__hw_mutex_is_locked(hmutex))) return ;
+ 	hw_mutex_set_reg(pmaster->reg_base + hw_mutex_locks[pmaster->master] + (hmutex->lock_name<<2),HW_MUTEX_MTX_UNLOCK_BIT);
+ 	atomic_set(&hmutex->status,HW_MUTEX_UNLOCKED);
+-	return ;
+ }
++
+ /*
+  * hw_mutex_unlock_all - unlock all of the HW mutexes at start-up
+  */
+ static void hw_mutex_unlock_all(struct hw_master * pmaster)
+ {
+ 	int i = 0;
++
+ 	/* Initialize critical structures */
+ 	for (i = 0; i< HW_MUTEX_TOTAL; i++){
+ 		__unlock_hw_mutex(&pmaster->hw_mutexes[i]);
+ 	}
+-	return;
+ }
++
+ #ifdef TEST_HWMUTEX
+ void lock_hw_mutex_as_different_master(struct hw_mutex *hmutex)
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+ 	int retval = 0;
+ 	
+-        /* Make sure we're doing a new request */
++    /* Make sure we're doing a new request */
+  	retval = hw_mutex_read_and_test_bits(pmaster->reg_base + hw_mutex_locks[MASTER_ARM11] + (hmutex->lock_name<<2),HW_MUTEX_MTX_UNLOCK_BIT);
+-        printk("Lock as diff master %d\n", retval);
+-
++    printk("HW Mutex: Lock as diff master %d\n", retval);
+ }
+ 
+ /*
+@@ -154,23 +156,18 @@ void lock_hw_mutex_as_different_master(s
+ void unlock_hw_mutex_as_different_master(struct hw_mutex *hmutex)
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
++
+ 	hw_mutex_set_reg(pmaster->reg_base + hw_mutex_locks[MASTER_ARM11] + (hmutex->lock_name<<2),HW_MUTEX_MTX_UNLOCK_BIT);
+-	return ;
+ }
+ 
+ void dump_hw_mutex_registers(struct hw_mutex *hmutex)
+ {
+    struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+-   int i =0;
+-   {
+-      printk("HW Mutex STATUS reg %x\n", hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_STATUS));
+-      printk("INTR val %x\n", hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_INTR));
+-      printk("CFG val %x\n", hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_CFG));
+-      printk("ARM owns %x wailts %x\n", hw_mutex_read_reg(pmaster->reg_base + hw_mutex_owns[MASTER_ARM11]), hw_mutex_read_reg(pmaster->reg_base + hw_mutex_waits[MASTER_ARM11]));
+-      printk("Atom owns %x wailts %x\n", hw_mutex_read_reg(pmaster->reg_base + hw_mutex_owns[pmaster->master]), hw_mutex_read_reg(pmaster->reg_base + hw_mutex_waits[pmaster->master]));
+-   }
+-   
+-   return;
++   printk("HW Mutex: STATUS reg %x\n", hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_STATUS));
++   printk("HW Mutex: INTR val %x\n", hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_INTR));
++   printk("HW Mutex: CFG val %x\n", hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_CFG));
++   printk("HW Mutex: ARM owns %x waits %x\n", hw_mutex_read_reg(pmaster->reg_base + hw_mutex_owns[MASTER_ARM11]), hw_mutex_read_reg(pmaster->reg_base + hw_mutex_waits[MASTER_ARM11]));
++   printk("HW Mutex: Atom owns %x waits %x\n", hw_mutex_read_reg(pmaster->reg_base + hw_mutex_owns[pmaster->master]), hw_mutex_read_reg(pmaster->reg_base + hw_mutex_waits[pmaster->master]));
+ }
+ #endif
+ 
+@@ -180,7 +177,7 @@ void dump_hw_mutex_registers(struct hw_m
+  */
+ static void __set_hw_mutex(struct hw_master * pmaster,hw_mutex_mode_type mode)
+ {
+-	switch(mode){
++	switch(mode) {
+ 		case HW_MUTEX_POLLING:
+ 			hw_mutex_read_and_set_bits(pmaster->reg_base + HW_MUTEX_CFG,HW_MUTEX_CFG_IP_BIT);
+ 			break;
+@@ -195,10 +192,11 @@ static void __set_hw_mutex(struct hw_mas
+ 		default:
+ 			printk(KERN_ERR "error mutex working mode\n");
+ 	}
+-	pmaster->mode	= mode;
++	pmaster->mode = mode;
+ 	return;
+ }
+ #endif
++
+ static struct hw_mutex_operations hw_mutex_ops = {
+ 	.name			= "hw-mutex-ops",
+ 	.lock			= __lock_hw_mutex,
+@@ -211,7 +209,7 @@ static struct hw_mutex_operations hw_mut
+ #ifdef CONFIG_PM
+ int hw_mutex_device_suspend(struct device *dev)
+ {
+-	struct pci_dev *pdev = to_pci_dev(dev);
++	/* struct pci_dev *pdev = to_pci_dev(dev); */
+ 	int ret = 0;
+ 
+ 	return ret;
+@@ -219,7 +217,7 @@ int hw_mutex_device_suspend(struct devic
+ 
+ int hw_mutex_device_resume(struct device *dev)
+ {
+-	struct pci_dev *pdev = to_pci_dev(dev);
++	/* struct pci_dev *pdev = to_pci_dev(dev); */
+ 	int ret = 0;
+ 
+ 	/*pci device restore*/
+@@ -248,26 +246,29 @@ static int hw_mutex_probe(struct pci_dev
+ 
+ 	mem_iobase = pci_resource_start(pdev,0);
+ 	mem_iosize = pci_resource_len(pdev,0);
+-	printk(KERN_INFO "mem_iobase = 0x%x, mem_iosize = 0x%x\n",(unsigned int)mem_iobase,(unsigned int)mem_iosize);
++	printk(KERN_INFO "HW Mutex: mem_iobase = 0x%x, mem_iosize = 0x%x\n",(unsigned int)mem_iobase,(unsigned int)mem_iosize);
+ 	
+-	if (pci_request_regions(pdev, "hw-mutex")){
++	if (pci_request_regions(pdev, "hw-mutex")) {
+ 		dev_err(&pdev->dev, "Cannot obtain PCI resources\n");
+ 		ret = -EBUSY;
+ 		goto free_dev;
+ 	}
+ 
+ 	pmaster = kzalloc(sizeof(struct hw_master), GFP_KERNEL);
+-	if (!pmaster){
++	if (!pmaster) {
+ 		dev_err(&pdev->dev, "Cannot allocate memory\n");
+ 		ret = -ENOMEM;
+ 		goto free_resource;
+ 	}
++
+ 	/* Initialize critical structures */
+-	for (i = 0; i< HW_MUTEX_TOTAL; i++){
++	for (i = 0; i< HW_MUTEX_TOTAL; i++) {
+ 			pmaster->hw_mutexes[i].lock_name = i;
+ 			spin_lock_init(&pmaster->hw_mutexes[i].irq_lock);
+-			mutex_init(&pmaster->hw_mutexes[i].lock);
++			mutex_init(&pmaster->hw_mutexes[i].soft_lock);
++			mutex_init(&pmaster->hw_mutexes[i].data_mutex);
+ 			pmaster->hw_mutexes[i].owner = NULL;
++            pmaster->hw_mutexes[i].lock_count = 0;
+ 			atomic_set(&pmaster->hw_mutexes[i].status,HW_MUTEX_UNLOCKED);
+ 	}
+ 
+@@ -286,7 +287,7 @@ static int hw_mutex_probe(struct pci_dev
+ 
+ 	pci_set_drvdata(pmaster->dev,pmaster);	
+ 	
+-	printk(KERN_INFO "pmaster 0x%x mem_base 0x%x, io_size 0x%x,irq_num %d, reg_base 0x%x\n",(uint32_t)pmaster, (uint32_t)mem_iobase,(uint32_t)mem_iosize,pmaster->irq_num,(uint32_t)pmaster->reg_base);
++	printk(KERN_INFO "HW Mutex: pmaster 0x%x mem_base 0x%x, io_size 0x%x,irq_num %d, reg_base 0x%x\n",(uint32_t)pmaster, (uint32_t)mem_iobase,(uint32_t)mem_iosize,pmaster->irq_num,(uint32_t)pmaster->reg_base);
+ 
+ 	/* HW mutex is configured to be fifo scheduler mode by default */	
+ 	/* Do not config the settings since BIOS already do that */
+@@ -304,6 +305,8 @@ static int hw_mutex_probe(struct pci_dev
+ 	}
+ 	printk(KERN_INFO "Intel(R) HW MUTEX driver built on %s @ %s\n", __DATE__, __TIME__);
+ 	return 0;
++
++    // TODO: The following is unexecuted code.
+ 	pci_set_drvdata(pmaster->dev,NULL);		
+ free_iomem:
+ 	iounmap(pmaster->reg_base);
+@@ -316,63 +319,72 @@ free_dev:
+ 
+ 	return ret;
+ }
++
+ #elif CONFIG_X86_PUMA7
+ void hw_mutex_register_with_netss(void)
+ {
+    int i, ret = -ENODEV;
++   bool use_sw_mutex_only;
+    netss_subdevice_mmio_t hwmutex_mmio;
+-   DEBUG_PRINT;
+ 
+-   if(!netss_driver_ready())
+-   {
+-      printk(KERN_INFO "Net SubSystem Driver is not ready, cannot initialize HW MUTEX driver\n");
+-      return;
++   use_sw_mutex_only = !netss_driver_ready();
++   if (use_sw_mutex_only) {
++      printk(KERN_INFO "HW Mutex: Initializing without the Net SubSystem Driver\n");
+    }
+ 
+-   if(netss_get_subdevice_mmio_info(NETSS_HW_MUTEX, &hwmutex_mmio))
+-   {
+-      printk(KERN_INFO "HW MUTEX driver could not get mmio info \n");
+-      return;
+-   }
+-   else
+-   {
+-      printk(KERN_INFO "HW Mutex mem_iobase = 0x%x, mem_iosize = 0x%x\n",(unsigned int)hwmutex_mmio.base,(unsigned int)hwmutex_mmio.size);
++   if (!use_sw_mutex_only) {
++       if (netss_get_subdevice_mmio_info(NETSS_HW_MUTEX, &hwmutex_mmio)) {
++          printk(KERN_INFO "HW MUTEX: could not get mmio info \n");
++          return;
++       }
++       else {
++          printk(KERN_INFO "HW Mutex: mem_iobase = 0x%x, mem_iosize = 0x%x\n",
++                 (unsigned int)hwmutex_mmio.base,(unsigned int)hwmutex_mmio.size);
++       }
+    }
+ 	
+    pmaster = kzalloc(sizeof(struct hw_master), GFP_KERNEL);
+    if (!pmaster) {
+-      printk(KERN_ERR, "Cannot allocate memory for HW Mutex context\n");
++      printk(KERN_ERR "HW Mutex: Cannot allocate memory for context\n");
+       ret = -ENOMEM;
+       return;
+    }
++
+    /* Initialize critical structures */
++   pmaster->use_sw_mutex_only = use_sw_mutex_only;
+    for (i = 0; i< HW_MUTEX_TOTAL; i++) {
+       pmaster->hw_mutexes[i].lock_name = i;
+       spin_lock_init(&pmaster->hw_mutexes[i].irq_lock);
+-      mutex_init(&pmaster->hw_mutexes[i].lock);
++      mutex_init(&pmaster->hw_mutexes[i].soft_lock);
++      mutex_init(&pmaster->hw_mutexes[i].data_mutex);
++      pmaster->hw_mutexes[i].lock_count = 0;
+       pmaster->hw_mutexes[i].owner = NULL;
+       atomic_set(&pmaster->hw_mutexes[i].status,HW_MUTEX_UNLOCKED);
+    }
+ 
+-   pmaster->reg_base = (void __iomem *)ioremap_nocache(hwmutex_mmio.base,hwmutex_mmio.size);
+-   if (!pmaster->reg_base) {
+-      printk(KERN_ERR, "error, failed to ioremap hw mutex registers\n");
+-      ret = -ENOMEM;
+-      goto free_mem;
++   if (!use_sw_mutex_only) {
++       pmaster->reg_base = (void __iomem *)ioremap_nocache(hwmutex_mmio.base,hwmutex_mmio.size);
++       if (!pmaster->reg_base) {
++          printk(KERN_ERR "HW Mutex: ERROR: Failed to ioremap hw mutex registers\n");
++          ret = -ENOMEM;
++          goto free_mem;
++       }
+    }
+ 	
+    /* We're running in ATOM */
+    pmaster->master = MASTER_ATOM; 
+-   pmaster->ops = &hw_mutex_ops;	
++   pmaster->ops = (use_sw_mutex_only) ? NULL : &hw_mutex_ops;
++
++   if (!use_sw_mutex_only)
+    {
+       unsigned int reg_val;
+       reg_val = hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_CFG);
+-      printk("HW MUTEX CFG register %x\n", reg_val);
++      printk("HW Mutex: CFG register %x\n", reg_val);
+       if(!(reg_val & 0x1))
+       {
+          hw_mutex_set_reg(pmaster->reg_base + HW_MUTEX_CFG, reg_val | 1);
+         reg_val = hw_mutex_read_reg(pmaster->reg_base + HW_MUTEX_CFG);
+-        printk("HW MUTEX register after writing %x\n", reg_val);
++        printk("HW Mutex: Register after writing %x\n", reg_val);
+       }
+    }
+ 
+@@ -386,18 +398,23 @@ void hw_mutex_register_with_netss(void)
+    pmaster->mode = HW_MUTEX_POLLING;
+ #endif
+ 
+-   if (hw_mutex_register(pmaster)){
++   /* If the NetIP driver is not available, ignore interrupts */
++   if (use_sw_mutex_only)
++       pmaster->mode = HW_MUTEX_POLLING;
++
++   if (hw_mutex_register(pmaster)) {
+       ret = -EINTR;
+       goto free_iomem;
+    }
++
+    printk(KERN_INFO "Intel(R) HW MUTEX driver built on %s @ %s\n", __DATE__, __TIME__);
+-   return 0;
++   return;
+ 
+ free_iomem:
+-   iounmap(pmaster->reg_base);
++   if (!use_sw_mutex_only)
++       iounmap(pmaster->reg_base);
+ free_mem:
+    kfree(pmaster);
+-   return 0;
+ }
+ 
+ #endif
+@@ -419,23 +436,19 @@ static void hw_mutex_remove(struct pci_d
+ 	pci_release_regions(pmaster->dev);
+ 	pci_disable_device(pmaster->dev);
+ 	DEBUG_PRINT;
+-	printk(KERN_INFO "hw-mutex : device exit \n");
+- 
+-	return;
++	printk(KERN_INFO "HW Mutex: Device exit \n");
+ }
+ #elif CONFIG_X86_PUMA7
+ static void hw_mutex_unregister_with_netss(void)
+ {
+    hw_mutex_unregister(pmaster);
+    /* Unlock all mutexes when driver exit */
+-   pci_set_drvdata(pmaster->dev,NULL);		
++   pci_set_drvdata(pmaster->dev, NULL);		
+    hw_mutex_unlock_all(pmaster);
+    iounmap(pmaster->reg_base);
+    kfree(pmaster);
+    DEBUG_PRINT;
+-   printk(KERN_INFO "hw-mutex : device exit \n");
+- 
+-   return;
++   printk(KERN_INFO "HW Mutex: device exit \n");
+ }
+ 
+ #endif
+@@ -451,20 +464,23 @@ static struct pci_driver hw_mutex_driver
+         .name           = "ce-hw-mutex",
+         .id_table       = hw_mutex_pci_tbl,
+         .probe          = hw_mutex_probe,
+-        .remove		= hw_mutex_remove,
++        .remove         = hw_mutex_remove,
+ #ifdef CONFIG_PM
+ 	.driver.pm 	= &hw_mutex_pm_ops,
+ #endif
+ };
+ #endif
++
+ static int __init hw_mutex_lld_init (void)
+ {
+ #ifdef CONFIG_X86_PUMA6
+    return pci_register_driver(&hw_mutex_driver);
+ #elif CONFIG_X86_PUMA7
+   hw_mutex_register_with_netss();   
++  return 0;
+ #endif
+ }
++
+ static void __exit hw_mutex_lld_exit(void)
+ {
+ #ifdef CONFIG_X86_PUMA6
+@@ -480,6 +496,3 @@ module_exit(hw_mutex_lld_exit);
+ MODULE_DESCRIPTION("Intel(R) HW MUTEX DEVICE Driver");
+ MODULE_AUTHOR("Intel Corporation");
+ MODULE_LICENSE("GPL");
+-
+-
+-
+--- a/arch/x86/hw_mutex/hw_mutex_lld.h
++++ b/arch/x86/hw_mutex/hw_mutex_lld.h
+@@ -45,7 +45,9 @@
+ 
+ #define HW_MUTEX_DEVICE 0x0949 
+ 
++#ifndef BIT
+ #define BIT(i)    ((1 << (i)))
++#endif
+ 
+ /*
+  * Configs Mutex to be in polling or FIFO/NULL scheduler mode
+--- a/include/linux/hw_mutex.h
++++ b/include/linux/hw_mutex.h
+@@ -102,9 +102,11 @@ typedef enum {
+ struct hw_mutex {
+ 		hw_mutex_device_type lock_name;
+ 		spinlock_t irq_lock;
+-		struct mutex lock;
++		struct mutex soft_lock;     /* Causes a different thread to sleep waiting for the HW mutex */
++		struct mutex data_mutex;    /* Protects the struct */
+ 		struct thread_info	*owner; /* Which thread owns the MUTEX */
+ 		atomic_t	status;			/* 1: unlocked, 0: requesting, negative: locked, possible waiters */
++        unsigned int lock_count;    /* Counts the number of lock/unlock calls. 0 = Unlocked */
+ 		
+ #define	HW_MUTEX_LOCKED  	(-1)	/* The MUTEX is locked 							*/
+ #define	HW_MUTEX_REQUESTING (0)		/* We've requested for the MUTEX, but not get it yet 	*/
+@@ -120,6 +122,7 @@ struct hw_master {
+ 	struct pci_dev *dev;	
+ 	struct hw_mutex hw_mutexes[HW_MUTEX_TOTAL];
+ 	struct hw_mutex_operations *ops;	
++    bool use_sw_mutex_only;         /* Indicates the NetIP driver is unavailable */
+ }__attribute__((aligned(4)));
+ 
+ /* Abstraction oprations of a HW mutex */
+--- a/kernel/hwmutex.c
++++ b/kernel/hwmutex.c
+@@ -26,7 +26,7 @@
+  *    Santa Clara, CA  97052
+  *
+  */
+- 
++
+ #include <linux/interrupt.h>
+ #include <linux/init.h>
+ 
+@@ -51,7 +51,7 @@ struct hw_master *hw_master_glob = NULL;
+ 
+ #define to_hw_mutex_ops() (hw_master_glob->ops)
+ #define to_hw_mutex(mutex) (&hw_master_glob->hw_mutexes[mutex])
+-
++#define to_use_sw_mutex_only() (hw_master_glob->use_sw_mutex_only)
+ 
+ /* hw_mutex_is_locked - check whether the current master owns the mutex or not
+  * @mutex: the mutex number to be checked
+@@ -62,263 +62,321 @@ struct hw_master *hw_master_glob = NULL;
+ */
+ int hw_mutex_is_locked(uint8_t mutex)
+ {
+-	struct hw_mutex  * hmutex = NULL;
+-	struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
++    struct hw_mutex  * hmutex = NULL;
++    struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
++    bool use_sw_mutex_only = to_use_sw_mutex_only();
++
++    BUG_ON(mutex >= HW_MUTEX_TOTAL);
++    DEBUG_PRINTK("func %s mutex number: %x\n", __FUNCTION__, mutex);
++    hmutex = to_hw_mutex(mutex);
+ 
+-	BUG_ON(mutex >= HW_MUTEX_TOTAL);
+-	DEBUG_PRINTK("func %s mutex number: %x\n", __FUNCTION__,mutex);
+-	hmutex = to_hw_mutex(mutex);
+-	
+-	return hmutex_ops->is_locked(hmutex);
++    return use_sw_mutex_only ? hmutex->lock_count > 0 : hmutex_ops->is_locked(hmutex);
+ }
+-
+ EXPORT_SYMBOL(hw_mutex_is_locked);
+ 
+ /*
+  * hw_mutex_isr - interrupt handler
+- * 
++ *
+  *  Sequence in case of FIFO interrupt mode:
+      1, Are we the one requesting for it? If not, then go away
+      2, Check whether we own the MUTEX
+      3, Is there a valid waiter waiting for the MUTEX? If not, then release the MUTEX
+      4, Wake up the waiter process
+  *
+- * 
+- *  Sequence in case of NULL interrupt mode: 
++ *
++ *  Sequence in case of NULL interrupt mode:
+      1, Are we the one wairing for it? If not, then go away
+      2, Is there a valid waiter waiting for the MUTEX? If not, then release the MUTEX
+      3, Try to lock the HW mutex again, if failure, wait for the next interrupt
+  */
+ static irqreturn_t hw_mutex_isr(int irq, void *dev_id)
+ {
+-	struct hw_master *pmaster = (struct hw_master *)dev_id;
+-	struct hw_mutex_operations *hmutex_ops = pmaster->ops;
+-	struct hw_mutex *hmutex;
+-	irqreturn_t	ret = IRQ_NONE;
+-	int i;
+-
+-	switch(pmaster->mode){
+-		case HW_MUTEX_FIFO_SCHE:	
+-			hmutex_ops->clr_intr(pmaster);
+-			ret = IRQ_HANDLED;
+-			for (i = 0; i< HW_MUTEX_TOTAL; i++) {
+-				hmutex = &pmaster->hw_mutexes[i]; 
+-				spin_lock(&hmutex->irq_lock);
+-				if (HW_MUTEX_REQUESTING == atomic_read(&hmutex->status)){ 
+-					if (hmutex_ops->is_locked(hmutex)) {
+-						atomic_set(&hmutex->status, HW_MUTEX_LOCKED);
+-						if (likely(hw_mutex_get_owner(hmutex))) {
+-                                                        printk("HW MUTEX ISR: acquiring lock\n");
+-							wake_up_process(hmutex->owner->task);
+-                                                }
+-						else {
+-						/* Nobody need the MUTEX, just unlock it to avoid deadlock */
+-                                                        printk("HW MUTEX ISR: Nobody waiting\n");
+-							hmutex_ops->unlock(hmutex);				
+-                                                }
+-					} else {
+-                                           printk("HW MUTEX ISR: IS LOCKED current master is not holdig the lock\n");
+-                                        }
+-				} else {
+-                                   printk("HW MUTEX ISR: status is not requesting\n");
+-                                }
+-				spin_unlock(&hmutex->irq_lock);
+-			}
+-			break;
+-		case HW_MUTEX_NULL_SCHE: 		
+-			for (i = 0; i< HW_MUTEX_TOTAL; i++){	
+-				hmutex = &pmaster->hw_mutexes[i]; 
+-				if (hmutex_ops->is_waiting(hmutex)) {
+-					hmutex_ops->clr_intr(pmaster);
+-					spin_lock(&hmutex->irq_lock);				
+-					 if (likely(hw_mutex_get_owner(hmutex))){
+-						 /* Forcibly request it again */
+-						 if (hmutex_ops->lock(hmutex,1))
+-							 wake_up_process(hmutex->owner->task);
+-					}
+-					 spin_unlock(&hmutex->irq_lock);
+-					 ret = IRQ_HANDLED;
+-				}
+-			}
+-			break;
+-		case HW_MUTEX_POLLING:
+-			return ret;
+-	}	
+-	/* clear interrupt status */
+-	return ret;
++    struct hw_master *pmaster = (struct hw_master *)dev_id;
++    struct hw_mutex_operations *hmutex_ops = pmaster->ops;
++    struct hw_mutex *hmutex;
++    irqreturn_t ret = IRQ_NONE;
++    int i;
++
++    switch(pmaster->mode) {
++        case HW_MUTEX_FIFO_SCHE:
++            hmutex_ops->clr_intr(pmaster);
++            ret = IRQ_HANDLED;
++            for (i = 0; i< HW_MUTEX_TOTAL; i++) {
++                hmutex = &pmaster->hw_mutexes[i];
++                spin_lock(&hmutex->irq_lock);
++                if (HW_MUTEX_REQUESTING == atomic_read(&hmutex->status)) {
++                    if (hmutex_ops->is_locked(hmutex)) {
++                        atomic_set(&hmutex->status, HW_MUTEX_LOCKED);
++                        if (likely(hw_mutex_get_owner(hmutex))) {
++                            printk("HW MUTEX ISR: acquiring lock\n");
++                            wake_up_process(hmutex->owner->task);
++                        }
++                        else {
++                            /* Nobody need the MUTEX, just unlock it to avoid deadlock */
++                            printk("HW MUTEX ISR: Nobody waiting\n");
++                            hmutex_ops->unlock(hmutex);
++                        }
++                    } else {
++                        printk("HW MUTEX ISR: IS LOCKED current master is not holdig the lock\n");
++                    }
++                } else {
++                    printk("HW MUTEX ISR: status is not requesting\n");
++                }
++                spin_unlock(&hmutex->irq_lock);
++            }
++            break;
++        case HW_MUTEX_NULL_SCHE:
++            for (i = 0; i< HW_MUTEX_TOTAL; i++) {
++                hmutex = &pmaster->hw_mutexes[i];
++                if (hmutex_ops->is_waiting(hmutex)) {
++                    hmutex_ops->clr_intr(pmaster);
++                    spin_lock(&hmutex->irq_lock);
++                    if (likely(hw_mutex_get_owner(hmutex))) {
++                        /* Forcibly request it again */
++                        if (hmutex_ops->lock(hmutex,1))
++                            wake_up_process(hmutex->owner->task);
++                    }
++                    spin_unlock(&hmutex->irq_lock);
++                    ret = IRQ_HANDLED;
++                }
++            }
++            break;
++        case HW_MUTEX_POLLING:
++            return ret;
++    }
++
++    /* clear interrupt status */
++    return ret;
+ }
+ 
++/*
++ * Sleep until the irq indicates the lock was obtained or a timeout occurs.
++ *
++ * NOTE: Assumes that interrupts have been disabled before calling.
++ *       Exits with interrupts disabled.
++ */
+ static inline long __sched
+-do_wait_common(struct hw_mutex_operations *hmutex_ops, struct hw_mutex *hmutex, long timeout, int state, unsigned long flags)
++wait_for_interrupt(struct hw_mutex_operations *hmutex_ops,
++                   struct hw_mutex            *hmutex,
++                   long                        timeout,
++                   int                         state,
++                   unsigned long               flags)
+ {
++    int ret = 0;
++    bool use_sw_mutex_only = to_use_sw_mutex_only();
+ 
+-	DEBUG_PRINT;
+-	do {
+-		if (hmutex_ops->is_locked(hmutex)) {
+-			break;
+-                }
+-		if (unlikely(signal_pending_state(state, current))) {
+-			printk(KERN_ERR "interrupt by signal\n");
+-			return -EINTR;
+-		}
+-		__set_current_state(state);
+-		spin_unlock_irqrestore(&hmutex->irq_lock,flags);	
+-		timeout = schedule_timeout(timeout);
+-		/* timeout:0, wake up for timer timeout, positive value: wake up by others */
+-		spin_lock_irqsave(&hmutex->irq_lock,flags);	
+-	} while (timeout);
+-	
+-	DEBUG_PRINTK("exit loop timeout 0x%x\n",(unsigned int)timeout);
+-	if (likely(hmutex_ops->is_locked(hmutex))) {
+-                 printk("Mutex lock wait successfull\n");
+-		return 0;
++    WARN_ON(use_sw_mutex_only);
++
++    do {
++        /* If we have the lock, we are done */
++        if (hmutex_ops->is_locked(hmutex)) {
++            break;
++        }
++
++        /* Check if a signal has interrupted us */
++        if (unlikely(signal_pending_state(state, current))) {
++            printk(KERN_ERR "interrupt by signal\n");
++            ret = -EINTR;
++            goto exit;
+         }
+-	else
+-    {
++
++        __set_current_state(state);
++
++        /* Enable interrupts and wait to see if we get an interrupt */
++        spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++        timeout = schedule_timeout(timeout);
++        /* timeout == 0: woken up from timer timeout
++         * timeout  > 0: woken up by others         */
++        spin_lock_irqsave(&hmutex->irq_lock,flags);
++    } while (timeout);
++
++
++    if (unlikely(!hmutex_ops->is_locked(hmutex))) {
+         printk(KERN_ERR "HW_Mutex-ERROR: timeout while waiting to HW mutex id=%d\n",hmutex->lock_name);
+-        return -EINTR;
++        ret = -EINTR;
++        goto exit;
+     }
+-}
+ 
++exit:
++    return ret;
++}
+ 
+ /*
+-  * hw_mutex_lock - acquire the mutex
+-  * @mutex: the mutex to be acquired
+-  *
+-  * Lock the mutex exclusively for this task. If the mutex is not
+-  * available right now, it will sleep until we can get it.
+-  *
+-  * The function is non interruptible
+-  */
++ * hw_mutex_lock - acquire the mutex
++ * @mutex: the mutex to be acquired
++ *
++ * Lock the mutex exclusively for this task. If the mutex is not
++ * available right now, it will sleep until we can get it.
++ *
++ * The function is non interruptible
++ */
+ void hw_mutex_lock(uint8_t mutex)
+ {
+-	struct hw_mutex  * hmutex = NULL;
+-	struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
+-	unsigned long flags;
+-	long timeout;	
+-	
+-	BUG_ON(mutex >= HW_MUTEX_TOTAL);
+-	
+-	hmutex = to_hw_mutex(mutex);
+-	
+-	DEBUG_PRINTK("lock hmutex 0x%x, number %d\n",(unsigned int)hmutex,hmutex->lock_name);
+-	might_sleep();
+-		
+-	mutex_lock(&hmutex->lock);
+-	spin_lock_irqsave(&hmutex->irq_lock,flags);	
+-	hw_mutex_set_owner(hmutex);
+-	if (hmutex_ops->lock(hmutex,0)) {
+-		spin_unlock_irqrestore(&hmutex->irq_lock,flags);
+-		return ;
+-	}
+-        dump_hw_mutex_registers(hmutex);
+-	timeout = do_wait_common(hmutex_ops,hmutex,MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE, flags);
+-	if (timeout == -EINTR) 
+-		hw_mutex_clear_owner(hmutex);
+-	spin_unlock_irqrestore(&hmutex->irq_lock,flags);	
+-
+-	/* Lock failure */
+-	if (timeout) 
+-		mutex_unlock(&hmutex->lock);
+-	printk("mutex status %d\n", atomic_read(&hmutex->status));
+-	return ;
+-}
++    struct hw_mutex  *hmutex = NULL;
++    struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
++    bool use_sw_mutex_only = to_use_sw_mutex_only();
++    unsigned long flags;
++    long timeout;
++
++    BUG_ON(mutex >= HW_MUTEX_TOTAL);
++
++    hmutex = to_hw_mutex(mutex);
++
++    might_sleep();
++
++    /* Is this the same thread locking again? */
++    mutex_lock(&hmutex->data_mutex);
++    if (hmutex->lock_count > 0 && hw_mutex_is_same_owner(hmutex)) {
++        hmutex->lock_count++;
++        mutex_unlock(&hmutex->data_mutex);
++        return;
++    }
++    mutex_unlock(&hmutex->data_mutex);
++
++    /* This mutex is held between lock/unlock calls forcing others to sleep here */
++    mutex_lock(&hmutex->soft_lock);
++    mutex_lock(&hmutex->data_mutex);
++    spin_lock_irqsave(&hmutex->irq_lock, flags);
++
++    hw_mutex_set_owner(hmutex);
++    /* If there is no HW support, continue with "lock succeeded" as the SW mutex is already held. */
++    if (use_sw_mutex_only || hmutex_ops->lock(hmutex,0)) {
++        spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++        hmutex->lock_count = 1;
++        mutex_unlock(&hmutex->data_mutex);
++        return;
++    }
++
++    timeout = wait_for_interrupt(hmutex_ops, hmutex, MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE, flags);
++    if (timeout == -EINTR) {
++        hw_mutex_clear_owner(hmutex);
++    }
++    spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++
++    if (!timeout)
++        hmutex->lock_count = 1;
+ 
++    mutex_unlock(&hmutex->data_mutex);
++
++    /* Lock failure */
++    if (timeout) {
++        printk(KERN_ERR "Failed to obtain HW Mutex\n");
++        mutex_unlock(&hmutex->soft_lock);
++    }
++}
+ EXPORT_SYMBOL(hw_mutex_lock);
+ 
+ #ifdef TEST_HWMUTEX
+ void hw_mutex_lock_test(uint8_t mutex)
+ {
+-	struct hw_mutex  * hmutex = NULL;
+-	struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
+-	unsigned long flags;
+-	long timeout;	
+-	
+-	BUG_ON(mutex >= HW_MUTEX_TOTAL);
+-	
+-	hmutex = to_hw_mutex(mutex);
+-	
+-	DEBUG_PRINTK("lock hmutex 0x%x, number %d\n",(unsigned int)hmutex,hmutex->lock_name);
+-	might_sleep();
+-		
+-	mutex_lock(&hmutex->lock);
+-	spin_lock_irqsave(&hmutex->irq_lock,flags);	
+-	hw_mutex_set_owner(hmutex);
++    struct hw_mutex  * hmutex = NULL;
++    struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
++    unsigned long flags;
++    long timeout;
++
++    BUG_ON(mutex >= HW_MUTEX_TOTAL);
++
++    hmutex = to_hw_mutex(mutex);
++
++    DEBUG_PRINTK("lock hmutex 0x%x, number %d\n",(unsigned int)hmutex,hmutex->lock_name);
++    might_sleep();
++
++    mutex_lock(&hmutex->soft_lock);
++    spin_lock_irqsave(&hmutex->irq_lock,flags);
++    hw_mutex_set_owner(hmutex);
+ #ifdef TEST_HWMUTEX
+         lock_hw_mutex_as_different_master(hmutex);
+         dump_hw_mutex_registers(hmutex);
+ #endif
+-	if (hmutex_ops->lock(hmutex,0)) {
+-		spin_unlock_irqrestore(&hmutex->irq_lock,flags);	
+-		return ;
+-	}
++    if (hmutex_ops->lock(hmutex,0)) {
++        spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++        return ;
++    }
+ #ifdef TEST_HWMUTEX
+         unlock_hw_mutex_as_different_master(hmutex);
+ #endif
+-	timeout = do_wait_common(hmutex_ops,hmutex,MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE, flags);
+-	if (timeout == -EINTR) 
+-		hw_mutex_clear_owner(hmutex);
+-	spin_unlock_irqrestore(&hmutex->irq_lock,flags);	
+-
+-	/* Lock failure */
+-	if (timeout) 
+-		mutex_unlock(&hmutex->lock);
+-	printk("mutex status %d\n", atomic_read(&hmutex->status));
++    timeout = wait_for_interrupt(hmutex_ops,hmutex,MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE, flags);
++    if (timeout == -EINTR)
++        hw_mutex_clear_owner(hmutex);
++    spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++
++    /* Lock failure */
++    if (timeout)
++        mutex_unlock(&hmutex->soft_lock);
++    printk("mutex status %d\n", atomic_read(&hmutex->status));
+ #ifdef TEST_HWMUTEX
+         dump_hw_mutex_registers(hmutex);
+ #endif
+-	return ;
++    return ;
+ }
+ 
+ EXPORT_SYMBOL(hw_mutex_lock_test);
+ #endif
+ 
+-
+ /*
+  * hw_mutex_lock_interruptible - acquire the mutex
+  * @mutex: the mutex to be acquired
+  *
+  * Lock the mutex exclusively for this task. If the mutex is not
+  * available right now, it will sleep until it can get it.
+- * It can be interruptibed by signal, or exit when timeout
++ * It can be interruptibed by signal, or exit when timedout.
+  *
+  * Returns 0 if success, negative if interrupted or timeout
+  */
+ 
+ long __sched hw_mutex_lock_interruptible(uint8_t mutex)
+ {
+-	struct hw_mutex  * hmutex = NULL;
+-	struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
+-	unsigned long flags;
+-	long timeout;	
+-	
+-	BUG_ON(mutex >= HW_MUTEX_TOTAL);
+-	
+-	hmutex = to_hw_mutex(mutex);
+-	
+-	DEBUG_PRINTK("lock hmutex(interruptible) 0x%x, number %d\n",(uint32_t)hmutex,hmutex->lock_name);
+-	might_sleep();
+-
+-	if (mutex_lock_interruptible(&hmutex->lock))
+-		return -EINTR;
+-	
+-	spin_lock_irqsave(&hmutex->irq_lock,flags);	
+-	hw_mutex_set_owner(hmutex);
+-	/* Locked */	
+-	if (hmutex_ops->lock(hmutex,0)) {
+-		spin_unlock_irqrestore(&hmutex->irq_lock,flags);	
+-		return 0;
+-	}
+-	timeout = do_wait_common(hmutex_ops,hmutex,IRQ_HW_MUTEX_TIME_OUT, TASK_INTERRUPTIBLE, flags);
+-	if (timeout == -EINTR)
+-		hw_mutex_clear_owner(hmutex);
+-	spin_unlock_irqrestore(&hmutex->irq_lock,flags);	
+-
+-	/* Lock failure */
+-	if (timeout) 
+-		mutex_unlock(&hmutex->lock);
+-	return timeout;
++    struct hw_mutex  * hmutex = NULL;
++    struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
++    bool use_sw_mutex_only = to_use_sw_mutex_only();
++    unsigned long flags;
++    long timeout;
++
++    BUG_ON(mutex >= HW_MUTEX_TOTAL);
++
++    hmutex = to_hw_mutex(mutex);
++
++	DEBUG_PRINTK("lock hmutex(interruptible) 0x%x, number %d\n", (uint32_t)hmutex, hmutex->lock_name);
++    might_sleep();
++
++    /* Is this the same thread locking again? */
++    mutex_lock(&hmutex->data_mutex);
++    if (hmutex->lock_count > 0 && hw_mutex_is_same_owner(hmutex)) {
++        hmutex->lock_count++;
++        mutex_unlock(&hmutex->data_mutex);
++        return 0;
++    }
++    mutex_unlock(&hmutex->data_mutex);
++
++    /* This mutex is held between lock/unlock calls forcing others to sleep here */
++    if (mutex_lock_interruptible(&hmutex->soft_lock))
++        return -EINTR;
+ 
++    mutex_lock(&hmutex->data_mutex);
++    spin_lock_irqsave(&hmutex->irq_lock,flags);
++
++    hw_mutex_set_owner(hmutex);
++
++    /* If there is no HW support, continue with "lock succeeded" as the SW mutex is already held. */
++    if (use_sw_mutex_only || hmutex_ops->lock(hmutex,0)) {
++        spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++        hmutex->lock_count = 1;
++        mutex_unlock(&hmutex->data_mutex);
++        return 0;
++    }
++
++    timeout = wait_for_interrupt(hmutex_ops, hmutex, IRQ_HW_MUTEX_TIME_OUT, TASK_INTERRUPTIBLE, flags);
++    if (timeout == -EINTR)
++        hw_mutex_clear_owner(hmutex);
++    spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++
++    mutex_unlock(&hmutex->data_mutex);
++
++    /* Lock failure */
++    if (timeout)
++        mutex_unlock(&hmutex->soft_lock);
++
++    return timeout;
+ }
+ EXPORT_SYMBOL(hw_mutex_lock_interruptible);
+ 
+@@ -328,32 +386,48 @@ EXPORT_SYMBOL(hw_mutex_lock_interruptibl
+  */
+ void hw_mutex_unlock(uint8_t mutex)
+ {
+-	struct hw_mutex  * hmutex = NULL;	
+-	struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
+-	unsigned long  flags;
+-	
+-	BUG_ON(mutex >= HW_MUTEX_TOTAL);
+-	
+-	hmutex = to_hw_mutex(mutex);
+-	DEBUG_PRINTK("unlock hmutex 0x%x, number %d\n",(uint32_t)hmutex,hmutex->lock_name);
+-
+-	if (hw_mutex_get_owner(hmutex) != current_thread_info()){	
+-		printk(KERN_ERR "WARN: HW MUTEX should be released by the same owner %x\n", mutex);
+-		return;
+-	} else {		
+-		DEBUG_PRINTK("hmutex 0x%x, number %d, owner 0x%x, released by 0x%x\n",(uint32_t)hmutex,hmutex->lock_name,(uint32_t)hw_mutex_get_owner(hmutex),(uint32_t)current_thread_info());
+-		spin_lock_irqsave(&hmutex->irq_lock,flags);	
+-		hmutex_ops->unlock(hmutex);
++    struct hw_mutex  * hmutex = NULL;
++    struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
++    bool use_sw_mutex_only = to_use_sw_mutex_only();
++    unsigned long  flags;
++
++    BUG_ON(mutex >= HW_MUTEX_TOTAL);
++
++    hmutex = to_hw_mutex(mutex);
++	DEBUG_PRINTK("unlock hmutex 0x%x, number %d\n", (uint32_t)hmutex, hmutex->lock_name);
++
++    mutex_lock(&hmutex->data_mutex);
++    if (!hw_mutex_is_same_owner(hmutex)) {
++        printk(KERN_ERR "ERROR: HW MUTEX can only be released by the same "
++                        "owner/thread. Mutex:0x%x\n", mutex);
++        mutex_unlock(&hmutex->data_mutex);
++        return;
++    }
++
++    WARN_ON(hmutex->lock_count == 0);
++    DEBUG_PRINTK("hmutex 0x%x, number %d, owner 0x%x, released by 0x%x\n",
++                 (uint32_t)hmutex, hmutex->lock_name, (uint32_t)hw_mutex_get_owner(hmutex),
++                 (uint32_t)current_thread_info());
++
++    if (hmutex->lock_count >= 2) {
++        hmutex->lock_count--;
++        mutex_unlock(&hmutex->data_mutex);
++        return;
++    }
+ 
+-		hw_mutex_clear_owner(hmutex);
+-		spin_unlock_irqrestore(&hmutex->irq_lock,flags);	
++    spin_lock_irqsave(&hmutex->irq_lock,flags);
+ 
+-		mutex_unlock(&hmutex->lock);
+-	}
++    if (!use_sw_mutex_only)
++        hmutex_ops->unlock(hmutex);
++
++    spin_unlock_irqrestore(&hmutex->irq_lock,flags);
++    hw_mutex_clear_owner(hmutex);
++    hmutex->lock_count = 0;
++    mutex_unlock(&hmutex->data_mutex);
++    mutex_unlock(&hmutex->soft_lock);
+ }
+ EXPORT_SYMBOL(hw_mutex_unlock);
+ 
+-
+ int hw_mutex_register (struct hw_master *pmaster)
+ {
+    if (WARN_ON(pmaster == NULL)) return -EINVAL;
+@@ -374,24 +448,22 @@ int hw_mutex_register (struct hw_master
+    return 0;
+ }
+ EXPORT_SYMBOL(hw_mutex_register);
++
+ void hw_mutex_unregister(struct hw_master *pmaster)
+ {
+ #ifdef CONFIG_X86_PUMA6
+-	if (WARN_ON(pmaster == NULL)) return;
+-	if (pmaster->mode != HW_MUTEX_POLLING){
+-		free_irq(pmaster->irq_num,(void *)pmaster);
+-	}
++    if (WARN_ON(pmaster == NULL)) return;
++    if (pmaster->mode != HW_MUTEX_POLLING) {
++        free_irq(pmaster->irq_num,(void *)pmaster);
++    }
+ #elif CONFIG_X86_PUMA7
+    netss_subdev_irq_info_t irq_info;
+    irq_info.func = NULL;
+    irq_info.args = NULL;
+-   netss_subdev_register_irq(NETSS_HW_MUTEX, -1, &irq_info);
++   if (pmaster->mode != HW_MUTEX_POLLING)
++       netss_subdev_register_irq(NETSS_HW_MUTEX, -1, &irq_info);
+ #endif
+ 
+    hw_master_glob = NULL;
+ }
+ EXPORT_SYMBOL(hw_mutex_unregister);
+-
+-
+-
+-
+--- a/kernel/hwmutex.h
++++ b/kernel/hwmutex.h
+@@ -54,6 +54,10 @@ static inline struct thread_info* hw_mut
+ {
+ 	return lock->owner;
+ }
++static inline int hw_mutex_is_same_owner(struct hw_mutex *lock)
++{
++    return (lock->owner == current_thread_info()) ? 1 : 0;
++}
+ 
+ #endif 
+ /* end of hw_mutex.h */

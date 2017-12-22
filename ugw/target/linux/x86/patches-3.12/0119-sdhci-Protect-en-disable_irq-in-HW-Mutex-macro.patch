@@ -1,0 +1,94 @@
+From 977033b725d63e5456a8d4a25e1c6bef67548d7d Mon Sep 17 00:00:00 2001
+From: "Brett T. Warden" <brett.t.warden@intel.com>
+Date: Wed, 27 May 2015 16:24:46 -0700
+Subject: [PATCH 119/441] sdhci: Protect en/disable_irq in HW Mutex macro
+
+Uses a kernel mutex to protect the enable_irq() and disable_irq() calls
+in the LOCK_EMMC_HW_MUTEX and UNLOCK_EMMC_HW_MUTEX macros in case the HW
+Mutex is not yet available. This prevents a concurrency issue between
+sdhci_pci_probe_slot and mmc_rescan that could result in unbalanced IRQ
+masking. Moves the existing kernel mutex from the header file so it's
+actually a single mutex.
+---
+ drivers/mmc/host/sdhci.c  | 18 ++++++++++++++++++
+ include/linux/mmc/sdhci.h | 26 ++++++--------------------
+ 2 files changed, 24 insertions(+), 20 deletions(-)
+
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -128,6 +128,24 @@ static void sdhci_dumpregs(struct sdhci_
+ 	pr_err(DRIVER_NAME ": ===========================================\n");
+ }
+ 
++#ifdef CONFIG_HW_MUTEXES
++/*
++ * Mutex to protect enable/disable_irq calls within HW_MUTEX macros when HW
++ * Mutex is not yet initialized
++ */
++static DEFINE_MUTEX(mmc_access_lock);
++void lock_emmc_access(void)
++{
++  might_sleep();
++  mutex_lock(&mmc_access_lock);
++}
++
++void unlock_emmc_access(void)
++{
++  mutex_unlock(&mmc_access_lock);
++}
++#endif
++
+ /*****************************************************************************\
+  *                                                                           *
+  * Low level functions                                                       *
+--- a/include/linux/mmc/sdhci.h
++++ b/include/linux/mmc/sdhci.h
+@@ -199,18 +199,8 @@ struct sdhci_host {
+ };
+ 
+ #ifdef CONFIG_HW_MUTEXES
+-static DEFINE_MUTEX(mmc_access_lock);
+-
+-static void lock_emmc_access(void)
+-{
+-  might_sleep();
+-  mutex_lock(&mmc_access_lock);
+-}
+-
+-static void unlock_emmc_access(void)
+-{
+-  mutex_unlock(&mmc_access_lock);
+-}
++void lock_emmc_access(void);
++void unlock_emmc_access(void);
+ 
+ #define EMMC_HW_MUTEX_IS_LOCKED(host) (netss_driver_ready() &&\
+   hw_mutex_is_locked(HW_MUTEX_EMMC))
+@@ -219,23 +209,19 @@ static void unlock_emmc_access(void)
+   if (((struct sdhci_host *)host->private)->flags & SDHCI_SUPPORT_HW_MUTEX)\
+     {\
+       if (netss_driver_ready()) \
+-      {\
+         hw_mutex_lock(HW_MUTEX_EMMC);\
+-        lock_emmc_access();\
+-        enable_irq(((struct sdhci_host *)host->private)->irq);\
+-      }\
++      lock_emmc_access();\
++      enable_irq(((struct sdhci_host *)host->private)->irq);\
+     }\
+   } while(0)
+ 
+ #define UNLOCK_EMMC_HW_MUTEX(host) do{\
+   if (((struct sdhci_host *)host->private)->flags & SDHCI_SUPPORT_HW_MUTEX)\
+     {\
++      disable_irq(((struct sdhci_host *)host->private)->irq);\
++      unlock_emmc_access();\
+       if (netss_driver_ready()) \
+-      {\
+-        disable_irq(((struct sdhci_host *)host->private)->irq);\
+-        unlock_emmc_access();\
+         hw_mutex_unlock(HW_MUTEX_EMMC);\
+-      }\
+     }\
+   } while(0)
+ 

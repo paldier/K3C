@@ -1,0 +1,157 @@
+diff -x 'msvc*' -x '*.d' -Npur 23_hostapd_orig/src/ap/gas_serv.c 22_hostapd_final/src/ap/gas_serv.c
+--- 23_hostapd_orig/src/ap/gas_serv.c	2017-01-10 22:18:02.000000000 +0200
++++ 22_hostapd_final/src/ap/gas_serv.c	2017-01-11 13:46:49.000000000 +0200
+@@ -175,7 +175,7 @@ static void anqp_add_mbo_cell_pref_capab
+ 		u8 *len = gas_anqp_add_element(buf, ANQP_VENDOR_SPECIFIC);
+ 		wpabuf_put_be24(buf, OUI_WFA);
+ 		wpabuf_put_u8(buf, MBO_ANQP_OUI_TYPE);
+-		wpabuf_put_u8(buf, MBO_ANQP_SUBTYPE_CELL_CONN_PREF);
++		wpabuf_put_u8(buf, MBO_ANQP_SUBTYPE_QUERY_LIST);
+ 		wpabuf_put_u8(buf, 0); /* Reserved */
+ 		gas_anqp_set_element_len(buf, len);
+ 	}
+@@ -577,12 +577,14 @@ static void anqp_add_neighbor_report(str
+ 		wpabuf_put_le16(buf, ANQP_NEIGHBOR_REPORT);
+ 		wpabuf_put_le16(buf, 0);
+ 	} else {
++		u8 *len = gas_anqp_add_element(buf, ANQP_NEIGHBOR_REPORT);
+ 		dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
+ 				list) {
+-			wpabuf_put_le16(buf, ANQP_NEIGHBOR_REPORT);
+-			wpabuf_put_le16(buf, wpabuf_len(nr->nr));
++			wpabuf_put_u8(buf, WLAN_EID_NEIGHBOR_REPORT);
++			wpabuf_put_u8(buf, wpabuf_len(nr->nr));
+ 			wpabuf_put_buf(buf, nr->nr);
+ 		}
++		gas_anqp_set_element_len(buf, len);
+ 	}
+ }
+ 
+@@ -831,8 +833,7 @@ static void anqp_add_mbo_cell_pref(struc
+ 		u8 *len = gas_anqp_add_element(buf, ANQP_VENDOR_SPECIFIC);
+ 		wpabuf_put_be24(buf, OUI_WFA);
+ 		wpabuf_put_u8(buf, MBO_ANQP_OUI_TYPE);
+-		wpabuf_put_u8(buf, MBO_ANQP_SUBTYPE_CELL_CONN_PREF);
+-		wpabuf_put_u8(buf, 0); /* Reserved */
++		wpabuf_put_u8(buf, MBO_ANQP_SUBTYPE_CELL_PREF);
+ 		wpabuf_put_u8(buf, hapd->mbo_cell_pref);
+ 		gas_anqp_set_element_len(buf, len);
+ 	}
+@@ -859,7 +860,7 @@ static size_t anqp_get_required_len(stru
+ 
+ static struct wpabuf *
+ gas_serv_build_gas_resp_payload(struct hostapd_data *hapd,
+-				unsigned int request,
++				unsigned int request,unsigned int mbo_request,
+ 				const u8 *home_realm, size_t home_realm_len,
+ 				const u8 *icon_name, size_t icon_name_len,
+ 				const u16 *extra_req,
+@@ -936,7 +937,7 @@ gas_serv_build_gas_resp_payload(struct h
+ #endif /* CONFIG_HS20 */
+ 
+ #ifdef CONFIG_MBO
+-	if (request & ANQP_REQ_MBO_CELL_PREF)
++	if (mbo_request & ANQP_REQ_MBO_CELL_PREF)
+ 		anqp_add_mbo_cell_pref(hapd, buf);
+ #endif /* CONFIG_MBO */
+ 
+@@ -948,6 +949,7 @@ gas_serv_build_gas_resp_payload(struct h
+ 
+ struct anqp_query_info {
+ 	unsigned int request;
++	unsigned int mbo_request;
+ 	const u8 *home_realm_query;
+ 	size_t home_realm_query_len;
+ 	const u8 *icon_name;
+@@ -1159,9 +1161,19 @@ static void rx_anqp_hs_icon_request(stru
+ 
+ #ifdef CONFIG_MBO
+ static void rx_anqp_mbo_cell_pref_request(struct hostapd_data *hapd,
++					const u8 *pos, const u8 *end,
+ 				    struct anqp_query_info *qi)
+ {
+-	qi->request |= ANQP_REQ_MBO_CELL_PREF;
++	u8 payload;
++	payload = *pos++;
++
++	if (payload != MBO_ANQP_SUBTYPE_CELL_PREF) {
++		wpa_printf(MSG_DEBUG, "ANQP: MBO unknown query request type:%u",
++				payload);
++		return;
++	}
++
++	qi->mbo_request |= ANQP_REQ_MBO_CELL_PREF;
+ 	if (hapd->conf->mbo_enabled && hapd->conf->mbo_cell_aware) {
+ 		wpa_printf(MSG_DEBUG, "ANQP: MBO Request Query "
+ 			   "(local)");
+@@ -1243,18 +1255,18 @@ static void rx_anqp_vendor_specific(stru
+ #ifdef CONFIG_MBO
+ 		pos++;
+ 
+-		if (end - pos <= 1)
++		if (end - pos <= 1) /*subtype + payload */
+ 			return;
+ 
+ 		subtype = *pos++;
+-		pos++; /* Reserved */
+ 		switch (subtype) {
+-		case MBO_ANQP_SUBTYPE_CELL_CONN_PREF:
+-			rx_anqp_mbo_cell_pref_request(hapd, qi);
++		case MBO_ANQP_SUBTYPE_QUERY_LIST:
++			rx_anqp_mbo_cell_pref_request(hapd, pos, end, qi);
+ 			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG, "ANQP: Unsupported MBO query subtype "
+ 				   "%u", subtype);
++			pos += end - pos; /* skip payload */
+ 			break;
+ 		}
+ #endif /* CONFIG_MBO */
+@@ -1273,7 +1285,7 @@ static void gas_serv_req_local_processin
+ {
+ 	struct wpabuf *buf, *tx_buf;
+ 
+-	buf = gas_serv_build_gas_resp_payload(hapd, qi->request,
++	buf = gas_serv_build_gas_resp_payload(hapd, qi->request, qi->mbo_request,
+ 					      qi->home_realm_query,
+ 					      qi->home_realm_query_len,
+ 					      qi->icon_name, qi->icon_name_len,
+diff -x 'msvc*' -x '*.d' -Npur 23_hostapd_orig/src/ap/gas_serv.h 22_hostapd_final/src/ap/gas_serv.h
+--- 23_hostapd_orig/src/ap/gas_serv.h	2017-01-10 22:18:02.000000000 +0200
++++ 22_hostapd_final/src/ap/gas_serv.h	2017-01-11 12:00:00.000000000 +0200
+@@ -64,7 +64,7 @@
+ 	(0x10000 << HS20_STYPE_ICON_REQUEST)
+ 
+ #define ANQP_REQ_MBO_CELL_PREF \
+-	(0x200000000 << MBO_ANQP_SUBTYPE_CELL_CONN_PREF)
++	(1 << MBO_ANQP_SUBTYPE_CELL_PREF)
+ 
+ struct gas_dialog_info {
+ 	u8 valid;
+diff -x 'msvc*' -x '*.d' -Npur 23_hostapd_orig/src/common/ieee802_11_defs.h 22_hostapd_final/src/common/ieee802_11_defs.h
+--- 23_hostapd_orig/src/common/ieee802_11_defs.h	2017-01-10 22:18:03.000000000 +0200
++++ 22_hostapd_final/src/common/ieee802_11_defs.h	2017-01-11 12:00:15.000000000 +0200
+@@ -1236,7 +1236,9 @@ enum wfa_wnm_notif_subelem_id {
+ 
+ /* MBO v0.0_r25, 4.3: MBO ANQP-elements */
+ #define MBO_ANQP_OUI_TYPE 0x12
+-#define MBO_ANQP_SUBTYPE_CELL_CONN_PREF 1
++#define MBO_ANQP_SUBTYPE_QUERY_LIST     1
++#define MBO_ANQP_SUBTYPE_CELL_PREF      2
++
+ 
+ /* Wi-Fi Direct (P2P) */
+ 
+diff -x 'msvc*' -x '*.d' -Npur 23_hostapd_orig/wpa_supplicant/mbo.c 22_hostapd_final/wpa_supplicant/mbo.c
+--- 23_hostapd_orig/wpa_supplicant/mbo.c	2017-01-10 22:18:02.000000000 +0200
++++ 22_hostapd_final/wpa_supplicant/mbo.c	2017-01-11 11:41:51.000000000 +0200
+@@ -826,7 +826,8 @@ struct wpabuf * mbo_build_anqp_buf(struc
+ 	wpabuf_put_be24(anqp_buf, OUI_WFA);
+ 	wpabuf_put_u8(anqp_buf, MBO_ANQP_OUI_TYPE);
+ 
+-	wpabuf_put_u8(anqp_buf, MBO_ANQP_SUBTYPE_CELL_CONN_PREF);
++	wpabuf_put_u8(anqp_buf, MBO_ANQP_SUBTYPE_QUERY_LIST);
++	wpabuf_put_u8(anqp_buf, MBO_ANQP_SUBTYPE_CELL_PREF);
+ 	gas_anqp_set_element_len(anqp_buf, len_pos);
+ 
+ 	return anqp_buf;

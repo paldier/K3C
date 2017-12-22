@@ -1,0 +1,963 @@
+From 6c4b39872685d6d1222eab78fb209328195d3fcd Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Tue, 2 Apr 2013 13:16:31 -0700
+Subject: [PATCH 084/105] MIPS: EVA CACHEE instruction implementation in kernel
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+---
+ arch/mips/include/asm/cacheflush.h |    2 +
+ arch/mips/include/asm/r4kcache.h   |  200 ++++++++++++++++++++++++++++++++++-
+ arch/mips/kernel/ftrace.c          |    4 +
+ arch/mips/kernel/kgdb.c            |   17 +++-
+ arch/mips/kernel/smp-cmp.c         |    2 +-
+ arch/mips/kernel/smp-mt.c          |    4 +-
+ arch/mips/kernel/vpe.c             |    5 +
+ arch/mips/mm/c-octeon.c            |    8 ++
+ arch/mips/mm/c-r3k.c               |    9 ++-
+ arch/mips/mm/c-r4k.c               |  206 ++++++++++++++++++++++++++----------
+ arch/mips/mm/c-tx39.c              |    8 ++
+ arch/mips/mm/cache.c               |    3 +
+ arch/mips/mm/init.c                |   15 ++-
+ arch/mips/mti-malta/malta-init.c   |    4 +-
+ 14 files changed, 417 insertions(+), 70 deletions(-)
+
+diff --git a/arch/mips/include/asm/cacheflush.h b/arch/mips/include/asm/cacheflush.h
+index 82cd13e..42e5fc6 100644
+--- a/arch/mips/include/asm/cacheflush.h
++++ b/arch/mips/include/asm/cacheflush.h
+@@ -94,6 +94,8 @@ extern void (*flush_cache_sigtramp)(unsigned long addr);
+ extern void (*flush_icache_all)(void);
+ extern void (*local_flush_data_cache_page)(void * addr);
+ extern void (*flush_data_cache_page)(unsigned long addr);
++extern void (*mips_flush_data_cache_range)(struct vm_area_struct *vma,
++	struct page *page, unsigned long addr, unsigned long size);
+ 
+ /*
+  * This flag is used to indicate that the page pointed to by a pte
+diff --git a/arch/mips/include/asm/r4kcache.h b/arch/mips/include/asm/r4kcache.h
+index 5faed26..ff23a63 100644
+--- a/arch/mips/include/asm/r4kcache.h
++++ b/arch/mips/include/asm/r4kcache.h
+@@ -16,6 +16,7 @@
+ #include <asm/cacheops.h>
+ #include <asm/cpu-features.h>
+ #include <asm/mipsmtregs.h>
++#include <asm/uaccess.h>
+ 
+ /*
+  * This macro return a properly sign-extended address suitable as base address
+@@ -205,12 +206,31 @@ static inline void flush_scache_line(unsigned long addr)
+ 	:							\
+ 	: "i" (op), "r" (addr))
+ 
++#ifdef CONFIG_EVA
++#define protected_cachee_op(op,addr)                            \
++	__asm__ __volatile__(					\
++	"	.set	push			\n"		\
++	"	.set	noreorder		\n"		\
++	"       .set    eva                     \n"             \
++	"1:     cachee  %0, (%1)                \n"             \
++	"2:	.set	pop			\n"		\
++	"	.section __ex_table,\"a\"	\n"		\
++	"	"STR(PTR)" 1b, 2b		\n"		\
++	"	.previous"					\
++	:							\
++	: "i" (op), "r" (addr))
++#endif
++
+ /*
+  * The next two are for badland addresses like signal trampolines.
+  */
+ static inline void protected_flush_icache_line(unsigned long addr)
+ {
++#ifndef CONFIG_EVA
+ 	protected_cache_op(Hit_Invalidate_I, addr);
++#else
++	protected_cachee_op(Hit_Invalidate_I, addr);
++#endif
+ }
+ 
+ /*
+@@ -221,7 +241,11 @@ static inline void protected_flush_icache_line(unsigned long addr)
+  */
+ static inline void protected_writeback_dcache_line(unsigned long addr)
+ {
++#ifndef CONFIG_EVA
+ 	protected_cache_op(Hit_Writeback_Inv_D, addr);
++#else
++	protected_cachee_op(Hit_Writeback_Inv_D, addr);
++#endif
+ }
+ 
+ static inline void protected_writeback_scache_line(unsigned long addr)
+@@ -341,6 +365,112 @@ static inline void invalidate_tcache_page(unsigned long addr)
+ 		: "r" (base),						\
+ 		  "i" (op));
+ 
++#ifdef CONFIG_EVA
++#define cache16_unroll32_user(base,op)                                  \
++	__asm__ __volatile__(						\
++	"	.set push					\n"	\
++	"	.set noreorder					\n"	\
++	"       .set eva                                        \n"     \
++	"       cachee %1, 0x000(%0); cachee %1, 0x010(%0)      \n"     \
++	"       cachee %1, 0x020(%0); cachee %1, 0x030(%0)      \n"     \
++	"       cachee %1, 0x040(%0); cachee %1, 0x050(%0)      \n"     \
++	"       cachee %1, 0x060(%0); cachee %1, 0x070(%0)      \n"     \
++	"       cachee %1, 0x080(%0); cachee %1, 0x090(%0)      \n"     \
++	"       cachee %1, 0x0a0(%0); cachee %1, 0x0b0(%0)      \n"     \
++	"       cachee %1, 0x0c0(%0); cachee %1, 0x0d0(%0)      \n"     \
++	"       cachee %1, 0x0e0(%0); cachee %1, 0x0f0(%0)      \n"     \
++	"       cachee %1, 0x100(%0); cachee %1, 0x110(%0)      \n"     \
++	"       cachee %1, 0x120(%0); cachee %1, 0x130(%0)      \n"     \
++	"       cachee %1, 0x140(%0); cachee %1, 0x150(%0)      \n"     \
++	"       cachee %1, 0x160(%0); cachee %1, 0x170(%0)      \n"     \
++	"       cachee %1, 0x180(%0); cachee %1, 0x190(%0)      \n"     \
++	"       cachee %1, 0x1a0(%0); cachee %1, 0x1b0(%0)      \n"     \
++	"       cachee %1, 0x1c0(%0); cachee %1, 0x1d0(%0)      \n"     \
++	"       cachee %1, 0x1e0(%0); cachee %1, 0x1f0(%0)      \n"     \
++	"	.set pop					\n"	\
++		:							\
++		: "r" (base),						\
++		  "i" (op));
++
++#define cache32_unroll32_user(base,op)                                  \
++	__asm__ __volatile__(						\
++	"	.set push					\n"	\
++	"	.set noreorder					\n"	\
++	"       .set eva                                        \n"     \
++	"       cachee %1, 0x000(%0); cachee %1, 0x020(%0)      \n"     \
++	"       cachee %1, 0x040(%0); cachee %1, 0x060(%0)      \n"     \
++	"       cachee %1, 0x080(%0); cachee %1, 0x0a0(%0)      \n"     \
++	"       cachee %1, 0x0c0(%0); cachee %1, 0x0e0(%0)      \n"     \
++	"       cachee %1, 0x100(%0); cachee %1, 0x120(%0)      \n"     \
++	"       cachee %1, 0x140(%0); cachee %1, 0x160(%0)      \n"     \
++	"       cachee %1, 0x180(%0); cachee %1, 0x1a0(%0)      \n"     \
++	"       cachee %1, 0x1c0(%0); cachee %1, 0x1e0(%0)      \n"     \
++	"       cachee %1, 0x200(%0); cachee %1, 0x220(%0)      \n"     \
++	"       cachee %1, 0x240(%0); cachee %1, 0x260(%0)      \n"     \
++	"       cachee %1, 0x280(%0); cachee %1, 0x2a0(%0)      \n"     \
++	"       cachee %1, 0x2c0(%0); cachee %1, 0x2e0(%0)      \n"     \
++	"       cachee %1, 0x300(%0); cachee %1, 0x320(%0)      \n"     \
++	"       cachee %1, 0x340(%0); cachee %1, 0x360(%0)      \n"     \
++	"       cachee %1, 0x380(%0); cachee %1, 0x3a0(%0)      \n"     \
++	"       cachee %1, 0x3c0(%0); cachee %1, 0x3e0(%0)      \n"     \
++	"	.set pop					\n"	\
++		:							\
++		: "r" (base),						\
++		  "i" (op));
++
++#define cache64_unroll32_user(base,op)                                  \
++	__asm__ __volatile__(						\
++	"	.set push					\n"	\
++	"	.set noreorder					\n"	\
++	"       .set eva                                        \n"     \
++	"       cachee %1, 0x000(%0); cachee %1, 0x040(%0)      \n"     \
++	"       cachee %1, 0x080(%0); cachee %1, 0x0c0(%0)      \n"     \
++	"       cachee %1, 0x100(%0); cachee %1, 0x140(%0)      \n"     \
++	"       cachee %1, 0x180(%0); cachee %1, 0x1c0(%0)      \n"     \
++	"       cachee %1, 0x200(%0); cachee %1, 0x240(%0)      \n"     \
++	"       cachee %1, 0x280(%0); cachee %1, 0x2c0(%0)      \n"     \
++	"       cachee %1, 0x300(%0); cachee %1, 0x340(%0)      \n"     \
++	"       cachee %1, 0x380(%0); cachee %1, 0x3c0(%0)      \n"     \
++	"       cachee %1, 0x400(%0); cachee %1, 0x440(%0)      \n"     \
++	"       cachee %1, 0x480(%0); cachee %1, 0x4c0(%0)      \n"     \
++	"       cachee %1, 0x500(%0); cachee %1, 0x540(%0)      \n"     \
++	"       cachee %1, 0x580(%0); cachee %1, 0x5c0(%0)      \n"     \
++	"       cachee %1, 0x600(%0); cachee %1, 0x640(%0)      \n"     \
++	"       cachee %1, 0x680(%0); cachee %1, 0x6c0(%0)      \n"     \
++	"       cachee %1, 0x700(%0); cachee %1, 0x740(%0)      \n"     \
++	"       cachee %1, 0x780(%0); cachee %1, 0x7c0(%0)      \n"     \
++	"	.set pop					\n"	\
++		:							\
++		: "r" (base),						\
++		  "i" (op));
++
++#define cache128_unroll32_user(base,op)                                 \
++	__asm__ __volatile__(						\
++	"	.set push					\n"	\
++	"	.set noreorder					\n"	\
++	"       .set eva                                        \n"     \
++	"       cachee %1, 0x000(%0); cachee %1, 0x080(%0)      \n"     \
++	"       cachee %1, 0x100(%0); cachee %1, 0x180(%0)      \n"     \
++	"       cachee %1, 0x200(%0); cachee %1, 0x280(%0)      \n"     \
++	"       cachee %1, 0x300(%0); cachee %1, 0x380(%0)      \n"     \
++	"       cachee %1, 0x400(%0); cachee %1, 0x480(%0)      \n"     \
++	"       cachee %1, 0x500(%0); cachee %1, 0x580(%0)      \n"     \
++	"       cachee %1, 0x600(%0); cachee %1, 0x680(%0)      \n"     \
++	"       cachee %1, 0x700(%0); cachee %1, 0x780(%0)      \n"     \
++	"       cachee %1, 0x800(%0); cachee %1, 0x880(%0)      \n"     \
++	"       cachee %1, 0x900(%0); cachee %1, 0x980(%0)      \n"     \
++	"       cachee %1, 0xa00(%0); cachee %1, 0xa80(%0)      \n"     \
++	"       cachee %1, 0xb00(%0); cachee %1, 0xb80(%0)      \n"     \
++	"       cachee %1, 0xc00(%0); cachee %1, 0xc80(%0)      \n"     \
++	"       cachee %1, 0xd00(%0); cachee %1, 0xd80(%0)      \n"     \
++	"       cachee %1, 0xe00(%0); cachee %1, 0xe80(%0)      \n"     \
++	"       cachee %1, 0xf00(%0); cachee %1, 0xf80(%0)      \n"     \
++	"	.set pop					\n"	\
++		:							\
++		: "r" (base),						\
++		  "i" (op));
++#endif
++
+ /* build blast_xxx, blast_xxx_page, blast_xxx_page_indexed */
+ #define __BUILD_BLAST_CACHE(pfx, desc, indexop, hitop, lsize) \
+ static inline void blast_##pfx##cache##lsize(void)			\
+@@ -413,6 +543,33 @@ __BUILD_BLAST_CACHE(inv_s, scache, Index_Writeback_Inv_SD, Hit_Invalidate_SD, 32
+ __BUILD_BLAST_CACHE(inv_s, scache, Index_Writeback_Inv_SD, Hit_Invalidate_SD, 64)
+ __BUILD_BLAST_CACHE(inv_s, scache, Index_Writeback_Inv_SD, Hit_Invalidate_SD, 128)
+ 
++#ifdef CONFIG_EVA
++
++#define __BUILD_BLAST_USER_CACHE(pfx, desc, indexop, hitop, lsize) \
++static inline void blast_##pfx##cache##lsize##_user_page(unsigned long page) \
++{									\
++	unsigned long start = page;					\
++	unsigned long end = page + PAGE_SIZE;				\
++									\
++	__##pfx##flush_prologue						\
++									\
++	do {								\
++		cache##lsize##_unroll32_user(start, hitop);             \
++		start += lsize * 32;					\
++	} while (start < end);						\
++									\
++	__##pfx##flush_epilogue						\
++}
++
++__BUILD_BLAST_USER_CACHE(d, dcache, Index_Writeback_Inv_D, Hit_Writeback_Inv_D, 16)
++__BUILD_BLAST_USER_CACHE(i, icache, Index_Invalidate_I, Hit_Invalidate_I, 16)
++__BUILD_BLAST_USER_CACHE(d, dcache, Index_Writeback_Inv_D, Hit_Writeback_Inv_D, 32)
++__BUILD_BLAST_USER_CACHE(i, icache, Index_Invalidate_I, Hit_Invalidate_I, 32)
++__BUILD_BLAST_USER_CACHE(d, dcache, Index_Writeback_Inv_D, Hit_Writeback_Inv_D, 64)
++__BUILD_BLAST_USER_CACHE(i, icache, Index_Invalidate_I, Hit_Invalidate_I, 64)
++
++#endif
++
+ /* build blast_xxx_range, protected_blast_xxx_range */
+ #define __BUILD_BLAST_CACHE_RANGE(pfx, desc, hitop, prot) \
+ static inline void prot##blast_##pfx##cache##_range(unsigned long start, \
+@@ -425,7 +582,7 @@ static inline void prot##blast_##pfx##cache##_range(unsigned long start, \
+ 	__##pfx##flush_prologue						\
+ 									\
+ 	while (1) {							\
+-		prot##cache_op(hitop, addr);				\
++		prot##cache_op(hitop, addr);                            \
+ 		if (addr == aend)					\
+ 			break;						\
+ 		addr += lsize;						\
+@@ -434,10 +591,49 @@ static inline void prot##blast_##pfx##cache##_range(unsigned long start, \
+ 	__##pfx##flush_epilogue						\
+ }
+ 
++#ifndef CONFIG_EVA
++
+ __BUILD_BLAST_CACHE_RANGE(d, dcache, Hit_Writeback_Inv_D, protected_)
+-__BUILD_BLAST_CACHE_RANGE(s, scache, Hit_Writeback_Inv_SD, protected_)
+ __BUILD_BLAST_CACHE_RANGE(i, icache, Hit_Invalidate_I, protected_)
++
++#else
++
++#define __BUILD_PROT_BLAST_CACHE_RANGE(pfx, desc, hitop)                \
++static inline void protected_blast_##pfx##cache##_range(unsigned long start, \
++						    unsigned long end)	\
++{									\
++	unsigned long lsize = cpu_##desc##_line_size();			\
++	unsigned long addr = start & ~(lsize - 1);			\
++	unsigned long aend = (end - 1) & ~(lsize - 1);			\
++									\
++	__##pfx##flush_prologue						\
++									\
++	if (segment_eq(get_fs(), USER_DS))                              \
++		while (1) {                                             \
++			protected_cachee_op(hitop, addr);               \
++			if (addr == aend)                               \
++				break;                                  \
++			addr += lsize;                                  \
++		}                                                       \
++	else                                                            \
++		while (1) {                                             \
++			protected_cache_op(hitop, addr);                \
++			if (addr == aend)                               \
++				break;                                  \
++			addr += lsize;                                  \
++		}                                                       \
++									\
++	__##pfx##flush_epilogue						\
++}
++
++__BUILD_PROT_BLAST_CACHE_RANGE(d, dcache, Hit_Writeback_Inv_D)
++__BUILD_PROT_BLAST_CACHE_RANGE(i, icache, Hit_Invalidate_I)
++
++#endif
++
++__BUILD_BLAST_CACHE_RANGE(s, scache, Hit_Writeback_Inv_SD, protected_)
+ __BUILD_BLAST_CACHE_RANGE(d, dcache, Hit_Writeback_Inv_D, )
++__BUILD_BLAST_CACHE_RANGE(i, icache, Hit_Invalidate_I, )
+ __BUILD_BLAST_CACHE_RANGE(s, scache, Hit_Writeback_Inv_SD, )
+ /* blast_inv_dcache_range */
+ __BUILD_BLAST_CACHE_RANGE(inv_d, dcache, Hit_Invalidate_D, )
+diff --git a/arch/mips/kernel/ftrace.c b/arch/mips/kernel/ftrace.c
+index dba90ec..d635ba2 100644
+--- a/arch/mips/kernel/ftrace.c
++++ b/arch/mips/kernel/ftrace.c
+@@ -87,6 +87,7 @@ static inline void ftrace_dyn_arch_init_insns(void)
+ static int ftrace_modify_code(unsigned long ip, unsigned int new_code)
+ {
+ 	int faulted;
++	mm_segment_t old_fs;
+ 
+ 	/* *(unsigned int *)ip = new_code; */
+ 	safe_store_code(new_code, ip, faulted);
+@@ -94,7 +95,10 @@ static int ftrace_modify_code(unsigned long ip, unsigned int new_code)
+ 	if (unlikely(faulted))
+ 		return -EFAULT;
+ 
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
+ 	flush_icache_range(ip, ip + 8);
++	set_fs(old_fs);
+ 
+ 	return 0;
+ }
+diff --git a/arch/mips/kernel/kgdb.c b/arch/mips/kernel/kgdb.c
+index fcaac2f..284f84b 100644
+--- a/arch/mips/kernel/kgdb.c
++++ b/arch/mips/kernel/kgdb.c
+@@ -32,6 +32,7 @@
+ #include <asm/cacheflush.h>
+ #include <asm/processor.h>
+ #include <asm/sigcontext.h>
++#include <asm/uaccess.h>
+ 
+ static struct hard_trap_info {
+ 	unsigned char tt;	/* Trap type code for MIPS R3xxx and R4xxx */
+@@ -208,7 +209,14 @@ void arch_kgdb_breakpoint(void)
+ 
+ static void kgdb_call_nmi_hook(void *ignored)
+ {
++	mm_segment_t old_fs;
++
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
++
+ 	kgdb_nmicallback(raw_smp_processor_id(), NULL);
++
++	set_fs(old_fs);
+ }
+ 
+ void kgdb_roundup_cpus(unsigned long flags)
+@@ -282,6 +290,7 @@ static int kgdb_mips_notify(struct notifier_block *self, unsigned long cmd,
+ 	struct die_args *args = (struct die_args *)ptr;
+ 	struct pt_regs *regs = args->regs;
+ 	int trap = (regs->cp0_cause & 0x7c) >> 2;
++	mm_segment_t old_fs;
+ 
+ #ifdef CONFIG_KPROBES
+ 	/*
+@@ -296,11 +305,16 @@ static int kgdb_mips_notify(struct notifier_block *self, unsigned long cmd,
+ 	if (user_mode(regs))
+ 		return NOTIFY_DONE;
+ 
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
++
+ 	if (atomic_read(&kgdb_active) != -1)
+ 		kgdb_nmicallback(smp_processor_id(), regs);
+ 
+-	if (kgdb_handle_exception(trap, compute_signal(trap), cmd, regs))
++	if (kgdb_handle_exception(trap, compute_signal(trap), cmd, regs)) {
++		set_fs(old_fs);
+ 		return NOTIFY_DONE;
++	}
+ 
+ 	if (atomic_read(&kgdb_setting_breakpoint))
+ 		if ((trap == 9) && (regs->cp0_epc == (unsigned long)breakinst))
+@@ -310,6 +324,7 @@ static int kgdb_mips_notify(struct notifier_block *self, unsigned long cmd,
+ 	local_irq_enable();
+ 	__flush_cache_all();
+ 
++	set_fs(old_fs);
+ 	return NOTIFY_STOP;
+ }
+ 
+diff --git a/arch/mips/kernel/smp-cmp.c b/arch/mips/kernel/smp-cmp.c
+index 5969f1e..7267dcf 100644
+--- a/arch/mips/kernel/smp-cmp.c
++++ b/arch/mips/kernel/smp-cmp.c
+@@ -147,7 +147,7 @@ static void cmp_boot_secondary(int cpu, struct task_struct *idle)
+ 
+ #if 0
+ 	/* Needed? */
+-	flush_icache_range((unsigned long)gp,
++	local_flush_icache_range((unsigned long)gp,
+ 			   (unsigned long)(gp + sizeof(struct thread_info)));
+ #endif
+ 
+diff --git a/arch/mips/kernel/smp-mt.c b/arch/mips/kernel/smp-mt.c
+index 3e5164c..2f8c468 100644
+--- a/arch/mips/kernel/smp-mt.c
++++ b/arch/mips/kernel/smp-mt.c
+@@ -213,8 +213,8 @@ static void __cpuinit vsmp_boot_secondary(int cpu, struct task_struct *idle)
+ 	/* global pointer */
+ 	write_tc_gpr_gp((unsigned long)gp);
+ 
+-	flush_icache_range((unsigned long)gp,
+-			   (unsigned long)(gp + sizeof(struct thread_info)));
++	local_flush_icache_range((unsigned long)gp,
++			(unsigned long)(gp + sizeof(struct thread_info)));
+ 
+ 	/* finally out of configuration and into chaos */
+ 	clear_c0_mvpcontrol(MVPCONTROL_VPC);
+diff --git a/arch/mips/kernel/vpe.c b/arch/mips/kernel/vpe.c
+index 1765bab..4169541 100644
+--- a/arch/mips/kernel/vpe.c
++++ b/arch/mips/kernel/vpe.c
+@@ -832,6 +832,7 @@ static int vpe_elfload(struct vpe * v)
+ 	char *secstrings, *strtab = NULL;
+ 	unsigned int len, i, symindex = 0, strindex = 0, relocate = 0;
+ 	struct module mod;	// so we can re-use the relocations code
++	mm_segment_t old_fs;
+ 
+ 	memset(&mod, 0, sizeof(struct module));
+ 	strcpy(mod.name, "VPE loader");
+@@ -973,8 +974,12 @@ static int vpe_elfload(struct vpe * v)
+ 	}
+ 
+ 	/* make sure it's physically written out */
++	/* flush the icache in correct context */
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
+ 	flush_icache_range((unsigned long)v->load_addr,
+ 			   (unsigned long)v->load_addr + v->len);
++	set_fs(old_fs);
+ 
+ 	if ((find_vpe_symbols(v, sechdrs, symindex, strtab, &mod)) < 0) {
+ 		if (v->__start == 0) {
+diff --git a/arch/mips/mm/c-octeon.c b/arch/mips/mm/c-octeon.c
+index 8557fb5..e59ee0e 100644
+--- a/arch/mips/mm/c-octeon.c
++++ b/arch/mips/mm/c-octeon.c
+@@ -176,6 +176,13 @@ static void octeon_flush_kernel_vmap_range(unsigned long vaddr, int size)
+ 	BUG();
+ }
+ 
++static void octeon_flush_data_cache_range(struct vm_area_struct *vma,
++	struct page *page, unsigned long addr, unsigned long size)
++{
++	octeon_flush_cache_page(vma, addr, page_to_pfn(page));
++}
++
++
+ /**
+  * Probe Octeon's caches
+  *
+@@ -275,6 +282,7 @@ void __cpuinit octeon_cache_init(void)
+ 	flush_cache_sigtramp		= octeon_flush_cache_sigtramp;
+ 	flush_icache_all		= octeon_flush_icache_all;
+ 	flush_data_cache_page		= octeon_flush_data_cache_page;
++	mips_flush_data_cache_range     = octeon_flush_data_cache_range;
+ 	flush_icache_range		= octeon_flush_icache_range;
+ 	local_flush_icache_range	= local_octeon_flush_icache_range;
+ 
+diff --git a/arch/mips/mm/c-r3k.c b/arch/mips/mm/c-r3k.c
+index 704dc73..6131e75 100644
+--- a/arch/mips/mm/c-r3k.c
++++ b/arch/mips/mm/c-r3k.c
+@@ -274,6 +274,12 @@ static void r3k_flush_data_cache_page(unsigned long addr)
+ {
+ }
+ 
++static void r3_mips_flush_data_cache_range(struct vm_area_struct *vma,
++	struct page *page, unsigned long addr, unsigned long size)
++{
++	r3k_flush_cache_page(vma, addr, page_to_pfn(page));
++}
++
+ static void r3k_flush_cache_sigtramp(unsigned long addr)
+ {
+ 	unsigned long flags;
+@@ -322,7 +328,7 @@ void __cpuinit r3k_cache_init(void)
+ 	flush_cache_all = r3k_flush_cache_all;
+ 	__flush_cache_all = r3k___flush_cache_all;
+ 	flush_cache_mm = r3k_flush_cache_mm;
+-	flush_cache_range = r3k_flush_cache_range;
++	mips_flush_cache_range = r3k_mips_flush_cache_range;
+ 	flush_cache_page = r3k_flush_cache_page;
+ 	flush_icache_range = r3k_flush_icache_range;
+ 	local_flush_icache_range = r3k_flush_icache_range;
+@@ -332,6 +338,7 @@ void __cpuinit r3k_cache_init(void)
+ 	flush_cache_sigtramp = r3k_flush_cache_sigtramp;
+ 	local_flush_data_cache_page = local_r3k_flush_data_cache_page;
+ 	flush_data_cache_page = r3k_flush_data_cache_page;
++	flush_data_cache_range = r3_flush_data_cache_range;
+ 
+ 	_dma_cache_wback_inv = r3k_dma_cache_wback_inv;
+ 	_dma_cache_wback = r3k_dma_cache_wback_inv;
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index 6d618cb..ea227e9 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -6,6 +6,7 @@
+  * Copyright (C) 1996 David S. Miller (davem@davemloft.net)
+  * Copyright (C) 1997, 1998, 1999, 2000, 2001, 2002 Ralf Baechle (ralf@gnu.org)
+  * Copyright (C) 1999, 2000 Silicon Graphics, Inc.
++ * Copyright (C) 2012, MIPS Technology, Leonid Yegoshin (yegoshin@mips.com)
+  */
+ #include <linux/hardirq.h>
+ #include <linux/init.h>
+@@ -46,6 +47,11 @@
+  *  o doesn't disable interrupts on the local CPU
+  *
+  *  Note: this function is used now for address cacheops only
++ *
++ *  Note2: It is unsafe to use address cacheops via SMP call, other CPU may not
++ *         have this process address map (ASID) loaded into EntryHI and
++ *         it usualy requires some tricks, which are absent from this file.
++ *         Cross-CPU address cacheops are much easy and safely.
+  */
+ static inline void r4k_on_each_cpu(void (*func) (void *info), void *info)
+ {
+@@ -178,6 +184,28 @@ static void __cpuinit r4k_blast_dcache_page_setup(void)
+ 		r4k_blast_dcache_page = r4k_blast_dcache_page_dc64;
+ }
+ 
++#ifndef CONFIG_EVA
++#define r4k_blast_dcache_user_page  r4k_blast_dcache_page
++#else
++
++static void (*r4k_blast_dcache_user_page)(unsigned long addr);
++
++static void __cpuinit r4k_blast_dcache_user_page_setup(void)
++{
++	unsigned long  dc_lsize = cpu_dcache_line_size();
++
++	if (dc_lsize == 0)
++		r4k_blast_dcache_user_page = (void *)cache_noop;
++	else if (dc_lsize == 16)
++		r4k_blast_dcache_user_page = blast_dcache16_user_page;
++	else if (dc_lsize == 32)
++		r4k_blast_dcache_user_page = blast_dcache32_user_page;
++	else if (dc_lsize == 64)
++		r4k_blast_dcache_user_page = blast_dcache64_user_page;
++}
++
++#endif
++
+ static void (* r4k_blast_dcache_page_indexed)(unsigned long addr);
+ 
+ static void __cpuinit r4k_blast_dcache_page_indexed_setup(void)
+@@ -298,6 +326,27 @@ static void __cpuinit r4k_blast_icache_page_setup(void)
+ 		r4k_blast_icache_page = blast_icache64_page;
+ }
+ 
++#ifndef CONFIG_EVA
++#define r4k_blast_icache_user_page  r4k_blast_icache_page
++#else
++
++static void (* r4k_blast_icache_user_page)(unsigned long addr);
++
++static void __cpuinit r4k_blast_icache_user_page_setup(void)
++{
++	unsigned long ic_lsize = cpu_icache_line_size();
++
++	if (ic_lsize == 0)
++		r4k_blast_icache_user_page = (void *)cache_noop;
++	else if (ic_lsize == 16)
++		r4k_blast_icache_user_page = blast_icache16_user_page;
++	else if (ic_lsize == 32)
++		r4k_blast_icache_user_page = blast_icache32_user_page;
++	else if (ic_lsize == 64)
++		r4k_blast_icache_user_page = blast_icache64_user_page;
++}
++
++#endif
+ 
+ static void (* r4k_blast_icache_page_indexed)(unsigned long addr);
+ 
+@@ -526,12 +575,10 @@ static inline void local_r4k_flush_cache_range(void * args)
+ static void r4k_flush_cache_range(struct vm_area_struct *vma,
+ 	unsigned long start, unsigned long end)
+ {
+-#ifndef CONFIG_EVA
+ 	int exec = vma->vm_flags & VM_EXEC;
+ 
+ 	if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc))
+ 		r4k_indexop_on_each_cpu(local_r4k_flush_cache_range, vma);
+-#endif
+ }
+ 
+ static inline void local_r4k_flush_cache_mm(void * args)
+@@ -612,9 +659,17 @@ static inline void local_r4k_flush_cache_page(void *args)
+ 	if ((!exec) && !cpu_has_dc_aliases)
+ 		return;
+ 
+-	if ((mm == current->active_mm) && (pte_val(*ptep) & _PAGE_VALID))
+-		vaddr = NULL;
+-	else {
++	if ((mm == current->active_mm) && (pte_val(*ptep) & _PAGE_VALID)) {
++		if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc)) {
++			r4k_blast_dcache_user_page(addr);
++			if (exec && !cpu_has_ic_fills_f_dc)
++				wmb();
++			if (exec && !cpu_icache_snoops_remote_store)
++				r4k_blast_scache_page(addr);
++		}
++		if (exec)
++			r4k_blast_icache_user_page(addr);
++	} else {
+ 		/*
+ 		 * Use kmap_coherent or kmap_atomic to do flushes for
+ 		 * another ASID than the current one.
+@@ -626,47 +681,37 @@ static inline void local_r4k_flush_cache_page(void *args)
+ 		else
+ 			vaddr = kmap_atomic(page);
+ 		addr = (unsigned long)vaddr;
+-	}
+ 
+-	if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc)) {
+-		r4k_blast_dcache_page(addr);
+-		if (exec && !cpu_has_ic_fills_f_dc)
+-			wmb();
+-		if (exec && !cpu_icache_snoops_remote_store)
+-			r4k_blast_scache_page(addr);
+-	}
+-	if (exec) {
+-		if (vaddr && cpu_has_vtag_icache && mm == current->active_mm) {
+-			int cpu = smp_processor_id();
+-
+-			if (cpu_context(cpu, mm) != 0)
+-				drop_mmu_context(mm, cpu);
+-			dontflash = 1;
+-		} else
+-			if (map_coherent || !cpu_has_ic_aliases)
+-#ifndef CONFIG_EVA
+-				r4k_blast_icache_page(addr);
+-#else
+-				r4k_blast_icache();
+-#endif
+-	}
++		if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc)) {
++			r4k_blast_dcache_page(addr);
++			if (exec && !cpu_has_ic_fills_f_dc)
++				wmb();
++			if (exec && !cpu_icache_snoops_remote_store)
++				r4k_blast_scache_page(addr);
++		}
++		if (exec) {
++			if (cpu_has_vtag_icache && mm == current->active_mm) {
++				int cpu = smp_processor_id();
++
++				if (cpu_context(cpu, mm) != 0)
++					drop_mmu_context(mm, cpu);
++				dontflash = 1;
++			} else
++				if (map_coherent || !cpu_has_ic_aliases)
++					r4k_blast_icache_page(addr);
++		}
+ 
+-	if (vaddr) {
+ 		if (map_coherent)
+ 			kunmap_coherent();
+ 		else
+ 			kunmap_atomic(vaddr);
+-	}
+ 
+-	/*  in case of I-cache aliasing - blast it via coherent page */
+-	if (exec && cpu_has_ic_aliases && (!dontflash) && !map_coherent) {
+-		vaddr = kmap_coherent(page, addr);
+-#ifndef CONFIG_EVA
+-		r4k_blast_icache_page((unsigned long)vaddr);
+-#else
+-		r4k_blast_icache();
+-#endif
+-		kunmap_coherent();
++		/*  in case of I-cache aliasing - blast it via coherent page */
++		if (exec && cpu_has_ic_aliases && (!dontflash) && !map_coherent) {
++			vaddr = kmap_coherent(page, addr);
++			r4k_blast_icache_page((unsigned long)vaddr);
++			kunmap_coherent();
++		}
+ 	}
+ }
+ 
+@@ -698,6 +743,45 @@ static void r4k_flush_data_cache_page(unsigned long addr)
+ }
+ 
+ 
++struct mips_flush_data_cache_range_args {
++	struct vm_area_struct *vma;
++	unsigned long start;
++	unsigned long end;
++};
++
++static inline void local_r4k_mips_flush_data_cache_range(void *args)
++{
++	struct mips_flush_data_cache_range_args *f_args = args;
++	unsigned long start = f_args->start;
++	unsigned long end = f_args->end;
++	struct vm_area_struct * vma = f_args->vma;
++
++	blast_dcache_range(start, end);
++
++	if ((vma->vm_flags & VM_EXEC) && !cpu_has_ic_fills_f_dc) {
++		wmb();
++
++		/* vma is given for exec check only, mmap is current,
++		   so - no non-current vma page flush, just user or kernel */
++		protected_blast_icache_range(start, end);
++	}
++}
++
++/* flush dirty kernel data and a corresponding user instructions (if needed).
++   used in copy_to_user_page() */
++static void r4k_mips_flush_data_cache_range(struct vm_area_struct *vma,
++	struct page *page, unsigned long start, unsigned long len)
++{
++	struct mips_flush_data_cache_range_args args;
++
++	args.vma = vma;
++	args.start = start;
++	args.end = start + len;
++
++	r4k_on_each_cpu(local_r4k_mips_flush_data_cache_range, (void *)&args);
++}
++
++
+ struct flush_icache_range_args {
+ 	unsigned long start;
+ 	unsigned long end;
+@@ -705,10 +789,11 @@ struct flush_icache_range_args {
+ 
+ static inline void local_r4k_flush_icache(void *args)
+ {
+-	if (!cpu_has_ic_fills_f_dc)
+-			r4k_blast_dcache();
++	if (!cpu_has_ic_fills_f_dc) {
++		r4k_blast_dcache();
+ 
+-	wmb();
++		wmb();
++	}
+ 
+ 	r4k_blast_icache();
+ }
+@@ -722,9 +807,9 @@ static inline void local_r4k_flush_icache_range_ipi(void *args)
+ 	if (!cpu_has_ic_fills_f_dc) {
+ 		R4600_HIT_CACHEOP_WAR_IMPL;
+ 		protected_blast_dcache_range(start, end);
+-	}
+ 
+-	wmb();
++		wmb();
++	}
+ 
+ 	protected_blast_icache_range(start, end);
+ 
+@@ -738,22 +823,21 @@ static inline void local_r4k_flush_icache_range(unsigned long start, unsigned lo
+ 			r4k_blast_dcache();
+ 		} else {
+ 			R4600_HIT_CACHEOP_WAR_IMPL;
+-			protected_blast_dcache_range(start, end);
++			blast_dcache_range(start, end);
+ 		}
+-	}
+ 
+-	wmb();
++		wmb();
++	}
+ 
+-#ifndef CONFIG_EVA
+ 	if (end - start > icache_size)
+ 		r4k_blast_icache();
+ 	else
+-		protected_blast_icache_range(start, end);
+-#else
+-	r4k_blast_icache();
+-#endif
++		blast_icache_range(start, end);
+ }
+ 
++/* this function can be called for kernel OR user addresses,
++ * kernel is for module, *gdb*. User is for binfmt_a.out/flat
++ * So - take care, check get_fs() */
+ static void r4k_flush_icache_range(unsigned long start, unsigned long end)
+ {
+ 	struct flush_icache_range_args args;
+@@ -857,9 +941,6 @@ static void r4k_dma_cache_inv(unsigned long addr, unsigned long size)
+  */
+ static void local_r4k_flush_cache_sigtramp(void * arg)
+ {
+-#ifdef CONFIG_EVA
+-	__flush_cache_all();
+-#else
+ 	unsigned long ic_lsize = cpu_icache_line_size();
+ 	unsigned long dc_lsize = cpu_dcache_line_size();
+ 	unsigned long sc_lsize = cpu_scache_line_size();
+@@ -890,7 +971,6 @@ static void local_r4k_flush_cache_sigtramp(void * arg)
+ 			:
+ 			: "i" (Hit_Invalidate_I));
+ 	}
+-#endif
+ 	if (MIPS_CACHE_SYNC_WAR)
+ 		__asm__ __volatile__ ("sync");
+ }
+@@ -902,9 +982,7 @@ static void r4k_flush_cache_sigtramp(unsigned long addr)
+ 
+ static void r4k_flush_icache_all(void)
+ {
+-#ifndef CONFIG_EVA
+ 	if (cpu_has_vtag_icache)
+-#endif
+ 		r4k_blast_icache();
+ }
+ 
+@@ -1639,6 +1717,10 @@ void __cpuinit r4k_cache_init(void)
+ 	r4k_blast_scache_page_setup();
+ 	r4k_blast_scache_page_indexed_setup();
+ 	r4k_blast_scache_setup();
++#ifdef CONFIG_EVA
++	r4k_blast_dcache_user_page_setup();
++	r4k_blast_icache_user_page_setup();
++#endif
+ 
+ 	/*
+ 	 * Some MIPS32 and MIPS64 processors have physically indexed caches.
+@@ -1667,6 +1749,7 @@ void __cpuinit r4k_cache_init(void)
+ 	flush_icache_all	= r4k_flush_icache_all;
+ 	local_flush_data_cache_page	= local_r4k_flush_data_cache_page;
+ 	flush_data_cache_page	= r4k_flush_data_cache_page;
++	mips_flush_data_cache_range = r4k_mips_flush_data_cache_range;
+ 	flush_icache_range	= r4k_flush_icache_range;
+ 	local_flush_icache_range	= local_r4k_flush_icache_range;
+ 
+@@ -1691,6 +1774,13 @@ void __cpuinit r4k_cache_init(void)
+ 	 * or not to flush caches.
+ 	 */
+ 	local_r4k___flush_cache_all(NULL);
++#ifdef CONFIG_EVA
++	/* this is done just in case if some address aliasing does exist in
++	   board like old Malta memory map. Doesn't hurt anyway. LY22 */
++	smp_wmb();
++	r4k_blast_scache();
++	smp_wmb();
++#endif
+ 
+ 	coherency_setup();
+ 	board_cache_error_setup = r4k_cache_error_setup;
+diff --git a/arch/mips/mm/c-tx39.c b/arch/mips/mm/c-tx39.c
+index 2257dca..76fe949 100644
+--- a/arch/mips/mm/c-tx39.c
++++ b/arch/mips/mm/c-tx39.c
+@@ -230,6 +230,12 @@ static void tx39_flush_data_cache_page(unsigned long addr)
+ 	tx39_blast_dcache_page(addr);
+ }
+ 
++static void local_flush_data_cache_range(struct vm_area_struct *vma,
++	struct page *page, unsigned long addr, unsigned long size)
++{
++	flush_cache_page(vma, addr, page_to_pfn(page));
++}
++
+ static void tx39_flush_icache_range(unsigned long start, unsigned long end)
+ {
+ 	if (end - start > dcache_size)
+@@ -371,6 +377,7 @@ void __cpuinit tx39_cache_init(void)
+ 
+ 		flush_cache_sigtramp	= (void *) tx39h_flush_icache_all;
+ 		local_flush_data_cache_page	= (void *) tx39h_flush_icache_all;
++		mips_flush_data_cache_range     = (void *) local_flush_data_cache_range;
+ 		flush_data_cache_page	= (void *) tx39h_flush_icache_all;
+ 
+ 		_dma_cache_wback_inv	= tx39h_dma_cache_wback_inv;
+@@ -402,6 +409,7 @@ void __cpuinit tx39_cache_init(void)
+ 
+ 		flush_cache_sigtramp = tx39_flush_cache_sigtramp;
+ 		local_flush_data_cache_page = local_tx39_flush_data_cache_page;
++		mips_flush_data_cache_range     = (void *) local_flush_data_cache_range;
+ 		flush_data_cache_page = tx39_flush_data_cache_page;
+ 
+ 		_dma_cache_wback_inv = tx39_dma_cache_wback_inv;
+diff --git a/arch/mips/mm/cache.c b/arch/mips/mm/cache.c
+index 25625f2..10ad9d0 100644
+--- a/arch/mips/mm/cache.c
++++ b/arch/mips/mm/cache.c
+@@ -45,10 +45,13 @@ EXPORT_SYMBOL_GPL(__flush_kernel_vmap_range);
+ void (*flush_cache_sigtramp)(unsigned long addr);
+ void (*local_flush_data_cache_page)(void * addr);
+ void (*flush_data_cache_page)(unsigned long addr);
++void (*mips_flush_data_cache_range)(struct vm_area_struct *vma,
++      struct page *page, unsigned long addr, unsigned long size);
+ void (*flush_icache_all)(void);
+ 
+ EXPORT_SYMBOL_GPL(local_flush_data_cache_page);
+ EXPORT_SYMBOL(flush_data_cache_page);
++EXPORT_SYMBOL(mips_flush_data_cache_range);
+ EXPORT_SYMBOL(flush_icache_all);
+ 
+ #ifdef CONFIG_DMA_NONCOHERENT
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+index b9fa854..52cd38f 100644
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -237,11 +237,12 @@ void copy_to_user_page(struct vm_area_struct *vma,
+ 	struct page *page, unsigned long vaddr, void *dst, const void *src,
+ 	unsigned long len)
+ {
++	void *vto = NULL;
++
+ 	if (cpu_has_dc_aliases &&
+ 	    page_mapped(page) && !Page_dcache_dirty(page)) {
+-		void *vto = kmap_coherent(page, vaddr) + (vaddr & ~PAGE_MASK);
++		vto = kmap_coherent(page, vaddr) + (vaddr & ~PAGE_MASK);
+ 		memcpy(vto, src, len);
+-		kunmap_coherent();
+ 	} else {
+ 		memcpy(dst, src, len);
+ 		if (cpu_has_dc_aliases)
+@@ -251,10 +252,18 @@ void copy_to_user_page(struct vm_area_struct *vma,
+ 	    (Page_dcache_dirty(page) &&
+ 	     pages_do_alias((unsigned long)dst & PAGE_MASK,
+ 			    vaddr & PAGE_MASK))) {
+-		flush_cache_page(vma, vaddr, page_to_pfn(page));
++		if (vto)
++			mips_flush_data_cache_range(vma, page,
++						    (unsigned long)vto, len);
++		else
++			mips_flush_data_cache_range(vma, page,
++						    (unsigned long)dst, len);
++
+ 		if (cpu_has_dc_aliases)
+ 			ClearPageDcacheDirty(page);
+ 	}
++	if (vto)
++		kunmap_coherent();
+ }
+ 
+ void copy_from_user_page(struct vm_area_struct *vma,
+diff --git a/arch/mips/mti-malta/malta-init.c b/arch/mips/mti-malta/malta-init.c
+index 780aa34..8cbb43a 100644
+--- a/arch/mips/mti-malta/malta-init.c
++++ b/arch/mips/mti-malta/malta-init.c
+@@ -87,7 +87,7 @@ static void __init mips_nmi_setup(void)
+ 		(void *)(CAC_BASE + 0xa80) :
+ 		(void *)(CAC_BASE + 0x380);
+ 	memcpy(base, &except_vec_nmi, 0x80);
+-	flush_icache_range((unsigned long)base, (unsigned long)base + 0x80);
++	local_flush_icache_range((unsigned long)base, (unsigned long)base + 0x80);
+ }
+ 
+ static void __init mips_ejtag_setup(void)
+@@ -99,7 +99,7 @@ static void __init mips_ejtag_setup(void)
+ 		(void *)(CAC_BASE + 0xa00) :
+ 		(void *)(CAC_BASE + 0x300);
+ 	memcpy(base, &except_vec_ejtag_debug, 0x80);
+-	flush_icache_range((unsigned long)base, (unsigned long)base + 0x80);
++	local_flush_icache_range((unsigned long)base, (unsigned long)base + 0x80);
+ }
+ 
+ extern struct plat_smp_ops msmtc_smp_ops;
+-- 
+1.7.1
+

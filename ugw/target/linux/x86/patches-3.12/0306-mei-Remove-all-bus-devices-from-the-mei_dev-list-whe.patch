@@ -1,0 +1,85 @@
+From 02211b9ae0c2b5cad0d52f363348b9f5ee6f3d86 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Mon, 17 Feb 2014 15:13:19 +0200
+Subject: [PATCH 306/441] mei: Remove all bus devices from the mei_dev list
+ when stopping the MEI
+
+When stopping the MEI, we should remove and potentially unregister
+all bus devices queued on the mei_dev linked list.
+
+Change-Id: Ice83b78328c9bf65448716556fbbaa4a60dfbaff
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5dc7574996940a1d7613e287f17d6e6c05614f26)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/bus.c     | 16 ++++++++++++++++
+ drivers/misc/mei/init.c    |  2 ++
+ drivers/misc/mei/mei_dev.h |  1 +
+ drivers/misc/mei/nfc.c     |  8 +-------
+ 4 files changed, 20 insertions(+), 7 deletions(-)
+
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@ -524,6 +524,22 @@ void mei_cl_bus_rx_event(struct mei_cl *
+ 	schedule_work(&device->event_work);
+ }
+ 
++void mei_cl_bus_remove_devices(struct mei_device *dev)
++{
++	struct mei_cl *cl, *next;
++
++	mutex_lock(&dev->device_lock);
++	list_for_each_entry_safe(cl, next, &dev->device_list, device_link) {
++		if (cl->device)
++			mei_cl_remove_device(cl->device);
++
++		list_del(&cl->device_link);
++		mei_cl_unlink(cl);
++		kfree(cl);
++	}
++	mutex_unlock(&dev->device_lock);
++}
++
+ int __init mei_cl_bus_init(void)
+ {
+ 	return bus_register(&mei_cl_bus_type);
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -281,6 +281,8 @@ void mei_stop(struct mei_device *dev)
+ 
+ 	mei_nfc_host_exit(dev);
+ 
++	mei_cl_bus_remove_devices(dev);
++
+ 	mutex_lock(&dev->device_lock);
+ 
+ 	mei_wd_stop(dev);
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -296,6 +296,7 @@ int __mei_cl_async_send(struct mei_cl *c
+ int __mei_cl_send(struct mei_cl *cl, u8 *buf, size_t length);
+ int __mei_cl_recv(struct mei_cl *cl, u8 *buf, size_t length);
+ void mei_cl_bus_rx_event(struct mei_cl *cl);
++void mei_cl_bus_remove_devices(struct mei_device *dev);
+ int mei_cl_bus_init(void);
+ void mei_cl_bus_exit(void);
+ 
+--- a/drivers/misc/mei/nfc.c
++++ b/drivers/misc/mei/nfc.c
+@@ -551,13 +551,7 @@ err:
+ void mei_nfc_host_exit(struct mei_device *dev)
+ {
+ 	struct mei_nfc_dev *ndev = &nfc_dev;
+-
+ 	cancel_work_sync(&ndev->init_work);
++}
+ 
+-	mutex_lock(&dev->device_lock);
+-	if (ndev->cl && ndev->cl->device)
+-		mei_cl_remove_device(ndev->cl->device);
+ 
+-	mei_nfc_free(ndev);
+-	mutex_unlock(&dev->device_lock);
+-}

@@ -1,0 +1,575 @@
+From 5f067cdee73f41312ba2acf2364131104ebb9d7d Mon Sep 17 00:00:00 2001
+From: "Michael L. Walker" <michael.l.walker@intel.com>
+Date: Sat, 20 Feb 2016 12:14:44 -0700
+Subject: [PATCH 353/441] Revert "Title: [RDKB] Puma7 PP Acceleration , set
+ bypass flag for flooded packets" We need to take more time to understand
+ whether this change could bypass other non-rdk-b customers, especially those
+ on UGW where they are doing some pakcet processor changes on the Atom kernel
+
+This reverts commit 48df35c18055edfed3e5cdc988f34c71dcee82a3.
+---
+ include/linux/ti_hil.h  | 332 ++++++++++++++++++++++++++++++++++++++++++++----
+ net/Makefile            |   2 -
+ net/bridge/br_forward.c |   4 -
+ net/ti/Makefile         |  26 ----
+ net/ti/pp/Makefile      |  25 ----
+ net/ti/pp/ti_hil_core.c |  79 ------------
+ 6 files changed, 308 insertions(+), 160 deletions(-)
+ delete mode 100644 net/ti/Makefile
+ delete mode 100644 net/ti/pp/Makefile
+ delete mode 100644 net/ti/pp/ti_hil_core.c
+
+--- a/include/linux/ti_hil.h
++++ b/include/linux/ti_hil.h
+@@ -1,28 +1,66 @@
+ /*
+-  GPL LICENSE SUMMARY
++   This file is provided under a dual BSD/GPLv2 license.  When using or
++   redistributing this file, you may do so under either license.
+ 
+-  Copyright(c) 2016 Intel Corporation.
++   GPL LICENSE SUMMARY
++
++   Copyright(c) 2014-2015 Intel Corporation.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of version 2 of the GNU General Public License as
++   published by the Free Software Foundation.
++
++   This program is distributed in the hope that it will be useful, but
++   WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++   The full GNU General Public License is included in this distribution
++   in the file called LICENSE.GPL.
++
++
++   Contact Information:
++   Intel Corporation
++   2200 Mission College Blvd.
++   Santa Clara, CA  97052
++
++   BSD LICENSE
++
++   Copyright(c) 2014-2015 Intel Corporation. All rights reserved.
++
++   Redistribution and use in source and binary forms, with or without
++   modification, are permitted provided that the following conditions
++   are met:
++
++ * Redistributions of source code must retain the above copyright
++ notice, this list of conditions and the following disclaimer.
++
++ * Redistributions in binary form must reproduce the above copyright
++ notice, this list of conditions and the following disclaimer in
++ the documentation and/or other materials provided with the
++ distribution.
++
++ * Neither the name of Intel Corporation nor the names of its
++ contributors may be used to endorse or promote products derived
++ from this software without specific prior written permission.
++
++ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++ */
+ 
+-  This program is free software; you can redistribute it and/or modify
+-  it under the terms of version 2 of the GNU General Public License as
+-  published by the Free Software Foundation.
+-
+-  This program is distributed in the hope that it will be useful, but
+-  WITHOUT ANY WARRANTY; without even the implied warranty of
+-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-  General Public License for more details.
+-
+-  You should have received a copy of the GNU General Public License
+-  along with this program; if not, write to the Free Software
+-  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+-  The full GNU General Public License is included in this distribution
+-  in the file called LICENSE.GPL.
+-
+-  Contact Information:
+-    Intel Corporation
+-    2200 Mission College Blvd.
+-    Santa Clara, CA  97052
+-*/
+ 
+ #ifndef __TI_HIL_H__
+ #define __TI_HIL_H__
+@@ -32,19 +70,31 @@
+ #endif /* CONFIG_TI_PACKET_PROCESSOR_STATS */
+ #endif /* KERNEL*/
+ 
++
++#define TI_HIL_PACKET_FLAG_PP_SESSION_INGRESS_RECORDED          0x00000001
+ #define TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS                    0x00000002
+ 
++
++/**************************************************************************
++ ****************************** Module Identifers *************************
++ **************************************************************************/
++
++/* Module Identifers: These describe the module which generated the event. */
++#define TI_DEVICE   1
++#define TI_INET     2
++#define TI_PP       3
++
+ /**************************************************************************
+  **************************** PP Event Identifiers ************************
+  **************************************************************************/
+ 
+ /* List of event identifiers which have been added and are called from various
+  * parts of the networking subsystem to generate events which should be addressed
+- * by the HIL profile.
++ * by the HIL profile. 
+  * To be as intutitive as possible for the HIL profile authors the following naming
+- * convention has been deployed
++ * convention has been deployed 
+  *  TI_<NET-SUBSYSTEM>_<EVENTNAME>
+- * For example: If the bridge generates an event when a FDB is created
++ * For example: If the bridge generates an event when a FDB is created 
+  * the name is TI_BRIDGE_FDBCREATE */
+ 
+ /**************************************************************************
+@@ -57,11 +107,11 @@
+ /* Event generated when an interface is removed from the bridge. */
+ #define TI_BRIDGE_PORT_DELETE        (TI_BRIDGE_EVENT + 0x1)
+ 
+-/* Event generated when an interface moves into the forwarding state.
++/* Event generated when an interface moves into the forwarding state. 
+  * Note: The event needs to be handled only if the system support STP. */
+ #define TI_BRIDGE_PORT_FORWARD       (TI_BRIDGE_EVENT + 0x2)
+ 
+-/* Event generated when an interface is moved into the blocked state.
++/* Event generated when an interface is moved into the blocked state. 
+  * Note: The event needs to be handled only if the system support STP. */
+ #define TI_BRIDGE_PORT_DISABLED      (TI_BRIDGE_EVENT + 0x3)
+ 
+@@ -74,9 +124,243 @@
+ /* Event generated when a packet is flooded onto all interfaces */
+ #define TI_BRIDGE_PACKET_FLOODED     (TI_BRIDGE_EVENT + 0x6)
+ 
++/**************************************************************************
++ **************************** PP Routing Event Identifiers *****************
++ **************************************************************************/
++
++/* Base for all routing PP Event identifiers. */
++#define TI_ROUTE_EVENT              0x10
++
++/* Event generated when a route is added. */
++#define TI_ROUTE_ADDED              (TI_ROUTE_EVENT + 0x1)
++
++/* Event generated when a route is deleted. */
++#define TI_ROUTE_DELETED            (TI_ROUTE_EVENT + 0x2)
++
++/**************************************************************************
++ **************************** PP VLAN Event Identifiers *****************
++ **************************************************************************/
++
++/* Base for all VLAN PP Event identifiers. */
++#define TI_VLAN_EVENT               0x20
++
++/* Event generated when a VLAN device is created. */
++#define TI_VLAN_DEV_CREATED         (TI_VLAN_EVENT + 0x1)
++
++/* Event generated when a VLAN device is deleted. */
++#define TI_VLAN_DEV_DELETED         (TI_VLAN_EVENT + 0x2)
++
++
++/**************************************************************************
++ ********************* PP Connection Tracking Event Identifiers ***********
++ **************************************************************************/
++
++/* Base for all connection tracking PP Event identifiers. */
++#define TI_CT_EVENT                  0x30
++
++/* Event generated when a connection tracking entry has been created. */
++#define TI_CT_ENTRY_CREATED          (TI_CT_EVENT + 0x1)
++
++/* Event generated when a connection tracking entry has timed-out */
++#define TI_CT_DEATH_BY_TIMEOUT       (TI_CT_EVENT + 0x2)
++
++/* Event generated when a Netfilter table is being updated. */
++#define TI_CT_NETFILTER_TABLE_UPDATE (TI_CT_EVENT + 0x3)
++
++/* Event generated once Netfilter decides to drop the packet */
++#define TI_CT_NETFILTER_DISCARD_PKT  (TI_CT_EVENT + 0x4)
++
++/* Event generated once Netfilter decides to cancel drop acceleration */
++#define TI_CT_NETFILTER_CANCEL_DISCARD_ACCELERATION     (TI_CT_EVENT + 0x5)
++
++
++/**************************************************************************
++ ********************* PP Multicast Routing Event Identifiers *************
++ **************************************************************************/
++
++/* Base for all Multicast Routing PP Event identifiers. */
++#define TI_MFC_EVENT                  0x40
++
++/* Event generated when a multicast routing entry is created. */
++#define TI_MFC_ENTRY_CREATED          (TI_MFC_EVENT + 0x1)
++
++/* Event generated when a multicast routing entry is deleted. */
++#define TI_MFC_ENTRY_DELETED          (TI_MFC_EVENT + 0x2)
++
++#define TI_MC_SESSION_DELETED         (TI_MFC_EVENT + 0x3)
++
++/**************************************************************************
++ **************************** PP PPP Event Identifiers *****************
++ **************************************************************************/
++
++/* Base for all PPP PP Event identifiers. */
++#define TI_PPP_EVENT               0x50
++
++/* Event generated when a PPP interface is created. */
++#define TI_PPP_INTERFACE_CREATED    (TI_PPP_EVENT + 0x1)
++
++/* Event generated when a PPP interface is deleted. */
++#define TI_PPP_INTERFACE_SHUTDOWN   (TI_PPP_EVENT + 0x2)
++
++
++/**************************************************************************
++ ************************* PP DOCSIS Event Identifiers ********************
++ **************************************************************************/
++
++/* Base for all DOCSIS PP Event identifiers. */
++#define TI_DOCSIS_EVENT         0x60
++
++/* Event generated when DOCSIS Bridge decides to drop(filter) the packet */
++#define TI_DOCSIS_FLTR_DISCARD_PKT          (TI_DOCSIS_EVENT + 0x1)
++
++/* Event generated when a new filter rule is added */
++#define TI_DOCSIS_FLTR_ADD                  (TI_DOCSIS_EVENT + 0x2)
++
++/* Event generated when a filter rule is deleted */
++#define TI_DOCSIS_FLTR_DEL                  (TI_DOCSIS_EVENT + 0x3)
++
++/* Event generated when a filter rule is being changed */
++#define TI_DOCSIS_FLTR_CHG                  (TI_DOCSIS_EVENT + 0x4)
++
++/* Event generated when a new classifier rule is added */
++#define TI_DOCSIS_CLASSIFY_ADD              (TI_DOCSIS_EVENT + 0x5)
++
++/* Event generated when a classifier rule is deleted */
++#define TI_DOCSIS_CLASSIFY_DEL              (TI_DOCSIS_EVENT + 0x6)
++
++/* Event generated when a classifier rule is being changed */
++#define TI_DOCSIS_CLASSIFY_CHG              (TI_DOCSIS_EVENT + 0x7)
++
++/* Event generated when DSID encoding is being changed, added or deleted */
++#define TI_DOCSIS_DSID_CHG                  (TI_DOCSIS_EVENT + 0x8)
++
++/* Event generated when MCAST filter is deleted */
++#define TI_DOCSIS_MCAST_DEL                 (TI_DOCSIS_EVENT + 0x9)
++
++/* Event generated when need to delete sessions from PP */
++#define TI_DOCSIS_SESSIONS_DEL              (TI_DOCSIS_EVENT + 0xA)
++
++/* Event generated when need to delete voice sessions from PP */
++#define TI_DOCSIS_VOICE_SESSIONS_DEL        (TI_DOCSIS_EVENT + 0xB)
++
++
++
++/**************************************************************************
++ ************************* PP General Event Identifiers *******************
++ **************************************************************************/
++
++/* Base for all general PP Event identifiers. */
++#define TI_PP_GENERAL_EVENT         0x70
++/* Event generated when create vpid */
++#define TI_PP_ADD_VPID          (TI_PP_GENERAL_EVENT + 0x1)
++
++/* Event generated when remove vpid */
++#define TI_PP_REMOVE_VPID       (TI_PP_GENERAL_EVENT + 0x2)
++
++/* DOCSIS Packet processor start/delete session notification defines */
++#define TI_DOCSIS_PP_SESSION_TYPE_FORWARDING                    0x1
++#define TI_DOCSIS_PP_SESSION_TYPE_DISCARDING                    0x2
++
++typedef enum
++{
++    TUNNEL_TYPE_L2TPv3 = 0,
++    TUNNEL_TYPE_GRE_MPLS = 1
++} TUNNEL_TYPE_E;
++
++/**************************************************************************
++ ************************* PP IP Event Identifiers ************************
++ **************************************************************************/
++
++/* Base for all IP PP Event identifiers. */
++#define TI_IP_EVENT                 0x80
++
++/* Event generated for general packet drop */
++#define TI_IP_DISCARD_PKT_IPV4   (TI_IP_EVENT + 0x1)
++#define TI_IP_DISCARD_PKT_IPV6   (TI_IP_EVENT + 0x2)
++
++/**************************************************************************
++ **************************** HIL Profile Structures **********************
++ **************************************************************************/
++
++/* Prototype Declaration for the profile handler. */
++typedef int (*TI_PROFILE_HANDLER)(unsigned int module_id, unsigned long event_id, void* ptr);
++typedef int (*TI_PROFILE_INIT)(void);
++typedef int (*TI_PROFILE_DEINIT)(void);
++
++/**************************************************************************
++ * STRUCTURE NAME : TI_HIL_PROFILE
++ **************************************************************************
++ * DESCRIPTION   :
++ *  The structure describes the HIL Profile.
++ **************************************************************************/
++typedef struct TI_HIL_PROFILE
++{
++    char*               name;
++    TI_PROFILE_INIT     profile_init;
++    TI_PROFILE_HANDLER  profile_handler;
++    TI_PROFILE_DEINIT   profile_deinit;
++}TI_HIL_PROFILE;
++
++/**************************************************************************
++ ********************* PP Multicast Routing Event param *************
++ **************************************************************************/
++struct pp_mr_param {
++	struct vif_device *vif_table;
++    struct mfc_cache *cache;
++};
++
++/**************************************************************************
++ **************************** HIL Core Exported API ***********************
++ **************************************************************************/
++#if defined(__KERNEL__)
++/* Initialization and Cleanup API */
++extern int ti_hil_initialize (void);
++
++/* Profile Management API */
++extern int ti_hil_register_profile (TI_HIL_PROFILE* ptr_profile);
++
++/* This is the API which is used for the event generation to the PP chain.
++ * This should only be used in the networking subsystem to generate events 
++ * which do not already exist and which are needed for the packet processor. 
++ * This is needed only if the packet processor has been built into the system. */
+ #ifdef CONFIG_TI_PACKET_PROCESSOR
+ extern int ti_hil_pp_event(unsigned long val, void *v);
++extern void ti_hil_clone_netdev_pp_info(struct net_device *newDev, struct net_device *origDev);
++
+ #else
+ #define ti_hil_pp_event(val, v)
++#define ti_hil_clone_netdev_pp_info(newDev, origDev)
+ #endif /* CONFIG_TI_PACKET_PROCESSOR */
++
++#ifdef CONFIG_TI_PACKET_PROCESSOR_STATS
++/* DOCSIS Packet processor session notification API */
++typedef int (*TI_HIL_START_SESSION)(unsigned int sessionHandle, 
++                                    unsigned int sessionType,
++                                    struct sk_buff* skb);
++/* DOCSIS Packet processor delete session notification Callback */
++typedef int (*TI_HIL_DELETE_SESSION)(unsigned int sessionHandle, 
++                                     unsigned int sessionPacketsFw,
++									 unsigned long long sessionOcttestsFw);
++
++extern int ti_hil_register_start_session_notification(TI_HIL_START_SESSION ti_hil_start_session_notification);
++extern int ti_hil_unregister_start_session_notification(void);
++extern int ti_hil_register_delete_session_notification(TI_HIL_DELETE_SESSION ti_hil_delete_session_notification);
++extern int ti_hil_unregister_delete_session_notification(void);
++#endif /* CONFIG_TI_PACKET_PROCESSOR_STATS */
++
++#ifdef CONFIG_MACH_PUMA5
++/* Power Saving Mode (PSM) API */
++extern int ti_hil_enable_psm (void);
++extern int ti_hil_disable_psm (void);
++#endif /* CONFIG_MACH_PUMA5 */
++#ifdef CONFIG_INTEL_PP_TUNNEL_SUPPORT
++extern int ti_hil_set_tunnel_mode(unsigned char tunnelMode);
++extern int ti_hil_set_cm_mac_address(unsigned char *cmAddress);
++extern int ti_hil_create_tunnel(char *tunnelHeader, unsigned char tunnelHeaderLen, unsigned char l2L3HeaderLen,
++                         TUNNEL_TYPE_E tunnelType, unsigned char udpMode);
++extern int ti_hil_delete_tunnel(void);
++#endif /*CONFIG_INTEL_PP_TUNNEL_SUPPORT*/
++#endif /*KERNEL*/
+ #endif /* __TI_HIL_H__ */
++
++
+--- a/net/Makefile
++++ b/net/Makefile
+@@ -62,8 +62,6 @@ obj-$(CONFIG_MAC802154)		+= mac802154/
+ 
+ ifeq ($(CONFIG_NET),y)
+ obj-$(CONFIG_SYSCTL)		+= sysctl_net.o
+-# Always Build the TI Extensions
+-obj-y				+= ti/
+ endif
+ obj-$(CONFIG_WIMAX)		+= wimax/
+ obj-$(CONFIG_DNS_RESOLVER)	+= dns_resolver/
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -19,7 +19,6 @@
+ #include <linux/skbuff.h>
+ #include <linux/if_vlan.h>
+ #include <linux/netfilter_bridge.h>
+-#include <linux/ti_hil.h>
+ #include "br_private.h"
+ 
+ static int deliver_clone(const struct net_bridge_port *prev,
+@@ -219,9 +218,6 @@ void br_flood_deliver(struct net_bridge
+ void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
+ 		      struct sk_buff *skb2, bool unicast)
+ {
+-#ifdef CONFIG_TI_PACKET_PROCESSOR
+-	ti_hil_pp_event (TI_BRIDGE_PACKET_FLOODED, (void*)skb);
+-#endif// CONFIG_TI_PACKET_PROCESSOR
+ 	br_flood(br, skb, skb2, __br_forward, unicast, true);
+ }
+ 
+--- a/net/ti/Makefile
++++ /dev/null
+@@ -1,26 +0,0 @@
+-#  GPL LICENSE SUMMARY
+-#
+-#  Copyright(c) 2016 Intel Corporation.
+-#
+-#  This program is free software; you can redistribute it and/or modify
+-#  it under the terms of version 2 of the GNU General Public License as
+-#  published by the Free Software Foundation.
+-#
+-#  This program is distributed in the hope that it will be useful, but
+-#  WITHOUT ANY WARRANTY; without even the implied warranty of
+-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-#  General Public License for more details.
+-#
+-#  You should have received a copy of the GNU General Public License
+-#  along with this program; if not, write to the Free Software
+-#  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+-#  The full GNU General Public License is included in this distribution
+-#  in the file called LICENSE.GPL.
+-#
+-#  Contact Information:
+-#    Intel Corporation
+-#    2200 Mission College Blvd.
+-#    Santa Clara, CA  97052
+-
+-obj-y :=
+-obj-$(CONFIG_TI_PACKET_PROCESSOR) += pp/
+--- a/net/ti/pp/Makefile
++++ /dev/null
+@@ -1,25 +0,0 @@
+-#  GPL LICENSE SUMMARY
+-#
+-#  Copyright(c) 2016 Intel Corporation.
+-#
+-#  This program is free software; you can redistribute it and/or modify
+-#  it under the terms of version 2 of the GNU General Public License as
+-#  published by the Free Software Foundation.
+-#
+-#  This program is distributed in the hope that it will be useful, but
+-#  WITHOUT ANY WARRANTY; without even the implied warranty of
+-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-#  General Public License for more details.
+-#
+-#  You should have received a copy of the GNU General Public License
+-#  along with this program; if not, write to the Free Software
+-#  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+-#  The full GNU General Public License is included in this distribution
+-#  in the file called LICENSE.GPL.
+-#
+-#  Contact Information:
+-#    Intel Corporation
+-#    2200 Mission College Blvd.
+-#    Santa Clara, CA  97052
+-
+-obj-y +=  ti_hil_core.o
+--- a/net/ti/pp/ti_hil_core.c
++++ /dev/null
+@@ -1,79 +0,0 @@
+-/*
+-  GPL LICENSE SUMMARY
+-
+-  Copyright(c) 2016 Intel Corporation.
+-
+-  This program is free software; you can redistribute it and/or modify
+-  it under the terms of version 2 of the GNU General Public License as
+-  published by the Free Software Foundation.
+-
+-  This program is distributed in the hope that it will be useful, but
+-  WITHOUT ANY WARRANTY; without even the implied warranty of
+-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-  General Public License for more details.
+-
+-  You should have received a copy of the GNU General Public License
+-  along with this program; if not, write to the Free Software
+-  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+-  The full GNU General Public License is included in this distribution
+-  in the file called LICENSE.GPL.
+-
+-  Contact Information:
+-    Intel Corporation
+-    2200 Mission College Blvd.
+-    Santa Clara, CA  97052
+-*/
+-
+-/**************************************************************************
+- * FUNCTION NAME : ti_hil_pp_event
+- **************************************************************************
+- * DESCRIPTION   :
+- *  Placeholder for the hil event notifyer.  Remove when full hil layer
+- *  is ported to the Atom SDK.
+- *
+- * RETURNS       :
+- *  0   -   Success
+- *  <0  -   Error
+- **************************************************************************/
+-
+-#include <linux/kernel.h>
+-#include <linux/byteorder/generic.h>
+-#include <linux/ti_hil.h>
+-
+-int ti_hil_pp_event(unsigned long val, void *v)
+-{
+-    struct sk_buff*              skb;
+-    unsigned int                 flags;
+-
+-    /* Handle only the events currently supported in Atom SDK */
+-    switch (val)
+-    {
+-        case TI_BRIDGE_PACKET_FLOODED:
+-        {
+-            /* Event indicates that the packet will now be flooded onto all interfaces. This can happen in any of the following cases:-
+-             *  a) Unicast packet but no matching FDB entry is found.
+-             *  b) Broadcast packet
+-             *  c) Multicast packet but no layer2 extensions eg IGMP snooping exists */
+-            skb = (struct sk_buff*) v;
+-
+-            /* Convert existing flags to host byte order */
+-            flags = ntohl(skb->pp_packet_info->flags);
+-
+-            /* In the intrusive mode profile these packets are not considered as candidates for acceleration so mark the packet BYPASS mode so that the egress hook is bypassed */
+-            flags |= TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS;
+-
+-            /* Convert new flags back to network byte order */
+-            skb->pp_packet_info->flags = htonl(flags);
+-
+-            break;
+-        }
+-
+-        default:
+-        {
+-            printk ("Intrusive -> Does not handle event 0x%x\n", val);
+-            break;
+-        }
+-
+-    }
+-    return 0; 
+-}

@@ -1,0 +1,99 @@
+From 1ae2cf631d152f6823d40eb39c62b2d9128fc4e9 Mon Sep 17 00:00:00 2001
+From: Maciej W. Rozycki <macro@linux-mips.org>
+Date: Tue, 3 Sep 2013 01:29:58 +0100
+Subject: [PATCH 042/105] MIPS: R4k clock source initialization bug fix
+
+This is a fix for a bug introduced with commit
+447cdf2628b59aa513a42785450b348dced26d8a, submitted as archived here:
+http://www.linux-mips.org/cgi-bin/mesg.cgi?a=linux-mips&i=20080312235002.c717dde3.yoichi_yuasa%40tripeaks.co.jp
+regrettably with no further explanation.
+
+The issue is with the CP0 Count register read erratum present on R4000 and
+some R4400 processors.  If this erratum is present, then a read from this
+register that happens around the time it reaches the value stored in the
+CP0 Compare register causes a CP0 timer interrupt that is supposed to
+happen when the values in the two registers match to be missed.  The
+implication for the chips affected is the CP0 timer can be used either as
+a source of a timer interrupt (a clock event) or as a source of a
+high-resolution counter (a clock source), but not both at a time.
+
+The erratum does not affect timer interrupt operation itself, because in
+this case the CP0 Count register is only read while the timer interrupt
+has already been raised, while high-resolution counter references happen
+at random times.
+
+Additionally some systems apparently have issues with the timer interrupt
+line being routed externally and not following the usual CP0 Count/Compare
+semantics.  In this case we don't want to use the R4k clock event.
+
+We've meant to address the erratum and the timer interrupt routing issue
+in time_init, however the commit referred to above broke our solution.
+What we currently have is we enable the R4k clock source if the R4k clock
+event initialization has succeeded (the timer is present and has no timer
+interrupt routing issue) or there is no CP0 Count register read erratum.
+Which gives the following boolean matrix:
+
+clock event | count erratum => clock source
+------------+---------------+--------------
+     0      |       0       |      1 (OK)
+     0      |       1       |      0 (bug!) -> no interference, could use
+     1      |       0       |      1 (OK)
+     1      |       1       |      1 (bug!) -> can't use, interference
+
+What we want instead is to enable the R4k clock source if there is no CP0
+Count register read erratum (obviously) or the R4k clock event
+initialization has *failed* -- because in the latter case we won't be
+using the timer interrupt anyway, so we don't care about any interference
+CP0 Count reads might cause with the interrupt.  This corresponds to the
+following boolean matrix:
+
+clock event | count erratum => clock source
+------------+---------------+--------------
+     0      |       0       |      1
+     0      |       1       |      1
+     1      |       0       |      1
+     1      |       1       |      0
+
+This is implemented here, effectively reverting the problematic commit,
+and a short explanation is given next to code modified so that the
+rationale is known to future readers and confusion is prevented from
+happening here again.
+
+It is worth noting that mips_clockevent_init returns 0 upon success while
+cpu_has_mfc0_count_bug returns 0 upon failure.  This is because the former
+function returns an error code while the latter returns a boolean value.
+To signify the difference I have therefore chosen to compare the result of
+the former call explicitly against 0.
+
+Signed-off-by: Maciej W. Rozycki <macro@linux-mips.org>
+Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+Cc: linux-mips@linux-mips.org
+Patchwork: https://patchwork.linux-mips.org/patch/5799/
+(cherry picked from commit afddce0cc9f22c72e6ee7350a0e90b04aaa470b2)
+---
+ arch/mips/kernel/time.c |   10 +++++++++-
+ 1 files changed, 9 insertions(+), 1 deletions(-)
+
+diff --git a/arch/mips/kernel/time.c b/arch/mips/kernel/time.c
+index 9d686bf..364d26a 100644
+--- a/arch/mips/kernel/time.c
++++ b/arch/mips/kernel/time.c
+@@ -121,6 +121,14 @@ void __init time_init(void)
+ {
+ 	plat_time_init();
+ 
+-	if (!mips_clockevent_init() || !cpu_has_mfc0_count_bug())
++	/*
++	 * The use of the R4k timer as a clock event takes precedence;
++	 * if reading the Count register might interfere with the timer
++	 * interrupt, then we don't use the timer as a clock source.
++	 * We may still use the timer as a clock source though if the
++	 * timer interrupt isn't reliable; the interference doesn't
++	 * matter then, because we don't use the interrupt.
++	 */
++	if (mips_clockevent_init() != 0 || !cpu_has_mfc0_count_bug())
+ 		init_mips_clocksource();
+ }
+-- 
+1.7.1
+

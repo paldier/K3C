@@ -1,0 +1,161 @@
+From 3daa071ab26c4c020d2ce67bcffb61c5b82bc75c Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Tue, 2 Apr 2013 13:34:00 -0700
+Subject: [PATCH 089/105] MIPS: bugfix of Malta PCI bridges loop.
+
+Malta board has two independent bridges for traffic inbound (DMA)
+and outbound (PIO) transactions on PCI bus. If bridges windows overlap
+then loop occurs. It is a problem for new EVA memory map.
+
+Solution is to move PCI devices memory up (above 2GB) in PCI address space
+and restrict the total DMA memory by low 2GB. So, outbound bridge now is
+not transparent because it adds 0x80000000 to addresses in PCI window which
+is located starting from 256MB of physical addresses (system bus) before it
+does access on PCI bus.
+
+PCI BAR devices are filled with 0x9XXXXXXX values now but drivers may still
+use 0x1XXXXXXX physical address (and KSEG1 of kernel virtual addr, of course :)
+
+The problem was observed on PCI graphic board (Matrox G450).
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+(cherry picked from commit 91f8255dc9b099038dc6e17ed9749b8a9623a274)
+---
+ arch/mips/Kconfig                         |    7 ++++---
+ arch/mips/include/asm/mach-malta/spaces.h |   24 ++++++++++++++++++++++--
+ arch/mips/mti-malta/malta-init.c          |    6 ++++--
+ arch/mips/mti-malta/malta-pci.c           |    6 ++++++
+ 4 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index e60b6d1..5b04c19 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -1513,7 +1513,7 @@ config EVA_OLD_MALTA_MAP
+ 	help
+ 	  Choose this option to build EVA kernel for old Malta memory map.
+ 	  All memory are located above 0x80000000 and first 256M is mirrored
+-	  to first 0x80000000. IOCU doesn't work.
++	  to first 0x80000000. IOCU doesn't work with this option.
+ 	  It is designed for systems with RocIt system controller 1.418/1.424
+ 	  and it is kept just for MTI testing purposes. (1.424 can be used
+ 	  with new memory map too).
+@@ -1530,8 +1530,9 @@ config EVA_3GB
+ 	  additional 1GB physical memory. Actually, to minimize changes in
+ 	  drivers and code the same name (KSEG1) will still be used but it's
+ 	  address will be changed. The physical I/O address is still the same.
+-	  On Malta board with old memory map it doesn't give you 3GB but it
+-	  can be used as a start point for development.
++	  On Malta board with old memory map it doesn't give you 3GB
++	  (because of PCI bridges loop) but it can be used as a start point
++	  for development.
+ 
+ if CPU_LOONGSON2F
+ config CPU_NOP_WORKAROUNDS
+diff --git a/arch/mips/include/asm/mach-malta/spaces.h b/arch/mips/include/asm/mach-malta/spaces.h
+index ff1bf24..a8de733 100644
+--- a/arch/mips/include/asm/mach-malta/spaces.h
++++ b/arch/mips/include/asm/mach-malta/spaces.h
+@@ -16,6 +16,9 @@
+ 
+ /* Classic (old) Malta board EVA memory map with system controller RocIt2-1.418
+ 
++   This memory map is traditional but IOCU works only with mirroring 256MB memory
++   and effectively can't be used with EVA.
++
+    Phys memory - 80000000 to ffffffff - 2GB (last 64KB reserved for
+ 		 correct HIGHMEM macros arithmetics)
+    KV memory   - 0 - 7fffffff (2GB) or even higher
+@@ -29,6 +32,13 @@
+    CAC_ADDR      ... it used to revert effect of UNCAC_ADDR
+    VMALLOC is cut to C0000000 to E0000000 (KSEG2)
+    PKMAP/kmap_coherent should be not used - no HIGHMEM
++
++   PCI bus:
++   PCI devices are located in 256MB-512MB of PCI space,
++   phys memory window is located in 2GB-4GB of PCI space.
++
++   Note: CONFIG_EVA_3GB actually gives only 2GB but it shifts IO space up to KSEG3
++	 It is done as a preparation work for non-Malta boards.
+  */
+ 
+ #define PAGE_OFFSET             _AC(0x0, UL)
+@@ -48,10 +58,13 @@
+ 
+ /* New Malta board EVA memory map basic's:
+ 
++   This map is designed for work with IOCU on Malta.
++   IOCU on Malta can't support mirroring of first 256MB in old memory map.
++
+    Phys memory - 00000000 to ffffffff - up to 4GB
+ 		 (last 64KB reserved for correct HIGHMEM macros arithmetics,
+ 		  memory hole 256M-512M is for I/O registers and PCI)
+-		 For EVA_3G the first 512MB are not used, let's use 4GB memory.
++		 For EVA_3GB the first 512MB are not used, let's use 4GB memory.
+    KV memory   - 0 - 7fffffff (2GB) or even higher,
+    Kernel code is located in the same place (80000000) just for keeping
+ 		 the same YAMON and other stuff, at least for now.
+@@ -60,11 +73,18 @@
+    CAC_ADDR      ... it used to revert effect of UNCAC_ADDR
+    VMALLOC is cut to C0000000 to E0000000 (KSEG2)
+    PKMAP/kmap_coherent should be not used - no HIGHMEM
++
++   PCI bus:
++   PCI devices are located in 2GB + (256MB-512MB) of PCI space (non-transparent)
++   phys memory window is located in 0GB-2GB of PCI space.
++
++   Note: 3GB configuration doesn't work until PCI bridges loop problem is fixed
++	 and that code is not finished yet (loop was discovered after work done)
+  */
+ 
+ #define PAGE_OFFSET             _AC(0x0, UL)
+ 
+-#ifdef CONFIG_EVA_3G
++#ifdef CONFIG_EVA_3GB
+ /* skip first 512MB */
+ #define PHYS_OFFSET             _AC(0x20000000, UL)
+ #else
+diff --git a/arch/mips/mti-malta/malta-init.c b/arch/mips/mti-malta/malta-init.c
+index 2ccd53c..1c0cc7c 100644
+--- a/arch/mips/mti-malta/malta-init.c
++++ b/arch/mips/mti-malta/malta-init.c
+@@ -260,15 +260,17 @@ mips_pci_controller:
+ 		MSC_WRITE(MSC01_PCI_P2SCMAPL, mask);
+ #else
+ 		/* New Malta memory map:
+-		   Setup the Malta max memory (4G) for PCI DMA in host bridge
++		   Setup the Malta max memory (2G) for PCI DMA in host bridge
+ 		   in transparent addressing mode, starting from 00000000.
+ 		   Don't believe in registers content */
+-		mask = 0x00000008;
++		mask = 0x80000008;
+ 		MSC_WRITE(MSC01_PCI_BAR0, mask);
+ 
+ 		mask = 0x00000000;
+ 		MSC_WRITE(MSC01_PCI_HEAD4, mask);
++		mask = 0x80000000;
+ 		MSC_WRITE(MSC01_PCI_P2SCMSKL, mask);
++		mask = 0x00000000;
+ 		MSC_WRITE(MSC01_PCI_P2SCMAPL, mask);
+ #endif
+ #endif
+diff --git a/arch/mips/mti-malta/malta-pci.c b/arch/mips/mti-malta/malta-pci.c
+index 37134dd..da8271c 100644
+--- a/arch/mips/mti-malta/malta-pci.c
++++ b/arch/mips/mti-malta/malta-pci.c
+@@ -198,6 +198,12 @@ void __init mips_pcibios_init(void)
+ 		MSC_READ(MSC01_PCI_SC2PMBASL, start);
+ 		MSC_READ(MSC01_PCI_SC2PMMSKL, mask);
+ 		MSC_READ(MSC01_PCI_SC2PMMAPL, map);
++#if defined(CONFIG_EVA) && !defined(CONFIG_EVA_OLD_MALTA_MAP)
++		/* shift PCI devices to upper 2GB, to prevent PCI bridges loop */
++		map |= 0xa0000000;
++		MSC_WRITE(MSC01_PCI_SC2PMMAPL, map);
++		MSC_READ(MSC01_PCI_SC2PMMAPL, map);
++#endif
+ 		msc_mem_resource.start = start & mask;
+ 		msc_mem_resource.end = (start & mask) | ~mask;
+ 		msc_controller.mem_offset = (start & mask) - (map & mask);
+-- 
+1.7.1
+

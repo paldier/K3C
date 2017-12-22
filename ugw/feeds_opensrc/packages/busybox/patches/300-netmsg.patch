@@ -1,0 +1,118 @@
+--- a/include/applets.src.h
++++ b/include/applets.src.h
+@@ -278,6 +278,7 @@ IF_MT(APPLET(mt, _BB_DIR_BIN, _BB_SUID_D
+ IF_MV(APPLET(mv, _BB_DIR_BIN, _BB_SUID_DROP))
+ IF_NAMEIF(APPLET(nameif, _BB_DIR_SBIN, _BB_SUID_DROP))
+ IF_NC(APPLET(nc, _BB_DIR_USR_BIN, _BB_SUID_DROP))
++IF_NETMSG(APPLET(netmsg, _BB_DIR_BIN, _BB_SUID_REQUIRE))
+ IF_NETSTAT(APPLET(netstat, _BB_DIR_BIN, _BB_SUID_DROP))
+ IF_NICE(APPLET(nice, _BB_DIR_BIN, _BB_SUID_DROP))
+ IF_NMETER(APPLET(nmeter, _BB_DIR_USR_BIN, _BB_SUID_DROP))
+--- a/networking/Config.src
++++ b/networking/Config.src
+@@ -623,6 +623,12 @@ config FEATURE_NAMEIF_EXTENDED
+ 	    new_interface_name  mac=00:80:C8:38:91:B5
+ 	    new_interface_name  00:80:C8:38:91:B5
+ 
++config NETMSG
++	bool "netmsg"
++	default n
++	help
++	  simple program for sending udp broadcast messages
++
+ config NETSTAT
+ 	bool "netstat"
+ 	default y
+--- a/networking/Kbuild.src
++++ b/networking/Kbuild.src
+@@ -27,6 +27,7 @@ lib-$(CONFIG_IP)           += ip.o
+ lib-$(CONFIG_IPCALC)       += ipcalc.o
+ lib-$(CONFIG_NAMEIF)       += nameif.o
+ lib-$(CONFIG_NC)           += nc.o
++lib-$(CONFIG_NETMSG)       += netmsg.o
+ lib-$(CONFIG_NETSTAT)      += netstat.o
+ lib-$(CONFIG_NSLOOKUP)     += nslookup.o
+ lib-$(CONFIG_NTPD)         += ntpd.o
+--- /dev/null
++++ b/networking/netmsg.c
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (C) 2006 Felix Fietkau <nbd@openwrt.org>
++ *
++ * This is free software, licensed under the GNU General Public License v2.
++ */
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <netdb.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "busybox.h"
++
++
++#ifndef CONFIG_NETMSG
++int main(int argc, char **argv)
++#else
++int netmsg_main(int argc, char **argv)
++#endif
++{
++	int s;
++	struct sockaddr_in addr;
++	int optval = 1;
++	unsigned char buf[1001];
++
++	if (argc != 3) {
++		fprintf(stderr, "usage: %s <ip> \"<message>\"\n", argv[0]);
++		exit(1);
++	}
++
++	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
++		perror("Opening socket");
++		exit(1);
++	}
++
++	memset(&addr, 0, sizeof(addr));
++	addr.sin_family = AF_INET;
++	addr.sin_addr.s_addr = inet_addr(argv[1]);
++	addr.sin_port = htons(0x1337);
++
++	memset(buf, 0, 1001);
++	buf[0] = 0xde;
++	buf[1] = 0xad;
++
++	strncpy(buf + 2, argv[2], 998);
++
++	if (setsockopt (s, SOL_SOCKET, SO_BROADCAST, (caddr_t) &optval, sizeof (optval)) < 0) {
++		perror("setsockopt()");
++		goto fail;
++	}
++
++	if (sendto(s, buf, 1001, 0, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
++		perror("sendto()");
++		goto fail;
++	}
++
++	return 0;
++	
++fail:
++	close(s);
++	exit(1);
++}
+--- a/include/usage.src.h
++++ b/include/usage.src.h
+@@ -1,3 +1,4 @@
++
+ /* vi: set sw=8 ts=8: */
+ /*
+  * This file suffers from chronically incorrect tabification
+@@ -2961,6 +2962,9 @@ INSERT
+        " or\n" \
+        "$ nameif -c /etc/my_mactab_file\n" \
+ 
++#define netmsg_trivial_usage NOUSAGE_STR
++#define netmsg_full_usage ""
++
+ #define netstat_trivial_usage \
+        "[-laentuwxr"IF_FEATURE_NETSTAT_WIDE("W")IF_FEATURE_NETSTAT_PRG("p")"]"
+ #define netstat_full_usage "\n\n" \

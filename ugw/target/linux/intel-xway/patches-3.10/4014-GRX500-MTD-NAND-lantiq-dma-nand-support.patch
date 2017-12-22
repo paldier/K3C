@@ -1,0 +1,555 @@
+# HG changeset patch
+# Parent d94d83e3542729210a22ab164196bd37e8ea0866
+
+diff --git a/drivers/mtd/nand/xway_dmanand.c b/drivers/mtd/nand/xway_dmanand.c
+--- a/drivers/mtd/nand/xway_dmanand.c
++++ b/drivers/mtd/nand/xway_dmanand.c
+@@ -74,7 +74,11 @@
+ 
+ 
+ /* Project header */
++#ifdef CONFIG_SOC_GRX500
+ #include <lantiq_dma.h>
++#else
++#include <lantiq_dma.h>
++#endif /* CONFIG_SOC_GRX500 */
+ #include <lantiq_soc.h>
+ 
+ #include "xway_dmanand.h"
+@@ -89,16 +93,33 @@
+ #define EBU_NAND_ECC_AC		0xBC
+ 
+ /* DMA nand registers */
++#ifndef CONFIG_SOC_GRX500
+ #define DMA_NAND_NDAC_CTL1	0x10
+ #define DMA_NAND_NDAC_CTL2	0x14
+ #define DMA_NAND_INT_MSK	0x24
+ #define DMA_NAND_INT_STAT	0x28
+ #define DMA_NAND_HSMD_CTL	0x30
++#define DMA_NAND_CSMSG0		0x34
++#define DMA_NAND_CSMSG1		0x38
+ #define DMA_NAND_ND_PARA0	0x3C
+ #define DMA_NAND_ODD_ECC0	0x40
+ #define DMA_NAND_ODD_ECC1	0x44
+ #define DMA_NAND_EVEN_ECC0	0x48
+ #define DMA_NAND_EVEN_ECC1	0x4C
++#else
++#define DMA_NAND_NDAC_CTL1	0x110
++#define DMA_NAND_NDAC_CTL2	0x114
++#define DMA_NAND_INT_MSK	0x124
++#define DMA_NAND_INT_STAT	0x128
++#define DMA_NAND_HSMD_CTL	0x130
++#define DMA_NAND_ND_PARA0	0x13C
++#define DMA_NAND_ODD_ECC0	0x140
++#define DMA_NAND_ODD_ECC1	0x144
++#define DMA_NAND_EVEN_ECC0	0x148
++#define DMA_NAND_EVEN_ECC1	0x14C
++#define DMA_NAND_CSMSG0		0x150
++#define DMA_NAND_CSMSG1		0x154
++#endif /* CONFIG_SOC_GRX500 */
+ 
+ /* nand commands */
+ #define NAND_CMD_ALE		(1 << 2)
+@@ -192,6 +213,17 @@
+ #define SAMSUNG_512_3ADDR	0xec75
+ #define HYNIX_MLC_FLASH		0xaddc
+ 
++#ifndef CONFIG_EVA
++ #define NANDPHYSADDR(x)    CPHYSADDR(x)
++#else
++ #ifdef CONFIG_EVA_2GB
++  #define NANDPHYSADDR(x) CPHYSADDR(x)
++ #else
++  #define NANDPHYSADDR(x) RPHYSADDR(x)
++ #endif
++#endif /* CONFIG_EVA */
++
++
+ static struct dma_device_info *dma_device;
+ static void update_mlc_nand_addr_lp(struct mtd_info *mtd,
+ 							int page_addr, int col, int cmd);
+@@ -229,6 +261,12 @@
+ 	int partial_page_attr;
+ 	int oob_data_status;  /* determines whether oob has data or not */
+ 
++	/* xrx500 extra features */
++	int empty_page_check;	/* Prevent ecc error for blank pages*/
++	int bbt_msg_offset;		/* write bbt msg in dma txcn */
++	int oob_ecc_offset;		/* ecc offset at 8th byte in OOB area */
++	int supports_msg_offset; /* allows customer msg to be written by HW */
++
+ 	u8 chip_info[8];
+ 	u8 multiplane_wr_cmd;
+ 	u8 multiplane_rd_cmd;
+@@ -671,10 +709,12 @@
+ 
+ 	/* if intr has occured, let mtd layer handle the badblock */
+ 	if ((mlc->ecc_status) && (mlc->dma_ecc_mode == 1)) {
+-		ret = check_empty_page((const u8 *) buf, writesize);
+-		if (!ret) {
+-			mlc->ecc_status = 0;
+-			return 0;
++		if (mlc->empty_page_check == 0) {
++			ret = check_empty_page((const u8 *) buf, writesize);
++			if (!ret) {
++				mlc->ecc_status = 0;
++				return 0;
++			}
+ 		}
+ #if defined(NAND_DEBUG)
+ 	int i
+@@ -747,6 +787,8 @@
+ 	int eccsize = chip->ecc.size;
+ 	int *eccpos = chip->ecc.layout->eccpos;
+ 	int page_addr = mlc->current_page;
++	int bbt_offs = chip->bbt_td->offs;
++	int ver_offs = chip->bbt_td->veroffs;
+ 	u8 *ecc_data = chip->buffers->ecccalc;
+ 	const u8 *p = buf;
+ 
+@@ -756,32 +798,58 @@
+ 	/* We would only want to use the EBU method to write into the NAND
+ 	 * flash when there are valid data in the OOB area. Otherwise, it
+ 	 * would suffice to just use the DMA method to write to the NAND
++	 *
++	 * From GRX500, support for customer msg (2 x 32 bit = 8B) is available
++	 * and this method uses the existing DMA based NAND hardware to transfer
++	 * the data to NAND flash (instead of using EBU method. However, note that
++	 * the limitation is only 8B of data is allowed and this is mainly used 
++	 * for BBT signatures. Other means of using the OOB (Filesystem marker, etc)
++	 * needs the EBU method to write into the NAND flash. i.e set supports_msg_offset 
++	 * to zero
+ 	*/
+ 	if (oob_required == 1) {
+ 		pr_info("writing using EBU method at page %d, size: %d oobsize: %d\n",
+ 				page_addr, writesize, mtd->oobsize);
+ 
+ 		mlc->oob_data_status = 1;
+-		/* Update address again for EBU NAND write */
+-		chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, mlc->current_page);
++		if (mlc->supports_msg_offset) {
++			if (bbt_offs >= mtd->oobsize || 
++				ver_offs >= mtd->oobsize) {
++				mlc->oob_data_status = 0;
++				pr_err("%s: OOB offsets bbt: %d, ver: %d, more than oobsize: %d\n",
++						__func__, bbt_offs, ver_offs, mtd->oobsize);
++				return -EBADMSG;
++			}
+ 
+-		for (i = 0; eccsteps; eccsteps--, i += eccbytes, p += eccsize)
+-			reed_solomn_128bytes_ecc(p, &ecc_data[i]);
++			mlc->dma_ecc_mode = 0x1;
++			NAND_CE_SET;
++			chip->write_buf(mtd, tmp_wr_buf, writesize);
++			mlc->oob_data_status = 0;
++			
++			return 0;
++		} else {
++			/* Update address again for EBU NAND write */
++			chip->cmdfunc(mtd, NAND_CMD_SEQIN, 0x00, mlc->current_page);
+ 
+-		for (i = 0; i < chip->ecc.total; i++)
+-			chip->oob_poi[eccpos[i]] = ecc_data[i];
++			for (i = 0; eccsteps; eccsteps--, i += eccbytes, p += eccsize)
++				reed_solomn_128bytes_ecc(p, &ecc_data[i]);
++
++			for (i = 0; i < chip->ecc.total; i++)
++				chip->oob_poi[eccpos[i]] = ecc_data[i];
+ 
+ #if defined(NAND_DEBUG)
+-		for (i = 0; i < writesize; i++) {
+-			if (!(i % 16))
+-				pr_debug("\nbuf[%d]: ", i);
+-			pr_debug("%02x", buf[i]);
+-		}
++			for (i = 0; i < writesize; i++) {
++				if (!(i % 16))
++					pr_debug("\nbuf[%d]: ", i);
++				pr_debug("%02x", buf[i]);
++			}
+ #endif
+ 
+-		write_nand_via_ebu(mtd, chip, buf, writesize, page_addr);
+-		mlc->oob_data_status = 0;
+-		return 0;
++			write_nand_via_ebu(mtd, chip, buf, writesize, page_addr);
++			mlc->oob_data_status = 0;
++			
++			return 0;
++		}
+ 	}
+ 
+ 	/* jffs2 FS does not erase empty pages before writing into them.
+@@ -810,6 +878,7 @@
+ {
+ 	struct dma_device_info *dma_dev = dma_device;
+ 	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct nand_chip *chip = mtd->priv;
+ 	int ret_len;
+ 	int type = mlc->type;
+ 	int page_count = mlc->pcount;
+@@ -820,6 +889,8 @@
+ 	int block_cnt = mlc->pib;
+ 	int page, pagesize = mlc->pagesize;
+ 	int dma_ecc_mode = mlc->dma_ecc_mode;
++	int bbt_offs = chip->bbt_td->offs;
++	int ver_offs = chip->bbt_td->veroffs;
+ 	u32 reg;
+ 
+ 	NAND_ALE_SET;
+@@ -844,10 +915,30 @@
+ 	pr_debug("NAND write PARA0 reg: %08x\n", reg);
+ 	pr_debug("NAND write length: %d, page: %08x\n", len, mlc->current_page);
+ 
++	if ((mlc->bbt_msg_offset) && (mlc->oob_data_status)) {
++		/* BBT pattern @ offset bbt_offs */
++		ltq_dma_nand_w32((chip->oob_poi[bbt_offs + 3] << 24) | 
++						(chip->oob_poi[bbt_offs + 2] << 16) |
++						(chip->oob_poi[bbt_offs + 1] << 8) |
++						chip->oob_poi[bbt_offs], DMA_NAND_CSMSG0);
++		/* version number @ offset ver_offs */
++		ltq_dma_nand_w32((chip->oob_poi[ver_offs + 3] << 24) | 
++						(chip->oob_poi[ver_offs + 2] << 16) |
++						(chip->oob_poi[ver_offs + 1] << 8) |
++						chip->oob_poi[ver_offs], DMA_NAND_CSMSG1);
++	} else {
++		ltq_dma_nand_w32(0xffffffff, DMA_NAND_CSMSG0);
++		ltq_dma_nand_w32(0xffffffff, DMA_NAND_CSMSG1);
++	}
++
++
+ 	ltq_dma_nand_w32(reg, DMA_NAND_ND_PARA0);
+ 	reg = 0x0;
+ 	ltq_dma_nand_w32(0, DMA_NAND_HSMD_CTL);
+-	reg |= (mlc->cs_trigger | (1 << 10) | dma_ecc_mode);
++	reg |= ((mlc->bbt_msg_offset << 17) | (mlc->empty_page_check << 16) | 
++			(mlc->oob_ecc_offset << 11) | mlc->cs_trigger |
++			(1 << 10) | dma_ecc_mode);
++	
+ 	ltq_dma_nand_w32(reg, DMA_NAND_HSMD_CTL);
+ 
+ 	/* Update ndac address registers */
+@@ -928,7 +1019,10 @@
+ 	dma_device_desc_setup(dma_dev, (u8 *) buf, len);
+ 
+ 	reg = 0x0;
+-	reg |= (mlc->cs_trigger | dma_ecc_mode);
++	reg |= ((mlc->bbt_msg_offset << 17) |
++			(mlc->empty_page_check << 16) |
++			(mlc->oob_ecc_offset << 11) |
++			mlc->cs_trigger | dma_ecc_mode);
+ 	ltq_dma_nand_w32(reg, DMA_NAND_HSMD_CTL);
+ 
+ 	/* Update ndac address registers */
+@@ -987,9 +1081,9 @@
+ 				((mlc->addr_cycle) << 16) | (addr_4 << 8) |
+ 				addr_3;
+ 	} else {
+-		mlc->ndac_ctl_2 = (mlc->multiplane_rd_cmd << 19) |
+-						  ((mlc->addr_cycle) << 16) |
+-						  (addr_4 << 8) | addr_3;
++		mlc->ndac_ctl_2 =	(mlc->multiplane_rd_cmd << 19) |
++							((mlc->addr_cycle) << 16) |
++							(addr_4 << 8) | addr_3;
+ 	}
+ 
+ 	pr_debug("ndac_1: %08x, ndac_2: %08x\n", mlc->ndac_ctl_1,
+@@ -1009,9 +1103,9 @@
+ 	u32 addr_3 = 0, addr_4 = 0;
+ 
+ 	mlc->current_page = page_addr;
+-	/* pr_debug("page address: %d\n", page_addr); */
+-	/* pr_debug("multiplane: %d, address cycle: %d",
+-	 * mlc->multiplane_rd_cmd, (mlc->addr_cycle)); */
++	 pr_debug("page address: %d\n", page_addr); 
++	 pr_debug("multiplane: %d, address cycle: %d",
++			mlc->multiplane_rd_cmd, (mlc->addr_cycle)); 
+ 
+ 	if (writesize == 2048) {
+ 		tmp_addr = page_addr << 12;
+@@ -1366,7 +1460,6 @@
+ 		NAND_ALE_CLEAR;
+ 		set_bit(DMA_NAND_EVENT, &mlc->wait_flag);
+ 		wake_up_interruptible(&mlc->dma_nand_wait);
+-
+ 		break;
+ 
+ 	case TX_BUF_FULL_INT:
+@@ -1443,9 +1536,9 @@
+ 		if (mlc->addr_cycle > 2)
+ 			mlc->addr_cycle = 2;
+ 	}
+-	pr_info("writesize: %d, pib: %d\n",
++	pr_debug("writesize: %d, pib: %d\n",
+ 				mtd->writesize,  mlc->pib);
+-	pr_info("writesize: %d, addr cycle: %d\n",
++	pr_debug("writesize: %d, addr cycle: %d\n",
+ 				mlc->pagesize, mlc->addr_cycle);
+ 
+ 	return 0;
+@@ -1574,6 +1667,7 @@
+ 	mlc->pib = 0;
+ 	mlc->oob_data_status = 0;
+ 
++#if 0
+ 	if ((mlc->ecc_strength) && (mlc->ecc_mode))
+ 		chip->ecc.strength = 3;
+ 	else if ((!mlc->ecc_strength) && (mlc->ecc_mode))
+@@ -1582,6 +1676,7 @@
+ 		chip->ecc.strength = 2;
+ 	else
+ 		chip->ecc.strength = 1;
++#endif
+ 
+ 	mtd->bitflip_threshold = chip->ecc.strength;
+ 
+@@ -1593,7 +1688,7 @@
+ 
+ 	chip->cellinfo = id[2];
+ 	extid = id[3];
+-
++	
+ 	if (id[0] == id[6] && id[1] == id[7] &&
+ 		(id[0] == NAND_MFR_SAMSUNG ||
+ 		id[0] == NAND_MFR_HYNIX) &&
+@@ -1658,15 +1753,43 @@
+ 		chip->ecc.bytes = 4;
+ 	else
+ 		chip->ecc.bytes = 3;
+-
+-	/* dummy otherwise nand scan will fail*/
+-	chip->ecc.size = 128;
+-
++	
+ 	pre_allocate_ecc_location(mtd, mlc, chip, mtd->oobsize);
+ 
+ 	return busw;
+ }
+ 
++static void ltq_onfi_driver_settings(struct mtd_info *mtd) 
++{
++	struct dma_nand_priv *mlc = dma_nand_dev;
++	struct nand_chip *chip = mtd->priv;
++	struct nand_onfi_params *p = &chip->onfi_params;
++	u16 id = (p->model[0] << 8 | p->model[1]);
++
++	/* Some ONFI chips which are configured non-onfi way */
++	//if (mlc->chip_id != 0)
++	//	return;
++	
++	mlc->chip_id = (int) id;
++	mlc->addr_cycle = (p->addr_cycles >> 4) + (p->addr_cycles & 0xf);
++	mlc->addr_cycle -= 3;
++	/* multiplane rd/wr commands for ONFI flash */
++	mlc->type = 1; // ONFI complient
++	mlc->multiplane_wr_cmd = 0x80;
++	mlc->multiplane_rd_cmd = 0x0;
++	mlc->partial_page_attr = p->programs_per_page;
++	mlc->plane_mode = 0;
++	
++	if (mlc->ecc_mode)
++		chip->ecc.bytes = 4;
++	else
++		chip->ecc.bytes = 3;
++	
++	pr_info("id: 0x%04x, addr cycle: %d", id, mlc->addr_cycle);
++
++	pre_allocate_ecc_location(mtd, mlc, chip, mtd->oobsize);
++	return;
++}
+ 
+ static int nand_define_flash_bbt(int pagesize, struct nand_chip *chip)
+ {
+@@ -1724,6 +1847,7 @@
+ 	u32 cs_flag = 0;
+ 	struct dma_nand_priv *mlc = dma_nand_dev;
+ 	struct nand_chip *this = mtd->priv;
++
+ 	unsigned long nandaddr = (unsigned long) this->IO_ADDR_W;
+ 	const __be32 *cs = of_get_property(pdev->dev.of_node,
+ 					"lantiq,cs", NULL);
+@@ -1742,6 +1866,15 @@
+ 	/* 0: safe mode, 1: advance mode */
+ 	mlc->ecc_strength = *ecc_strength;
+ 
++    if ((mlc->ecc_strength) && (mlc->ecc_mode))
++        this->ecc.strength = 3;
++    else if ((!mlc->ecc_strength) && (mlc->ecc_mode))
++        this->ecc.strength = 2;
++    else if ((mlc->ecc_strength) && (!mlc->ecc_mode))
++        this->ecc.strength = 2;
++    else
++        this->ecc.strength = 1;
++
+ 	if (cs && (*cs == 0)) {
+ 		mlc->chip_select = 0;
+ 		mlc->cs_trigger = 0x08;
+@@ -1763,8 +1896,18 @@
+ 		mlc->cs_trigger = 0x10;
+ 		cs_flag = NAND_CON_OUT_CS1 | NAND_CON_IN_CS1;
+ 
+-		ltq_ebu_w32(CPHYSADDR(nandaddr)
+-			| ADDSEL1_MASK(2) | ADDSEL1_REGEN, EBU_ADDSEL1);
++        if (of_machine_is_compatible("lantiq,vr9")) {
++            ltq_ebu_w32(NANDPHYSADDR(nandaddr)
++                | ADDSEL1_MASK(2) | ADDSEL1_REGEN, EBU_ADDSEL1);
++        } else if (of_machine_is_compatible("lantiq,grx500")) {
++            ltq_ebu_w32(0x17400051, EBU_ADDSEL0);
++            //ltq_ebu_w32(0x17c00051, EBU_ADDSEL1);
++            ltq_ebu_w32(NANDPHYSADDR(nandaddr)
++                | ADDSEL1_MASK(5) | ADDSEL1_REGEN, EBU_ADDSEL1);
++        } else {
++            ltq_ebu_w32(NANDPHYSADDR(nandaddr)
++                | ADDSEL1_MASK(2) | ADDSEL1_REGEN, EBU_ADDSEL1);
++        }
+ 
+ 		ltq_ebu_w32(BUSCON1_SETUP | BUSCON1_ALEC
+ 			| BUSCON1_BCGEN_RES | BUSCON1_WAITWRC2
+@@ -1776,23 +1919,61 @@
+ 			| NAND_CON_CS_P	| NAND_CON_SE_P
+ 			| NAND_CON_WP_P | NAND_CON_PRE_P
+ 			| cs_flag, EBU_NAND_CON);
++
+ 	} else {
+ 		pr_err("Platform does not support chip select %d\n",
+ 				cs_flag);
+ 	}
+ 
+ 	/* Enable ECC intr. and clear intr status */
++#ifndef CONFIG_SOC_GRX500
+ 	ltq_ebu_w32((ltq_ebu_r32(DMA_NAND_INT_MSK) |
+ 				(0x3 << 5)), DMA_NAND_INT_MSK);
+ 	ltq_ebu_w32((ltq_ebu_r32(DMA_NAND_INT_STAT) |
+ 				(0x3 << 5)), DMA_NAND_INT_STAT);
+-
++#else
++	ltq_dma_nand_w32((ltq_dma_nand_r32(DMA_NAND_INT_MSK) |
++				(0x3 << 5)), DMA_NAND_INT_MSK);
++	ltq_dma_nand_w32((ltq_dma_nand_r32(DMA_NAND_INT_STAT) |
++				(0x3 << 5)), DMA_NAND_INT_STAT);
++#endif
+ 	/* Reset nand chip */
+ 	xway_reset_chip(this);
+ 
+ 	return 0;
+ }
+ 
++struct lantiq_dmanand_cfg {
++	unsigned int has_ecc_offset;
++	unsigned int bbt_msg_offset;
++	unsigned int empty_page_ecc_check;
++	unsigned int supports_msg_offset;
++};
++
++static struct lantiq_dmanand_cfg xway_nand_cfg = {
++	.has_ecc_offset = 0,
++	.bbt_msg_offset = 0,
++	.empty_page_ecc_check = 0,
++	.supports_msg_offset = 0,
++};
++
++static struct lantiq_dmanand_cfg xrx500_nand_cfg = {
++	.has_ecc_offset = 1,
++	.bbt_msg_offset = 1,
++	.empty_page_ecc_check = 1,
++	.supports_msg_offset = 1,
++};
++
++static struct of_device_id xway_dmanand_match_table[] = {
++	{	.compatible = "lantiq,dma-nand-xway", 
++		.data = &xway_nand_cfg
++	},
++	{	.compatible = "lantiq,dma-nand-xrx500",
++		.data = &xrx500_nand_cfg
++	},
++	{},
++};
++
+ static int __init ltq_dmanand_probe(struct platform_device *pdev)
+ {
+ 	int err = 0;
+@@ -1800,6 +1981,8 @@
+ 	struct mtd_partition *mtd_parts = NULL;
+ 	struct nand_chip *this;
+ 	struct resource *res;
++	const struct of_device_id *match;
++	const struct lantiq_dmanand_cfg *config;
+ 	void __iomem *io_base;
+ 
+ 	/* clear address */
+@@ -1811,6 +1994,14 @@
+ 		return err;
+ 	}
+ 
++	match = of_match_device(xway_dmanand_match_table, &pdev->dev);
++	if (match) {
++		config = (const struct lantiq_dmanand_cfg *) match->data;
++	} else {
++		pr_err("%s failed to find matching config data\n", __func__);
++		goto out;
++	}
++
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!res) {
+ 		pr_err("Cannot get platform device for DMA NAND driver\n");
+@@ -1833,11 +2024,21 @@
+ 	}
+ 
+ 	/* set default settings */
++	dma_nand_dev->chip_id = 0x0;
+ 	dma_nand_dev->ndac_ctl_1 = 0x0;
+ 	dma_nand_dev->ndac_ctl_2 = 0x0;
+ 	dma_nand_dev->current_page = 0x0;
+ 	dma_nand_dev->dma_ecc_mode = 1;
+ 
++	dma_nand_dev->empty_page_check = config->empty_page_ecc_check;
++	dma_nand_dev->bbt_msg_offset = config->bbt_msg_offset;
++	dma_nand_dev->oob_ecc_offset = config->has_ecc_offset;
++	dma_nand_dev->supports_msg_offset = config->supports_msg_offset;
++
++	pr_debug("epty pg: %d, bbt_offset: %d, oob_ecc_offset %d, support_msg_offset: %d\n",
++		dma_nand_dev->empty_page_check, dma_nand_dev->bbt_msg_offset, 
++		dma_nand_dev->oob_ecc_offset, dma_nand_dev->supports_msg_offset);
++
+ 	pr_info("Initializing MLCNAND driver\n");
+ 	dma_nand_mtd = kmalloc(sizeof(struct mtd_info) +
+ 				 sizeof(struct nand_chip), GFP_KERNEL);
+@@ -1896,6 +2097,14 @@
+ 	this->cmdfunc = ltq_dmanand_command_lp;
+ 	this->init_size = ltq_pre_scan_chip_info;
+ 
++	/* This is meant for ONFI chips with non-conventional
++	 * oobsize which will cause the nand_scan_tail to pass
++	 * Otherwise, it will complain: No oob scheme defined for oobsize
++	*/
++	this->ecc.layout = &B4_byte_ecc_oobinfo_2048;
++	/* dummy otherwise nand scan will fail*/
++	this->ecc.size = 128;
++	
+ 	err = ltq_nand_dma_setup();
+ 	if (err < 0) {
+ 		pr_err("MLC NAND DMA setup failed\n");
+@@ -1914,6 +2123,11 @@
+ 		goto out;
+ 	}
+ 
++	if (this->onfi_version) {
++		printk("Setting ONFI settings for MLC NAND\n");
++		ltq_onfi_driver_settings(dma_nand_mtd);
++	}
++
+ 	/* read and write buffer MUST BE dma page aligned */
+ 	tmp_rd_buf = kmalloc(dma_nand_mtd->writesize, GFP_KERNEL);
+ 	if (!tmp_rd_buf) {
+@@ -1987,11 +2201,6 @@
+ 	return 0;
+ }
+ 
+-static struct of_device_id xway_dmanand_match_table[] = {
+-	{ .compatible = "lantiq,dma-nand-xway", },
+-	{},
+-};
+-
+ static struct platform_driver xway_dmanand_driver = {
+ 	.remove = ltq_dmanand_exit,
+ 	.driver = {

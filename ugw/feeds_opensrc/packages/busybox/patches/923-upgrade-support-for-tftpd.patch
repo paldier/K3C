@@ -1,0 +1,273 @@
+Index: busybox-1.17.1/networking/Config.src
+===================================================================
+--- busybox-1.17.1.orig/networking/Config.src	2012-10-30 22:06:00.000000000 +0530
++++ busybox-1.17.1/networking/Config.src	2012-10-30 22:06:34.000000000 +0530
+@@ -844,6 +844,13 @@
+ 	  is usually used for simple, small transfers such as a root image
+ 	  for a network-enabled bootloader.
+ 
++config FEATURE_TFTP_UPGRADE_IMAGE
++	bool "Support for upgrade image"
++	depends on FEATURE_TFTP_GET && FEATURE_TFTP_PUT
++	default n
++	help
++	  Support for image upgrade via tftp process.
++
+ config TFTPD
+ 	bool "tftpd"
+ 	default y
+Index: busybox-1.17.1/networking/tftp.c
+===================================================================
+--- busybox-1.17.1.orig/networking/tftp.c	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/tftp.c	2012-10-30 22:07:16.000000000 +0530
+@@ -50,10 +50,17 @@
+ #define ERR_BAD_USER 7
+ #define ERR_BAD_OPT  8
+ 
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++static int ltq_chkImage(const char *name,char *errorMsg,char *img_type,int *iExapndDir);
++#endif
++
+ /* masks coming from getopt32 */
+ enum {
+ 	TFTP_OPT_GET = (1 << 0),
+ 	TFTP_OPT_PUT = (1 << 1),
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++	TFTP_OPT_UPGRADE_IMAGE = (1 << 2),
++#endif
+ 	/* pseudo option: if set, it's tftpd */
+ 	TFTPD_OPT = (1 << 7) * ENABLE_TFTPD,
+ 	TFTPD_OPT_r = (1 << 8) * ENABLE_TFTPD,
+@@ -73,6 +80,9 @@
+ #define IF_GETPUT(...) __VA_ARGS__
+ #define CMD_GET(cmd) ((cmd) & TFTP_OPT_GET)
+ #define CMD_PUT(cmd) ((cmd) & TFTP_OPT_PUT)
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++#define CMD_UPGRADE_IMAGE(cmd) ((cmd) & TFTP_OPT_UPGRADE_IMAGE)
++#endif
+ #endif
+ /* NB: in the code below
+  * CMD_GET(cmd) and CMD_PUT(cmd) are mutually exclusive
+@@ -668,6 +678,14 @@
+ 	const char *blksize_str = TFTP_BLKSIZE_DEFAULT_STR;
+ 	int blksize;
+ # endif
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++	int upgrade = 0;
++	char command[256] = {0};
++	int iRet_chkImage = -1;
++	char temp1[200]={0};
++	char img_type[16] ={0};
++	int iExapndDir = 0;
++#endif
+ 	int result;
+ 	int port;
+ 	IF_GETPUT(int opt;)
+@@ -680,11 +698,18 @@
+ 
+ 	IF_GETPUT(opt =) getopt32(argv,
+ 			IF_FEATURE_TFTP_GET("g") IF_FEATURE_TFTP_PUT("p")
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++			IF_FEATURE_TFTP_UPGRADE_IMAGE("u")
++#endif
+ 				"l:r:" IF_FEATURE_TFTP_BLOCKSIZE("b:"),
+ 			&local_file, &remote_file
+ 			IF_FEATURE_TFTP_BLOCKSIZE(, &blksize_str));
+ 	argv += optind;
+ 
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++	if (CMD_UPGRADE_IMAGE(option_mask32))
++		upgrade = 1;
++#endif
+ # if ENABLE_FEATURE_TFTP_BLOCKSIZE
+ 	/* Check if the blksize is valid:
+ 	 * RFC2348 says between 8 and 65464 */
+@@ -720,6 +745,16 @@
+ # if ENABLE_FEATURE_TFTP_PROGRESS_BAR
+ 	G.file = remote_file;
+ # endif
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++	if(upgrade == 1) {
++		system("/etc/rc.d/free_memory.sh tftp");	//free memory after download
++		/*Free WAN DMA buffers. FIXME: need to get sock info on interface. you can download from wan using web interface!! For now, we assume upgrade from web is from LAN side. and from TR69 is from WAN side */
++		system("killall br2684ctld");
++		system("/bin/mknod /dev/free_dma_dev c 235 0");
++		system("/usr/sbin/free_dma 2 &");
++		sleep(10);
++	}
++#endif
+ 	result = tftp_protocol(
+ 		NULL /*our_lsa*/, peer_lsa,
+ 		local_file, remote_file
+@@ -731,6 +766,23 @@
+ 	if (result != EXIT_SUCCESS && NOT_LONE_DASH(local_file) && CMD_GET(opt)) {
+ 		unlink(local_file);
+ 	}
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++	if(upgrade == 1){
++		iRet_chkImage = ltq_chkImage(local_file, temp1, img_type, &iExapndDir);
++		if(!iRet_chkImage){
++			system("/etc/rc.d/free_memory.sh");	//free memory after download
++			sprintf(command,"/etc/rc.d/invoke_upgrade.sh `pwd`/%s %s %d 1 reboot", local_file, img_type, iExapndDir);
++			fprintf(stderr, "calling command : %s",command);
++			system(command);
++		}else{
++			fprintf(stderr, "Invalid file !!");
++		}
++	}
++	if((upgrade == 1) && (iRet_chkImage)){
++		fprintf(stderr, "Rebooting since process were killed !!");
++		system("reboot");
++	}
++#endif
+ 	return result;
+ }
+ 
+@@ -849,6 +901,133 @@
+ 	goto do_proto;
+ }
+ 
++#if ENABLE_FEATURE_TFTP_UPGRADE_IMAGE
++/******************** DEFINES FOR CHECK IMAGE FUNCTION ******************/
++#define IH_TYPE_INVALID		0	/* Invalid Image		*/
++#define IH_TYPE_STANDALONE	1	/* Standalone Program		*/
++#define IH_TYPE_KERNEL		2	/* OS Kernel Image		*/
++#define IH_TYPE_RAMDISK		3	/* RAMDisk Image		*/
++#define IH_TYPE_MULTI		4	/* Multi-File Image		*/
++#define IH_TYPE_FIRMWARE	5	/* Firmware Image		*/
++#define IH_TYPE_SCRIPT		6	/* Script file			*/
++#define IH_TYPE_FILESYSTEM	7	/* Filesystem Image (any type)	*/
++
++#define IH_MAGIC	0x27051956	/* Image Magic Number		*/
++#define IH_NMLEN		32	/* Image Name Length		*/
++
++typedef struct image_header {
++	uint32_t	ih_magic;	/* Image Header Magic Number	*/
++	uint32_t	ih_hcrc;	/* Image Header CRC Checksum	*/
++	uint32_t	ih_time;	/* Image Creation Timestamp	*/
++	uint32_t	ih_size;	/* Image Data Size		*/
++	uint32_t	ih_load;	/* Data	 Load  Address		*/
++	uint32_t	ih_ep;		/* Entry Point Address		*/
++	uint32_t	ih_dcrc;	/* Image Data CRC Checksum	*/
++	uint8_t		ih_os;		/* Operating System		*/
++	uint8_t		ih_arch;	/* CPU architecture		*/
++	uint8_t		ih_type;	/* Image Type			*/
++	uint8_t		ih_comp;	/* Compression Type		*/
++	char		ih_name[IH_NMLEN];	/* Image Name		*/
++} image_header_t;
++
++#define TEMP_BUF	4096
++
++/* We use our own crc32. Similar to flash_eraseall. */
++static inline uint32_t
++crc32(uint32_t val, const void *ss, int len)
++{
++        const unsigned char *s = ss;
++		uint32_t *crc32_table;
++		crc32_table = crc32_filltable(NULL, 0);
++        while (--len >= 0)
++                val = crc32_table[(val ^ *s++) & 0xff] ^ (val >> 8);
++        return val;
++}
++
++static int ltq_chkImage(const char *name,char *errorMsg,char *img_type,int *iExapndDir)
++{
++	char buf[TEMP_BUF];
++	int fd_img;
++	int len;
++	image_header_t img_header;
++	unsigned int crc;
++	int retval = 0;
++
++	fd_img = open(name,O_RDONLY);
++	if(fd_img <= 0)
++	{
++		sprintf(errorMsg,"Could not open image %s\n",name);
++		retval = 1;
++		goto abort;
++	}
++	read(fd_img,&img_header,sizeof(image_header_t));
++	if(img_header.ih_magic != IH_MAGIC)
++	{
++		sprintf(errorMsg,"The image %s does not contain valid header\n",name);
++		retval = 1;
++		goto abort;
++	}
++
++	crc = 0x00000000 ^ 0xffffffff;
++	len = 0;
++	buf[0]='\0';
++	while((len = read(fd_img,buf,sizeof(buf) - 1)) > 0)
++	{
++		crc = crc32(crc,buf,len);
++		buf[0]='\0';
++	}
++	crc ^= 0xffffffff;
++
++	if(crc != img_header.ih_dcrc)
++	{
++		sprintf(errorMsg,"The image %s does not contain valid checksum",name);
++		retval = 1;
++		goto abort;
++	}
++
++	img_type[0]='\0';
++	if(strstr(img_header.ih_name,"linux") || strstr(img_header.ih_name,"Linux") || img_header.ih_type == IH_TYPE_KERNEL)
++	{
++		strcpy(img_type,"kernel");
++		*iExapndDir = 1;
++
++	} else if(strstr(img_header.ih_name,"uboot") || strstr(img_header.ih_name,"U-Boot"))
++	{
++		strcpy(img_type,"uboot");
++		*iExapndDir = 0;
++	} else if(strstr(img_header.ih_name,"rootfs") || strstr(img_header.ih_name,"Rootfs") || strstr(img_header.ih_name,"RootFS"))
++	{
++		strcpy(img_type,"rootfs");
++		*iExapndDir = 0;
++	} else if(strstr(img_header.ih_name,"firmware") || strstr(img_header.ih_name,"Firmware") || img_header.ih_type == IH_TYPE_FIRMWARE)
++	{
++		strcpy(img_type,"firmware");
++		*iExapndDir = 0;
++	} else if(strstr(img_header.ih_name,"sysconfig") || strstr(img_header.ih_name,"Sysconfig"))
++	{
++		strcpy(img_type,"sysconfig");
++		*iExapndDir = 0;
++	} else if(strstr(img_header.ih_name,"ubootconfig") || strstr(img_header.ih_name,"Ubootconfig"))
++	{
++		strcpy(img_type,"ubootconfig");
++		*iExapndDir = 0;
++	} else if(strstr(img_header.ih_name,"fullimage") || strstr(img_header.ih_name,"Fullimage"))
++	{
++		strcpy(img_type,"fullimage");
++		*iExapndDir = 0;
++	} else if(strstr(img_header.ih_name,"totalimage") || strstr(img_header.ih_name,"Totalimage"))
++	{
++		strcpy(img_type,"totalimage");
++		*iExapndDir = 0;
++	} else
++	{
++		sprintf(errorMsg,"Uploaded image type = %d and name [%s] are unknown. The name could be one of [L|l]inux, [R|r]ootfs, [F|f]irmware, [S|s]ysconfig, [U|u]bootconfig only.\n",img_header.ih_type,img_header.ih_name);
++		retval = 1;
++	}
++abort:
++	return retval;
++}
++#endif /* ENABLE_FEATURE_TFTP_UPGRADE_IMAGE */
+ #endif /* ENABLE_TFTPD */
+ 
+ #endif /* ENABLE_FEATURE_TFTP_GET || ENABLE_FEATURE_TFTP_PUT */
+Index: busybox-1.17.1/include/usage.src.h
+===================================================================
+--- busybox-1.17.1.orig/include/usage.src.h	2012-10-30 22:06:00.000000000 +0530
++++ busybox-1.17.1/include/usage.src.h	2012-10-30 22:06:34.000000000 +0530
+@@ -4351,6 +4351,9 @@
+      "\nOptions:" \
+      "\n	-l FILE	Local FILE" \
+      "\n	-r FILE	Remote FILE" \
++	IF_FEATURE_TFTP_UPGRADE_IMAGE( \
++     "\n	-u	upgrade image" \
++	) \
+ 	IF_FEATURE_TFTP_GET( \
+      "\n	-g	Get file" \
+ 	) \

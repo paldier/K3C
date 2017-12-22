@@ -1,0 +1,920 @@
+diff -Naur linux-atm-2.5.0/configure.in open_linux_atm/configure.in
+--- linux-atm-2.5.0/configure.in	2007-12-30 02:00:55.000000000 +0530
++++ open_linux_atm/configure.in	2009-08-19 16:14:38.000000000 +0530
+@@ -161,6 +161,21 @@
+ 	]
+ )
+ 
++AC_ARG_ENABLE(mpr,
++	[  --enable-ifx-opt         Remove unneeded routines in library (optimized for IFX release)],
++	[
++	case "$enable_ifx_opt" in
++	"" | y | ye | yes | Y | YE | YES )
++		ifx_opt=true
++	;;
++	* )
++		ifx_opt=false
++	;;
++	esac
++	]
++)
++AM_CONDITIONAL(IFX_OPT, test "x$ifx_opt" != xfalse)
++
+ AC_ARG_WITH(kernel-headers,
+ [  --with-kernel-headers=path     use the kernel headers found at path]
+ )
+diff -Naur linux-atm-2.5.0/src/br2684/br2684ctl.c open_linux_atm/src/br2684/br2684ctl.c
+--- linux-atm-2.5.0/src/br2684/br2684ctl.c	2007-12-30 02:34:27.000000000 +0530
++++ open_linux_atm/src/br2684/br2684ctl.c	2009-08-19 16:14:38.000000000 +0530
+@@ -10,6 +10,9 @@
+ #include <atm.h>
+ #include <linux/atmdev.h>
+ #include <linux/atmbr2684.h>
++#include <linux/if.h>
++#include <linux/if_arp.h>
++#include <linux/if_ether.h>
+ #ifndef BR2684_FLAG_ROUTED
+ #warning "Kernel missing routed support for br2684"
+ #define BR2684_FLAG_ROUTED    (1<<16) /* payload is routed, not bridged */
+@@ -24,7 +27,10 @@
+   - Added daemonization code
+   - Added syslog
+   
+-  TODO: Delete interfaces after exit?
++  6/6/2008	Arvind		Fixed the code to handle QoS parameters correctly.
++				Fixed the condition where if the PVC creation fails, then the netdevice is not created.
++  23/07/2008	Lin Mars	Support removal of interface once process is killed.
++				Fix incorrect handle of opened socket
+ */
+ 
+ 
+@@ -39,6 +45,8 @@
+   int payload;
+   char *astr; /* temporary */
+   struct atm_qos reqqos;
++  int is_addr;
++  struct sockaddr addr;
+ };
+ 
+ 
+@@ -48,20 +56,29 @@
+ void fatal(const char *str, int err)
+ {
+   syslog (LOG_ERR,"Fatal: %s; %s", str, strerror(err));
+-  exit(-2);
+-};
+-
+-
+-void exitFunc(void)
+-{
+-  syslog (LOG_NOTICE,"Daemon terminated");
++  //exit(-2);
+ }
+ 
+-
+-void int_signal(int dummy)
++int remove_brif(int fd, int itfnum)
+ {
+-  syslog (LOG_INFO,"Killed by a signal");
+-  exit(0);
++  struct atm_backend_br2684 be;
++  int err = -1;
++
++  if (fd >= 0) {
++    be.backend_num = ATM_BACKEND_BR2684;
++    be.ifspec.method = BR2684_FIND_BYIFNAME;
++    sprintf(be.ifspec.spec.ifname, "nas%d", itfnum);
++    err = ioctl (fd, ATM_DELBACKENDIF, &be);
++    if (err == 0)
++        syslog (LOG_INFO,"Interface nas%d removed", itfnum);
++    else {
++        syslog (LOG_ERR,"Could not remove interface nas%d :%s", itfnum, strerror(errno));
++        close(fd);
++        return(-1);
++    }
++    close(fd);
++  }
++  return 0;
+ }
+ 
+ int create_pidfile(int num)
+@@ -80,18 +97,61 @@
+   return 0;
+ }
+ 
++int remove_pidfile(int num)
++{
++  FILE *pidfile = NULL;
++  char name[32];
++
++  if (num < 0) return -1;
++
++  snprintf(name, 32, "/var/run/br2684ctl-nas%d.pid", num);
++  pidfile = fopen(name, "r");
++  if (pidfile == NULL) 
++	  return -1;
++  fclose(pidfile);
++  remove(name);
++
++  return 0;
++}
++
++void int_signal(int dummy)
++{
++  syslog (LOG_ERR,"Killed by a signal");
++  remove_brif(lastsock, lastitf);
++  remove_pidfile(lastitf);
++  exit(0);
++}
++
++void exitFunc(void)
++{
++  syslog (LOG_ERR,"Daemon terminated");
++  remove_brif(lastsock, lastitf);
++  remove_pidfile(lastitf);
++}
++
++
++/* AV: 
++	Moved to assign_vcc as this causes the creation of a ethernet (netdevice) which is cannot be used if the vcc
++	creation fails.
++*/
++#if 0
+ int create_br(int itfnum, int payload)
+ {
+   int err;
+   
+-  if(lastsock<0) {
++  if(lastsock < 0) 
++  {
+     lastsock = socket(PF_ATMPVC, SOCK_DGRAM, ATM_AAL5);
+   }
+-  if (lastsock<0) {
++  if (lastsock < 0) 
++  {
+     syslog(LOG_ERR, "socket creation failed: %s",strerror(errno));
+-  } else {
++  } 
++  else 
++  {
+     /* create the device with ioctl: */
+-    if( itfnum>=0 && itfnum<1234567890){
++    if(itfnum >=0 && itfnum < 1234567890)
++	{
+       struct atm_newif_br2684 ni;
+       ni.backend_num = ATM_BACKEND_BR2684;
+       ni.media = BR2684_MEDIA_ETHERNET;
+@@ -101,36 +161,48 @@
+ #endif
+       ni.mtu = 1500;
+       sprintf(ni.ifname, "nas%d", itfnum);
+-      err=ioctl (lastsock, ATM_NEWBACKENDIF, &ni);
++      err = ioctl (lastsock, ATM_NEWBACKENDIF, &ni);
+   
+       if (err == 0)
+-	syslog(LOG_NOTICE, "Interface \"%s\" created sucessfully",ni.ifname);
++		syslog(LOG_NOTICE, "Interface \"%s\" created sucessfully",ni.ifname);
+       else
+-	syslog(LOG_INFO, "Interface \"%s\" could not be created, reason: %s",
+-	       ni.ifname,
+-	       strerror(errno));
+-      lastitf=itfnum;	/* even if we didn't create, because existed, 
+-			assign_vcc wil want to know it! */
+-    } else {
++		syslog(LOG_INFO, "Interface \"%s\" could not be created, reason: %s",
++				ni.ifname,
++				strerror(errno));
++      lastitf = itfnum;	/* even if we didn't create, because existed, 
++			assign_vcc will want to know it! */
++    } 
++	else 
++	{
+       syslog(LOG_ERR,"err: strange interface number %d", itfnum );
+     }
+   }
+-  return 0;
++  return lastsock;
+ }
+-
++#endif //#if 0
+ 
+ int assign_vcc(char *astr, int encap, int payload,
+-               int bufsize, struct atm_qos qos)
++               int bufsize, struct atm_qos qos, int itfnum, struct sockaddr *hwaddr)
+ {
+     int err;
+     struct sockaddr_atmpvc addr;
+-    int fd;
++    int fd, skfd;
+     struct atm_backend_br2684 be;
++    struct ifreq ifr;
++
++    if(itfnum < 0 || itfnum > 1234567890)
++    {
++        syslog(LOG_ERR,"Invalid interface number requested %d",itfnum);
++        return(-1);
++    }
+ 
+     memset(&addr, 0, sizeof(addr));
+-    err=text2atm(astr,(struct sockaddr *)(&addr), sizeof(addr), T2A_PVC);
++    err = text2atm(astr,(struct sockaddr *)(&addr), sizeof(addr), T2A_PVC);
+     if (err!=0)
+-      syslog(LOG_ERR,"Could not parse ATM parameters (error=%d)",err);
++    {
++        syslog(LOG_ERR,"Could not parse ATM parameters (error=%d)",err);
++        return(-2);
++    }
+     
+     syslog(LOG_NOTICE,"Communicating over ATM %d.%d.%d, encapsulation: %s",
+ 	   addr.sap_addr.itf,
+@@ -139,33 +211,77 @@
+ 	   encap?"VC mux":"LLC");
+     
+     if ((fd = socket(PF_ATMPVC, SOCK_DGRAM, ATM_AAL5)) < 0)
+-      syslog(LOG_ERR,"failed to create socket %d, reason: %s", 
+-	     errno,strerror(errno));
+-    
++    {
++        syslog(LOG_ERR,"failed to create socket %d, reason: %s", errno,strerror(errno));
++        return(-3);
++    }
++
++	
+     if (qos.aal == 0) {
+-      qos.aal                     = ATM_AAL5;
+-      qos.txtp.traffic_class      = ATM_UBR;
+-      qos.txtp.max_sdu            = 1524;
+-      qos.txtp.pcr                = ATM_MAX_PCR;
+-      qos.rxtp = qos.txtp;
++        qos.aal                     = ATM_AAL5;
++        /* AV: This should not overide the default QoS. */
++        //qos.txtp.traffic_class      = ATM_UBR;
++        qos.txtp.max_sdu            = 1524;
++        /* AV: This should not overide the default QoS parameters. */
++        //qos.txtp.pcr                = ATM_MAX_PCR;
++        qos.rxtp = qos.txtp;
+     }
+ 
+-    if ( (err=setsockopt(fd,SOL_SOCKET,SO_SNDBUF, &bufsize ,sizeof(bufsize))) )
+-      syslog(LOG_ERR,"setsockopt SO_SNDBUF: (%d) %s",err, strerror(err));
++    if ( (err = setsockopt(fd,SOL_SOCKET,SO_SNDBUF, &bufsize ,sizeof(bufsize))) )
++    {
++        syslog(LOG_ERR,"setsockopt SO_SNDBUF: (%d) %s",err, strerror(err));
++        close(fd);
++        return(-4);
++    }
+     
+     if (setsockopt(fd, SOL_ATM, SO_ATMQOS, &qos, sizeof(qos)) < 0)
+-      syslog(LOG_ERR,"setsockopt SO_ATMQOS %d", errno);
++    {
++        syslog(LOG_ERR,"setsockopt SO_ATMQOS %s", strerror(errno));
++        close(fd);
++        return(-5);
++    }
+ 
+     err = connect(fd, (struct sockaddr*)&addr, sizeof(struct sockaddr_atmpvc));
+     
+     if (err < 0)
+-      fatal("failed to connect on socket", errno);
+-    
+-    /* attach the vcc to device: */
+-    
++    {
++        syslog(LOG_ERR,"failed to connect on socket %s", strerror(errno));
++        close(fd);
++        return(-6);
++    }
++	
++    /* AV: moved here from create_br() */
++    /* attach the vcc to device after creating the device with ioctl: */
++    if(itfnum >=0 && itfnum < 1234567890)
++    {
++        struct atm_newif_br2684 ni;
++        ni.backend_num = ATM_BACKEND_BR2684;
++        ni.media = BR2684_MEDIA_ETHERNET;
++#ifdef BR2684_FLAG_ROUTED
++        if (payload == 0)
++            ni.media |= BR2684_FLAG_ROUTED;
++#endif
++        ni.mtu = 1500;
++        sprintf(ni.ifname, "nas%d", itfnum);
++        err = ioctl (fd, ATM_NEWBACKENDIF, &ni);
++
++        if (err == 0)
++            syslog(LOG_NOTICE, "Interface \"%s\" created sucessfully",ni.ifname);
++        else
++            syslog(LOG_INFO, "Interface \"%s\" could not be created, reason: %s",
++                ni.ifname, strerror(errno));
++        lastitf = itfnum;   /* even if we didn't create, because existed, 
++                               someone else will want to know it! */
++    }
++    else 
++    {
++        syslog(LOG_ERR,"err: strange interface number %d", itfnum);
++        return(-7);
++    }
++		
+     be.backend_num = ATM_BACKEND_BR2684;
+     be.ifspec.method = BR2684_FIND_BYIFNAME;
+-    sprintf(be.ifspec.spec.ifname, "nas%d", lastitf);
++    sprintf(be.ifspec.spec.ifname, "nas%d", itfnum);
+     be.fcs_in = BR2684_FCSIN_NO;
+     be.fcs_out = BR2684_FCSOUT_NO;
+     be.fcs_auto = 0;
+@@ -173,42 +289,113 @@
+     be.has_vpiid = 0;
+     be.send_padding = 0;
+     be.min_size = 0;
+-    err=ioctl (fd, ATM_SETBACKEND, &be);
++    if (hwaddr != NULL) {
++        be.has_addr = 1;
++	memcpy(&(be.addr), hwaddr, sizeof(struct sockaddr));
++    }
++    err = ioctl (fd, ATM_SETBACKEND, &be);
+     if (err == 0)
+-      syslog (LOG_INFO,"Interface configured");
+-    else {
+-      syslog (LOG_ERR,"Could not configure interface:%s",strerror(errno));
+-      exit(2);
++    {
++        syslog (LOG_INFO,"Interface configured");
++    }
++    else 
++    {
++        syslog (LOG_ERR,"Could not configure interface:%s",strerror(errno));
++        close(fd);
++        return(-8);
+     }
++
++    /* AV: Bring up the interface by default. */
++    skfd = socket(AF_INET, SOCK_DGRAM, 0);
++    sprintf(ifr.ifr_name, "nas%d", itfnum);
++    err = ioctl(skfd, SIOCGIFFLAGS, &ifr);
++    if(err)
++        fprintf(stderr, "SIOCGIFFLAGS:%d\n",err);
++    sprintf(ifr.ifr_name, "nas%d", itfnum);
++    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
++    err = ioctl(skfd, SIOCSIFFLAGS, &ifr);
++    if(err)
++        fprintf(stderr, "SIOCGIFFLAGS:%d\n",err);
++    close(skfd);
++
+     return fd ;
+ }
+ 
+-void start_interface(struct br2684_params* params)
++int start_interface(struct br2684_params* params)
+ {
+-  if (params->astr==NULL) {
+-    syslog(LOG_ERR, "Required ATM parameters not specified.");
+-    exit(1);
+-  }
++    int vcc_sock = 0;
+ 
+-  create_br(params->itfnum, params->payload);
+-  assign_vcc(params->astr, params->encap, params->payload, params->sndbuf,
+-	     params->reqqos);
+-}
++    if (params->astr==NULL) {
++        syslog(LOG_ERR, "Required ATM parameters not specified.");
++        exit(1);
++    }
+ 
++    /* AV: Removing this for now as it is moved into the assign_vcc(). */
++    /*br_sock = create_br(params->itfnum, params->payload);
++    if(br_sock)
++    {*/
++        if (params->is_addr == 1)
++            vcc_sock = assign_vcc(params->astr, params->encap, params->payload, params->sndbuf, params->reqqos, params->itfnum, &(params->addr));
++        else
++            vcc_sock = assign_vcc(params->astr, params->encap, params->payload, params->sndbuf, params->reqqos, params->itfnum, NULL);
++    //}
++	
++    return vcc_sock;
++}
+ 
+ void usage(char *s)
+ {
+-  printf("usage: %s [-b] [[-c number] [-e 0|1] [-s sndbuf] [-q qos] [-p 0|1] "
++  printf("usage: %s [-b] [[-c number] [-e 0|1] [-m hwaddr] [-s sndbuf] [-q qos] [-p 0|1] "
+ 	 "[-a [itf.]vpi.vci]*]*\n", s);
+   printf("  encapsulations: 0=llc, 1=vcmux\n  payloads: 0=routed, 1=bridged\n");
+   exit(1);
+ }
+ 
++/* in_ether() is copied from busybox's ifconfig.c */
++static int in_ether(const char *bufp, struct sockaddr *sap)
++{
++	char *ptr;
++	int i, j;
++	unsigned char val;
++	unsigned char c;
++
++	sap->sa_family = ARPHRD_ETHER;
++	ptr = sap->sa_data;
++
++	i = 0;
++	do {
++		j = val = 0;
++
++		/* We might get a semicolon here - not required. */
++		if (i && (*bufp == ':')) {
++			bufp++;
++		}
++
++		do {
++			c = *bufp;
++			if (((unsigned char)(c - '0')) <= 9) {
++				c -= '0';
++			} else if (((unsigned char)((c|0x20) - 'a')) <= 5) {
++				c = (c|0x20) - ('a'-10);
++			} else if (j && (c == ':' || c == 0)) {
++				break;
++			} else {
++				return -1;
++			}
++			++bufp;
++			val <<= 4;
++			val += c;
++		} while (++j < 2);
++		*ptr++ = val;
++	} while (++i < ETH_ALEN);
+ 
++	return *bufp; /* Error if we don't end at end of string. */
++}
+ 
+ int main (int argc, char **argv)
+ {
+   int c, background=0;
++  int vcc_sock = 0;
+ 
+   struct br2684_params params;
+   params.itfnum=-1;
+@@ -218,17 +405,17 @@
+   params.astr=NULL;
+   memset(&params.reqqos, 0, sizeof(params.reqqos));
+   
+-  lastsock=-1;
+-  lastitf=0;
++  lastsock = -1;
++  lastitf = 0;
+   
+   /* st qos to 0 */
+ 
+   openlog (LOG_NAME,LOG_OPTION,LOG_FACILITY);
+-  if (argc>1)
+-    while ((c = getopt(argc, argv,"q:a:bc:e:s:p:?h")) !=EOF)
++  if (argc > 1)
++    while ((c = getopt(argc, argv,"q:a:bc:e:s:p:m:?h")) !=EOF)
+       switch (c) {
+       case 'q':
+-	printf ("optarg : %s",optarg);
++	//printf ("optarg : %s",optarg);
+ 	if (text2qos(optarg,&params.reqqos,0))
+ 	  fprintf(stderr,"QOS parameter invalid\n");
+ 	break;
+@@ -240,7 +427,16 @@
+ 	break;
+       case 'c':
+ 	/* temporary, to make it work with multiple interfaces: */
+-	if (params.itfnum>=0) start_interface(&params);
++	/* AV: Hack breaks things. */
++	/*if (params.itfnum >= 0) 
++	  {
++		vcc_sock = start_interface(&params);
++		if(vcc_sock < 0)
++		  {
++			 close(lastsock);
++			 lastsock = -1;
++		  }
++	  }*/
+ 	params.itfnum= atoi(optarg);
+ 	break;
+       case 'e':
+@@ -265,6 +461,10 @@
+ #else
+ 	syslog(LOG_ERR, "payload option not supported.");
+ #endif
++      case 'm':
++	in_ether(optarg, &(params.addr));
++	params.is_addr = 1;
++        break;
+       case '?':
+       case 'h':
+       default:
+@@ -273,35 +473,52 @@
+   else
+     usage(argv[0]);
+ 
+-  if (argc != optind) usage(argv[0]);
+-  
+-  start_interface(&params);  
+ 
+-  if(lastsock>=0) close(lastsock);
++  if (argc != optind) 
++	  usage(argv[0]);
+   
++  if(vcc_sock <= 0)
++	vcc_sock = start_interface(&params);  
++
++  if(lastsock >= 0) 
++	  close(lastsock);
++
++  /* AV: Please do not fork if the PVC creation/configuration has failed. */
++  if(vcc_sock <=0)
++  {
++	syslog(LOG_ERR,"creating PVC failed = %d \n", vcc_sock);
++	return -1;
++  }
++  lastsock = vcc_sock;
++ 
+   if (background) {
+     pid_t pid;
+     
+-    pid=fork();
++    pid = fork();
+     if (pid < 0) {
+       fprintf(stderr,"Error detaching\n");
+-      exit(2);
++	  return 2;
+     } else if (pid) 
+-      exit(0); // This is the parent
++	  {
++		// This is the parent
++		return 0;
++	  }
+     
+     // Become a process group and session group leader
+     if (setsid()<0) {
+       fprintf (stderr,"Could not set process group\n");
+-      exit(2);
++	  return 2;
+     }
+     
+     // Fork again to let process group leader exit
+     pid = fork();
+     if (pid < 0) {
+       fprintf(stderr,"Error detaching during second fork\n");
+-      exit(2);
++	  return 2;
+     } else if (pid)
+-      exit(0); // This is the parent
++      {
++		return 0;
++	  }
+     
+     // Now we're ready for buisness
+     chdir("/");            // Don't keep directories in use
+diff -Naur linux-atm-2.5.0/src/lib/Makefile.am open_linux_atm/src/lib/Makefile.am
+--- linux-atm-2.5.0/src/lib/Makefile.am	2007-07-11 20:56:17.000000000 +0530
++++ open_linux_atm/src/lib/Makefile.am	2009-08-19 16:14:38.000000000 +0530
+@@ -4,12 +4,18 @@
+ # ATMLIBS_VERSION comes from configure.in in the toplevel directory
+ AM_LDFLAGS = -version-info @LIBVER_CURRENT@:@LIBVER_REVISION@:@LIBVER_AGE@
+ 
+-
+-
++if IFX_OPT
++libatm_la_SOURCES = text2atm.c atm2text.c atmequal.c text2qos.c \
++			qos2text.c qosequal.c \
++			misc.c ans.c \
++			common.c diag.c text2ip.c timer.c unix.c
++else
+ libatm_la_SOURCES = text2atm.c atm2text.c atmequal.c sdu2cell.c text2qos.c \
+ 			qos2text.c qosequal.c sap2text.c text2sap.c sapequal.c \
+ 			misc.c atmres.h ans.c \
+ 			common.c diag.c kptr.c text2ip.c timer.c unix.c
++endif
++
+ libatm_la_LIBADD = -lresolv
+ libatm_la_DEPENDENCIES = $(top_builddir)/src/include/atm.h \
+ 				$(top_builddir)/src/include/atmsap.h \
+diff -Naur linux-atm-2.5.0/src/lib/qos2text.c open_linux_atm/src/lib/qos2text.c
+--- linux-atm-2.5.0/src/lib/qos2text.c	2001-10-10 04:03:07.000000000 +0530
++++ open_linux_atm/src/lib/qos2text.c	2009-08-19 16:14:38.000000000 +0530
+@@ -72,10 +72,32 @@
+ 	    strcpy(buffer,"cbr");
+ 	    pos += 3;
+ 	    break;
++#if 0	/* Same as ATM_VBR_NRT */
++	case ATM_VBR:
++	    strcpy(buffer,"vbr");
++	    pos += 3;
++	    break;
++#endif
+ 	case ATM_ABR:
+ 	    strcpy(buffer,"abr");
+ 	    pos += 3;
+ 	    break;
++	case ATM_VBR_NRT:
++	    strcpy(buffer,"nrt-vbr");
++	    pos += 7;
++	    break;
++	case ATM_VBR_RT:
++	    strcpy(buffer,"rt-vbr");
++	    pos += 6;
++	    break;
++	case ATM_UBR_PLUS:
++	    strcpy(buffer,"ubr+");
++	    pos += 4;
++	    break;
++	case ATM_GFR:
++	    strcpy(buffer,"gfr");
++	    pos += 3;
++	    break;
+ 	default:
+ 	    return -1;
+     }
+diff -Naur linux-atm-2.5.0/src/lib/text2qos.c open_linux_atm/src/lib/text2qos.c
+--- linux-atm-2.5.0/src/lib/text2qos.c	2001-10-10 04:03:07.000000000 +0530
++++ open_linux_atm/src/lib/text2qos.c	2009-08-19 16:14:38.000000000 +0530
+@@ -2,6 +2,7 @@
+ 		encoding */
+ 
+ /* Written 1996-2000 by Werner Almesberger, EPFL-LRC/ICA */
++/* 6/6/2008		Arvind	Adding support for passing scr and mbs for vbr traffic.*/
+ 
+ #if HAVE_CONFIG_H
+ #include <config.h>
+@@ -39,39 +40,45 @@
+     if (*end == '.')
+ 	for (end++; *end && isdigit(*end); end++) {
+ 	    fract = fract*10+*end-48;
+-	    if (--power == -9) break;
++	    if (--power == -9) 
++			break;
+ 	}
+     multiplier = NULL;
+     if (*end && (multiplier = strchr(mult,*end))) {
+-	while (multiplier >= mult) {
+-	    if (rate > UINT_MAX/1000) return RATE_ERROR;
+-	    rate *= 1000;
+-	    power += 3;
+-	    multiplier -= 2;
+-	}
+-	end++;
+-    }
+-    while (power && fract)
+-	if (power < 0) {
+-	    fract /= 10;
+-	    power++;
+-	}
+-	else {
+-	    fract *= 10;
+-	    power--;
++		while (multiplier >= mult) {
++			if (rate > UINT_MAX/1000) 
++				return RATE_ERROR;
++			rate *= 1000;
++			power += 3;
++			multiplier -= 2;
++		}
++		end++;
++    }
++    while (power && fract){
++		if (power < 0)	{
++			fract /= 10;
++			power++;
++		}
++		else {
++			fract *= 10;
++			power--;
++		}
+ 	}
+     rate += fract;
+     if (strlen(end) < 3) {
+-	if (multiplier) return RATE_ERROR;
++		if (multiplier) 
++			return RATE_ERROR;
+     }
+-    else if (!strncmp(end,"cps",3)) end += 3;
++    else if (!strncmp(end,"cps",3)) 
++		end += 3;
+ 	else if (!strncmp(end,"bps",3)) {
+-		rate = (rate+(up ? 8*ATM_CELL_PAYLOAD-1 : 0))/8/
+-		  ATM_CELL_PAYLOAD;
++		rate = (rate+(up ? 8*ATM_CELL_PAYLOAD-1 : 0))/8/ATM_CELL_PAYLOAD;
+ 		end += 3;
+-	    }
+-	    else if (multiplier) return RATE_ERROR;
+-    if (rate > INT_MAX) return RATE_ERROR;
++	}
++	else if (multiplier) 
++		return RATE_ERROR;
++    if (rate > INT_MAX) 
++		return RATE_ERROR;
+     *text = end;
+     return rate;
+ }
+@@ -85,38 +92,68 @@
+ 
+     if (*(*text)++ != ':') return -1;
+     while (1) {
+-	if (!**text) return -1;
+-	switch (fetch(text,"max_pcr=","pcr=","min_pcr=","max_sdu=","sdu=",
+-	  NULL)) {
+-	    case 0:
+-		if ((value = __t2q_get_rate(text,0)) == RATE_ERROR) return -1;
+-		if (a) a->max_pcr = value;
+-		if (b) b->max_pcr = value;
+-		break;
+-	    case 1:
+-		if ((value = __t2q_get_rate(text,0)) == RATE_ERROR) return -1;
+-		if (a) a->pcr = value;
+-		if (b) b->pcr = value;
+-		break;
+-	    case 2:
+-		if ((value = __t2q_get_rate(text,1)) == RATE_ERROR) return -1;
+-		if (value == ATM_MAX_PCR) return -1;
+-		if (a) a->min_pcr = value;
+-		if (b) b->min_pcr = value;
+-		break;
+-	    case 3:
+-	    case 4:
+-		value = strtol(*text,&end,10);
+-		if (value < 0) return -1;
+-		*text = end;
+-		if (a) a->max_sdu = value;
+-		if (b) b->max_sdu = value;
+-		break;
+-	    default:
+-		return 0;
+-	}
+-	if (!**text) break;
+-	if (*(*text)++ != ',') return -1;
++		if (!**text) return -1;
++		switch (fetch(text,"max_pcr=","pcr=","min_pcr=","max_sdu=","sdu=","scr=","mbs=",NULL)) {
++			case 0:
++				if ((value = __t2q_get_rate(text,0)) == RATE_ERROR) 
++					return -1;
++				if (a) 
++					a->max_pcr = value;
++				if (b) 
++					b->max_pcr = value;
++				break;
++			case 1:
++				if ((value = __t2q_get_rate(text,0)) == RATE_ERROR) 
++					return -1;
++				if (a) 
++					a->pcr = value;
++				if (b) 
++					b->pcr = value;
++				break;
++			case 2:
++				if ((value = __t2q_get_rate(text,1)) == RATE_ERROR) 
++					return -1;
++				if (value == ATM_MAX_PCR) 
++					return -1;
++				if (a) 
++					a->min_pcr = value;
++				if (b) 
++					b->min_pcr = value;
++				break;
++			case 3:
++			case 4:
++				value = strtol(*text,&end,10);
++				if (value < 0) 
++					return -1;
++				*text = end;
++				if (a) 
++					a->max_sdu = value;
++				if (b) 
++					b->max_sdu = value;
++				break;
++			case 5:
++				if ((value = __t2q_get_rate(text,0)) == RATE_ERROR) 
++					return -1;
++				if (a) 
++					a->scr = value;
++				if (b) 
++					b->scr = value;
++				break;
++			case 6:
++				if ((value = __t2q_get_rate(text,0)) == RATE_ERROR) 
++					return -1;
++				if (a) 
++					a->mbs = value;
++				if (b) 
++					b->mbs = value;
++				break;
++			default:
++				return 0;
++		}
++		if (!**text) 
++			break;
++		if (*(*text)++ != ',') 
++			return -1;
+     }
+     return 0;
+ }
+@@ -129,42 +166,65 @@
+     traffic_class = ATM_NONE;
+     aal = ATM_NO_AAL;
+     do {
+-	static const unsigned char aal_number[] = { ATM_AAL0, ATM_AAL5 };
+-	int item;
++		static const unsigned char aal_number[] = { ATM_AAL0, ATM_AAL5 };
++		int item;
+ 
+-	item = fetch(&text,"!none","ubr","cbr","vbr","abr","aal0","aal5",NULL);
+-	switch (item) {
+-	    case 1:
+-	    case 2:
+-		/* we don't support VBR yet */
+-	    case 4:
+-		traffic_class = item;
+-		break;
+-	    case 5:
+-	    case 6:
+-		aal = aal_number[item-5];
+-		break;
+-	    default:
+-		return -1;
+-	}
++		item = fetch(&text,"!none","ubr","cbr","vbr","abr","aal0","aal5","nrt-vbr","rt-vbr","ubr+","gfr",NULL);
++		switch (item) {
++			case 1:
++			case 2:
++			case 3:
++			case 4:
++				traffic_class = item;
++				break;
++			case 5:
++			case 6:
++				aal = aal_number[item-5];
++				break;
++			case 7:
++				traffic_class = 3;	/* NRT-VBR = VBR */
++				break;
++			case 8:
++			case 9:
++			case 10:
++				traffic_class = item-2;	/* mapping to kernel atm.h value carefully */
++				break;
++			default:
++				return -1;
++		}
+     }
+     while (*text == ',' ? text++ : 0);
+-    if (!traffic_class) return -1;
+-    if (qos && !(flags & T2Q_DEFAULTS)) memset(qos,0,sizeof(*qos));
+-    if (qos) qos->txtp.traffic_class = qos->rxtp.traffic_class = traffic_class;
+-    if (qos && aal) qos->aal = aal;
+-    if (!*text) return 0;
++    if (!traffic_class) 
++		return -1;
++    if (qos && !(flags & T2Q_DEFAULTS)) 
++		memset(qos,0,sizeof(*qos));
++    if (qos) 
++		qos->txtp.traffic_class = qos->rxtp.traffic_class = traffic_class;
++    if (qos && aal) 
++		qos->aal = aal;
++    if (!*text) 
++		return 0;
+     if (params(&text,qos ? &qos->txtp : NULL,qos ? &qos->rxtp : NULL))
+-	return -1;
+-    if (!*text) return 0;
++		return -1;
++    if (qos && (traffic_class == ATM_UBR)) {
++		if ((qos->txtp.max_pcr != 0) || (qos->txtp.pcr != 0) || (qos->txtp.min_pcr != 0))
++			return -1;
++		if ((qos->rxtp.max_pcr != 0) || (qos->rxtp.pcr != 0) || (qos->rxtp.min_pcr != 0))
++			return -1;
++    }
++    if (!*text) 
++		return 0;
+     switch (fetch(&text,"tx","rx",NULL)) {
+ 	case 0:
+ 	    if (!fetch(&text,":none",NULL)) {
+-		if (qos) qos->txtp.traffic_class = ATM_NONE;
+-		if (*text == ',') text++;
++			if (qos) 
++				qos->txtp.traffic_class = ATM_NONE;
++			if (*text == ',') 
++				text++;
+ 		break;
+ 	    }
+-	    if (params(&text,qos ? &qos->txtp : NULL,NULL)) return -1;
++	    if (params(&text,qos ? &qos->txtp : NULL,NULL)) 
++			return -1;
+ 	    break;
+ 	case 1:
+ 	    text -= 2;
+@@ -172,9 +232,13 @@
+ 	default:
+ 	    return -1;
+     }
+-    if (!*text) return 0;
+-    if (fetch(&text,"rx",NULL)) return -1;
+-    if (!fetch(&text,":none",NULL) && qos) qos->rxtp.traffic_class = ATM_NONE;
+-    else if (params(&text,qos ? &qos->rxtp : NULL,NULL)) return -1;
++    if (!*text) 
++		return 0;
++    if (fetch(&text,"rx",NULL)) 
++		return -1;
++    if (!fetch(&text,":none",NULL) && qos) 
++		qos->rxtp.traffic_class = ATM_NONE;
++    else if (params(&text,qos ? &qos->rxtp : NULL,NULL)) 
++		return -1;
+     return *text ? -1 : 0;
+ }

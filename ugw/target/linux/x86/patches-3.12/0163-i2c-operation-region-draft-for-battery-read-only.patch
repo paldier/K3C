@@ -1,0 +1,416 @@
+From 5d99c96681612311a2fc60066eb3f12b689f08e8 Mon Sep 17 00:00:00 2001
+From: Aubrey Li <aubrey.li@intel.com>
+Date: Tue, 11 Mar 2014 00:10:02 -0500
+Subject: [PATCH 163/441] i2c operation region draft for battery, read only
+
+Signed-off-by Lan Tianyu <tianyu.lan@intel.com>
+
+Change-Id: Ie5434011dacf586fc81e27b80ced31d498709e7a
+(cherry picked from commit 5d16d3fcefe3c9b4337f4fe28e3d9daeef2e6560)
+
+Some backporting touchups to drivers/acpi/scan.c and
+drivers/i2c/busses/i2c-designware-platdrv.c
+---
+ drivers/acpi/acpica/exfield.c               |  18 +++--
+ drivers/acpi/acpica/nsxfobj.c               |  52 ++++++++++++
+ drivers/acpi/acpica/rscreate.c              |   1 +
+ drivers/acpi/scan.c                         |  79 +++++++++++++++---
+ drivers/i2c/busses/i2c-designware-platdrv.c | 119 ++++++++++++++++++++++++++++
+ include/acpi/acpixf.h                       |   1 +
+ include/linux/acpi.h                        |   1 +
+ 7 files changed, 252 insertions(+), 19 deletions(-)
+
+--- a/drivers/acpi/acpica/exfield.c
++++ b/drivers/acpi/acpica/exfield.c
+@@ -116,9 +116,12 @@ acpi_ex_read_data_from_field(struct acpi
+ 			    ACPI_READ | (obj_desc->field.attribute << 16);
+ 		} else if (obj_desc->field.region_obj->region.space_id ==
+ 			   ACPI_ADR_SPACE_GSBUS) {
+-			length = ACPI_GSBUS_BUFFER_SIZE;
+-			function =
+-			    ACPI_READ | (obj_desc->field.attribute << 16);
++			u16 accessor_type;
++
++			accessor_type = obj_desc->field.attribute;
++			length = acpi_get_serial_access_length(accessor_type,
++							       obj_desc->field. access_length);
++			function = ACPI_READ | (accessor_type << 16);
+ 		} else {	/* IPMI */
+ 
+ 			length = ACPI_IPMI_BUFFER_SIZE;
+@@ -315,9 +318,12 @@ acpi_ex_write_data_to_field(union acpi_o
+ 			    ACPI_WRITE | (obj_desc->field.attribute << 16);
+ 		} else if (obj_desc->field.region_obj->region.space_id ==
+ 			   ACPI_ADR_SPACE_GSBUS) {
+-			length = ACPI_GSBUS_BUFFER_SIZE;
+-			function =
+-			    ACPI_WRITE | (obj_desc->field.attribute << 16);
++			u16 accessor_type;
++
++			accessor_type = obj_desc->field.attribute;
++			length = acpi_get_serial_access_length(accessor_type,
++					obj_desc->field. access_length);
++			function =  ACPI_WRITE | (obj_desc->field.attribute << 16);
+ 		} else {	/* IPMI */
+ 
+ 			length = ACPI_IPMI_BUFFER_SIZE;
+--- a/drivers/acpi/acpica/nsxfobj.c
++++ b/drivers/acpi/acpica/nsxfobj.c
+@@ -46,12 +46,64 @@
+ #include <acpi/acpi.h>
+ #include "accommon.h"
+ #include "acnamesp.h"
++#include "amlcode.h"
+ 
+ #define _COMPONENT          ACPI_NAMESPACE
+ ACPI_MODULE_NAME("nsxfobj")
+ 
+ /*******************************************************************************
+  *
++ * FUNCTION:    acpi_get_serial_access_length
++ *
++ * PARAMETERS:  accessor_type   - The type of the protocol indicated by region
++ *                                field access attributes
++ *              access_length   - The access length of the region field
++ *
++ * RETURN:      Decoded access length
++ *
++ * DESCRIPTION: This routine returns the length of the generic_serial_bus
++ *              protocol bytes
++ *
++ ******************************************************************************/
++u32 acpi_get_serial_access_length(u32 accessor_type, u32 access_length)
++{
++	u32 length;
++
++	switch (accessor_type) {
++	case AML_FIELD_ATTRIB_QUICK:
++	case AML_FIELD_ATTRIB_SEND_RCV:
++	case AML_FIELD_ATTRIB_BYTE:
++
++		length = 1;
++		break;
++
++	case AML_FIELD_ATTRIB_WORD:
++	case AML_FIELD_ATTRIB_WORD_CALL:
++
++		length = 2;
++		break;
++
++	case AML_FIELD_ATTRIB_MULTIBYTE:
++	case AML_FIELD_ATTRIB_RAW_BYTES:
++	case AML_FIELD_ATTRIB_RAW_PROCESS:
++
++		length = access_length;
++		break;
++
++	case AML_FIELD_ATTRIB_BLOCK:
++	case AML_FIELD_ATTRIB_BLOCK_CALL:
++	default:
++
++		length = ACPI_GSBUS_BUFFER_SIZE;
++		break;
++	}
++
++	return (length);
++}
++ACPI_EXPORT_SYMBOL(acpi_get_serial_access_length);
++
++/*******************************************************************************
++ *
+  * FUNCTION:    acpi_get_id
+  *
+  * PARAMETERS:  Handle          - Handle of object whose id is desired
+--- a/drivers/acpi/acpica/rscreate.c
++++ b/drivers/acpi/acpica/rscreate.c
+@@ -112,6 +112,7 @@ acpi_buffer_to_resource(u8 *aml_buffer,
+ 
+ 	return (status);
+ }
++ACPI_EXPORT_SYMBOL(acpi_buffer_to_resource);
+ 
+ /*******************************************************************************
+  *
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -35,12 +35,19 @@ bool acpi_force_hot_remove;
+ 
+ static const char *dummy_hid = "device";
+ 
++static LIST_HEAD(acpi_bus_dep_device_list);
+ static LIST_HEAD(acpi_bus_id_list);
+ static DEFINE_MUTEX(acpi_scan_lock);
+ static LIST_HEAD(acpi_scan_handlers_list);
+ DEFINE_MUTEX(acpi_device_lock);
+ LIST_HEAD(acpi_wakeup_device_list);
+ 
++
++struct acpi_dep_handle{
++	struct list_head node;
++	acpi_handle handle;
++};
++
+ struct acpi_device_bus_id{
+ 	char bus_id[15];
+ 	unsigned int instance_no;
+@@ -1828,10 +1835,25 @@ out:
+ 	acpi_free_pnp_ids(&pnp);
+ }
+ 
++
++static int acpi_dep_device_check(acpi_handle handle)
++{
++	struct acpi_dep_handle *dep;
++
++	list_for_each_entry(dep, &acpi_bus_dep_device_list, node)
++		if (dep->handle == handle)
++			return -EEXIST;
++
++	return 0;		
++}
++
+ static acpi_status acpi_bus_check_add(acpi_handle handle, u32 lvl_not_used,
+ 				      void *not_used, void **return_value)
+ {
++	union acpi_object *package = NULL;
++	union acpi_object *element = NULL;
+ 	struct acpi_device *device = NULL;
++	struct acpi_dep_handle *dep = NULL;
+ 	int type;
+ 	unsigned long long sta;
+ 	int result;
+@@ -1851,21 +1873,24 @@ static acpi_status acpi_bus_check_add(ac
+ 
+ 	acpi_scan_init_hotplug(handle, type);
+ 
+-	if (!(sta & ACPI_STA_DEVICE_PRESENT) &&
+-	    !(sta & ACPI_STA_DEVICE_FUNCTIONING)) {
+-		struct acpi_device_wakeup wakeup;
++	if(!acpi_dep_device_check(handle)
++	   && acpi_has_method(handle, "_BIX")
++	   && acpi_has_method(handle, "_DEP")) {
++		dep = kmalloc(sizeof(struct acpi_dep_handle), GFP_KERNEL);
++		if (!dep)
++			return AE_CTRL_DEPTH;
++		dep->handle = handle;
++		list_add_tail(&dep->node , &acpi_bus_dep_device_list);
+ 
+-		if (acpi_has_method(handle, "_PRW")) {
+-			acpi_bus_extract_wakeup_device_power_package(handle,
+-								     &wakeup);
+-			acpi_power_resources_list_free(&wakeup.resources);
+-		}
+-		return AE_CTRL_DEPTH;
+-	}
++		acpi_handle_info(dep->handle,
++				"is added to dep device list.\n");
+ 
+-	acpi_add_single_object(&device, handle, type, sta);
+-	if (!device)
+-		return AE_CTRL_DEPTH;
++		return AE_OK;
++	} else {
++		acpi_add_single_object(&device, handle, type, sta);
++		if (!device)
++			return AE_CTRL_DEPTH;
++      	}
+ 
+  out:
+ 	if (!*return_value)
+@@ -1874,6 +1899,34 @@ static acpi_status acpi_bus_check_add(ac
+ 	return AE_OK;
+ }
+ 
++
++int acpi_walk_dep_device_list(void)
++{
++	struct acpi_device *device;
++	struct acpi_dep_handle *dep;
++	acpi_status status;
++	unsigned long long sta;
++	int ret = 0;
++
++	list_for_each_entry(dep, &acpi_bus_dep_device_list, node) {
++		status = acpi_evaluate_integer(dep->handle, "_STA", NULL, &sta);
++
++		acpi_handle_info(dep->handle, "Device_STA 0x%02x\n", sta);
++		if (ACPI_FAILURE(status)) {
++			acpi_handle_warn(dep->handle,
++				"Status check failed (0x%x)\n", status);
++		} else if (sta & ACPI_STA_DEVICE_ENABLED) {
++			acpi_bus_scan(dep->handle);
++		//			acpi_bus_check_add(dep->handle, 0, NULL, (void **)&device);
++			acpi_handle_info(dep->handle,
++				"Device is readly\n");
++		}
++	}
++	
++	return 0;
++}
++EXPORT_SYMBOL_GPL(acpi_walk_dep_device_list);
++
+ static int acpi_scan_attach_handler(struct acpi_device *device)
+ {
+ 	struct acpi_hardware_id *hwid;
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@ -42,6 +42,8 @@
+ #include <linux/io.h>
+ #include <linux/slab.h>
+ #include <linux/acpi.h>
++
++#include <acpi/actypes.h>
+ #include "i2c-designware-core.h"
+ 
+ static struct i2c_algorithm i2c_dw_algo = {
+@@ -70,6 +72,121 @@ static const struct dmi_system_id dw_i2c
+ 	{ }
+ };
+ 
++struct dw_i2c_acpi_handler_data {
++	struct acpi_connection_info info;
++	struct platform_device *pdev;
++};
++
++static acpi_status
++dw_i2c_acpi_space_handler(u32 function, acpi_physical_address address,
++			u32 bits, u64 *value64,
++			void *handler_context, void *region_context)
++{
++	struct dw_i2c_acpi_handler_data *data = handler_context;
++	struct acpi_connection_info *info = &data->info;
++	struct dw_i2c_dev *dev = platform_get_drvdata(data->pdev);
++	struct acpi_resource_i2c_serialbus *sb;
++	struct acpi_resource *ares;
++	u8 target;
++	int ret, length;
++	u8 *value = (u8 *)value64;
++	u8 *buffer;
++	u32 accessor_type = function >> 16;
++	u8 addr = (u8)address;
++	struct i2c_msg msgs[2];
++
++
++	acpi_buffer_to_resource(info->connection, info->length, &ares);
++	if (ares->type != ACPI_RESOURCE_TYPE_SERIAL_BUS)
++		return AE_BAD_PARAMETER;
++
++	sb = &ares->data.i2c_serial_bus;
++	if (sb->type != ACPI_RESOURCE_SERIAL_TYPE_I2C)
++		return AE_BAD_PARAMETER;
++
++	pr_info("%s: Found I2C Resource type, addr %d\n",
++				__func__, sb->slave_address);
++	target = sb->slave_address;
++
++	length = acpi_get_serial_access_length(accessor_type, info->access_length);
++	pr_info("%s: access opeation region, addr 0x%x operation %d len %d\n",
++		__func__, addr, function, length);
++
++	if (!value64)
++		return AE_BAD_PARAMETER;
++
++	function &= ACPI_IO_MASK; 
++	if (function == ACPI_READ) {
++		buffer = kzalloc(length, GFP_KERNEL);
++	
++		msgs[0].addr = target;
++		msgs[0].flags = 0;
++		msgs[0].len = 1;
++		msgs[0].buf = &addr;
++	
++		msgs[1].addr = target;
++		msgs[1].flags = I2C_M_RD;
++		msgs[1].len = length;
++		msgs[1].buf = buffer;
++	
++		ret = i2c_transfer(&dev->adapter, msgs, 2);
++		if (ret < 0) {
++			pr_info("%s: i2c read failed\n", __func__);	
++			return AE_ERROR;		
++		}
++	
++		memcpy(value + 2, buffer, length - 2);
++		value[0] = value[1] = 0;
++		kfree(buffer);
++	} else if (function == ACPI_WRITE) {
++//		buffer = kzalloc(length - 1, GFP_KERNEL);
++//		
++//		buffer[0] = addr;
++//		memcpy(buffer + 1, value + 2, length - 2);
++//		msgs[0].addr = target;
++//		msgs[0].flags = 0;
++//		msgs[0].len = length - 1;
++//		msgs[0].buf = buffer;
++//
++//		ret = i2c_transfer(&dev->adapter, msgs, 2);
++//		if (ret < 0) {
++//			pr_info("%s: i2c read failed\n", __func__);	
++//			return AE_ERROR;		
++//		}
++//		kfree(buffer);
++//
++	}
++
++	return AE_OK;
++}
++
++static int dw_i2c_acpi_install_space_handler(struct platform_device *pdev)
++{
++	acpi_handle *handle = ACPI_HANDLE(&pdev->dev);
++	struct dw_i2c_acpi_handler_data *data;
++	acpi_status status;
++
++	if (!handle)
++		return -EFAULT;
++
++	data = devm_kzalloc(&pdev->dev, sizeof(struct dw_i2c_acpi_handler_data),
++			    GFP_KERNEL);
++
++	if(!data)
++		return -ENOMEM;
++
++	data->pdev = pdev;
++	status = acpi_install_address_space_handler(handle,
++				ACPI_ADR_SPACE_GSBUS,
++				&dw_i2c_acpi_space_handler,
++				NULL,
++				data);
++	if (ACPI_FAILURE(status))
++		return -EFAULT;
++	return 0;
++}
++
++
+ static void dw_i2c_acpi_params(struct platform_device *pdev, char method[],
+ 			       u16 *hcnt, u16 *lcnt, u32 *sda_hold)
+ {
+@@ -235,6 +352,8 @@ static int dw_i2c_probe(struct platform_
+ 	pm_runtime_set_active(&pdev->dev);
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	dw_i2c_acpi_install_space_handler(pdev);
++	acpi_walk_dep_device_list();
+ 	return 0;
+ }
+ 
+--- a/include/acpi/acpixf.h
++++ b/include/acpi/acpixf.h
+@@ -276,6 +276,7 @@ acpi_status acpi_get_parent(acpi_handle
+ /*
+  * Handler interfaces
+  */
++u32 acpi_get_serial_access_length(u32 accessor_type, u32 access_length);
+ acpi_status
+ acpi_install_initialization_handler(acpi_init_handler handler, u32 function);
+ 
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -94,6 +94,7 @@ int acpi_boot_init (void);
+ void acpi_boot_table_init (void);
+ int acpi_mps_check (void);
+ int acpi_numa_init (void);
++int acpi_walk_dep_device_list(void);
+ 
+ int acpi_table_init (void);
+ int acpi_table_parse(char *id, acpi_tbl_table_handler handler);

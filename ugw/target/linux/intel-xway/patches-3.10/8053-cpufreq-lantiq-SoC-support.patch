@@ -1,0 +1,3409 @@
+# HG changeset patch
+# Parent c7a5435b613edf5471a0a80da59dc025e7c5342f
+# User -e
+This patch adds cpufreq support for Lantiq SoC's.
+Following platforms are supported: XRX200, XRX300, XRX330 GRX350
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -254,6 +254,7 @@ config LANTIQ
+ 	select USE_OF
+ 	select PINCTRL
+ 	select PINCTRL_LANTIQ
++	select CPU_SUPPORTS_CPUFREQ
+ 
+ config LASAT
+ 	bool "LASAT Networks platforms"
+@@ -2680,7 +2681,7 @@ endmenu
+ config MIPS_EXTERNAL_TIMER
+ 	bool
+ 
+-if CPU_SUPPORTS_CPUFREQ && MIPS_EXTERNAL_TIMER
++if CPU_SUPPORTS_CPUFREQ
+ menu "CPU Power Management"
+ source "drivers/cpufreq/Kconfig"
+ endmenu
+diff --git a/arch/mips/include/asm/mach-lantiq/cpufreq/ltq_cpufreq.h b/arch/mips/include/asm/mach-lantiq/cpufreq/ltq_cpufreq.h
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/include/asm/mach-lantiq/cpufreq/ltq_cpufreq.h
+@@ -0,0 +1,173 @@
++/*
++ *
++ *			   Copyright (c) 2012
++ *			Lantiq Deutschland GmbH
++ *		 Am Campeon 3; 85579 Neubiberg, Germany
++ *
++ *  For licensing information, see the file 'LICENSE' in the root folder of
++ *  this software module.
++ */
++
++#ifndef _LTQ_CPUFREQ_H_
++#define _LTQ_CPUFREQ_H_
++
++#define LTQ_CPUFREQ_API_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))
++/* define LTQ_CPUFREQ API version */
++#define LTQ_CPUFREQ_VERSION_CODE LTQ_CPUFREQ_API_VERSION(2,0,0)
++
++/** LTQ_CPUFREQ_MODULE_t
++	Definition of the modules identifier
++*/
++enum ltq_cpufreq_module {
++	LTQ_CPUFREQ_MODULE_CPU	,
++	LTQ_CPUFREQ_MODULE_WLAN	,
++	LTQ_CPUFREQ_MODULE_VE	,
++	LTQ_CPUFREQ_MODULE_PPE	,
++	LTQ_CPUFREQ_MODULE_SWITCH,
++	LTQ_CPUFREQ_MODULE_UART	,
++	LTQ_CPUFREQ_MODULE_GPTC	,
++	LTQ_CPUFREQ_MODULE_PCIE	,
++	LTQ_CPUFREQ_MODULE_USB	,
++	LTQ_CPUFREQ_MODULE_DEU	,
++	LTQ_CPUFREQ_MODULE_DP	,	/*Direct Path driver*/
++	LTQ_CPUFREQ_MODULE_DPL	,	/*Direct Path Lib*/
++	LTQ_CPUFREQ_MODULE_ETH	,	/*Ethernet driver*/
++	LTQ_CPUFREQ_MODULE_PATM	,	/*PTM/ATM driver*/
++	LTQ_CPUFREQ_MODULE_I2C	,
++	LTQ_CPUFREQ_MODULE_ID_MAX,
++};
++
++
++/** LTQ_CPUFREQ_STATE_t
++	Definition of power management state
++*/
++enum ltq_cpufreq_state {
++	/** Power State Invalid. */
++	LTQ_CPUFREQ_PS_UNDEF,
++	/** Power State D0. normal operation freq */
++	LTQ_CPUFREQ_PS_D0,
++	/** Power State D1.  intermediate freq */
++	LTQ_CPUFREQ_PS_D1,
++	/** Power State D2.  intermediate freq */
++	LTQ_CPUFREQ_PS_D2,
++	/** Power State D3. lowest freq */
++	LTQ_CPUFREQ_PS_D3,
++	/** Power State don't care */
++	LTQ_CPUFREQ_PS_D0D3,
++	/** Power State BOOST highest freq, time limited because of
++	 *  thermal aspects */
++	LTQ_CPUFREQ_PS_BOOST,
++};
++
++/* return codes used in LTQ_CPUFREQ */
++#define	LTQ_CPUFREQ_RETURN_SUCCESS	0
++	/** Operation denied */
++#define	LTQ_CPUFREQ_RETURN_DENIED	1
++	/** called function just return without doing anything; used only
++	 *  in callback functions */
++#define	LTQ_CPUFREQ_RETURN_NOACTIVITY	3
++	/** is used if callback function is not defined */
++#define	LTQ_CPUFREQ_RETURN_NOTDEFINED	4
++
++	/** linked list ADD / DEL */
++#define	LTQ_CPUFREQ_LIST_ADD	1
++#define	LTQ_CPUFREQ_LIST_DEL	0
++
++#define NUM_SUPPLY		1
++#define NUM_SUPPLY_NAMES	6
++#define NUM_DEBUGFS_FILES	3
++
++struct reg_cpufreq {
++	struct	regulator	*regulator;
++	/* Support notifier */
++	struct notifier_block	nb;
++	struct work_struct	update_supply_work;
++	bool			supply_uv_valid;
++	int			supply_uv;
++	int			reg_idx;
++};
++
++struct reg_supply_names {
++	char	name[16];
++	int	used;
++};
++
++/** IFX_PMCU_MODULE_STATE_t
++	Structure hold the module-ID, the moduleSub-ID and the
++	PowerState of one module.
++*/
++struct ltq_cpufreq_module_state {
++	enum ltq_cpufreq_module pmcuModule;/** Module identifier */
++	unsigned int  pmcuModuleNr;/** Module instance */
++	enum ltq_cpufreq_state  pmcuState;/** Module PowerState */
++};
++
++struct ltq_cpufreq_module_info {
++	struct list_head		list;
++	char				*name;
++	enum ltq_cpufreq_module		pmcuModule;
++	unsigned int			pmcuModuleNr;
++	int				powerFeatureStat;
++	int	(*ltq_cpufreq_state_get) (enum ltq_cpufreq_state *pmcuState);
++	int	(*ltq_cpufreq_pwr_feature_switch) (int pmcuPwrStateEna);
++};
++
++
++struct ltq_cpufreq_latency {
++	int	max_time;
++	int	min_time;
++	int	cur_time;
++	int	cpu_frequency;
++	char   *comment;
++};
++
++struct ltq_cpufreq_threshold {
++	int	th_d0;
++	int	th_d1;
++	int	th_d2;
++	int	th_d3;
++};
++
++struct ltq_cpufreq {
++	struct list_head list_head_module;
++	spinlock_t ltq_cpufreq_lock;
++	enum ltq_cpufreq_state cpufreq_cur_state;
++	enum ltq_cpufreq_state cpufreq_new_state;
++	unsigned long cpu_scaling_rates[8];
++	unsigned long ddr_scaling_rates[8];
++	int ltq_state_change_control;
++	int (*ltq_clk_change_cb) (void *);
++	struct regulator *regulator;
++	int polling_period;
++	/* power state threshould datapath RMON cnt used for down-scaling */
++	struct ltq_cpufreq_threshold ps_threshold_dp;
++	int frequency_up_threshold;
++	int frequency_down_threshold;
++	int sampling_down_factor;
++};
++
++
++
++int ltq_cpufreq_state_req(enum ltq_cpufreq_module module,
++				unsigned char moduleNr,
++				enum ltq_cpufreq_state newState);
++int ltq_cpufreq_get_poll_period(enum ltq_cpufreq_module module,
++				unsigned char moduleNr);
++struct ltq_cpufreq_threshold *ltq_cpufreq_get_threshold(
++				enum ltq_cpufreq_module module,
++				unsigned char moduleNr);
++int ltq_cpufreq_mod_list(struct list_head *head, int add);
++enum ltq_cpufreq_state ltq_cpufreq_get_ps_from_khz(unsigned int freqkhz);
++unsigned int ltq_cpufreq_get_khz_from_ps(enum ltq_cpufreq_state ps);
++unsigned int ltq_cpufreq_getfreq_khz(unsigned int cpu);
++int ltq_cpufreq_state_change_disable(void);
++int ltq_cpufreq_state_change_enable(void);
++int ltq_count0_diff(unsigned int count_start, unsigned int count_end,
++						char *ident, int index);
++unsigned int ltq_count0_read(void);
++struct ltq_cpufreq *ltq_cpufreq_get(void);
++int ltq_register_clk_change_cb(int (*callback) (void *));
++
++extern void rcf_debugfs_init(struct reg_cpufreq *data);
++extern void rcf_debugfs_cleanup(struct reg_cpufreq *data); 
++#endif /* _LTQ_CPUFREQ_H_ */
+diff --git a/arch/mips/include/asm/mach-lantiq/cpufreq/ltq_cpufreq_pmcu_compatible.h b/arch/mips/include/asm/mach-lantiq/cpufreq/ltq_cpufreq_pmcu_compatible.h
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/include/asm/mach-lantiq/cpufreq/ltq_cpufreq_pmcu_compatible.h
+@@ -0,0 +1,45 @@
++/******************************************************************************
++
++		Copyright (c) 2010
++		Lantiq Deutschland GmbH
++		Am Campeon 3; 85579 Neubiberg, Germany
++
++  For licensing information, see the file 'LICENSE' in the root folder of
++  this software module.
++
++******************************************************************************/
++#ifndef _LTQ_CPUFREQ_PMCU_COMPATIBLE_H_
++#define _LTQ_CPUFREQ_PMCU_COMPATIBLE_H_
++
++/*********************************************************************
++ * Compatibility with PMCU                                           *
++ *********************************************************************/
++#define IFX_PMCU_MODULE_WLAN		LTQ_CPUFREQ_MODULE_WLAN
++#define IFX_PMCU_MODULE_PPE		LTQ_CPUFREQ_MODULE_PPE
++#define IFX_PMCU_MODULE_VE		LTQ_CPUFREQ_MODULE_VE
++#define IFX_PMCU_MODULE_PCIE		LTQ_CPUFREQ_MODULE_PCIE
++#define IFX_PMCU_MODULE_USB		LTQ_CPUFREQ_MODULE_USB
++#define IFX_PMCU_MODULE_DEU		LTQ_CPUFREQ_MODULE_DEU
++
++#define IFX_PMCU_STATE_INVALID		LTQ_CPUFREQ_PS_UNDEF
++#define IFX_PMCU_STATE_D0		LTQ_CPUFREQ_PS_D0
++#define IFX_PMCU_STATE_D1		LTQ_CPUFREQ_PS_D1
++#define IFX_PMCU_STATE_D2		LTQ_CPUFREQ_PS_D2
++#define IFX_PMCU_STATE_D3		LTQ_CPUFREQ_PS_D3
++#define IFX_PMCU_STATE_D0D3		LTQ_CPUFREQ_PS_D0D3
++
++#define IFX_PMCU_PWR_STATE_ON		1
++#define IFX_PMCU_PWR_STATE_OFF		0
++
++#define IFX_PMCU_RETURN_SUCCESS		LTQ_CPUFREQ_RETURN_SUCCESS
++#define IFX_PMCU_RETURN_DENIED		LTQ_CPUFREQ_RETURN_DENIED
++#define IFX_PMCU_RETURN_ERROR		-1
++#define IFX_PMCU_RETURN_NOACTIVITY	LTQ_CPUFREQ_RETURN_NOACTIVITY
++#define IFX_PMCU_RETURN_NOTDEFINED	LTQ_CPUFREQ_RETURN_NOTDEFINED
++
++typedef enum	ltq_cpufreq_state	IFX_PMCU_STATE_t;
++typedef enum	ltq_cpufreq_module	IFX_PMCU_MODULE_t;
++typedef int	IFX_PMCU_PWR_STATE_ENA_t;
++typedef int	IFX_PMCU_RETURN_t;
++
++#endif		/* _LTQ_CPUFREQ_PMCU_COMPATIBLE_H_ */
+diff --git a/arch/mips/kernel/proc.c b/arch/mips/kernel/proc.c
+--- a/arch/mips/kernel/proc.c
++++ b/arch/mips/kernel/proc.c
+@@ -7,6 +7,7 @@
+ #include <linux/kernel.h>
+ #include <linux/sched.h>
+ #include <linux/seq_file.h>
++#include <linux/cpufreq.h>
+ #include <asm/bootinfo.h>
+ #include <asm/cpu.h>
+ #include <asm/cpu-features.h>
+@@ -25,6 +26,7 @@ static int show_cpuinfo(struct seq_file 
+ 	char fmt [64];
+ 	int i;
+ 
++
+ #ifdef CONFIG_SMP
+ 	if (!cpu_online(n))
+ 		return 0;
+@@ -39,13 +41,22 @@ static int show_cpuinfo(struct seq_file 
+ 			seq_printf(m, "machine\t\t\t: %s\n",
+ 				   mips_get_machine_name());
+ 	}
+-
+ 	seq_printf(m, "processor\t\t: %ld\n", n);
+ 	sprintf(fmt, "cpu model\t\t: %%s V%%d.%%d%s\n",
+ 		      cpu_data[n].options & MIPS_CPU_FPU ? "  FPU V%d.%d" : "");
+ 	seq_printf(m, fmt, __cpu_name[n],
+ 		      (version >> 4) & 0x0f, version & 0x0f,
+ 		      (fp_vers >> 4) & 0x0f, fp_vers & 0x0f);
++	#ifdef CONFIG_CPU_FREQ
++	{
++		unsigned int freq = cpufreq_quick_get(n);
++
++		if (freq > 0){
++			seq_printf(m, "cpu MHz\t\t\t: %u.%03u\n",
++				   freq / 1000, (freq % 1000));
++		}
++	}
++	#endif
+ 	seq_printf(m, "BogoMIPS\t\t: %u.%02u\n",
+ 		      cpu_data[n].udelay_val / (500000/HZ),
+ 		      (cpu_data[n].udelay_val / (5000/HZ)) % 100);
+diff --git a/drivers/cpufreq/Kconfig b/drivers/cpufreq/Kconfig
+--- a/drivers/cpufreq/Kconfig
++++ b/drivers/cpufreq/Kconfig
+@@ -48,7 +48,7 @@ config CPU_FREQ_STAT_DETAILS
+ choice
+ 	prompt "Default CPUFreq governor"
+ 	default CPU_FREQ_DEFAULT_GOV_USERSPACE if ARM_SA1100_CPUFREQ || ARM_SA1110_CPUFREQ
+-	default CPU_FREQ_DEFAULT_GOV_PERFORMANCE
++	default CPU_FREQ_DEFAULT_GOV_USERSPACE
+ 	help
+ 	  This option sets which CPUFreq governor shall be loaded at
+ 	  startup. If in doubt, select 'performance'.
+@@ -102,6 +102,18 @@ config CPU_FREQ_DEFAULT_GOV_CONSERVATIVE
+ 	  Be aware that not all cpufreq drivers support the conservative
+ 	  governor. If unsure have a look at the help section of the
+ 	  driver. Fallback governor will be the performance governor.
++
++config CPU_FREQ_DEFAULT_GOV_LANTIQGOV
++	bool "lantiqgov"
++	select CPU_FREQ_GOV_LANTIQGOV
++	select CPU_FREQ_GOV_USERSPACE
++	help
++	  Use the CPUFreq governor 'lantiqgov' as default. This allows
++	  you to get a dynamic frequency capable system by simply
++	  loading your cpufreq low-level hardware driver.
++	  This Lantiq specific governor is based on the 'conservative' governor
++	  with the exception that the frequency steps are defined by the given
++	  frequency table. Fallback governor will be the userspace governor.
+ endchoice
+ 
+ config CPU_FREQ_GOV_PERFORMANCE
+@@ -184,6 +196,21 @@ config CPU_FREQ_GOV_CONSERVATIVE
+ 
+ 	  If in doubt, say N.
+ 
++config CPU_FREQ_GOV_LANTIQGOV
++	tristate "'lantiqgov' cpufreq governor"
++	depends on CPU_FREQ
++	select CPU_FREQ_GOV_COMMON
++	help
++	  'lantiqgov' - this driver is rather similar to the 'conservative'
++	  governor. The difference is its optimisation on the increase/decrease
++	  steps in case of a given frequency table. Lantiq SoC's can only be
++	  scaled in fix frequency steps. If a request for an increase/decrease 
++	  of the CPU clock rate is detected, this governor fetch the next higher
++	  or next lower value from the table to set the new frequency according to
++	  this table entry.
++
++	  If in doubt, say N.
++
+ config GENERIC_CPUFREQ_CPU0
+ 	tristate "Generic CPU0 cpufreq driver"
+ 	depends on HAVE_CLK && REGULATOR && PM_OPP && OF
+@@ -240,6 +267,7 @@ depends on MIPS
+ 
+ config LOONGSON2_CPUFREQ
+ 	tristate "Loongson2 CPUFreq Driver"
++	depends on MIPS_EXTERNAL_TIMER
+ 	select CPU_FREQ_TABLE
+ 	help
+ 	  This option adds a CPUFreq driver for loongson processors which
+@@ -251,6 +279,47 @@ config LOONGSON2_CPUFREQ
+ 
+ 	  If in doubt, say N.
+ 
++config LTQ_CPUFREQ
++	tristate "Lantiq SoC CPUFreq Driver"
++	select LTQ_PPA_COC_SUPPORT
++	select LTQ_DATAPATH_CPUFREQ
++	select XRX500_ETH_DRV_COC_SUPPORT
++	help
++	  This option adds a CPUFreq driver for Lantiq SoC's which
++	  support software configurable cpu frequency scaling.
++
++	  If in doubt, say N.
++
++config LTQ_CPUFREQ_DEBUG
++	tristate "Enable debug messages for Lantiq Frequency Driver"
++	depends on LTQ_CPUFREQ
++	default n
++	help
++	  This option enables debug ability to the CPUFreq driver for
++	  Lantiq SoC's. Further message control can be done via sysfs:
++	  /sys/module/ltq_cpufreq/parameters/ltq_cpufreq_debug
++	  add 1 for INFO, 2 for FUNCtrace, and 4 for DEBUG.
++	  Combination is valid, e.g. add 7 to enable all three."
++
++config LTQ_CPU_FREQ
++	tristate "Enable the sub system support for frequency scaling"
++	depends on LTQ_CPUFREQ
++	default y
++	help
++	  This option enables the lantiq sub system support for
++		frequency scaling (register to cpufreq, get notification).
++		Necessary because of clock dependencies.
++
++config LTQ_CPUFREQ_DVS
++	tristate "Enable support for Dynamic Voltage Scaling"
++	depends on LTQ_CPUFREQ
++	default n
++	help
++	  This option enables the lantiq sub system support for
++		DVS to adapt the digital core voltage according to the current
++		frequency. For any defined cpu scaling frequencies a corresponding
++		core voltage value will be set to reduce power consumption.
++
+ endmenu
+ 
+ menu "PowerPC CPU frequency scaling drivers"
+diff --git a/drivers/cpufreq/Makefile b/drivers/cpufreq/Makefile
+--- a/drivers/cpufreq/Makefile
++++ b/drivers/cpufreq/Makefile
+@@ -10,7 +10,7 @@ obj-$(CONFIG_CPU_FREQ_GOV_USERSPACE)	+= 
+ obj-$(CONFIG_CPU_FREQ_GOV_ONDEMAND)	+= cpufreq_ondemand.o
+ obj-$(CONFIG_CPU_FREQ_GOV_CONSERVATIVE)	+= cpufreq_conservative.o
+ obj-$(CONFIG_CPU_FREQ_GOV_COMMON)		+= cpufreq_governor.o
+-
++obj-$(CONFIG_CPU_FREQ_GOV_LANTIQGOV)	+= ltq_cpufreq_dyn_govenor.o
+ # CPUfreq cross-arch helpers
+ obj-$(CONFIG_CPU_FREQ_TABLE)		+= freq_table.o
+ 
+@@ -92,3 +92,6 @@ obj-$(CONFIG_SH_CPU_FREQ)		+= sh-cpufreq
+ obj-$(CONFIG_SPARC_US2E_CPUFREQ)	+= sparc-us2e-cpufreq.o
+ obj-$(CONFIG_SPARC_US3_CPUFREQ)		+= sparc-us3-cpufreq.o
+ obj-$(CONFIG_UNICORE32)			+= unicore2-cpufreq.o
++obj-$(CONFIG_LTQ_CPUFREQ)		+= ltq_cpufreq.o
++obj-$(CONFIG_LTQ_CPUFREQ_DVS)	+= ltq_regulator_cpufreq.o
++
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -14,6 +14,9 @@
+  * published by the Free Software Foundation.
+  *
+  */
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++#define DEBUG
++#endif
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+@@ -68,7 +71,7 @@ static DEFINE_PER_CPU(int, cpufreq_polic
+ static DEFINE_PER_CPU(struct rw_semaphore, cpu_policy_rwsem);
+ 
+ #define lock_policy_rwsem(mode, cpu)					\
+-static int lock_policy_rwsem_##mode(int cpu)				\
++int lock_policy_rwsem_##mode(int cpu)				\
+ {									\
+ 	int policy_cpu = per_cpu(cpufreq_policy_cpu, cpu);		\
+ 	BUG_ON(policy_cpu == -1);					\
+@@ -76,17 +79,19 @@ static int lock_policy_rwsem_##mode(int 
+ 									\
+ 	return 0;							\
+ }
++EXPORT_SYMBOL_GPL(lock_policy_rwsem_write);
+ 
+ lock_policy_rwsem(read, cpu);
+ lock_policy_rwsem(write, cpu);
+ 
+ #define unlock_policy_rwsem(mode, cpu)					\
+-static void unlock_policy_rwsem_##mode(int cpu)				\
++void unlock_policy_rwsem_##mode(int cpu)				\
+ {									\
+ 	int policy_cpu = per_cpu(cpufreq_policy_cpu, cpu);		\
+ 	BUG_ON(policy_cpu == -1);					\
+ 	up_##mode(&per_cpu(cpu_policy_rwsem, policy_cpu));		\
+ }
++EXPORT_SYMBOL_GPL(unlock_policy_rwsem_write);
+ 
+ unlock_policy_rwsem(read, cpu);
+ unlock_policy_rwsem(write, cpu);
+@@ -218,7 +223,8 @@ static void cpufreq_cpu_put_sysfs(struct
+  * systems as each CPU might be scaled differently. So, use the arch
+  * per-CPU loops_per_jiffy value wherever possible.
+  */
+-#ifndef CONFIG_SMP
++/*#ifndef CONFIG_SMP*/
++#if 0
+ static unsigned long l_p_j_ref;
+ static unsigned int  l_p_j_ref_freq;
+ 
+@@ -249,13 +255,14 @@ static inline void adjust_jiffies(unsign
+ #endif
+ 
+ 
+-void __cpufreq_notify_transition(struct cpufreq_policy *policy,
++int __cpufreq_notify_transition(struct cpufreq_policy *policy,
+ 		struct cpufreq_freqs *freqs, unsigned int state)
+ {
++	int ret = -1;
+ 	BUG_ON(irqs_disabled());
+ 
+ 	if (cpufreq_disabled())
+-		return;
++		return ret;
+ 
+ 	freqs->flags = cpufreq_driver->flags;
+ 	pr_debug("notification %u of frequency transition to %u kHz\n",
+@@ -277,8 +284,9 @@ void __cpufreq_notify_transition(struct 
+ 				freqs->old = policy->cur;
+ 			}
+ 		}
+-		srcu_notifier_call_chain(&cpufreq_transition_notifier_list,
+-				CPUFREQ_PRECHANGE, freqs);
++		ret = srcu_notifier_call_chain(
++					&cpufreq_transition_notifier_list,
++					CPUFREQ_PRECHANGE, freqs);
+ 		adjust_jiffies(CPUFREQ_PRECHANGE, freqs);
+ 		break;
+ 
+@@ -287,12 +295,14 @@ void __cpufreq_notify_transition(struct 
+ 		pr_debug("FREQ: %lu - CPU: %lu", (unsigned long)freqs->new,
+ 			(unsigned long)freqs->cpu);
+ 		trace_cpu_frequency(freqs->new, freqs->cpu);
+-		srcu_notifier_call_chain(&cpufreq_transition_notifier_list,
+-				CPUFREQ_POSTCHANGE, freqs);
++		ret = srcu_notifier_call_chain(
++					&cpufreq_transition_notifier_list,
++					CPUFREQ_POSTCHANGE, freqs);
+ 		if (likely(policy) && likely(policy->cpu == freqs->cpu))
+ 			policy->cur = freqs->new;
+ 		break;
+ 	}
++	return ret;
+ }
+ /**
+  * cpufreq_notify_transition - call notifier chain and adjust_jiffies
+@@ -302,14 +312,35 @@ void __cpufreq_notify_transition(struct 
+  * function. It is called twice on all CPU frequency changes that have
+  * external effects.
+  */
+-void cpufreq_notify_transition(struct cpufreq_policy *policy,
++int cpufreq_notify_transition(struct cpufreq_policy *policy,
+ 		struct cpufreq_freqs *freqs, unsigned int state)
+ {
+-	for_each_cpu(freqs->cpu, policy->cpus)
+-		__cpufreq_notify_transition(policy, freqs, state);
++	int ret = -1;
++	for_each_cpu(freqs->cpu, policy->cpus) {
++		ret = __cpufreq_notify_transition(policy, freqs, state);
++		if (!ret)
++			break;
++	}
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(cpufreq_notify_transition);
+ 
++/**
++ * cpufreq_notify_transition_once - call notifier chain and adjust_jiffies
++ * on frequency transition.
++ *
++ * This function calls the transition notifiers and the "adjust_jiffies"
++ * function. It is called only for cpu0. This function should be used if the 
++ * cpu clock is always the same for all cpu's. This avoid multiple notifications 
++ * of the registered sub-systems. 
++ */
++int cpufreq_notify_transition_once(struct cpufreq_policy *policy,
++		struct cpufreq_freqs *freqs, unsigned int state)
++{
++	return __cpufreq_notify_transition(policy, freqs, state);
++}
++EXPORT_SYMBOL_GPL(cpufreq_notify_transition_once);
++
+ 
+ 
+ /*********************************************************************
+@@ -848,9 +879,9 @@ static int cpufreq_add_policy_cpu(unsign
+  *
+  * Adds the cpufreq interface for a CPU device.
+  *
+- * The Oracle says: try running cpufreq registration/unregistration concurrently
+- * with with cpu hotplugging and all hell will break loose. Tried to clean this
+- * mess up, but more thorough testing is needed. - Mathieu
++ * The Oracle says: try running cpufreq registration/unregistration
++ * concurrently with with cpu hotplugging and all hell will break loose.
++ * Tried to clean this mess up, but more thorough testing is needed. - Mathieu
+  */
+ static int cpufreq_add_dev(struct device *dev, struct subsys_interface *sif)
+ {
+@@ -1005,7 +1036,8 @@ static void update_policy_cpu(struct cpu
+  * Caller should already have policy_rwsem in write mode for this CPU.
+  * This routine frees the rwsem before returning.
+  */
+-static int __cpufreq_remove_dev(struct device *dev, struct subsys_interface *sif)
++static int __cpufreq_remove_dev(struct device *dev,
++				struct subsys_interface *sif)
+ {
+ 	unsigned int cpu = dev->id, ret, cpus;
+ 	unsigned long flags;
+@@ -1049,6 +1081,10 @@ static int __cpufreq_remove_dev(struct d
+ 	} else if (cpus > 1) {
+ 		/* first sibling now owns the new sysfs dir */
+ 		cpu_dev = get_cpu_device(cpumask_first(data->cpus));
++		if (cpu_dev == NULL) {
++			pr_err("%s: Failed to get cpu_dev", __func__);
++			return -EINVAL;
++		}
+ 		sysfs_remove_link(&cpu_dev->kobj, "cpufreq");
+ 		ret = kobject_move(&data->kobj, &cpu_dev->kobj);
+ 		if (ret) {
+@@ -1137,7 +1173,8 @@ static void handle_update(struct work_st
+ }
+ 
+ /**
+- *	cpufreq_out_of_sync - If actual and saved CPU frequency differs, we're in deep trouble.
++ *	cpufreq_out_of_sync - If actual and saved CPU frequency differs,
++ *	we're in deep trouble.
+  *	@cpu: cpu number
+  *	@old_freq: CPU frequency the kernel thinks the CPU runs at
+  *	@new_freq: CPU frequency the CPU actually runs at
+@@ -1738,13 +1775,15 @@ static int __cpufreq_set_policy(struct c
+ 
+ 			/* start new governor */
+ 			data->governor = policy->governor;
+-			if (!__cpufreq_governor(data, CPUFREQ_GOV_POLICY_INIT)) {
+-				if (!__cpufreq_governor(data, CPUFREQ_GOV_START)) {
++			if (!__cpufreq_governor(data,
++						CPUFREQ_GOV_POLICY_INIT)) {
++				if (!__cpufreq_governor(data,
++							CPUFREQ_GOV_START)) {
+ 					failed = 0;
+ 				} else {
+ 					unlock_policy_rwsem_write(policy->cpu);
+ 					__cpufreq_governor(data,
+-							CPUFREQ_GOV_POLICY_EXIT);
++						CPUFREQ_GOV_POLICY_EXIT);
+ 					lock_policy_rwsem_write(policy->cpu);
+ 				}
+ 			}
+@@ -1756,7 +1795,7 @@ static int __cpufreq_set_policy(struct c
+ 				if (old_gov) {
+ 					data->governor = old_gov;
+ 					__cpufreq_governor(data,
+-							CPUFREQ_GOV_POLICY_INIT);
++						CPUFREQ_GOV_POLICY_INIT);
+ 					__cpufreq_governor(data,
+ 							   CPUFREQ_GOV_START);
+ 				}
+@@ -1855,7 +1894,7 @@ static int __cpuinit cpufreq_cpu_callbac
+ }
+ 
+ static struct notifier_block __refdata cpufreq_cpu_notifier = {
+-    .notifier_call = cpufreq_cpu_callback,
++	.notifier_call = cpufreq_cpu_callback,
+ };
+ 
+ /*********************************************************************
+@@ -1975,7 +2014,8 @@ static int __init cpufreq_core_init(void
+ 		init_rwsem(&per_cpu(cpu_policy_rwsem, cpu));
+ 	}
+ 
+-	cpufreq_global_kobject = kobject_create_and_add("cpufreq", &cpu_subsys.dev_root->kobj);
++	cpufreq_global_kobject = kobject_create_and_add("cpufreq",
++						&cpu_subsys.dev_root->kobj);
+ 	BUG_ON(!cpufreq_global_kobject);
+ 	register_syscore_ops(&cpufreq_syscore_ops);
+ 
+diff --git a/drivers/cpufreq/cpufreq_governor.c b/drivers/cpufreq/cpufreq_governor.c
+--- a/drivers/cpufreq/cpufreq_governor.c
++++ b/drivers/cpufreq/cpufreq_governor.c
+@@ -249,6 +249,8 @@ int cpufreq_governor_dbs(struct cpufreq_
+ 		dbs_data = cdata->gdbs_data;
+ 
+ 	WARN_ON(!dbs_data && (event != CPUFREQ_GOV_POLICY_INIT));
++	if (!dbs_data && (event != CPUFREQ_GOV_POLICY_INIT))
++		return -ENOMEM;
+ 
+ 	switch (event) {
+ 	case CPUFREQ_GOV_POLICY_INIT:
+@@ -315,9 +317,11 @@ int cpufreq_governor_dbs(struct cpufreq_
+ 
+ 			if ((dbs_data->cdata->governor == GOV_CONSERVATIVE) &&
+ 				(policy->governor->initialized == 1)) {
+-				struct cs_ops *cs_ops = dbs_data->cdata->gov_ops;
++				struct cs_ops *cs_ops =
++						dbs_data->cdata->gov_ops;
+ 
+-				cpufreq_unregister_notifier(cs_ops->notifier_block,
++				cpufreq_unregister_notifier(
++						cs_ops->notifier_block,
+ 						CPUFREQ_TRANSITION_NOTIFIER);
+ 			}
+ 
+diff --git a/drivers/cpufreq/ltq_cpufreq.c b/drivers/cpufreq/ltq_cpufreq.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/cpufreq/ltq_cpufreq.c
+@@ -0,0 +1,1676 @@
++/*
++ *
++ *			 Copyright (c) 2012, 2014, 2015
++ *			Lantiq Beteiligungs-GmbH & Co. KG
++ *
++ *  For licensing information, see the file 'LICENSE' in the root folder of
++ *  this software module.
++ */
++
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	#define DEBUG
++#endif
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/ctype.h>
++#include <linux/init.h>
++#include <linux/spinlock.h>
++#include <linux/cpu.h>
++#include <linux/types.h>
++#include <linux/fs.h>
++#include <linux/sysfs.h>
++#include <linux/delay.h>
++#include <linux/of.h>
++#include <linux/clk.h>
++#include <lantiq.h>
++#include <linux/regulator/consumer.h>
++#include <linux/cpufreq.h>
++#include <cpufreq/ltq_cpufreq.h>
++#ifdef CONFIG_LTQ_CPUFREQ_DVS
++	#include <../arch/mips/lantiq/grx500/clk.h>
++#endif
++#include <../arch/mips/lantiq/clk.h>
++#include <../arch/mips/include/asm/idle.h>
++
++#define VERSION "3.0.0"
++#define RED     "\033[31;1m"
++#define NORMAL  "\033[0m"
++#define LTQ_PR_DBG(fmt, arg...)				\
++({							\
++	if (alert_msg > 0) {				\
++		pr_alert(RED pr_fmt(fmt) NORMAL, ##arg);\
++	} else {					\
++		pr_debug(pr_fmt(fmt), ##arg);		\
++	}						\
++})
++
++#define LTQ_CPUFREQ_TRANSITION_LATENCY 500000 /* ns */
++
++/* GRX500 product variants */
++#define GRX350			0x1
++#define GRX550			0x2
++
++int alert_msg;
++
++enum ltq_cpufreq_req_id {
++	/** no pending powerState request pending in the ringBuffer */
++	LTQ_CPUFREQ_NO_PENDING_REQ      = 0,
++	/** powerState request pending in the ringBuffer */
++	LTQ_CPUFREQ_PENDING_REQ         = 1,
++	/** unknown powerState request in buffer or buffer overflow */
++	LTQ_CPUFREQ_PENDING_REQ_ERROR   = -1,
++};
++
++/**
++	struct used in REQUEST ringBuffer to keep all relevant info's for one
++	powerState request
++*/
++struct ltq_cpufreq_req_state {
++	struct ltq_cpufreq_module_state moduleState;
++	enum ltq_cpufreq_req_id         reqId;
++};
++
++
++/*======================================================================*/
++/* LOCAL FUNCTIONS PROTOTYPES						*/
++/*======================================================================*/
++static int ltq_cpufreq_init(struct cpufreq_policy *policy);
++static int ltq_cpufreq_verify(struct cpufreq_policy *policy);
++static int ltq_cpufreq_target(struct cpufreq_policy *policy,
++				unsigned int target_freq,
++				unsigned int relation);
++static int ltq_cpufreq_exit(struct cpufreq_policy *policy);
++static int ltq_cpufreq_resume(struct cpufreq_policy *policy);
++static struct ltq_cpufreq_req_state ltq_cpufreq_get_req(void);
++static int ltq_cpufreq_put_req(struct ltq_cpufreq_req_state req);
++static void ltq_cpufreq_process_req(struct work_struct *work);
++static int ltq_cpucg_pwrFeatureSwitch(int pwrStateEna);
++static int ltq_cpufreq_state_get(enum ltq_cpufreq_state *pmcuState);
++
++/*======================================================================*/
++/* WORKQUEUE DECLARATION						*/
++/*======================================================================*/
++static DECLARE_WORK(work_obj, ltq_cpufreq_process_req);
++
++/*======================================================================*/
++/* module DEFINES							*/
++/*======================================================================*/
++/* size of request ringbuffer */
++#define LTQ_REQ_BUFFER_SIZE 5
++
++/*======================================================================*/
++/* Internal module global variable DECLARATIONS				*/
++/*======================================================================*/
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++struct ltq_cpufreq_latency ltq_cpufreq_latency_g[3] = {
++	/* max,  min   , cur, freq, comment */
++	{ -1, 999999999, -1,   0,   "Not Defined"},
++	{ -1, 999999999, -1,   0,   "Not Defined"},
++	{ -1, 999999999, -1,   0,   "Not Defined"},
++};
++#endif
++
++struct reg_cpufreq	drvdata;
++
++struct ltq_cpufreq_module_info cpuddr_feature_fss = {
++	.name                      = "CPU/DDR frequency scaling support",
++	.pmcuModule                = LTQ_CPUFREQ_MODULE_CPU,
++	.pmcuModuleNr              = 0,
++	.powerFeatureStat          = 1,
++	.ltq_cpufreq_state_get     = ltq_cpufreq_state_get,
++	.ltq_cpufreq_pwr_feature_switch = NULL,
++};
++
++struct ltq_cpufreq_module_info cpuwait_feature_cgs = {
++	.name                   = "CPU clock gating support (sleep opcode)",
++	.pmcuModule             = LTQ_CPUFREQ_MODULE_CPU,
++	.pmcuModuleNr           = 0,
++	.powerFeatureStat       = 1,
++	.ltq_cpufreq_state_get  = NULL,
++	.ltq_cpufreq_pwr_feature_switch = ltq_cpucg_pwrFeatureSwitch,
++};
++
++/** \ingroup LQ_CPUFREQ
++\brief  Container to save cpu_wait pointer
++	Used to enable/disable the mips_core clock gating feature
++*/
++static void (*cpu_wait_sav)(void);	/* container to save mips_wait */
++
++static struct ltq_cpufreq ltq_cpufreq_obj = {
++	.list_head_module = LIST_HEAD_INIT(ltq_cpufreq_obj.list_head_module),
++	.cpufreq_cur_state  = LTQ_CPUFREQ_PS_D0,
++	.cpufreq_new_state  = LTQ_CPUFREQ_PS_D0,
++	.cpu_scaling_rates = {
++		500000000, /* D0 */
++		500000000, /* D1 */
++		500000000, /* D2 */
++		500000000, /* D3 */
++		0xA}, /* eol */
++	.ddr_scaling_rates = {
++		250000000, /* D0 */
++		250000000, /* D1 */
++		250000000, /* D2 */
++		250000000, /* D3 */
++		0xA}, /* eol */
++	.ltq_state_change_control = 0,
++	.ltq_clk_change_cb = NULL,
++	.regulator = NULL,
++	.polling_period = 10, /*10 seconds*/
++	.ps_threshold_dp = {
++		.th_d0 = 1,
++		.th_d1 = 1,
++		.th_d2 = 1,
++		.th_d3 = 100,
++		},
++	.frequency_up_threshold = 60,
++	.frequency_down_threshold = 20,
++	.sampling_down_factor = 8
++};
++
++static int ltq_state_change_enable = 1;
++
++/** \ingroup LTQ_CPUFREQ
++\brief  The powerState request ringBuffer collect the incoming power state
++	requests. The ringBuffer has a size of LTQ_REQ_BUFFER_SIZE,
++	and will continuously start from the beginning with each overflow.
++*/
++static struct ltq_cpufreq_req_state ltq_cpufreq_reqBuffer[LTQ_REQ_BUFFER_SIZE];
++
++/** \ingroup LTQ_CPUFREQ
++\brief  The reqGetIndex points to the next request entry to be processed.
++*/
++static unsigned int ltq_cpufreq_reqGetIndex;
++
++/** \ingroup LTQ_CPUFREQ
++\brief  The reqPutIndex points to the next free entry inside the ringBuffer
++			to place the next incoming request.
++*/
++static unsigned int ltq_cpufreq_reqPutIndex;
++
++/** \ingroup LTQ_CPUFREQ
++\brief  The reqBufferSize is the ringBuffer watchdog to signalize a real
++	overflow of the ringBuffer. A real overflow means that the
++	reqbuffer contains already LTQ_REQ_BUFFER_SIZE request entries
++	and a new incoming request can not be placed and will be discarded.
++*/
++static unsigned int ltq_cpufreq_reqBufferSize;
++
++
++/* module names; array correspond to enum enum ltq_cpufreq_module */
++char *ltq_cpufreq_mod[LTQ_CPUFREQ_MODULE_ID_MAX+1] = {
++	"CPU" ,
++	"WLAN" ,
++	"VE" ,
++	"PPE" ,
++	"SWITCH" ,
++	"UART" ,
++	"GPTC" ,
++	"PCIE" ,
++	"USB" ,
++	"DEU" ,
++	"DP" ,
++	"DPL" ,
++	"ETH" ,
++	"PATM" ,
++	"I2C" ,
++	"INVALID" ,
++};
++
++/* CPUFREQ specific power state translation */
++const char *ltq_cpufreq_pst[] = {
++	"UNDEF",
++	"D0",
++	"D1",
++	"D2",
++	"D3",
++	"D0D3",
++	"BOOST"
++};
++
++/** \ingroup LTQ_CPUFREQ
++\brief  hold the current status if a sub system is busy and will deny
++	a freq change. Each sub system is represented by one bit position.
++	'1' sub system is busy and will deny a frequency change request
++	'0' sub system is idle and can accept a frequency change request
++*/
++static int ltq_subsys_busy;
++
++struct cpufreq_frequency_table ltq_freq_tab[] = {
++	{.index = LTQ_CPUFREQ_PS_D0, .frequency = CPUFREQ_ENTRY_INVALID,},
++	{.index = LTQ_CPUFREQ_PS_D1, .frequency = CPUFREQ_ENTRY_INVALID,},
++	{.index = LTQ_CPUFREQ_PS_D2, .frequency = CPUFREQ_ENTRY_INVALID,},
++	{.index = LTQ_CPUFREQ_PS_D3, .frequency = CPUFREQ_ENTRY_INVALID,},
++	{.index = 0, .frequency = CPUFREQ_TABLE_END,}
++};
++
++
++static struct freq_attr *ltq_freq_attr[] = {
++	&cpufreq_freq_attr_scaling_available_freqs,
++	NULL,
++};
++
++struct cpufreq_driver ltq_cpufreq_driver = {
++
++	.name       = "ltq_cpufreq_drv "VERSION"\n",
++	.owner      = THIS_MODULE,
++	.init       = ltq_cpufreq_init,
++	.flags      = 0,
++	.verify     = ltq_cpufreq_verify,
++	.setpolicy  = NULL,
++	.target     = ltq_cpufreq_target,
++	.get        = ltq_cpufreq_getfreq_khz,
++	.getavg     = NULL,
++	.exit       = ltq_cpufreq_exit,
++	.suspend    = NULL,
++	.resume     = ltq_cpufreq_resume,
++	.attr       = ltq_freq_attr,
++};
++
++static int ltq_cpufreq_state_set(enum ltq_cpufreq_state ps)
++{
++	int retval = 0;
++	unsigned long *cpu_freq;
++	unsigned long freq;
++	struct clk *clk = clk_get_sys("cpu", "cpu");
++
++	if (clk == NULL) {
++		pr_err("CPU clock structure not found\n");
++		return -1;
++	}
++	cpu_freq = ltq_cpufreq_obj.cpu_scaling_rates;
++	if (cpu_freq == NULL)
++		return -1;
++
++	switch (ps) {
++	case LTQ_CPUFREQ_PS_D0:
++		{
++			freq = *(cpu_freq +
++				(LTQ_CPUFREQ_PS_D0 - LTQ_CPUFREQ_PS_D0));
++			ltq_cpufreq_obj.cpufreq_new_state = LTQ_CPUFREQ_PS_D0;
++			retval = clk_set_rate(clk, freq);
++			if (retval == 0) {
++				ltq_cpufreq_obj.cpufreq_cur_state =
++				ltq_cpufreq_obj.cpufreq_new_state;
++			}
++			break;
++		}
++	case LTQ_CPUFREQ_PS_D1:
++		{
++			freq = *(cpu_freq +
++				(LTQ_CPUFREQ_PS_D1 - LTQ_CPUFREQ_PS_D0));
++			ltq_cpufreq_obj.cpufreq_new_state = LTQ_CPUFREQ_PS_D1;
++			retval = clk_set_rate(clk, freq);
++			if (retval == 0) {
++				ltq_cpufreq_obj.cpufreq_cur_state =
++				ltq_cpufreq_obj.cpufreq_new_state;
++			}
++			break;
++		}
++	case LTQ_CPUFREQ_PS_D2:
++		{
++			freq = *(cpu_freq +
++				(LTQ_CPUFREQ_PS_D2 - LTQ_CPUFREQ_PS_D0));
++			ltq_cpufreq_obj.cpufreq_new_state = LTQ_CPUFREQ_PS_D2;
++			retval = clk_set_rate(clk, freq);
++			if (retval == 0) {
++				ltq_cpufreq_obj.cpufreq_cur_state =
++				ltq_cpufreq_obj.cpufreq_new_state;
++			}
++			break;
++		}
++	case LTQ_CPUFREQ_PS_D3:
++		{
++			freq = *(cpu_freq +
++				(LTQ_CPUFREQ_PS_D3 - LTQ_CPUFREQ_PS_D0));
++			ltq_cpufreq_obj.cpufreq_new_state = LTQ_CPUFREQ_PS_D3;
++			retval = clk_set_rate(clk, freq);
++			if (retval == 0) {
++				ltq_cpufreq_obj.cpufreq_cur_state =
++				ltq_cpufreq_obj.cpufreq_new_state;
++			}
++			break;
++		}
++	default:
++		{
++			break;
++		}
++	}
++	return retval;
++}
++
++
++/**
++	Callback function registered at the CPUFREQ.
++	Enable/Disable of the mips_core clock gating (mips wait instruction).
++
++	\param[in]  pwrStateEna
++		- 1 enabled
++		- 0 disabled
++
++	\return Returns value as follows:
++		- 0: if successful
++		- < 0: in case of an error
++*/
++static int ltq_cpucg_pwrFeatureSwitch(int pwrStateEna)
++{
++	if (pwrStateEna == 1) {
++		cpu_wait = cpu_wait_sav;
++		cpuwait_feature_cgs.powerFeatureStat = 1;
++		return 0;
++	}
++	if (pwrStateEna == 0) {
++		cpu_wait = 0;
++		cpuwait_feature_cgs.powerFeatureStat = 0;
++		return 0;
++	}
++	return -1;
++}
++
++/**
++	Callback function registered at the PMCU.
++	This function is called by the PMCU to get the current power state
++	status of the cpu frequency driver.
++
++	\param[out]   pmcuState  current power state
++
++	\return Returns value as follows:
++		- IFX_PMCU_RETURN_SUCCESS: if successful
++		- IFX_PMCU_RETURN_ERROR: in case of an error
++*/
++static int ltq_cpufreq_state_get(enum ltq_cpufreq_state *pmcuState)
++{
++	*pmcuState = ltq_cpufreq_obj.cpufreq_cur_state;
++	return 0;
++}
++
++struct ltq_cpufreq *ltq_cpufreq_get(void)
++{
++	return &ltq_cpufreq_obj;
++}
++EXPORT_SYMBOL(ltq_cpufreq_get);
++
++int ltq_cpufreq_state_change_disable(void)
++{
++
++	ltq_state_change_enable = 0;
++	ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_CPU, 0, LTQ_CPUFREQ_PS_D0);
++	return 0;
++}
++
++int ltq_cpufreq_state_change_enable(void)
++{
++
++	ltq_state_change_enable = 1;
++	ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_CPU, 0, LTQ_CPUFREQ_PS_D3);
++	return 0;
++}
++
++static void ltq_cpufreq_process_req(struct work_struct *work)
++{
++	struct cpufreq_policy *policy = NULL;
++	struct ltq_cpufreq_req_state reqState;
++
++	pr_debug("%s is called\n", __func__);
++
++	while (ltq_cpufreq_reqBufferSize > 0) {
++		reqState = ltq_cpufreq_get_req();
++		if (reqState.reqId == LTQ_CPUFREQ_PENDING_REQ_ERROR) {
++			pr_err("CPUFREQ Request Buffer underflow\n");
++			return;
++		}
++		if (reqState.reqId == LTQ_CPUFREQ_NO_PENDING_REQ) {
++			pr_err("No valid CPUFREQ Request in buffer!!!!!\n");
++			return;
++		}
++
++		if (!ltq_state_change_enable) {
++			pr_debug("Frequency down scaling disabled.\n");
++			reqState.moduleState.pmcuState = LTQ_CPUFREQ_PS_D0;
++		}
++		policy = cpufreq_cpu_get(smp_processor_id());
++		if (!policy)
++			continue;
++
++		if (reqState.moduleState.pmcuState == LTQ_CPUFREQ_PS_D0) {
++			__cpufreq_driver_target(policy, policy->max,
++							CPUFREQ_RELATION_L);
++		} else {
++			__cpufreq_driver_target(policy, policy->min,
++							CPUFREQ_RELATION_L);
++		}
++	}
++	return;
++}
++
++static void ltq_set_subsys_busy(unsigned int busy,
++				enum ltq_cpufreq_module module)
++{
++	unsigned long iflags;
++
++	spin_lock_irqsave(&ltq_cpufreq_obj.ltq_cpufreq_lock, iflags);
++
++	if (busy == 0)
++		ltq_subsys_busy &= ~(0x1<<module);
++	else if (busy == 1)
++		ltq_subsys_busy |= 0x1<<module;
++	else
++		ltq_subsys_busy = 0;
++
++	spin_unlock_irqrestore(&ltq_cpufreq_obj.ltq_cpufreq_lock, iflags);
++}
++
++int ltq_cpufreq_state_req(enum ltq_cpufreq_module module,
++				unsigned char moduleNr,
++				enum ltq_cpufreq_state newState)
++{
++	struct cpufreq_policy *policy = NULL;
++	struct ltq_cpufreq_req_state reqState;
++
++	LTQ_PR_DBG("%s is called: Module=%s, ModuleNr=%d, State=%s\n",
++			  __func__, ltq_cpufreq_mod[module], moduleNr,
++			 ltq_cpufreq_pst[newState]);
++	/* check if the acception of the powerstate request is enabled */
++	if (ltq_cpufreq_obj.ltq_state_change_control == 0) {
++		pr_debug("StateChange disabled. Request will be rejected\n");
++		return LTQ_CPUFREQ_RETURN_DENIED;
++	}
++
++	if (ltq_cpufreq_driver.flags & CPUFREQ_PM_NO_DENY) {
++		/*we are in special thermal mode where we deny any up-scaling*/
++		return LTQ_CPUFREQ_RETURN_DENIED;
++	}
++
++	/*only D0 request will be processed. Down scaling will be triggered by
++	  dyn. governor*/
++	if (newState != LTQ_CPUFREQ_PS_D0) {
++		/*special handling for PPE. DS request handled by DP metering*/
++		if ((module & LTQ_CPUFREQ_MODULE_DP) == LTQ_CPUFREQ_MODULE_DP)
++			ltq_set_subsys_busy(0, LTQ_CPUFREQ_MODULE_PPE);
++
++		ltq_set_subsys_busy(0, module);
++		return 0;
++	} else {
++		ltq_set_subsys_busy(1, module);
++	}
++
++	/*check if the new request is already active*/
++	policy = cpufreq_cpu_get(smp_processor_id());
++	if (policy) {
++		if (ltq_cpufreq_get_ps_from_khz(policy->cur) == newState)
++			return 0;
++	}
++
++	reqState.moduleState.pmcuModule = module;
++	reqState.moduleState.pmcuModuleNr = moduleNr;
++	reqState.moduleState.pmcuState = newState;
++	reqState.reqId = LTQ_CPUFREQ_NO_PENDING_REQ;
++
++	/* put new powerState request into request buffer */
++	if (ltq_cpufreq_put_req(reqState) < 0)
++		pr_err("CPUFREQ RequestBuffer overflow !!!\n");
++
++	if (system_wq == NULL) {
++		pr_debug("No workqueue available\n");
++		return -EFAULT;
++	}
++	/* feed the system_wq workqueue.
++	   fetch powerState request from requestBuffer by the wq */
++	if (!queue_work(system_wq, &work_obj))
++		pr_debug("workqueue successfully loaded\n");
++
++	return 0;
++}
++EXPORT_SYMBOL(ltq_cpufreq_state_req);
++
++int ltq_cpufreq_get_poll_period(enum ltq_cpufreq_module module,
++				unsigned char moduleNr)
++{
++	/*currently we define same polling period for all modules*/
++	return ltq_cpufreq_obj.polling_period;
++}
++EXPORT_SYMBOL(ltq_cpufreq_get_poll_period);
++
++
++struct ltq_cpufreq_threshold *ltq_cpufreq_get_threshold(
++				enum ltq_cpufreq_module module,
++				unsigned char moduleNr)
++{
++	return &ltq_cpufreq_obj.ps_threshold_dp;
++}
++EXPORT_SYMBOL(ltq_cpufreq_get_threshold);
++
++static int ltq_cpufreq_put_req(struct ltq_cpufreq_req_state req)
++{
++	int i;
++	unsigned long iflags;
++
++	pr_debug("%s is called\n", __func__);
++	if (ltq_cpufreq_reqBufferSize >= LTQ_REQ_BUFFER_SIZE)
++		return -1;
++
++	spin_lock_irqsave(&ltq_cpufreq_obj.ltq_cpufreq_lock, iflags);
++
++	/* first check if there is already a request for this module pending.
++	   If this is the case, reject the actual one. */
++	for (i = 0; i < LTQ_REQ_BUFFER_SIZE; i++) {
++		if (ltq_cpufreq_reqBuffer[i].reqId ==
++			LTQ_CPUFREQ_NO_PENDING_REQ) {
++			continue;
++		}
++		if ((ltq_cpufreq_reqBuffer[i].moduleState.pmcuModule ==
++			 req.moduleState.pmcuModule) &&
++			(ltq_cpufreq_reqBuffer[i].moduleState.pmcuModuleNr ==
++			 req.moduleState.pmcuModuleNr) &&
++			(ltq_cpufreq_reqBuffer[i].moduleState.pmcuState ==
++			 req.moduleState.pmcuState)) {
++			spin_unlock_irqrestore(
++				&ltq_cpufreq_obj.ltq_cpufreq_lock, iflags);
++			pr_debug("%s multiple requests from same module.\n",
++				 __func__);
++			return 0;
++		}
++	}
++
++	req.reqId = LTQ_CPUFREQ_PENDING_REQ;
++	memcpy(&ltq_cpufreq_reqBuffer[ltq_cpufreq_reqPutIndex],
++		   &req, sizeof(req));
++	ltq_cpufreq_reqPutIndex++;
++	if (ltq_cpufreq_reqPutIndex >= LTQ_REQ_BUFFER_SIZE)
++		ltq_cpufreq_reqPutIndex = 0;
++
++	ltq_cpufreq_reqBufferSize++;
++	spin_unlock_irqrestore(&ltq_cpufreq_obj.ltq_cpufreq_lock, iflags);
++	return 0;
++}
++
++static struct ltq_cpufreq_req_state ltq_cpufreq_get_req(void)
++{
++	struct ltq_cpufreq_req_state req;
++
++	pr_debug("%s is called\n", __func__);
++	memset(&req, 0, sizeof(req));
++	req.reqId = LTQ_CPUFREQ_PENDING_REQ_ERROR;
++
++	if (!ltq_cpufreq_reqBufferSize)
++		return req;
++
++	ltq_cpufreq_reqBufferSize--;
++	memcpy(&req, &ltq_cpufreq_reqBuffer[ltq_cpufreq_reqGetIndex],
++		   sizeof(req));
++	ltq_cpufreq_reqBuffer[ltq_cpufreq_reqGetIndex].reqId =
++	LTQ_CPUFREQ_NO_PENDING_REQ;
++	ltq_cpufreq_reqGetIndex++;
++	if (ltq_cpufreq_reqGetIndex >= LTQ_REQ_BUFFER_SIZE)
++		ltq_cpufreq_reqGetIndex = 0;
++
++	return req;
++}
++
++static unsigned long ltq_get_min_freq(unsigned long *freq_list)
++{
++	int i;
++	unsigned long freq = 0xdeadbeef;
++
++	for (i = 0; i < 4; i++) {
++		if ((*(freq_list + i) != 0) &&
++			(*(freq_list + i) < freq)) {
++			freq = *(freq_list + i);
++		}
++	}
++	return freq;
++}
++
++/* convert given frequency in kHz to corresponding power state */
++enum ltq_cpufreq_state ltq_cpufreq_get_ps_from_khz(unsigned int freqkhz)
++{
++	struct cpufreq_frequency_table *ltq_freq_tab_p;
++	ltq_freq_tab_p = ltq_freq_tab;
++
++	while (ltq_freq_tab_p->frequency != CPUFREQ_TABLE_END) {
++		if (ltq_freq_tab_p->frequency == freqkhz)
++			return (enum ltq_cpufreq_state)ltq_freq_tab_p->index;
++
++		ltq_freq_tab_p++;
++	}
++	return (enum ltq_cpufreq_state)ltq_freq_tab_p->index;
++}
++EXPORT_SYMBOL(ltq_cpufreq_get_ps_from_khz);
++
++/* convert given power state to corresponding frequency in kHz */
++unsigned int ltq_cpufreq_get_khz_from_ps(enum ltq_cpufreq_state ps)
++{
++	unsigned long *cpu_freq;
++
++	cpu_freq = ltq_cpufreq_obj.cpu_scaling_rates;
++	if (cpu_freq == NULL)
++		return -1;
++
++	return (*(cpu_freq + (ps - LTQ_CPUFREQ_PS_D0)))/1000;
++}
++EXPORT_SYMBOL(ltq_cpufreq_get_khz_from_ps);
++
++unsigned int ltq_cpufreq_getfreq_khz(unsigned int cpu)
++{
++	struct clk *clk = clk_get_sys("cpu", "cpu");
++
++	if (clk == NULL) {
++		pr_err("CPU clock structure not found\n");
++		return -1;
++	}
++
++	return clk_get_rate(clk) / 1000;
++}
++EXPORT_SYMBOL(ltq_cpufreq_getfreq_khz);
++
++int ltq_get_subsys_busy(void)
++{
++	return ltq_subsys_busy;
++}
++EXPORT_SYMBOL(ltq_get_subsys_busy);
++
++int ltq_register_clk_change_cb(int (*callback) (void *))
++{
++	pr_debug("%s is called\n", __func__);
++	ltq_cpufreq_obj.ltq_clk_change_cb = callback;
++	return 0;
++}
++EXPORT_SYMBOL(ltq_register_clk_change_cb);
++
++int ltq_cpufreq_mod_list(struct list_head *head, int add)
++{
++	unsigned long iflags;
++
++	pr_debug("%s is called\n", __func__);
++	spin_lock_irqsave(&ltq_cpufreq_obj.ltq_cpufreq_lock, iflags);
++	if (add == 1)
++		list_add_tail(head, &ltq_cpufreq_obj.list_head_module);
++	else
++		list_del(head);
++
++	spin_unlock_irqrestore(&ltq_cpufreq_obj.ltq_cpufreq_lock, iflags);
++	return 0;
++}
++EXPORT_SYMBOL(ltq_cpufreq_mod_list);
++
++struct cpufreq_policy *policy_sav;
++
++static int ltq_cpufreq_init(struct cpufreq_policy *policy)
++{
++	unsigned long freq;
++	struct clk *clk = clk_get_sys("cpu", "cpu");
++
++	pr_debug("%s is called\n", __func__);
++	if (clk == NULL) {
++		pr_err("CPU clock structure not found\n");
++		return -EINVAL;
++	}
++	freq = ltq_get_min_freq(ltq_cpufreq_obj.cpu_scaling_rates);
++	if (freq == 0xdeadbeef) {
++		pr_err("no valid scaling frequencies defined\n");
++		return -EINVAL;
++	}
++	policy_sav = policy;
++	cpumask_copy(policy->cpus, cpu_possible_mask);
++	policy->cpuinfo.min_freq = freq / 1000;
++	policy->cpuinfo.max_freq = ltq_cpufreq_obj.cpu_scaling_rates[0]/1000;
++	policy->cpuinfo.transition_latency = LTQ_CPUFREQ_TRANSITION_LATENCY;
++	policy->cur      = (clk_get_rate(clk) / 1000);
++	policy->min      = freq / 1000;
++	policy->max      = ltq_cpufreq_obj.cpu_scaling_rates[0]/1000;
++	policy->policy   = 0;
++
++	cpufreq_frequency_table_cpuinfo(policy, ltq_freq_tab);
++	cpufreq_frequency_table_get_attr(ltq_freq_tab, policy->cpu);
++	return 0;
++}
++
++static int ltq_cpufreq_verify(struct cpufreq_policy *policy)
++{
++	pr_debug("%s is called\n", __func__);
++	cpufreq_frequency_table_verify(policy, ltq_freq_tab);
++	return 0;
++}
++
++static int ltq_cpufreq_target(struct cpufreq_policy *policy,
++				unsigned int target_freq,
++				unsigned int relation)
++{
++	static struct cpufreq_policy *policy_sav;
++	static unsigned int target_freq_sav;
++	static unsigned int tab_index, ret;
++	int freqOk = -1;
++	struct cpufreq_freqs freqs;
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	unsigned int count_start;
++#endif
++	struct clk *clk = clk_get_sys("cpu", "cpu");
++
++	pr_debug("%s is called\n", __func__);
++	if (clk == NULL) {
++		pr_err("CPU clock structure not found\n");
++		return -EINVAL;
++	}
++	policy_sav = policy;
++	target_freq_sav = target_freq;
++	if (cpufreq_frequency_table_target(policy, ltq_freq_tab,
++				target_freq, relation, &tab_index)) {
++		return -EINVAL;
++	}
++	freqs.new = ltq_freq_tab[tab_index].frequency;
++	freqs.old = (clk_get_rate(clk) / 1000);	/* get kHz */
++	freqs.cpu = policy->cpu;
++	/* interrupt the process here if frequency doesn't change */
++	if (freqs.new == freqs.old)
++		return 0; /* nothing to do */
++
++	pr_debug("cpufreq_notify_transition_once, CPUFREQ_PRECHANGE\n");
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	count_start = ltq_count0_read();
++#endif
++	ret = cpufreq_notify_transition_once(policy, &freqs, CPUFREQ_PRECHANGE);
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	ltq_count0_diff(count_start, ltq_count0_read(),
++					"prechange notification ", 0);
++#endif
++	if ((ret & NOTIFY_STOP_MASK) == NOTIFY_STOP_MASK) {
++		ret = (ret >> 4) & 0x1F; /*mask module id*/
++		LTQ_PR_DBG("Frequency scaling was denied by module %s\n",
++				 ltq_cpufreq_mod[ret]);
++	} else {
++
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++		count_start = ltq_count0_read();
++#endif
++		if (ltq_cpufreq_state_set(ltq_freq_tab[tab_index].index))
++			freqOk = -1;
++		else
++			freqOk = 0;
++
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++		ltq_count0_diff(count_start, ltq_count0_read(),
++						"change clock rate      ", 1);
++#endif
++	}
++
++	if (freqOk < 0) {
++		/* if freq change is denied, call post_change with new=old */
++		freqs.new = freqs.old;
++	}
++	pr_debug("cpufreq_notify_transition_once, CPUFREQ_POSTCHANGE\n");
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	count_start = ltq_count0_read();
++#endif
++	cpufreq_notify_transition_once(policy, &freqs, CPUFREQ_POSTCHANGE);
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	ltq_count0_diff(count_start, ltq_count0_read(),
++					"postchange notification", 2);
++#endif
++	if ((freqOk >= 0) && (ltq_cpufreq_obj.ltq_clk_change_cb != NULL))
++		(void)ltq_cpufreq_obj.ltq_clk_change_cb(NULL);
++
++	/* copy loops_per_jiffy to cpu_data */
++	/*cpu_data[smp_processor_id()].udelay_val = loops_per_jiffy;*/
++	return freqOk;
++}
++
++static int ltq_cpufreq_exit(struct cpufreq_policy *policy)
++{
++	pr_debug("%s is called\n", __func__);
++	return 0;
++}
++
++static int ltq_cpufreq_resume(struct cpufreq_policy *policy)
++{
++	pr_debug("%s is called\n", __func__);
++	return 0;
++}
++
++
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++/* time measurement routines for debug purpose only */
++	#define COUNT0_MAX 0xFFFFFFFF
++
++static unsigned int cpu_freq_MHz;
++
++int ltq_count0_diff(u32 count_start, u32 count_end, char *ident, int index)
++{
++	u64 diff, time64;
++	int time;
++
++	if (count_start >= count_end)
++		diff = (COUNT0_MAX - count_start) + count_end;
++	else
++		diff = count_end - count_start;
++
++	time64 = 2 * diff; /* count runs with cpu/2 */
++	do_div(time64, cpu_freq_MHz);
++
++	/* check for realistic time */
++	if (time64 > 0x7FFFFFFF) {
++		pr_debug("timer overflow in freq change measurement\n");
++		time = 0x7FFFFFFF;
++	}
++	time = (int)time64;
++
++	switch (index) {
++	case 0:/*PRE*/
++		{
++			ltq_cpufreq_latency_g[0].comment = ident;
++			ltq_cpufreq_latency_g[0].cpu_frequency = cpu_freq_MHz;
++			if (time < ltq_cpufreq_latency_g[0].min_time)
++				ltq_cpufreq_latency_g[0].min_time = time;
++
++			ltq_cpufreq_latency_g[0].cur_time = time;
++			if (time > ltq_cpufreq_latency_g[0].max_time)
++				ltq_cpufreq_latency_g[0].max_time = time;
++			break;
++		}
++	case 1:/*STATE CHANGE*/
++		{
++			ltq_cpufreq_latency_g[1].comment = ident;
++			ltq_cpufreq_latency_g[1].cpu_frequency = cpu_freq_MHz;
++			if (time < ltq_cpufreq_latency_g[1].min_time)
++				ltq_cpufreq_latency_g[1].min_time = time;
++
++			ltq_cpufreq_latency_g[1].cur_time = time;
++			if (time > ltq_cpufreq_latency_g[1].max_time)
++				ltq_cpufreq_latency_g[1].max_time = time;
++			break;
++		}
++	case 2:/*POST*/
++		{
++			ltq_cpufreq_latency_g[2].comment = ident;
++			ltq_cpufreq_latency_g[2].cpu_frequency = cpu_freq_MHz;
++			if (time < ltq_cpufreq_latency_g[2].min_time)
++				ltq_cpufreq_latency_g[2].min_time = time;
++
++			ltq_cpufreq_latency_g[2].cur_time = time;
++			if (time > ltq_cpufreq_latency_g[2].max_time)
++				ltq_cpufreq_latency_g[2].max_time = time;
++			break;
++		}
++	default:
++			break;
++	}
++
++	return time;
++}
++EXPORT_SYMBOL(ltq_count0_diff);
++
++u32 ltq_count0_read(void)
++{
++	struct clk *clk = clk_get_sys("cpu", "cpu");
++
++	if (clk == NULL) {
++		pr_err("CPU clock structure not found\n");
++		return -1;
++	}
++	cpu_freq_MHz = clk_get_rate(clk)/1000000;
++	return read_c0_count();
++}
++EXPORT_SYMBOL(ltq_count0_read);
++
++#endif /* CONFIG_LTQ_CPUFREQ_DEBUG */
++
++/*======================================================================*/
++/* START: SYSFS HELPER FUNCTION CALLED FROM LINUX CPUFREQ		*/
++/*======================================================================*/
++static int ltq_cpufreq_read_scaling_clks(char *buf)
++{
++	int len = 0;
++	unsigned long ngi, cbm, ddr;
++
++	ngi = clk_get_rate(clk_get_sys("xbar", "xbar"))/1000;
++	if (ngi) {
++		cbm = clk_get_rate(clk_get_sys("ppe", "ppe"))/1000;
++		ddr = clk_get_rate(clk_get_sys("ddr", "ddr"))/1000;
++
++		len += sprintf(buf+len, " NGI frequency: %lu\n", ngi);
++		len += sprintf(buf+len, " CBM frequency: %lu\n", cbm);
++		len += sprintf(buf+len, " DDR frequency: %lu\n", ddr);
++	}
++	return len;
++}
++
++static int ltq_cpufreq_read_dvs(char *buf)
++{
++	int len = 0;
++
++	len += sprintf(buf+len, "  ltq_dvs_support = %s\n\n",
++	(ltq_cpufreq_obj.regulator != NULL) ? "AVAILABLE" : "NOT AVAILABLE");
++	return len;
++}
++
++static int ltq_cpufreq_read_control(char *buf)
++{
++	int len = 0;
++
++	len += sprintf(buf+len, "  ltq_state_change_control = %s\n\n",
++	(ltq_cpufreq_obj.ltq_state_change_control == 1) ? "ON" : "OFF");
++	return len;
++}
++
++static int ltq_cpufreq_write_control(const char *buf, size_t count)
++{
++	if (buf == NULL)
++		return 0;
++
++	if (sysfs_streq(buf, "on\n") || sysfs_streq(buf, "1")) {
++		ltq_cpufreq_obj.ltq_state_change_control = 1;
++	} else if (sysfs_streq(buf, "off\n") || sysfs_streq(buf, "0")) {
++		ltq_cpufreq_obj.ltq_state_change_control = 0;
++		ltq_set_subsys_busy(0xFF, 0);
++	} else {
++		pr_err("wrong input parameter. Use on | off | 1 | 0\n");
++	}
++	return count;
++}
++
++static int ltq_cpufreq_read_force_ds(char *buf)
++{
++	int len = 0;
++	u8 no_deny = ltq_cpufreq_driver.flags & CPUFREQ_PM_NO_DENY;
++
++	len += sprintf(buf+len, "  ltq_force_down_scaling = %s\n\n",
++	(no_deny == CPUFREQ_PM_NO_DENY) ? "ON" : "OFF");
++	return len;
++}
++
++static int ltq_cpufreq_write_force_ds(const char *buf, size_t count)
++{
++	if (buf == NULL)
++		return 0;
++
++	if (sysfs_streq(buf, "on\n") || sysfs_streq(buf, "1")) {
++		ltq_cpufreq_driver.flags |= CPUFREQ_PM_NO_DENY;
++		ltq_set_subsys_busy(0xFF, 0);
++	} else if (sysfs_streq(buf, "off\n") || sysfs_streq(buf, "0")) {
++		ltq_cpufreq_driver.flags &= ~CPUFREQ_PM_NO_DENY;
++	} else {
++		pr_err("wrong input parameter. Use on | off | 1 | 0\n");
++	}
++	return count;
++}
++
++static int ltq_cpufreq_read_alert(char *buf)
++{
++	int len = 0;
++	len += sprintf(buf+len, "  alert_msg = %s\n\n",
++	(alert_msg == 1) ? "ON" : "OFF");
++	return len;
++}
++
++static int ltq_cpufreq_write_alert(const char *buf, size_t count)
++{
++	if (buf == NULL)
++		return 0;
++
++	if (sysfs_streq(buf, "on\n") || sysfs_streq(buf, "1"))
++		alert_msg = 1;
++	else if (sysfs_streq(buf, "off\n") || sysfs_streq(buf, "0"))
++		alert_msg = 0;
++	else
++		pr_err("wrong input parameter. Use on | off | 1 | 0\n");
++
++	return count;
++}
++
++static int ltq_cpufreq_read_poll_period(char *buf)
++{
++	int len = 0;
++
++	len += sprintf(buf+len, "%d [sec]\n",
++		       ltq_cpufreq_obj.polling_period);
++	return len;
++}
++
++static int ltq_cpufreq_write_poll_period(const char *buf, size_t count)
++{
++	unsigned int ret;
++
++	if (buf == NULL)
++		return 0;
++	ret = sscanf(buf, "%d", &ltq_cpufreq_obj.polling_period);
++	if (ret != 1)
++		return -EINVAL;
++
++	return count;
++}
++
++static int ltq_cpufreq_read_subsys_busy(char *buf)
++{
++	int len = 0;
++	int i;
++
++	len += sprintf(buf+len, "ltq_subsys_busy=0x%x\n", ltq_subsys_busy);
++	for (i = 0; i < LTQ_CPUFREQ_MODULE_ID_MAX; i++) {
++		if ((ltq_subsys_busy >> i) & 0x1)
++			len += sprintf(buf+len, "%s busy\n",
++							ltq_cpufreq_mod[i]);
++	}
++	return len;
++}
++
++static int ltq_cpufreq_write_subsys_busy(const char *buf, size_t count)
++{
++	unsigned int ret;
++
++	if (buf == NULL)
++		return 0;
++	ret = sscanf(buf, "%d", &ltq_subsys_busy);
++	if (ret != 1)
++		return -EINVAL;
++
++	return count;
++}
++
++static int ltq_cpufreq_read_frequency_up_threshold(char *buf)
++{
++	int len = 0;
++
++	len += sprintf(buf+len, "%d\n",
++				ltq_cpufreq_obj.frequency_up_threshold);
++	return len;
++}
++
++static int ltq_cpufreq_write_frequency_up_threshold(const char *buf,
++								size_t count)
++{
++	unsigned int ret;
++
++	if (buf == NULL)
++		return 0;
++	ret = sscanf(buf, "%d", &ltq_cpufreq_obj.frequency_up_threshold);
++	if (ret != 1)
++		return -EINVAL;
++
++	return count;
++}
++
++static int ltq_cpufreq_read_frequency_down_threshold(char *buf)
++{
++	int len = 0;
++
++	len += sprintf(buf+len, "%d\n",
++				ltq_cpufreq_obj.frequency_down_threshold);
++	return len;
++}
++
++static int ltq_cpufreq_write_frequency_down_threshold(const char *buf,
++								size_t count)
++{
++	unsigned int ret;
++
++	if (buf == NULL)
++		return 0;
++	ret = sscanf(buf, "%d", &ltq_cpufreq_obj.frequency_down_threshold);
++	if (ret != 1)
++		return -EINVAL;
++
++	return count;
++}
++
++static int ltq_cpufreq_read_sampling_down_factor(char *buf)
++{
++	int len = 0;
++
++	len += sprintf(buf+len, "%d\n",
++				ltq_cpufreq_obj.sampling_down_factor);
++	return len;
++}
++
++static int ltq_cpufreq_write_sampling_down_factor(const char *buf,
++								size_t count)
++{
++	unsigned int ret;
++
++	if (buf == NULL)
++		return 0;
++	ret = sscanf(buf, "%d", &ltq_cpufreq_obj.sampling_down_factor);
++	if (ret != 1)
++		return -EINVAL;
++
++	return count;
++}
++
++static int ltq_cpufreq_read_module_info(char *buf)
++{
++	int len = 0;
++	struct ltq_cpufreq_module_info *cur_list_pos;
++	enum ltq_cpufreq_state pState;
++
++	len += sprintf(buf+len, " sub system state change = %s\n\n",
++	(ltq_cpufreq_obj.ltq_state_change_control == 1) ? "ON" : "OFF");
++	list_for_each_entry(cur_list_pos,
++				&ltq_cpufreq_obj.list_head_module, list) {
++		len += sprintf(buf+len, " Comment = %s\n", cur_list_pos->name);
++		if (cur_list_pos->pmcuModule < LTQ_CPUFREQ_MODULE_ID_MAX) {
++			len += sprintf(buf+len, " Mod = %s\t",
++				ltq_cpufreq_mod[cur_list_pos->pmcuModule]);
++			if (cur_list_pos->pmcuModuleNr != 0) {
++				len += sprintf(buf+len, "  SubNo = %d",
++						cur_list_pos->pmcuModuleNr);
++			}
++		}
++		if (cur_list_pos->ltq_cpufreq_state_get != NULL) {
++			cur_list_pos->ltq_cpufreq_state_get(&pState);
++			len += sprintf(buf+len, "\tPS = %s\t",
++						   ltq_cpufreq_pst[pState]);
++		}
++		if ((cur_list_pos->powerFeatureStat == 1)
++			|| (cur_list_pos->powerFeatureStat == 0)) {
++			len += sprintf(buf+len, "\tPowerFeature = %s\n\n",
++			(cur_list_pos->powerFeatureStat == 1 ? "ENABLED" :
++							"DISABLED"));
++		} else {
++			len += sprintf(buf+len, "\n\n");
++		}
++	}
++	len += sprintf(buf+len, "\n");
++	return len;
++}
++
++int ltq_cpufreq_write_module_info(const char *buf, size_t count)
++{
++	int par1 = 0;
++	char *s = (char *)buf;
++	char *p0;
++	char *p1;
++	struct ltq_cpufreq_module_info *c;
++
++	if (s == NULL)
++		return 0;
++
++	p0 = strsep(&s, "/");
++	p1 = strsep(&s, "/");
++	if ((p0 == NULL) || (p1 == NULL))
++		return 0;
++
++	*(p1 + strlen(p1) - 1) = '\0'; /* remove LF */
++	if (strcmp(p1, "on") == 0)
++		par1 = 1;
++
++	list_for_each_entry(c, &ltq_cpufreq_obj.list_head_module, list) {
++		if (strcmp(c->name, p0) == 0) {
++			/*pr_debug("power feature found, %s\n",p0);*/
++			if (c->ltq_cpufreq_pwr_feature_switch != NULL) {
++				if (c->
++				ltq_cpufreq_pwr_feature_switch(par1) >= 0) {
++					c->powerFeatureStat = par1;
++					pr_debug("pwr feature set, %s, to %d\n",
++							 p0, par1);
++				}
++			}
++		}
++	}
++	return count;
++}
++
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++static int ltq_cpufreq_read_freqchangelatency(char *buf)
++{
++	int len = 0;
++
++	len += sprintf(buf+len, "\n\n");
++	len += sprintf(buf+len, "%s: cur_time measured = %d[us], @%dHz,\n",
++				   ltq_cpufreq_latency_g[0].comment,
++				   ltq_cpufreq_latency_g[0].cur_time,
++				   ltq_cpufreq_latency_g[0].cpu_frequency);
++	len += sprintf(buf+len, "%s: min_time measured = %d[us]\n",
++				   ltq_cpufreq_latency_g[0].comment,
++				   ltq_cpufreq_latency_g[0].min_time);
++	len += sprintf(buf+len, "%s: max_time measured = %d[us]\n",
++				   ltq_cpufreq_latency_g[0].comment,
++				   ltq_cpufreq_latency_g[0].max_time);
++	len += sprintf(buf+len, "%s: cur_time measured = %d[us], @%dHz,\n",
++				   ltq_cpufreq_latency_g[1].comment,
++				   ltq_cpufreq_latency_g[1].cur_time,
++				   ltq_cpufreq_latency_g[1].cpu_frequency);
++	len += sprintf(buf+len, "%s: min_time measured = %d[us]\n",
++				   ltq_cpufreq_latency_g[1].comment,
++				   ltq_cpufreq_latency_g[1].min_time);
++	len += sprintf(buf+len, "%s: max_time measured = %d[us]\n",
++				   ltq_cpufreq_latency_g[1].comment,
++				   ltq_cpufreq_latency_g[1].max_time);
++	len += sprintf(buf+len, "%s: cur_time measured = %d[us], @%dHz,\n",
++				   ltq_cpufreq_latency_g[2].comment,
++				   ltq_cpufreq_latency_g[2].cur_time,
++				   ltq_cpufreq_latency_g[2].cpu_frequency);
++	len += sprintf(buf+len, "%s: min_time measured = %d[us]\n",
++				   ltq_cpufreq_latency_g[2].comment,
++				   ltq_cpufreq_latency_g[2].min_time);
++	len += sprintf(buf+len, "%s: max_time measured = %d[us]\n",
++				   ltq_cpufreq_latency_g[2].comment,
++				   ltq_cpufreq_latency_g[2].max_time);
++
++	len += sprintf(buf+len, "\n\n");
++	return len;
++}
++
++static int ltq_cpufreq_write_freqchangelatency(const char *buf,
++						unsigned long count)
++{
++	int i;
++
++	if (sysfs_streq(buf, "reset\n") || sysfs_streq(buf, "0")) {
++		/* reset the freq change latency buffer */
++		for (i = 0; i < 3; i++) {
++			ltq_cpufreq_latency_g[i].max_time = -1;
++			ltq_cpufreq_latency_g[i].min_time = 999999999;
++			ltq_cpufreq_latency_g[i].cur_time = -1;
++			ltq_cpufreq_latency_g[i].cpu_frequency = 0;
++			ltq_cpufreq_latency_g[i].comment  = "Not Defined";
++		}
++	} else {
++		pr_err("wrong input parameter. Use reset | 0\n");
++	}
++
++	return count;
++}
++
++/* test function to check the correct setting for loops_per_jiffy */
++static int ltq_cpufreq_read_udelay1000us(char *buf)
++{
++	int len = 0;
++	u32 count_start;
++	int time;
++
++	count_start = ltq_count0_read();
++	udelay(1000); /* 1000us */
++	time = ltq_count0_diff(count_start, ltq_count0_read(), NULL, 0xFF);
++	len += sprintf(buf+len, "\n\n");
++	len += sprintf(buf+len, "This is a udelay/jiffies test to prove that\n"
++				"the kernel timing settings are correct\n\n");
++	len += sprintf(buf+len, "udelay measured = %d[us] for udelay 1000[us]",
++				  time);
++	len += sprintf(buf+len, "\n\n");
++	return len;
++}
++
++static ssize_t show_ltq_freqchangelatency(struct cpufreq_policy *policy,
++						char *buf)
++{
++	return ltq_cpufreq_read_freqchangelatency(buf);
++}
++
++static ssize_t store_ltq_freqchangelatency(struct cpufreq_policy *policy,
++						const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_freqchangelatency(buf, count);
++}
++
++static ssize_t show_ltq_udelay1000us(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_udelay1000us(buf);
++}
++
++cpufreq_freq_attr_rw(ltq_freqchangelatency);
++cpufreq_freq_attr_ro(ltq_udelay1000us);
++#endif /* CONFIG_LTQ_CPUFREQ_DEBUG */
++
++static ssize_t show_ltq_moduleinfo(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_module_info(buf);
++}
++
++static ssize_t store_ltq_moduleinfo(struct cpufreq_policy *policy,
++					const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_module_info(buf, count);
++}
++
++static ssize_t show_ltq_control(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_control(buf);
++}
++
++static ssize_t store_ltq_control(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_control(buf, count);
++}
++
++static ssize_t show_ltq_force_ds(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_force_ds(buf);
++}
++
++static ssize_t store_ltq_force_ds(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_force_ds(buf, count);
++}
++
++static ssize_t show_ltq_alert(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_alert(buf);
++}
++
++static ssize_t store_ltq_alert(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_alert(buf, count);
++}
++
++static ssize_t show_ltq_dvs(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_dvs(buf);
++}
++
++static ssize_t show_ltq_scaling_clks(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_scaling_clks(buf);
++}
++
++static ssize_t show_ltq_poll_period(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_poll_period(buf);
++}
++
++static ssize_t store_ltq_poll_period(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_poll_period(buf, count);
++}
++
++static ssize_t show_ltq_subsysbusy(struct cpufreq_policy *policy, char *buf)
++{
++	return ltq_cpufreq_read_subsys_busy(buf);
++}
++
++static ssize_t store_ltq_subsysbusy(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_subsys_busy(buf, count);
++}
++
++static ssize_t show_ltq_frequency_up_threshold(struct cpufreq_policy *policy,
++								char *buf)
++{
++	return ltq_cpufreq_read_frequency_up_threshold(buf);
++}
++
++static ssize_t store_ltq_frequency_up_threshold(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_frequency_up_threshold(buf, count);
++}
++
++static ssize_t show_ltq_frequency_down_threshold(struct cpufreq_policy *policy,
++								char *buf)
++{
++	return ltq_cpufreq_read_frequency_down_threshold(buf);
++}
++
++static ssize_t store_ltq_frequency_down_threshold(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_frequency_down_threshold(buf, count);
++}
++
++static ssize_t show_ltq_sampling_down_factor(struct cpufreq_policy *policy,
++								char *buf)
++{
++	return ltq_cpufreq_read_sampling_down_factor(buf);
++}
++
++static ssize_t store_ltq_sampling_down_factor(struct cpufreq_policy *policy,
++					 const char *buf, size_t count)
++{
++	return ltq_cpufreq_write_sampling_down_factor(buf, count);
++}
++
++cpufreq_freq_attr_rw(ltq_moduleinfo);
++cpufreq_freq_attr_rw(ltq_control);
++cpufreq_freq_attr_rw(ltq_alert);
++cpufreq_freq_attr_rw(ltq_force_ds);
++cpufreq_freq_attr_rw(ltq_poll_period);
++cpufreq_freq_attr_rw(ltq_subsysbusy);
++cpufreq_freq_attr_rw(ltq_frequency_up_threshold);
++cpufreq_freq_attr_rw(ltq_frequency_down_threshold);
++cpufreq_freq_attr_rw(ltq_sampling_down_factor);
++cpufreq_freq_attr_ro(ltq_dvs);
++cpufreq_freq_attr_ro(ltq_scaling_clks);
++
++static struct attribute *default_attrs[] = {
++	&ltq_moduleinfo.attr,
++	&ltq_control.attr,
++	&ltq_alert.attr,
++	&ltq_force_ds.attr,
++	&ltq_dvs.attr,
++	&ltq_scaling_clks.attr,
++	&ltq_poll_period.attr,
++	&ltq_subsysbusy.attr,
++	&ltq_frequency_up_threshold.attr,
++	&ltq_frequency_down_threshold.attr,
++	&ltq_sampling_down_factor.attr,
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	&ltq_freqchangelatency.attr,
++	&ltq_udelay1000us.attr,
++#endif
++	NULL
++};
++
++static struct attribute_group ltq_stats_attr_group = {
++	.attrs = default_attrs,
++	.name = "ltq_stats",
++};
++
++static int ltq_cpufreq_stats_create(struct cpufreq_policy *policy)
++{
++	unsigned int ret = 0;
++	struct cpufreq_policy *data;
++
++	data = cpufreq_cpu_get(policy->cpu);
++	if (data == NULL) {
++		ret = -EINVAL;
++		return ret;
++	}
++	ret = sysfs_create_group(&data->kobj, &ltq_stats_attr_group);
++	cpufreq_cpu_put(data);
++	return ret;
++}
++/*======================================================================*/
++/* END: SYSFS HELPER FUNCTION CALLED FROM LANTIQ CPUFREQ		*/
++/*======================================================================*/
++
++
++static void get_frequencies(const u32 *addr, unsigned long *freqs, int len)
++{
++	int i;
++
++	if (len > 4*sizeof(u32))
++		len = 4*sizeof(u32); /* we allow currently only 4 u32 values */
++
++	for (i = 0; i < (len/4); i++)
++		*(freqs+i) = (unsigned long)*(addr+i);
++}
++
++static void of_get_cpuddr_scaling_rates(void)
++{
++	struct device_node *np;
++	struct device_node *nc;
++	int len;
++	const u32 *addr;
++
++	np = of_find_compatible_node(NULL, NULL, "lantiq,scaling-frequencies");
++	if (!np) {
++		pr_debug("No Scaling frequencies found");
++		return;
++	}
++
++	for_each_available_child_of_node(np, nc) {
++		addr = of_get_property(nc, "lantiq,cpuclocks", &len);
++		if (addr != NULL) {
++			get_frequencies(addr,
++					&ltq_cpufreq_obj.cpu_scaling_rates[0],
++					len);
++		}
++		addr = of_get_property(nc, "lantiq,ddrclocks", &len);
++		if (addr != NULL) {
++			get_frequencies(addr,
++					&ltq_cpufreq_obj.ddr_scaling_rates[0],
++					len);
++		}
++		addr = of_get_property(nc, "lantiq,threshold_dp", &len);
++		if (addr != NULL) {
++			if (len == 16) {
++				ltq_cpufreq_obj.ps_threshold_dp.th_d0 =
++								(int)*(addr+0);
++				ltq_cpufreq_obj.ps_threshold_dp.th_d1 =
++								(int)*(addr+1);
++				ltq_cpufreq_obj.ps_threshold_dp.th_d2 =
++								(int)*(addr+2);
++				ltq_cpufreq_obj.ps_threshold_dp.th_d3 =
++								(int)*(addr+3);
++			} else {
++				pr_err("DTerr: threshold_dp needs 4 values\n");
++			}
++		}
++		addr = of_get_property(nc, "lantiq,poll_period", &len);
++		if (addr != NULL)
++			ltq_cpufreq_obj.polling_period = *((int *)addr);
++	}
++
++	return;
++}
++
++static void ltq_set_default_scaling_rates(void)
++{
++	struct clk *clk = clk_get_sys("cpu", "cpu");
++	int cpu_clk = clk_get_rate(clk);
++
++	if (clk == NULL) {
++		pr_err("CPU clock structure not found\n");
++		return;
++	}
++	ltq_cpufreq_obj.cpu_scaling_rates[0] = cpu_clk;
++	ltq_cpufreq_obj.cpu_scaling_rates[1] = cpu_clk;
++	ltq_cpufreq_obj.cpu_scaling_rates[2] = cpu_clk;
++	ltq_cpufreq_obj.cpu_scaling_rates[3] = cpu_clk;
++}
++
++static int __init ltq_cpufreq_modinit(void)
++{
++	int i, ret = 0;
++	unsigned int freq;
++	struct cpufreq_policy *policy = NULL;
++#if CONFIG_LTQ_CPUFREQ_DVS
++	unsigned long vol;
++	unsigned int chip_type;
++	unsigned int chip_id = ltq_get_cpu_id();
++	unsigned int chip_rev = ltq_get_soc_rev();
++	struct clk *clk = clk_get_sys("cpu", "cpu");
++#endif
++
++	pr_debug("LTQ_CPUFREQ_Version: 0x%x\n", LTQ_CPUFREQ_VERSION_CODE);
++	spin_lock_init(&ltq_cpufreq_obj.ltq_cpufreq_lock);
++	ltq_set_default_scaling_rates();
++	of_get_cpuddr_scaling_rates();
++	for (i = 0; i < 4; i++) {
++		freq = ltq_cpufreq_obj.cpu_scaling_rates[i];
++		if (freq == 0)
++			ltq_freq_tab[i].frequency = CPUFREQ_ENTRY_INVALID;
++		else
++			ltq_freq_tab[i].frequency = freq / 1000;
++	}
++
++#if CONFIG_LTQ_CPUFREQ_DVS
++	ltq_cpufreq_obj.regulator = regulator_get(NULL, "1V15VDD");
++	if (IS_ERR(ltq_cpufreq_obj.regulator)) {
++		pr_err("regulator %s not found.\n", "1V15VDD");
++		ltq_cpufreq_obj.regulator = NULL;
++		return -EINVAL;
++	}
++	drvdata.regulator = ltq_cpufreq_obj.regulator;
++	drvdata.reg_idx = 0;
++
++	vol = ltq_grx500_cpu_vol(NULL);
++	if (vol == 0) {
++		pr_err("core voltage returned is 0V\n");
++		return -EINVAL;
++	}
++
++	ret = regulator_set_voltage(ltq_cpufreq_obj.regulator, vol, vol);
++	if (ret < 0) {
++		pr_err("regulator_set_voltage failed\n");
++		return ret;
++	}
++
++	ret = regulator_enable(ltq_cpufreq_obj.regulator);
++	if (ret < 0) {
++		pr_err("regulator CPUFreq enable failed\n");
++		return ret;
++	}
++
++	if (chip_rev == 1) { /*V1.1*/
++		chip_type = GRX350;
++	} else {
++		switch (chip_id) {
++		case 0x20:
++		case 0x26:
++		       chip_type = GRX350;
++		       break;
++		case 0x24:
++		case 0x25:
++		       chip_type = GRX550;
++		       break;
++		default:
++		       chip_type = GRX350;
++		       break;
++		}
++	}
++	if (chip_type == GRX550) {
++		/*enable I2C control*/
++		pr_info("GRX550 detected. cpu_freq = %d\n",
++						ltq_cpufreq_getfreq_khz(0));
++		ret = regulator_enable_ext_ctrl(ltq_cpufreq_obj.regulator);
++		if (ret < 0) {
++			pr_err("regulator CPUFreq enable I2C Control failed\n");
++			return ret;
++		}
++
++		ltq_cpufreq_obj.cpufreq_cur_state  = LTQ_CPUFREQ_PS_D1;
++		ltq_cpufreq_obj.cpufreq_new_state  = LTQ_CPUFREQ_PS_D0;
++		ret = clk_set_rate(clk, ltq_cpufreq_obj.cpu_scaling_rates[0]);
++		if (ret < 0) {
++			pr_err("clk_set_rate failed for %lu\n",
++					ltq_cpufreq_obj.cpu_scaling_rates[0]);
++		}
++		ltq_cpufreq_obj.cpufreq_cur_state  = LTQ_CPUFREQ_PS_D0;
++		pr_info("new cpu_freq for GRX550 = %d\n",
++						ltq_cpufreq_getfreq_khz(0));
++	}
++
++	rcf_debugfs_init(&drvdata);
++#endif
++
++	/* register driver to the linux cpufreq driver */
++	ret = cpufreq_register_driver(&ltq_cpufreq_driver);
++	if (ret < 0) {
++		pr_err("Error in %s, cpufreq_register_driver\n", __func__);
++		return ret;
++	}
++	/* define the usage of mips_wait instruction inside linux idle loop */
++	cpu_wait_sav = cpu_wait; /* save cpu_wait pointer */
++	ltq_cpufreq_mod_list(&cpuddr_feature_fss.list, LTQ_CPUFREQ_LIST_ADD);
++	ltq_cpufreq_mod_list(&cpuwait_feature_cgs.list, LTQ_CPUFREQ_LIST_ADD);
++
++	policy = cpufreq_cpu_get(smp_processor_id());
++	if (policy) {
++		ret = ltq_cpufreq_stats_create(policy);
++		if (ret < 0) {
++			pr_err("Error in %s,ltq_cpufreq_stats_create_table\n",
++				   __func__);
++			return ret;
++		}
++	}
++	return ret;
++}
++/*needs to be fs_initcall and not subsys_initcall because we need to have
++  the clocksource initialized first because it is used in ltq_setclk_hz().
++  clocksource is initialized also during fs_initcall but before ltq_cpufreq.*/
++fs_initcall(ltq_cpufreq_modinit);
++
+diff --git a/drivers/cpufreq/ltq_cpufreq_dyn_govenor.c b/drivers/cpufreq/ltq_cpufreq_dyn_govenor.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/cpufreq/ltq_cpufreq_dyn_govenor.c
+@@ -0,0 +1,475 @@
++/*
++ *  drivers/cpufreq/cpufreq_cs_freqtable.c
++ *
++ *  Copyright (C)  2001 Russell King
++ *            (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
++ *                      Jun Nakajima <jun.nakajima@intel.com>
++ *            (C)  2009 Alexander Clouter <alex@digriz.org.uk>
++ *            (C)  2014 Lantiq; derived from conservative governor
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/cpufreq.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/kernel_stat.h>
++#include <linux/kobject.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/notifier.h>
++#include <linux/percpu-defs.h>
++#include <linux/slab.h>
++#include <linux/sysfs.h>
++#include <linux/types.h>
++#include <cpufreq/ltq_cpufreq.h>
++
++#include "cpufreq_governor.h"
++
++/* lantiqgov governor macros */
++/*
++#define DEF_FREQUENCY_UP_THRESHOLD	(80)
++#define DEF_FREQUENCY_DOWN_THRESHOLD	(20)
++#define DEF_SAMPLING_DOWN_FACTOR	(1)
++*/
++#define MAX_SAMPLING_DOWN_FACTOR	(20)
++#define DEF_FREQUENCY_STEP		(5) /*not used*/
++#define DOWN				(0)
++#define UP				(1)
++
++static DEFINE_PER_CPU(struct cs_cpu_dbs_info_s, cs_cpu_dbs_info);
++extern int ltq_get_subsys_busy(void);
++
++static  unsigned int get_freq_target(struct cs_dbs_tuners *cs_tuners,
++				 struct cpufreq_policy *policy, int dir)
++{
++	struct cpufreq_frequency_table *table;
++	int i, found = -1;
++	unsigned int freq;
++
++	table = cpufreq_frequency_get_table(policy->cpu);
++
++	if (dir == DOWN) {
++		/* fetch next lower frequency */
++		for (i = 0; (table[i].frequency != CPUFREQ_TABLE_END); i++) {
++			freq = table[i].frequency;
++			if (freq == CPUFREQ_ENTRY_INVALID) {
++				pr_debug("tab entry %u invalid, skip\n", i);
++				continue;
++			}
++			pr_debug("tab entry %u: %u kHz, %u index\n", i, freq,
++					 table[i].index);
++			if (freq >= policy->cur)
++				continue;
++			/*smaller frequency found*/
++			found = 1;
++			break;
++		}
++	} else {
++		/* fetch next higher frequency */
++		/*first search end of list*/
++		for (i = 0; (table[i].frequency != CPUFREQ_TABLE_END); i++)
++			;
++		i--; /*leave CPUFREQ_TABLE_END*/
++		for (; i >= 0; i--) {
++			freq = table[i].frequency;
++			if (freq == CPUFREQ_ENTRY_INVALID) {
++				pr_debug("tab entry %u invalid, skip\n", i);
++				continue;
++			}
++			pr_debug("tab entry %u: %u kHz, %u index\n", i, freq,
++					 table[i].index);
++			if (freq <= policy->cur)
++				continue;
++			/*higher frequency found*/
++			found = 1;
++			break;
++		}
++	}
++	if (found < 0)
++		return -EINVAL;
++	else
++		return freq;
++}
++
++/*
++ * Every sampling_rate, we check, if current idle time is less than 20%
++ * (default), then we try to increase frequency. Every sampling_rate *
++ * sampling_down_factor, we check, if current idle time is more than 80%
++ * (default), then we try to decrease frequency
++ *
++ * Any frequency increase takes it to the maximum frequency. Frequency
++ * reduction happens step by step as defined in the frequency table.
++ */
++static void cs_check_cpu(int cpu, unsigned int load)
++{
++	struct cs_cpu_dbs_info_s *dbs_info = &per_cpu(cs_cpu_dbs_info, cpu);
++	struct cpufreq_policy *policy = dbs_info->cdbs.cur_policy;
++	struct dbs_data *dbs_data = policy->governor_data;
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	/*int freq;*/
++
++	/*
++	 * break out if we 'cannot' reduce the speed as the user might
++	 * want freq_step to be zero
++	 */
++	if (cs_tuners->freq_step == 0)
++		return;
++
++	/* Check for frequency increase */
++	if (load > cs_tuners->up_threshold) {
++		dbs_info->down_skip = 0;
++
++		/* if we are already at full speed then break out early */
++		if ((dbs_info->requested_freq == policy->max) &&
++			(policy->cur == policy->max))
++			return;
++
++
++		/*
++		freq = get_freq_target(cs_tuners, policy, UP);
++		if (freq < 0)
++		        return;
++		*/
++
++		dbs_info->requested_freq = policy->max; /*freq;*/
++		__cpufreq_driver_target(policy, dbs_info->requested_freq,
++			CPUFREQ_RELATION_H);
++		return;
++	}
++
++	/* if sampling_down_factor is active break out early */
++	if (++dbs_info->down_skip < cs_tuners->sampling_down_factor)
++		return;
++	dbs_info->down_skip = 0;
++
++	/* Check for frequency decrease */
++	if ((load < cs_tuners->down_threshold) &&
++						(0 == ltq_get_subsys_busy())) {
++		/*
++		 * if we cannot reduce the frequency anymore, break out early
++		 */
++		if (policy->cur == policy->min)
++			return;
++
++		dbs_info->requested_freq =
++				get_freq_target(cs_tuners, policy, DOWN);
++/*
++		requested_freq is unsigned int therefore this check makes
++		if (dbs_info->requested_freq < 0)
++			return;
++
++*/
++		__cpufreq_driver_target(policy, dbs_info->requested_freq,
++				CPUFREQ_RELATION_L);
++		return;
++	}
++}
++
++static void cs_dbs_timer(struct work_struct *work)
++{
++	struct cs_cpu_dbs_info_s *dbs_info = container_of(work,
++			struct cs_cpu_dbs_info_s, cdbs.work.work);
++	unsigned int cpu = dbs_info->cdbs.cur_policy->cpu;
++	struct cs_cpu_dbs_info_s *core_dbs_info = &per_cpu(cs_cpu_dbs_info,
++			cpu);
++	struct dbs_data *dbs_data = dbs_info->cdbs.cur_policy->governor_data;
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	int delay = delay_for_sampling_rate(cs_tuners->sampling_rate);
++	bool modify_all = true;
++
++	mutex_lock(&core_dbs_info->cdbs.timer_mutex);
++	if (!need_load_eval(&core_dbs_info->cdbs, cs_tuners->sampling_rate))
++		modify_all = false;
++	else
++		dbs_check_cpu(dbs_data, cpu);
++
++	gov_queue_work(dbs_data, dbs_info->cdbs.cur_policy, delay, modify_all);
++	mutex_unlock(&core_dbs_info->cdbs.timer_mutex);
++}
++
++static int dbs_cpufreq_notifier(struct notifier_block *nb, unsigned long val,
++		void *data)
++{
++	struct cpufreq_freqs *freq = data;
++	struct cs_cpu_dbs_info_s *dbs_info =
++					&per_cpu(cs_cpu_dbs_info, freq->cpu);
++	struct cpufreq_policy *policy;
++
++	if (!dbs_info->enable)
++		return 0;
++
++	policy = dbs_info->cdbs.cur_policy;
++
++	/*
++	 * we only care if our internally tracked freq moves outside the valid
++	 * ranges of frequency available to us otherwise we do not change it
++	*/
++	if (dbs_info->requested_freq > policy->max
++			|| dbs_info->requested_freq < policy->min)
++		dbs_info->requested_freq = freq->new;
++
++	return 0;
++}
++
++/************************** sysfs interface ************************/
++static struct common_dbs_data cs_dbs_cdata;
++
++static ssize_t store_sampling_down_factor(struct dbs_data *dbs_data,
++		const char *buf, size_t count)
++{
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	unsigned int input;
++	int ret;
++	ret = sscanf(buf, "%u", &input);
++
++	if (ret != 1 || input > MAX_SAMPLING_DOWN_FACTOR || input < 1)
++		return -EINVAL;
++
++	cs_tuners->sampling_down_factor = input;
++	return count;
++}
++
++static ssize_t store_sampling_rate(struct dbs_data *dbs_data, const char *buf,
++		size_t count)
++{
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	unsigned int input;
++	int ret;
++	ret = sscanf(buf, "%u", &input);
++
++	if (ret != 1)
++		return -EINVAL;
++
++	cs_tuners->sampling_rate = max(input, dbs_data->min_sampling_rate);
++	return count;
++}
++
++static ssize_t store_up_threshold(struct dbs_data *dbs_data, const char *buf,
++		size_t count)
++{
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	unsigned int input;
++	int ret;
++	ret = sscanf(buf, "%u", &input);
++
++	if (ret != 1 || input > 100 || input <= cs_tuners->down_threshold)
++		return -EINVAL;
++
++	cs_tuners->up_threshold = input;
++	return count;
++}
++
++static ssize_t store_down_threshold(struct dbs_data *dbs_data, const char *buf,
++		size_t count)
++{
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	unsigned int input;
++	int ret;
++	ret = sscanf(buf, "%u", &input);
++
++	/* cannot be lower than 11 otherwise freq will not fall */
++	if (ret != 1 || input < 11 || input > 100 ||
++			input >= cs_tuners->up_threshold)
++		return -EINVAL;
++
++	cs_tuners->down_threshold = input;
++	return count;
++}
++
++static ssize_t store_ignore_nice_load(struct dbs_data *dbs_data,
++		const char *buf, size_t count)
++{
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	unsigned int input, j;
++	int ret;
++
++	ret = sscanf(buf, "%u", &input);
++	if (ret != 1)
++		return -EINVAL;
++
++	if (input > 1)
++		input = 1;
++
++	if (input == cs_tuners->ignore_nice_load) /* nothing to do */
++		return count;
++
++	cs_tuners->ignore_nice_load = input;
++
++	/* we need to re-evaluate prev_cpu_idle */
++	for_each_online_cpu(j) {
++		struct cs_cpu_dbs_info_s *dbs_info;
++		dbs_info = &per_cpu(cs_cpu_dbs_info, j);
++		dbs_info->cdbs.prev_cpu_idle = get_cpu_idle_time(j,
++					&dbs_info->cdbs.prev_cpu_wall, 0);
++		if (cs_tuners->ignore_nice_load)
++			dbs_info->cdbs.prev_cpu_nice =
++				kcpustat_cpu(j).cpustat[CPUTIME_NICE];
++	}
++	return count;
++}
++
++static ssize_t store_freq_step(struct dbs_data *dbs_data, const char *buf,
++		size_t count)
++{
++	struct cs_dbs_tuners *cs_tuners = dbs_data->tuners;
++	unsigned int input;
++	int ret;
++	ret = sscanf(buf, "%u", &input);
++
++	if (ret != 1)
++		return -EINVAL;
++
++	if (input > 100)
++		input = 100;
++
++	/*
++	 * no need to test here if freq_step is zero as the user might actually
++	 * want this, they would be crazy though :)
++	 */
++	cs_tuners->freq_step = input;
++	return count;
++}
++
++show_store_one(cs, sampling_rate);
++show_store_one(cs, sampling_down_factor);
++show_store_one(cs, up_threshold);
++show_store_one(cs, down_threshold);
++show_store_one(cs, ignore_nice_load);
++show_store_one(cs, freq_step);
++declare_show_sampling_rate_min(cs);
++
++gov_sys_pol_attr_rw(sampling_rate);
++gov_sys_pol_attr_rw(sampling_down_factor);
++gov_sys_pol_attr_rw(up_threshold);
++gov_sys_pol_attr_rw(down_threshold);
++gov_sys_pol_attr_rw(ignore_nice_load);
++gov_sys_pol_attr_rw(freq_step);
++gov_sys_pol_attr_ro(sampling_rate_min);
++
++static struct attribute *dbs_attributes_gov_sys[] = {
++	&sampling_rate_min_gov_sys.attr,
++	&sampling_rate_gov_sys.attr,
++	&sampling_down_factor_gov_sys.attr,
++	&up_threshold_gov_sys.attr,
++	&down_threshold_gov_sys.attr,
++	&ignore_nice_load_gov_sys.attr,
++	&freq_step_gov_sys.attr,
++	NULL
++};
++
++static struct attribute_group cs_attr_group_gov_sys = {
++	.attrs = dbs_attributes_gov_sys,
++	.name = "lantiqgov",
++};
++
++static struct attribute *dbs_attributes_gov_pol[] = {
++	&sampling_rate_min_gov_pol.attr,
++	&sampling_rate_gov_pol.attr,
++	&sampling_down_factor_gov_pol.attr,
++	&up_threshold_gov_pol.attr,
++	&down_threshold_gov_pol.attr,
++	&ignore_nice_load_gov_pol.attr,
++	&freq_step_gov_pol.attr,
++	NULL
++};
++
++static struct attribute_group cs_attr_group_gov_pol = {
++	.attrs = dbs_attributes_gov_pol,
++	.name = "lantiqgov",
++};
++
++/************************** sysfs end ************************/
++
++static int cs_init(struct dbs_data *dbs_data)
++{
++	struct ltq_cpufreq *ltq_cpufreq_obj = ltq_cpufreq_get();
++	struct cs_dbs_tuners *tuners;
++
++	tuners = kzalloc(sizeof(struct cs_dbs_tuners), GFP_KERNEL);
++	if (!tuners) {
++		pr_err("%s: kzalloc failed\n", __func__);
++		return -ENOMEM;
++	}
++
++	tuners->up_threshold = ltq_cpufreq_obj->frequency_up_threshold;
++	tuners->down_threshold = ltq_cpufreq_obj->frequency_down_threshold;
++	tuners->sampling_down_factor = ltq_cpufreq_obj->sampling_down_factor;
++	tuners->ignore_nice_load = 0;
++	tuners->freq_step = DEF_FREQUENCY_STEP;
++
++	dbs_data->tuners = tuners;
++	dbs_data->min_sampling_rate = MIN_SAMPLING_RATE_RATIO *
++		jiffies_to_usecs(10);
++	mutex_init(&dbs_data->mutex);
++	return 0;
++}
++
++static void cs_exit(struct dbs_data *dbs_data)
++{
++	kfree(dbs_data->tuners);
++}
++
++define_get_cpu_dbs_routines(cs_cpu_dbs_info);
++
++static struct notifier_block cs_cpufreq_notifier_block = {
++	.notifier_call = dbs_cpufreq_notifier,
++};
++
++static struct cs_ops cs_ops = {
++	.notifier_block = &cs_cpufreq_notifier_block,
++};
++
++static struct common_dbs_data cs_dbs_cdata = {
++	.governor = GOV_CONSERVATIVE,
++	.attr_group_gov_sys = &cs_attr_group_gov_sys,
++	.attr_group_gov_pol = &cs_attr_group_gov_pol,
++	.get_cpu_cdbs = get_cpu_cdbs,
++	.get_cpu_dbs_info_s = get_cpu_dbs_info_s,
++	.gov_dbs_timer = cs_dbs_timer,
++	.gov_check_cpu = cs_check_cpu,
++	.gov_ops = &cs_ops,
++	.init = cs_init,
++	.exit = cs_exit,
++};
++
++static int cs_cpufreq_governor_dbs(struct cpufreq_policy *policy,
++				   unsigned int event)
++{
++	return cpufreq_governor_dbs(policy, &cs_dbs_cdata, event);
++}
++
++#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_LANTIQGOV
++static
++#endif
++struct cpufreq_governor cpufreq_gov_lantiqgov = {
++	.name			= "lantiqgov",
++	.governor		= cs_cpufreq_governor_dbs,
++	.max_transition_latency	= TRANSITION_LATENCY_LIMIT,
++	.owner			= THIS_MODULE,
++};
++
++static int __init cpufreq_gov_dbs_init(void)
++{
++	return cpufreq_register_governor(&cpufreq_gov_lantiqgov);
++}
++
++static void __exit cpufreq_gov_dbs_exit(void)
++{
++	cpufreq_unregister_governor(&cpufreq_gov_lantiqgov);
++}
++
++MODULE_AUTHOR("Thomas Bartholomae <t.bartholomae@lantiq.com>");
++MODULE_DESCRIPTION("'cpufreq_lantiqgov' - A dynamic cpufreq governor based\n"
++		"on conservative governor but frequency steps are given\n"
++		"by frequency table");
++MODULE_LICENSE("GPL");
++
++#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_LANTIQGOV
++fs_initcall(cpufreq_gov_dbs_init);
++#else
++module_init(cpufreq_gov_dbs_init);
++#endif
++module_exit(cpufreq_gov_dbs_exit);
+diff --git a/drivers/cpufreq/ltq_my_coc_drv.c b/drivers/cpufreq/ltq_my_coc_drv.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/cpufreq/ltq_my_coc_drv.c
+@@ -0,0 +1,275 @@
++/*
++ *
++ *			 Copyright (c) 2012, 2014, 2015
++ *       		Lantiq Beteiligungs-GmbH & Co. KG
++ *
++ *  For licensing information, see the file 'LICENSE' in the root folder of
++ *  this software module.
++ */
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/module.h>
++#include <linux/timer.h>
++#include <linux/cpufreq.h>
++#include <cpufreq/ltq_cpufreq.h>
++
++#define LTQ_MYCOCDRV_BUSY	1
++#define LTQ_MYCOCDRV_IDLE	0
++
++/* this ID should represent the PCIE interface No. (0, 1, 2, 3, ...) */
++#define LTQ_PCIE_ID		0
++
++
++/*
++static struct timer_list mycocdrv_timer;
++static int polling_period;              
++                                        
++*/
++
++/* threshold data for D0:D3 */
++struct ltq_cpufreq_threshold *th_data = NULL;
++
++/* driver is busy and needs highest performance */
++int mycocdrv_busy = LTQ_MYCOCDRV_IDLE;
++/* current power state of the driver */
++enum ltq_cpufreq_state mycocdrv_ps = LTQ_CPUFREQ_PS_D0;
++
++
++/*
++static void                                                                                 
++ltq_mycocdrv_timer_callback( unsigned long data )                                           
++{                                                                                           
++        int ret;                                                                            
++                                                                                            
++        polling_period = ltq_cpufreq_get_poll_period(LTQ_CPUFREQ_MODULE_PCIE, LTQ_PCIE_ID); 
++        ret = mod_timer( &mycocdrv_timer, jiffies + msecs_to_jiffies(polling_period*1000) );
++        if (ret)                                                                            
++                pr_err("Error in mod_timer\n");                                             
++        pr_info( "mycocdrv_timer_callback called.\n");                                      
++}                                                                                           
++                                                                                            
++*/
++
++static int
++ltq_mycocdrv_stateget(enum ltq_cpufreq_state *state)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	*state = mycocdrv_ps;
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_mycocdrv_fss_ena(int ena)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	if (ena) {
++		pr_debug("enable frequency scaling\n");
++	} else {
++		pr_debug("disable frequency scaling\n");
++	}
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_mycocdrv_prechange(enum ltq_cpufreq_module module,
++			enum ltq_cpufreq_state new_state,
++			enum ltq_cpufreq_state old_state,
++		        u8 flags)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	if (mycocdrv_busy == LTQ_MYCOCDRV_IDLE) {
++		/* do what ever is necessary to prepare the drv
++		for a frequency change. */
++		return LTQ_CPUFREQ_RETURN_SUCCESS;
++	} else if (flags & CPUFREQ_PM_NO_DENY) {
++		/* this flag is set if we need thermal reduction and
++		   frequency down scaling is a must to avoid thermal problems.*/
++		return LTQ_CPUFREQ_RETURN_SUCCESS;
++	} else {
++		if (new_state != LTQ_CPUFREQ_PS_D0)
++			return LTQ_CPUFREQ_RETURN_DENIED; /*avoid down scaling*/
++	}
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_mycocdrv_statechange(enum ltq_cpufreq_state new_state)
++{
++	/*pr_info("%s is called\n",__func__);*/
++	/* do what ever is necessary to make changes in the drv
++	to support the new frequency. */
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_mycocdrv_postchange(enum ltq_cpufreq_module module,
++			enum ltq_cpufreq_state new_state,
++			enum ltq_cpufreq_state old_state,
++			u8 flags)
++{
++	/*pr_info("%s is called\n", __func__);*/
++	/* do what ever is necessary to cleanup things in the drv
++	after a frequency change. */
++	mycocdrv_ps = new_state;
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++/* This function should be called if the driver becomes BUSY */
++void
++ltq_mycocdrv_busy(void)
++{
++	int ret = LTQ_CPUFREQ_RETURN_SUCCESS;
++
++	mycocdrv_busy = LTQ_MYCOCDRV_BUSY;
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_PCIE, LTQ_PCIE_ID,
++							LTQ_CPUFREQ_PS_D0);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_debug("Power state request D0 failed");
++}
++
++/* This function should be called if the driver becomes IDLE */
++void
++ltq_mycocdrv_idle(void)
++{
++	int ret = LTQ_CPUFREQ_RETURN_SUCCESS;
++
++	mycocdrv_busy = LTQ_MYCOCDRV_IDLE;
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_PCIE, LTQ_PCIE_ID,
++							LTQ_CPUFREQ_PS_D0D3);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_err("Power state request D0D3 failed");
++}
++
++/* keep track of frequency transitions */
++static int
++mycocdrv_cpufreq_notifier(struct notifier_block *nb, unsigned long val,
++							void *data)
++{
++	struct cpufreq_freqs *freq = data;
++	enum ltq_cpufreq_state new_state, old_state;
++	int ret;
++	pr_debug("%s is called\n", __func__);
++
++	new_state = ltq_cpufreq_get_ps_from_khz(freq->new);
++	if (new_state == LTQ_CPUFREQ_PS_UNDEF)
++		return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	old_state = ltq_cpufreq_get_ps_from_khz(freq->old);
++	if (old_state == LTQ_CPUFREQ_PS_UNDEF)
++		return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	if (val == CPUFREQ_PRECHANGE) {
++		ret = ltq_mycocdrv_prechange(LTQ_CPUFREQ_MODULE_PCIE,
++					new_state, old_state, freq->flags);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++		ret = ltq_mycocdrv_statechange(new_state);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	} else if (val == CPUFREQ_POSTCHANGE) {
++		ret = ltq_mycocdrv_postchange(LTQ_CPUFREQ_MODULE_PCIE,
++					new_state, old_state, freq->flags);
++		if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++			return NOTIFY_STOP_MASK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	} else {
++		return NOTIFY_OK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++	}
++	return NOTIFY_OK | (LTQ_CPUFREQ_MODULE_PCIE<<4);
++}
++
++static struct notifier_block mycocdrv_cpufreq_notifier_block = {
++	.notifier_call = mycocdrv_cpufreq_notifier
++};
++
++static struct ltq_cpufreq_module_info mycocdrv_feature_fss = {
++.name                           = "PCIe frequency scaling support",
++.pmcuModule                     = LTQ_CPUFREQ_MODULE_PCIE,
++.pmcuModuleNr                   = LTQ_PCIE_ID,
++.powerFeatureStat               = 1,
++.ltq_cpufreq_state_get          = ltq_mycocdrv_stateget,
++.ltq_cpufreq_pwr_feature_switch = ltq_mycocdrv_fss_ena,
++};
++
++static int
++ltq_mycocdrv_cpufreq_init(void)
++{
++        int ret;
++                
++	pr_debug("%s is called\n", __func__);
++	if (cpufreq_register_notifier(&mycocdrv_cpufreq_notifier_block,
++						CPUFREQ_TRANSITION_NOTIFIER)) {
++		pr_err("Fail in registering MYCOCDRV to CPUFreq\n");
++		return -1;
++	}
++	ltq_cpufreq_mod_list(&mycocdrv_feature_fss.list, LTQ_CPUFREQ_LIST_ADD);
++
++	th_data = ltq_cpufreq_get_threshold(LTQ_CPUFREQ_MODULE_PCIE,
++							LTQ_PCIE_ID);
++	if (th_data == NULL)
++		pr_err("No PS related threshold values are defined ");
++
++
++/*
++        polling_period = ltq_cpufreq_get_poll_period(LTQ_CPUFREQ_MODULE_PCIE, LTQ_PCIE_ID); 
++        setup_timer( &mycocdrv_timer, ltq_mycocdrv_timer_callback, 0 );                     
++        pr_debug( "Starting timer to fire in 3000ms (%ld)\n", jiffies );                    
++        ret = mod_timer( &mycocdrv_timer, jiffies + msecs_to_jiffies(polling_period*1000) );
++        if (ret)                                                                            
++                pr_err("Error in mod_timer\n");                                             
++                                                                                            
++*/
++
++	ret = ltq_cpufreq_state_req(LTQ_CPUFREQ_MODULE_PCIE, LTQ_PCIE_ID,
++							LTQ_CPUFREQ_PS_D0);
++	if (ret != LTQ_CPUFREQ_RETURN_SUCCESS)
++		pr_debug("Power state request D0 failed");
++
++	pr_debug("Register MYCOCDRV to CPUFREQ.\n");
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++ltq_mycocdrv_cpufreq_exit(void)
++{
++
++/*
++        int ret;                                         
++                                                         
++        ret = del_timer( &mycocdrv_timer );              
++        if (ret)                                         
++                pr_err("The timer is still in use...\n");
++                                                         
++*/
++
++	/* set status of mycocdrv inside CPUFreq to don't care */
++	ltq_mycocdrv_idle();
++
++	if (cpufreq_unregister_notifier(&mycocdrv_cpufreq_notifier_block,
++						CPUFREQ_TRANSITION_NOTIFIER)) {
++		pr_err("CPUFREQ unregistration failed.");
++		return -1;
++	}
++	ltq_cpufreq_mod_list(&mycocdrv_feature_fss.list, LTQ_CPUFREQ_LIST_DEL);
++	return LTQ_CPUFREQ_RETURN_SUCCESS;
++}
++
++static int
++__init ltq_mycocdrv_init(void)
++{
++	ltq_mycocdrv_cpufreq_init();
++	return 0;
++}
++
++static void
++__exit ltq_mycocdrv_exit(void)
++{
++	ltq_mycocdrv_cpufreq_exit();
++	return;
++}
++
++module_init(ltq_mycocdrv_init);
++module_exit(ltq_mycocdrv_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Thomas Bartholomae, t.bartholomae@lantiq.com");
++MODULE_DESCRIPTION("LANTIQ MYCOCDRV driver");
++MODULE_SUPPORTED_DEVICE("LANTIQ in general ;-)");
++
+diff --git a/drivers/cpufreq/ltq_regulator_cpufreq.c b/drivers/cpufreq/ltq_regulator_cpufreq.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/cpufreq/ltq_regulator_cpufreq.c
+@@ -0,0 +1,231 @@
++/******************************************************************************
++
++			Copyright (c) 2015
++			Lantiq Deutschland GmbH
++
++	For licensing information, see the file 'LICENSE' in the root folder
++	of this software module.
++
++******************************************************************************/
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++
++#if defined(CONFIG_DEBUG_FS)
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/interrupt.h>
++#include <linux/regulator/consumer.h>
++#include <cpufreq/ltq_cpufreq.h>
++
++#define BUF_SIZE 24
++
++static struct dentry		*debugfs_root;
++
++static int rc_ena_seq_write(struct file *file, const char __user *buf,
++					size_t count, loff_t *dat)
++{
++	struct reg_cpufreq *data = file->f_inode->i_private;
++	char str[BUF_SIZE];
++	int err;
++
++	pr_debug("%s is called\n", __func__);
++	memset(str, 0, sizeof(str));
++	if ((count <= 1) || (count > BUF_SIZE))
++		return count;
++
++	copy_from_user(str, buf, count - 1);
++
++	if (sysfs_streq(str, "disable") || sysfs_streq(str, "0")) {
++		err = regulator_disable(data->regulator);
++		if (err < 0) {
++			pr_err("regulator %d disable failed\n",
++							data->reg_idx + 1);
++			return count;
++		}
++		return count;
++	} else if (sysfs_streq(str, "enable") || sysfs_streq(str, "1")) {
++		err = regulator_enable(data->regulator);
++		if (err < 0) {
++			pr_err("regulator %d enable failed\n",
++							data->reg_idx + 1);
++			return count;
++		}
++		return count;
++	}
++	pr_err("invalid value! Please use: 0 | disable | 1 | enable\n");
++	return count;
++}
++
++static int rc_rd_ena(struct seq_file *seq, void *v)
++{
++	struct reg_cpufreq *data = seq->private;
++	int ret;
++
++	pr_debug("%s is called\n", __func__);
++	ret = regulator_is_enabled(data->regulator);
++	if (ret < 0)
++		pr_err("regulator %d read enable failed\n", data->reg_idx + 1);
++	else
++		seq_printf(seq, "regulator %d output: %s\n", data->reg_idx + 1,
++					(ret == 1) ? "enabled" : "disabled");
++	return 0;
++}
++
++static int rc_ena_seq_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, rc_rd_ena, inode->i_private);
++}
++
++static const struct file_operations rc_ena_fops = {
++	.owner		= THIS_MODULE,
++	.open		= rc_ena_seq_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.write		= rc_ena_seq_write,
++	.release	= single_release
++};
++
++static int rc_i2c_ctrl_seq_write(struct file *file, const char __user *buf,
++					size_t count, loff_t *dat)
++{
++	struct reg_cpufreq *data = file->f_inode->i_private;
++	char str[BUF_SIZE];
++	int err;
++
++	pr_debug("%s is called\n", __func__);
++	memset(str, 0, sizeof(str));
++	if ((count <= 1) || (count > BUF_SIZE))
++		return count;
++
++	copy_from_user(str, buf, count - 1);
++	if (sysfs_streq(str, "off") || sysfs_streq(str, "0")) {
++		err = regulator_disable_ext_ctrl(data->regulator);
++		if (err < 0)
++			pr_err("regulator %d set i2c mode failed\n",
++							data->reg_idx + 1);
++		return count;
++	} else if (sysfs_streq(str, "on") || sysfs_streq(str, "1")) {
++		err = regulator_enable_ext_ctrl(data->regulator);
++		if (err < 0)
++			pr_err("regulator %d set i2c mode failed\n",
++							data->reg_idx + 1);
++		return count;
++	}
++	pr_err("invalid value! Please use: 0 | off | 1 | on\n");
++	return count;
++}
++
++static int rc_rd_i2c_ctrl(struct seq_file *seq, void *v)
++{
++	struct reg_cpufreq *data = seq->private;
++	int ret;
++
++	pr_debug("%s is called\n", __func__);
++	ret = regulator_get_ext_ctrl(data->regulator);
++	seq_printf(seq, "i2c ctrl %d: %s\n", data->reg_idx + 1,
++					(ret == 1) ? "enabled" : "disabled");
++	return 0;
++}
++
++static int rc_i2c_ctrl_seq_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, rc_rd_i2c_ctrl, inode->i_private);
++}
++
++static const struct file_operations rc_i2c_ctrl_fops = {
++	.owner		= THIS_MODULE,
++	.open		= rc_i2c_ctrl_seq_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.write		= rc_i2c_ctrl_seq_write,
++	.release	= single_release
++};
++
++static int rc_vol_seq_write(struct file *file, const char __user *buf,
++					size_t count, loff_t *dat)
++{
++	struct reg_cpufreq *data = file->f_inode->i_private;
++	char str[BUF_SIZE];
++	signed long value;
++
++	pr_debug("%s is called\n", __func__);
++	memset(str, 0, sizeof(str));
++	if ((count <= 1) || (count > BUF_SIZE))
++		return count;
++
++	copy_from_user(str, buf, count - 1);
++	if (kstrtol(str, 10, &value) == 0)
++		regulator_set_voltage(data->regulator, value, value);
++	return count;
++}
++
++static int rc_rd_vol(struct seq_file *seq, void *v)
++{
++	struct reg_cpufreq *data = seq->private;
++
++	pr_debug("%s is called\n", __func__);
++	seq_printf(seq, "Current voltage %d: %d\n", data->reg_idx + 1,
++	regulator_get_voltage(data->regulator));
++	return 0;
++}
++
++static int rc_vol_seq_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, rc_rd_vol, inode->i_private);
++}
++
++static const struct file_operations rc_vol_fops = {
++	.owner		= THIS_MODULE,
++	.open		= rc_vol_seq_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.write		= rc_vol_seq_write,
++	.release	= single_release
++};
++
++void rcf_debugfs_init(struct reg_cpufreq *data)
++{
++	int i;
++	char str[12];
++
++//	pr_debug("%s is called\n", __func__);
++	pr_err("%s is called\n", __func__);
++	debugfs_root = debugfs_create_dir("ltq_regulator_cpufreq", NULL);
++	if (IS_ERR(debugfs_root)) {
++		debugfs_root = NULL;
++		pr_err("ERROR: no debugfs_root\n");
++		return;
++	}
++
++	for (i = 0; i < NUM_SUPPLY; i++) {
++		if (IS_ERR(data->regulator)) {
++			pr_debug("regulator %d not defined\n", i + 1);
++			data++;
++			continue;
++		}
++		sprintf(str, "vol%d", i+1);
++		(void)debugfs_create_file(str, S_IFREG | S_IRUGO, debugfs_root,
++					data, &rc_vol_fops);
++		sprintf(str, "enable%d", i+1);
++		(void)debugfs_create_file(str, S_IFREG | S_IRUGO, debugfs_root,
++					data, &rc_ena_fops);
++		sprintf(str, "i2c_ctrl%d", i+1);
++		(void)debugfs_create_file(str, S_IFREG | S_IRUGO, debugfs_root,
++					data, &rc_i2c_ctrl_fops);
++		data++;
++	}
++}
++
++void rcf_debugfs_cleanup(struct reg_cpufreq *data)
++{
++	pr_debug("%s is called\n", __func__);
++	if (!debugfs_root)
++		return;
++
++	debugfs_remove_recursive(debugfs_root);
++	debugfs_root = NULL;
++}
++#endif /* CONFIG_DEBUG_FS */
++
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -22,7 +22,7 @@
+ #include <linux/cpumask.h>
+ #include <asm/div64.h>
+ 
+-#define CPUFREQ_NAME_LEN 16
++#define CPUFREQ_NAME_LEN 24
+ /* Print length for names. Extra 1 space for accomodating '\n' in prints */
+ #define CPUFREQ_NAME_PLEN (CPUFREQ_NAME_LEN + 1)
+ 
+@@ -217,7 +217,8 @@ extern int __cpufreq_driver_getavg(struc
+ 
+ int cpufreq_register_governor(struct cpufreq_governor *governor);
+ void cpufreq_unregister_governor(struct cpufreq_governor *governor);
+-
++int lock_policy_rwsem_write(int cpu);
++void unlock_policy_rwsem_write(int cpu);
+ 
+ /*********************************************************************
+  *                      CPUFREQ DRIVER INTERFACE                     *
+@@ -274,11 +275,18 @@ struct cpufreq_driver {
+ #define CPUFREQ_PM_NO_WARN	0x04	/* don't warn on suspend/resume speed
+ 					 * mismatches */
+ 
++#define CPUFREQ_PM_NO_DENY	0x08	/* registered sub-systems must accept
++					 * a frequency change. This flag will
++					   be used for thermal management. */
++
+ int cpufreq_register_driver(struct cpufreq_driver *driver_data);
+ int cpufreq_unregister_driver(struct cpufreq_driver *driver_data);
+ 
+ 
+-void cpufreq_notify_transition(struct cpufreq_policy *policy,
++int cpufreq_notify_transition(struct cpufreq_policy *policy,
++		struct cpufreq_freqs *freqs, unsigned int state);
++
++int cpufreq_notify_transition_once(struct cpufreq_policy *policy,
+ 		struct cpufreq_freqs *freqs, unsigned int state);
+ 
+ static inline void cpufreq_verify_within_limits(struct cpufreq_policy *policy, unsigned int min, unsigned int max)
+@@ -393,6 +401,9 @@ extern struct cpufreq_governor cpufreq_g
+ #elif defined(CONFIG_CPU_FREQ_DEFAULT_GOV_CONSERVATIVE)
+ extern struct cpufreq_governor cpufreq_gov_conservative;
+ #define CPUFREQ_DEFAULT_GOVERNOR	(&cpufreq_gov_conservative)
++#elif defined(CONFIG_CPU_FREQ_DEFAULT_GOV_LANTIQGOV)
++extern struct cpufreq_governor cpufreq_gov_lantiqgov;
++#define CPUFREQ_DEFAULT_GOVERNOR	(&cpufreq_gov_lantiqgov)
+ #endif
+ 
+ 

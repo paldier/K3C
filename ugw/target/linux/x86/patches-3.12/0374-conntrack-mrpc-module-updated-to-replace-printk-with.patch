@@ -1,0 +1,123 @@
+From 51925e4cfa66faae4a2f5ca51b61a3b9c3f9c64c Mon Sep 17 00:00:00 2001
+From: avelayux <arunkumar.velayutham@intel.com>
+Date: Sun, 27 Mar 2016 17:03:59 -0700
+Subject: [PATCH 374/441] conntrack mrpc module updated to replace printk with
+ dbg. updated build guards
+
+Change-Id: Ie3db8f5aa5d743c5844c0eb83ff112c0bb55fd5c
+---
+ drivers/mrpc/core/conntrack_client.c | 12 ++++++------
+ net/netfilter/nf_conntrack_core.c    | 12 ++++--------
+ 2 files changed, 10 insertions(+), 14 deletions(-)
+
+--- a/drivers/mrpc/core/conntrack_client.c
++++ b/drivers/mrpc/core/conntrack_client.c
+@@ -239,7 +239,7 @@ int copy_conntrack_tuple_info(struct mrp
+ 	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.gre.key;
+ 	break;
+    default:
+-	printk(KERN_NOTICE "Protocol %d not supported by mrpc_conntrack_client.\n",protoNum);
++	DBG("Protocol %d not supported by mrpc_conntrack_client.\n",protoNum);
+    }
+ 
+    ct_tuple_info->tuple.src.l3num = htons(ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num);
+@@ -275,13 +275,13 @@ static void ct_tuple_info_fetcher(struct
+ 	   */
+       break;
+       case TI_CT_DEATH_BY_TIMEOUT:
+-	   memset(&conntrack_tuple_info,0,sizeof(struct mrpc_conntrack_tuple_info));
++	   /*memset(&conntrack_tuple_info,0,sizeof(struct mrpc_conntrack_tuple_info));*/
+ 
+ 	   /*Copy required tuple information from timeout ct to conntrack_tuple_info.
+ 	    *This will be MRPC'd to ARM conntrack server module to regenerate the HASH
+ 	    *and fetch the ARM side CT record for this timeout connection */
+ 	   copy_conntrack_tuple_info(&conntrack_tuple_info,ct);
+-	   printk(KERN_NOTICE "CT Tag %d :proto %d zone %d TUPLE INFO: %pI4:%u->%pI4:%u/%u \n",
++	   DBG("CT Tag %d :proto %d zone %d TUPLE INFO: %pI4:%u->%pI4:%u/%u \n",
+ 			 ntohl(conntrack_tuple_info.atomTag),
+ 			 ntohs(conntrack_tuple_info.tuple.src.l3num),
+ 			 nf_ct_zone(ct),
+@@ -296,7 +296,7 @@ static void ct_tuple_info_fetcher(struct
+ 	   if(extend_timeout==1)
+ 	   {
+ 	    /* The flows are still being accelerated; so keep the connection tracking timer alive */
+-	     printk(KERN_NOTICE "ARM replyed to extend timeout. set timer by 60 seconds.\n");
++	     DBG("ARM replyed to extend timeout. set timer by 60 seconds.\n");
+ 	    /*reset arm sync wait flag here. So that the nf_ct_delete will handle the 60 sec
+ 	     *timeout properly.*/
+ 	    ct->ct_tuple_arm_sync_wait=0;
+@@ -312,12 +312,12 @@ static void ct_tuple_info_fetcher(struct
+ 	   {
+ 	     /* Connection tracking record not found at ARM. Session not getting acclerated.
+ 	      * go-ahead and delete this CT at ATOM*/
+-	     printk(KERN_NOTICE "ARM replyed to KILL conntrack record. delete record.\n");
++	     DBG("ARM replyed to KILL conntrack record. delete record.\n");
+ 	     ct->ti_pp_status_flag |= TI_PP_KILL_CONNTRACK;
+ 	   }
+       break;
+       default:
+-	   printk(KERN_NOTICE "Connection tracking event not supported.");
++	   DBG("Connection tracking event not supported.");
+   }
+ 
+   kfree(worker);
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -33,7 +33,7 @@
+ #include <linux/mm.h>
+ #include <linux/nsproxy.h>
+ #include <linux/rculist_nulls.h>
+-#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++#if defined(CONFIG_APPCPU_GW_PP_HANDLE) && defined(CONFIG_MRPC_CONNTRACK_CLIENT)
+ #include <linux/mrpc.h>
+ #endif
+ #include <net/netfilter/nf_conntrack.h>
+@@ -302,7 +302,7 @@ static void nf_ct_dying_timeout(struct n
+ bool nf_ct_delete(struct nf_conn *ct, u32 portid, int report)
+ {
+ 	struct nf_conn_tstamp *tstamp;
+-#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++#if defined(CONFIG_APPCPU_GW_PP_HANDLE) && defined(CONFIG_MRPC_CONNTRACK_CLIENT)
+ 	if(ct->ct_tuple_arm_sync_wait==1)
+ 	{
+ 	   /* Did the HIL profile take over or not? - right after the temp timer expired */
+@@ -312,12 +312,10 @@ bool nf_ct_delete(struct nf_conn *ct, u3
+ 	       * extended timeout expires again.
+ 	       */
+ 	      ct->ct_tuple_arm_sync_wait=0;
+-	      printk(KERN_NOTICE "ARM HIL profile extended timeout. Record not deleted for now.\n");
+ 	      return;  /* HIL Profile took over... */
+ 	   }
+ 	   else
+ 	   {
+-	      printk(KERN_NOTICE "Conntrack record getting deleted\n");
+ 	      /*go ahead and clear the ct record */
+ 	      tstamp = nf_conn_tstamp_find(ct);
+ 	      if (tstamp && tstamp->stop == 0)
+@@ -329,7 +327,6 @@ bool nf_ct_delete(struct nf_conn *ct, u3
+ 		  /* destroy event was not delivered */
+ 		     nf_ct_delete_from_lists(ct);
+ 		     nf_ct_dying_timeout(ct);
+-		     printk(KERN_NOTICE "Conntrack record delete failed\n");
+ 		     return false;
+ 	      }
+ 	      set_bit(IPS_DYING_BIT, &ct->status);
+@@ -343,8 +340,7 @@ bool nf_ct_delete(struct nf_conn *ct, u3
+ 	  /* Generate an event indicating the connection tracking entry is being deleted. */
+ 	  nf_conn_info_event(TI_CT_DEATH_BY_TIMEOUT, (void *)ct);
+ 	  /* conntrack mrpc client is still working on to sync pp info from ARM */
+-	  printk(KERN_NOTICE "extend temporary timeout of 2 seconds.\n");
+-	  ct->timeout.expires = (1 * HZ) + jiffies;
++	  ct->timeout.expires = (3 * HZ) + jiffies;
+ 	  add_timer(&ct->timeout);
+ 	  ct->ct_tuple_arm_sync_wait=1;
+ 	  return;
+@@ -805,7 +801,7 @@ __nf_conntrack_alloc(struct net *net, u1
+ 	       offsetof(struct nf_conn, proto) -
+ 	       offsetof(struct nf_conn, tuplehash[IP_CT_DIR_MAX]));
+ 	spin_lock_init(&ct->lock);
+-#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++#if defined(CONFIG_APPCPU_GW_PP_HANDLE) && defined(CONFIG_MRPC_CONNTRACK_CLIENT)
+ 	ct->ct_tuple_arm_sync_wait = 0;
+ #endif
+ 	ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple = *orig;

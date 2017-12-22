@@ -1,0 +1,168 @@
+From 33cd517811841a8c7baca115a8436dde41e194ca Mon Sep 17 00:00:00 2001
+From: sdinkinx <simonx.dinkin@intel.com>
+Date: Sun, 5 Mar 2017 11:17:16 +0200
+Subject: [PATCH] wds: enable the support for wds capability in STA mode
+
+th usage to enable wds from conf file:
+wds=1
+if set, the STA will advertise wds vendor specific element in
+assoc request and connect to the AP in 4 address mode.
+
+Signed-off-by: sdinkinx <simonx.dinkin@intel.com>
+---
+ src/drivers/driver.h              |  5 +++++
+ src/drivers/driver_nl80211.c      |  3 +++
+ src/drivers/nl80211_copy.h        |  2 ++
+ wpa_supplicant/config.c           |  1 +
+ wpa_supplicant/config.h           | 10 ++++++++++
+ wpa_supplicant/config_file.c      |  3 +++
+ wpa_supplicant/sme.c              | 16 ++++++++++++++++
+ wpa_supplicant/wpa_supplicant_i.h |  1 +
+ 8 files changed, 41 insertions(+)
+
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index e4559a5..5c8b512 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1123,6 +1123,11 @@ struct wpa_driver_associate_params {
+ 	 * AP as usual. Valid for DMG network only.
+ 	 */
+ 	int pbss;
++
++	/**
++	 * wds - If set, station will connect to peer ap in 4 address mode.
++	 */
++	int wds;
+ };
+ 
+ enum hide_ssid {
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index cdd9778..53c8fe2 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -4921,6 +4921,9 @@ static int nl80211_connect_common(struct wpa_driver_nl80211_data *drv,
+ 	    nla_put_u32(msg, NL80211_ATTR_USE_MFP, NL80211_MFP_REQUIRED))
+ 		return -1;
+ 
++	if (params->wds && nla_put_u32(msg, NL80211_ATTR_VENDOR_WDS, params->wds))
++		return -1;
++
+ 	if (params->rrm_used) {
+ 		u32 drv_rrm_flags = drv->capa.rrm_flags;
+ 		if ((!((drv_rrm_flags &
+diff --git a/src/drivers/nl80211_copy.h b/src/drivers/nl80211_copy.h
+index b7db28d..9020abb 100644
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -1700,6 +1700,7 @@ enum nl80211_commands {
+  *	attribute is also used for vendor command feature advertisement
+  * @NL80211_ATTR_VENDOR_EVENTS: used for event list advertising in the wiphy
+  *	info, containing a nested array of possible events
++ * @NL80211_ATTR_VENDOR_WDS: used to enable the wds vendor specific capability
+  *
+  * @NL80211_ATTR_QOS_MAP: IP DSCP mapping for Interworking QoS mapping. This
+  *	data is in the format defined for the payload of the QoS Map Set element
+@@ -2195,6 +2196,7 @@ enum nl80211_attrs {
+ 	NL80211_ATTR_VENDOR_SUBCMD,
+ 	NL80211_ATTR_VENDOR_DATA,
+ 	NL80211_ATTR_VENDOR_EVENTS,
++	NL80211_ATTR_VENDOR_WDS,
+ 
+ 	NL80211_ATTR_QOS_MAP,
+ 
+diff --git a/wpa_supplicant/config.c b/wpa_supplicant/config.c
+index dd922ca..58a4034 100644
+--- a/wpa_supplicant/config.c
++++ b/wpa_supplicant/config.c
+@@ -4371,6 +4371,7 @@ static const struct global_parse_data global_fields[] = {
+ 	{ INT(gas_address3), 0 },
+ 	{ INT_RANGE(ftm_responder, 0, 1), 0 },
+ 	{ INT_RANGE(ftm_initiator, 0, 1), 0 },
++	{ INT_RANGE(wds, 0, 1), 0 },
+ };
+ 
+ #undef FUNC
+diff --git a/wpa_supplicant/config.h b/wpa_supplicant/config.h
+index 48e64be..bb5b53e 100644
+--- a/wpa_supplicant/config.h
++++ b/wpa_supplicant/config.h
+@@ -1328,6 +1328,16 @@ struct wpa_config {
+ 	 * wpa_supplicant.
+ 	 */
+ 	int ftm_initiator;
++
++	/**
++	 * wds - Publish wds vendor specific element.
++	 *
++	 * Values:
++	 * 0 - do not publish wds vendor specific functionality (Default)
++	 * 1 - publish wds vendor specific functionality in
++	 *	association request
++	 */
++	int wds;
+ };
+ 
+ 
+diff --git a/wpa_supplicant/config_file.c b/wpa_supplicant/config_file.c
+index 7ae1654..625e895 100644
+--- a/wpa_supplicant/config_file.c
++++ b/wpa_supplicant/config_file.c
+@@ -1344,6 +1344,9 @@ static void wpa_config_write_global(FILE *f, struct wpa_config *config)
+ 		fprintf(f, "ftm_responder=%d\n", config->ftm_responder);
+ 	if (config->ftm_initiator)
+ 		fprintf(f, "ftm_initiator=%d\n", config->ftm_initiator);
++
++	if (config->wds)
++		fprintf(f, "wds=%d\n", config->wds);
+ }
+ 
+ #endif /* CONFIG_NO_CONFIG_WRITE */
+diff --git a/wpa_supplicant/sme.c b/wpa_supplicant/sme.c
+index 61fd3b2..85a77e9 100644
+--- a/wpa_supplicant/sme.c
++++ b/wpa_supplicant/sme.c
+@@ -549,6 +549,21 @@ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
+ 	}
+ #endif /* CONFIG_SAE */
+ 
++	if (wpa_s->conf->wds) {
++		u8 *pos = wpa_s->sme.assoc_req_ie +
++				  wpa_s->sme.assoc_req_ie_len;
++		*pos++ = WLAN_EID_VENDOR_SPECIFIC;
++		*pos++ = 0x05; /* len */
++		*pos++ = 0x00; /* INTEL_PROPRIETARY_OUI_OCTET_0 */
++		*pos++ = 0x17; /* INTEL_PROPRIETARY_OUI_OCTET_1 */
++		*pos++ = 0x35; /* INTEL_PROPRIETARY_OUI_OCTET_2 */
++		*pos++ = 0x30; /* WLAN_EID_VENDOR_SPECIFIC_OUI_TYPE_4ADDR_MODE */
++		*pos++ = 0x01; /* WLAN_EID_VENDOR_SPECIFIC_OUI_4ADDR_MODE_STA */
++		wpa_s->sme.assoc_req_ie_len += 7;
++		wpa_s->sme.wds = wpa_s->conf->wds;
++	}
++
++
+ 	wpa_supplicant_cancel_sched_scan(wpa_s);
+ 	wpa_supplicant_cancel_scan(wpa_s);
+ 
+@@ -989,6 +1004,7 @@ void sme_associate(struct wpa_supplicant *wpa_s, enum wpas_mode mode,
+ 	params.mode = mode;
+ 	params.mgmt_frame_protection = wpa_s->sme.mfp;
+ 	params.rrm_used = wpa_s->rrm.rrm_used;
++	params.wds = wpa_s->sme.wds;
+ 	if (wpa_s->sme.prev_bssid_set)
+ 		params.prev_bssid = wpa_s->sme.prev_bssid;
+ 
+diff --git a/wpa_supplicant/wpa_supplicant_i.h b/wpa_supplicant/wpa_supplicant_i.h
+index ef9273d..de26cc4 100644
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -724,6 +724,7 @@ struct wpa_supplicant {
+ 		u8 assoc_req_ie[200];
+ 		size_t assoc_req_ie_len;
+ 		int mfp;
++		int wds;
+ 		int ft_used;
+ 		u8 mobility_domain[2];
+ 		u8 *ft_ies;
+-- 
+2.10.1
+

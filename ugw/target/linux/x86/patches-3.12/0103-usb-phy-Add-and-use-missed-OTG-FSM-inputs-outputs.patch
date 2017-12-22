@@ -1,0 +1,156 @@
+From f5522228458a3a2b211dbe730639ff7e57ecf535 Mon Sep 17 00:00:00 2001
+From: Anton Tikhomirov <av.tikhomirov@samsung.com>
+Date: Thu, 3 Oct 2013 12:42:04 +0900
+Subject: [PATCH 103/441] usb: phy: Add and use missed OTG FSM inputs/outputs
+
+Several input/output variables missed in current FSM implementation.
+This patch adds and makes use of them as specified in OTG and EH
+supplement to USB2.0.
+
+Signed-off-by: Anton Tikhomirov <av.tikhomirov@samsung.com>
+Signed-off-by: Felipe Balbi <balbi@ti.com>
+(cherry picked from commit ec04996a080d825f8acdf0f8fbb2f3ebd5963cf3)
+Signed-off-by: Maladau Mou <maladau.mou@intel.com>
+---
+ drivers/usb/phy/phy-fsm-usb.c | 18 +++++++++++++++---
+ include/linux/usb/otg-fsm.h   | 36 +++++++++++++++++++++++++++++++++++-
+ 2 files changed, 50 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/phy/phy-fsm-usb.c
++++ b/drivers/usb/phy/phy-fsm-usb.c
+@@ -70,8 +70,11 @@ void otg_leave_state(struct otg_fsm *fsm
+ 	case OTG_STATE_B_IDLE:
+ 		otg_del_timer(fsm, B_SE0_SRP);
+ 		fsm->b_se0_srp = 0;
++		fsm->adp_sns = 0;
++		fsm->adp_prb = 0;
+ 		break;
+ 	case OTG_STATE_B_SRP_INIT:
++		fsm->data_pulse = 0;
+ 		fsm->b_srp_done = 0;
+ 		break;
+ 	case OTG_STATE_B_PERIPHERAL:
+@@ -83,6 +86,7 @@ void otg_leave_state(struct otg_fsm *fsm
+ 	case OTG_STATE_B_HOST:
+ 		break;
+ 	case OTG_STATE_A_IDLE:
++		fsm->adp_prb = 0;
+ 		break;
+ 	case OTG_STATE_A_WAIT_VRISE:
+ 		otg_del_timer(fsm, A_WAIT_VRISE);
+@@ -130,6 +134,11 @@ int otg_set_state(struct otg_fsm *fsm, e
+ 		otg_chrg_vbus(fsm, 0);
+ 		otg_loc_conn(fsm, 0);
+ 		otg_loc_sof(fsm, 0);
++		/*
++		 * Driver is responsible for starting ADP probing
++		 * if ADP sensing times out.
++		 */
++		otg_start_adp_sns(fsm);
+ 		otg_set_protocol(fsm, PROTO_UNDEF);
+ 		otg_add_timer(fsm, B_SE0_SRP);
+ 		break;
+@@ -166,6 +175,7 @@ int otg_set_state(struct otg_fsm *fsm, e
+ 		otg_chrg_vbus(fsm, 0);
+ 		otg_loc_conn(fsm, 0);
+ 		otg_loc_sof(fsm, 0);
++		otg_start_adp_prb(fsm);
+ 		otg_set_protocol(fsm, PROTO_HOST);
+ 		break;
+ 	case OTG_STATE_A_WAIT_VRISE:
+@@ -255,7 +265,8 @@ int otg_statemachine(struct otg_fsm *fsm
+ 			otg_set_state(fsm, OTG_STATE_A_IDLE);
+ 		else if (fsm->b_sess_vld && fsm->otg->gadget)
+ 			otg_set_state(fsm, OTG_STATE_B_PERIPHERAL);
+-		else if (fsm->b_bus_req && fsm->b_ssend_srp && fsm->b_se0_srp)
++		else if ((fsm->b_bus_req || fsm->adp_change || fsm->power_up) &&
++				fsm->b_ssend_srp && fsm->b_se0_srp)
+ 			otg_set_state(fsm, OTG_STATE_B_SRP_INIT);
+ 		break;
+ 	case OTG_STATE_B_SRP_INIT:
+@@ -282,13 +293,14 @@ int otg_statemachine(struct otg_fsm *fsm
+ 	case OTG_STATE_B_HOST:
+ 		if (!fsm->id || !fsm->b_sess_vld)
+ 			otg_set_state(fsm, OTG_STATE_B_IDLE);
+-		else if (!fsm->b_bus_req || !fsm->a_conn)
++		else if (!fsm->b_bus_req || !fsm->a_conn || fsm->test_device)
+ 			otg_set_state(fsm, OTG_STATE_B_PERIPHERAL);
+ 		break;
+ 	case OTG_STATE_A_IDLE:
+ 		if (fsm->id)
+ 			otg_set_state(fsm, OTG_STATE_B_IDLE);
+-		else if (!fsm->a_bus_drop && (fsm->a_bus_req || fsm->a_srp_det))
++		else if (!fsm->a_bus_drop && (fsm->a_bus_req ||
++			  fsm->a_srp_det || fsm->adp_change || fsm->power_up))
+ 			otg_set_state(fsm, OTG_STATE_A_WAIT_VRISE);
+ 		break;
+ 	case OTG_STATE_A_WAIT_VRISE:
+--- a/include/linux/usb/otg-fsm.h
++++ b/include/linux/usb/otg-fsm.h
+@@ -54,6 +54,9 @@ enum otg_fsm_timer {
+ /* OTG state machine according to the OTG spec */
+ struct otg_fsm {
+ 	/* Input */
++	int adp_change;
++	int power_up;
++	int test_device;
+ 	int a_bus_drop;
+ 	int a_bus_req;
+ 	int a_bus_resume;
+@@ -93,9 +96,12 @@ struct otg_fsm {
+ 	int b_bus_req_inf;
+ 
+ 	/* Output */
++	int data_pulse;
+ 	int drv_vbus;
+ 	int loc_conn;
+ 	int loc_sof;
++	int adp_prb;
++	int adp_sns;
+ 
+ 	struct otg_fsm_ops *ops;
+ 	struct usb_otg *otg;
+@@ -111,6 +117,8 @@ struct otg_fsm_ops {
+ 	void	(*loc_conn)(struct otg_fsm *fsm, int on);
+ 	void	(*loc_sof)(struct otg_fsm *fsm, int on);
+ 	void	(*start_pulse)(struct otg_fsm *fsm);
++	void	(*start_adp_prb)(struct otg_fsm *fsm);
++	void	(*start_adp_sns)(struct otg_fsm *fsm);
+ 	void	(*add_timer)(struct otg_fsm *fsm, enum otg_fsm_timer timer);
+ 	void	(*del_timer)(struct otg_fsm *fsm, enum otg_fsm_timer timer);
+ 	int	(*start_host)(struct otg_fsm *fsm, int on);
+@@ -163,7 +171,33 @@ static inline int otg_start_pulse(struct
+ {
+ 	if (!fsm->ops->start_pulse)
+ 		return -EOPNOTSUPP;
+-	fsm->ops->start_pulse(fsm);
++	if (!fsm->data_pulse) {
++		fsm->data_pulse = 1;
++		fsm->ops->start_pulse(fsm);
++	}
++	return 0;
++}
++
++static inline int otg_start_adp_prb(struct otg_fsm *fsm)
++{
++	if (!fsm->ops->start_adp_prb)
++		return -EOPNOTSUPP;
++	if (!fsm->adp_prb) {
++		fsm->adp_sns = 0;
++		fsm->adp_prb = 1;
++		fsm->ops->start_adp_prb(fsm);
++	}
++	return 0;
++}
++
++static inline int otg_start_adp_sns(struct otg_fsm *fsm)
++{
++	if (!fsm->ops->start_adp_sns)
++		return -EOPNOTSUPP;
++	if (!fsm->adp_sns) {
++		fsm->adp_sns = 1;
++		fsm->ops->start_adp_sns(fsm);
++	}
+ 	return 0;
+ }
+ 

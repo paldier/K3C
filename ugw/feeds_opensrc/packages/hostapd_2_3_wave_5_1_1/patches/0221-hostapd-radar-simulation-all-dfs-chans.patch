@@ -1,0 +1,99 @@
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/acs.c hostapd-2.6/src/ap/acs.c
+--- hostapd-2.6-orig/src/ap/acs.c	2017-03-23 15:16:10.630649707 +0200
++++ hostapd-2.6/src/ap/acs.c	2017-03-23 15:27:37.793647999 +0200
+@@ -1859,6 +1859,35 @@ channel_80 channels80[] = { {  42,  36, 
+                             { 155, 157, 161, 5000 + 149 * 5 },
+                             { 155, 161, 157, 5000 + 149 * 5 } };
+ 
++/* Gets secondary channel offset and VHT operational center frequency segment 0 index
++ * from 40 MHz and 80 MHz ACS candidate tables for 5 GHz band */
++int acs_get_chan_data_from_candidates_5g (int primary_chan, u8 is_80_mhz_chan,
++										   int *secondary_chan_offset, u8 *vht_oper_centr_freq_seg0_idx)
++{
++	int i;
++
++	if (!is_80_mhz_chan) { /* 40 MHz */
++		for (i = 0; i < sizeof(channel_pairs_40_5G)/sizeof(channel_pairs_40_5G[0]); i++) {
++			if (channel_pairs_40_5G[i].primary == primary_chan) {
++				*secondary_chan_offset = channel_pairs_40_5G[i].secondary > channel_pairs_40_5G[i].primary ? 1 : -1;
++				*vht_oper_centr_freq_seg0_idx = channel_pairs_40_5G[i].primary + 2 * (*secondary_chan_offset);
++				return 0;
++			}
++		}
++	}
++	else { /*80 MHz*/
++		for (i = 0; i < sizeof(channels80)/sizeof(channels80[0]); i++) {
++			if (channels80[i].primary == primary_chan) {
++				*secondary_chan_offset = channels80[i].secondary > channels80[i].primary ? 1 : -1;
++				*vht_oper_centr_freq_seg0_idx = channels80[i].chan_no;
++				return 0;
++			}
++		}
++	}
++
++	wpa_printf(MSG_ERROR, "Channel %d not found in 5 GHz ACS candidates table", primary_chan);
++	return 1;
++}
+ 
+ static u32 acs_get_center_chan_index(struct hostapd_iface *iface)
+ {
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/acs.h hostapd-2.6/src/ap/acs.h
+--- hostapd-2.6-orig/src/ap/acs.h	2017-03-23 15:16:10.694648421 +0200
++++ hostapd-2.6/src/ap/acs.h	2017-03-23 15:28:02.512071694 +0200
+@@ -23,6 +23,8 @@ int acs_do_switch_channel(struct hostapd
+ int get_num_width(int vht_width, int secondary);
+ int acs_chan_to_freq(int channel);
+ int acs_current_channel_request_scan(struct hostapd_iface *iface);
++int acs_get_chan_data_from_candidates_5g (int primary_chan, u8 is_80_mhz_chan,
++										   int *secondary_chan_offset, u8 *vht_oper_centr_freq_seg0_idx);
+ 
+ typedef struct {
+   u8 pri;
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/dfs.c hostapd-2.6/src/ap/dfs.c
+--- hostapd-2.6-orig/src/ap/dfs.c	2017-03-23 15:16:10.628649747 +0200
++++ hostapd-2.6/src/ap/dfs.c	2017-03-23 15:29:15.219324732 +0200
+@@ -861,6 +861,20 @@ int hostapd_dfs_complete_cac(struct host
+ 	return 0;
+ }
+ 
++int dfs_adjust_debug_dfs_chan (struct hostapd_iface *iface, struct hostapd_channel_data *channel,
++							    int *secondary_chan_offset, u8 *vht_oper_centr_freq_seg0_idx)
++{
++	/* 20 MHz channel configured */
++	if (!iface->conf->secondary_channel) {
++		*vht_oper_centr_freq_seg0_idx = channel->chan;
++		*secondary_chan_offset = 0;
++		return 0;
++	}
++	
++	return acs_get_chan_data_from_candidates_5g(channel->chan, iface->conf->vht_oper_chwidth,
++											    secondary_chan_offset, vht_oper_centr_freq_seg0_idx);
++}
++
+ struct hostapd_channel_data *
+ dfs_get_debug_dfs_chan(struct hostapd_iface *iface,
+ 											 int *secondary_channel,
+@@ -886,15 +900,14 @@ dfs_get_debug_dfs_chan(struct hostapd_if
+ 		return NULL;
+ 	}
+ 
+-	if (iface->conf->secondary_channel)
+-		*secondary_channel = 1;
+-	else
+-		*secondary_channel = 0;
+-
+-	dfs_adjust_vht_center_freq(iface, channel,
+-					*secondary_channel,
+-					vht_oper_centr_freq_seg0_idx,
+-					vht_oper_centr_freq_seg1_idx);
++	/* Set the same channel bandwidth as configured in conf file */
++	if (dfs_adjust_debug_dfs_chan(iface, channel, secondary_channel, vht_oper_centr_freq_seg0_idx)) {
++		wpa_printf(MSG_ERROR, "DFS_DEBUG: Failed to adjust channel %d parameters", channel->chan);
++		return NULL;
++	}
++
++	/* Not supported */
++	*vht_oper_centr_freq_seg1_idx = 0;
+ 
+ 	if (channel->flag & HOSTAPD_CHAN_RADAR)
+ 		iface->conf->dfs_dbg_need_cac = TRUE;

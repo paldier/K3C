@@ -1,0 +1,377 @@
+Index: ebtables-v2.0.9-2/extensions/Makefile
+===================================================================
+--- ebtables-v2.0.9-2.orig/extensions/Makefile	2014-01-13 16:36:23.000000000 +0530
++++ ebtables-v2.0.9-2/extensions/Makefile	2014-01-13 16:39:15.000000000 +0530
+@@ -1,7 +1,7 @@
+ #! /usr/bin/make
+ 
+ EXT_FUNC+=802_3 nat arp arpreply ip ip6 standard log redirect vlan mark_m mark \
+-          pkttype stp among limit ulog nflog imq
++          pkttype stp among limit ulog nflog imq extmark_m extmark
+ EXT_TABLES+=filter nat broute
+ EXT_OBJS+=$(foreach T,$(EXT_FUNC), extensions/ebt_$(T).o)
+ EXT_OBJS+=$(foreach T,$(EXT_TABLES), extensions/ebtable_$(T).o)
+Index: ebtables-v2.0.9-2/extensions/ebt_extmark.c
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ ebtables-v2.0.9-2/extensions/ebt_extmark.c	2014-01-13 16:43:09.000000000 +0530
+@@ -0,0 +1,178 @@
++/* ebt_extmark
++ *
++ * Authors:
++ * Bart De Schuymer <bdschuym@pandora.be>
++ *
++ * July, 2002, September 2006
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <getopt.h>
++#include "../include/ebtables_u.h"
++#include <linux/netfilter_bridge/ebt_extmark_t.h>
++
++static int mark_supplied;
++
++#define EXTMARK_TARGET  '1'
++#define EXTMARK_SETEXTMARK '2'
++#define EXTMARK_OREXTMARK  '3'
++#define EXTMARK_ANDEXTMARK '4'
++#define EXTMARK_XOREXTMARK '5'
++static struct option opts[] =
++{
++	{ "extmark-target" , required_argument, 0, EXTMARK_TARGET },
++	/* an oldtime messup, we should have always used the scheme
++	 * <extension-name>-<option> */
++	{ "set-extmark"    , required_argument, 0, EXTMARK_SETEXTMARK },
++	{ "extmark-set"    , required_argument, 0, EXTMARK_SETEXTMARK },
++	{ "extmark-or"     , required_argument, 0, EXTMARK_OREXTMARK  },
++	{ "extmark-and"    , required_argument, 0, EXTMARK_ANDEXTMARK },
++	{ "extmark-xor"    , required_argument, 0, EXTMARK_XOREXTMARK },
++	{ 0 }
++};
++
++static void print_help()
++{
++	printf(
++	"extmark target options:\n"
++	" --extmark-set value     : Set nfextmark value\n"
++	" --extmark-or  value     : Or nfextmark with value (nfextmark |= value)\n"
++	" --extmark-and value     : And nfextmark with value (nfextmark &= value)\n"
++	" --extmark-xor value     : Xor nfextmark with value (nfextmark ^= value)\n"
++	" --extmark-target target : ACCEPT, DROP, RETURN or CONTINUE\n");
++}
++
++static void init(struct ebt_entry_target *target)
++{
++	struct ebt_extmark_t_info *extmarkinfo =
++	   (struct ebt_extmark_t_info *)target->data;
++
++	extmarkinfo->target = EBT_ACCEPT;
++	extmarkinfo->extmark = 0;
++	mark_supplied = 0;
++}
++
++#define OPT_EXTMARK_TARGET   0x01
++#define OPT_EXTMARK_SETEXTMARK  0x02
++#define OPT_EXTMARK_OREXTMARK   0x04
++#define OPT_EXTMARK_ANDEXTMARK  0x08
++#define OPT_EXTMARK_XOREXTMARK  0x10
++static int parse(int c, char **argv, int argc,
++   const struct ebt_u_entry *entry, unsigned int *flags,
++   struct ebt_entry_target **target)
++{
++	struct ebt_extmark_t_info *extmarkinfo =
++	   (struct ebt_extmark_t_info *)(*target)->data;
++	char *end;
++
++	switch (c) {
++	case EXTMARK_TARGET:
++		{ int tmp;
++		ebt_check_option2(flags, OPT_EXTMARK_TARGET);
++		if (FILL_TARGET(optarg, tmp))
++			ebt_print_error2("Illegal --extmark-target target");
++		/* the 4 lsb are left to designate the target */
++		extmarkinfo->target = (extmarkinfo->target & ~EBT_VERDICT_BITS) | (tmp & EBT_VERDICT_BITS);
++		}
++		return 1;
++	case EXTMARK_SETEXTMARK:
++		ebt_check_option2(flags, OPT_EXTMARK_SETEXTMARK);
++		if (*flags & (OPT_EXTMARK_OREXTMARK|OPT_EXTMARK_ANDEXTMARK|OPT_EXTMARK_XOREXTMARK))
++			ebt_print_error2("--extmark-set cannot be used together with specific --extmark option");
++                break;
++	case EXTMARK_OREXTMARK:
++		ebt_check_option2(flags, OPT_EXTMARK_OREXTMARK);
++		if (*flags & (OPT_EXTMARK_SETEXTMARK|OPT_EXTMARK_ANDEXTMARK|OPT_EXTMARK_XOREXTMARK))
++			ebt_print_error2("--extmark-or cannot be used together with specific --extmark option");
++		extmarkinfo->target = (extmarkinfo->target & EBT_VERDICT_BITS) | EXTMARK_OR_VALUE;
++                break;
++	case EXTMARK_ANDEXTMARK:
++		ebt_check_option2(flags, OPT_EXTMARK_ANDEXTMARK);
++		if (*flags & (OPT_EXTMARK_SETEXTMARK|OPT_EXTMARK_OREXTMARK|OPT_EXTMARK_XOREXTMARK))
++			ebt_print_error2("--extmark-and cannot be used together with specific --extmark option");
++		extmarkinfo->target = (extmarkinfo->target & EBT_VERDICT_BITS) | EXTMARK_AND_VALUE;
++                break;
++	case EXTMARK_XOREXTMARK:
++		ebt_check_option2(flags, OPT_EXTMARK_XOREXTMARK);
++		if (*flags & (OPT_EXTMARK_SETEXTMARK|OPT_EXTMARK_ANDEXTMARK|OPT_EXTMARK_OREXTMARK))
++			ebt_print_error2("--extmark-xor cannot be used together with specific --extmark option");
++		extmarkinfo->target = (extmarkinfo->target & EBT_VERDICT_BITS) | EXTMARK_XOR_VALUE;
++                break;
++	 default:
++		return 0;
++	}
++	/* mutual code */
++	extmarkinfo->extmark = strtoul(optarg, &end, 0);
++	if (*end != '\0' || end == optarg)
++		ebt_print_error2("Bad EXTMARK value '%s'", optarg);
++	mark_supplied = 1;
++	return 1;
++}
++
++static void final_check(const struct ebt_u_entry *entry,
++   const struct ebt_entry_target *target, const char *name,
++   unsigned int hookmask, unsigned int time)
++{
++	struct ebt_extmark_t_info *extmarkinfo =
++	   (struct ebt_extmark_t_info *)target->data;
++
++	if (time == 0 && mark_supplied == 0) {
++		ebt_print_error("No extmark value supplied");
++	} else if (BASE_CHAIN && (extmarkinfo->target|~EBT_VERDICT_BITS) == EBT_RETURN)
++		ebt_print_error("--extmark-target RETURN not allowed on base chain");
++}
++
++static void print(const struct ebt_u_entry *entry,
++   const struct ebt_entry_target *target)
++{
++	struct ebt_extmark_t_info *extmarkinfo =
++	   (struct ebt_extmark_t_info *)target->data;
++	int tmp;
++
++	tmp = extmarkinfo->target & ~EBT_VERDICT_BITS;
++	if (tmp == EXTMARK_SET_VALUE)
++		printf("--extmark-set");
++	else if (tmp == EXTMARK_OR_VALUE)
++		printf("--extmark-or");
++	else if (tmp == EXTMARK_XOR_VALUE)
++		printf("--extmark-xor");
++	else if (tmp == EXTMARK_AND_VALUE)
++		printf("--extmark-and");
++	else
++		ebt_print_error("oops, unknown extmark action, try a later version of ebtables");
++	printf(" 0x%lx", extmarkinfo->extmark);
++	tmp = extmarkinfo->target | ~EBT_VERDICT_BITS;
++	printf(" --extmark-target %s", TARGET_NAME(tmp));
++}
++
++static int compare(const struct ebt_entry_target *t1,
++   const struct ebt_entry_target *t2)
++{
++	struct ebt_extmark_t_info *extmarkinfo1 =
++	   (struct ebt_extmark_t_info *)t1->data;
++	struct ebt_extmark_t_info *extmarkinfo2 =
++	   (struct ebt_extmark_t_info *)t2->data;
++
++	return extmarkinfo1->target == extmarkinfo2->target &&
++	   extmarkinfo1->extmark == extmarkinfo2->extmark;
++}
++
++static struct ebt_u_target extmark_target =
++{
++	.name		= "extmark",
++	.size		= sizeof(struct ebt_extmark_t_info),
++	.help		= print_help,
++	.init		= init,
++	.parse		= parse,
++	.final_check	= final_check,
++	.print		= print,
++	.compare	= compare,
++	.extra_ops	= opts,
++};
++
++void _init(void)
++{
++	ebt_register_target(&extmark_target);
++}
+Index: ebtables-v2.0.9-2/extensions/ebt_extmark_m.c
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ ebtables-v2.0.9-2/extensions/ebt_extmark_m.c	2014-01-13 16:43:14.000000000 +0530
+@@ -0,0 +1,127 @@
++/* ebt_extmark_m
++ *
++ * Authors:
++ * Bart De Schuymer <bdschuym@pandora.be>
++ *
++ * July, 2002
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <getopt.h>
++#include "../include/ebtables_u.h"
++#include <linux/netfilter_bridge/ebt_extmark_m.h>
++
++#define EXTMARK '1'
++
++static struct option opts[] =
++{
++	{ "extmark", required_argument, 0, EXTMARK },
++	{ 0 }
++};
++
++static void print_help()
++{
++	printf(
++"extmark option:\n"
++"--extmark    [!] [value][/mask]: Match nfmask value (see man page)\n");
++}
++
++static void init(struct ebt_entry_match *match)
++{
++	struct ebt_extmark_m_info *extmarkinfo = (struct ebt_extmark_m_info *)match->data;
++
++	extmarkinfo->extmark    = 0;
++	extmarkinfo->mask    = 0;
++	extmarkinfo->invert  = 0;
++	extmarkinfo->bitmask = 0;
++}
++
++#define OPT_EXTMARK 0x01
++static int parse(int c, char **argv, int argc, const struct ebt_u_entry *entry,
++   unsigned int *flags, struct ebt_entry_match **match)
++{
++	struct ebt_extmark_m_info *extmarkinfo = (struct ebt_extmark_m_info *)
++	   (*match)->data;
++	char *end;
++
++	switch (c) {
++	case EXTMARK:
++		ebt_check_option2(flags, EXTMARK);
++		if (ebt_check_inverse2(optarg))
++			extmarkinfo->invert = 1;
++		extmarkinfo->extmark = strtoul(optarg, &end, 0);
++		extmarkinfo->bitmask = EBT_EXTMARK_AND;
++		if (*end == '/') {
++			if (end == optarg)
++				extmarkinfo->bitmask = EBT_EXTMARK_OR;
++			extmarkinfo->mask = strtoul(end+1, &end, 0);
++		} else
++			extmarkinfo->mask = 0xffffffff;
++		if ( *end != '\0' || end == optarg)
++			ebt_print_error2("Bad extmark value '%s'", optarg);
++		break;
++	default:
++		return 0;
++	}
++	return 1;
++}
++
++static void final_check(const struct ebt_u_entry *entry,
++   const struct ebt_entry_match *match, const char *name,
++   unsigned int hookmask, unsigned int time)
++{
++}
++
++static void print(const struct ebt_u_entry *entry,
++   const struct ebt_entry_match *match)
++{
++	struct ebt_extmark_m_info *extmarkinfo =
++	   (struct ebt_extmark_m_info *)match->data;
++
++	printf("--extmark ");
++	if (extmarkinfo->invert)
++		printf("! ");
++	if (extmarkinfo->bitmask == EBT_EXTMARK_OR)
++		printf("/0x%lx ", extmarkinfo->mask);
++	else if(extmarkinfo->mask != 0xffffffff)
++		printf("0x%lx/0x%lx ", extmarkinfo->extmark, extmarkinfo->mask);
++	else
++		printf("0x%lx ", extmarkinfo->extmark);
++}
++
++static int compare(const struct ebt_entry_match *m1,
++   const struct ebt_entry_match *m2)
++{
++	struct ebt_extmark_m_info *extmarkinfo1 = (struct ebt_extmark_m_info *)m1->data;
++	struct ebt_extmark_m_info *extmarkinfo2 = (struct ebt_extmark_m_info *)m2->data;
++
++	if (extmarkinfo1->invert != extmarkinfo2->invert)
++		return 0;
++	if (extmarkinfo1->extmark != extmarkinfo2->extmark)
++		return 0;
++	if (extmarkinfo1->mask != extmarkinfo2->mask)
++		return 0;
++	if (extmarkinfo1->bitmask != extmarkinfo2->bitmask)
++		return 0;
++	return 1;
++}
++
++static struct ebt_u_match extmark_match =
++{
++	.name		= "extmark_m",
++	.size		= sizeof(struct ebt_extmark_m_info),
++	.help		= print_help,
++	.init		= init,
++	.parse		= parse,
++	.final_check	= final_check,
++	.print		= print,
++	.compare	= compare,
++	.extra_ops	= opts,
++};
++
++void _init(void)
++{
++	ebt_register_match(&extmark_match);
++}
+Index: ebtables-v2.0.9-2/include/linux/netfilter_bridge/ebt_extmark_m.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ ebtables-v2.0.9-2/include/linux/netfilter_bridge/ebt_extmark_m.h	2014-01-13 16:43:33.000000000 +0530
+@@ -0,0 +1,15 @@
++#ifndef __LINUX_BRIDGE_EBT_EXTMARK_M_H
++#define __LINUX_BRIDGE_EBT_EXTMARK_M_H
++
++#define EBT_EXTMARK_AND 0x01
++#define EBT_EXTMARK_OR 0x02
++#define EBT_EXTMARK_MASK (EBT_EXTMARK_AND | EBT_EXTMARK_OR)
++struct ebt_extmark_m_info
++{
++	unsigned long extmark, mask;
++	uint8_t invert;
++	uint8_t bitmask;
++};
++#define EBT_EXTMARK_MATCH "extmark_m"
++
++#endif
+Index: ebtables-v2.0.9-2/include/linux/netfilter_bridge/ebt_extmark_t.h
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ ebtables-v2.0.9-2/include/linux/netfilter_bridge/ebt_extmark_t.h	2014-01-13 16:43:28.000000000 +0530
+@@ -0,0 +1,24 @@
++#ifndef __LINUX_BRIDGE_EBT_EXTMARK_T_H
++#define __LINUX_BRIDGE_EBT_EXTMARK_T_H
++
++/* The target member is reused for adding new actions, the
++ * value of the real target is -1 to -NUM_STANDARD_TARGETS.
++ * For backward compatibility, the 4 lsb (2 would be enough,
++ * but let's play it safe) are kept to designate this target.
++ * The remaining bits designate the action. By making the set
++ * action 0xfffffff0, the result will look ok for older
++ * versions. [September 2006] */
++#define EXTMARK_SET_VALUE (0xfffffff0)
++#define EXTMARK_OR_VALUE  (0xffffffe0)
++#define EXTMARK_AND_VALUE (0xffffffd0)
++#define EXTMARK_XOR_VALUE (0xffffffc0)
++
++struct ebt_extmark_t_info
++{
++	unsigned long extmark;
++	/* EBT_ACCEPT, EBT_DROP, EBT_CONTINUE or EBT_RETURN */
++	int target;
++};
++#define EBT_EXTMARK_TARGET "extmark"
++
++#endif

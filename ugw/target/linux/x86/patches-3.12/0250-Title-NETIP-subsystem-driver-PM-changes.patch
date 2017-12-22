@@ -1,0 +1,2384 @@
+From a197cb5c9a42e9a2731e9efeb5c4a7362b21777f Mon Sep 17 00:00:00 2001
+From: Marco A Vital Yep <marco.a.vital.yep@intel.com>
+Date: Tue, 5 Jan 2016 10:48:24 -0700
+Subject: [PATCH 250/441] Title:      NETIP subsystem driver PM changes
+ IssueID:    CPM-234 IssueType:  ECR Symptom:    NA RootCause:  NA Resolution:
+ > Change the service status attribute to not use               the reserved
+ value for not available services.             > Expose a service available
+ attribute.             > Update the service level attribute to write-only.
+          > Handle the NETIP reset during deep standby/suspend state. Test:
+    Unit test. Reviewer:   Vinay Patel ReviewID:   CCID-118454
+
+---
+ arch/x86/Kconfig                                   |  16 +-
+ arch/x86/NetIP_SubSystem/Makefile                  |   3 +-
+ arch/x86/NetIP_SubSystem/avalanche_intc.c          |   0
+ arch/x86/NetIP_SubSystem/netip_subsystem_lld.c     |  11 +-
+ arch/x86/NetIP_SubSystem/netip_subsystem_pm.c      | 584 +++++++++------------
+ arch/x86/NetIP_SubSystem/netip_subsystem_pm.h      |  17 +-
+ arch/x86/NetIP_SubSystem/netip_subsystem_sysfs.c   | 472 +++++++++++++++++
+ arch/x86/NetIP_SubSystem/netip_subsystem_sysfs.h   |  59 +++
+ drivers/net/Makefile                               |   2 -
+ drivers/net/NetIP_Subsystem_sysfs/Makefile         |   7 -
+ .../NetIP_Subsystem_sysfs/netip_subsystem_sysfs.c  | 474 -----------------
+ include/linux/netip_subsystem.h                    |   5 +-
+ 12 files changed, 809 insertions(+), 841 deletions(-)
+ mode change 100755 => 100644 arch/x86/NetIP_SubSystem/Makefile
+ mode change 100755 => 100644 arch/x86/NetIP_SubSystem/avalanche_intc.c
+ mode change 100755 => 100644 arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
+ create mode 100644 arch/x86/NetIP_SubSystem/netip_subsystem_sysfs.c
+ create mode 100644 arch/x86/NetIP_SubSystem/netip_subsystem_sysfs.h
+ delete mode 100644 drivers/net/NetIP_Subsystem_sysfs/Makefile
+ delete mode 100644 drivers/net/NetIP_Subsystem_sysfs/netip_subsystem_sysfs.c
+ mode change 100755 => 100644 include/linux/netip_subsystem.h
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -450,11 +450,19 @@ config ARCH_GEN3
+ endmenu
+ 
+ config NET_SUBSYSTEM
+-	bool "Net IP controller support for Intel CE2600 platform"
++    bool "Net IP controller support for Intel CE2600 platform"
+         depends on ARCH_GEN3
+-	default y
+-	---help---
+-	  This is the NET-IP subsystem support for Intel CE2600 platform.
++        default y
++        ---help---
++          This is the NET-IP subsystem support for Intel CE2600 platform.
++
++config NET_SUBSYSTEM_SYSFS
++    bool "Sysfs interface for Net IP controller"
++        depends on NET_SUBSYSTEM
++        depends on NETDEVICES
++        default y
++        ---help---
++          Exposes sysfs interface to get and set NET-IP subsystem attributes.
+ 
+ menu  "Intel PUMA7 AVALANCHE support"
+     config ARM_AVALANCHE_PDSP_PP
+--- a/arch/x86/NetIP_SubSystem/Makefile
++++ b/arch/x86/NetIP_SubSystem/Makefile
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (c) 2011, Intel Corporation and its suppliers.
++# Copyright (c) 2011-2016, Intel Corporation and its suppliers.
+ #
+ # This program is free software; you can redistribute it and/or modify it
+ # under the terms and conditions of the GNU General Public License,
+@@ -21,3 +21,4 @@ obj-$(CONFIG_NET_SUBSYSTEM) := netip_sub
+ netip_subsystem-objs += netip_subsystem_lld.o
+ netip_subsystem-objs += netip_subsystem_pm.o
+ netip_subsystem-objs += avalanche_intc.o
++obj-$(CONFIG_NET_SUBSYSTEM_SYSFS) += netip_subsystem_sysfs.o
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
+@@ -3,7 +3,7 @@
+  *
+  *  GPL LICENSE SUMMARY
+  *
+- *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *  Copyright(c) 2015-2016 Intel Corporation. All rights reserved.
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of version 2 of the GNU General Public License as
+@@ -78,7 +78,6 @@ void netss_manage_netip_services(void);
+ void netss_stop_handshake_thread(void);
+ 
+ struct net_subsystem_drv_data *pnetss_drv_data;
+-extern netss_sysfs_attributes_info_t g_netss_sysfs_attributes_info;
+ 
+ void netss_interrupt_register(netss_interrupt_t intrpt, int arm11_int_id, netss_interrupt_info_t *irq_info)
+ {
+@@ -189,12 +188,16 @@ int netss_device_get_info(netss_dev_t su
+          mmio->size = NETSS_DEV_MOCA_MMIO_SIZE;
+          ret = 0;
+       break;
+-
+       case NETSS_DEV_GBE:
+          mmio->base = net_ip_mmios.region1_base + NETSS_DEV_GBE_MMIO_OFFSET;
+          mmio->size = NETSS_DEV_GBE_MMIO_SIZE;
+          ret = 0;
+       break;
++      case NETSS_DEV_CLK_CTRL:
++         mmio->base = net_ip_mmios.region1_base + NETSS_DEV_CLK_CTRL_MMIO_OFFSET;
++         mmio->size = NETSS_DEV_CLK_CTRL_MMIO_SIZE;
++         ret = 0;
++      break;
+       default:
+          ret = -1;
+    }
+@@ -411,7 +414,6 @@ static int netss_probe(struct pci_dev *p
+    /**Get the ACPI handle */
+    pnetss_drv_data->acpi_h = ACPI_HANDLE(&pdev->dev);
+    pci_set_drvdata(pnetss_drv_data->dev,pnetss_drv_data);
+-   mutex_init(&g_netss_sysfs_attributes_info.lock);
+    pnetss_drv_data->netss_driver_initialized = true;
+ #ifdef CONFIG_PM_RUNTIME
+    //pm_runtime_enable(&pdev->dev);
+@@ -448,7 +450,6 @@ static void netss_remove(struct pci_dev
+       return;
+    mutex_destroy(&pnetss_drv_data->netss_lock);
+    mutex_destroy(&pnetss_drv_data->netip_msg.lock);
+-   mutex_destroy(&g_netss_sysfs_attributes_info.lock);
+    /*wake up and stop the thread */
+    netss_stop_handshake_thread();
+    pm_runtime_disable(&pdev->dev);
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
+@@ -3,7 +3,7 @@
+  *
+  *  GPL LICENSE SUMMARY
+  *
+- *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *  Copyright(c) 2015-2016 Intel Corporation. All rights reserved.
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of version 2 of the GNU General Public License as
+@@ -38,25 +38,27 @@
+ #include <linux/timer.h>
+ #include "netip_subsystem_defs.h"
+ #include "netip_subsystem_pm.h"
++#include "netip_subsystem_sysfs.h"
++
++#define CLK_CTRL_CRU0_OFFSET (0)
+ 
+ extern int docsis_chan_cfg;
+-extern int  cm_mode;
++extern int cm_mode;
+ extern int RCE_Floor;
+ extern int RCE_Filter;
+ 
+ void netss_sysfs_clean_up(uint32_t available_services);
+ 
+-
+-/**Function that sends service request msg  */
+-static int netss_send_service_request_msg(uint32_t service_level);
+-
+ int __netss_set_service_level(uint32_t level);
++
+ /*External variables */
+ extern struct net_subsystem_drv_data *pnetss_drv_data;
+-netss_sysfs_attributes_info_t g_netss_sysfs_attributes_info;
+ 
+-static int g_enable_debug = 0;
+-#define NETSS_PM_PRINT(fmt, args...) { if(g_enable_debug) printk(fmt, ##args); } 
++#define NETSS_PM_PRINT(fmt, args...) \
++do { \
++   if(g_netss_sysfs_attributes_info.enable_debug) \
++      printk(KERN_INFO fmt, ##args); \
++} while(0)
+ 
+ #define IS_SERVICE_RESOURCE_TO_BE_CONTROLLED(id)  ( ( (id == NETSS_SERVICE_ID_SGMII0) || \
+                                                       (id == NETSS_SERVICE_ID_SGMII1) || \
+@@ -64,18 +66,21 @@ static int g_enable_debug = 0;
+                                                       (id == NETSS_SERVICE_ID_RGMII3) || \
+                                                       (id == NETSS_SERVICE_ID_EXSW) ) ? 1 : 0)
+ 
+-/*The variable when set indicates that a message is received from NetIP 
++/** Global variables */
++netss_sysfs_attributes_info_t g_netss_sysfs_attributes_info;
++
++/*The variable when set indicates that a message is received from NetIP
+  *NetIP subsustem msg processing thread sleeps in the work queue
+  *untill this variable is not zero*/
+ static int g_netip_msg = 0;
+ /*Bit mask representing available services
+  * set bit indicates the availablity of the corresponding service.
+- * bit 0 represents the availability of service id 1 
++ * bit 0 represents the availability of service id 1
+  * bit 1 represents the availability of service id 2 and so on
+  * bit 11 represents the availability of service id 12
+  * As of now the maximum number of services is 12 */
+ static uint16_t g_netip_services_available = 0;
+-/*The variable indicates the services whose service status message is received. 
++/*The variable indicates the services whose service status message is received.
+  * if bit n is set, service id n-1's service status message is received */
+ static uint16_t g_netip_services_status_received = 0;
+ /* Netip services that are ready to be  moved to desired power level */
+@@ -109,7 +114,7 @@ static netss_power_level_t g_current_net
+ /*Indicated if the bootime hand shake with NetIP is done or not */
+ static bool g_netss_boot_handshake_done = false;
+ 
+-/**timer to indicate timeout,if at all happens during dualboot handshake or 
++/**timer to indicate timeout,if at all happens during dualboot handshake or
+  * while waiting for the service request replies */
+ static struct timer_list netss_pm_timer;
+ static bool g_timer_created = false;
+@@ -122,20 +127,46 @@ extern int puma_netip_notify_state(int s
+ 
+ static DECLARE_WAIT_QUEUE_HEAD(waitForNetIPMsgWQ);
+ 
++/** Initialize all PM global data */
++static void netss_pm_init_data(void)
++{
++   mutex_init(&g_netss_sysfs_attributes_info.lock);
++   init_timer(&netss_pm_timer);
++   g_timer_created = true;
++   /** Initialize services status and level.
++       Notes:
++         Bits 28-31 do not represent a valid service.
++         Bit 2 is unused.
++         Bit 3 indicates on-battery status. */
++   g_netss_sysfs_attributes_info.service_status = 0xAFFFFFF3;
++   g_netss_sysfs_attributes_info.service_level = 0xAFFFFFF0;
++   g_netss_sysfs_attributes_info.service_ready = 0x0;
++}
++
+ static void netss_handle_resource_power_state(uint8_t service_id, uint8_t state)
+ {
++   struct acpi_object_list input;
++   union acpi_object in_params[2];
++
++   input.count = 2;
++   input.pointer = in_params;
++   in_params[0].type = ACPI_TYPE_INTEGER;
++   in_params[0].integer.value = service_id;
++   in_params[1].type = ACPI_TYPE_INTEGER;
++   in_params[1].integer.value = state;
+    if(pnetss_drv_data->acpi_h == NULL)
+    {
+-      //printk("NetIP acpi handle is NULL \n");
++      printk("NetIP acpi handle is NULL \n");
+    }
+    else
+    {
+       /** call ACPI function from here to power on/off of the resource associated with the service */
+-      //NETSS_PM_PRINT("Changing the resource power state of service id %d state %d\n", service_id, state);
++      NETSS_PM_PRINT("Changing the resource power state of service id %d state %d\n", service_id, state);
++      acpi_evaluate_object(pnetss_drv_data->acpi_h, "SRPS", &input, NULL);
+    }
+    return;
+ }
+-static void netss_pm_timeout_handler (unsigned long data) 
++static void netss_pm_timeout_handler (unsigned long data)
+ {
+    printk("IT APPEARS THAT ATOM NOT RECEIVING MSGS FROM NETIP \n");
+    printk("Keep Checking #cat /sys/class/net/netip_subsystem/service_status \n");
+@@ -165,13 +196,13 @@ static int  netss_receive_netip_msg(hw_m
+    mutex_lock(&pnetss_drv_data->netip_msg.lock);
+    memcpy(pnetss_drv_data->netip_msg.payload, dataBuf, dataLen);
+    pnetss_drv_data->netip_msg.len = dataLen;
+-   pnetss_drv_data->netip_msg.type = dataBuf[0]; 
+-   /*Wake up thread, cleanup sysfs attributes */ 
+-   if(pnetss_drv_data->netip_msg.type == NETSS_OPCODE_NETIP_PROPERTIES) 
++   pnetss_drv_data->netip_msg.type = dataBuf[0];
++   /*Wake up thread, cleanup sysfs attributes */
++   if(pnetss_drv_data->netip_msg.type == NETSS_OPCODE_NETIP_PROPERTIES)
+    {
+       g_netip_msg = 1;
+       msg_name = "Properties";
+-   } 
++   }
+    else if (pnetss_drv_data->netip_msg.type == NETSS_OPCODE_SERVICE_STATUS)
+    {
+       g_netip_msg = 2;
+@@ -185,7 +216,7 @@ static int  netss_receive_netip_msg(hw_m
+    NETSS_PM_PRINT("NetIP Msg recvd: %s\n", msg_name);
+    for(i=0; i<dataLen; i++)
+    {
+-      if(i%4 == 0) 
++      if(i%4 == 0)
+       {
+          NETSS_PM_PRINT("\n");
+       }
+@@ -198,8 +229,6 @@ static int  netss_receive_netip_msg(hw_m
+    return 0;
+ }
+ 
+-int data;
+-
+ static void netss_send_reply_ack(void)
+ {
+    int ret = 0;
+@@ -218,12 +247,13 @@ static void netss_send_reply_msg(void)
+ 
+    return;
+ }
++
+ /** NetIP properties message format
+  * ---------------------------
+  * |   Opcode - 4bytes       |
+  * |-------------------------|
+  * |-------------------------|
+- * | service ids of 1byte ech|  
++ * | service ids of 1byte ech|
+  * | ID   |  ID  | ID  |  ID |
+  * |-------------------------|
+  * | ID   |  ID  | ID  |  ID |
+@@ -231,17 +261,15 @@ static void netss_send_reply_msg(void)
+  * | And so on.........      |
+  * |-------------------------|
+  * |-------------------------|
+- * |           0             | 1, 2, 3 or 4 terminating bytes 
++ * |           0             | 1, 2, 3 or 4 terminating bytes
+  * |-------------------------|
+  */
+-
+ static void ness_process_netip_props_msg(void)
+ {
+    uint8_t *data = (uint8_t  *)(&pnetss_drv_data->netip_msg.payload[4]);
+-   
+    while(*data != 0 )
+    {
+-      /*netip properties message is null terminated 
++      /*netip properties message is null terminated
+        *set the bit n-1, for the service id n
+        *service id starts from 1  */
+       if(*data < NETSS_SERVICE_ID_MAX)
+@@ -252,12 +280,11 @@ static void ness_process_netip_props_msg
+       {
+          printk("Invalid service id in properties msg %d\n", *data);
+       }
+-      
+       /*Check next two bytes */
+       data++;
+-   } 
++   }
+    NETSS_PM_PRINT("services that are available = %x\n", g_netip_services_available);
+-  
++
+    /*Remove the sysfs attribute files of the services that are not available */
+    //netss_sysfs_clean_up(g_netip_services_available);
+    return;
+@@ -268,19 +295,19 @@ static void ness_process_netip_props_msg
+  * |----------------------------------|
+  * | chan id | chan id|chan id|chan id|   32 bytes are reserved for 32 channels [1...32]
+  * | 1byte   | 1byte  |1byte  |1byte  |   to be specified as docsis channels.
+- * |----------------------------------|   terminate list with 0 
++ * |----------------------------------|   terminate list with 0
+  * |And so on....
+  * |----------------------------------|
+  * | chan id | chan id|chan id|chan id|
+  * | 1bytes  | 1byte  |1byte  |1byte  |
+  * |----------------------------------|
+- * | cable modem mode 0-docsis, 1-GW  |  
++ * | cable modem mode 0-docsis, 1-GW  |
+  * |           4bytes                 |
+  * |----------------------------------|
+- * |          RCE Floor               |  
++ * |          RCE Floor               |
+  * |           4bytes                 |
+  * |----------------------------------|
+- * |          RCE Filter              |  
++ * |          RCE Filter              |
+  * |           4bytes                 |
+  * |----------------------------------|
+  */
+@@ -292,11 +319,11 @@ static void netss_send_configure_msg (vo
+    netss_configure_msg_t cfg_msg;
+    uint8_t *msg= (uint8_t *)(&cfg_msg);
+    uint32_t reply_len;
+-    
++
+    /*clear the message */
+-    memset(&cfg_msg, 0, sizeof(netss_configure_msg_t));
+-   
++   memset(&cfg_msg, 0, sizeof(netss_configure_msg_t));
+    cfg_msg.hdr.opcode = NETSS_OPCODE_CONFIGURE;
++
+    /*These values should be read from platfom config files
+     *for now writing some default values  */
+    for(i=0; i < 32; i++)
+@@ -308,15 +335,15 @@ static void netss_send_configure_msg (vo
+    }
+    /*Just write 0 to terminate the list */
+    cfg_msg.docsis_chan[j] = 0;
+-  
+-   cfg_msg.cm_mode = cm_mode; 
++
++   cfg_msg.cm_mode = cm_mode;
+    cfg_msg.RCE_floor = RCE_Floor;
+    cfg_msg.RCE_filter = RCE_Filter;
+ 
+    NETSS_PM_PRINT("configure Msg:");
+    for(i=0; i<sizeof(netss_configure_msg_t); i++)
+    {
+-      if(i%4 == 0) 
++      if(i%4 == 0)
+       {
+          NETSS_PM_PRINT("\n");
+       }
+@@ -328,8 +355,8 @@ static void netss_send_configure_msg (vo
+    {
+        printk(KERN_ERR "Send configure message failed ret %d \n", ret);
+    }
+-   /**Add some debug message on success */  
+-   return; 
++   /**Add some debug message on success */
++   return;
+ }
+ 
+ #define SERVICE_OFFSET 8
+@@ -340,41 +367,43 @@ static void netss_send_configure_msg (vo
+  * |  netip level - 4bytes   |
+  * |-------------------------|
+  * | serv |     | serv |     |
+- * |  id  |level|  id  |level|  
++ * |  id  |level|  id  |level|
+  * | 1byt | 1byt| 1byt | 1byt|
+  * |-------------------------|
+  * |-------------------------|
+  * | And so on.........      |
+  * |-------------------------|
+  * | serv |     | serv |     |
+- * |  id  |level|  id  |level|  
++ * |  id  |level|  id  |level|
+  * | 1byt | 1byt| 1byt | 1byt|
+  * |-------------------------|
+- * |           0             | terminating bytes 
++ * |           0             | terminating bytes
+  * |-------------------------|
+  */
+-static void ness_process_service_status_msg(void) 
++static void ness_process_service_status_msg(void)
+ {
+    int i=0;
+    netss_service_status_msg_t *service_msg =(netss_service_status_msg_t*) &pnetss_drv_data->netip_msg.payload[0];
+    netss_service_status_t *service_status = (netss_service_status_t *)&pnetss_drv_data->netip_msg.payload[SERVICE_OFFSET];
+-   
++
+    NETSS_PM_PRINT("processing service status message opcode %d\n", service_msg->hdr.opcode);
+-   while(service_status[i].id != 0) 
++
++   while(service_status[i].id != 0)
+    {
+-      /**Check if the service id is available i.e mentioned in netip properties msg and valid */
+-      if((g_netip_services_available & (1 << (service_status[i].id-1))) &&
+-         (service_status[i].id < NETSS_SERVICE_ID_MAX))
++      uint16_t id_mask = 1 << (service_status[i].id - 1);
++      /** Check if the service id is available i.e mentioned in netip properties msg and valid */
++      if(g_netip_services_available & id_mask)
+       {
+-         if(!(g_netip_services_status_received & (1 << (service_status[i].id -1))))
++         if(!(g_netip_services_status_received & id_mask))
+          {
+-            g_netip_services_status_received |= (1 << (service_status[i].id -1));
+-
+-            /*Services that are ready to request */
+-            if(service_status[i].state == NETSS_SERVICE_STATUS_INITIALIZED)  
++            g_netip_services_status_received |= id_mask;
++            /* Services that are ready to request */
++            if(service_status[i].state == NETSS_SERVICE_STATUS_INITIALIZED)
+             {
+-               g_netip_services_status_ready |= (1 << (service_status[i].id -1));
++               g_netip_services_status_ready |= id_mask;
+                g_num_netip_services_status_ready++;
++               /** Update sysfs service_ready attribute */
++               g_netss_sysfs_attributes_info.service_ready |= NETSS_SET_SERVICE_POWER_LEVEL(service_status[i].id, NETSS_SERVICE_STATUS_INITIALIZED);
+             }
+          }
+       }
+@@ -384,22 +413,24 @@ static void ness_process_service_status_
+       }
+       i++;
+    }
+-   
++
+    return;
+ }
+ 
+ static void netss_update_sysfs_attributes(netss_sysfs_attributes_info_t *sysfs_info, netss_service_request_msg_t *service_msg)
+ {
+    int i=0;
+-   uint32_t netip_level = service_msg->netip_level;
+    /*Upon successful reply process the reply and update sysfs attributes */
+-   sysfs_info->runtime_state[0] = service_msg->netip_level;
+-   /**Clear and update netip level */
++   //sysfs_info->runtime_state[0] = service_msg->netip_level;
++   NETSS_PM_PRINT("--> Service Status(0x%08x)\n", sysfs_info->service_status);
++   /** Clear and update netip level */
+    sysfs_info->service_status &= ~NETSS_BIT_MASK_POWER_LEVEL;
+-   sysfs_info->service_status = service_msg->netip_level & NETSS_BIT_MASK_POWER_LEVEL;
++   sysfs_info->service_status |= service_msg->netip_level & NETSS_BIT_MASK_POWER_LEVEL;
+ 
+-   while(service_msg->service[i].id != 0) 
++   while(service_msg->service[i].id != 0)
+    {
++      NETSS_PM_PRINT("Service ID(%d) Status(%d)\n",
++         service_msg->service[i].id, service_msg->service[i].state);
+ 
+       /**Clear and update the individual service level */
+       NETSS_CLEAR_SERVICE_POWER_LEVEL(service_msg->service[i].id, sysfs_info->service_status);
+@@ -410,7 +441,7 @@ static void netss_update_sysfs_attribute
+       {
+          netss_handle_resource_power_state(service_msg->service[i].id, service_msg->service[i].state);
+       }
+-      if(!g_netss_boot_handshake_done) 
++      if(!g_netss_boot_handshake_done)
+       {
+          /*Service completed initalized by moving to the requested power level*/
+          g_netip_services_init_complete |= (1<< (service_msg->service[i].id-1));
+@@ -422,7 +453,7 @@ static void netss_update_sysfs_attribute
+       i++;
+    }
+    if(!g_netss_boot_handshake_done)
+-   { 
++   {
+       NETSS_PM_PRINT("services_ready = %X init complete %X service status %X\n", g_netip_services_status_ready, g_netip_services_init_complete, sysfs_info->service_status);
+    }
+    else
+@@ -433,13 +464,12 @@ static void netss_update_sysfs_attribute
+    if( (!g_netss_boot_handshake_done && (g_netip_services_status_ready == g_netip_services_init_complete)) ||
+        (g_netss_boot_handshake_done && (g_netip_services_change_complete == g_netip_services_change_requested)) )
+    {
+-      int i=0;
+       uint32_t temp = g_current_netip_power_state;
+       g_current_netip_power_state = service_msg->netip_level;
+-     
++
+       if(g_timer_created)
+       {
+-         /**delete the timer as we completed either dualboot handshake or 
++         /**delete the timer as we completed either dualboot handshake or
+           * a service_request change initiated by user after dualboot handshake */
+          del_timer_sync(&netss_pm_timer);
+       }
+@@ -452,30 +482,21 @@ static void netss_update_sysfs_attribute
+       {
+          sysfs_info->service_status &= ~NETSS_BIT_MASK_ON_BATTERY;
+       }
+-      /**Mark the services that are not ready with reserved power level */
+-      for(i = NETSS_SERVICE_ID_DOCSIS; i < NETSS_SERVICE_ID_MAX; i++)
+-      {
+-         if(!(g_netip_services_status_ready & (1<<(i-1))))
+-         {
+-            /**Clear power leveland update with reserved */
+-            NETSS_CLEAR_SERVICE_POWER_LEVEL(i, sysfs_info->service_status);
+-            sysfs_info->service_status |= NETSS_SET_SERVICE_POWER_LEVEL(i, NETSS_SERVICE_POWER_LEVEL_RESERVED);
+-         }
+-      } 
++
+       if(service_msg->netip_level == NETSS_POWER_LEVEL_RESERVED)
+       {
+          NETSS_PM_PRINT("ERROR NetIP level should not be reserved level = %d\n", NETSS_POWER_LEVEL_RESERVED);
+-      }   
++      }
+       if(g_current_netip_power_state == NETSS_POWER_LEVEL_DEEP_STANDBY)
+       {
+ #ifdef CONFIG_PM_RUNTIME
+          /**Let the usage counter go to zero */
+          pm_runtime_put(&pnetss_drv_data->dev->dev);
+ #endif
+-      }        
++      }
+       if(temp < g_current_netip_power_state && g_current_netip_power_state != NETSS_POWER_LEVEL_DEEP_STANDBY)
+       {
+-         /* No need to call if going to deepstandby, because netss_runtime_suspend will call. 
++         /* No need to call if going to deepstandby, because netss_runtime_suspend will call.
+           * 1. Call the platform driver api to inform the new power state
+           * we are going to lower power level like active to bbu, active to fast standby/disable
+           */
+@@ -489,16 +510,16 @@ static void netss_update_sysfs_attribute
+              puma_netip_notify_state(1);
+           }
+       } /** g_current_netip_power_state will never be NETSS_POWER_LEVEL_RESERVED, just a safety check */
+-      else if(temp == g_current_netip_power_state && g_current_netip_power_state != NETSS_POWER_LEVEL_RESERVED) 
++      else if(temp == g_current_netip_power_state && g_current_netip_power_state != NETSS_POWER_LEVEL_RESERVED)
+       {
+          /**There is no change in the netip level */
+          if(g_onBattery && (g_current_netip_power_state == NETSS_POWER_LEVEL_ENABLE))
+          {
+-            puma_netip_notify_state(1); 
++            puma_netip_notify_state(1);
+          }
+          else
+          {
+-            puma_netip_notify_state(g_current_netip_power_state); 
++            puma_netip_notify_state(g_current_netip_power_state);
+          }
+       }
+ 
+@@ -507,7 +528,7 @@ static void netss_update_sysfs_attribute
+       {
+          g_netip_services_change_complete = 0;
+          g_netip_services_change_requested = 0;
+-         
++
+          if (g_netip_service_level_request_pending)
+          {
+             g_netip_service_level_request_pending =  false;
+@@ -516,32 +537,25 @@ static void netss_update_sysfs_attribute
+          }
+       }
+    }
++   NETSS_PM_PRINT("<-- Service Status(0x%08x)\n", sysfs_info->service_status);
+    return;
+ }
+ 
++
+ static bool netss_request_for_service_level_change(int index)
+ {
+    bool add_service_to_msg = false;
+-   if(!g_netss_boot_handshake_done)
+-   {
+-      if((g_netip_services_status_ready & (1<<index)) && !(g_netip_services_init_complete & (1<<index)))
+-      {
+-         add_service_to_msg = true;
+-      }
+-   }
+-   else
+-   {
+-      if(g_netip_services_status_ready & (1<<index))
+-      {
+-         if(!(g_netip_services_change_requested & (1<<index)));
+-         {
+-            add_service_to_msg = true;
+-         }
+-      }
++   uint32_t service_mask = (1 << (index - 1));
++   if(g_netip_services_status_ready & service_mask) {
++      if(g_netss_boot_handshake_done)
++         add_service_to_msg = !(g_netip_services_change_requested & service_mask);
++      else
++         add_service_to_msg = !(g_netip_services_init_complete & service_mask);
+    }
+    return add_service_to_msg;
+ }
+-/*Service request message format is same as service status message 
++
++/*Service request message format is same as service status message
+  *sys/class/net/netip_subsystem/service_level is set by PMP (power management policy)
+  *and it is interpreted as follows
+  * ---------------------------------------------
+@@ -573,22 +587,22 @@ static bool netss_request_for_service_le
+  * ---------------------------
+  * |   Opcode - 4bytes       |
+  * |-------------------------|
+- * |   On Battery - 4bytes   |  
++ * |   On Battery - 4bytes   |
+  * |-------------------------|
+  * |  netip level - 4bytes   |
+  * |-------------------------|
+  * | serv |     | serv |     |
+- * |  id  |level|  id  |level|  
++ * |  id  |level|  id  |level|
+  * | 1byt | 1byt| 1byt | 1byt|
+  * |-------------------------|
+  * |-------------------------|
+  * | And so on.........      |
+  * |-------------------------|
+  * | serv |     | serv |     |
+- * |  id  |level|  id  |level|  
++ * |  id  |level|  id  |level|
+  * | 1byt | 1byt| 1byt | 1byt|
+  * |-------------------------|
+- * |           0             | terminating bytes 
++ * |           0             | terminating bytes
+  * |-------------------------|
+  */
+ 
+@@ -601,7 +615,6 @@ static int netss_send_service_request_ms
+    netss_service_request_msg_t *service_msg = NULL;
+    uint8_t *msg;
+    uint32_t service_msg_len;
+-   netss_sysfs_attributes_info_t *syfs_info = &g_netss_sysfs_attributes_info;
+ 
+    /*Need one service for null termination */
+    service_msg_len = sizeof(netss_service_request_msg_t)+((g_num_netip_services_status_ready+1)*sizeof(netss_service_status_t));
+@@ -613,89 +626,42 @@ static int netss_send_service_request_ms
+    msg = (uint8_t *)service_msg;
+    if(!service_msg) {
+       printk(KERN_ERR "Could not allocate service request message\n");
+-   } 
+-   else 
++   }
++   else
+    {
+       //mutex_lock(&syfs_info->lock);
+       service_msg->hdr.opcode = NETSS_OPCODE_SERVICE_REQUEST;
+-      /**Assume that we are not on Battery */
+-      g_onBattery = false;
+-      if(0 == service_level) 
+-      {
+-         /*PMP has not set the service level, 
+-          *assume Enable onAC power and enable all available services */
+-         service_msg->netip_level =  NETSS_POWER_LEVEL_ENABLE;
+-         service_msg->onBattery = 0;
+-         for(i = NETSS_SERVICE_ID_DOCSIS; i < NETSS_SERVICE_ID_MAX; i++) 
+-         {
+-            /*If the Dual boot handshake is not done then request all the services that are
+-             *not moved to a initial power level 
+-             *If the dual boot handshake is done then it means power manager want to change the power level
+-             *of the services, just make sure that their status was ready and avoid sending request for
+-             *for services which are already sent */
+-            if(netss_request_for_service_level_change(i-1))
+-            {
+-               service_msg->service[j].id = i; // service ID starts from 1
+-               service_msg->service[j].state = NETSS_SERVICE_POWER_LEVEL_ON;
+-               if(IS_SERVICE_RESOURCE_TO_BE_CONTROLLED(i)) 
+-               {
+-                  netss_handle_resource_power_state(i, NETSS_SERVICE_POWER_LEVEL_ON);
+-               }
+-               j++;
+-               msg_len += 2;
+-            }
+-         }
+-      } 
+-      else 
+-      {
+-         service_msg->netip_level = (service_level & NETSS_BIT_MASK_POWER_LEVEL);
++      service_msg->onBattery = g_onBattery = (service_level & NETSS_BIT_MASK_ON_BATTERY)? 1 : 0;
++      service_msg->netip_level = (service_level & NETSS_BIT_MASK_POWER_LEVEL);
+ 
+-         if(service_msg->netip_level == NETSS_POWER_LEVEL_RESERVED)
+-         {
+-            NETSS_PM_PRINT("ERROR NetIP level should not be reserved\n");
+-         }
++      if(service_msg->netip_level == NETSS_POWER_LEVEL_RESERVED) {
++         NETSS_PM_PRINT("ERROR NetIP level should not be reserved\n");
++      }
+ 
+-         if (service_level & NETSS_BIT_MASK_ON_BATTERY)
+-         {
+-            service_msg->onBattery = 1;
+-            g_onBattery = true;
+-         }
+-         /*This is the case where service_level sysfs attribute is set by PMP
+-          * we have to iterate from bit 2 to 23 to see the requested service states
+-          * the desription of the servel_level vector is mentioned just above this function */
+-         for(i = NETSS_SERVICE_ID_DOCSIS; i < NETSS_SERVICE_ID_MAX; i++) 
+-         {
+-            if(netss_request_for_service_level_change(i-1))
+-            {
+-               uint32_t level = NETSS_GET_SERVICE_POWER_LEVEL(i, service_level); 
+-               service_msg->service[j].id = i; 
+-               service_msg->service[j].state = level;
+-               if(level == NETSS_SERVICE_POWER_LEVEL_RESERVED)
+-               {
+-                  NETSS_PM_PRINT("ERROR service id %d  level should not be %d\n", i, NETSS_SERVICE_POWER_LEVEL_RESERVED);
+-               }
+-               if( IS_SERVICE_RESOURCE_TO_BE_CONTROLLED(i) && 
+-                   (level == NETSS_SERVICE_POWER_LEVEL_ON) )
+-               {
++      for(i = NETSS_SERVICE_ID_DOCSIS; i < NETSS_SERVICE_ID_MAX; i++) {
++         if(netss_request_for_service_level_change(i)) {
++            uint32_t level = NETSS_GET_SERVICE_POWER_LEVEL(i, service_level);
++            if(level == NETSS_SERVICE_POWER_LEVEL_RESERVED) {
++               NETSS_PM_PRINT("ERROR Cannot set service id %d to level %d\n", i, NETSS_SERVICE_POWER_LEVEL_RESERVED);
++            } else {
++               if( IS_SERVICE_RESOURCE_TO_BE_CONTROLLED(i) &&
++                   (level == NETSS_SERVICE_POWER_LEVEL_ON)) {
+                   netss_handle_resource_power_state(i, level);
+                }
+-                
++               service_msg->service[j].id = i;
++               service_msg->service[j].state = level;
+                j++;
+                msg_len += 2;
+-            } 
+-            else 
+-            {
+-               NETSS_PM_PRINT("Service id %d is not initialized, not including in the service request msg \n", i);
+             }
+          }
+       }
+-      
++
+       /*Null termination of the list */
+       if(msg_len % 4) {
+          service_msg->service[j].id = 0;
+          service_msg->service[j].state = 0;
+          msg_len += 2;
+-      } 
++      }
+       else
+       {
+          service_msg->service[j].id = 0;
+@@ -710,7 +676,7 @@ static int netss_send_service_request_ms
+       NETSS_PM_PRINT("service request:");
+       for(i=0; i<msg_len; i++)
+       {
+-         if(i%4 == 0) 
++         if(i%4 == 0)
+          {
+             NETSS_PM_PRINT("\n");
+          }
+@@ -719,11 +685,11 @@ static int netss_send_service_request_ms
+       NETSS_PM_PRINT("\n=======msg_len = %d ===================\n", msg_len);
+ 
+        ret = hwMbox_sendOpcode(HW_MBOX_MASTER_NP_CPU, 1, (uint8_t *)service_msg, msg_len, msg_len, &reply_len);
+-       if(ret) 
++       if(ret)
+        {
+           printk(KERN_ERR "Send Sevice Request message failed ret %d \n", ret);
+-       } 
+-       else 
++       }
++       else
+        {
+           g_netip_service_request_reply_pending =  true;
+           /**Power manager or PMP is making these requests */
+@@ -734,10 +700,10 @@ static int netss_send_service_request_ms
+                 if(service_msg->service[i].id != 0)
+                 {
+                    g_netip_services_change_requested |= (1 << (service_msg->service[i].id-1));
+-                }            
++                }
+              }
+-             
+-             if(g_timer_created) 
++
++             if(g_timer_created)
+              {
+                 /**Set the timeout  value 30 sec before getting replies for all the services */
+                 netss_pm_timer.expires = jiffies + msecs_to_jiffies(30000);
+@@ -749,63 +715,20 @@ static int netss_send_service_request_ms
+        /*Can free the message memory now */
+        kfree(service_msg);
+    }
+-   
+-   /**Add some debug message on success */   
+-   return ret;
+-}
+-
+-/**Function to send a single service message */
+-static int ness_send_single_service_request_msg(uint32_t service_id, uint32_t state)
+-{
+-   int ret = -1;
+-   uint32_t reply_len;
+-   netss_service_request_msg_t *service_msg = NULL;
+-   uint32_t service_msg_len;
+-   netss_sysfs_attributes_info_t *syfs_info = &g_netss_sysfs_attributes_info;
+-
+-   service_msg_len = sizeof(netss_service_request_msg_t)+(2*sizeof(netss_service_status_t));;
+-   /* Alloc memory for service request message */
+-   service_msg = kzalloc(service_msg_len, GFP_KERNEL);
+-   if(!service_msg) {
+-      printk(KERN_ERR "Could not allocate service request message\n");
+-   }
+-   else
+-   {
+-      service_msg->hdr.opcode = NETSS_OPCODE_SERVICE_REQUEST;
+-      service_msg->onBattery = g_onBattery;
+-      service_msg->netip_level = g_current_netip_power_state;
+ 
+-      service_msg->service[0].id = service_id;
+-      service_msg->service[0].state = state;
+-      
+-      service_msg->service[1].id = 0;
+-      service_msg->service[1].state = 0;
+-
+-      ret = hwMbox_sendOpcode(HW_MBOX_MASTER_NP_CPU, 1, (uint8_t *)service_msg, service_msg_len, service_msg_len, &reply_len);
+-      if(ret) {
+-         printk(KERN_ERR "Send Single Sevice Request message failed ret %d \n", ret);
+-      } else {
+-         /*Mark that reply is pending */
+-         g_netip_service_request_reply_pending = true;
+-         if(g_netss_boot_handshake_done) 
+-         {
+-            g_netip_services_change_requested |= (1 << (service_id-1));
+-         }
+-         
+-      }
+-
+-      /*Can free the message memory now */
+-      kfree(service_msg);
+-   }   
++   /**Add some debug message on success */
+    return ret;
+ }
++
+ static int netss_configure_and_setup_netip_services(void *data)
+ {
+    int count=0;
+    int sleep_count=0;
++
++   netss_pm_init_data();
+    while(1)
+    {
+-      if(0 == hwMbox_isReady()) 
++      if(0 == hwMbox_isReady())
+       {
+          /*HW Mailbox driver is ready register callbacks for netip pm messages */
+          /*Register netip properties message, update tag and token later */
+@@ -816,24 +739,23 @@ static int netss_configure_and_setup_net
+                                    netss_receive_netip_msg,
+                                    NETSS_MSG_TAG_SERVICE_REQ_RPLY, 0x1);
+ 
+-         NETSS_PM_PRINT("Slept for iterations %d msec %d\n", sleep_count, sleep_count*10); 
++         NETSS_PM_PRINT("Slept for iterations %d msec %d\n", sleep_count, sleep_count*10);
+          break;
+       }
+       msleep(10);
+       sleep_count++;
+-      
+    }
+-   init_timer(&netss_pm_timer);
+-   g_timer_created = true;
++
++   /** Within a minute atleast we should receive netip propertis msg */
+    netss_pm_timer.expires = jiffies + msecs_to_jiffies(60000);
+    netss_pm_timer.function = netss_pm_timeout_handler;
+-   /**Within a minute atleast we should receive netip propertis msg */
+    add_timer(&netss_pm_timer);
++
+    while(1)
+    {
+       /*Wait for netip messages */
+       wait_event_interruptible(waitForNetIPMsgWQ, ((g_netip_msg != NETIP_MSG_NONE) || ((kthread_should_stop()))));
+-      
++
+       mutex_lock(&pnetss_drv_data->netip_msg.lock);
+       if(kthread_should_stop()) {
+ 
+@@ -845,7 +767,7 @@ static int netss_configure_and_setup_net
+       /*Acquire sysfs lock */
+       mutex_lock(&g_netss_sysfs_attributes_info.lock);
+       if(pnetss_drv_data->netip_msg.type == NETSS_OPCODE_NETIP_PROPERTIES) {
+-         /*send reply*/ 
++         /*send reply*/
+          netss_send_reply_ack();
+          /*process netip properties message */
+          ness_process_netip_props_msg();
+@@ -856,7 +778,7 @@ static int netss_configure_and_setup_net
+             /**Within 30 seconds we should receive status message */
+             mod_timer(&netss_pm_timer, jiffies + msecs_to_jiffies(30000));
+          }
+-         
++
+       } else if(pnetss_drv_data->netip_msg.type == NETSS_OPCODE_SERVICE_STATUS) {
+          /*send reply*/
+          netss_send_reply_ack();
+@@ -879,24 +801,24 @@ static int netss_configure_and_setup_net
+          g_netip_service_request_reply_pending = false;
+ 
+          netss_update_sysfs_attributes(&g_netss_sysfs_attributes_info, (netss_service_request_msg_t*) &pnetss_drv_data->netip_msg.payload[0]);
+-         
++
+          /*Check if all the ready services are moved to initial power state */
+          if(g_netip_services_status_ready == g_netip_services_init_complete)
+          {
+             if(g_netss_boot_handshake_done == false)
+             {
+                /*Check if we have received status messages for all services */
+-               if(g_netip_services_status_received  == g_netip_services_available) 
++               if(g_netip_services_status_received  == g_netip_services_available)
+                {
+                   g_netss_boot_handshake_done = true;
+-                  
++
+                   printk("Dual boot handshake is done services available %08X init complete %08X\n", g_netip_services_available, g_netip_services_init_complete);
+ #ifdef CONFIG_PM_RUNTIME
+                   /**Increament the usage counter */
+                   /**Count is already one so dont increament */
+                   //pm_runtime_get_noresume(&pnetss_drv_data->dev->dev);
+ #endif
+-                  if(g_onBattery) 
++                  if(g_onBattery)
+                   {
+                      puma_netip_notify_state(1);
+                   }
+@@ -904,7 +826,7 @@ static int netss_configure_and_setup_net
+                   {
+                      puma_netip_notify_state(0);
+                   }
+-               }  
++               }
+                else
+                {
+                   NETSS_PM_PRINT("Status of all services not recvd Available %X status recvd %X\n", g_netip_services_status_received, g_netip_services_available);
+@@ -924,26 +846,25 @@ static int netss_configure_and_setup_net
+          netss_send_reply_ack();
+       }
+ 
+-     /*Done processing the message */ 
++     /*Done processing the message */
+       g_netip_msg = NETIP_MSG_NONE;
+       /*Release sysfs lock */
+       mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+       /*Release NetIP message lock */
+       mutex_unlock(&pnetss_drv_data->netip_msg.lock);
+-     
++
+       /*send service request message */
+    }
++   mutex_destroy(&g_netss_sysfs_attributes_info.lock);
+    return 0;
+ }
+ 
+-void netss_manage_netip_services(void) 
++void netss_manage_netip_services(void)
+ {
+-   pnetss_drv_data->handshake_thread = kthread_run(netss_configure_and_setup_netip_services, (void *)data, "netip_service_manager");
+-   
++   pnetss_drv_data->handshake_thread = kthread_run(netss_configure_and_setup_netip_services, NULL, "netip_service_manager");
+    if(!pnetss_drv_data->handshake_thread) {
+      printk(KERN_ERR "Failed to create netss boot hand shake thread\n");
+    }
+-
+    return;
+ }
+ 
+@@ -955,55 +876,80 @@ void netss_stop_handshake_thread(void)
+    return;
+ }
+ 
+-int netss_set_service_state(uint32_t service_id, uint32_t state)
++uint32_t netss_get_attribute(uint32_t attr_id, uint32_t service_id)
+ {
+-   mutex_lock(&g_netss_sysfs_attributes_info.lock);
+-
+-   if(g_netip_service_request_reply_pending ) {
+-      NETSS_PM_PRINT("Service Request Reply is pending, so cannot send another request\n");
+-      mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+-      return -1;
++   uint32_t value = 0, bit_offset = 0, service_id_mask = 0xFFFFFFFF;
++   if(service_id == 0) {
++      service_id_mask = 0xF;
++   } else if(service_id < NETSS_SERVICE_ID_MAX) {
++      bit_offset = (2 * (service_id + 1));
++      service_id_mask = NETSS_BIT_MASK_POWER_LEVEL << bit_offset;
+    }
+-   if(g_netss_boot_handshake_done) {
+-      /*send message to netip and update the value based on reply*/
+-      ness_send_single_service_request_msg(service_id, state);
+-   } else {
+-      //g_netss_sysfs_attributes_info.runtime_state[service_id] = state;
++   mutex_lock(&g_netss_sysfs_attributes_info.lock);
++   switch (attr_id)
++   {
++      case NETSS_SERVICE_LEVEL_ATTR:
++         value = (g_netss_sysfs_attributes_info.service_level & service_id_mask) >> bit_offset;
++      break;
++      case NETSS_SERVICE_STATE_ATTR:
++         value = (g_netss_sysfs_attributes_info.service_status & service_id_mask) >> bit_offset;
++      break;
++      case NETSS_SERVICE_READY_ATTR:
++         value = (g_netss_sysfs_attributes_info.service_ready & service_id_mask) >> bit_offset;
++      break;
++      case NETSS_ENABLE_DEBUG_ATTR:
++         value = g_netss_sysfs_attributes_info.enable_debug;
++      break;
++      default:
++         printk(KERN_ERR "Attempting to get an invalid attribute ID!\n");
+    }
+    mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+-   return 0;
++   return value;
+ }
+-EXPORT_SYMBOL(netss_set_service_state);
+-uint32_t netss_get_service_state(uint32_t service_id)
++
++int netss_set_attribute(uint32_t attr_id, uint32_t value, uint32_t service_id)
+ {
+-   uint32_t ret;
++   int ret = -EINVAL;
+    mutex_lock(&g_netss_sysfs_attributes_info.lock);
+-   //ret = g_netss_sysfs_attributes_info.runtime_state[service_id]; 
+-   ret = g_netss_sysfs_attributes_info.service_status; 
+-   mutex_unlock(&g_netss_sysfs_attributes_info.lock); 
++   // TODO: Implement logic to set the level to an individual service,
++   //       it may require to add another global variable (level_mask)
++   switch (attr_id)
++   {
++      case NETSS_SERVICE_LEVEL_ATTR:
++         ret = __netss_set_service_level(value);
++      break;
++      case NETSS_ENABLE_DEBUG_ATTR:
++         g_netss_sysfs_attributes_info.enable_debug = (value != 0);
++         ret = 0;
++      break;
++      default:
++         printk(KERN_ERR "Attempting to set an invalid attribute ID!\n");
++   }
++   mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+    return ret;
+ }
+-EXPORT_SYMBOL(netss_get_service_state);
+-
+ 
+ int __netss_set_service_level(uint32_t level)
+ {
+    int ret = -1;
+    netss_power_level_t new_state = level & NETSS_BIT_MASK_POWER_LEVEL;
+-  
++
+    /** Updated the global service level */
+    g_netss_sysfs_attributes_info.service_level = level;
+-   /*If Boot handshake is not done, just update the attribute and 
+-    *boot handshake thread will send the message */
+-   if(g_netss_boot_handshake_done && !g_netip_service_request_reply_pending) {
++   /** Service request reply is pending mark service request is pending
++       so this request will be sent after receiving all replies to the earlier request */
++   if(g_netip_service_request_reply_pending) {
++      NETSS_PM_PRINT("service level Request pending %X\n", level);
++      g_netip_service_level_request_pending = true;
++   } else if(g_netss_boot_handshake_done) {
+ 
+       /**NOTE: WHEN TO CALL PLATFORM API
+        * If new power state is greater old power state, call before making service request
+-       * Else if new power state  old power state, call after making service request 
++       * Else if new power state old power state, call after making service request
+        * ORDER OF THE POWER states FROM HIGHEST TO LOWEST
+        * |======================= ===================|
+        * |POWER LEVELS                  | ENUMERATION|
+-       * |===========================================| 
++       * |===========================================|
+        * |NETSS_POWER_LEVEL_ACTIVE      |     0      |
+        * |NETSS_POWER_LEVEL_RESERVED    |     1      |
+        * |NETSS_POWER_LEVEL_DISABLE     |     2      |
+@@ -1015,90 +961,65 @@ int __netss_set_service_level(uint32_t l
+          /**We are going to deep standby lowest power level */
+          ret = netss_send_service_request_msg(level);
+          /* This has to be done in the netss_update_sysfs_attributes after
+-          * receiving the reply for all the service requests 
++          * receiving the reply for all the service requests
+           * 1. Call the platform driver api
+           */
+       } else if(new_state == NETSS_POWER_LEVEL_ENABLE && g_current_netip_power_state == NETSS_POWER_LEVEL_DEEP_STANDBY) {
+          /*
+           * 1. Call the platform driver api
+           */
+-          puma_netip_notify_state(((level & NETSS_BIT_MASK_ON_BATTERY)? 1:0));
++         puma_netip_notify_state(((level & NETSS_BIT_MASK_ON_BATTERY)? 1:0));
+ #ifdef CONFIG_PM_RUNTIME
+          pm_runtime_get(&pnetss_drv_data->dev->dev);
+ #endif
+-         /* Runtime resume will be called and resume message will be sent, so update sysfs */
+-         g_netss_sysfs_attributes_info.service_level = level;
+       } else if(new_state > g_current_netip_power_state) {
+          /*Going to lower power state Ex: Active to BBU, Active to Standby
+           *BBU to standby */
+          ret = netss_send_service_request_msg(level);
+          /* This has to be done in the netss_update_sysfs_attributes after
+-          * receiving the reply for all the service requests 
++          * receiving the reply for all the service requests
+           * 1. Call the platform driver api
+           */
+       } else if(new_state < g_current_netip_power_state) {
+          /*Going to higher power state Ex: BBU to Active or Standby to Active */
+-         /* 
++         /*
+           * 1. Call the platform driver api
+           */
+           puma_netip_notify_state(((level & NETSS_BIT_MASK_ON_BATTERY)? 1:0));
+           ret = netss_send_service_request_msg(level);
+       } else {
+-         /*This is probably changing the individual services without changing netip level */
++         /* This is 'probably' changing the individual services without changing netip level */
+          ret = netss_send_service_request_msg(level);
+       }
+-   } else {
+-      /*Service request reply is pending mark service request is pending
+-       *so this request will be sent after receiving all replies to the earlier request */
+-      if(g_netip_service_request_reply_pending) 
+-      {
+-         NETSS_PM_PRINT("service level Request pending %X\n", level);
+-         g_netip_service_level_request_pending = true;
+-      }
+    }
+-   
+-   return ret;
+-}
+-int netss_set_service_level(uint32_t level)
+-{
+-   int ret = -1;
+-   mutex_lock(&g_netss_sysfs_attributes_info.lock);
+-   ret = __netss_set_service_level(level);
+-   mutex_unlock(&g_netss_sysfs_attributes_info.lock);
++
+    return ret;
+ }
+-EXPORT_SYMBOL(netss_set_service_level);
+-uint32_t netss_get_service_level(void)
+-{
+-   uint32_t ret;
+-   mutex_lock(&g_netss_sysfs_attributes_info.lock); 
+-   ret = g_netss_sysfs_attributes_info.service_level;
+-   mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+-   return ret; 
+-}
+-EXPORT_SYMBOL(netss_get_service_level);
+ 
+-/**Not locking using sysfs attributes lock
+- * user should write this when before running any test */
+-int netss_get_debug_level(void)
++int netss_turn_off_netip_clock(void)
+ {
+-   return g_enable_debug; 
+-}
+-EXPORT_SYMBOL(netss_get_debug_level);
+-void netss_set_debug_level(int debug_level)
+-{
+-   mutex_lock(&g_netss_sysfs_attributes_info.lock); 
+-   g_enable_debug = debug_level;
+-   mutex_unlock(&g_netss_sysfs_attributes_info.lock); 
++   netss_dev_info_t clk_ctrl_mmio;
++   int ret = 0;
++   if(netss_device_get_info(NETSS_DEV_CLK_CTRL, &clk_ctrl_mmio)) {
++      printk(KERN_ALERT "Couldn't get clock Ctrl MMIO info!\n");
++      ret = -1;
++   } else {
++      void __iomem *clk_ctrl_base = (void __iomem *)ioremap_nocache(clk_ctrl_mmio.base, clk_ctrl_mmio.size);
++      uint32_t reg_val = __raw_readl(clk_ctrl_base + CLK_CTRL_CRU0_OFFSET);
++      reg_val &= ~(0x3);
++      __raw_writel(reg_val, clk_ctrl_base + CLK_CTRL_CRU0_OFFSET);
++      iounmap(clk_ctrl_base);
++   }
++   return ret;
+ }
+-EXPORT_SYMBOL(netss_set_debug_level);
+ 
+ int netss_runtime_suspend(struct device *dev)
+ {
+    int i=0;
+    uint32_t level;
+    struct pci_dev *pdev = to_pci_dev(dev);
+-   struct net_subsystem_drv_data *pnetss_drv_data = pci_get_drvdata(pdev);
++
++   //struct net_subsystem_drv_data *pnetss_drv_data = pci_get_drvdata(pdev);
+ 
+    mutex_lock(&g_netss_sysfs_attributes_info.lock);
+    NETSS_PM_PRINT("NETSS SUSPEND CALLED\n");
+@@ -1117,12 +1038,12 @@ int netss_runtime_suspend(struct device
+          printk(KERN_ERR "Service id %d is not in disable state, current state is %d\n", i, level);
+       }
+    }
+-   /*
+-    *1. Call the platform driver api 
+-    */
+-    puma_netip_notify_state(3);
+-    /*Resume will be like a fresh boot for NETIP, which involues netip properties, configure messages */
+-    g_netss_boot_handshake_done = false;
++   /** 1. Call the platform driver API */
++   puma_netip_notify_state(3);
++   /** 2. Turn off NetIP clock */
++   netss_turn_off_netip_clock();
++   /** Resume will be like a fresh boot for NETIP, which involues netip properties, configure messages */
++   g_netss_boot_handshake_done = false;
+ 
+    mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+    return 0;
+@@ -1132,10 +1053,10 @@ int netss_runtime_resume(struct device *
+ {
+    struct pci_dev *pdev = to_pci_dev(dev);
+    uint32_t level;
+-  
++
+    mutex_lock(&g_netss_sysfs_attributes_info.lock);
+-   level = g_netss_sysfs_attributes_info.service_level; 
+-   netss_send_service_request_msg(level); 
++   level = g_netss_sysfs_attributes_info.service_level;
++   netss_send_service_request_msg(level);
+    mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+    return 0;
+ }
+@@ -1143,7 +1064,6 @@ int netss_runtime_resume(struct device *
+ int netss_runtime_idle(struct device *dev)
+ {
+    struct pci_dev *pdev = to_pci_dev(dev);
+-
+    return 0;
+ }
+ 
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_pm.h
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_pm.h
+@@ -3,7 +3,7 @@
+  *
+  *  GPL LICENSE SUMMARY
+  *
+- *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *  Copyright(c) 2015-2016 Intel Corporation. All rights reserved.
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of version 2 of the GNU General Public License as
+@@ -75,7 +75,7 @@ typedef enum netss_level_state
+ typedef enum netss_service_power_level_state 
+ {
+    NETSS_SERVICE_POWER_LEVEL_ON = 0,
+-   NETSS_SERVICE_POWER_LEVEL_LOW = 2,
++   NETSS_SERVICE_POWER_LEVEL_LOW = 1,
+    NETSS_SERVICE_POWER_LEVEL_RESERVED = 2,
+    NETSS_SERVICE_POWER_LEVEL_OFF = 3,
+ }netss_service_power_level_t;
+@@ -87,21 +87,10 @@ typedef enum netss_service_status_type
+    NETSS_SERVICE_STATUS_INITIALIZED
+ }netss_service_status_type_t;
+ 
+-typedef struct netss_sysfs_attributes_info {
+-   uint32_t service_level;        /**sysfs attrivute. it is a vector that represents the netip and its services power states  
+-                                   * It is Write only to user space */
+-   uint32_t service_status;       /**sysfs attrivute. it is a vector that represents the netip and its services power states 
+-                                   * It is Read Only for user space. This gets updated after the service request reply is received. */
+-   uint32_t runtime_state[13];    /**sysfs attibute, for configuring individual service power states */
+-   struct mutex lock;            /**to synchronise between the thread that is writing to service_level and thread that is sending message
+-                                  * This lock may be needed only during boot time. */
+-} netss_sysfs_attributes_info_t;
+-
+ typedef struct netss_msg_info {
+    uint32_t type;         /**Netip properties or service status msg */
+    uint32_t len;          /**Payload length */
+    uint8_t payload[64];   /**Payload */
+-   
+    struct mutex lock; 
+ } netss_msg_info_t;
+ 
+@@ -137,6 +126,4 @@ typedef struct netss_service_request_msg
+    netss_service_status_t service[0];
+ }netss_service_request_msg_t;
+ 
+-
+ #endif
+-
+--- /dev/null
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_sysfs.c
+@@ -0,0 +1,472 @@
++/*  netip_subsystem_sysfs.c: 
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/netdevice.h>
++#include <linux/init.h>
++#include <linux/rtnetlink.h>
++#include <linux/string.h>
++#include <linux/netip_subsystem.h>
++#include "netip_subsystem_sysfs.h"
++
++static int netssdev_dummy_init(struct net_device *dev)
++{
++   return 0;
++}
++
++static void netssdev_dummy_uninit(struct net_device *dev)
++{
++   return;
++}
++
++static const struct net_device_ops dummy_netdev_ops = {
++   .ndo_init   = netssdev_dummy_init,
++   .ndo_uninit = netssdev_dummy_uninit,
++};
++
++static void dummy_setup(struct net_device *dev)
++{
++   /* Initialize the device structure. */
++   dev->netdev_ops = &dummy_netdev_ops;
++   dev->destructor = free_netdev;
++}
++
++struct netss_dev_priv_data_t {
++   netss_service_id_t service_id;
++};
++
++extern const char power_group_name[];
++
++static struct net_device *g_netssdevs[NETSS_SERVICES_MAX];
++
++static ssize_t service_show(struct device * dev, struct device_attribute *attr, char *buf)
++{
++   uint32_t attribute_value = 0;
++   if(strncmp(attr->attr.name, "service_level", 13) == 0)
++   {
++      attribute_value = netss_get_attribute(NETSS_SERVICE_LEVEL_ATTR, NETSS_SERVICE_ID_MAX);
++   }
++   else if(strncmp(attr->attr.name, "service_status", 14) == 0)
++   {
++      attribute_value = netss_get_attribute(NETSS_SERVICE_STATE_ATTR, NETSS_SERVICE_ID_MAX);
++   }
++   else if(strncmp(attr->attr.name, "service_available", 17) == 0)
++   {
++      attribute_value = netss_get_attribute(NETSS_SERVICE_READY_ATTR, NETSS_SERVICE_ID_MAX);
++   }
++   else
++   {
++      attribute_value = netss_get_attribute(NETSS_ENABLE_DEBUG_ATTR, 0);
++   }
++   return sprintf(buf, "0x%08X\n", (unsigned int)attribute_value);
++}
++
++static ssize_t service_store(struct device * dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++   uint32_t attribute_value = simple_strtoul(buf, NULL, 0);
++   if(strncmp(attr->attr.name, "service_level", 13) == 0)
++   {
++      attribute_value = netss_set_attribute(NETSS_SERVICE_LEVEL_ATTR, attribute_value, NETSS_SERVICE_ID_MAX);
++   }
++  else
++   {
++      attribute_value = netss_set_attribute(NETSS_ENABLE_DEBUG_ATTR, attribute_value, 0);
++   }
++   return count;
++}
++
++//static DEVICE_ATTR(runtime_state, 0644, runtime_state_show, runtime_state_store);
++static DEVICE_ATTR(service_level, S_IWUSR, NULL, service_store);
++static DEVICE_ATTR(service_status, S_IRUGO, service_show, NULL);
++static DEVICE_ATTR(service_available, S_IRUGO, service_show, NULL);
++static DEVICE_ATTR(enable_debug,  S_IRUGO | S_IWUSR, service_show, service_store);
++
++char * get_netss_service_name(int i)
++{
++   switch(i) 
++   {
++      case NETIP_SUBSYSTEM:
++         return "netip_subsystem";
++      case NETSS_SERVICE_ID_DOCSIS:
++         return "docsis";
++      case NETSS_SERVICE_ID_SPECTRAL_ANALYSIS:
++         return "spectraAnalysis";
++      case NETSS_SERVICE_ID_VIDEO:
++         return "video";
++      case NETSS_SERVICE_ID_VOICE:
++         return "voice"; 
++      case NETSS_SERVICE_ID_MOCA:
++         return "moca";
++      case NETSS_SERVICE_ID_BBU:
++         return "bbu";
++      case NETSS_SERVICE_ID_WIFI:
++         return "wifi";
++      case NETSS_SERVICE_ID_EXSW:
++         return "exSw";
++      case NETSS_SERVICE_ID_SGMII0:
++         return "sgmii0";
++      case NETSS_SERVICE_ID_SGMII1:
++         return "sgmii1";
++      case NETSS_SERVICE_ID_RGMII2:
++         return "rgmii2";
++      case NETSS_SERVICE_ID_RGMII3:
++         return "rgmii3";
++      default:
++	return "";
++   }
++}
++
++static int __init netss_sysfs_create_netip_attributes(void)
++{
++   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
++   int ret;
++
++   g_netssdevs[0] = alloc_netdev(sizeof(struct netss_dev_priv_data_t), get_netss_service_name(0), dummy_setup);
++
++   if(!g_netssdevs[0])
++   {
++      ret = -ENOMEM;
++   }
++   else
++   {
++      pnetss_dev_priv_data = netdev_priv(g_netssdevs[0]);
++      pnetss_dev_priv_data->service_id = 0;
++   
++      ret = register_netdevice(g_netssdevs[0]);
++      if (ret < 0) 
++      {
++         free_netdev(g_netssdevs[0]);
++      }
++      else
++      {
++         ret = device_create_file(&g_netssdevs[0]->dev, &dev_attr_service_level);
++         if(ret < 0)
++         {
++            printk("NetIP subsystem service_level sysfs could not be created\n");
++         }
++         else if (0 > (ret = device_create_file(&g_netssdevs[0]->dev, &dev_attr_service_status)))
++         {
++            printk("NetIP subsystem service_status sysfs could not be created\n");
++         }
++         else if( 0 > (ret = device_create_file(&g_netssdevs[0]->dev, &dev_attr_service_available)))
++         {
++            printk("NetIP subsystem service_available sysfs could not be created\n");
++         } 
++         else if( 0 > (ret = device_create_file(&g_netssdevs[0]->dev, &dev_attr_enable_debug)))
++         {
++            printk("NetIP subsystem enable_debug sysfs could not be created\n");
++         } 
++      }
++   
++   }
++   return ret;
++}
++
++static int __init netss_sysfs_init_module(void)
++{
++   int i, err = 0;
++   for(i=0; i<NETSS_SERVICES_MAX; i++)
++   {
++      g_netssdevs[i] = NULL;
++   }
++   rtnl_lock();
++   err = netss_sysfs_create_netip_attributes();
++   rtnl_unlock();
++ 
++   return err;
++}
++
++static void __exit netss_sysfs_cleanup_module(void)
++{
++   int i;
++   for(i=0; i<NETSS_SERVICES_MAX; i++)
++   {
++      if(g_netssdevs[i] != NULL) {
++         unregister_netdevice(g_netssdevs[i]);
++         free_netdev(g_netssdevs[i]);
++         g_netssdevs[i] = NULL;
++     }
++   }
++}
++void netss_sysfs_clean_up(uint32_t available_services)
++{
++   int i = 1;
++   for(i=0; i<NETSS_SERVICES_MAX; i++)
++   {
++     if(!(available_services & (1 << i))) {
++        if(g_netssdevs[i] != NULL) {
++           unregister_netdevice(g_netssdevs[i]);
++           free_netdev(g_netssdevs[i]);
++           g_netssdevs[i] = NULL;
++        }
++     }
++   }
++
++   return;
++}
++EXPORT_SYMBOL(netss_sysfs_clean_up);
++
++module_init(netss_sysfs_init_module);
++module_exit(netss_sysfs_cleanup_module);
++MODULE_DESCRIPTION("Intel(R) NET SUBSYSTEM sysfs Driver");
++MODULE_AUTHOR("Intel Corporation");
++MODULE_LICENSE("GPL");
++
++#if 0
++static char * convert_level_to_string_and_show(netss_service_id_t id, uint32_t state)
++{
++   char *ret = NULL;
++   if(id == NETIP_SUBSYSTEM) 
++   {
++      switch(state)
++      {
++         case 0:
++            ret = "Active";
++            break;
++         case 1:
++            ret = "bbu";
++            break;
++         case 2:
++            ret = "standby";
++            break;
++         case 3:
++            ret = "off";
++            break;
++         default:
++            break;
++      }
++   }
++   else
++   {
++      switch(state)
++      {
++         case 0:
++            ret = "enabled";
++            break;
++         case 1:
++            ret = "low";
++            break;
++         case 2:
++            ret = "initialized";
++            break;
++         case 3:
++            ret = "disabled";
++            break;
++         case 4:
++            if(id != NETIP_SUBSYSTEM) {
++               ret = "unusable";
++            }
++            break;
++         default:
++            break;
++      }
++
++   }
++   return ret;
++}
++
++static ssize_t runtime_state_show(struct device * dev, struct device_attribute *attr, char *buf)
++{
++   struct net_device * pnetssdev;
++   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
++   char * string_state = NULL;
++   uint32_t state;
++   pnetssdev = to_net_dev(dev);
++   pnetss_dev_priv_data = netdev_priv(pnetssdev);
++   state = netss_get_service_state(pnetss_dev_priv_data->service_id); 
++   string_state = convert_level_to_string_and_show(pnetss_dev_priv_data->service_id, state);
++   if( string_state != NULL) {
++      strcpy(buf, string_state);
++      printk("showing runtime state of service id = %d current state %s\n", pnetss_dev_priv_data->service_id, string_state);
++      return strlen(string_state);
++   }
++   return 0;
++}
++
++static int convert_level_to_int_and_store(const char *buf, netss_service_id_t id)
++{
++   int ret = -1, i;
++#if 0
++   char active[] = "active";
++   char low[] = "low";
++   char disable[] = "disable";
++     
++   for(i=0; i<strlen(active);i++)
++   {
++     if(buf[i] != active[i]) {
++        ret = -1;
++        break;
++     } else {
++       ret = 0;
++     }
++   }
++
++   if(ret == 0) return 0;
++
++   for(i=0; i<strlen(low);i++)
++   {
++     if(buf[i] != low[i]) {
++        ret = -1;
++        break;
++     } else {
++       ret = 0;
++     }
++   }
++
++   if(ret == 0) {
++    if(id == NETIP_SUBSYSTEM) return 2;
++    return 1;
++   }
++
++   for(i=0; i<strlen(disable);i++)
++   {
++     if(buf[i] != disable[i]) {
++        ret = -1;
++        break;
++     } else {
++       ret = 0;
++     }
++   }
++
++   if(ret == 0) return 3;
++
++   printk("cmp4 -1 ret = %d len1 %d len2 %d\n", ret, strlen(buf), strlen(disable));
++#endif
++
++   if(id == NETIP_SUBSYSTEM)
++   {
++      if((strncmp(buf, "active", 6)) == 0) {
++         printk("buf is active\n");
++         ret = 0;
++      } else if (((strncmp(buf, "bbu", 3)) == 0)){
++         printk("buf is bbu\n");
++         ret = 1;
++      } else if ((strncmp(buf, "standby", 7)) == 0) {
++         printk("buf is disable\n");
++         ret = 2;
++      } else if ((strncmp(buf, "off", 3)) == 0) {
++         printk("buf is disable\n");
++         ret = 3;
++      }
++   }
++   else
++   {
++      if((strncmp(buf, "active", 6)) == 0) {
++         printk("buf is active\n");
++         ret = 0;
++      } else if (((strncmp(buf, "low", 3)) == 0) || ((strncmp(buf, "1x1", 3)) == 0)) {
++         printk("buf is low or 1x1\n");
++         ret = 1;
++      } else if ((strncmp(buf, "disable", 7)) == 0) {
++         printk("buf is disable\n");
++         ret = 3;
++      }
++
++   }
++   return ret;
++}
++
++static ssize_t runtime_state_store(struct device * dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++   struct net_device * pnetssdev;
++   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
++   int requested_state = -1;
++   pnetssdev = to_net_dev(dev);
++   pnetss_dev_priv_data = netdev_priv(pnetssdev);
++
++   requested_state = convert_level_to_int_and_store(buf,pnetss_dev_priv_data->service_id); 
++   if(requested_state > -1) {
++      /*call netss api to send mesage and update attribute value*/
++      netss_set_service_state(pnetss_dev_priv_data->service_id, requested_state);
++   }
++   printk("Writing to runtime_state of service id %d buf %s val %d \n", pnetss_dev_priv_data->service_id, buf, requested_state);
++   /*Return count on success otherwise return zero */
++   return count;
++}
++
++static int __init netss_sysfs_create_netip_attributes(void)
++{
++   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
++
++   int i,j, ret;
++
++   for(i=0; i < NETSS_SERVICES_MAX; i++) 
++   {
++      if(i==BBU) {
++         continue;
++      }
++      g_netssdevs[i] = alloc_netdev(sizeof(struct netss_dev_priv_data_t), get_netss_service_name(i), dummy_setup);
++      if (!g_netssdevs[i]) {
++         ret = -ENOMEM;
++         goto free_netdevs;
++      }
++   }
++
++   for(i=0; i < NETSS_SERVICES_MAX; i++)
++   {
++      if(i==BBU) {
++         continue;
++      }
++      pnetss_dev_priv_data = netdev_priv(g_netssdevs[i]);
++      pnetss_dev_priv_data->service_id = i;
++      ret = register_netdevice(g_netssdevs[i]);
++      if (ret < 0) {
++         goto unregister_netdevs;
++      }
++
++      if(i == NETIP_SUBSYSTEM) {
++         sysfs_add_file_to_group(&g_netssdevs[i]->dev.kobj, &dev_attr_service_level, power_group_name);
++      }
++      sysfs_add_file_to_group(&g_netssdevs[i]->dev.kobj, &dev_attr_runtime_state, power_group_name);
++   }
++   return 0;
++unregister_netdevs:
++   for(j=i-1; j>=0; j--)
++   {
++      if(g_netssdevs[j] != NULL) {
++         unregister_netdevice(g_netssdevs[j]);
++      }
++   }
++   for(j=0; j<NETSS_SERVICES_MAX; j++)
++   {
++      if(g_netssdevs[j] != NULL) {
++         free_netdev(g_netssdevs[j]);
++      }
++   }
++   return ret;
++free_netdevs:
++   for(j=i-1; j<=0; j--)
++   {
++      if(g_netssdevs[j] != NULL) {
++         free_netdev(g_netssdevs[j]);
++      }
++   }
++   return ret;
++}
++
++#endif
+--- /dev/null
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_sysfs.h
+@@ -0,0 +1,59 @@
++/*
++ * netip_subsystem_pm.h
++ *
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++#ifndef _NETIP_SUBSYSTEM_SYSFS_H
++#define _NETIP_SUBSYSTEM_SYSFS_H
++
++/** Attributes ID */
++typedef enum
++{
++   NETSS_SERVICE_LEVEL_ATTR,
++   NETSS_SERVICE_STATE_ATTR,
++   NETSS_SERVICE_READY_ATTR,
++   NETSS_ENABLE_DEBUG_ATTR
++} netss_attribute_id_t;
++
++/** Attributes structure */
++typedef struct netss_sysfs_attributes_info {
++   uint32_t service_level;    /** Vector representing the requested NetIP and its services power states.
++                                  This is write-only from user space. */
++   uint32_t service_status;   /** Vector representing the current NetIP and its services power states
++                                  This is updated after the service request reply is received.
++                                  This is read-only from user space. */
++   uint32_t service_ready;    /** Vector that represents the ready NetIP services.
++                                  This is updated during boot time, while handshake is done between cores
++                                  This is read-only from user space. */
++   bool enable_debug;         /** Flag to indicate whether to enable or disable the debug prints */
++   struct mutex lock;         /** to synchronise between the thread that is writing to service_level and thread that is sending message
++                                  This lock may be needed only during boot time. */
++} netss_sysfs_attributes_info_t;
++
++uint32_t netss_get_attribute(uint32_t attr_id, uint32_t service_id);
++int netss_set_attribute(uint32_t attr_id, uint32_t value, uint32_t service_id);
++
++#endif
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -73,5 +73,3 @@ obj-$(CONFIG_USB_CDC_PHONET)   += usb/
+ 
+ obj-$(CONFIG_HYPERV_NET) += hyperv/
+ obj-$(CONFIG_NTB_NETDEV) += ntb_netdev.o
+-obj-$(CONFIG_NET_SUBSYSTEM) += NetIP_Subsystem_sysfs/
+-
+--- a/drivers/net/NetIP_Subsystem_sysfs/Makefile
++++ /dev/null
+@@ -1,7 +0,0 @@
+-#
+-# Makefile for creating dummy net devices for CE2700's NetIP subsystem
+-#
+-
+-obj-$(CONFIG_NET_SUBSYSTEM) += netip_subsystem_sysfs.o
+-
+-
+--- a/drivers/net/NetIP_Subsystem_sysfs/netip_subsystem_sysfs.c
++++ /dev/null
+@@ -1,474 +0,0 @@
+-/*  netip_subsystem_sysfs.c: 
+- *  GPL LICENSE SUMMARY
+- *
+- *  Copyright(c) 2015 Intel Corporation. All rights reserved.
+- *
+- *  This program is free software; you can redistribute it and/or modify
+- *  it under the terms of version 2 of the GNU General Public License as
+- *  published by the Free Software Foundation.
+- *
+- *  This program is distributed in the hope that it will be useful, but
+- *  WITHOUT ANY WARRANTY; without even the implied warranty of
+- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- *  General Public License for more details.
+- *
+- *  You should have received a copy of the GNU General Public License
+- *  along with this program; if not, write to the Free Software
+- *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+- *  The full GNU General Public License is included in this distribution
+- *  in the file called LICENSE.GPL.
+- *
+- *  Contact Information:
+- *    Intel Corporation
+- *    2200 Mission College Blvd.
+- *    Santa Clara, CA  97052
+- *
+- */
+-
+-#include <linux/module.h>
+-#include <linux/kernel.h>
+-#include <linux/netdevice.h>
+-#include <linux/init.h>
+-#include <linux/rtnetlink.h>
+-#include <linux/string.h>
+-#include <linux/netip_subsystem.h>
+-
+-static int netssdev_dummy_init(struct net_device *dev)
+-{
+-   return 0;
+-}
+-
+-static void netssdev_dummy_uninit(struct net_device *dev)
+-{
+-   return;
+-}
+-
+-static const struct net_device_ops dummy_netdev_ops = {
+-   .ndo_init   = netssdev_dummy_init,
+-   .ndo_uninit = netssdev_dummy_uninit,
+-};
+-
+-static void dummy_setup(struct net_device *dev)
+-{
+-   /* Initialize the device structure. */
+-   dev->netdev_ops = &dummy_netdev_ops;
+-   dev->destructor = free_netdev;
+-}
+-
+-struct netss_dev_priv_data_t {
+-  netss_service_id_t service_id;
+-};
+-static struct net_device *g_netssdevs[NETSS_SERVICES_MAX];
+-extern const char power_group_name[];
+-extern uint32_t netss_get_service_state(uint32_t service_id);
+-extern int netss_set_service_state(uint32_t service_id, uint32_t state);
+-
+-extern int netss_get_debug_level(void);
+-extern void netss_set_debug_level(int debug_level);
+-
+-extern uint32_t netss_get_service_level(void);
+-extern int netss_set_service_level(uint32_t level);
+-
+-static ssize_t enable_debug_show(struct device * dev, struct device_attribute *attr, char *buf)
+-{
+-   return sprintf(buf, "%d\n", netss_get_debug_level());
+-}
+-
+-static ssize_t enable_debug_store(struct device * dev, struct device_attribute *attr, const char *buf, size_t count)
+-{
+-   int ret;
+-   int debug_level = 0;
+-   ret = kstrtoint(buf, 10, &debug_level);
+-   
+-   netss_set_debug_level(debug_level);
+-   //printk("Writing to service level ret  %d val = %x\n", ret, service_level);
+-   return count;
+-}
+-static ssize_t service_level_show(struct device * dev, struct device_attribute *attr, char *buf)
+-{
+-   uint32_t service_level;
+-   if(strncmp(attr->attr.name, "service_level", 13) == 0)
+-   {
+-      service_level = netss_get_service_level();
+-   }
+-   else
+-   {
+-      service_level = netss_get_service_state(0);
+-   }
+-   return sprintf(buf, "0x%08X\n", (unsigned int)service_level);;
+-}
+-
+-static ssize_t service_level_store(struct device * dev, struct device_attribute *attr, const char *buf, size_t count)
+-{
+-   int ret;
+-   uint32_t service_level;
+-   ret = kstrtou32(buf,16,&service_level );
+-
+-   netss_set_service_level(service_level);
+-   //printk("Writing to service level ret  %d val = %x\n", ret, service_level);
+-   return count;
+-}
+-//static DEVICE_ATTR(runtime_state, 0644, runtime_state_show, runtime_state_store);
+-static DEVICE_ATTR(enable_debug, 0644, enable_debug_show, enable_debug_store);
+-static DEVICE_ATTR(service_level, 0644, service_level_show, service_level_store);
+-static DEVICE_ATTR(service_status, 0444, service_level_show, service_level_store);
+-
+-char * get_netss_service_name(int i)
+-{
+-   switch(i) 
+-   {
+-      case NETIP_SUBSYSTEM:
+-         return "netip_subsystem";
+-      case NETSS_SERVICE_ID_DOCSIS:
+-         return "docsis";
+-      case NETSS_SERVICE_ID_SPECTRAL_ANALYSIS:
+-         return "spectraAnalysis";
+-      case NETSS_SERVICE_ID_VIDEO:
+-         return "video";
+-      case NETSS_SERVICE_ID_VOICE:
+-         return "voice"; 
+-      case NETSS_SERVICE_ID_MOCA:
+-         return "moca";
+-      case NETSS_SERVICE_ID_BBU:
+-         return "bbu";
+-      case NETSS_SERVICE_ID_WIFI:
+-         return "wifi";
+-      case NETSS_SERVICE_ID_EXSW:
+-         return "exSw";
+-      case NETSS_SERVICE_ID_SGMII0:
+-         return "sgmii0";
+-      case NETSS_SERVICE_ID_SGMII1:
+-         return "sgmii1";
+-      case NETSS_SERVICE_ID_RGMII2:
+-         return "rgmii2";
+-      case NETSS_SERVICE_ID_RGMII3:
+-         return "rgmii3";
+-      default:
+-	return "";
+-   }
+-}
+-
+-static int __init netss_sysfs_create_netip_attributes(void)
+-{
+-   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
+-   int ret;
+-
+-   g_netssdevs[0] = alloc_netdev(sizeof(struct netss_dev_priv_data_t), get_netss_service_name(0), dummy_setup);
+-
+-   if(!g_netssdevs[0])
+-   {
+-      ret = -ENOMEM;
+-   }
+-   else
+-   {
+-      pnetss_dev_priv_data = netdev_priv(g_netssdevs[0]);
+-      pnetss_dev_priv_data->service_id = 0;
+-   
+-      ret = register_netdevice(g_netssdevs[0]);
+-      if (ret < 0) 
+-      {
+-         free_netdev(g_netssdevs[0]);
+-      }
+-      else
+-      {
+-         ret = device_create_file(&g_netssdevs[0]->dev, &dev_attr_service_level);
+-         if(ret < 0)
+-         {
+-            printk("NetIP subsystem service_level sysfs could not be created\n");
+-         }
+-         else if (0 > (ret = device_create_file(&g_netssdevs[0]->dev, &dev_attr_service_status)))
+-         {
+-            printk("NetIP subsystem service_status sysfs could not be created\n");
+-         } 
+-         else if( 0 > (ret = device_create_file(&g_netssdevs[0]->dev, &dev_attr_enable_debug)))
+-         {
+-            printk("NetIP subsystem enable_debug sysfs could not be created\n");
+-         } 
+-      }
+-   
+-   }
+-   return ret;
+-}
+-
+-static int __init netss_sysfs_init_module(void)
+-{
+-   int i, err = 0;
+-   for(i=0; i<NETSS_SERVICES_MAX; i++)
+-   {
+-      g_netssdevs[i] = NULL;
+-   }
+-   rtnl_lock();
+-   err = netss_sysfs_create_netip_attributes();
+-   rtnl_unlock();
+- 
+-   return err;
+-}
+-
+-static void __exit netss_sysfs_cleanup_module(void)
+-{
+-   int i;
+-   for(i=0; i<NETSS_SERVICES_MAX; i++)
+-   {
+-      if(g_netssdevs[i] != NULL) {
+-         unregister_netdevice(g_netssdevs[i]);
+-         free_netdev(g_netssdevs[i]);
+-         g_netssdevs[i] = NULL;
+-     }
+-   }
+-}
+-void netss_sysfs_clean_up(uint32_t available_services)
+-{
+-   int i = 1;
+-   for(i=0; i<NETSS_SERVICES_MAX; i++)
+-   {
+-     if(!(available_services & (1 << i))) {
+-        if(g_netssdevs[i] != NULL) {
+-           unregister_netdevice(g_netssdevs[i]);
+-           free_netdev(g_netssdevs[i]);
+-           g_netssdevs[i] = NULL;
+-        }
+-     }
+-   }
+-
+-   return;
+-}
+-EXPORT_SYMBOL(netss_sysfs_clean_up);
+-
+-module_init(netss_sysfs_init_module);
+-module_exit(netss_sysfs_cleanup_module);
+-MODULE_DESCRIPTION("Intel(R) NET SUBSYSTEM sysfs Driver");
+-MODULE_AUTHOR("Intel Corporation");
+-MODULE_LICENSE("GPL");
+-#if 0
+-static char * convert_level_to_string_and_show(netss_service_id_t id, uint32_t state)
+-{
+-   char *ret = NULL;
+-   if(id == NETIP_SUBSYSTEM) 
+-   {
+-      switch(state)
+-      {
+-         case 0:
+-            ret = "Active";
+-            break;
+-         case 1:
+-            ret = "bbu";
+-            break;
+-         case 2:
+-            ret = "standby";
+-            break;
+-         case 3:
+-            ret = "off";
+-            break;
+-         default:
+-            break;
+-      }
+-   }
+-   else
+-   {
+-      switch(state)
+-      {
+-         case 0:
+-            ret = "enabled";
+-            break;
+-         case 1:
+-            ret = "low";
+-            break;
+-         case 2:
+-            ret = "initialized";
+-            break;
+-         case 3:
+-            ret = "disabled";
+-            break;
+-         case 4:
+-            if(id != NETIP_SUBSYSTEM) {
+-               ret = "unusable";
+-            }
+-            break;
+-         default:
+-            break;
+-      }
+-
+-   }
+-   return ret;
+-}
+-
+-static ssize_t runtime_state_show(struct device * dev, struct device_attribute *attr, char *buf)
+-{
+-   struct net_device * pnetssdev;
+-   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
+-   char * string_state = NULL;
+-   uint32_t state;
+-   pnetssdev = to_net_dev(dev);
+-   pnetss_dev_priv_data = netdev_priv(pnetssdev);
+-   state = netss_get_service_state(pnetss_dev_priv_data->service_id); 
+-   string_state = convert_level_to_string_and_show(pnetss_dev_priv_data->service_id, state);
+-   if( string_state != NULL) {
+-      strcpy(buf, string_state);
+-      printk("showing runtime state of service id = %d current state %s\n", pnetss_dev_priv_data->service_id, string_state);
+-      return strlen(string_state);
+-   }
+-   return 0;
+-}
+-
+-static int convert_level_to_int_and_store(const char *buf, netss_service_id_t id)
+-{
+-   int ret = -1, i;
+-#if 0
+-   char active[] = "active";
+-   char low[] = "low";
+-   char disable[] = "disable";
+-     
+-   for(i=0; i<strlen(active);i++)
+-   {
+-     if(buf[i] != active[i]) {
+-        ret = -1;
+-        break;
+-     } else {
+-       ret = 0;
+-     }
+-   }
+-
+-   if(ret == 0) return 0;
+-
+-   for(i=0; i<strlen(low);i++)
+-   {
+-     if(buf[i] != low[i]) {
+-        ret = -1;
+-        break;
+-     } else {
+-       ret = 0;
+-     }
+-   }
+-
+-   if(ret == 0) {
+-    if(id == NETIP_SUBSYSTEM) return 2;
+-    return 1;
+-   }
+-
+-   for(i=0; i<strlen(disable);i++)
+-   {
+-     if(buf[i] != disable[i]) {
+-        ret = -1;
+-        break;
+-     } else {
+-       ret = 0;
+-     }
+-   }
+-
+-   if(ret == 0) return 3;
+-
+-   printk("cmp4 -1 ret = %d len1 %d len2 %d\n", ret, strlen(buf), strlen(disable));
+-#endif
+-
+-   if(id == NETIP_SUBSYSTEM)
+-   {
+-      if((strncmp(buf, "active", 6)) == 0) {
+-         printk("buf is active\n");
+-         ret = 0;
+-      } else if (((strncmp(buf, "bbu", 3)) == 0)){
+-         printk("buf is bbu\n");
+-         ret = 1;
+-      } else if ((strncmp(buf, "standby", 7)) == 0) {
+-         printk("buf is disable\n");
+-         ret = 2;
+-      } else if ((strncmp(buf, "off", 3)) == 0) {
+-         printk("buf is disable\n");
+-         ret = 3;
+-      }
+-   }
+-   else
+-   {
+-      if((strncmp(buf, "active", 6)) == 0) {
+-         printk("buf is active\n");
+-         ret = 0;
+-      } else if (((strncmp(buf, "low", 3)) == 0) || ((strncmp(buf, "1x1", 3)) == 0)) {
+-         printk("buf is low or 1x1\n");
+-         ret = 1;
+-      } else if ((strncmp(buf, "disable", 7)) == 0) {
+-         printk("buf is disable\n");
+-         ret = 3;
+-      }
+-
+-   }
+-   return ret;
+-}
+-
+-static ssize_t runtime_state_store(struct device * dev, struct device_attribute *attr, const char *buf, size_t count)
+-{
+-   struct net_device * pnetssdev;
+-   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
+-   int requested_state = -1;
+-   pnetssdev = to_net_dev(dev);
+-   pnetss_dev_priv_data = netdev_priv(pnetssdev);
+-
+-   requested_state = convert_level_to_int_and_store(buf,pnetss_dev_priv_data->service_id); 
+-   if(requested_state > -1) {
+-      /*call netss api to send mesage and update attribute value*/
+-      netss_set_service_state(pnetss_dev_priv_data->service_id, requested_state);
+-   }
+-   printk("Writing to runtime_state of service id %d buf %s val %d \n", pnetss_dev_priv_data->service_id, buf, requested_state);
+-   /*Return count on success otherwise return zero */
+-   return count;
+-}
+-
+-static int __init netss_sysfs_create_netip_attributes(void)
+-{
+-   struct netss_dev_priv_data_t *pnetss_dev_priv_data;
+-
+-   int i,j, ret;
+-
+-   for(i=0; i < NETSS_SERVICES_MAX; i++) 
+-   {
+-      if(i==BBU) {
+-         continue;
+-      }
+-      g_netssdevs[i] = alloc_netdev(sizeof(struct netss_dev_priv_data_t), get_netss_service_name(i), dummy_setup);
+-      if (!g_netssdevs[i]) {
+-         ret = -ENOMEM;
+-         goto free_netdevs;
+-      }
+-   }
+-
+-   for(i=0; i < NETSS_SERVICES_MAX; i++)
+-   {
+-      if(i==BBU) {
+-         continue;
+-      }
+-      pnetss_dev_priv_data = netdev_priv(g_netssdevs[i]);
+-      pnetss_dev_priv_data->service_id = i;
+-      ret = register_netdevice(g_netssdevs[i]);
+-      if (ret < 0) {
+-         goto unregister_netdevs;
+-      }
+-
+-      if(i == NETIP_SUBSYSTEM) {
+-         sysfs_add_file_to_group(&g_netssdevs[i]->dev.kobj, &dev_attr_service_level, power_group_name);
+-      }
+-      sysfs_add_file_to_group(&g_netssdevs[i]->dev.kobj, &dev_attr_runtime_state, power_group_name);
+-   }
+-   return 0;
+-unregister_netdevs:
+-   for(j=i-1; j>=0; j--)
+-   {
+-      if(g_netssdevs[j] != NULL) {
+-         unregister_netdevice(g_netssdevs[j]);
+-      }
+-   }
+-   for(j=0; j<NETSS_SERVICES_MAX; j++)
+-   {
+-      if(g_netssdevs[j] != NULL) {
+-         free_netdev(g_netssdevs[j]);
+-      }
+-   }
+-   return ret;
+-free_netdevs:
+-   for(j=i-1; j<=0; j--)
+-   {
+-      if(g_netssdevs[j] != NULL) {
+-         free_netdev(g_netssdevs[j]);
+-      }
+-   }
+-   return ret;
+-}
+-
+-#endif
+--- a/include/linux/netip_subsystem.h
++++ b/include/linux/netip_subsystem.h
+@@ -3,7 +3,7 @@
+  *
+  *  GPL LICENSE SUMMARY
+  *
+- *  Copyright(c) 2015 Intel Corporation. All rights reserved.
++ *  Copyright(c) 2015-2016 Intel Corporation. All rights reserved.
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of version 2 of the GNU General Public License as
+@@ -55,6 +55,8 @@
+ #define NETSS_DEV_MOCA_MMIO_SIZE (0x800000)
+ #define NETSS_DEV_GBE_MMIO_OFFSET (0x318000)
+ #define NETSS_DEV_GBE_MMIO_SIZE (0x6000)
++#define NETSS_DEV_CLK_CTRL_MMIO_OFFSET (0xD0000)
++#define NETSS_DEV_CLK_CTRL_MMIO_SIZE (0x10000)
+ 
+ #define NETSS_INTERUPT_ARM11_MAX (64)  /*ARM11 is a bundle of 64 interrupts */
+ 
+@@ -67,6 +69,7 @@ typedef enum {
+    NETSS_DEV_HW_COUNTERS,
+    NETSS_DEV_MOCA,
+    NETSS_DEV_GBE,
++   NETSS_DEV_CLK_CTRL,
+    NETSS_DEV_MAX
+ }netss_dev_t;
+ 

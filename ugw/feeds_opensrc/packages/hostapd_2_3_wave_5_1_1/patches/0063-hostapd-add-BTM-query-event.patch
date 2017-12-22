@@ -1,0 +1,239 @@
+From 03a942472a0ec5b22355418aa2b3c0000e349ee2 Mon Sep 17 00:00:00 2001
+From: Aaron Komisar <aaronx.komisar@intel.com>
+Date: Thu, 25 Aug 2016 17:20:35 +0300
+Subject: [PATCH 63/69] hostapd: add BTM query event
+
+BSS TM Query Added event to report WNM BSS Transition Management Request
+to ctrl interface. Candidate list is also reported. BSS Transition Management
+request, which is sent in response to the query now includes candidate list
+from the neighbor DB.
+
+Signed-off-by: Aaron Komisar <aaronx.komisar@intel.com>
+---
+ src/ap/wnm_ap.c              | 124 ++++++++++++++++++++++++++++++++++++++++---
+ src/common/ieee802_11_defs.h |  25 +++++++++
+ src/common/wpa_ctrl.h        |   2 +
+ 3 files changed, 144 insertions(+), 7 deletions(-)
+
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 9e59b35..ac1b348 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -252,7 +252,9 @@ static void ieee802_11_rx_wnmsleep_req(struct hostapd_data *hapd,
+ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 						  const u8 *addr,
+ 						  u8 dialog_token,
+-						  const char *url)
++						  const char *url,
++						  const u8 *nei_rep,
++						  int nei_rep_len)
+ {
+ 	struct ieee80211_mgmt *mgmt;
+ 	size_t url_len, len;
+@@ -264,7 +266,7 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	else
+ 		url_len = 0;
+ 
+-	mgmt = os_zalloc(sizeof(*mgmt) + (url_len ? 1 + url_len : 0));
++	mgmt = os_zalloc(sizeof(*mgmt) + (url_len ? 1 + url_len : 0) + nei_rep_len);
+ 	if (mgmt == NULL)
+ 		return -1;
+ 	os_memcpy(mgmt->da, addr, ETH_ALEN);
+@@ -285,6 +287,12 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 		pos += url_len;
+ 	}
+ 
++	if (nei_rep){
++		mgmt->u.action.u.bss_tm_req.req_mode |= WNM_BSS_TM_REQ_PREF_CAND_LIST_INCLUDED;
++		os_memcpy(pos, nei_rep, nei_rep_len);
++		pos += nei_rep_len;
++	}
++
+ 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
+ 		   MACSTR " dialog_token=%u req_mode=0x%x disassoc_timer=%u "
+ 		   "validity_interval=%u",
+@@ -307,6 +315,13 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ {
+ 	u8 dialog_token, reason;
+ 	const u8 *pos, *end;
++	char candidates_str[1024];/* would typically be able to report more than 20 candidates */
++	u32 bssid_info;
++	u8 regulatory_class, channel_number, phy_type;
++	struct hostapd_neighbor_entry *nr;
++	/* Neighbor report buffer - Maximum candidate list size assuming there are no other optional fields */
++	u8 nei_rep [IEEE80211_MAX_MMPDU_SIZE-7]={0};
++	size_t bss_tm_req_nr_list_len = 0;
+ 
+ 	if (len < 2) {
+ 		wpa_printf(MSG_DEBUG, "WNM: Ignore too short BSS Transition Management Query from "
+@@ -315,18 +330,113 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 	}
+ 
+ 	pos = frm;
++
+ 	end = pos + len;
+ 	dialog_token = *pos++;
+ 	reason = *pos++;
+ 
+ 	wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
+-		   MACSTR " dialog_token=%u reason=%u",
+-		   MAC2STR(addr), dialog_token, reason);
++			MACSTR " dialog_token=%u reason=%u len=%d",
++			MAC2STR(addr), dialog_token, reason, len);
++
++	/* Control interface event. Format:
++	 *
++	 *	BSS-TM-QUERY <sta mac addr> reason=<number, 1-5>
++	 *	[candidate=<BSSID>,<BSSID Information>,<Operating Class>,<Channel Number>,<PHY Type>,
++	 *	<priority for this BSS, 1-255> [candidate=<BSSID>,<BSSID Information>,<Operating Class>,
++	 *	<Channel Number>,<PHY Type>,<priority for this BSS, 1-255>]…]
++	 *
++	 */
++	candidates_str[0] = '\0';
++	if (reason == WNM_BSS_TM_REASON_CANDIDATE_LIST_INCLUDED){
+ 
+-	wpa_hexdump(MSG_DEBUG, "WNM: BSS Transition Candidate List Entries",
+-		    pos, end - pos);
++		if (pos == end){
++
++			wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
++					MACSTR ". Reason is set to Preferred candidate " \
++							"list included but no candidate list found", MAC2STR(addr));
++		} else
++		{
++			int nei_element_len, ret;
++			char * candidates_str_pos = candidates_str;
++			char * candidates_str_end = candidates_str + sizeof(candidates_str);
++
++			while (pos < end){
++
++				if (end - pos < 15) {
++					wpa_printf(MSG_DEBUG, "WNM: BSS TM Query, neighbor report element in candidate list is too short");
++					break;
++				}
++
++				if (*pos++ != WLAN_EID_NEIGHBOR_REPORT){
++					wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
++										MACSTR ". Expected Neighbor report Element ID", MAC2STR(addr));
++					break;
++				}
++				nei_element_len = *pos++;
++				if (pos + nei_element_len > end){
++					wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
++										MACSTR ". Expected Neighbor report invalid", MAC2STR(addr));
++					break;
++				}
++
++				/* BSSID */
++				ret = os_snprintf(candidates_str_pos, candidates_str_end - candidates_str_pos, " candidate=" MACSTR, MAC2STR(pos));
++				if (os_snprintf_error(candidates_str_end - candidates_str_pos, ret))
++					break;
++				candidates_str_pos += ret;
++				pos +=6;
++				nei_element_len -=6;
++
++				bssid_info = WPA_GET_LE32(pos);
++				regulatory_class = pos[4];
++				channel_number = pos[5];
++				phy_type = pos[6];
++
++				ret = os_snprintf(candidates_str_pos, candidates_str_end - candidates_str_pos, ",%u,%u,%u,%u",
++						bssid_info,regulatory_class,channel_number,phy_type);
++				if (os_snprintf_error(candidates_str_end - candidates_str_pos, ret))
++					break;
++				candidates_str_pos += ret;
++				pos +=7;
++				nei_element_len -= 7;
++
++				/* Priority (optional sub-element) */
++				if ((nei_element_len >=3) && (*pos == WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE)){
++
++					ret = os_snprintf(candidates_str_pos, candidates_str_end - candidates_str_pos, ",%u",
++							pos[2]);
++					if (os_snprintf_error(candidates_str_end - candidates_str_pos, ret))
++						break;
++					candidates_str_pos += ret;
++					pos +=3;
++					nei_element_len -=3;
++
++				}
++
++				/* Additional optional sub-elements may follow, skip to next candidate */
++				pos += nei_element_len;
++
++			}
++		}
++	}
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, BSS_TM_QUERY MACSTR
++					" reason=%u%s",
++					MAC2STR(addr), reason, candidates_str );
++
++	/* Add candidate list to BSS TM Request */
++	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
++			 list) {
++		if (bss_tm_req_nr_list_len+nr->nr->size + 7 > sizeof (nei_rep))
++			break;
++		os_memcpy (nei_rep + bss_tm_req_nr_list_len, nr->nr->buf, nr->nr->size);
++		bss_tm_req_nr_list_len += nr->nr->size;
++
++	}
++
++	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token, NULL, bss_tm_req_nr_list_len > 0 ? nei_rep : NULL, bss_tm_req_nr_list_len);
+ 
+-	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token, NULL);
+ }
+ 
+ 
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 86023d4..c9a2cc6 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1469,6 +1469,31 @@ enum bss_trans_mgmt_status_code {
+ 	WNM_BSS_TM_REJECT_LEAVING_ESS = 8
+ };
+ 
++/* IEEE Std 802.11-2015 - Table 8-171 - Transition and Transition Query Reasons */
++enum bss_trans_mgmt_reason_code {
++	WNM_BSS_TM_REASON_UNSPECIFIED = 0,
++	WNM_BSS_TM_REASON_EXESSIVE_FRAME_LOSS = 1,
++	WNM_BSS_TM_REASON_EXESSIVE_DELAY = 2,
++	WNM_BSS_TM_REASON_TSPEC_REJECTED = 3,
++	WNM_BSS_TM_REASON_FIRST_ASSOCIATION_TO_ESS = 4,
++	WNM_BSS_TM_REASON_LOAD_BALANCING = 5,
++	WNM_BSS_TM_REASON_BETTER_AP_FOUND = 6,
++	WNM_BSS_TM_REASON_DEAUTH_FROM_PREV_AP = 7,
++	WNM_BSS_TM_REASON_AP_FAILED_EAP_AUTH = 8,
++	WNM_BSS_TM_REASON_AP_FAILED_4WAY_HANDSHAKE = 9,
++	WNM_BSS_TM_REASON_TOO_MANY_REPLAY_COUNTER_FAILURES = 10,
++	WNM_BSS_TM_REASON_TOO_MANY_MIC_FAILURES = 11,
++	WNM_BSS_TM_REASON_EXCEEDED_MAX_RETRANSMISSIONS = 12,
++	WNM_BSS_TM_REASON_TOO_MANY_BCAST_DISASSOCIATIONS = 13,
++	WNM_BSS_TM_REASON_TOO_MANY_BCAST_DEAUTHENTICATIONS = 14,
++	WNM_BSS_TM_REASON_PREVIOUS_TRANSITION_FAILED = 15,
++	WNM_BSS_TM_REASON_LOW_RSSI = 16,
++	WNM_BSS_TM_REASON_ROAM_FROM_NON_80211_SYSTEM = 17,
++	WNM_BSS_TM_REASON_RECV_BSS_TM_REQUEST = 18,
++	WNM_BSS_TM_REASON_CANDIDATE_LIST_INCLUDED = 19,
++	WNM_BSS_TM_REASON_LEAVING_ESS = 20
++};
++
+ /*
+  * IEEE P802.11-REVmc/D5.0 Table 9-150 - Optional subelement IDs for
+  * neighbor report
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index cb7b45a..1a35deb 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -284,6 +284,8 @@ extern "C" {
+ 
+ /* BSS Transition Management Response frame received */
+ #define BSS_TM_RESP "BSS-TM-RESP "
++/* BSS Transition Management Query frame received */
++#define BSS_TM_QUERY "BSS-TM-QUERY "
+ 
+ /* MBO IE with cellular data connection preference received */
+ #define MBO_CELL_PREFERENCE "MBO-CELL-PREFERENCE "
+-- 
+1.8.3.4
+

@@ -1,0 +1,221 @@
+Index: stunnel-4.55/src/network.c
+===================================================================
+--- stunnel-4.55.orig/src/network.c
++++ stunnel-4.55/src/network.c
+@@ -441,6 +441,7 @@ int connect_blocking(CLI *c, SOCKADDR_UN
+         s_log(LOG_ERR, "connect_blocking: connect %s: %s (%d)",
+             dst, s_strerror(error), error);
+         str_free(dst);
++        update_validation_file(CONNECT_FAILED);
+         return -1;
+     }
+ 
+@@ -454,11 +455,13 @@ int connect_blocking(CLI *c, SOCKADDR_UN
+         s_log(LOG_ERR, "connect_blocking: s_poll_wait %s: %s (%d)",
+             dst, s_strerror(error), error);
+         str_free(dst);
++        update_validation_file(CONNECT_FAILED);
+         return -1;
+     case 0:
+         s_log(LOG_ERR, "connect_blocking: s_poll_wait %s:"
+             " TIMEOUTconnect exceeded", dst);
+         str_free(dst);
++        update_validation_file(CONNECT_FAILED);
+         return -1;
+     default:
+         error=get_socket_error(c->fd);
+@@ -466,6 +469,7 @@ int connect_blocking(CLI *c, SOCKADDR_UN
+             s_log(LOG_ERR, "connect_blocking: connect %s: %s (%d)",
+                dst, s_strerror(error), error);
+             str_free(dst);
++            update_validation_file(CONNECT_FAILED);
+             return -1;
+         }
+         if(s_poll_canwrite(c->fds, c->fd)) {
+@@ -476,8 +480,10 @@ int connect_blocking(CLI *c, SOCKADDR_UN
+         s_log(LOG_ERR, "connect_blocking: s_poll_wait %s: internal error",
+             dst);
+         str_free(dst);
++        update_validation_file(CONNECT_FAILED);
+         return -1;
+     }
++    update_validation_file(CONNECT_FAILED);
+     return -1; /* should not be possible */
+ }
+ 
+Index: stunnel-4.55/src/options.c
+===================================================================
+--- stunnel-4.55.orig/src/options.c
++++ stunnel-4.55/src/options.c
+@@ -1913,6 +1913,29 @@ static char *parse_service_option(CMD cm
+         break;
+     }
+ 
++    /* CNcheck */
++     switch(cmd) {
++     case CMD_BEGIN:
++         section->option.cn_check=0;
++         break;
++     case CMD_EXEC:
++         if(strcasecmp(opt, "CNcheck"))
++             break;
++         if(!strcasecmp(arg, "yes"))
++             section->option.cn_check=1;
++         else if(!strcasecmp(arg, "no"))
++             section->option.cn_check=0;
++         else
++             return "Argument should be either 'yes' or 'no'";
++         return NULL; /* OK */
++     case CMD_DEFAULT:
++         break;
++     case CMD_HELP:
++         s_log(LOG_NOTICE, "%-15s = yes|no verify CN against DNS",
++             "cn_check");
++         break;
++     }
++
+     if(cmd==CMD_EXEC)
+         return option_not_found;
+ 
+Index: stunnel-4.55/src/prototypes.h
+===================================================================
+--- stunnel-4.55.orig/src/prototypes.h
++++ stunnel-4.55/src/prototypes.h
+@@ -225,6 +225,7 @@ typedef struct service_options_struct {
+ #endif
+         unsigned int reset:1;           /* reset sockets on error */
+         unsigned int renegotiation:1;
++        unsigned int cn_check:1;
+     } option;
+ } SERVICE_OPTIONS;
+ 
+@@ -374,6 +375,7 @@ void sslerror(char *);
+ 
+ /**************************************** prototypes for verify.c */
+ 
++int update_validation_file(int32_t);
+ int verify_init(SERVICE_OPTIONS *);
+ 
+ /**************************************** prototypes for network.c */
+@@ -398,6 +400,11 @@ int s_poll_wait(s_poll_set *, int, int);
+ #define SIGNAL_TERMINATE        SIGTERM
+ #endif
+ 
++#define CERT_VALIDATION_FILE  "/tmp/cert_validation"
++#define VALIDATION_FAILED -217
++#define CONNECT_FAILED -258
++#define VALIDATION_SUCCESS 0
++
+ int set_socket_options(int, int);
+ int make_sockets(int [2]);
+ 
+Index: stunnel-4.55/src/verify.c
+===================================================================
+--- stunnel-4.55.orig/src/verify.c
++++ stunnel-4.55/src/verify.c
+@@ -52,6 +52,7 @@ static int crl_check(CLI *c, X509_STORE_
+ static int ocsp_check(CLI *c, X509_STORE_CTX *);
+ static OCSP_RESPONSE *ocsp_get_response(CLI *, OCSP_REQUEST *);
+ #endif
++static int common_name_check(CLI *c, X509_STORE_CTX *, char *);
+ 
+ /* utility functions */
+ static void log_time(const int, const char *, ASN1_TIME *);
+@@ -178,12 +179,14 @@ static int verify_callback(int preverify
+     s_log(LOG_DEBUG, "Starting certificate verification: depth=%d, %s",
+         depth, subject_name);
+     if(!cert_check(c, callback_ctx, preverify_ok)) {
++        update_validation_file(VALIDATION_FAILED);
+         s_log(LOG_WARNING, "Certificate check failed: depth=%d, %s",
+             depth, subject_name);
+         OPENSSL_free(subject_name);
+         return 0; /* reject connection */
+     }
+     if(!crl_check(c, callback_ctx)) {
++        update_validation_file(VALIDATION_FAILED);
+         s_log(LOG_WARNING, "CRL check failed: depth=%d, %s",
+             depth, subject_name);
+         OPENSSL_free(subject_name);
+@@ -191,12 +194,27 @@ static int verify_callback(int preverify
+     }
+ #ifdef HAVE_OSSL_OCSP_H
+     if(c->opt->option.ocsp && !ocsp_check(c, callback_ctx)) {
++        update_validation_file(VALIDATION_FAILED);
+         s_log(LOG_WARNING, "OCSP check failed: depth=%d, %s",
+             depth, subject_name);
+         OPENSSL_free(subject_name);
+         return 0; /* reject connection */
+     }
+ #endif /* HAVE_OSSL_OCSP_H */
++
++    if(c->opt->option.cn_check && !common_name_check(c, callback_ctx, subject_name))
++    {
++        update_validation_file(VALIDATION_FAILED);
++        s_log(LOG_WARNING, "Common Name check failed: depth=%d, %s",
++            depth, subject_name);
++        OPENSSL_free(subject_name);
++
++        return 0; /* reject connection */
++    }
++
++    if(depth == 0)
++        update_validation_file(VALIDATION_SUCCESS);
++
+     /* errnum=X509_STORE_CTX_get_error(ctx); */
+     s_log(LOG_NOTICE, "Certificate accepted: depth=%d, %s",
+         depth, subject_name);
+@@ -512,7 +530,54 @@ cleanup:
+ }
+ 
+ #endif /* HAVE_OSSL_OCSP_H */
++int update_validation_file(int32_t nCode)
++{
++    s_log(LOG_INFO, "Updating Certificate validation file [%d]\n",nCode);
++    FILE * pFile;
++    pFile = fopen (CERT_VALIDATION_FILE, "w");
++    if(pFile == NULL)
++    {
++        return 0 ;
++    }
++    fprintf ( pFile,"%d",nCode);
++    fclose (pFile);
++    return 1;
++}
++static int common_name_check(CLI *c, X509_STORE_CTX *callback_ctx, char *subject_name) {
++     X509_NAME *name;
++     int i;
++     ASN1_STRING *data;
++     int retval;
++
++     if(callback_ctx->error_depth!=0)
++         /* Only the leaf cert needs its commonName checked */
++         return 1;
++     name=X509_get_subject_name(callback_ctx->current_cert);
++     i=X509_NAME_get_index_by_NID(name, NID_commonName, -1);
++     if(i<0) {
++         /* No common name at all? That's too weird, let's reject */
++         s_log(LOG_WARNING,
++             "DNS VERIFY ERROR: No commonName, depth=%d, %s",
++             callback_ctx->error_depth,
++             subject_name);
++         return 0;
++     }
++     data=X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, i));
++
++    if(strcasecmp(c->opt->sni , (char*)data->data) == 0 )
++    {
++        /* accept */
++        retval=1;
++    }
++    else
++    {
++         /* reject connection */
++        s_log(LOG_WARNING, "Common Name Check Failed: HOST=[%s], CN=[%s]", c->opt->sni,data->data);
++         retval=0;
++    }
+ 
++     return retval;
++ }
+ static void log_time(const int level, const char *txt, ASN1_TIME *t) {
+     char *cp;
+     BIO *bio;

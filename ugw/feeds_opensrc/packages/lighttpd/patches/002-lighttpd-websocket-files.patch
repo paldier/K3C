@@ -1,0 +1,2811 @@
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket.c lighttpd-1.4.30/src/mod_websocket.c
+--- lighttpd-1.4.30-orig/src/mod_websocket.c	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket.c	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,879 @@
++/*
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ */
++
++#include <string.h>
++#include <errno.h>
++
++#include "connections.h"
++#include "fdevent.h"
++#include "joblist.h"
++#include "log.h"
++
++#include "mod_websocket.h"
++#include "mod_websocket_socket.h"
++
++#ifdef	HAVE_PCRE_H
++# include <pcre.h>
++#endif	/* HAVE_PCRE_H */
++
++#if defined (LIGHTTPD_VERSION_ID) && (LIGHTTPD_VERSION_ID >= (1 << 16 | 4 << 8 | 30))
++# define	NETWORK_SSL_BACKEND_WRITE(a,b,c,d) \
++    network_ssl_backend_write(a, b, c, d, MAX_WRITE_LIMIT)
++# define	NETWORK_BACKEND_WRITE(a,b,c,d) \
++    network_backend_write(a, b, c, d, MAX_WRITE_LIMIT)
++#else
++# define	NETWORK_SSL_BACKEND_WRITE(a,b,c,d) \
++    network_ssl_backend_write(a, b, c, d)
++# define	NETWORK_BACKEND_WRITE(a,b,c,d) \
++    network_backend_write(a, b, c, d)
++#endif
++
++/* prototypes */
++static int connect_backend(handler_ctx *);
++static void disconnect_backend(handler_ctx *);
++static void prepare_disconnect_client(handler_ctx *);
++static handler_t handle_backend(server *, void *, int);
++static handler_t mod_websocket_handle_subrequest(server *, connection *, void *);
++
++/* OK */
++static handler_ctx *handler_ctx_init(void) {
++    handler_ctx *hctx = calloc(1, sizeof(handler_ctx));
++
++    if (!hctx) {
++        return NULL;
++    }
++    hctx->state = MOD_WEBSOCKET_STATE_INIT;
++    hctx->mode = MOD_WEBSOCKET_TCP_PROXY;
++
++    hctx->handshake.host = NULL;
++    hctx->handshake.origin = NULL;
++    hctx->handshake.version = -1;
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++    hctx->handshake.key1 = NULL;
++    hctx->handshake.key2 = NULL;
++    hctx->handshake.key3 = buffer_init();
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_RFC_6455_
++    hctx->handshake.key = NULL;
++#endif	/* _MOD_WEBSOCKET_RFC_6455_ */
++
++    hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_INIT;
++    hctx->frame.ctl.siz = 0;
++    hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_CLOSE;
++    hctx->frame.type_before = MOD_WEBSOCKET_FRAME_TYPE_CLOSE;
++    hctx->frame.type_backend = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++    hctx->frame.payload = buffer_init();
++    hctx->tosrv = chunkqueue_init();
++
++    hctx->fd = -1;
++    hctx->fd_idx = -1;
++
++    hctx->srv = NULL;
++    hctx->con = NULL;
++    hctx->ext = NULL;
++    hctx->pd = NULL;
++    hctx->fromcli = NULL;
++    hctx->tocli = NULL;
++
++    return hctx;
++}
++
++/* OK */
++static void handler_ctx_free(handler_ctx *hctx) {
++    if (!hctx) {
++        return;
++    }
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++    buffer_free(hctx->handshake.key3);
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++    buffer_free(hctx->frame.payload);
++    chunkqueue_free(hctx->tosrv);
++    free(hctx);
++    return;
++}
++
++/* OK */
++int connect_backend(handler_ctx *hctx) {
++    data_unset *du;
++    buffer *host = NULL;
++    buffer *port = NULL;
++
++    du = array_get_element(hctx->ext->value, "host");
++    if (!du || du->type != TYPE_STRING) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "host section is invalid");
++        hctx->con->http_status = 500;
++        hctx->con->mode = DIRECT;
++        return -1;
++    }
++    host = ((data_string *)du)->value;
++    if (buffer_is_empty(host)) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "host section is invalid");
++        hctx->con->http_status = 500;
++        hctx->con->mode = DIRECT;
++        return -1;
++    }
++    du = array_get_element(hctx->ext->value, "port");
++    if (!du) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "port section is invalid");
++        hctx->con->http_status = 500;
++        hctx->con->mode = DIRECT;
++        return -1;
++    }
++    port = buffer_init();
++    if (du->type == TYPE_INTEGER) {
++        if (buffer_copy_long(port, ((data_integer *)du)->value) != 0) {
++            buffer_free(port);
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++            hctx->con->http_status = 500;
++            hctx->con->mode = DIRECT;
++            return -1;
++        }
++    } else if (du->type == TYPE_STRING && !buffer_is_empty(((data_string *)du)->value)) {
++        if (buffer_copy_string_buffer(port, ((data_string *)du)->value) != 0) {
++            buffer_free(port);
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++            hctx->con->http_status = 500;
++            hctx->con->mode = DIRECT;
++            return -1;
++        }
++    } else {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "port section is invalid");
++        buffer_free(port);
++        hctx->con->http_status = 500;
++        hctx->con->mode = DIRECT;
++        return -1;
++    }
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ssss",
++              "try to connect backend ->", host->ptr, ":", port->ptr);
++    hctx->fd = mod_websocket_connect(host->ptr, port->ptr);
++    if (hctx->fd < 0) {
++        buffer_free(port);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN, "s", "fail to connect");
++        hctx->con->http_status = 503;
++        hctx->con->mode = DIRECT;
++        return -1;
++    }
++    int flag = 1;
++    if (setsockopt(hctx->fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) == -1) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN, "s", "fail to set TCP_NODELAY for backend");
++    }
++    if (setsockopt(hctx->con->fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) == -1) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN, "s", "fail to set TCP_NODELAY for client");
++    }
++    hctx->fd_idx = -1;
++    hctx->srv->cur_fds++;
++    fdevent_register(hctx->srv->ev, hctx->fd, handle_backend, hctx);
++    fdevent_event_set(hctx->srv->ev, &(hctx->fd_idx), hctx->fd, FDEVENT_IN);
++
++    // for logging remote ipaddr and port
++    if (hctx->pd->conf.debug >= MOD_WEBSOCKET_LOG_INFO) {
++        mod_websocket_sockinfo_t info;
++        if (mod_websocket_getsockinfo(hctx->con->fd, &info) == 0) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sssdsdsssssds",
++                      "connected",
++                      info.peer.addr, ":", info.peer.port, "( fd =", hctx->con->fd, ") ->",
++                      host->ptr, ":", port->ptr, "( fd =", hctx->fd, ")");
++        } else {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "connected");
++        }
++    }
++    buffer_free(port);
++    return 0;
++}
++
++/* OK */
++void disconnect_backend(handler_ctx *hctx) {
++    if (hctx && hctx->srv && hctx->fd > 0) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds", "disconnect backend ( fd =", hctx->fd, ")");
++        fdevent_event_del(hctx->srv->ev, &(hctx->fd_idx), hctx->fd);
++        fdevent_unregister(hctx->srv->ev, hctx->fd);
++        mod_websocket_disconnect(hctx->fd);
++        hctx->srv->cur_fds--;
++        hctx->fd = -1;
++    }
++}
++
++void prepare_disconnect_client(handler_ctx *hctx) {
++    if (hctx && hctx->con && hctx->con->fd > 0) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds", "disconnect client ( fd =", hctx->con->fd, ")");
++    }
++    if (hctx && hctx->srv && hctx->fd > 0) {
++        fdevent_event_del(hctx->srv->ev, &(hctx->fd_idx), hctx->fd);
++        fdevent_unregister(hctx->srv->ev, hctx->fd);
++        mod_websocket_disconnect(hctx->fd);
++        hctx->srv->cur_fds--;
++        hctx->fd = -1;
++    }
++}
++
++/* OK */
++handler_t handle_backend(server *srv, void *ctx, int revents) {
++    handler_ctx *hctx = (handler_ctx *)ctx;
++    char readbuf[UINT16_MAX];
++    ssize_t siz;
++
++    if (revents & FDEVENT_NVAL || revents & FDEVENT_HUP || revents & FDEVENT_ERR) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds",
++                  "disconnected from backend ( fd =", hctx->fd, ")");
++        prepare_disconnect_client(hctx);
++    } else if (revents & FDEVENT_IN) {
++        errno = 0;
++        memset(readbuf, 0, sizeof(readbuf));
++        siz = read(hctx->fd, readbuf, sizeof(readbuf));
++        if (siz == 0) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds",
++                      "disconnected from backend ( fd =", hctx->fd, ")");
++            prepare_disconnect_client(hctx);
++        } else if (siz > 0) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++                      "recv data from backend ( fd =", hctx->fd, "), size =", siz);
++            if (mod_websocket_frame_send(hctx, hctx->frame.type_backend, readbuf, (size_t)siz) < 0) {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "fail to send data to client");
++                chunkqueue_reset(hctx->tocli);
++            }
++        } else if (errno != EAGAIN && errno != EINTR) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "sdss",
++                      "recv error from backend ( fd =", hctx->fd, "),", strerror(errno));
++            prepare_disconnect_client(hctx);
++        }
++    }
++    return mod_websocket_handle_subrequest(srv, hctx->con, hctx->pd);
++}
++
++/* OK */
++static int mod_websocket_patch_connection(server *srv, connection *con, plugin_data *p) {
++    size_t i, j;
++    plugin_config *s;
++
++    if (!p) {
++        return -1;
++    }
++    s = p->config_storage[0];
++
++#define PATCH(x) do { p->conf.x = s->x; } while (0)
++
++    PATCH(exts);
++    PATCH(debug);
++    PATCH(timeout);
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++    PATCH(ping_interval);
++#endif	/* _MOD_WEBSOCKET_RFC_6455_ */
++
++    /* skip the first, the global context */
++    for (i = 1; i < srv->config_context->used; i++) {
++        data_config *dc = (data_config *)srv->config_context->data[i];
++        s = p->config_storage[i];
++
++        /* condition didn't match */
++        if (!config_check_cond(srv, con, dc)) {
++            continue;
++        }
++        /* merge config */
++        for (j = 0; j < dc->value->used; j++) {
++            data_unset *du = dc->value->data[j];
++
++            if (buffer_is_equal_string(du->key, CONST_STR_LEN(MOD_WEBSOCKET_CONFIG_SERVER))) {
++                PATCH(exts);
++            } else if (buffer_is_equal_string(du->key, CONST_STR_LEN(MOD_WEBSOCKET_CONFIG_DEBUG))) {
++                PATCH(debug);
++            }
++        }
++    }
++#undef PATCH
++    if (!p->conf.exts) {
++        return -1;
++    }
++    return 0;
++}
++
++/* OK */
++static handler_t mod_websocket_check_extension(server *srv, connection *con, void *p_d) {
++    plugin_data *p = p_d;
++    size_t i;
++    data_array *ext = NULL;
++    handler_ctx *hctx = NULL;
++
++#ifdef	HAVE_PCRE_H
++    pcre *re = NULL;
++    int rc;
++    const char* err_str;
++    int err_off;
++# define	N	(10)
++    int ovec[N * 3];
++#endif	/* HAVE_PCRE_H */
++
++    if (con->request.http_method != HTTP_METHOD_GET) {
++        return HANDLER_GO_ON;
++    }
++    if (mod_websocket_patch_connection(srv, con, p) < 0) {
++        return HANDLER_GO_ON;
++    }
++    for (i = p->conf.exts->used; i > 0; i--) {
++        ext = (data_array *)p->conf.exts->data[i - 1];
++
++#ifdef	HAVE_PCRE_H
++        re = pcre_compile(ext->key->ptr, 0, &err_str, &err_off, NULL);
++        rc = pcre_exec(re, NULL, con->uri.path->ptr, con->uri.path->used - 1, 0, PCRE_ANCHORED, ovec, N);
++        free(re);
++        if (rc > 0) {
++            break;
++        }
++# undef	N
++#else
++        if (buffer_is_equal(con->uri.path, ext->key)) {
++            break;
++        }
++#endif	/* HAVE_PCRE_H */
++
++        ext = NULL;
++    }
++    if (!ext) {
++        return HANDLER_GO_ON;
++    }
++    if (p->conf.debug >= MOD_WEBSOCKET_LOG_INFO) {
++        log_error_write(srv, __FILE__, __LINE__, "sss",
++                        con->uri.path->ptr, "is match WebSocket extension:", ext->key->ptr);
++    }
++
++    array *hdrs = NULL;
++    data_string *hdr = NULL;
++    buffer *connection_hdr_value = NULL;
++    buffer *upgrade_hdr_value = NULL;
++
++    hdrs = con->request.headers;
++    for (i = hdrs->used; i > 0; i--) {
++        hdr = (data_string *)hdrs->data[i - 1];
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Connection"))) {
++            connection_hdr_value = buffer_init_buffer(hdr->value);
++            buffer_to_lower(connection_hdr_value);
++        }
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Upgrade"))) {
++            upgrade_hdr_value = buffer_init_buffer(hdr->value);
++            buffer_to_lower(upgrade_hdr_value);
++        }
++    }
++    /*
++     * Connection: upgrade, keep-alive, ...
++     * Upgrade: WebSocket, ...
++     */
++    if (buffer_is_empty(connection_hdr_value) ||
++        buffer_is_empty(upgrade_hdr_value) ||
++        strstr(connection_hdr_value->ptr, "upgrade") == NULL ||
++        strstr(upgrade_hdr_value->ptr, "websocket") == NULL) {
++        if (p->conf.debug >= MOD_WEBSOCKET_LOG_INFO) {
++            log_error_write(srv, __FILE__, __LINE__, "ss",
++                            con->uri.path->ptr, "is not WebSocket Request");
++        }
++        buffer_free(connection_hdr_value);
++        buffer_free(upgrade_hdr_value);
++        return HANDLER_GO_ON;
++    }
++    buffer_free(connection_hdr_value);
++    buffer_free(upgrade_hdr_value);
++
++    /* init handler-context */
++    hctx = handler_ctx_init();
++    if (!hctx) {
++        if (p->conf.debug) {
++            log_error_write(srv, __FILE__, __LINE__, "s", "no memory.");
++        }
++        return HANDLER_ERROR;
++    }
++    con->plugin_ctx[p->id] = hctx;
++    con->mode = p->id;
++    hctx->srv = srv;
++    hctx->con = con;
++    hctx->ext = ext;
++    hctx->pd = p;
++    hctx->fromcli = con->read_queue;
++    hctx->tocli = con->write_queue;
++    return HANDLER_GO_ON;
++}
++
++/* OK */
++INIT_FUNC(mod_websocket_init) {
++    plugin_data *p;
++    p = calloc(1, sizeof(*p));
++    return p;
++}
++
++/* OK */
++FREE_FUNC(mod_websocket_free) {
++    size_t i;
++    plugin_data *p = p_d;
++    plugin_config *s = NULL;
++
++    if (p->config_storage) {
++        for (i = 0; i < srv->config_context->used; i++) {
++            s = p->config_storage[i];
++            if (s) {
++                array_free(s->exts);
++                free(s);
++            }
++        }
++        free(p->config_storage);
++    }
++    free(p);
++    return HANDLER_GO_ON;
++}
++
++/* OK */
++SETDEFAULTS_FUNC(mod_websocket_set_defaults) {
++    size_t i, j;
++    plugin_data *p = p_d;
++    config_values_t cv[] = {
++        { MOD_WEBSOCKET_CONFIG_SERVER,        NULL, T_CONFIG_LOCAL, T_CONFIG_SCOPE_CONNECTION },
++        { MOD_WEBSOCKET_CONFIG_TIMEOUT,       NULL, T_CONFIG_SHORT, T_CONFIG_SCOPE_CONNECTION },
++        { MOD_WEBSOCKET_CONFIG_DEBUG,         NULL, T_CONFIG_SHORT, T_CONFIG_SCOPE_CONNECTION },
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++        { MOD_WEBSOCKET_CONFIG_PING_INTERVAL, NULL, T_CONFIG_SHORT, T_CONFIG_SCOPE_CONNECTION },
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++        { NULL,                      NULL, T_CONFIG_UNSET, T_CONFIG_SCOPE_UNSET }
++    };
++
++    if (!p) {
++        return HANDLER_ERROR;
++    }
++    p->config_storage = calloc(1, srv->config_context->used * sizeof(specific_config *));
++    if (!p->config_storage) {
++        log_error_write(srv, __FILE__, __LINE__, "s", "no memory.");
++        return HANDLER_ERROR;
++    }
++    for (i = 0; i < srv->config_context->used; i++) {
++        plugin_config *s = NULL;
++        array *ca = NULL;
++        data_unset *du = NULL;
++        data_array *da = NULL;
++        data_array *ext = NULL;
++
++        s = calloc(1, sizeof(plugin_config));
++        if (!s) { /* p->config_storage is freed at FREE_FUNC */
++            log_error_write(srv, __FILE__, __LINE__, "s", "no memory");
++            return HANDLER_ERROR;
++        }
++        s->exts = array_init();
++        cv[0].destination = s->exts;
++        s->timeout = 30; // default timeout == 30 sec
++        cv[1].destination = &(s->timeout);
++        s->debug = MOD_WEBSOCKET_LOG_NONE;
++        cv[2].destination = &(s->debug);
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++        s->ping_interval = 0; // not send ping
++        cv[3].destination = &(s->ping_interval);
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++        p->config_storage[i] = s;
++
++        ca = ((data_config *)(srv->config_context->data[i]))->value;
++        if (config_insert_values_global(srv, ca, cv) != 0) {
++            log_error_write(srv, __FILE__, __LINE__, "s", "no memory.");
++            return HANDLER_ERROR;
++        }
++        if ((du = array_get_element(ca, MOD_WEBSOCKET_CONFIG_SERVER)) == NULL) {
++            continue;
++        }
++        if (du->type != TYPE_ARRAY) {
++            log_error_write(srv, __FILE__, __LINE__, "s", "invalid configuration");
++            return HANDLER_ERROR;
++        }
++        da = (data_array *)du;
++        for (j = 0; j < da->value->used; j++) {
++            if (da->value->data[j]->type != TYPE_ARRAY) {
++                log_error_write(srv, __FILE__, __LINE__, "s", "invalid configuration");
++                return HANDLER_ERROR;
++            }
++            ext = data_array_init();
++            buffer_copy_string_buffer(ext->key, ((data_array *)(da->value->data[j]))->key);
++            ext->value = array_init_array(((data_array *)(da->value->data[j]))->value);
++            ext->is_index_key = ((data_array *)(da->value->data[j]))->is_index_key;
++            array_insert_unique(s->exts, (data_unset *)ext);
++        }
++    }
++    return HANDLER_GO_ON;
++}
++
++SUBREQUEST_FUNC(mod_websocket_handle_subrequest) {
++    plugin_data *p = p_d;
++    handler_ctx *hctx = con->plugin_ctx[p->id];
++    int ret;
++    mod_websocket_errno_t err;
++    data_unset *du;
++    data_string *proto = NULL;
++
++    /* not my job */
++    if (!hctx || con->mode != p->id) {
++        return HANDLER_GO_ON;
++    }
++    switch (hctx->state) {
++    case MOD_WEBSOCKET_STATE_INIT:
++        /* check request */
++        err = mod_websocket_handshake_check_request(hctx);
++        /* not my job */
++        if (err != MOD_WEBSOCKET_OK) {
++            hctx->con->http_status = err;
++            hctx->con->mode = DIRECT;
++            return HANDLER_FINISHED;
++        }
++        /* select mode */
++        du = array_get_element(hctx->ext->value, "proto");
++        if (du != NULL && du->type == TYPE_STRING) {
++            proto = (data_string *)du;
++            if (!buffer_is_empty(proto->value) && strcasecmp(proto->value->ptr, "websocket") == 0) {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "works as WebSocket Proxy");
++                hctx->mode = MOD_WEBSOCKET_WEBSOCKET_PROXY;
++            } else {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "works as WebSocket-TCP Proxy");
++                hctx->mode = MOD_WEBSOCKET_TCP_PROXY;
++            }
++        } else {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "works as WebSocket-TCP Proxy");
++            hctx->mode = MOD_WEBSOCKET_TCP_PROXY;
++        }
++        if (hctx->mode == MOD_WEBSOCKET_TCP_PROXY) {
++            if (hctx->handshake.version == 0) {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "WebSocket Version = hybi-00");
++            } else {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sd", "WebSocket Version =", hctx->handshake.version);
++            }
++        }
++
++        if (hctx->mode == MOD_WEBSOCKET_TCP_PROXY) {
++            du = array_get_element(hctx->ext->value, "type");
++            if (du == NULL) {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "will recv text data from backend");
++                hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                hctx->frame.type_before = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                hctx->frame.type_backend = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++            } else {
++                if (du->type == TYPE_STRING) {
++                    data_string *type = (data_string *)du;
++                    if (!buffer_is_empty(type->value) &&
++                        (strncasecmp(type->value->ptr, "binary", strlen("binary")) == 0)) {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "will recv binary data from backend");
++                        hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_BIN;
++                        hctx->frame.type_before = MOD_WEBSOCKET_FRAME_TYPE_BIN;
++                        hctx->frame.type_backend = MOD_WEBSOCKET_FRAME_TYPE_BIN;
++                    } else {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "will recv text data from backend");
++                        hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                        hctx->frame.type_before = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                        hctx->frame.type_backend = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                    }
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "will recv text data from backend");
++                    hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                    hctx->frame.type_before = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                    hctx->frame.type_backend = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                }
++            }
++        }
++
++        /* connect to backend server */
++        if (connect_backend(hctx) < 0) {
++            return HANDLER_FINISHED;
++        }
++        if (hctx->mode == MOD_WEBSOCKET_WEBSOCKET_PROXY) {
++            err = mod_websocket_handshake_forward_request(hctx);
++            if (err != MOD_WEBSOCKET_OK) {
++                disconnect_backend(hctx);
++                hctx->con->http_status = err;
++                hctx->con->mode = DIRECT;
++                return HANDLER_FINISHED;
++            }
++            do {
++                ret = srv->NETWORK_BACKEND_WRITE(srv, con, hctx->fd, hctx->tosrv);
++                if (0 <= ret) {
++                    chunkqueue_remove_finished_chunks(hctx->tosrv);
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "ss",
++                              "forward handshake error,", strerror(errno));
++                    hctx->con->http_status = MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++                    hctx->con->mode = DIRECT;
++                    return HANDLER_FINISHED;
++                }
++            } while (!chunkqueue_is_empty(hctx->tosrv));
++        } else if (hctx->mode == MOD_WEBSOCKET_TCP_PROXY) {
++            /* send handshake response */
++            err = mod_websocket_handshake_create_response(hctx);
++            if (err != MOD_WEBSOCKET_OK) {
++                disconnect_backend(hctx);
++                hctx->con->http_status = err;
++                hctx->con->mode = DIRECT;
++                return HANDLER_FINISHED;
++            }
++            do {
++                if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++
++#ifdef	USE_OPENSSL
++                    ret = srv->NETWORK_SSL_BACKEND_WRITE(srv, con, hctx->con->ssl, hctx->tocli);
++#else	/* SSL is not available */
++                    ret = -1;
++#endif	/* USE_OPENSSL */
++
++                } else {
++                    ret = srv->NETWORK_BACKEND_WRITE(srv, con, hctx->con->fd, hctx->tocli);
++                }
++                if (ret >= 0) {
++                    chunkqueue_remove_finished_chunks(hctx->tocli);
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "ss",
++                              "send handshake response error,", strerror(errno));
++                    hctx->con->http_status = MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++                    hctx->con->mode = DIRECT;
++                    return HANDLER_FINISHED;
++                }
++            } while (!chunkqueue_is_empty(hctx->tocli));
++        }
++        hctx->state = MOD_WEBSOCKET_STATE_CONNECTED;
++        hctx->timeout_cnt = 0;
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++        hctx->ping_ts = srv->cur_ts;
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++        chunkqueue_reset(hctx->fromcli);
++        fdevent_event_del(srv->ev, &(hctx->fd_idx), hctx->fd);
++        fdevent_event_del(srv->ev, &(con->fde_ndx), con->fd);
++        fdevent_event_set(srv->ev, &(hctx->fd_idx), hctx->fd, FDEVENT_IN);
++        fdevent_event_set(srv->ev, &(con->fde_ndx), con->fd, FDEVENT_IN);
++        connection_set_state(srv, hctx->con, CON_STATE_READ_CONTINUOUS);
++        return HANDLER_WAIT_FOR_EVENT;
++
++    case MOD_WEBSOCKET_STATE_CONNECTED:
++        if (hctx->con->fd < 0) {
++            break;
++        } else {
++            if (!chunkqueue_is_empty(hctx->fromcli)) {
++                hctx->timeout_cnt = 0;
++                if (mod_websocket_frame_recv(hctx) < 0) {
++                    if (hctx->mode == MOD_WEBSOCKET_WEBSOCKET_PROXY) {
++                        break;
++                    }
++                    if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++
++#ifdef	USE_OPENSSL
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds",
++                                  "disconnected from client ( fd =", hctx->con->ssl, ")");
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sds",
++                                  "send close response to client ( fd =", hctx->con->ssl, ")");
++                        mod_websocket_frame_send(hctx, MOD_WEBSOCKET_FRAME_TYPE_CLOSE,
++                                                 (char *)"1000", strlen("1000"));
++                        srv->NETWORK_SSL_BACKEND_WRITE(srv, con, hctx->con->ssl, hctx->tocli);
++#endif	/* USE_OPENSSL */
++
++                    } else {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds",
++                                  "disconnected from client ( fd =", hctx->con->fd, ")");
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sds",
++                                  "send close response to client ( fd =", hctx->con->fd, ")");
++                        mod_websocket_frame_send(hctx, MOD_WEBSOCKET_FRAME_TYPE_CLOSE,
++                                                 (char *)"1000", strlen("1000"));
++                        srv->NETWORK_BACKEND_WRITE(srv, con, hctx->con->fd, hctx->tocli);
++                    }
++                    break;
++                }
++            }
++            if (!chunkqueue_is_empty(hctx->tosrv)) {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++                          "send data to backend ( fd =", hctx->fd,
++                          "), size =", chunkqueue_length(hctx->tosrv));
++                ret = srv->NETWORK_BACKEND_WRITE(srv, con, hctx->fd, hctx->tosrv);
++                if (0 <= ret) {
++                    chunkqueue_remove_finished_chunks(hctx->tosrv);
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "ss",
++                              "fail to send data to backend:", strerror(errno));
++                    chunkqueue_reset(hctx->tosrv);
++                }
++            }
++        }
++        if (hctx->fd < 0) {
++            chunkqueue_reset(hctx->tocli);
++            if (hctx->mode == MOD_WEBSOCKET_WEBSOCKET_PROXY) {
++                break;
++            }
++            if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++
++#ifdef	USE_OPENSSL
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sds",
++                          "send close request to client ( fd =", hctx->con->ssl, ")");
++                mod_websocket_frame_send(hctx, MOD_WEBSOCKET_FRAME_TYPE_CLOSE, (char *)"1001", strlen("1001"));
++                srv->NETWORK_SSL_BACKEND_WRITE(srv, con, hctx->con->ssl, hctx->tocli);
++#endif	/* USE_OPENSSL */
++
++            } else {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sds",
++                          "send close request to client ( fd =", hctx->con->fd, ")");
++                mod_websocket_frame_send(hctx, MOD_WEBSOCKET_FRAME_TYPE_CLOSE, (char *)"1001", strlen("1001"));
++                srv->NETWORK_BACKEND_WRITE(srv, con, hctx->con->fd, hctx->tocli);
++            }
++            break;
++        } else {
++            if (!chunkqueue_is_empty(hctx->tocli)) {
++                if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++
++#ifdef	USE_OPENSSL
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++                              "send data to client ( fd =", hctx->con->ssl,
++                              "), size =", chunkqueue_length(hctx->tocli));
++                    ret = srv->NETWORK_SSL_BACKEND_WRITE(srv, con, hctx->con->ssl, hctx->tocli);
++#else	/* SSL is not available */
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "SSL is not available");
++                    ret = -1;
++#endif	/* USE_OPENSSL */
++
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++                              "send data to client ( fd =", hctx->con->fd,
++                              "), size =", chunkqueue_length(hctx->tocli));
++                    ret = srv->NETWORK_BACKEND_WRITE(srv, con, hctx->con->fd, hctx->tocli);
++                }
++                if (ret >= 0) {
++                    chunkqueue_remove_finished_chunks(hctx->tocli);
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "ss",
++                              "fail to send data to client:", strerror(errno));
++                    chunkqueue_reset(hctx->tocli);
++                }
++            }
++        }
++        fdevent_event_del(srv->ev, &(hctx->fd_idx), hctx->fd);
++        fdevent_event_del(srv->ev, &(con->fde_ndx), con->fd);
++        if (!chunkqueue_is_empty(hctx->tosrv)) {
++            fdevent_event_set(srv->ev, &(hctx->fd_idx), hctx->fd, FDEVENT_OUT);
++        } else {
++            fdevent_event_set(srv->ev, &(hctx->fd_idx), hctx->fd, FDEVENT_IN);
++        }
++        if (!chunkqueue_is_empty(hctx->tocli)) {
++            fdevent_event_set(srv->ev, &(con->fde_ndx), con->fd, FDEVENT_OUT);
++        } else {
++            fdevent_event_set(srv->ev, &(con->fde_ndx), con->fd, FDEVENT_IN);
++        }
++        connection_set_state(srv, hctx->con, CON_STATE_READ_CONTINUOUS);
++        return HANDLER_WAIT_FOR_EVENT;
++    }
++    disconnect_backend(hctx);
++    handler_ctx_free(hctx);
++    connection_set_state(srv, con, CON_STATE_CLOSE);
++    con->plugin_ctx[p->id] = NULL;
++    return HANDLER_FINISHED;
++}
++
++TRIGGER_FUNC(mod_websocket_handle_trigger) {
++    connection *con;
++    handler_ctx *hctx;
++    plugin_data *p = p_d;
++    size_t i;
++
++    for (i = 0; i < srv->conns->used; i++) {
++        con = srv->conns->ptr[i];
++        if (con->mode != p->id) {
++            continue;
++        }
++        hctx = con->plugin_ctx[p->id];
++        if (!hctx || hctx->mode != MOD_WEBSOCKET_TCP_PROXY) {
++            continue;
++        }
++
++        if (hctx->handshake.version != 0 &&
++            p->conf.ping_interval > 0 &&
++            p->conf.ping_interval < (unsigned int)difftime(srv->cur_ts, hctx->ping_ts)) {
++            mod_websocket_frame_send(hctx, MOD_WEBSOCKET_FRAME_TYPE_PING, (char *)"ping", strlen("ping"));
++            if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++
++#ifdef	USE_OPENSSL
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++                          "send data to client ( fd =", hctx->con->ssl,
++                          "), size =", chunkqueue_length(hctx->tocli));
++                srv->NETWORK_SSL_BACKEND_WRITE(srv, con, hctx->con->ssl, hctx->tocli);
++#else	/* SSL is not available */
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "SSL is not available");
++                chunkqueue_reset(hctx->tocli);
++#endif	/* USE_OPENSSL */
++
++            } else {
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++                          "send data to client ( fd =", hctx->con->fd,
++                          "), size =", chunkqueue_length(hctx->tocli));
++                srv->NETWORK_BACKEND_WRITE(srv, con, hctx->con->fd, hctx->tocli);
++            }
++            hctx->ping_ts = srv->cur_ts;
++            chunkqueue_remove_finished_chunks(hctx->tocli);
++        }
++        hctx->timeout_cnt += 1;
++        if (p->conf.timeout > 0 && hctx->timeout_cnt >= p->conf.timeout) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds", "timeout client ( fd =", con->fd, ")");
++            mod_websocket_frame_send(hctx, MOD_WEBSOCKET_FRAME_TYPE_CLOSE, NULL, 0);
++            if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++
++#ifdef	USE_OPENSSL
++                srv->NETWORK_SSL_BACKEND_WRITE(srv, con, hctx->con->ssl, hctx->tocli);
++#else	/* SSL is not available */
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "SSL is not available");
++                chunkqueue_reset(hctx->tocli);
++#endif	/* USE_OPENSSL */
++
++            } else {
++                srv->NETWORK_BACKEND_WRITE(srv, con, hctx->con->fd, hctx->tocli);
++            }
++            disconnect_backend(hctx);
++            handler_ctx_free(hctx);
++            connection_set_state(srv, con, CON_STATE_CLOSE);
++            con->plugin_ctx[p->id] = NULL;
++        }
++    }
++    return HANDLER_GO_ON;
++}
++
++/* OK */
++static handler_t mod_websocket_disconnected_from_client(server *srv, connection *con, void *pd) {
++    plugin_data *p = (plugin_data *)pd;
++    handler_ctx *hctx = con->plugin_ctx[p->id];
++
++    UNUSED(srv);
++
++    if (con->plugin_ctx[p->id]) {
++        if ((server_socket *)(con->srv_socket) && ((server_socket *)(con->srv_socket))->is_ssl) {
++
++#ifdef	USE_OPENSSL
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds", "disconnected from client ( fd =", con->ssl, ")");
++#else	/* SSL is not available */
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "SSL is not available");
++#endif	/* USE_OPENSSL */
++
++        } else if (hctx) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sds", "disconnected from client ( fd =", con->fd, ")");
++        }
++        disconnect_backend(hctx);
++        handler_ctx_free(hctx);
++        con->plugin_ctx[p->id] = NULL;
++    }
++    return HANDLER_GO_ON;
++}
++
++int mod_websocket_plugin_init(plugin *p) {
++    p->version = LIGHTTPD_VERSION_ID;
++    p->name = buffer_init_string("mod_websocket");
++    p->init = mod_websocket_init;
++    p->cleanup = mod_websocket_free;
++    p->set_defaults = mod_websocket_set_defaults;
++    p->connection_reset = mod_websocket_disconnected_from_client;
++    p->handle_connection_close = mod_websocket_disconnected_from_client;
++    p->handle_uri_clean = mod_websocket_check_extension;
++    p->handle_subrequest = mod_websocket_handle_subrequest;
++    p->read_continuous = mod_websocket_handle_subrequest;
++    p->handle_trigger = mod_websocket_handle_trigger;
++    p->data = NULL;
++    return 0;
++}
++
++/* EOF */
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket.h lighttpd-1.4.30/src/mod_websocket.h
+--- lighttpd-1.4.30-orig/src/mod_websocket.h	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket.h	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,213 @@
++/*
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * - Redistributions of source code must retain the above copyright notice,
++ *   this list of conditions and the following disclaimer.
++ * - Redistributions in binary form must reproduce the above copyright notice,
++ *   this list of conditions and the following disclaimer in the documentation
++ *   and/or other materials provided with the distribution.
++ * - Neither the name of the 'incremental' nor the names of its contributors
++ *   may be used to endorse or promote products derived from this software
++ *   without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ * THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef	_MOD_WEBSOCKET_H_
++#define	_MOD_WEBSOCKET_H_
++
++#include "config.h"
++
++#include <time.h>
++
++#ifdef HAVE_STDINT_H
++# include <stdint.h>
++#endif /* HAVE_STDINT_H */
++
++#include "array.h"
++#include "buffer.h"
++#include "chunk.h"
++#include "base.h"
++#include "plugin.h"
++#include "log.h"
++
++#define	MOD_WEBSOCKET_CONFIG_SERVER		"websocket.server"
++#define	MOD_WEBSOCKET_CONFIG_PING_INTERVAL	"websocket.ping_interval"
++#define	MOD_WEBSOCKET_CONFIG_TIMEOUT		"websocket.timeout"
++#define	MOD_WEBSOCKET_CONFIG_DEBUG		"websocket.debug"
++
++#define	MOD_WEBSOCKET_LOG_NONE	(0)
++#define	MOD_WEBSOCKET_LOG_ERR	(1)
++#define	MOD_WEBSOCKET_LOG_WARN	(2)
++#define	MOD_WEBSOCKET_LOG_INFO	(3)
++#define	MOD_WEBSOCKET_LOG_DEBUG	(4)
++
++#define DEBUG_LOG(level, format, ...)                                   \
++    if (hctx->pd->conf.debug >= level) {                                \
++        log_error_write(hctx->srv, __FILE__, __LINE__, format, __VA_ARGS__); \
++    }
++
++#define	MOD_WEBSOCKET_TRUE			(1)
++#define	MOD_WEBSOCKET_FALSE			(0)
++
++typedef unsigned char mod_websocket_bool_t;
++
++#define	MOD_WEBSOCKET_ERRNO_MAP(GEN)    \
++    GEN(OK, 200)                        \
++    GEN(BAD_REQUEST, 400)               \
++    GEN(FORBIDDEN, 403)                 \
++    GEN(NOT_FOUND, 404)                 \
++    GEN(INTERNAL_SERVER_ERROR, 500)     \
++    GEN(SERVICE_UNAVAILABLE, 503)
++
++#define	MOD_WEBSOCKET_ERRNO_GEN(ident, num) MOD_WEBSOCKET_##ident = num,
++
++typedef enum {
++    MOD_WEBSOCKET_ERRNO_MAP(MOD_WEBSOCKET_ERRNO_GEN)
++} mod_websocket_errno_t;
++
++typedef struct {
++    array *exts;
++    unsigned int timeout;
++    unsigned int debug;
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++    unsigned int ping_interval;
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++} plugin_config;
++
++typedef struct {
++    PLUGIN_DATA;
++    plugin_config **config_storage;
++    plugin_config conf;
++} plugin_data;
++
++typedef enum {
++    MOD_WEBSOCKET_TCP_PROXY,
++    MOD_WEBSOCKET_WEBSOCKET_PROXY,
++} mod_websocket_mode_t;
++
++typedef enum {
++    MOD_WEBSOCKET_STATE_INIT,
++    MOD_WEBSOCKET_STATE_CONNECTED,
++} mod_websocket_state_t;
++
++typedef struct {
++    buffer *host;
++    buffer *origin;
++    int version;
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++    buffer *key1;
++    buffer *key2;
++    buffer *key3;
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++    buffer *key;
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++} mod_websocket_handshake_t;
++
++typedef enum {
++    MOD_WEBSOCKET_FRAME_STATE_INIT,
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++    MOD_WEBSOCKET_FRAME_STATE_READ_LENGTH,
++    MOD_WEBSOCKET_FRAME_STATE_READ_EX_LENGTH,
++    MOD_WEBSOCKET_FRAME_STATE_READ_MASK,
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++    MOD_WEBSOCKET_FRAME_STATE_READ_PAYLOAD,
++} mod_websocket_frame_state_t;
++
++typedef enum {
++    MOD_WEBSOCKET_FRAME_TYPE_TEXT,
++    MOD_WEBSOCKET_FRAME_TYPE_BIN,
++    MOD_WEBSOCKET_FRAME_TYPE_CLOSE,
++
++#ifdef  _MOD_WEBSOCKET_SPEC_RFC_6455_
++    MOD_WEBSOCKET_FRAME_TYPE_PING,
++    MOD_WEBSOCKET_FRAME_TYPE_PONG,
++#endif  /* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++} mod_websocket_frame_type_t;
++
++typedef struct {
++    uint64_t siz;
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++    int siz_cnt;
++# define	MOD_WEBSOCKET_MASK_CNT	(4)
++    unsigned char mask[MOD_WEBSOCKET_MASK_CNT];
++    int mask_cnt;
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++} mod_websocket_frame_control_t;
++
++typedef struct {
++    mod_websocket_frame_state_t state;
++    mod_websocket_frame_control_t ctl;
++    mod_websocket_frame_type_t type, type_before, type_backend;
++    buffer *payload;
++} mod_websocket_frame_t;
++
++typedef struct {
++    mod_websocket_mode_t mode;
++    mod_websocket_state_t state;
++    mod_websocket_handshake_t handshake;
++    mod_websocket_frame_t frame;
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++    time_t ping_ts;
++    unsigned int timeout_cnt;
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++    /* fd and fd_idx to backend */
++    int fd, fd_idx;
++
++    /* mbuf for server */
++    chunkqueue  *tosrv;		/* chunkqueue to server */
++
++    /* ref */
++    server      *srv;		/* server */
++    connection  *con;		/* connection */
++    data_array  *ext;		/* extention */
++    plugin_data *pd;		/* config */
++    chunkqueue  *fromcli;	/* chunkqueue from client */
++    chunkqueue  *tocli;		/* chunkqueue to client */
++} handler_ctx;
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++    int mod_websocket_backend_connect(const char *, const char *);
++    void mod_websocket_backend_disconnect(int);
++
++    mod_websocket_errno_t mod_websocket_handshake_check_request(handler_ctx *);
++    mod_websocket_errno_t mod_websocket_handshake_create_response(handler_ctx *);
++    mod_websocket_errno_t mod_websocket_handshake_forward_request(handler_ctx *);
++
++    int mod_websocket_frame_send(handler_ctx *, mod_websocket_frame_type_t, char *, size_t);
++    int mod_websocket_frame_recv(handler_ctx *);
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif /* _MOD_WEBSOCKET_H_ */
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_base64.c lighttpd-1.4.30/src/mod_websocket_base64.c
+--- lighttpd-1.4.30-orig/src/mod_websocket_base64.c	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_base64.c	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,111 @@
++/*
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ */
++
++#include <string.h>
++#include <stdlib.h>
++
++#include "mod_websocket_base64.h"
++
++static const char base64_encode_chars[] =
++	"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
++	"abcdefghijklmnopqrstuvwxyz"
++	"0123456789+/";
++
++static const signed char base64_decode_chars[] = {
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1,  62, - 1, - 1, - 1,  63,
++	 52,  53,  54,  55,  56,  57,  58,  59,
++	 60,  61, - 1, - 1, - 1,   0, - 1, - 1,
++	- 1,   0,   1,   2,   3,   4,   5,   6,
++	  7,   8,   9,  10,  11,  12,  13,  14,
++	 15,  16,  17,  18,  19,  20,  21,  22,
++	 23,  24,  25, - 1, - 1, - 1, - 1, - 1,
++	- 1,  26,  27,  28,  29,  30,  31,  32,
++	 33,  34,  35,  36,  37,  38,  39,  40,
++	 41,  42,  43,  44,  45,  46,  47,  48,
++	 49,  50,  51, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1,
++	- 1, - 1, - 1, - 1, - 1, - 1, - 1, - 1};
++
++int mod_websocket_base64_encode(unsigned char **dst, size_t *dstsiz, const unsigned char *src, size_t srcsiz) {
++    unsigned long x = 0UL;
++    int i = 0, l = 0;
++    unsigned char *pdst;
++
++    *dst = (unsigned char *)malloc(srcsiz * 2);
++    if (!*dst) {
++        return -1;
++    }
++    pdst = *dst;
++    *dstsiz = 0;
++    for (; srcsiz > 0; src++, srcsiz--) {
++        x = x << 8 | *src;
++        for (l += 8; l >= 6; l -= 6) {
++            pdst[i++] = base64_encode_chars[(x >> (l - 6)) & 0x3f];
++        }
++    }
++    if (l > 0) {
++        x <<= 6 - l;
++        pdst[i++] = base64_encode_chars[x & 0x3f];
++    }
++    for (; i % 4;) {
++        pdst[i++] = '=';
++    }
++    *dstsiz = i;
++    pdst[i] = '\0';
++    return 0;
++}
++
++int mod_websocket_base64_decode(unsigned char **dst, size_t *dstsiz, const unsigned char *src) {
++    union {
++        unsigned long x;
++        char c[4];
++    } base64;
++    unsigned char *pdst;
++    int i, j = 0;
++    size_t srcsiz = strlen((const char *)src);
++
++    if ((srcsiz % 4) != 0) {
++        return -1;
++    }
++    base64.x = 0UL;
++    *dst = (unsigned char *)malloc(srcsiz);
++    if (!*dst) {
++        return -1;
++    }
++    pdst = *dst;
++    *dstsiz = 0;
++    for (; srcsiz > 0; src+=4, srcsiz-=4) {
++        for (i = 0; i < 4; i++) {
++            if (base64_decode_chars[src[i]] == -1) {
++                return -1;
++            }
++            base64.x = base64.x << 6 | base64_decode_chars[src[i]];
++            j += (src[i] == '=');
++        }
++        for (i = 3; i > j; i--, (*dstsiz)++) {
++            *pdst++ = base64.c[i - 1];
++        }
++    }
++    *pdst = '\0';
++    return 0;
++}
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_base64.h lighttpd-1.4.30/src/mod_websocket_base64.h
+--- lighttpd-1.4.30-orig/src/mod_websocket_base64.h	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_base64.h	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,45 @@
++/**
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * - Redistributions of source code must retain the above copyright notice,
++ *   this list of conditions and the following disclaimer.
++ * - Redistributions in binary form must reproduce the above copyright notice,
++ *   this list of conditions and the following disclaimer in the documentation
++ *   and/or other materials provided with the distribution.
++ * - Neither the name of the 'incremental' nor the names of its contributors
++ *   may be used to endorse or promote products derived from this software
++ *   without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ * THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef	_MOD_WEBSOCKET_BASE64_H_
++#define	_MOD_WEBSOCKET_BASE64_H_
++
++#include "stdio.h"
++
++#ifdef	__cplusplus
++extern "C" {
++#endif
++
++    int mod_websocket_base64_encode(unsigned char **, size_t *, const unsigned char *, size_t);
++    int mod_websocket_base64_decode(unsigned char **, size_t *, const unsigned char *);
++
++#ifdef	__cplusplus
++}
++#endif
++
++#endif	/* _MOD_WEBSOCKET_BASE64_H_ */
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_frame.c lighttpd-1.4.30/src/mod_websocket_frame.c
+--- lighttpd-1.4.30-orig/src/mod_websocket_frame.c	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_frame.c	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,574 @@
++/*
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ */
++
++#include <string.h>
++
++#include "mod_websocket.h"
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++# include "mod_websocket_base64.h"
++#endif
++
++#define MOD_WEBSOCKET_BUFMAX (0x0fffff)
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++# define	MOD_WEBSOCKET_OPCODE_CONT	(0x00)
++# define	MOD_WEBSOCKET_OPCODE_TEXT	(0x01)
++# define	MOD_WEBSOCKET_OPCODE_BIN	(0x02)
++# define	MOD_WEBSOCKET_OPCODE_CLOSE	(0x08)
++# define	MOD_WEBSOCKET_OPCODE_PING	(0x09)
++# define	MOD_WEBSOCKET_OPCODE_PONG	(0x0A)
++
++# define	MOD_WEBSOCKET_FRAME_LEN16	(0x7E)
++# define	MOD_WEBSOCKET_FRAME_LEN63	(0x7F)
++# define	MOD_WEBSOCKET_FRAME_LEN16_CNT	(2)
++# define	MOD_WEBSOCKET_FRAME_LEN63_CNT	(8)
++# define	MOD_WEBSOCKET_MASK_CNT		(4)
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++static int send_ietf_00(handler_ctx *hctx, mod_websocket_frame_type_t type, char *payload, size_t siz) {
++    const char endl = '\0';
++    const unsigned char head = 0x00;
++    const unsigned char tail = 0xff;
++    buffer *b = NULL;
++    char *enc = NULL;
++    size_t encsiz = 0;
++
++    /* allowed null payload for close frame */
++    if (payload == NULL && (type == MOD_WEBSOCKET_FRAME_TYPE_TEXT || type == MOD_WEBSOCKET_FRAME_TYPE_BIN)) {
++        return -1;
++    }
++    if (siz == 0 && (type == MOD_WEBSOCKET_FRAME_TYPE_TEXT || type == MOD_WEBSOCKET_FRAME_TYPE_BIN)) {
++        return 0;
++    }
++    b = chunkqueue_get_append_buffer(hctx->tocli);
++    if (!b) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++        return -1;
++    }
++    switch (type) {
++    case MOD_WEBSOCKET_FRAME_TYPE_TEXT:
++        buffer_append_memory(b, (const char *)&head, 1);
++        buffer_append_memory(b, payload, siz);
++        buffer_append_memory(b, (const char *)&tail, 1);
++        break;
++    case MOD_WEBSOCKET_FRAME_TYPE_BIN:
++        buffer_append_memory(b, (const char *)&head, 1);
++        if (mod_websocket_base64_encode((unsigned char **)&enc, &encsiz,
++                                        (unsigned char *)payload, siz) != 0) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "fail to base64-encode");
++            chunkqueue_reset(hctx->tocli);
++            return -1;
++        }
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "base64-encoded data:", enc, ", size = ", encsiz);
++        buffer_append_memory(b, enc, encsiz);
++        free(enc);
++        buffer_append_memory(b, (const char *)&tail, 1);
++        break;
++    case MOD_WEBSOCKET_FRAME_TYPE_CLOSE:
++        buffer_append_memory(b, (const char *)&tail, 1);
++        buffer_append_memory(b, (const char *)&head, 1);
++        break;
++    default:
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "invalid frame type");
++        return -1;
++    }
++    /* needs '\0' char to send */
++    buffer_append_memory(b, &endl, 1);
++    return 0;
++}
++
++static int recv_ietf_00(handler_ctx *hctx) {
++    const char endl = '\0';
++    char *pff = NULL;
++    chunk *c = NULL;
++    buffer *frame = NULL, *payload = NULL, *b = NULL;
++    size_t i;
++    char *b64 = NULL;
++    size_t b64siz = 0;
++
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++              "recv data from client ( fd =", hctx->con->fd, "), size =", chunkqueue_length(hctx->fromcli));
++    for (c = hctx->fromcli->first; c; c = c->next) {
++        frame = c->mem;
++        if (!frame) {
++            continue;
++        }
++        payload = hctx->frame.payload;
++        i = 0;
++        while (i < frame->used - 1) {
++            switch (hctx->frame.state) {
++            case MOD_WEBSOCKET_FRAME_STATE_INIT:
++                hctx->frame.ctl.siz = 0;
++                if (frame->ptr[i] == 0x00) {
++                    hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_READ_PAYLOAD;
++                    i++;
++                } else if ((unsigned char)frame->ptr[i] == 0xff) {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "recv close frame");
++                    chunkqueue_reset(hctx->tosrv);
++                    chunkqueue_reset(hctx->fromcli);
++                    buffer_reset(payload);
++                    return -1;
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "recv invalid frame");
++                    chunkqueue_reset(hctx->tosrv);
++                    chunkqueue_reset(hctx->fromcli);
++                    buffer_reset(payload);
++                    return -1;
++                }
++                break;
++            case MOD_WEBSOCKET_FRAME_STATE_READ_PAYLOAD:
++                pff = (char *)memchr(&frame->ptr[i], 0xff, frame->used - i - 1);
++                if (pff == NULL) {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG,
++                              "sx", "got continuous payload, size =", frame->used - i - 1);
++                    hctx->frame.ctl.siz += frame->used - i - 1;
++                    if (hctx->frame.ctl.siz > MOD_WEBSOCKET_BUFMAX) {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN,
++                                  "sx", "frame size has been exceeded:", MOD_WEBSOCKET_BUFMAX);
++                        chunkqueue_reset(hctx->tosrv);
++                        chunkqueue_reset(hctx->fromcli);
++                        buffer_reset(payload);
++                        return -1;
++                    }
++                    buffer_append_memory(payload, &frame->ptr[i], frame->used - i - 1);
++                    i += frame->used - i - 1;
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG,
++                              "sx", "got final payload, size =", (pff - &frame->ptr[i]));
++                    hctx->frame.ctl.siz += (pff - &frame->ptr[i]);
++                    if (hctx->frame.ctl.siz > MOD_WEBSOCKET_BUFMAX) {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN,
++                                  "sx", "frame size has beed exceeded:", MOD_WEBSOCKET_BUFMAX);
++                        chunkqueue_reset(hctx->tosrv);
++                        chunkqueue_reset(hctx->fromcli);
++                        buffer_reset(payload);
++                        return -1;
++                    }
++                    buffer_append_memory(payload, &frame->ptr[i], pff - &frame->ptr[i]);
++                    i += (pff - &frame->ptr[i]);
++                    hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_INIT;
++                }
++                i++;
++                if (hctx->frame.type == MOD_WEBSOCKET_FRAME_TYPE_TEXT && payload->used > 0) {
++                    hctx->frame.ctl.siz = 0;
++                    b = chunkqueue_get_append_buffer(hctx->tosrv);
++                    if (!b) {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++                        chunkqueue_reset(hctx->tosrv);
++                        chunkqueue_reset(hctx->fromcli);
++                        buffer_reset(payload);
++                        return -1;
++                    }
++                    buffer_append_memory(b, payload->ptr, payload->used);
++                    /* needs '\0' char to send */
++                    buffer_append_memory(b, &endl, 1);
++                    buffer_reset(payload);
++                } else {
++                    if (hctx->frame.state == MOD_WEBSOCKET_FRAME_STATE_INIT && payload->used > 0) {
++                        b = chunkqueue_get_append_buffer(hctx->tosrv);
++                        if (!b) {
++                            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++                            chunkqueue_reset(hctx->tosrv);
++                            chunkqueue_reset(hctx->fromcli);
++                            buffer_reset(payload);
++                            return -1;
++                        }
++                        payload->ptr[payload->used] = '\0';
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "try to base64 decode:", payload->ptr);
++                        if (mod_websocket_base64_decode((unsigned char **)&b64, &b64siz,
++                                                        (unsigned char *)payload->ptr) != 0) {
++                            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "fail to base64-decode");
++                            chunkqueue_reset(hctx->tosrv);
++                            chunkqueue_reset(hctx->fromcli);
++                            return -1;
++                        }
++                        buffer_append_memory(b, b64, b64siz);
++                        /* needs '\0' char to send */
++                        buffer_append_memory(b, &endl, 1);
++                        buffer_reset(payload);
++                        free(b64);
++                    }
++                }
++                break;
++            default: /* never reach */
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR,"s", "BUG: unknown state");
++                chunkqueue_reset(hctx->tosrv);
++                chunkqueue_reset(hctx->fromcli);
++                buffer_reset(payload);
++                return -1;
++            }
++        }
++    }
++    chunkqueue_reset(hctx->fromcli);
++    return 0;
++}
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++static int send_rfc_6455(handler_ctx *hctx, mod_websocket_frame_type_t type, char *payload, size_t siz) {
++    const char endl = '\0';
++    char c, sizbuf[MOD_WEBSOCKET_FRAME_LEN63 + 1];
++    buffer *b = NULL;
++
++    /* allowed null payload for ping, pong, close frame */
++    if (payload == NULL && (type == MOD_WEBSOCKET_FRAME_TYPE_TEXT || type == MOD_WEBSOCKET_FRAME_TYPE_BIN)) {
++        return -1;
++    }
++    b = chunkqueue_get_append_buffer(hctx->tocli);
++    if (!b) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++        return -1;
++    }
++    switch (type) {
++    case MOD_WEBSOCKET_FRAME_TYPE_TEXT:
++        c = (char)(0x80 | MOD_WEBSOCKET_OPCODE_TEXT);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = text");
++        break;
++    case MOD_WEBSOCKET_FRAME_TYPE_BIN:
++        c = (char)(0x80 | MOD_WEBSOCKET_OPCODE_BIN);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = binary");
++        break;
++    case MOD_WEBSOCKET_FRAME_TYPE_PING:
++        c = (char) (0x80 | MOD_WEBSOCKET_OPCODE_PING);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = ping");
++        break;
++    case MOD_WEBSOCKET_FRAME_TYPE_PONG:
++        c = (char)(0x80 | MOD_WEBSOCKET_OPCODE_PONG);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = pong");
++        break;
++    case MOD_WEBSOCKET_FRAME_TYPE_CLOSE:
++    default:
++        c = (char)(0x80 | MOD_WEBSOCKET_OPCODE_CLOSE);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = close");
++        break;
++    }
++    buffer_append_memory(b, &c, 1);
++
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sx", "payload size =", siz);
++    if (siz < MOD_WEBSOCKET_FRAME_LEN16) {
++        sizbuf[0] = siz;
++        buffer_append_memory(b, sizbuf, 1);
++    } else if (siz <= UINT16_MAX) {
++        sizbuf[0] = MOD_WEBSOCKET_FRAME_LEN16;
++        sizbuf[1] = (siz >> 8) & 0xff;
++        sizbuf[2] = siz & 0xff;
++        buffer_append_memory(b, sizbuf, MOD_WEBSOCKET_FRAME_LEN16_CNT + 1);
++    } else {
++        memset(sizbuf, 0, sizeof(sizbuf));
++        sizbuf[0] = MOD_WEBSOCKET_FRAME_LEN63;
++        sizbuf[5] = (siz >> 24) & 0xff;
++        sizbuf[6] = (siz >> 16) & 0xff;
++        sizbuf[7] = (siz >> 8) & 0xff;
++        sizbuf[8] = siz & 0xff;
++        buffer_append_memory(b, sizbuf, MOD_WEBSOCKET_FRAME_LEN63_CNT + 1);
++    }
++    if (siz == 0) {
++        /* needs '\0' char to send */
++        buffer_append_memory(b, &endl, 1);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sx", "frame size =", b->used - 1);
++        return 0;
++    }
++    buffer_append_memory(b, payload, siz);
++    /* needs '\0' char to send */
++    buffer_append_memory(b, &endl, 1);
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sx", "frame size =", b->used - 1);
++    return 0;
++}
++
++static void unmask_payload(handler_ctx *hctx) {
++    size_t i;
++
++    for (i = 0; i < hctx->frame.payload->used; i++) {
++        hctx->frame.payload->ptr[i] =
++            hctx->frame.payload->ptr[i] ^ hctx->frame.ctl.mask[hctx->frame.ctl.mask_cnt];
++        hctx->frame.ctl.mask_cnt = (hctx->frame.ctl.mask_cnt + 1) % 4;
++    }
++    return;
++}
++
++static int recv_rfc_6455(handler_ctx *hctx) {
++    const char endl = '\0';
++    chunk *c = NULL;
++    buffer *frame = NULL, *payload = NULL, *b = NULL;
++    size_t i;
++
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++              "recv data from client ( fd =", hctx->con->fd, "), size =", chunkqueue_length(hctx->fromcli));
++    for (c = hctx->fromcli->first; c; c = c->next) {
++        frame = c->mem;
++        if (!frame) {
++            continue;
++        }
++        payload = hctx->frame.payload;
++        i = 0;
++        while (i < frame->used - 1) {
++            switch (hctx->frame.state) {
++            case MOD_WEBSOCKET_FRAME_STATE_INIT:
++                switch (frame->ptr[i] & 0x0f) {
++                case MOD_WEBSOCKET_OPCODE_CONT:
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = continue");
++                    hctx->frame.type = hctx->frame.type_before;
++                    break;
++                case MOD_WEBSOCKET_OPCODE_TEXT:
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = text");
++                    hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_TEXT;
++                    hctx->frame.type_before = hctx->frame.type;
++                    break;
++                case MOD_WEBSOCKET_OPCODE_BIN:
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = binary");
++                    hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_BIN;
++                    hctx->frame.type_before = hctx->frame.type;
++                    break;
++                case MOD_WEBSOCKET_OPCODE_PING:
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = ping");
++                    hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_PING;
++                    break;
++                case MOD_WEBSOCKET_OPCODE_PONG:
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = pong");
++                    hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_PONG;
++                    break;
++                case MOD_WEBSOCKET_OPCODE_CLOSE:
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "type = close");
++                    hctx->frame.type = MOD_WEBSOCKET_FRAME_TYPE_CLOSE;
++                    chunkqueue_reset(hctx->fromcli);
++                    return -1;
++                    break;
++                default:
++                    chunkqueue_reset(hctx->fromcli);
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "type is invalid");
++                    return -1;
++                    break;
++                }
++                i++;
++                hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_READ_LENGTH;
++                break;
++            case MOD_WEBSOCKET_FRAME_STATE_READ_LENGTH:
++                if ((frame->ptr[i] & 0x80) != 0x80) {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "payload was not masked");
++                    chunkqueue_reset(hctx->fromcli);
++                    return -1;
++                }
++                hctx->frame.ctl.mask_cnt = 0;
++                hctx->frame.ctl.siz = (uint64_t)(frame->ptr[i] & 0x7f);
++                if (hctx->frame.ctl.siz == 0) {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG,
++                              "sx", "specified payload size =", hctx->frame.ctl.siz);
++                    hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_READ_MASK;
++                } else if (hctx->frame.ctl.siz == MOD_WEBSOCKET_FRAME_LEN16) {
++                    hctx->frame.ctl.siz = 0;
++                    hctx->frame.ctl.siz_cnt = MOD_WEBSOCKET_FRAME_LEN16_CNT;
++                    hctx->frame.state =
++                        MOD_WEBSOCKET_FRAME_STATE_READ_EX_LENGTH;
++                } else if (hctx->frame.ctl.siz == MOD_WEBSOCKET_FRAME_LEN63) {
++                    hctx->frame.ctl.siz = 0;
++                    hctx->frame.ctl.siz_cnt = MOD_WEBSOCKET_FRAME_LEN63_CNT;
++                    hctx->frame.state =
++                        MOD_WEBSOCKET_FRAME_STATE_READ_EX_LENGTH;
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG,
++                              "sx", "specified payload size =", hctx->frame.ctl.siz);
++                    hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_READ_MASK;
++                }
++                i++;
++                break;
++            case MOD_WEBSOCKET_FRAME_STATE_READ_EX_LENGTH:
++                hctx->frame.ctl.siz =
++                    (hctx->frame.ctl.siz << 8) + (frame->ptr[i] & 0xff);
++                hctx->frame.ctl.siz_cnt--;
++                if (hctx->frame.ctl.siz_cnt <= 0) {
++                    if (hctx->frame.type == MOD_WEBSOCKET_FRAME_TYPE_PING &&
++                        hctx->frame.ctl.siz > MOD_WEBSOCKET_BUFMAX) {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN,
++                                  "sx", "frame size has beed exceeded:",
++                                  MOD_WEBSOCKET_BUFMAX);
++                        chunkqueue_reset(hctx->fromcli);
++                        return -1;
++                    }
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sx", "specified payload size =", hctx->frame.ctl.siz);
++                    hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_READ_MASK;
++                }
++                i++;
++                break;
++            case MOD_WEBSOCKET_FRAME_STATE_READ_MASK:
++                hctx->frame.ctl.mask[hctx->frame.ctl.mask_cnt] = frame->ptr[i];
++                hctx->frame.ctl.mask_cnt++;
++                if (hctx->frame.ctl.mask_cnt >= MOD_WEBSOCKET_MASK_CNT) {
++                    hctx->frame.ctl.mask_cnt = 0;
++                    if (hctx->frame.type == MOD_WEBSOCKET_FRAME_TYPE_PING &&
++                        hctx->frame.ctl.siz == 0) {
++                        mod_websocket_frame_send(hctx,
++                                                 MOD_WEBSOCKET_FRAME_TYPE_PONG,
++                                                 NULL, 0);
++                    }
++                    if (hctx->frame.ctl.siz == 0) {
++                        hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_INIT;
++                    } else {
++                        hctx->frame.state =
++                            MOD_WEBSOCKET_FRAME_STATE_READ_PAYLOAD;
++                    }
++                }
++                i++;
++                break;
++            case MOD_WEBSOCKET_FRAME_STATE_READ_PAYLOAD:
++                /* hctx->frame.ctl.siz <= SIZE_MAX */
++                if (hctx->frame.ctl.siz <= (uint64_t)(frame->used - i - 1)) {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG,
++                              "sx", "read payload, size =", hctx->frame.ctl.siz);
++                    buffer_append_memory(payload, &frame->ptr[i],
++                                         (size_t)(hctx->frame.ctl.siz & SIZE_MAX));
++                    i += (size_t)(hctx->frame.ctl.siz & SIZE_MAX);
++                    hctx->frame.ctl.siz = 0;
++                    hctx->frame.state = MOD_WEBSOCKET_FRAME_STATE_INIT;
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG,
++                              "sx", "rest of frame size =", frame->used - i - 1);
++                /* SIZE_MAX < hctx->frame.ctl.siz */
++                } else {
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG,
++                              "sx", "read payload, size =",
++                              frame->used - i - 1);
++                    buffer_append_memory(payload, &frame->ptr[i], frame->used - i - 1);
++                    hctx->frame.ctl.siz -= (uint64_t)(frame->used - i - 1);
++                    i += (frame->used - i - 1);
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sx", "rest of payload size =", hctx->frame.ctl.siz);
++                }
++                switch (hctx->frame.type) {
++                case MOD_WEBSOCKET_FRAME_TYPE_TEXT:
++                case MOD_WEBSOCKET_FRAME_TYPE_BIN:
++                    unmask_payload(hctx);
++                    b = chunkqueue_get_append_buffer(hctx->tosrv);
++                    if (!b) {
++                        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++                        chunkqueue_reset(hctx->fromcli);
++                        buffer_reset(payload);
++                        return -1;
++                    }
++                    buffer_append_memory(b, payload->ptr, payload->used);
++                    buffer_reset(payload);
++                    /* needs '\0' char to send */
++                    buffer_append_memory(b, &endl, 1);
++                    break;
++                case MOD_WEBSOCKET_FRAME_TYPE_PING:
++                    if (hctx->frame.ctl.siz == 0) {
++                        unmask_payload(hctx);
++                        mod_websocket_frame_send(hctx,
++                                                 MOD_WEBSOCKET_FRAME_TYPE_PONG,
++                                                 payload->ptr, payload->used);
++                        buffer_reset(payload);
++                    }
++                    break;
++                case MOD_WEBSOCKET_FRAME_TYPE_PONG:
++                    buffer_reset(payload);
++                    break;
++                case MOD_WEBSOCKET_FRAME_TYPE_CLOSE:
++                default:
++                    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "BUG: invalid frame type");
++                    chunkqueue_reset(hctx->fromcli);
++                    buffer_reset(payload);
++                    return -1;
++                }
++                break;
++            default:
++                DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "BUG: invalid state");
++                chunkqueue_reset(hctx->fromcli);
++                buffer_reset(payload);
++                return -1;
++            }
++        }
++    }
++    chunkqueue_reset(hctx->fromcli);
++    return 0;
++}
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++static int send_forward(handler_ctx *hctx, char *payload, size_t siz) {
++    const char endl = '\0';
++    buffer *b = NULL;
++
++    if (payload == NULL || siz == 0) {
++        return 0;
++    }
++    b = chunkqueue_get_append_buffer(hctx->tocli);
++    if (!b) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++        return -1;
++    }
++    buffer_append_memory(b, payload, siz);
++    /* needs '\0' char to send */
++    buffer_append_memory(b, &endl, 1);
++    return 0;
++}
++
++static int recv_forward(handler_ctx *hctx) {
++    chunk *c = NULL;
++    buffer *frame = NULL, *b = NULL;
++
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "sdsx",
++              "recv data from client ( fd =", hctx->con->fd,
++              "), size =", chunkqueue_length(hctx->fromcli));
++    for (c = hctx->fromcli->first; c; c = c->next) {
++        frame = c->mem;
++        if (!frame) {
++            continue;
++        }
++        b = chunkqueue_get_append_buffer(hctx->tosrv);
++        if (!b) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++            return -1;
++        }
++        buffer_append_memory(b, frame->ptr, frame->used);
++    }
++    chunkqueue_reset(hctx->fromcli);
++    return 0;
++}
++
++int mod_websocket_frame_send(handler_ctx *hctx, mod_websocket_frame_type_t type,
++                             char *payload, size_t siz) {
++    if (!hctx) {
++        return -1;
++    }
++    if (hctx->mode == MOD_WEBSOCKET_WEBSOCKET_PROXY) {
++        return send_forward(hctx, payload, siz);
++    } else if (hctx->mode == MOD_WEBSOCKET_TCP_PROXY) {
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++        if (hctx->handshake.version == 0) {
++            return send_ietf_00(hctx, type, payload, siz);
++        }
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++        if (hctx->handshake.version >= 8) {
++            return send_rfc_6455(hctx, type, payload, siz);
++        }
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++    }
++    return -1;
++}
++
++int mod_websocket_frame_recv(handler_ctx *hctx) {
++    if (!hctx) {
++        return -1;
++    }
++    if (hctx->mode == MOD_WEBSOCKET_WEBSOCKET_PROXY) {
++        return recv_forward(hctx);
++    } else if (hctx->mode == MOD_WEBSOCKET_TCP_PROXY) {
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++        if (hctx->handshake.version == 0) {
++            return recv_ietf_00(hctx);
++        }
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++        if (hctx->handshake.version >= 8) {
++            return recv_rfc_6455(hctx);
++        }
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++    }
++    return -1;
++}
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_handshake.c lighttpd-1.4.30/src/mod_websocket_handshake.c
+--- lighttpd-1.4.30-orig/src/mod_websocket_handshake.c	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_handshake.c	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,547 @@
++/*
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ */
++
++#include "mod_websocket.h"
++#include "mod_websocket_socket.h"
++
++# include <string.h>
++
++#ifdef HAVE_PCRE_H
++# include <pcre.h>
++#endif /* HAVE_PCRE_H */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++# include <ctype.h>
++# include <poll.h>
++# include <unistd.h>
++# include "md5.h"
++
++# define	SEC_WEBSOCKET_KEY3_STRLEN	(8)
++# define	MD5_STRLEN			(16)
++
++# if defined (LIGHTTPD_VERSION_ID) && (LIGHTTPD_VERSION_ID >= (1 << 16 | 4 << 8 | 29))
++typedef li_MD5_CTX MD5_CTX;
++#  define	MD5_Init	li_MD5_Init
++#  define	MD5_Update	li_MD5_Update
++#  define	MD5_Final	li_MD5_Final
++# endif	/* (LIGHTTPD_VERSION_ID) && (LIGHTTPD_VERSION_ID >= (1 << 16 | 4 << 8 | 29)) */
++
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++# include <limits.h>
++
++# ifdef HAVE_STDINT_H
++#  include <stdint.h>
++# endif
++
++# ifdef USE_OPENSSL
++#  include <openssl/sha.h>
++typedef unsigned char sha1_byte;
++# else
++#  include "mod_websocket_sha1.h"
++#  define	SHA_DIGEST_LENGTH	SHA1_DIGEST_LENGTH
++# endif
++
++# include "mod_websocket_base64.h"
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++static int get_key3(handler_ctx *hctx) {
++    int ret, timeout = 1000; /* XXX: poll timeout = 1000ms */
++    char key3[SEC_WEBSOCKET_KEY3_STRLEN];
++    chunkqueue *q;
++    const char *body = NULL;
++    struct pollfd pfd;
++    ssize_t siz;
++
++    q = hctx->con->read_queue;
++    if (chunkqueue_is_empty(q)) {
++        pfd.fd = hctx->con->fd;
++        pfd.events = POLLIN;
++        ret = poll(&pfd, 1, timeout);
++        if (ret > 0 && pfd.revents & POLLIN) {
++            siz = read(hctx->con->fd, key3, SEC_WEBSOCKET_KEY3_STRLEN);
++            if (siz != SEC_WEBSOCKET_KEY3_STRLEN) {
++                return -1;
++            }
++            buffer_copy_string_len(hctx->handshake.key3, key3, SEC_WEBSOCKET_KEY3_STRLEN);
++        } else {
++            return -1;
++        }
++    } else {
++        body = &q->first->mem->ptr[q->first->offset];
++        buffer_copy_string_len(hctx->handshake.key3, body, SEC_WEBSOCKET_KEY3_STRLEN);
++    }
++    return 0;
++}
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++static mod_websocket_bool_t is_allowed_origin(handler_ctx *hctx) {
++    size_t i;
++    data_unset *du = NULL;
++    array *allowed_origins = NULL;
++    data_string *allowed_origin = NULL;
++
++#ifdef	HAVE_PCRE_H
++    pcre *re = NULL;
++    int rc = 0;
++    const char *err_str;
++    int err_off;
++# define	N	(10)
++    int ovec[N * 3];
++#endif	/* HAVE_PCRE_H */
++
++    du = array_get_element(hctx->ext->value, "origins");
++    if (!du || du->type != TYPE_ARRAY) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "allowed origins are not specified");
++        return MOD_WEBSOCKET_TRUE;
++    }
++    allowed_origins = ((data_array *)du)->value;
++    if (!allowed_origins || allowed_origins->used == 0) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "s", "allowed origins are not specified");
++        return MOD_WEBSOCKET_TRUE;
++    }
++    for (i = allowed_origins->used; i > 0; i--) {
++        du = allowed_origins->data[i - 1];
++        if (du->type != TYPE_STRING) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN, "s", "allowed origin configuration is invalid");
++            continue;
++        }
++        allowed_origin = (data_string *)du;
++        if (buffer_is_empty(allowed_origin->value)) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN, "s", "allowed origin value is empty");
++            continue;
++        }
++
++#ifdef	HAVE_PCRE_H
++        re = pcre_compile(allowed_origin->value->ptr, 0, &err_str, &err_off, NULL);
++        if (!re) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_WARN, "ss", allowed_origin->value->ptr, "is invalid RegExp");
++            continue;
++        }
++        rc = pcre_exec(re, NULL, hctx->handshake.origin->ptr, hctx->handshake.origin->used - 1,
++                       0, PCRE_ANCHORED, ovec, N);
++        free(re);
++        if (rc > 0) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sss",
++                      hctx->handshake.origin->ptr, "is match allowed origin:", allowed_origin->value->ptr);
++            return MOD_WEBSOCKET_TRUE;
++        }
++# undef	N
++#else
++        if (buffer_is_equal(allowed_origin->value, hctx->handshake.origin)) {
++            DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "sss",
++                      hctx->handshake.origin->ptr, "is match allowed origin:", allowed_origin->value->ptr);
++            return MOD_WEBSOCKET_TRUE;
++        }
++#endif	/* HAVE_PCRE_H */
++
++    }
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_INFO, "ss",
++              hctx->handshake.origin->ptr, "is not match any allowed origins");
++    return MOD_WEBSOCKET_FALSE;
++}
++
++mod_websocket_errno_t mod_websocket_handshake_check_request(handler_ctx *hctx) {
++    size_t i;
++    array *hdrs;
++    data_string *hdr = NULL;
++    mod_websocket_handshake_t *handshake;
++    buffer *version_hdr_value = NULL;
++
++    if (hctx == NULL || hctx->con == NULL) {
++        return MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++    }
++    hdrs = hctx->con->request.headers;
++    handshake = &hctx->handshake;
++
++    /* store necessary headers */
++    for (i = hdrs->used; i > 0; i--) {
++        hdr = (data_string *)hdrs->data[i - 1];
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Host"))) {
++            handshake->host = hdr->value;
++        }
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Sec-WebSocket-Version"))) {
++            version_hdr_value = hdr->value;
++        }
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Origin")) ||
++            buffer_is_equal_string(hdr->key, CONST_STR_LEN("Sec-WebSocket-Origin"))) {
++            handshake->origin = hdr->value;
++        }
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Sec-WebSocket-Key1"))) {
++            handshake->key1 = hdr->value;
++        }
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Sec-WebSocket-Key2"))) {
++            handshake->key2 = hdr->value;
++        }
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("Sec-WebSocket-Key"))) {
++            handshake->key = hdr->value;
++        }
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++    }
++    if (buffer_is_empty(handshake->host)) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "Host header does not exist");
++        return MOD_WEBSOCKET_BAD_REQUEST;
++    }
++    if (buffer_is_empty(handshake->origin)) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "Origin header does not exist");
++        return MOD_WEBSOCKET_BAD_REQUEST;
++    }
++    if (is_allowed_origin(hctx) != MOD_WEBSOCKET_TRUE) {
++        return MOD_WEBSOCKET_FORBIDDEN;
++    }
++    if (buffer_is_empty(version_hdr_value)) {
++        handshake->version = 0;
++    } else {
++        handshake->version = (int)(strtol(version_hdr_value->ptr, NULL, 10) & INT_MAX);
++    }
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++    if (handshake->version == 0 && get_key3(hctx) < 0) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "Sec-WebSocket-Key is invalid");
++        return MOD_WEBSOCKET_BAD_REQUEST;
++    }
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++    return MOD_WEBSOCKET_OK;
++}
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++static uint32_t count_spc(buffer *b) {
++    size_t i;
++    uint32_t c = 0;
++
++    for (i = b->used; i > 0; i--) {
++        c += (b->ptr[i - 1] == ' ');
++    }
++    return c;
++}
++
++static int get_key_number(uint32_t *ret, buffer *b) {
++#define	UINT32_MAX_STRLEN	(10)
++    char tmp[UINT32_MAX_STRLEN + 1];
++    size_t i, j = 0;
++    unsigned long n;
++    uint32_t s;
++
++    memset(tmp, 0, sizeof(tmp));
++    for (i = 0; i < b->used; i++) {
++        if (isdigit((int)b->ptr[i])) {
++            tmp[j] = b->ptr[i];
++            j++;
++        }
++        if (UINT32_MAX_STRLEN < j) {
++            return -1;
++        }
++    }
++    n = strtoul(tmp, NULL, 10);
++    if (UINT32_MAX < n) {
++        return -1;
++    }
++    s = count_spc(b);
++    if (s == 0) {
++        return -1;
++    }
++    *ret = (uint32_t)(n / s);
++    return 0;
++#undef	UINT32_MAX_STRLEN
++}
++
++static int create_MD5_sum(unsigned char *md5sum, handler_ctx *hctx) {
++    unsigned char buf[MD5_STRLEN];
++    uint32_t k1 = 0, k2 = 0;
++    MD5_CTX ctx;
++
++    if (buffer_is_empty(hctx->handshake.key1) ||
++        buffer_is_empty(hctx->handshake.key2) ||
++        buffer_is_empty(hctx->handshake.key3)) {
++        return -1;
++    }
++    if (get_key_number(&k1, hctx->handshake.key1) < 0 ||
++        get_key_number(&k2, hctx->handshake.key2) < 0 ||
++        hctx->handshake.key3->used < SEC_WEBSOCKET_KEY3_STRLEN) {
++        return -1;
++    }
++    buf[0] = (k1 >> 24) & 0x0ff;
++    buf[1] = (k1 >> 16) & 0x0ff;
++    buf[2] = (k1 >>  8) & 0x0ff;
++    buf[3] =  k1        & 0x0ff;
++    buf[4] = (k2 >> 24) & 0x0ff;
++    buf[5] = (k2 >> 16) & 0x0ff;
++    buf[6] = (k2 >>  8) & 0x0ff;
++    buf[7] =  k2        & 0x0ff;
++    memcpy(&buf[8], hctx->handshake.key3->ptr, SEC_WEBSOCKET_KEY3_STRLEN);
++    MD5_Init(&ctx);
++    MD5_Update(&ctx, buf, sizeof(buf));
++    MD5_Final(md5sum, &ctx);
++    return 0;
++}
++
++static mod_websocket_errno_t create_response_ietf_00(handler_ctx *hctx) {
++    const char *const_hdr = "HTTP/1.1 101 Web Socket Protocol Handshake\r\n"
++                            "Upgrade: WebSocket\r\n"
++                            "Connection: Upgrade\r\n";
++    buffer *resp = NULL;
++    unsigned char md5sum[MD5_STRLEN];
++
++    /* calc MD5 sum from keys */
++    if (create_MD5_sum(md5sum, hctx) < 0) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "Sec-WebSocket-Key is invalid");
++        return MOD_WEBSOCKET_BAD_REQUEST;
++    }
++    resp = chunkqueue_get_append_buffer(hctx->tocli);
++    if (resp == NULL) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++        return MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++    }
++    buffer_append_string(resp, const_hdr);
++    /* Sec-WebSocket-Origin header */
++    if (!buffer_is_empty(hctx->handshake.origin)) {
++        buffer_append_string(resp, "Sec-WebSocket-Origin: ");
++        buffer_append_string_buffer(resp, hctx->handshake.origin);
++        buffer_append_string(resp, "\r\n");
++    } else {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "Origin header is invalid");
++        return MOD_WEBSOCKET_BAD_REQUEST;
++    }
++    /* Sec-WebSocket-Location header */
++    buffer_append_string(resp, "Sec-WebSocket-Location: ");
++    if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++        buffer_append_string(resp, "wss://");
++    } else {
++        buffer_append_string(resp, "ws://");
++    }
++    if (!buffer_is_empty(hctx->handshake.host)) {
++        buffer_append_string_buffer(resp, hctx->handshake.host);
++    } else {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "Host header does not exist");
++        return MOD_WEBSOCKET_BAD_REQUEST;
++    }
++    buffer_append_string_buffer(resp, hctx->con->uri.path);
++    buffer_append_string(resp, "\r\n\r\n");
++    buffer_append_string_len(resp, (char *)md5sum, MD5_STRLEN);
++    return MOD_WEBSOCKET_OK;
++}
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++static mod_websocket_errno_t create_response_rfc_6455(handler_ctx *hctx) {
++    const char *const_hdr = "HTTP/1.1 101 Switching Protocols\r\n"
++                            "Upgrade: websocket\r\n"
++                            "Connection: Upgrade\r\n";
++    buffer *key;
++    buffer *resp = NULL;
++    SHA_CTX sha;
++    unsigned char sha_digest[SHA_DIGEST_LENGTH];
++    unsigned char *accept_body;
++    size_t accept_body_siz;
++    data_unset *du;
++
++    if (buffer_is_empty(hctx->handshake.key)) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "Sec-WebSocket-Key is invalid");
++        return MOD_WEBSOCKET_BAD_REQUEST;
++    }
++
++    key = buffer_init_buffer(hctx->handshake.key);
++/* refer: RFC-6455 Sec.1.3 Opening Handshake */
++#define	GUID	"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++    buffer_append_string(key, GUID);
++#undef GUID
++
++    /* get SHA1 hash of key */
++    SHA1_Init(&sha);
++    SHA1_Update(&sha, (sha1_byte *)key->ptr, key->used - 1);
++    SHA1_Final(sha_digest, &sha);
++    buffer_free(key);
++
++    /* get base64 encoded SHA1 hash */
++    if (mod_websocket_base64_encode(&accept_body, &accept_body_siz, sha_digest, SHA_DIGEST_LENGTH) < 0) {
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++        return MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++    }
++
++    resp = chunkqueue_get_append_buffer(hctx->tocli);
++    if (resp == NULL) {
++        free(accept_body);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "no memory");
++        return MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++    }
++    buffer_append_string(resp, const_hdr);
++    buffer_append_string(resp, "Sec-WebSocket-Accept: ");
++    buffer_append_string_len(resp, (char *)accept_body, accept_body_siz);
++    free(accept_body);
++    buffer_append_string(resp, "\r\n");
++
++    du = array_get_element(hctx->ext->value, "subproto");
++    if (du && du->type == TYPE_STRING) {
++        buffer_append_string(resp, "Sec-WebSocket-Protocol: ");
++        buffer_append_string_buffer(resp, ((data_string *)du)->value);
++        buffer_append_string(resp, "\r\n");
++    }
++    buffer_append_string(resp, "\r\n");
++    return MOD_WEBSOCKET_OK;
++}
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++mod_websocket_errno_t mod_websocket_handshake_create_response(handler_ctx *hctx) {
++    if (!hctx) {
++        return MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++    }
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "send handshake response");
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++    if (hctx->handshake.version == 0) {
++        return create_response_ietf_00(hctx);
++    }
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++#ifdef	_MOD_WEBSOCKET_SPEC_RFC_6455_
++    if (hctx->handshake.version >= 8) {
++        return create_response_rfc_6455(hctx);
++    }
++#endif	/* _MOD_WEBSOCKET_SPEC_RFC_6455_ */
++
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_ERR, "s", "not supported WebSocket Version");
++    return MOD_WEBSOCKET_SERVICE_UNAVAILABLE;
++}
++
++/*
++ * append X-Forwarded-{For, Proto, Port}
++ */
++static void append_x_forwarded_headers(handler_ctx *hctx) {
++    size_t i;
++    mod_websocket_sockinfo_t info;
++    array *hdrs;
++    data_string *hdr = NULL;
++    data_string *x_forwarded_proto = NULL;
++    data_string *x_forwarded_for = NULL;
++    data_string *x_forwarded_port = NULL;
++    buffer *addr = NULL;
++    buffer *port = NULL;
++
++    if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++
++#ifdef USE_OPENSSL
++        if (mod_websocket_getsockinfo(SSL_get_fd(hctx->con->ssl), &info) < 0) {
++            addr = buffer_init_string("unknown");
++            port = buffer_init_string("unknown");
++        } else {
++            addr = buffer_init_string(info.peer.addr);
++            port = buffer_init();
++            buffer_append_long(port, info.peer.port);
++        }
++#else
++        addr = buffer_init_string("unknown");
++        port = buffer_init_string("unknown");
++#endif
++
++    } else {
++        if (mod_websocket_getsockinfo(hctx->con->fd, &info) < 0) {
++            addr = buffer_init_string("unknown");
++            port = buffer_init_string("unknown");
++        } else {
++            addr = buffer_init_string(info.peer.addr);
++            port = buffer_init();
++            buffer_append_long(port, info.peer.port);
++        }
++    }
++    hdrs = hctx->con->request.headers;
++    for (i = hdrs->used; i > 0; i--) {
++        hdr = (data_string *)hdrs->data[i - 1];
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("X-Forwarded-Proto"))) {
++            x_forwarded_proto = hdr;
++        }
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("X-Forwarded-For"))) {
++            x_forwarded_for = hdr;
++        }
++        if (buffer_is_equal_string(hdr->key, CONST_STR_LEN("X-Forwarded-Port"))) {
++            x_forwarded_port = hdr;
++        }
++    }
++    if (x_forwarded_proto == NULL) {
++        x_forwarded_proto = data_string_init();
++        buffer_append_string(x_forwarded_proto->key, "X-Forwarded-Proto");
++        if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++            buffer_append_string(x_forwarded_proto->value, "https");
++        } else {
++            buffer_append_string(x_forwarded_proto->value, "http");
++        }
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "append X-Forwarded-Proto:", x_forwarded_proto->value->ptr);
++        array_insert_unique(hdrs, (data_unset *)x_forwarded_proto);
++    } else {
++        if (((server_socket *)(hctx->con->srv_socket))->is_ssl) {
++            buffer_append_string(x_forwarded_proto->value, ", https");
++        } else {
++            buffer_append_string(x_forwarded_proto->value, ", http");
++        }
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "X-Forwarded-Proto:", x_forwarded_proto->value->ptr);
++    }
++    if (x_forwarded_for == NULL) {
++        x_forwarded_for = data_string_init();
++        buffer_append_string(x_forwarded_for->key, "X-Forwarded-For");
++        buffer_append_string_buffer(x_forwarded_for->value, addr);
++        buffer_append_string(x_forwarded_for->value, ":");
++        buffer_append_string_buffer(x_forwarded_for->value, port);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "append X-Forwarded-For:", x_forwarded_for->value->ptr);
++        array_insert_unique(hdrs, (data_unset *)x_forwarded_for);
++    } else {
++        buffer_append_string(x_forwarded_for->value, ", ");
++        buffer_append_string_buffer(x_forwarded_for->value, addr);
++        buffer_append_string(x_forwarded_for->value, ":");
++        buffer_append_string_buffer(x_forwarded_for->value, port);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "X-Forwarded-For:", x_forwarded_for->value->ptr);
++    }
++    if (x_forwarded_port == NULL) {
++        x_forwarded_port = data_string_init();
++        buffer_append_string(x_forwarded_port->key, "X-Forwarded-Port");
++        buffer_append_string_buffer(x_forwarded_port->value, port);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "append X-Forwarded-Port:", x_forwarded_port->value->ptr);
++        array_insert_unique(hdrs, (data_unset *)x_forwarded_port);
++    } else {
++        buffer_append_string(x_forwarded_port->value, ", ");
++        buffer_append_string_buffer(x_forwarded_port->value, port);
++        DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "ss", "X-Forwarded-Port:", x_forwarded_port->value->ptr);
++    }
++    buffer_free(addr);
++    buffer_free(port);
++    return;
++}
++
++mod_websocket_errno_t mod_websocket_handshake_forward_request(handler_ctx *hctx) {
++    size_t i;
++    array *hdrs;
++    data_string *hdr = NULL;
++    buffer *new_request;
++
++    if (!hctx || !hctx->con || !hctx->tosrv) {
++        return MOD_WEBSOCKET_INTERNAL_SERVER_ERROR;
++    }
++    append_x_forwarded_headers(hctx);
++    new_request = chunkqueue_get_append_buffer(hctx->tosrv);
++    buffer_append_string_buffer(new_request, hctx->con->request.request_line);
++    buffer_append_string(new_request, "\r\n");
++    hdrs = hctx->con->request.headers;
++    for (i = 0; i < hdrs->used; i++) {
++        hdr = (data_string *)hdrs->data[i];
++        buffer_append_string_buffer(new_request, hdr->key);
++        buffer_append_string(new_request, ": ");
++        buffer_append_string_buffer(new_request, hdr->value);
++        buffer_append_string(new_request, "\r\n");
++    }
++    buffer_append_string(new_request, "\r\n");
++
++#ifdef	_MOD_WEBSOCKET_SPEC_IETF_00_
++    buffer_append_string_len(new_request, hctx->handshake.key3->ptr, SEC_WEBSOCKET_KEY3_STRLEN);
++#endif	/* _MOD_WEBSOCKET_SPEC_IETF_00_ */
++
++    DEBUG_LOG(MOD_WEBSOCKET_LOG_DEBUG, "s", "forward handshake request");
++    return MOD_WEBSOCKET_OK;
++}
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_sha1.c lighttpd-1.4.30/src/mod_websocket_sha1.c
+--- lighttpd-1.4.30-orig/src/mod_websocket_sha1.c	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_sha1.c	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,160 @@
++/*
++ * sha1.c
++ *
++ * Originally witten by Steve Reid <steve@edmweb.com>
++ *
++ * Modified by Aaron D. Gifford <agifford@infowest.com>
++ *
++ * NO COPYRIGHT - THIS IS 100% IN THE PUBLIC DOMAIN
++ *
++ * The original unmodified version is available at:
++ *    ftp://ftp.funet.fi/pub/crypt/hash/sha/sha1.c
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR(S) OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#include <string.h>
++
++#include "mod_websocket_sha1.h"
++
++#define rol(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
++
++/* blk0() and blk() perform the initial expand. */
++/* I got the idea of expanding during the round function from SSLeay */
++
++#ifdef LITTLE_ENDIAN
++#define blk0(i) (block->l[i] = (rol(block->l[i],24)&(sha1_quadbyte)0xFF00FF00) \
++    |(rol(block->l[i],8)&(sha1_quadbyte)0x00FF00FF))
++#else
++#define blk0(i) block->l[i]
++#endif
++
++#define blk(i) (block->l[i&15] = rol(block->l[(i+13)&15]^block->l[(i+8)&15] \
++    ^block->l[(i+2)&15]^block->l[i&15],1))
++
++/* (R0+R1), R2, R3, R4 are the different operations used in SHA1 */
++#define R0(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk0(i)+0x5A827999+rol(v,5);w=rol(w,30);
++#define R1(v,w,x,y,z,i) z+=((w&(x^y))^y)+blk(i)+0x5A827999+rol(v,5);w=rol(w,30);
++#define R2(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0x6ED9EBA1+rol(v,5);w=rol(w,30);
++#define R3(v,w,x,y,z,i) z+=(((w|x)&y)|(w&x))+blk(i)+0x8F1BBCDC+rol(v,5);w=rol(w,30);
++#define R4(v,w,x,y,z,i) z+=(w^x^y)+blk(i)+0xCA62C1D6+rol(v,5);w=rol(w,30);
++
++typedef union _BYTE64QUAD16 {
++    sha1_byte c[64];
++    sha1_quadbyte l[16];
++} BYTE64QUAD16;
++
++/* Hash a single 512-bit block. This is the core of the algorithm. */
++void SHA1_Transform(sha1_quadbyte state[5], sha1_byte buffer[64]) {
++    sha1_quadbyte a, b, c, d, e;
++    BYTE64QUAD16 src;
++    BYTE64QUAD16 *block;
++
++    /* slow but cast-align */
++    memcpy(src.c, buffer, sizeof(sha1_byte) * 64);
++    block = &src;
++    /* Copy context->state[] to working vars */
++    a = state[0];
++    b = state[1];
++    c = state[2];
++    d = state[3];
++    e = state[4];
++    /* 4 rounds of 20 operations each. Loop unrolled. */
++    R0(a,b,c,d,e, 0); R0(e,a,b,c,d, 1); R0(d,e,a,b,c, 2); R0(c,d,e,a,b, 3);
++    R0(b,c,d,e,a, 4); R0(a,b,c,d,e, 5); R0(e,a,b,c,d, 6); R0(d,e,a,b,c, 7);
++    R0(c,d,e,a,b, 8); R0(b,c,d,e,a, 9); R0(a,b,c,d,e,10); R0(e,a,b,c,d,11);
++    R0(d,e,a,b,c,12); R0(c,d,e,a,b,13); R0(b,c,d,e,a,14); R0(a,b,c,d,e,15);
++    R1(e,a,b,c,d,16); R1(d,e,a,b,c,17); R1(c,d,e,a,b,18); R1(b,c,d,e,a,19);
++    R2(a,b,c,d,e,20); R2(e,a,b,c,d,21); R2(d,e,a,b,c,22); R2(c,d,e,a,b,23);
++    R2(b,c,d,e,a,24); R2(a,b,c,d,e,25); R2(e,a,b,c,d,26); R2(d,e,a,b,c,27);
++    R2(c,d,e,a,b,28); R2(b,c,d,e,a,29); R2(a,b,c,d,e,30); R2(e,a,b,c,d,31);
++    R2(d,e,a,b,c,32); R2(c,d,e,a,b,33); R2(b,c,d,e,a,34); R2(a,b,c,d,e,35);
++    R2(e,a,b,c,d,36); R2(d,e,a,b,c,37); R2(c,d,e,a,b,38); R2(b,c,d,e,a,39);
++    R3(a,b,c,d,e,40); R3(e,a,b,c,d,41); R3(d,e,a,b,c,42); R3(c,d,e,a,b,43);
++    R3(b,c,d,e,a,44); R3(a,b,c,d,e,45); R3(e,a,b,c,d,46); R3(d,e,a,b,c,47);
++    R3(c,d,e,a,b,48); R3(b,c,d,e,a,49); R3(a,b,c,d,e,50); R3(e,a,b,c,d,51);
++    R3(d,e,a,b,c,52); R3(c,d,e,a,b,53); R3(b,c,d,e,a,54); R3(a,b,c,d,e,55);
++    R3(e,a,b,c,d,56); R3(d,e,a,b,c,57); R3(c,d,e,a,b,58); R3(b,c,d,e,a,59);
++    R4(a,b,c,d,e,60); R4(e,a,b,c,d,61); R4(d,e,a,b,c,62); R4(c,d,e,a,b,63);
++    R4(b,c,d,e,a,64); R4(a,b,c,d,e,65); R4(e,a,b,c,d,66); R4(d,e,a,b,c,67);
++    R4(c,d,e,a,b,68); R4(b,c,d,e,a,69); R4(a,b,c,d,e,70); R4(e,a,b,c,d,71);
++    R4(d,e,a,b,c,72); R4(c,d,e,a,b,73); R4(b,c,d,e,a,74); R4(a,b,c,d,e,75);
++    R4(e,a,b,c,d,76); R4(d,e,a,b,c,77); R4(c,d,e,a,b,78); R4(b,c,d,e,a,79);
++    /* Add the working vars back into context.state[] */
++    state[0] += a;
++    state[1] += b;
++    state[2] += c;
++    state[3] += d;
++    state[4] += e;
++    /* Wipe variables */
++    a = b = c = d = e = 0;
++}
++
++
++/* SHA1_Init - Initialize new context */
++void SHA1_Init(SHA_CTX* context) {
++    /* SHA1 initialization constants */
++    context->state[0] = 0x67452301;
++    context->state[1] = 0xEFCDAB89;
++    context->state[2] = 0x98BADCFE;
++    context->state[3] = 0x10325476;
++    context->state[4] = 0xC3D2E1F0;
++    context->count[0] = context->count[1] = 0;
++}
++
++/* Run your data through this. */
++void SHA1_Update(SHA_CTX *context, sha1_byte *data, unsigned int len) {
++    unsigned int i, j;
++
++    j = (context->count[0] >> 3) & 63;
++    if ((context->count[0] += len << 3) < (len << 3)) context->count[1]++;
++    context->count[1] += (len >> 29);
++    if ((j + len) > 63) {
++        memcpy(&context->buffer[j], data, (i = 64-j));
++        SHA1_Transform(context->state, context->buffer);
++        for ( ; i + 63 < len; i += 64) {
++            SHA1_Transform(context->state, &data[i]);
++        }
++        j = 0;
++    }
++    else i = 0;
++    memcpy(&context->buffer[j], &data[i], len - i);
++}
++
++
++/* Add padding and return the message digest. */
++void SHA1_Final(sha1_byte digest[SHA1_DIGEST_LENGTH], SHA_CTX *context) {
++    sha1_quadbyte i, j;
++    sha1_byte finalcount[8];
++
++    for (i = 0; i < 8; i++) {
++        finalcount[i] = (sha1_byte)((context->count[(i >= 4 ? 0 : 1)]
++         >> ((3-(i & 3)) * 8) ) & 255);  /* Endian independent */
++    }
++    SHA1_Update(context, (sha1_byte *)"\200", 1);
++    while ((context->count[0] & 504) != 448) {
++        SHA1_Update(context, (sha1_byte *)"\0", 1);
++    }
++    /* Should cause a SHA1_Transform() */
++    SHA1_Update(context, finalcount, 8);
++    for (i = 0; i < SHA1_DIGEST_LENGTH; i++) {
++        digest[i] = (sha1_byte)
++         ((context->state[i>>2] >> ((3-(i & 3)) * 8) ) & 255);
++    }
++    /* Wipe variables */
++    i = j = 0;
++    memset(context->buffer, 0, SHA1_BLOCK_LENGTH);
++    memset(context->state, 0, SHA1_DIGEST_LENGTH);
++    memset(context->count, 0, 8);
++    memset(&finalcount, 0, 8);
++}
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_sha1.h lighttpd-1.4.30/src/mod_websocket_sha1.h
+--- lighttpd-1.4.30-orig/src/mod_websocket_sha1.h	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_sha1.h	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,80 @@
++/*
++ * sha.h
++ *
++ * Originally taken from the public domain SHA1 implementation
++ * written by by Steve Reid <steve@edmweb.com>
++ * 
++ * Modified by Aaron D. Gifford <agifford@infowest.com>
++ *
++ * NO COPYRIGHT - THIS IS 100% IN THE PUBLIC DOMAIN
++ *
++ * The original unmodified version is available at:
++ *    ftp://ftp.funet.fi/pub/crypt/hash/sha/sha1.c
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR(S) OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#ifndef __MOD_WEBSOCKET_SHA1_H__
++#define __MOD_WEBSOCKET_SHA1_H__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Define this if your machine is LITTLE_ENDIAN, otherwise #undef it: */
++#ifdef WORDS_BIGENDIAN
++# undef		LITTLE_ENDIAN
++#else
++# ifndef LITTLE_ENDIAN
++#  define	LITTLE_ENDIAN
++# endif
++#endif
++
++/* Make sure you define these types for your architecture: */
++typedef unsigned int sha1_quadbyte;	/* 4 byte type */
++typedef unsigned char sha1_byte;	/* single byte type */
++
++/*
++ * Be sure to get the above definitions right.  For instance, on my
++ * x86 based FreeBSD box, I define LITTLE_ENDIAN and use the type
++ * "unsigned long" for the quadbyte.  On FreeBSD on the Alpha, however,
++ * while I still use LITTLE_ENDIAN, I must define the quadbyte type
++ * as "unsigned int" instead.
++ */
++
++#define SHA1_BLOCK_LENGTH	64
++#define SHA1_DIGEST_LENGTH	20
++
++/* The SHA1 structure: */
++typedef struct _SHA_CTX {
++	sha1_quadbyte	state[5];
++	sha1_quadbyte	count[2];
++	sha1_byte	buffer[SHA1_BLOCK_LENGTH];
++} SHA_CTX;
++
++#ifndef NOPROTO
++void SHA1_Init(SHA_CTX *context);
++void SHA1_Update(SHA_CTX *context, sha1_byte *data, unsigned int len);
++void SHA1_Final(sha1_byte digest[SHA1_DIGEST_LENGTH],
++                   SHA_CTX* context);
++#else
++void SHA1_Init();
++void SHA1_Update();
++void SHA1_Final();
++#endif
++
++#ifdef	__cplusplus
++}
++#endif
++
++#endif
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_socket.c lighttpd-1.4.30/src/mod_websocket_socket.c
+--- lighttpd-1.4.30-orig/src/mod_websocket_socket.c	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_socket.c	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,104 @@
++/*
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ */
++
++#include <assert.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <arpa/inet.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netdb.h>
++#include <errno.h>
++#include <poll.h>
++
++#include "mod_websocket_socket.h"
++
++int mod_websocket_connect(const char *host, const char *service) {
++    struct addrinfo hints;
++    struct addrinfo *res = NULL;
++    struct addrinfo *ai = NULL;
++    int flags, fd = -1, sockret = -1;
++    socklen_t socklen = sizeof(sockret);
++    struct pollfd pollfd;
++
++    memset(&hints, 0, sizeof(hints));
++    hints.ai_family = AF_UNSPEC;
++    hints.ai_socktype = SOCK_STREAM;
++    hints.ai_flags = 0;
++    if (getaddrinfo(host, service, &hints, &res) != 0) {
++        return -1;
++    }
++    for (ai = res; ai; ai = ai->ai_next) {
++        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
++        if (fd < 0) {
++            break;
++        }
++        if ((flags = fcntl(fd, F_GETFL, 0)) < 0 ||
++            fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
++            close(fd);
++            fd = -1;
++            continue;
++        }
++        pollfd.fd = fd;
++        pollfd.events = POLLOUT;
++        if (connect(fd, ai->ai_addr, ai->ai_addrlen) < 0 &&
++            errno != EINPROGRESS) {
++            close(fd);
++            fd = -1;
++            continue;
++        }
++        if (poll(&pollfd, 1, 5000) == 0) {
++            close(fd);
++            fd = -1;
++            continue;
++        }
++        if ((pollfd.revents & POLLOUT) &&
++            getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockret, &socklen) == 0 &&
++            sockret == 0 ) {
++            break;
++        }
++        close(fd);
++        fd = -1;
++    }
++    freeaddrinfo(res);
++    return fd;
++}
++
++void mod_websocket_disconnect(int fd) {
++    close(fd);
++}
++
++static void store_sockinfo(struct sockaddr_storage *sa, mod_websocket_addrinfo_t *info) {
++    assert(sa != NULL && info != NULL);
++    if (sa->ss_family == AF_INET) {
++        struct sockaddr_in *s = (struct sockaddr_in *)sa;
++        info->port = ntohs(s->sin_port);
++        inet_ntop(AF_INET, &s->sin_addr, info->addr, sizeof(info->addr));
++    } else {
++        struct sockaddr_in6 *s = (struct sockaddr_in6 *)sa;
++        info->port = ntohs(s->sin6_port);
++        inet_ntop(AF_INET6, &s->sin6_addr, info->addr, sizeof(info->addr));
++    }
++}
++
++int mod_websocket_getsockinfo(int fd, mod_websocket_sockinfo_t *info) {
++    socklen_t len;
++    struct sockaddr_storage sa;
++
++    if (info == NULL) {
++        return -1;
++    }
++    len = sizeof(sa);
++    if (getsockname(fd, (struct sockaddr*)&sa, &len) == -1) {
++        return -1;
++    }
++    store_sockinfo(&sa, &info->self);
++    if (getpeername(fd, (struct sockaddr*)&sa, &len) == -1) {
++        return -1;
++    }
++    store_sockinfo(&sa, &info->peer);
++    return 0;
++}
+diff -Naur lighttpd-1.4.30-orig/src/mod_websocket_socket.h lighttpd-1.4.30/src/mod_websocket_socket.h
+--- lighttpd-1.4.30-orig/src/mod_websocket_socket.h	1970-01-01 05:30:00.000000000 +0530
++++ lighttpd-1.4.30/src/mod_websocket_socket.h	2014-11-27 11:27:45.000000000 +0530
+@@ -0,0 +1,58 @@
++/*
++ * Copyright(c) 2010, Norio Kobota, All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * - Redistributions of source code must retain the above copyright notice,
++ *   this list of conditions and the following disclaimer.
++ * - Redistributions in binary form must reproduce the above copyright notice,
++ *   this list of conditions and the following disclaimer in the documentation
++ *   and/or other materials provided with the distribution.
++ * - Neither the name of the 'incremental' nor the names of its contributors
++ *   may be used to endorse or promote products derived from this software
++ *   without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
++ * THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef _MOD_WEBSOCKET_SOCKET_H_
++#define _MOD_WEBSOCKET_SOCKET_H_
++
++#ifndef INET6_ADDRSTRLEN
++# define	INET6_ADDRSTRLEN	(46)
++#endif
++
++typedef struct {
++    char addr[INET6_ADDRSTRLEN];
++    int port;
++} mod_websocket_addrinfo_t;
++
++typedef struct {
++    mod_websocket_addrinfo_t self;
++    mod_websocket_addrinfo_t peer;
++} mod_websocket_sockinfo_t;
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++    int mod_websocket_connect(const char *host, const char *service);
++    void mod_websocket_disconnect(int fd);
++    int mod_websocket_getsockinfo(int fd, mod_websocket_sockinfo_t *info);
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif  /* _MOD_WEBSOCKET_SOCKET_H_ */

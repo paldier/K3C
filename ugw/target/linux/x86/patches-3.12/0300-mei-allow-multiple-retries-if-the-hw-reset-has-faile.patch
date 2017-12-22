@@ -1,0 +1,177 @@
+From d314c780723d391b04d1159260da1cd31b7f813b Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Tue, 14 Jan 2014 23:10:10 +0200
+Subject: [PATCH 300/441] mei: allow multiple retries if the hw reset has
+ failed
+
+In some rare case mei hw reset may take long time to settle.
+Instead of blocking resume flow we span another driver reset flow in
+separate work context
+
+This allows as to shorten hw reset timeout to something more acceptable
+by DPM_WATCHDOG_TIMEOUT
+
+Change-Id: I05f7f62f76ff18554b7c7388401acd5edd69741b
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9aa48ea6c4c48ce23bd3030f71e6abdb61cc22d0)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/hbm.c   |  2 +-
+ drivers/misc/mei/hw-me.c |  2 +-
+ drivers/misc/mei/hw.h    |  4 ++--
+ drivers/misc/mei/init.c  | 40 ++++++++++++++++++++++++++++++----------
+ 4 files changed, 34 insertions(+), 14 deletions(-)
+
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -147,7 +147,7 @@ int mei_hbm_start_wait(struct mei_device
+ 	ret = wait_event_interruptible_timeout(dev->wait_recvd_msg,
+ 			dev->hbm_state == MEI_HBM_IDLE ||
+ 			dev->hbm_state >= MEI_HBM_STARTED,
+-			mei_secs_to_jiffies(MEI_INTEROP_TIMEOUT));
++			mei_secs_to_jiffies(MEI_HBM_TIMEOUT));
+ 	mutex_lock(&dev->device_lock);
+ 
+ 	if (ret <= 0 && (dev->hbm_state <= MEI_HBM_START)) {
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -254,7 +254,7 @@ static int mei_me_hw_ready_wait(struct m
+ 	mutex_unlock(&dev->device_lock);
+ 	err = wait_event_interruptible_timeout(dev->wait_hw_ready,
+ 			dev->recvd_hw_ready,
+-			mei_secs_to_jiffies(MEI_INTEROP_TIMEOUT));
++			mei_secs_to_jiffies(MEI_HW_READY_TIMEOUT));
+ 	mutex_lock(&dev->device_lock);
+ 	if (!err && !dev->recvd_hw_ready) {
+ 		if (!err)
+--- a/drivers/misc/mei/hw.h
++++ b/drivers/misc/mei/hw.h
+@@ -22,7 +22,7 @@
+ /*
+  * Timeouts in Seconds
+  */
+-#define MEI_INTEROP_TIMEOUT         7  /* Timeout on ready message */
++#define MEI_HW_READY_TIMEOUT        2  /* Timeout on ready message */
+ #define MEI_CONNECT_TIMEOUT         3  /* HPS: at least 2 seconds */
+ 
+ #define MEI_CL_CONNECT_TIMEOUT     15  /* HPS: Client Connect Timeout */
+@@ -31,13 +31,13 @@
+ #define MEI_IAMTHIF_STALL_TIMER    12  /* HPS */
+ #define MEI_IAMTHIF_READ_TIMER     10  /* HPS */
+ 
++#define MEI_HBM_TIMEOUT            1   /* 1 second */
+ 
+ /*
+  * MEI Version
+  */
+ #define HBM_MINOR_VERSION                   0
+ #define HBM_MAJOR_VERSION                   1
+-#define HBM_TIMEOUT                         1	/* 1 second */
+ 
+ /* Host bus message command opcode */
+ #define MEI_HBM_CMD_OP_MSK                  0x7f
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -119,7 +119,6 @@ int mei_reset(struct mei_device *dev)
+ 
+ 	if (ret) {
+ 		dev_err(&dev->pdev->dev, "hw_reset failed ret = %d\n", ret);
+-		dev->dev_state = MEI_DEV_DISABLED;
+ 		return ret;
+ 	}
+ 
+@@ -132,7 +131,6 @@ int mei_reset(struct mei_device *dev)
+ 	ret = mei_hw_start(dev);
+ 	if (ret) {
+ 		dev_err(&dev->pdev->dev, "hw_start failed ret = %d\n", ret);
+-		dev->dev_state = MEI_DEV_DISABLED;
+ 		return ret;
+ 	}
+ 
+@@ -142,7 +140,7 @@ int mei_reset(struct mei_device *dev)
+ 	ret = mei_hbm_start_req(dev);
+ 	if (ret) {
+ 		dev_err(&dev->pdev->dev, "hbm_start failed ret = %d\n", ret);
+-		dev->dev_state = MEI_DEV_DISABLED;
++		dev->dev_state = MEI_DEV_RESETTING;
+ 		return ret;
+ 	}
+ 
+@@ -159,6 +157,7 @@ EXPORT_SYMBOL_GPL(mei_reset);
+  */
+ int mei_start(struct mei_device *dev)
+ {
++	int ret;
+ 	mutex_lock(&dev->device_lock);
+ 
+ 	/* acknowledge interrupt and stop interrupts */
+@@ -168,10 +167,18 @@ int mei_start(struct mei_device *dev)
+ 
+ 	dev_dbg(&dev->pdev->dev, "reset in start the mei device.\n");
+ 
+-	dev->dev_state = MEI_DEV_INITIALIZING;
+ 	dev->reset_count = 0;
+-	mei_reset(dev);
++	do {
++		dev->dev_state = MEI_DEV_INITIALIZING;
++		ret = mei_reset(dev);
++
++		if (ret == -ENODEV || dev->dev_state == MEI_DEV_DISABLED) {
++			dev_err(&dev->pdev->dev, "reset failed ret = %d", ret);
++			goto err;
++		}
++	} while (ret);
+ 
++	/* we cannot start the device w/o hbm start message completed */
+ 	if (dev->dev_state == MEI_DEV_DISABLED) {
+ 		dev_err(&dev->pdev->dev, "reset failed");
+ 		goto err;
+@@ -231,27 +238,40 @@ int mei_restart(struct mei_device *dev)
+ 
+ 	mutex_unlock(&dev->device_lock);
+ 
+-	if (err || dev->dev_state == MEI_DEV_DISABLED)
++	if (err == -ENODEV || dev->dev_state == MEI_DEV_DISABLED) {
++		dev_err(&dev->pdev->dev, "device disabled = %d\n", err);
+ 		return -ENODEV;
++	}
++
++	/* try to start again */
++	if (err)
++		schedule_work(&dev->reset_work);
++
+ 
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(mei_restart);
+ 
+-
+ static void mei_reset_work(struct work_struct *work)
+ {
+ 	struct mei_device *dev =
+ 		container_of(work, struct mei_device,  reset_work);
++	int ret;
+ 
+ 	mutex_lock(&dev->device_lock);
+ 
+-	mei_reset(dev);
++	ret = mei_reset(dev);
+ 
+ 	mutex_unlock(&dev->device_lock);
+ 
+-	if (dev->dev_state == MEI_DEV_DISABLED)
+-		dev_err(&dev->pdev->dev, "reset failed");
++	if (dev->dev_state == MEI_DEV_DISABLED) {
++		dev_err(&dev->pdev->dev, "device disabled = %d\n", ret);
++		return;
++	}
++
++	/* retry reset in case of failure */
++	if (ret)
++		schedule_work(&dev->reset_work);
+ }
+ 
+ void mei_stop(struct mei_device *dev)

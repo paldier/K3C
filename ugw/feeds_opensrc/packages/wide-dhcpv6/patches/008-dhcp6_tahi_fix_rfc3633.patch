@@ -1,0 +1,193 @@
+diff -Nuar wide-dhcpv6-20080615/common.c wide-dhcpv6-20080615_modif/common.c
+--- wide-dhcpv6-20080615/common.c	2010-11-11 12:54:52.924645137 +0530
++++ wide-dhcpv6-20080615_modif/common.c	2010-11-11 13:57:56.384643743 +0530
+@@ -2262,6 +2262,18 @@
+ 			    in6addr2str(&iapd_prefix.addr, 0),
+ 			    iapd_prefix.plen,
+ 			    iapd_prefix.pltime, iapd_prefix.vltime);
++#ifdef DHCP6_TAHI_FIX
++			/*
++			 * A client discards any prefixes for which the preferred lifetime is
++			 * greater than the valid lifetime. 
++			 */
++
++			if (iapd_prefix.pltime > iapd_prefix.vltime) {
++			    dprintf(LOG_DEBUG, FNAME, "preferred life time (%d) is greater than "
++				      "valid life time (%d)", iapd_prefix.pltime, iapd_prefix.vltime);
++				goto nextoption;
++                	}
++#endif
+ 
+ 			if (dhcp6_find_listval(list, DHCP6_LISTVAL_PREFIX6,
+ 			    &iapd_prefix, 0)) {
+@@ -2307,6 +2319,18 @@
+ 			ia_addr.vltime = ntohl(opt_ia_addr.dh6_ia_addr_valid_time);
+ 			memcpy(&ia_addr.addr, &opt_ia_addr.dh6_ia_addr_addr,
+ 			    sizeof(ia_addr.addr));
++#ifdef DHCP6_TAHI_FIX
++			/*
++			 * A client discards any prefixes for which the preferred lifetime is
++			 * greater than the valid lifetime. 
++			 */
++
++			if (ia_addr.pltime > ia_addr.vltime) {
++			    dprintf(LOG_DEBUG, FNAME, "preferred life time (%d) is greater than "
++				      "valid life time (%d)", ia_addr.pltime, ia_addr.vltime);
++				goto nextoption;
++                	}
++#endif
+ 
+ 			#ifdef ADDR_POOL_PREFIX_SUPPORT /* Added by Sundar */
+ 			ia_addr.plen = opt_ia_addr.dh6_ia_addr_prefix_len;
+diff -Nuar wide-dhcpv6-20080615/config.c wide-dhcpv6-20080615_modif/config.c
+--- wide-dhcpv6-20080615/config.c	2010-11-11 12:54:52.864645308 +0530
++++ wide-dhcpv6-20080615_modif/config.c	2010-11-10 13:29:35.654643990 +0530
+@@ -1604,6 +1604,9 @@
+ 				TAILQ_REMOVE(&ia_conflist0, iac, link);
+ 				TAILQ_INSERT_TAIL(&ifc->iaconf_list,
+ 				    iac, link);
++#ifdef DHCP6_TAHI_FIX
++				ifc->send_flags |= DHCIFF_PREFIX_DELEGATION;
++#endif
+ 
+ 				break;
+ 			default:
+@@ -1629,6 +1632,9 @@
+ 				TAILQ_REMOVE(&ia_conflist0, iac, link);
+ 				TAILQ_INSERT_TAIL(&ifc->iaconf_list,
+ 				    iac, link);
++#ifdef DHCP6_TAHI_FIX
++				ifc->send_flags |= DHCIFF_NONTEMP_ADDR;
++#endif
+ 
+ 				break;
+ 			default:
+diff -Nuar wide-dhcpv6-20080615/config.h wide-dhcpv6-20080615_modif/config.h
+--- wide-dhcpv6-20080615/config.h	2010-11-11 12:54:52.964643809 +0530
++++ wide-dhcpv6-20080615_modif/config.h	2010-11-10 13:29:06.484643908 +0530
+@@ -81,6 +81,12 @@
+ 	u_long allow_flags;
+ #define DHCIFF_INFO_ONLY 0x1
+ #define DHCIFF_RAPID_COMMIT 0x2
++#ifdef DHCP6_TAHI_FIX
++#define DHCIFF_TEMP_ADDRS 0x4
++#define DHCIFF_PREFIX_DELEGATION 0x8
++#define DHCIFF_UNICAST 0x10     
++#define DHCIFF_NONTEMP_ADDR 0x20
++#endif
+ 
+ 	int server_pref;	/* server preference (server only) */
+ 	struct dhcp6_poolspec pool;	/* address pool (server only) */
+@@ -335,3 +341,15 @@
+ struct host_conf *create_dynamic_hostconf __P((struct duid *,
+ 	struct dhcp6_poolspec *));
+ extern char *qstrdup __P((char *));
++#ifdef DHCP6_TAHI_FIX
++static inline iatype_t get_iatype(struct dhcp6_if *ifp)
++{
++	if(ifp) {
++		if(ifp->send_flags & DHCIFF_PREFIX_DELEGATION)
++			return IATYPE_PD;
++		else if (ifp->send_flags & DHCIFF_NONTEMP_ADDR)
++			return IATYPE_NA;
++	}
++	return -1;
++}
++#endif
+diff -Nuar wide-dhcpv6-20080615/dhcp6c.c wide-dhcpv6-20080615_modif/dhcp6c.c
+--- wide-dhcpv6-20080615/dhcp6c.c	2010-11-11 12:54:52.864645308 +0530
++++ wide-dhcpv6-20080615_modif/dhcp6c.c	2010-11-10 17:29:55.484644937 +0530
+@@ -1817,6 +1817,21 @@
+ 	     lv = TAILQ_NEXT(lv, link)) {
+ 		dprintf(LOG_INFO, FNAME, "status code: %s",
+ 		    dhcp6_stcodestr(lv->val_num16));
++#ifdef DHCP6_TAHI_FIX
++	/*
++	 * If the client receives a Reply message with a Status Code containing
++   	 * UnspecFail, the server is indicating that it was unable to process
++   	 * the message due to an unspecified failure condition. 
++   	 * The client retransmits the original message.
++	 */
++		switch (lv->val_num16) {
++		case DH6OPT_STCODE_UNSPECFAIL:
++		case DH6OPT_STCODE_USEMULTICAST:
++			dprintf(LOG_INFO, FNAME, "Retransmitting packet..\n");
++			client6_send(ev);
++			return -1;
++		}
++#endif
+ 	}
+ 
+ 	if (!TAILQ_EMPTY(&optinfo->dns_list)) {
+@@ -1927,6 +1942,41 @@
+ 		    "unexpected information refresh time option (ignored)");
+ 	}
+ 
++#ifdef DHCP6_TAHI_FIX
++	/*  DHCPv6_Self_Test_P2_1_1_0, RFC 3633 - 61,62 */
++	/* 
++	 *	When the client receives a Reply message in response to a Renew 
++         *	message, the client examines each IA independently.  For each
++   	 *	IA in the original Renew message, the client sends a Renew if 
++   	 *	the IA is not in the Reply message.
++	 */
++	if (state == DHCP6S_RENEW || state == DHCP6S_REBIND) {
++		struct ia_conf * iac = NULL;
++		int iatype = (int )get_iatype(ifp);
++		switch (iatype) {
++		case IATYPE_PD: 
++			iac = find_iafield(iatype, &optinfo->iapd_list, ifp);
++			break;
++		case IATYPE_NA:
++			iac = find_iafield(iatype, &optinfo->iana_list, ifp);
++			break;
++		default:
++			dprintf(LOG_INFO, FNAME, "Unknown iatype: %#x\n", iatype);
++			iac = (void *)0xffffffff;
++			break;
++		}
++		if (iac == NULL) {
++			dprintf(LOG_INFO, FNAME, "no IA field in reply msg..\n");
++			ev->timeouts = 0;
++			dhcp6_set_timeoparam(ev);
++			dhcp6_reset_timer(ev);
++			client6_send(ev);
++			return -1;
++		}
++			
++	}
++#endif
++
+ 	/* update stateful configuration information */
+ 	if (state != DHCP6S_RELEASE) {
+ 		update_ia(IATYPE_PD, &optinfo->iapd_list, ifp,
+diff -Nuar wide-dhcpv6-20080615/dhcp6c_ia.c wide-dhcpv6-20080615_modif/dhcp6c_ia.c
+--- wide-dhcpv6-20080615/dhcp6c_ia.c	2007-03-21 15:22:55.000000000 +0530
++++ wide-dhcpv6-20080615_modif/dhcp6c_ia.c	2010-11-09 12:47:56.224643804 +0530
+@@ -90,6 +90,26 @@
+ static char *iastr __P((iatype_t));
+ static char *statestr __P((iastate_t));
+ 
++#ifdef DHCP6_TAHI_FIX
++struct ia_conf *
++find_iafield(iatype, ialist, ifp)
++	iatype_t iatype;
++	struct dhcp6_list *ialist;
++	struct dhcp6_if *ifp;
++{
++	struct ia_conf *iac = NULL;
++	struct dhcp6_listval *iav;
++
++	for (iav = TAILQ_FIRST(ialist); iav; iav = TAILQ_NEXT(iav, link)) {
++		if ((iac = find_iaconf(&ifp->iaconf_list, iatype,
++		    iav->val_ia.iaid)) != NULL) {
++			break;
++		}
++	}
++	return iac;
++}
++#endif
++
+ void
+ update_ia(iatype, ialist, ifp, serverid, authparam)
+ 	iatype_t iatype;

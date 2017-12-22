@@ -1,0 +1,283 @@
+From b730c41898b51ef7474fd1215c854f10a5e20452 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Wed, 19 Feb 2014 17:35:47 +0200
+Subject: [PATCH 316/441] mei: add mei_hbuf_acquire wrapper
+
+A client has to acquire host buffer
+before writing, we add lock like wrapper
+to replace the code snippet
+
+if (dev->hbuf_is_ready)
+        dev->hbuf_is_ready = false;
+
+Change-Id: Ib2c678bb375c8c273bb23100695eae5b00082142
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a81eb62df308d10cd9f84509fc895d61d9fe9092)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/amthif.c    |  7 +-----
+ drivers/misc/mei/client.c    | 56 ++++++++++++++++++++++++++++----------------
+ drivers/misc/mei/hw-me.c     |  2 ++
+ drivers/misc/mei/hw-txe.c    | 17 +++++---------
+ drivers/misc/mei/interrupt.c |  6 ++---
+ drivers/misc/mei/mei_dev.h   |  2 ++
+ drivers/misc/mei/wd.c        | 14 +++++------
+ 7 files changed, 57 insertions(+), 47 deletions(-)
+
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@ -296,9 +296,8 @@ static int mei_amthif_send_cmd(struct me
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (ret && dev->hbuf_is_ready) {
++	if (ret && mei_hbuf_acquire(dev)) {
+ 		ret = 0;
+-		dev->hbuf_is_ready = false;
+ 		if (cb->request_buffer.size > mei_hbuf_max_len(dev)) {
+ 			mei_hdr.length = mei_hbuf_max_len(dev);
+ 			mei_hdr.msg_complete = 0;
+@@ -330,10 +329,6 @@ static int mei_amthif_send_cmd(struct me
+ 			list_add_tail(&cb->list, &dev->write_list.list);
+ 		}
+ 	} else {
+-		if (!dev->hbuf_is_ready)
+-			dev_dbg(&dev->pdev->dev, "host buffer is not empty");
+-
+-		dev_dbg(&dev->pdev->dev, "No flow control credentials, so add iamthif cb to write list.\n");
+ 		list_add_tail(&cb->list, &dev->write_list.list);
+ 	}
+ 	return 0;
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -417,6 +417,23 @@ void mei_host_client_init(struct work_st
+ 	mutex_unlock(&dev->device_lock);
+ }
+ 
++/**
++ * mei_hbuf_acquire: try to acquire host buffer
++ *
++ * @dev: the device structure
++ * returns true if host buffer was acquired
++ */
++bool mei_hbuf_acquire(struct mei_device *dev)
++{
++	if (!dev->hbuf_is_ready) {
++		dev_dbg(&dev->pdev->dev, "hbuf is not ready\n");
++		return false;
++	}
++
++	dev->hbuf_is_ready = false;
++
++	return true;
++}
+ 
+ /**
+  * mei_cl_disconnect - disconnect host client from the me one
+@@ -448,8 +465,7 @@ int mei_cl_disconnect(struct mei_cl *cl)
+ 		return -ENOMEM;
+ 
+ 	cb->fop_type = MEI_FOP_CLOSE;
+-	if (dev->hbuf_is_ready) {
+-		dev->hbuf_is_ready = false;
++	if (mei_hbuf_acquire(dev)) {
+ 		if (mei_hbm_cl_disconnect_req(dev, cl)) {
+ 			rets = -ENODEV;
+ 			cl_err(dev, cl, "failed to disconnect.\n");
+@@ -550,9 +566,8 @@ int mei_cl_connect(struct mei_cl *cl, st
+ 
+ 	cb->fop_type = MEI_FOP_CONNECT;
+ 
+-	if (dev->hbuf_is_ready && !mei_cl_is_other_connecting(cl)) {
+-		dev->hbuf_is_ready = false;
+-
++	/* run hbuf acquire last so we don't have to undo */
++	if (!mei_cl_is_other_connecting(cl) && mei_hbuf_acquire(dev)) {
+ 		if (mei_hbm_cl_connect_req(dev, cl)) {
+ 			rets = -ENODEV;
+ 			goto out;
+@@ -711,8 +726,7 @@ int mei_cl_read_start(struct mei_cl *cl,
+ 		goto err;
+ 
+ 	cb->fop_type = MEI_FOP_READ;
+-	if (dev->hbuf_is_ready) {
+-		dev->hbuf_is_ready = false;
++	if (mei_hbuf_acquire(dev)) {
+ 		if (mei_hbm_cl_flow_control_req(dev, cl)) {
+ 			cl_err(dev, cl, "flow control send failed\n");
+ 			rets = -ENODEV;
+@@ -847,21 +861,29 @@ int mei_cl_write(struct mei_cl *cl, stru
+ 
+ 
+ 	cb->fop_type = MEI_FOP_WRITE;
++	cb->buf_idx = 0;
++	cl->writing_state = MEI_IDLE;
++
++	mei_hdr.host_addr = cl->host_client_id;
++	mei_hdr.me_addr = cl->me_client_id;
++	mei_hdr.reserved = 0;
++	mei_hdr.msg_complete = 0;
++	mei_hdr.internal = cb->internal;
+ 
+ 	rets = mei_cl_flow_ctrl_creds(cl);
+ 	if (rets < 0)
+ 		goto err;
+ 
+-	/* Host buffer is not ready, we queue the request */
+-	if (rets == 0 || !dev->hbuf_is_ready) {
+-		cb->buf_idx = 0;
+-		/* unseting complete will enqueue the cb for write */
+-		mei_hdr.msg_complete = 0;
++	if (rets == 0) {
++		cl_dbg(dev, cl, "No flow control credentials: not sending.\n");
++		rets = buf->size;
++		goto out;
++	}
++	if (!mei_hbuf_acquire(dev)) {
++		cl_dbg(dev, cl, "Cannot acquire the host buffer: not sending.\n");
+ 		rets = buf->size;
+ 		goto out;
+ 	}
+-
+-	dev->hbuf_is_ready = false;
+ 
+ 	/* Check for a maximum length */
+ 	if (buf->size > mei_hbuf_max_len(dev)) {
+@@ -872,12 +894,6 @@ int mei_cl_write(struct mei_cl *cl, stru
+ 		mei_hdr.msg_complete = 1;
+ 	}
+ 
+-	mei_hdr.host_addr = cl->host_client_id;
+-	mei_hdr.me_addr = cl->me_client_id;
+-	mei_hdr.reserved = 0;
+-	mei_hdr.internal = cb->internal;
+-
+-
+ 	rets = mei_write_message(dev, &mei_hdr, buf->data);
+ 	if (rets)
+ 		goto err;
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -526,6 +526,8 @@ irqreturn_t mei_me_irq_thread_handler(in
+ 		}
+ 	}
+ 
++	dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
++
+ 	rets = mei_irq_write_handler(dev, &complete_list);
+ 
+ 	dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
+--- a/drivers/misc/mei/hw-txe.c
++++ b/drivers/misc/mei/hw-txe.c
+@@ -605,7 +605,6 @@ static int mei_txe_write(struct mei_devi
+ 		mei_txe_input_payload_write(dev, i + 1, reg);
+ 	}
+ 
+-	dev->hbuf_is_ready = false;
+ 	/* Set Input-Doorbell */
+ 	mei_txe_input_doorbell_set(hw);
+ 
+@@ -983,20 +982,16 @@ irqreturn_t mei_txe_irq_thread_handler(i
+ 		dev->hbuf_is_ready = true;
+ 
+ 	if (hw->aliveness && dev->hbuf_is_ready) {
+-		/* if SeC did not complete reading the written data by host */
+-		if (!mei_txe_is_input_ready(dev)) {
+-			dev_dbg(&dev->pdev->dev, "got Input Ready Int, but SEC_IPC_INPUT_STATUS_RDY is 0.\n");
+-			goto end;
+-		}
+ 
++		/* get the real register value */
++		dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
+ 		rets = mei_irq_write_handler(dev, &complete_list);
+-		if (rets)
+-			dev_err(&dev->pdev->dev,
+-				"mei_irq_write_handler ret = %d.\n", rets);
++		if (rets && rets != -EMSGSIZE)
++			dev_err(&dev->pdev->dev, "mei_irq_write_handler ret = %d.\n",
++				rets);
++		dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
+ 	}
+ 
+-
+-
+ 	mei_irq_compl_handler(dev, &complete_list);
+ 
+ end:
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -446,10 +446,10 @@ int mei_irq_write_handler(struct mei_dev
+ 	s32 slots;
+ 	int ret;
+ 
+-	if (!mei_hbuf_is_ready(dev)) {
+-		dev_dbg(&dev->pdev->dev, "host buffer is not empty.\n");
++
++	if (!mei_hbuf_acquire(dev))
+ 		return 0;
+-	}
++
+ 	slots = mei_hbuf_empty_slots(dev);
+ 	if (slots <= 0)
+ 		return -EMSGSIZE;
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -630,6 +630,8 @@ static inline int mei_count_full_read_sl
+ 	return dev->ops->rdbuf_full_slots(dev);
+ }
+ 
++bool mei_hbuf_acquire(struct mei_device *dev);
++
+ #if IS_ENABLED(CONFIG_DEBUG_FS)
+ int mei_dbgfs_register(struct mei_device *dev, const char *name);
+ void mei_dbgfs_deregister(struct mei_device *dev);
+--- a/drivers/misc/mei/wd.c
++++ b/drivers/misc/mei/wd.c
+@@ -158,9 +158,8 @@ int mei_wd_stop(struct mei_device *dev)
+ 	if (ret < 0)
+ 		goto out;
+ 
+-	if (ret && dev->hbuf_is_ready) {
++	if (ret && mei_hbuf_acquire(dev)) {
+ 		ret = 0;
+-		dev->hbuf_is_ready = false;
+ 
+ 		if (!mei_wd_send(dev)) {
+ 			ret = mei_cl_flow_ctrl_reduce(&dev->wd_cl);
+@@ -265,8 +264,8 @@ static int mei_wd_ops_stop(struct watchd
+  */
+ static int mei_wd_ops_ping(struct watchdog_device *wd_dev)
+ {
+-	int ret = 0;
+ 	struct mei_device *dev;
++	int ret;
+ 
+ 	dev = watchdog_get_drvdata(wd_dev);
+ 	if (!dev)
+@@ -282,10 +281,12 @@ static int mei_wd_ops_ping(struct watchd
+ 
+ 	dev->wd_state = MEI_WD_RUNNING;
+ 
++	ret = mei_cl_flow_ctrl_creds(&dev->wd_cl);
++	if (ret < 0)
++		goto end;
+ 	/* Check if we can send the ping to HW*/
+-	if (dev->hbuf_is_ready && mei_cl_flow_ctrl_creds(&dev->wd_cl) > 0) {
++	if (ret && mei_hbuf_acquire(dev)) {
+ 
+-		dev->hbuf_is_ready = false;
+ 		dev_dbg(&dev->pdev->dev, "wd: sending ping\n");
+ 
+ 		if (mei_wd_send(dev)) {
+@@ -295,8 +296,7 @@ static int mei_wd_ops_ping(struct watchd
+ 		}
+ 
+ 		if (mei_cl_flow_ctrl_reduce(&dev->wd_cl)) {
+-			dev_err(&dev->pdev->dev,
+-				"wd: mei_cl_flow_ctrl_reduce() failed.\n");
++			dev_err(&dev->pdev->dev, "wd: mei_cl_flow_ctrl_reduce() failed.\n");
+ 			ret = -EIO;
+ 			goto end;
+ 		}

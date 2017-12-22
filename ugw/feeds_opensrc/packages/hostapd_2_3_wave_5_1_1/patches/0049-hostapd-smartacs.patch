@@ -1,0 +1,2850 @@
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/hostapd/config_file.c hostapd-2.6/hostapd/config_file.c
+--- hostapd-2.6-orig/hostapd/config_file.c	2017-04-03 14:43:00.874405034 +0300
++++ hostapd-2.6/hostapd/config_file.c	2017-04-03 14:44:31.852576047 +0300
+@@ -2834,7 +2834,8 @@ static int hostapd_config_fill(struct ho
+ 			return 1;
+ 		}
+ 	} else if (os_strcmp(buf, "channel") == 0) {
+-		if (os_strcmp(pos, "acs_survey") == 0 || os_strcmp(pos, "acs_numbss") == 0) {
++		if (os_strcmp(pos, "acs_survey") == 0 || os_strcmp(pos, "acs_numbss") == 0 ||
++                                             os_strcmp(pos, "acs_smart") == 0) {
+ #ifndef CONFIG_ACS
+ 			wpa_printf(MSG_ERROR, "Line %d: tries to enable ACS but CONFIG_ACS disabled",
+ 				   line);
+@@ -2842,9 +2843,9 @@ static int hostapd_config_fill(struct ho
+ #else /* CONFIG_ACS */
+ 			conf->acs = 1;
+ 			conf->channel = 0;
+-			conf->acs_algo = (os_strcmp(pos, "acs_numbss") == 0
+-							? ACS_ALGO_NUMBSS
+-							: ACS_ALGO_SURVEY);
++			if (!os_strcmp(pos, "acs_numbss")) conf->acs_algo = ACS_ALGO_NUMBSS;
++			else if (!os_strcmp(pos, "acs_smart")) conf->acs_algo = ACS_ALGO_SMART;
++				else conf->acs_algo = ACS_ALGO_SURVEY;
+ #endif /* CONFIG_ACS */
+ 		} else {
+ 			conf->channel = atoi(pos);
+@@ -2876,6 +2877,164 @@ static int hostapd_config_fill(struct ho
+ 			return 1;
+ 		}
+ 	}
++  /* Smart ACS */
++  else if (os_strcmp(buf, "acs_smart_info_file") == 0) {
++    os_free(conf->acs_smart_info_file);
++    conf->acs_smart_info_file = os_strdup(pos);
++  }
++  else if (os_strcmp(buf, "acs_history_file") == 0) {
++    os_free(conf->acs_history_file);
++    conf->acs_history_file = os_strdup(pos);
++  }
++  else if (os_strcmp(buf, "acs_fallback_chan") == 0) {
++    if (3 != sscanf(pos, "%d %d %d", &conf->acs_fallback_chan.primary,
++                                     &conf->acs_fallback_chan.secondary,
++                                     &conf->acs_fallback_chan.width)) {
++      wpa_printf(MSG_ERROR, "Line %d: ACS SMART: invalid fallback channel %s",
++        line, pos);
++      return 1;
++    }
++  }
++  else if (os_strcmp(buf, "acs_penalty_factors") == 0) {
++    int i = 0;
++    if (hostapd_parse_intlist(&conf->acs_penalty_factors, pos)) {
++      wpa_printf(MSG_ERROR, "Line %d: invalid ACS penalty factors list", line);
++      return 1;
++    }
++    /* it would be great to adopt a rule that "int-lists" contain their
++    * element count in the member at index 0, then we wouldn't have to count...
++    */
++    while (conf->acs_penalty_factors[i] >= 0)
++      i++;
++    if (i != ACS_NUM_PENALTY_FACTORS) {
++      wpa_printf(MSG_ERROR, "Line %d: ACS penalty factors list has %i elements instead of %i",
++        line, i, ACS_NUM_PENALTY_FACTORS);
++      return 1;
++    }
++  }
++  else if (os_strcmp(buf, "acs_chan_cust_penalty") == 0) {
++    char *cur_pos = pos;
++
++    while (cur_pos) {
++      int penalty, chan;
++
++      if (sscanf(cur_pos, "%d:%d", &chan, &penalty)) {
++        if ((chan < 0) || (chan > ACS_MAX_CHANNELS)) {
++          wpa_printf(MSG_ERROR, "Line %d: invalid ACS channel penalty, channel out of range", line);
++          return 1;
++        }
++        if ((penalty < 0) || (penalty > ACS_MAX_FACTOR)) {
++          wpa_printf(MSG_ERROR, "Line %d: invalid ACS channel penalty, penalty out of range", line);
++          return 1;
++        }
++        conf->acs_chan_cust_penalty[chan] = penalty;
++      }
++
++      cur_pos = strchr(cur_pos, ',');
++      if (cur_pos) cur_pos++;
++    }
++  }
++  else if (os_strcmp(buf, "acs_chan_noise_penalty") == 0) {
++    char *cur_pos = pos;
++
++    while (cur_pos) {
++      int penalty, chan;
++
++      if (sscanf(cur_pos, "%d:%d", &chan, &penalty)) {
++        if ((chan < 0) || (chan > ACS_MAX_CHANNELS)) {
++          wpa_printf(MSG_ERROR, "Line %d: invalid ACS channel noise penalty, channel out of range", line);
++          return 1;
++        }
++        if ((penalty < 0) || (penalty > ACS_MAX_FACTOR)) {
++          wpa_printf(MSG_ERROR, "Line %d: invalid ACS channel noise penalty, penalty out of range", line);
++          return 1;
++        }
++        conf->acs_chan_noise_penalty[chan] = penalty;
++      }
++
++      cur_pos = strchr(cur_pos, ',');
++      if (cur_pos) cur_pos++;
++    }
++  }
++  else if (os_strcmp(buf, "acs_to_degradation") == 0) {
++    int i = 0;
++    if (hostapd_parse_intlist(&conf->acs_to_degradation, pos)) {
++      wpa_printf(MSG_ERROR, "Line %d: invalid ACS timeout and degradation factors list", line);
++      return 1;
++    }
++    /* it would be great to adopt a rule that "int-lists" contain their
++    * element count in the member at index 0, then we wouldn't have to count...
++    */
++    while (conf->acs_to_degradation[i] >= 0)
++      i++;
++    if (i != ACS_NUM_DEGRADATION_FACTORS) {
++      wpa_printf(MSG_ERROR, "Line %d: ACS timeout and degradation factors list has %i elements instead of %i",
++        line, i, ACS_NUM_DEGRADATION_FACTORS);
++      return 1;
++    }
++  }
++  else if (os_strcmp(buf, "acs_vht_dynamic_bw") == 0) {
++		int val = atoi(pos);
++		if (val < 0 || val > 1) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid VHT dynamic bandwidth mode %d", line, val);
++			return 1;
++		}
++		conf->acs_vht_dynamic_bw = val;
++	}
++  else if (os_strcmp(buf, "acs_policy") == 0) {
++		int val = atoi(pos);
++		if (val < 0 || val > 1) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid channel selection mode %d", line, val);
++			return 1;
++		}
++		conf->acs_policy = val;
++	}
++  else if (os_strcmp(buf, "acs_switch_thresh") == 0) {
++    int val = atoi(pos);
++    if (val < 0 || val > 100) {
++      wpa_printf(MSG_ERROR, "Line %d: invalid channel switch threshold %d", line, val);
++      return 1;
++    }
++    conf->acs_switch_thresh = val;
++  }
++  else if (os_strcmp(buf, "acs_grp_priorities_throughput") == 0) {
++    int i = 0;
++    if (hostapd_parse_intlist(&conf->acs_grp_priorities_throughput, pos)) {
++      wpa_printf(MSG_ERROR, "Line %d: invalid ACS group priorities list (throughput policy)", line);
++      return 1;
++    }
++    for (i = 0; conf->acs_grp_priorities_throughput[i] >= 0; i++) {
++      if (conf->acs_grp_priorities_throughput[i] > ACS_NUM_GRP_PRIORITIES) {
++        wpa_printf(MSG_ERROR, "Line %d: invalid ACS group priorities list entry (throughput policy) %i, priority > %i",
++          line, i, ACS_NUM_GRP_PRIORITIES);
++      }
++      conf->acs_grp_prio_tp_map[conf->acs_grp_priorities_throughput[i] - 1] = i;
++    }
++    if (i != ACS_NUM_GRP_PRIORITIES) {
++      wpa_printf(MSG_ERROR, "Line %d: ACS group priorities list (throughput policy) has %i elements instead of %i",
++        line, i, ACS_NUM_GRP_PRIORITIES);
++      return 1;
++    }
++  }
++  else if (os_strcmp(buf, "acs_grp_priorities_reach") == 0) {
++    int i = 0;
++    if (hostapd_parse_intlist(&conf->acs_grp_priorities_reach, pos)) {
++      wpa_printf(MSG_ERROR, "Line %d: invalid ACS group priorities list (reach policy)", line);
++      return 1;
++    }
++    for (i = 0; conf->acs_grp_priorities_reach[i] >= 0; i++) {
++      if (conf->acs_grp_priorities_reach[i] > ACS_NUM_GRP_PRIORITIES) {
++        wpa_printf(MSG_ERROR, "Line %d: invalid ACS group priorities list entry (reach policy) %i, priority > %i",
++          line, i, ACS_NUM_GRP_PRIORITIES);
++      }
++      conf->acs_grp_prio_reach_map[conf->acs_grp_priorities_reach[i] - 1] = i;
++    }
++    if (i != ACS_NUM_GRP_PRIORITIES) {
++      wpa_printf(MSG_ERROR, "Line %d: ACS group priorities list (reach policy) has %i elements instead of %i",
++        line, i, ACS_NUM_GRP_PRIORITIES);
++      return 1;
++    }
++  }
+ #endif /* CONFIG_ACS */
+ 	else if (os_strcmp(buf, "chanlist") == 0) {
+ 		if (hostapd_parse_chanlist(conf, pos)) {
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/hostapd/ctrl_iface.c hostapd-2.6/hostapd/ctrl_iface.c
+--- hostapd-2.6-orig/hostapd/ctrl_iface.c	2017-04-03 14:43:00.874405034 +0300
++++ hostapd-2.6/hostapd/ctrl_iface.c	2017-04-03 14:44:31.852576047 +0300
+@@ -2082,6 +2082,14 @@ static int hostapd_ctrl_iface_track_sta_
+ }
+ #endif /* NEED_AP_MLME */
+ 
++static int hostapd_ctrl_iface_acs_recalc(struct hostapd_iface *iface)
++{
++  struct channel_data ch_data;
++
++  memset(&ch_data, 0, sizeof(ch_data));
++  hostapd_ltq_update_channel_data(iface, (const u8 *)&ch_data, sizeof(ch_data));
++  return 0;
++}
+ 
+ static int hostapd_ctrl_iface_req_lci(struct hostapd_data *hapd,
+ 				      const char *cmd)
+@@ -2529,6 +2537,9 @@ static int hostapd_ctrl_iface_receive_pr
+ 	} else if (os_strncmp(buf, "VENDOR ", 7) == 0) {
+ 		reply_len = hostapd_ctrl_iface_vendor(hapd, buf + 7, reply,
+ 						      reply_size);
++	} else if (os_strncmp(buf, "ACS_RECALC", 10) == 0) {
++		if (hostapd_ctrl_iface_acs_recalc(hapd->iface))
++			reply_len = -1;
+ 	} else if (os_strcmp(buf, "ERP_FLUSH") == 0) {
+ 		ieee802_1x_erp_flush(hapd);
+ #ifdef RADIUS_SERVER
+@@ -2581,7 +2592,6 @@ static int hostapd_ctrl_iface_receive_pr
+ 	return reply_len;
+ }
+ 
+-
+ static void hostapd_ctrl_iface_receive(int sock, void *eloop_ctx,
+ 				       void *sock_ctx)
+ {
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/hostapd/hostapd_cli.c hostapd-2.6/hostapd/hostapd_cli.c
+--- hostapd-2.6-orig/hostapd/hostapd_cli.c	2017-04-03 14:43:00.874405034 +0300
++++ hostapd-2.6/hostapd/hostapd_cli.c	2017-04-03 14:44:31.853576027 +0300
+@@ -1277,6 +1277,10 @@ static int hostapd_cli_cmd_driver_flags(
+ 	return wpa_ctrl_command(ctrl, "DRIVER_FLAGS");
+ }
+ 
++static int hostapd_cli_cmd_acs_recalc(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++  return wpa_ctrl_command(ctrl, "ACS_RECALC");
++}
+ 
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+@@ -1366,6 +1370,7 @@ static const struct hostapd_cli_cmd host
+ 	{ "hs20_wnm_notif", hostapd_cli_cmd_hs20_wnm_notif, NULL, NULL },
+ 	{ "hs20_deauth_req", hostapd_cli_cmd_hs20_deauth_req, NULL, NULL },
+ 	{ "vendor", hostapd_cli_cmd_vendor, NULL, NULL },
++	{ "acs_recalc", hostapd_cli_cmd_acs_recalc, NULL, NULL },
+ 	{ "enable", hostapd_cli_cmd_enable, NULL, NULL },
+ 	{ "reload", hostapd_cli_cmd_reload, NULL, NULL },
+ 	{ "disable", hostapd_cli_cmd_disable, NULL, NULL },
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/acs.c hostapd-2.6/src/ap/acs.c
+--- hostapd-2.6-orig/src/ap/acs.c	2017-04-03 14:43:00.884404833 +0300
++++ hostapd-2.6/src/ap/acs.c	2017-04-03 14:47:03.936875325 +0300
+@@ -19,6 +19,10 @@
+ #include "ap_drv_ops.h"
+ #include "ap_config.h"
+ #include "hw_features.h"
++#include "common/hw_features_common.h"
++#include "dfs.h"
++#include "beacon.h"
++#include <assert.h>
+ #include "acs.h"
+ 
+ /*
+@@ -243,6 +247,7 @@
+ 
+ static int acs_request_scan(struct hostapd_iface *iface);
+ static int acs_survey_is_sufficient(struct freq_survey *survey);
++static u32 acs_get_center_chan_index(struct hostapd_iface *iface);
+ 
+ 
+ static void acs_clean_chan_surveys(struct hostapd_channel_data *chan)
+@@ -850,6 +855,32 @@ fail:
+ #define VHT_OPER_CHWIDTH_160   2
+ #define VHT_OPER_CHWIDTH_80_80 3
+ 
++int get_num_width(int vht_width, int secondary)
++{
++  switch (vht_width) {
++    case VHT_OPER_CHWIDTH_20_40: return secondary ? 40 : 20;
++    case VHT_OPER_CHWIDTH_80:    return 80;
++    case VHT_OPER_CHWIDTH_160:   return 160;
++    case VHT_OPER_CHWIDTH_80_80:
++    default: wpa_printf(MSG_ERROR, "ACS: wrong or unsupported channel VHT width %d", vht_width);
++  }
++
++  return -1; /* should never happen */
++}
++
++int get_vht_width(int width)
++{
++  switch (width) {
++    case 20:
++    case 40: return VHT_OPER_CHWIDTH_20_40;
++    case 80: return VHT_OPER_CHWIDTH_80;
++    case 160: return VHT_OPER_CHWIDTH_160;
++    default: wpa_printf(MSG_ERROR, "ACS: wrong or unsupported channel width %d", width);
++  }
++
++  return -1; /* should never happen */
++}
++
+ static inline unsigned acs_freq_to_chan(int freq)
+ {
+ 	u8 chan;
+@@ -857,6 +888,31 @@ static inline unsigned acs_freq_to_chan(
+ 	return chan;
+ }
+ 
++int acs_chan_to_freq(int channel)
++{
++  int res = 0;
++
++  /* IEEE Std 802.11-2012: 20.3.15 Channel numbering and channelization
++  Channel center frequency = starting frequency + 5 * ch
++  */
++
++#define CHANNEL_THRESHOLD 180
++
++  /* channels 1..14 */
++  if (channel >= 1 && channel <= 14) {
++    res = 2407 + 5 * channel;
++    if (channel == 14) /* IEEE Std 802.11-2012: 17.4.6.3 Channel Numbering of operating channels */
++      res += 7;
++  }
++  else if (channel >= 36 && channel <= CHANNEL_THRESHOLD)
++    res = 5000 + 5 * channel;
++  else if (channel)
++    res = 4000 + 5 * channel;
++
++#undef CHANNEL_THRESHOLD
++  return res;
++}
++
+ static void acs_record_bsses(struct hostapd_iface *iface, struct wpa_scan_results *scan_res, FILE *fp)
+ {
+ 	struct hostapd_hw_modes *mode = iface->current_mode;
+@@ -1198,6 +1254,24 @@ static void acs_numbss_adjust_vht_center
+ 		iface->conf->channel + offset;
+ }
+ 
++static void acs_smart_adjust_vht_center_freq(struct hostapd_iface *iface, unsigned center_chan_index)
++{
++  wpa_printf(MSG_DEBUG, "ACS SMART: Adjusting VHT center frequency");
++
++  switch (iface->conf->vht_oper_chwidth) {
++  case VHT_CHANWIDTH_USE_HT:
++    iface->conf->vht_oper_centr_freq_seg0_idx = iface->conf->channel + 2 * iface->conf->secondary_channel;
++    break;
++  case VHT_CHANWIDTH_80MHZ:
++    iface->conf->vht_oper_centr_freq_seg0_idx =
++      center_chan_index ? center_chan_index : acs_get_center_chan_index(iface);
++    break;
++  default:
++    wpa_printf(MSG_INFO, "ACS SMART: Only VHT20/40/80 is supported now");
++    return;
++  }
++}
++
+ static void acs_find_min_badness(struct hostapd_iface *iface, FILE *fp)
+ {
+ 	struct hostapd_hw_modes *mode = iface->current_mode;
+@@ -1222,6 +1296,7 @@ static void acs_find_min_badness(struct 
+ 
+ 	for (j = 0; j < mode->num_channels; j++) {
+ 		struct hostapd_channel_data *chan = &mode->channels[j];
++
+ 		fprintf(fp, "%9i\t0x%04x\t%8u\t%8u\t%8u\t%8u\t%11u\t%12u\t%12u\t%9i\t%10i\t%10i\t%9i\n",
+ 			chan->chan, chan->flag,
+ 			chan->num_bss_pri, chan->num_bss_sec, chan->num_bss_tert, chan->num_bss_quat,
+@@ -1376,13 +1451,270 @@ static void acs_count_bsses(struct hosta
+ 	acs_fail(iface);
+ }
+ 
++Boolean channels_overlap(u32 freq1, u32 width1, u32 freq2, u32 width2)
++{
++
++#define SINGLE_CHANNEL_WIDTH 20
++
++  /* convert the first channel's center frequency to the start of frequency range */
++  freq1 -= SINGLE_CHANNEL_WIDTH >> 1;
++  freq2 -= SINGLE_CHANNEL_WIDTH >> 1;
++
++  if ((freq2 >= freq1) && (freq1 + width1 > freq2)) return TRUE;
++  if ((freq1 >= freq2) && (freq2 + width2 > freq1)) return TRUE;
++  return FALSE;
++}
++
++void acs_smart_record_bsses(struct hostapd_iface *iface, struct wpa_scan_results *scan_res, FILE *fp)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  struct acs_candidate_table *candidates = mode->candidates;
++  int i, j;
++
++  wpa_printf(MSG_DEBUG, "ACS_SMART: recording BSS-es");
++
++  /* init the counters */
++  for (j = 0; j < mode->num_channels; j++) {
++    struct hostapd_channel_data *chan = &mode->channels[j];
++    chan->num_bss_pri = chan->num_bss_sec = chan->num_bss_tert = chan->num_bss_quat = 0;
++    chan->num_bss_conflicting_20 = chan->num_bss_conflicting_ht40plus = chan->num_bss_conflicting_ht40minus = 0;
++  }
++  mode->num_bss = 0;
++
++  for (j = 0; j < mode->num_candidates; j++) {
++    candidates[j].num_bss = candidates[j].num_bss_pri = candidates[j].num_adjacent =
++    candidates[j].overlap40 = candidates[j].overlap80 = candidates[j].primary_on_overlap_4080 =
++    candidates[j].intolerant40 = 0;
++  }
++
++  fprintf(fp, "\n# ssid                          \twidth\tprimary\tsecondary\tcenter0\tcenter1\n");
++
++  for (i = 0; i < scan_res->num; i++) {
++    struct wpa_scan_res *bss = scan_res->res[i];
++    struct ieee802_11_elems elems;
++    struct ieee80211_ht_capabilities *ht_cap = NULL;
++    struct ieee80211_ht_operation *ht_oper = NULL;
++    struct ieee80211_vht_operation *vht_oper = NULL;
++    int bss_sec_freq = 0;
++    int bss_center_freq0 = bss->freq;
++    int bss_center_freq1 = 0;
++    int bss_width = 0;
++    int bss_base_freq;
++    int num_width = 20;
++    const char *bss_printable_width = "20";
++
++    if (!acs_find_chan(iface, bss->freq))
++      continue;
++
++    ieee802_11_parse_elems((u8 *)(bss + 1), bss->ie_len, &elems, 0);
++
++    /* get the HT capabilities element, needed later when we analyze each channel */
++    if (elems.ht_capabilities)
++      ht_cap = (struct ieee80211_ht_capabilities *) elems.ht_capabilities;
++
++    /* get the secondary channel's frequency */
++    if (elems.ht_operation) {
++      ht_oper = (struct ieee80211_ht_operation *) elems.ht_operation;
++
++      if (ht_oper->ht_param & HT_INFO_HT_PARAM_STA_CHNL_WIDTH) {
++        int sec = ht_oper->ht_param & HT_INFO_HT_PARAM_SECONDARY_CHNL_OFF_MASK;
++        if (sec == HT_INFO_HT_PARAM_SECONDARY_CHNL_ABOVE) {
++          bss_printable_width = "40";
++          num_width = 40;
++          bss_sec_freq = bss->freq + 20;
++        }
++        else if (sec == HT_INFO_HT_PARAM_SECONDARY_CHNL_BELOW) {
++          bss_printable_width = "40";
++          bss_sec_freq = bss->freq - 20;
++          num_width = 40;
++        }
++        bss_center_freq0 = (bss->freq + bss_sec_freq) / 2;
++      }
++    }
++
++    /* get the vht operational info if in 5 GHz band */
++    if (mode->mode == HOSTAPD_MODE_IEEE80211A && elems.vht_operation) {
++      vht_oper = (struct ieee80211_vht_operation *) elems.vht_operation;
++      bss_width = vht_oper->vht_op_info_chwidth;
++
++      if (bss_width > VHT_OPER_CHWIDTH_20_40) {
++        bss_printable_width = bss_width == VHT_OPER_CHWIDTH_80 ? "80" : "160";
++        num_width = (bss_width == VHT_OPER_CHWIDTH_80) ? 80 : 160;
++
++        bss_center_freq0 = 5000 + 5 * vht_oper->vht_op_info_chan_center_freq_seg0_idx;
++        if (bss_width == VHT_OPER_CHWIDTH_80_80) {
++          bss_printable_width = "80+80";
++          bss_center_freq1 = 5000 + 5 * vht_oper->vht_op_info_chan_center_freq_seg1_idx;
++          num_width = 160;
++        }
++      }
++    }
++
++    fprintf(fp, "%-32.*s\t%5s\t%7u\t%9u\t%7u\t%7u\n",
++      elems.ssid_len, elems.ssid, bss_printable_width,
++      acs_freq_to_chan(bss->freq),
++      bss_sec_freq > 0 ? acs_freq_to_chan(bss_sec_freq) : 0,
++      acs_freq_to_chan(bss_center_freq0),
++      bss_center_freq1 > 0 ? acs_freq_to_chan(bss_center_freq1) : 0);
++
++    if (bss_sec_freq) {
++      bss_base_freq = bss_sec_freq > bss->freq ? bss->freq : bss_sec_freq;
++    } else bss_base_freq = bss->freq;
++
++    /* increase the relevant counters in every channel affected */
++    for (j = 0; j < mode->num_candidates; j++)
++    {
++      if (channels_overlap(candidates[j].freq, candidates[j].width, bss_base_freq, num_width)) {
++        candidates[j].num_bss++;
++
++#if 0
++        fprintf(fp, "BSS %i cand %i chan %d/%d freq %d width %d base_freq %d bss_width %d num_bss %d\n",
++          i, j, candidates[j].primary, candidates[j].secondary, candidates[j].freq, candidates[j].width, bss_base_freq, num_width, candidates[j].num_bss);
++#endif
++
++        if (bss_width == VHT_OPER_CHWIDTH_80) {
++          candidates[j].overlap80++;
++          os_get_reltime(&candidates[j].ts_overlap80);
++          if (channels_overlap(acs_chan_to_freq(candidates[j].primary), 20, bss_base_freq, num_width)) {
++            candidates[j].primary_on_overlap_4080++;
++            wpa_printf(MSG_DEBUG, "pri_overlap80 - %d + %d vs. %d + %d , bss2 = %d overlaps ?", candidates[j].freq, 20, bss_base_freq, num_width, bss_sec_freq);
++          }
++        }
++        else if (bss_width == VHT_OPER_CHWIDTH_20_40) {
++          if (bss_sec_freq) {
++            if (channels_overlap(acs_chan_to_freq(candidates[j].primary), 20, bss_base_freq, num_width)) {
++                wpa_printf(MSG_DEBUG, "pri_overlap2040 - %d + %d vs. %d + %d , bss2 = %d overlaps ?", candidates[j].freq, 20, bss_base_freq, num_width, bss_sec_freq);
++                candidates[j].primary_on_overlap_4080++;
++            }
++          }
++        } else { /* 80+80 or 160 */
++          if (channels_overlap(acs_chan_to_freq(candidates[j].primary), 20, bss_base_freq, num_width)) {
++            candidates[j].primary_on_overlap_4080++;
++            wpa_printf(MSG_DEBUG, "pri_overlap160 - %d + %d vs. %d + %d , bss2 = %d overlaps ?", candidates[j].freq, 20, bss_base_freq, num_width, bss_sec_freq);
++          }
++        }
++
++        if (!ht_cap &&
++            (candidates[j].primary != acs_freq_to_chan(bss->freq)) &&
++            (candidates[j].width == 40)) {
++          os_get_reltime(&candidates[j].ts_legacy);
++        }
++
++        if (candidates[j].width == 40) { /* 20/40 rules */
++          if (((bss_width == VHT_OPER_CHWIDTH_20_40) && bss_sec_freq && /* pri and sec must be equal */
++            ((acs_chan_to_freq(candidates[j].primary) != bss->freq) ||
++              (acs_chan_to_freq(candidates[j].secondary) != bss_sec_freq))) ||
++            (!bss_sec_freq && acs_chan_to_freq(candidates[j].primary) != bss->freq))
++          { /* primary channel must be the same as the operating channel of all 20MHz BSSs */
++            candidates[j].overlap40++;
++            os_get_reltime(&candidates[j].ts_overlap40);
++          }
++        }
++
++        if (ht_cap &&
++            (le_to_host16(ht_cap->ht_capabilities_info) & HT_CAP_INFO_40MHZ_INTOLERANT) &&
++            candidates[j].secondary) {
++          candidates[j].intolerant40++;
++          os_get_reltime(&candidates[j].ts_intolerant40);
++        }
++
++        if (channels_overlap(acs_chan_to_freq(candidates[j].primary), 20, bss_base_freq, num_width)) {
++          candidates[j].num_bss_pri++;
++        }
++
++      } /* overlaps */
++
++      candidates[j].num_adjacent = candidates[j].num_bss - candidates[j].num_bss_pri;
++    } /* for - candidates */
++
++    mode->num_bss++;
++  }
++
++  iface->conf->acs_init_done = 1;
++
++  fprintf(fp, "\nnum_bss = %d\n\n", mode->num_bss);
++}
++
++static void acs_smart_process_bsses(struct hostapd_iface *iface, struct wpa_scan_results *scan_res)
++{
++  FILE *fp = fopen(iface->conf->acs_history_file, iface->conf->acs_init_done ? "a" : "w");
++
++  if (!fp) {
++    wpa_printf(MSG_ERROR, "Error opening the ACS history file '%s': %s",
++      iface->conf->acs_history_file, strerror(errno));
++    fp = stderr;
++  }
++
++  acs_smart_record_bsses(iface, scan_res, fp);
++
++  if (fp != stderr && fclose(fp))
++    wpa_printf(MSG_ERROR, "Error closing the ACS history file: %s", strerror(errno));
++
++  acs_recalc_ranks_and_set_chan(iface, SWR_INITIAL);
++
++  /* hostapd_setup_interface_complete() will return -1 on failure and 0 on success */
++  if (hostapd_acs_completed(iface, 0) == 0)
++  {
++    acs_cleanup(iface);
++    return;
++  }
++
++  /* If we're here then somehow ACS chose an invalid channel */
++  wpa_printf(MSG_ERROR, "SmartACS: BSS procedure failed. If reporting, please include your config file and info file '%s'.", iface->conf->acs_smart_info_file);
++  acs_fail(iface);
++}
++
++static void acs_bg_scan_complete(struct hostapd_iface *iface)
++{
++  struct wpa_scan_results *scan_res = NULL;
++  FILE *fp;
++
++  if (iface->acs_update_in_progress) {
++    wpa_printf(MSG_INFO, "ACS Update already in progress");
++    return;
++  }
++
++  iface->in_scan = 0;
++  iface->acs_update_in_progress = 1;
++
++  scan_res = hostapd_driver_get_scan_results(iface->bss[0]);
++
++  if (scan_res == NULL) {
++    wpa_printf(MSG_ERROR, "ACS: Failed to get BSS data from BG scan");
++    iface->acs_update_in_progress = 0;
++    return;
++  }
++
++  wpa_printf(MSG_INFO, "BSS data from BG scan received");
++  fp = fopen(iface->conf->acs_history_file, "a");
++
++  if (!fp) {
++    wpa_printf(MSG_ERROR, "Error opening the ACS history file '%s': %s",
++               iface->conf->acs_history_file, strerror(errno));
++    fp = stderr;
++  }
++
++  acs_smart_record_bsses(iface, scan_res, fp);
++
++  if (fp != stderr && fclose(fp))
++    wpa_printf(MSG_ERROR, "Error closing the ACS history file: %s", strerror(errno));
++
++  if (acs_recalc_ranks_and_set_chan(iface, SWR_BG_SCAN))
++    acs_do_switch_channel(iface, 0);
++
++  iface->acs_update_in_progress = 0;
++  return;
++}
+ 
+ static void acs_scan_complete(struct hostapd_iface *iface)
+ {
+ 	struct wpa_scan_results *scan_res = NULL;
+ 	int err;
+ 
+-	iface->scan_cb = NULL;
++  iface->in_scan = 0;
++
++  /* Change the scan callback function for BG scan results */
++  iface->scan_cb = acs_bg_scan_complete;
+ 
+ 	if (iface->conf->acs_algo == ACS_ALGO_SURVEY) {
+ 		wpa_printf(MSG_DEBUG, "ACS: Using survey based algorithm (acs_num_scans=%d)",
+@@ -1393,13 +1725,13 @@ static void acs_scan_complete(struct hos
+ 			wpa_printf(MSG_ERROR, "ACS: Failed to get survey data");
+ 			goto fail;
+ 		}
+-	} else if (iface->conf->acs_algo == ACS_ALGO_NUMBSS) {
+-		wpa_printf(MSG_DEBUG, "ACS: Using num-BSS based algorithm (acs_num_scans=%d)",
++	} else if ((iface->conf->acs_algo == ACS_ALGO_NUMBSS) || (iface->conf->acs_algo == ACS_ALGO_SMART)) {
++    wpa_printf(MSG_DEBUG, "ACS: Using BSS based algorithm (acs_num_scans=%d)",
+ 			   iface->conf->acs_num_scans);
+ 
+ 		scan_res = hostapd_driver_get_scan_results(iface->bss[0]);
+ 		if (scan_res == NULL) {
+-			wpa_printf(MSG_ERROR, "ACS: Failed to get num-BSS data");
++			wpa_printf(MSG_ERROR, "ACS: Failed to get BSS data");
+ 			goto fail;
+ 		}
+ 	}
+@@ -1414,10 +1746,22 @@ static void acs_scan_complete(struct hos
+ 		return;
+ 	}
+ 
+-	if (iface->conf->acs_algo == ACS_ALGO_SURVEY) {
+-		acs_study(iface);
+-	} else if (iface->conf->acs_algo == ACS_ALGO_NUMBSS) {
+-		acs_count_bsses(iface, scan_res);
++  switch (iface->conf->acs_algo) {
++
++    case ACS_ALGO_SURVEY:
++      acs_study(iface);
++      break;
++
++    case ACS_ALGO_NUMBSS:
++      acs_count_bsses(iface, scan_res);
++      break;
++
++    case ACS_ALGO_SMART:
++      acs_smart_process_bsses(iface, scan_res);
++      break;
++
++    default:
++      wpa_printf(MSG_ERROR, "ACS: unknown algo");
+ 	}
+ 
+ 	return;
+@@ -1427,6 +1771,285 @@ fail:
+ }
+ 
+ 
++typedef struct {
++  u32 primary;
++  u32 secondary;
++} channel_pair;
++
++channel_pair channel_pairs_40_24G[] = { { 1,  5 },
++                                       {  5,  1 },
++                                       {  2,  6 },
++                                       {  6,  2 },
++                                       {  3,  7 },
++                                       {  7,  3 },
++                                       {  4,  8 },
++                                       {  8,  4 },
++                                       {  5,  9 },
++                                       {  9,  5 },
++                                       {  6, 10 },
++                                       { 10,  6 },
++                                       {  7, 11 },
++                                       { 11,  7 },
++                                       {  8, 12 },
++                                       { 12,  8 },
++                                       {  9, 13 },
++                                       { 13,  9 } };
++
++channel_pair channel_pairs_40_5G[] = { {  36, 40 },
++                                       {  40, 36 },
++                                       {  44, 48 },
++                                       {  48, 44 },
++                                       {  52, 56 },
++                                       {  56, 52 },
++                                       {  60, 64 },
++                                       {  64, 60 },
++                                       { 100,104 },
++                                       { 104,100 },
++                                       { 108,112 },
++                                       { 112,108 },
++                                       { 116,120 },
++                                       { 120,116 },
++                                       { 124,128 },
++                                       { 128,124 },
++                                       { 132,136 },
++                                       { 136,132 },
++                                       { 140,144 },
++                                       { 144,140 },
++                                       { 149,153 },
++                                       { 153,149 },
++                                       { 157,161 },
++                                       { 161,157 } };
++
++
++typedef struct {
++  u32 chan_no;
++  u32 primary;
++  u32 secondary;
++  u32 freq;
++} channel_80;
++
++channel_80 channels80[] = { {  42,  36, 40, 5000 + 36 * 5 },
++                            {  42,  40, 36, 5000 + 36 * 5 },
++                            {  42,  44, 48, 5000 + 36 * 5 },
++                            {  42,  48, 44, 5000 + 36 * 5 },
++
++                            {  58,  52, 56, 5000 + 52 * 5 },
++                            {  58,  56, 52, 5000 + 52 * 5 },
++                            {  58,  60, 64, 5000 + 52 * 5 },
++                            {  58,  64, 60, 5000 + 52 * 5 },
++
++                            { 106, 100, 104, 5000 + 100 * 5 },
++                            { 106, 104, 100, 5000 + 100 * 5 },
++                            { 106, 108, 112, 5000 + 100 * 5 },
++                            { 106, 112, 108, 5000 + 100 * 5 },
++
++                            { 122, 116, 120, 5000 + 116 * 5 },
++                            { 122, 120, 116, 5000 + 116 * 5 },
++                            { 122, 124, 128, 5000 + 116 * 5 },
++                            { 122, 128, 124, 5000 + 116 * 5 },
++
++                            { 138, 132, 136, 5000 + 132 * 5 },
++                            { 138, 136, 132, 5000 + 132 * 5 },
++                            { 138, 140, 144, 5000 + 132 * 5 },
++                            { 138, 144, 140, 5000 + 132 * 5 },
++
++                            { 155, 149, 153, 5000 + 149 * 5 },
++                            { 155, 153, 149, 5000 + 149 * 5 },
++                            { 155, 157, 161, 5000 + 149 * 5 },
++                            { 155, 161, 157, 5000 + 149 * 5 } };
++
++
++static u32 acs_get_center_chan_index(struct hostapd_iface *iface)
++{
++  int i;
++  u32 primary, secondary;
++
++  if (iface->conf->vht_oper_chwidth != VHT_CHANWIDTH_80MHZ)
++    return 0;
++
++  primary   = iface->conf->channel;
++  secondary = iface->conf->secondary_channel ? iface->conf->channel + iface->conf->secondary_channel * 4 : 0;
++
++  for(i = 0; i < sizeof(channels80)/sizeof(channels80[0]); i++)
++    if (channels80[i].primary == primary &&
++      channels80[i].secondary == secondary)
++      return channels80[i].chan_no;
++
++  wpa_printf(MSG_ERROR, "didn't find center channel index from primary channel "
++    "%d and secondary channel %d", primary, secondary);
++  return 0;
++}
++
++static int acs_is_subchannel_allowed(struct hostapd_iface *iface, int channel)
++{
++  int j;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  for (j = 0; j < mode->num_channels; j++) {
++    if (mode->channels[j].flag & HOSTAPD_CHAN_DISABLED)
++      continue;
++    if (mode->channels[j].chan == channel) return 1;
++  }
++
++  return 0;
++}
++
++static int acs_is_channel_disabled(struct hostapd_iface *iface, int freq, int width)
++{
++  int i, j;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  for (j = 0; j < mode->num_channels; j++) {
++    struct hostapd_channel_data *chan = &mode->channels[j];
++
++    for (i = 0; i < (width / SINGLE_CHANNEL_WIDTH); i++) {
++      if ((chan->freq == freq + SINGLE_CHANNEL_WIDTH * i) && (chan->flag & HOSTAPD_CHAN_DISABLED)) return 1;
++    }
++  }
++
++  return 0;
++}
++
++static int acs_is_radar_affected_channel(struct hostapd_iface *iface, int channel)
++{
++  int j;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  for (j = 0; j < mode->num_channels; j++) {
++    if (mode->channels[j].chan == channel) {
++      if (mode->channels[j].flag & HOSTAPD_CHAN_RADAR)
++        return 1;
++      else return 0;
++    }
++  }
++
++  return 0;
++}
++
++void add_channel_pair_candidates(struct hostapd_iface *iface, channel_pair *channel_pairs, u32 nof_pairs, u32 base_freq, struct hostapd_channel_data *chan)
++{
++  int i;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  for (i = 0; i < nof_pairs; i++) {
++    if ((channel_pairs[i].primary == chan->chan) && acs_is_subchannel_allowed(iface, channel_pairs[i].secondary)) {
++      if (channel_pairs[i].primary < channel_pairs[i].secondary)
++        mode->candidates[mode->num_candidates].freq = chan->freq;
++      else mode->candidates[mode->num_candidates].freq = base_freq + 5 * channel_pairs[i].secondary;
++      mode->candidates[mode->num_candidates].primary = channel_pairs[i].primary;
++      mode->candidates[mode->num_candidates].secondary = channel_pairs[i].secondary;
++      mode->candidates[mode->num_candidates].chan = (channel_pairs[i].primary + channel_pairs[i].secondary) >> 1;
++      mode->candidates[mode->num_candidates].width = 40;
++
++      if ((chan->flag & HOSTAPD_CHAN_RADAR) ||
++           acs_is_radar_affected_channel(iface, channel_pairs[i].secondary))
++        mode->candidates[mode->num_candidates].radar_affected = TRUE;
++
++      wpa_printf(MSG_DEBUG, "ACS: adding candidate %d, freq %d chan %d pri %d sec %d width %d",
++        mode->num_candidates,
++        mode->candidates[mode->num_candidates].freq,
++        mode->candidates[mode->num_candidates].chan,
++        mode->candidates[mode->num_candidates].primary,
++        mode->candidates[mode->num_candidates].secondary,
++        mode->candidates[mode->num_candidates].width);
++
++      mode->num_candidates++;
++    }
++  }
++}
++
++void add_80_channels(struct hostapd_iface *iface, channel_80 *channel_pairs, u32 nof_pairs, struct hostapd_channel_data *chan)
++{
++  int i;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  for (i = 0; i < nof_pairs; i++) {
++    if ((channel_pairs[i].primary == chan->chan) &&
++        !acs_is_channel_disabled(iface, channel_pairs[i].freq, 80)) {
++      mode->candidates[mode->num_candidates].freq = channel_pairs[i].freq;
++      mode->candidates[mode->num_candidates].chan = channel_pairs[i].chan_no;
++      mode->candidates[mode->num_candidates].primary = channel_pairs[i].primary;
++      mode->candidates[mode->num_candidates].secondary = channel_pairs[i].secondary;
++      mode->candidates[mode->num_candidates].width = 80;
++
++      if (acs_is_radar_affected_channel(iface, channel_pairs[i].chan_no - 6) ||
++          acs_is_radar_affected_channel(iface, channel_pairs[i].chan_no - 2) ||
++          acs_is_radar_affected_channel(iface, channel_pairs[i].chan_no + 2) ||
++          acs_is_radar_affected_channel(iface, channel_pairs[i].chan_no + 6))
++        mode->candidates[mode->num_candidates].radar_affected = TRUE;
++
++      wpa_printf(MSG_DEBUG, "ACS: adding candidate %d, freq %d chan %d pri %d sec %d width %d",
++        mode->num_candidates,
++        mode->candidates[mode->num_candidates].freq,
++        mode->candidates[mode->num_candidates].chan,
++        mode->candidates[mode->num_candidates].primary,
++        mode->candidates[mode->num_candidates].secondary,
++        mode->candidates[mode->num_candidates].width);
++
++      mode->num_candidates++;
++    }
++  }
++}
++
++static void acs_init_candidate_table(struct hostapd_iface *iface)
++{
++  int i;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  memset(mode->candidates, 0, sizeof(mode->candidates));
++  mode->num_candidates = 0;
++  mode->selected_candidate = -1;
++
++  wpa_printf(MSG_DEBUG, "ACS: init candidate table, num_chan = %d", mode->num_channels);
++
++  for (i = 0; i < mode->num_channels; i++) {
++    struct hostapd_channel_data *chan = &mode->channels[i];
++    if (chan->flag & HOSTAPD_CHAN_DISABLED) continue;
++    if (chan->flag & HOSTAPD_CHAN_RADAR) mode->candidates[mode->num_candidates].radar_affected = TRUE;
++
++    mode->candidates[mode->num_candidates].freq = chan->freq;
++    mode->candidates[mode->num_candidates].chan = chan->chan;
++    mode->candidates[mode->num_candidates].primary = chan->chan;
++    mode->candidates[mode->num_candidates].secondary = 0;
++    mode->candidates[mode->num_candidates].width = 20;
++
++    wpa_printf(MSG_DEBUG, "ACS: adding candidate %d, freq %d chan %d pri %d sec %d width %d",
++                        mode->num_candidates,
++                        mode->candidates[mode->num_candidates].freq,
++                        mode->candidates[mode->num_candidates].chan,
++                        mode->candidates[mode->num_candidates].primary,
++                        mode->candidates[mode->num_candidates].secondary,
++                        mode->candidates[mode->num_candidates].width);
++
++    mode->num_candidates++;
++
++    if (!iface->conf->secondary_channel) { /* 40 MHz not supported */
++      continue;
++    }
++
++    if (chan->freq < 5000) { /* 2.4 GHz */
++      add_channel_pair_candidates(iface, channel_pairs_40_24G, sizeof(channel_pairs_40_24G) / sizeof(channel_pair), 2407, chan);
++    } else { /* 5 GHz */
++      add_channel_pair_candidates(iface, channel_pairs_40_5G, sizeof(channel_pairs_40_5G) / sizeof(channel_pair), 5000, chan);
++
++      if (iface->conf->vht_oper_chwidth) { /* 80 MHz supported */
++        add_80_channels(iface, channels80, sizeof(channels80) / sizeof(channel_80), chan);
++      }
++    }
++  }
++/*
++  if (chan->freq > 5000) { 5 GHz
++    add_80plus80channels(); ???
++    add_160_channels();
++  }
++*/
++
++  wpa_printf(MSG_DEBUG, "ACS: init candidate table done");
++
++  return;
++}
++
++
+ static int acs_request_scan(struct hostapd_iface *iface)
+ {
+ 	struct wpa_driver_scan_params params;
+@@ -1458,6 +2081,7 @@ static int acs_request_scan(struct hosta
+ 		   iface->acs_num_completed_scans + 1,
+ 		   iface->conf->acs_num_scans);
+ 
++  iface->in_scan = 1;
+ 	if (hostapd_driver_scan(iface->bss[0], &params) < 0) {
+ 		wpa_printf(MSG_ERROR, "ACS: Failed to request initial scan");
+ 		acs_cleanup(iface);
+@@ -1489,6 +2113,11 @@ enum hostapd_chan_status acs_init(struct
+ 
+ 	acs_cleanup(iface);
+ 
++#ifndef UNIT_TEST
++  if (!iface->conf->acs_init_done)
++    acs_init_candidate_table(iface);
++#endif
++
+ 	err = acs_request_scan(iface);
+ 	if (err < 0)
+ 		return HOSTAPD_CHAN_INVALID;
+@@ -1498,3 +2127,972 @@ enum hostapd_chan_status acs_init(struct
+ 
+ 	return HOSTAPD_CHAN_ACS;
+ }
++
++
++char acs_to_exclude_candidate(struct hostapd_iface *iface, u32 i, struct os_reltime *now)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  if (acs_is_channel_disabled(iface, mode->candidates[i].freq, mode->candidates[i].width)) {
++    wpa_printf(MSG_DEBUG, "ACS: skip candidate %d, disabled", i);
++    return ACS_EXCLUDE_DISABLED;
++  }
++
++  if (mode->candidates[i].radar_detected) {
++    wpa_printf(MSG_DEBUG, "ACS: skip candidate %d, radar detect", i);
++    return ACS_EXCLUDE_RADAR;
++  }
++
++  if (mode->candidates[i].intolerant40 &&
++    !os_reltime_expired(now, &mode->candidates[i].ts_intolerant40, iface->conf->acs_to_degradation[T_40INTO])) {
++    wpa_printf(MSG_DEBUG, "ACS: skip candidate %d, intolerant no timeout", i);
++    return ACS_EXCLUDE_INTOLERANT;
++  }
++
++  if (mode->candidates[i].overlap40) {
++    wpa_printf(MSG_DEBUG, "ACS: skip candidate %d, overlap40", i);
++    return ACS_EXCLUDE_OVERLAP40;
++  }
++
++  if (mode->candidates[i].cwi_noise + 128 > iface->conf->acs_to_degradation[D_CWI]) {
++    wpa_printf(MSG_DEBUG, "ACS: skip candidate %d, CWI noise %i > %i", i, mode->candidates[i].cwi_noise, iface->conf->acs_to_degradation[D_CWI]);
++    return ACS_EXCLUDE_CWI;
++  }
++
++  wpa_printf(MSG_DEBUG, "ACS: do NOT skip candidate %d", i);
++  return ACS_NO_EXCLUSION;
++}
++
++
++typedef struct {
++  u32 rank;
++  u32 cand_idx;
++} calibration_group;
++
++
++#ifndef MIN
++#define MIN(x,y) ((x)<(y)?(x):(y))
++#endif
++
++#ifndef MAX
++#define MAX(x,y) ((x)>(y)?(x):(y))
++#endif
++
++
++static int get_secondary_offset(int primary, int secondary)
++{
++  if (secondary) {
++    return ((secondary > primary) ? 1 : -1);
++  } else return 0;
++}
++
++int hostapd_csa_in_progress(struct hostapd_iface *iface);
++int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface);
++
++int acs_do_switch_channel(struct hostapd_iface *iface, int block_tx)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  struct csa_settings csa_settings;
++  unsigned int i;
++  int err = 1;
++
++  /* Check if CSA in progress */
++  if (hostapd_csa_in_progress(iface)) {
++    wpa_printf(MSG_DEBUG, "will NOT switch to a new channel - CSA already in progress");
++    return -1;
++  }
++
++  /* Check if active CAC */
++  if (iface->cac_started) return 0;
++
++  wpa_printf(MSG_DEBUG, "try switch to a new channel %d, params freq %d sec %d vht_chwidth %d seg0 %d seg1 %d block_tx %d", iface->conf->channel,
++    acs_chan_to_freq(iface->conf->channel),
++    iface->conf->secondary_channel,
++    iface->conf->vht_oper_chwidth,
++    iface->conf->vht_oper_centr_freq_seg0_idx,
++    iface->conf->vht_oper_centr_freq_seg1_idx,
++    block_tx);
++
++  /* check CAC required */
++  for (i = 0; i < mode->num_channels; i++) {
++    struct hostapd_channel_data *channel;
++
++    channel = &mode->channels[i];
++
++    if ((channel->chan == iface->conf->channel) &&
++        (channel->flag & HOSTAPD_CHAN_RADAR) &&
++        ((channel->flag & HOSTAPD_CHAN_DFS_MASK) != HOSTAPD_CHAN_DFS_AVAILABLE))
++    {
++      iface->freq = channel->freq;
++      hostapd_setup_interface_complete(iface, 0);
++      return 0;
++    }
++  }
++
++  wpa_printf(MSG_DEBUG, "will switch to a new channel %d, params freq %d sec %d vht_chwidth %d seg0 %d seg1 %d", iface->conf->channel,
++             acs_chan_to_freq(iface->conf->channel),
++             iface->conf->secondary_channel,
++             iface->conf->vht_oper_chwidth,
++             iface->conf->vht_oper_centr_freq_seg0_idx,
++             iface->conf->vht_oper_centr_freq_seg1_idx);
++
++  /* Setup CSA request */
++  os_memset(&csa_settings, 0, sizeof(csa_settings));
++  csa_settings.cs_count = 5;
++  csa_settings.block_tx = block_tx;
++
++  if (!iface->conf->ieee80211n) wpa_printf(MSG_ERROR, "interface HT == OFF, please report !!!");
++
++  err = hostapd_set_freq_params(&csa_settings.freq_params,
++    iface->conf->hw_mode,
++    acs_chan_to_freq(iface->conf->channel),
++    iface->conf->channel,
++    iface->conf->ieee80211n,
++    iface->conf->ieee80211ac,
++    iface->conf->secondary_channel,
++    iface->conf->vht_oper_chwidth,
++    iface->conf->vht_oper_centr_freq_seg0_idx,
++    iface->conf->vht_oper_centr_freq_seg1_idx,
++    iface->current_mode->vht_capab);
++
++  if (err) {
++    wpa_printf(MSG_ERROR, "failed to calculate CSA freq params");
++    /* possibly recover actual iface params */
++    hostapd_disable_iface(iface);
++    return -1;
++  }
++
++  for (i = 0; i < iface->num_bss; i++) {
++    err = hostapd_switch_channel(iface->bss[i], &csa_settings);
++    if (err) {
++      wpa_printf(MSG_ERROR, "Unable to switch channel !");
++      return -1;
++    }
++  }
++
++  return TRUE;
++}
++
++
++void acs_print_info_header(int level)
++{
++  wpa_printf(level, " #  1y  2y freq BW R#     NF load bss pri cal aff rdr ovl40 ovl80 priOvl int40 cwi dyn20 dyn40 dyn80 RSSI SNR RXevt extSTA");
++}
++
++void acs_print_info_header_file(FILE *fp)
++{
++  fprintf(fp, "\n #  1y  2y freq BW R#     NF load bss pri cal aff rdr ovl40 ovl80 priOvl int40 cwi dyn20 dyn40 dyn80 RSSI SNR RXevt extSTA skip\n");
++}
++
++void acs_print_cand_no(int level, struct hostapd_hw_modes *mode, int i)
++{
++  wpa_printf(level, "%2d %3d %3d %4d %2d %5d %4d %3d %2d  %2d   %1d  %2d  %2d   %2d    %2d    %2d     %2d  %4d %2d     %2d    %2d   %4d %3d  %2d  %2d",
++  i, mode->candidates[i].primary,
++  mode->candidates[i].secondary,
++  mode->candidates[i].freq,
++  mode->candidates[i].width,
++  mode->candidates[i].rank,
++
++  mode->candidates[i].noise_floor,
++  mode->candidates[i].channel_load,
++  mode->candidates[i].num_bss,
++  mode->candidates[i].num_bss_pri,
++  mode->candidates[i].calibrated,
++  mode->candidates[i].radar_affected,
++  mode->candidates[i].radar_detected,
++  mode->candidates[i].overlap40,
++  mode->candidates[i].overlap80,
++  mode->candidates[i].primary_on_overlap_4080,
++  mode->candidates[i].intolerant40,
++  mode->candidates[i].cwi_noise,
++  mode->candidates[i].dynBW20,
++  mode->candidates[i].dynBW40,
++  mode->candidates[i].dynBW80,
++  mode->candidates[i].rssi,
++  mode->candidates[i].snr,
++  mode->candidates[i].not_80211_rx_evt,
++  mode->candidates[i].not_my_sta_low_rssi);
++}
++
++void acs_print_cand_no_file(FILE *fp, struct hostapd_hw_modes *mode, int i)
++{
++  fprintf(fp, "%2d %3d %3d %4d %2d %5d %4d %3d %2d  %2d   %c  %2d  %2d   %2d    %2d    %2d     %2d  %4d %2d     %2d    %2d   %4d %3d  %2d    %2d    %c\n",
++    i,
++    mode->candidates[i].primary,
++    mode->candidates[i].secondary,
++    mode->candidates[i].freq,
++    mode->candidates[i].width,
++    mode->candidates[i].rank,
++
++    mode->candidates[i].noise_floor,
++    mode->candidates[i].channel_load,
++    mode->candidates[i].num_bss,
++    mode->candidates[i].num_bss_pri,
++    mode->candidates[i].calibrated ? 'y' : 'n',
++    mode->candidates[i].radar_affected,
++    mode->candidates[i].radar_detected,
++    mode->candidates[i].overlap40,
++    mode->candidates[i].overlap80,
++    mode->candidates[i].primary_on_overlap_4080,
++    mode->candidates[i].intolerant40,
++    mode->candidates[i].cwi_noise,
++    mode->candidates[i].dynBW20,
++    mode->candidates[i].dynBW40,
++    mode->candidates[i].dynBW80,
++    mode->candidates[i].rssi,
++    mode->candidates[i].snr,
++    mode->candidates[i].not_80211_rx_evt,
++    mode->candidates[i].not_my_sta_low_rssi,
++    mode->candidates[i].exclude_reason);
++}
++
++void acs_print_info_legend(FILE *fp)
++{
++  fprintf(fp, "Legend:  # = candidate no\n" \
++              "        1y = primary channel\n" \
++              "        2y = secondary channel\n" \
++              "      freq = frequency\n" \
++              "        BW = bandwidth, channel width\n" \
++              "        R# = calculated rank (not valid for skipped channels)\n" \
++              "        NF = noise floor\n" \
++              "       bsy = channel busy time\n" \
++              "       bss = number of APs detected overlapping with channel\n" \
++              "       pri = number of APs detected overlapping with primary channel\n" \
++              "       cal = calibrated ? yes or no\n" \
++              "       aff = radar affected ?\n" \
++              "       rdr = radar detected\n" \
++              "     ovl40 = overlapping 40MHz APs\n" \
++              "     ovl80 = overlapping 80MHz APs\n" \
++              "    priOvl = primary channel overlapping with 40 or 80MHZ BSS\n" \
++              "     int40 = intolerant 40MHz\n" \
++              "       cwi = CWI noise level detected\n" \
++              "     dyn20 = dynamicBW20MHz - number of instances when 20MHz transmission was aborted due to CCA busy\n" \
++              "     dyn40 = dynamicBW40MHz - number of instances when 40MHz transmission was aborted due to CCA busy\n" \
++              "     dyn80 = dynamicBW80MHz - number of instances when 80MHz transmission was aborted due to CCA busy\n" \
++              "      RSSI = average RSSI level in channel. Value in dB\n" \
++              "       SNR = average SNR in channel. Value in dB\n" \
++              "     RXevt = number of non 802.11 Rx events\n" \
++              "    extSTA = number of packets received from stations not connected to this AP\n" \
++              "      skip = reason, why this channel candidate was excluded from ranking/selection: r = radar, i = intolerant, o = overlap40, p = primary overlap, c = CWI noise\n");
++}
++
++const char *sw_reasons[] = {
++  "initial scan",
++  "intolerant",
++  "radar",
++  "background scan",
++  "periodic update"
++};
++
++
++int acs_set_new_chan_if_ok(struct hostapd_iface *iface, int min_rank_cand_idx, int switch_reason, FILE *fp_hist)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  int actual_primary, actual_secondary, actual_width;
++  int res = FALSE;
++
++  actual_primary   = iface->conf->channel;
++  actual_secondary = iface->conf->secondary_channel ? iface->conf->channel + iface->conf->secondary_channel * 4 : 0;
++  actual_width     = get_num_width(iface->conf->vht_oper_chwidth, actual_secondary);
++
++  /* validate previously selected candidate */
++  if (mode->selected_candidate >= 0)
++  {
++    if ((mode->candidates[mode->selected_candidate].primary != actual_primary) ||
++        (mode->candidates[mode->selected_candidate].width != actual_width) ||
++        (mode->candidates[mode->selected_candidate].secondary != actual_secondary))
++    {
++      wpa_printf(MSG_WARNING, "invalid previously candidate %d detected, current channel %d:%d width %d",
++        mode->selected_candidate, actual_primary, actual_secondary, actual_width);
++      mode->selected_candidate = -1; /* invalid */
++    }
++  } else wpa_printf(MSG_DEBUG, "no previously selected candidate, current channel %d:%d width %d",
++                               actual_primary, actual_secondary, actual_width);
++
++  /* got previous, now check threshold */
++  if ((mode->selected_candidate < 0) || /* if previously selected candidate is not known - switch */
++      (switch_reason == SWR_INTOLERANT) || (switch_reason == SWR_RADAR) || (switch_reason == SWR_INITIAL) || /* in these cases, switch regardless of threshold */
++      (mode->candidates[mode->selected_candidate].rank == -1) || /* If previously selected candidates rank is now invalid, switch regardless of threshold*/
++      ((mode->selected_candidate != min_rank_cand_idx) &&
++       (mode->candidates[min_rank_cand_idx].rank < mode->candidates[mode->selected_candidate].rank * (100 - iface->conf->acs_switch_thresh) / 100)))
++  {
++    if ((mode->candidates[min_rank_cand_idx].primary   != actual_primary) ||
++        (mode->candidates[min_rank_cand_idx].secondary != actual_secondary) ||
++        (mode->candidates[min_rank_cand_idx].width     != actual_width))
++    {
++      wpa_printf(MSG_DEBUG, "ACS going from candidate %d to %d", mode->selected_candidate, min_rank_cand_idx);
++      acs_print_info_header(MSG_DEBUG);
++      acs_print_info_header_file(fp_hist);
++      if (mode->selected_candidate >= 0) {
++        acs_print_cand_no(MSG_DEBUG, mode, mode->selected_candidate);
++        acs_print_cand_no_file(fp_hist, mode, mode->selected_candidate);
++      } else {
++        fprintf(fp_hist, "switch from channel %d:%d width %d\n", actual_primary, actual_secondary, actual_width);
++      }
++      acs_print_cand_no(MSG_DEBUG, mode, min_rank_cand_idx);
++      acs_print_cand_no_file(fp_hist, mode, min_rank_cand_idx);
++
++      /* set the new channel */
++      iface->conf->channel = mode->candidates[min_rank_cand_idx].primary;
++      iface->conf->vht_oper_chwidth = get_vht_width(mode->candidates[min_rank_cand_idx].width);
++      iface->conf->secondary_channel = get_secondary_offset(mode->candidates[min_rank_cand_idx].primary, mode->candidates[min_rank_cand_idx].secondary);
++      mode->selected_candidate = min_rank_cand_idx;
++
++      acs_smart_adjust_vht_center_freq(iface, mode->candidates[min_rank_cand_idx].chan);
++
++      res = TRUE;
++    }
++  }
++
++  return res;
++}
++
++int acs_recalc_ranks_and_set_chan (struct hostapd_iface *iface, int switch_reason)
++{
++  struct os_reltime now;
++  u32 numerator, denominator, base_denominator;
++  calibration_group cg[ACS_NUM_GRP_PRIORITIES];
++  int *grp_map;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  FILE *fp      = fopen(iface->conf->acs_smart_info_file, "w");
++  FILE *fp_hist = fopen(iface->conf->acs_history_file, "a");
++  int i, prio;
++  int res = FALSE;
++
++#if UNIT_TEST
++  FILE *ftest = fopen(iface->conf->smart_acs_test_vector, "r");
++
++  memset(mode->candidates, 0, sizeof(mode->candidates));
++  mode->num_candidates = 0;
++
++  fgets(ftest, line); /* header line */
++
++  for (i = 0; !foef(ftest), i++) {
++    fgets(ftest, line);
++    if (25 != sscanf(line, "%2d %2d %2d %4d %2d %2d %4d %3d %2d  %2d   %1d  %2d  %2d   %2d    %2d    %2d     %2d  %4d %2d     %2d    %2d   %4d %3d  %2d  %2d\n",
++                            &j,
++                            &mode->candidates[i].primary,
++                            &mode->candidates[i].secondary,
++                            &mode->candidates[i].freq,
++                            &mode->candidates[i].width,
++                            &mode->candidates[i].rank,
++
++                            &mode->candidates[i].noise_floor,
++                            &mode->candidates[i].busy_time,
++                            &mode->candidates[i].num_bss,
++                            &mode->candidates[i].num_bss_pri,
++                            &mode->candidates[i].calibrated,
++                            &mode->candidates[i].radar_affected,
++                            &mode->candidates[i].radar_detected,
++                            &mode->candidates[i].overlap40,
++                            &mode->candidates[i].overlap80,
++                            &mode->candidates[i].primary_on_overlap_4080,
++                            &mode->candidates[i].intolerant40,
++                            &mode->candidates[i].cwi_noise,
++                            &mode->candidates[i].dynBW20,
++                            &mode->candidates[i].dynBW40,
++                            &mode->candidates[i].dynBW80,
++                            &mode->candidates[i].rssi,
++                            &mode->candidates[i].snr,
++                            &mode->candidates[i].not_80211_rx_evt,
++                            &mode->candidates[i].not_my_sta_low_rssi) {
++      printf("epic fail in unit test mode");
++      fclose(ftest);
++      fclose(fp);
++      return;
++    }
++    mode->num_candidates++;
++  }
++#endif
++
++  if (!fp) {
++    wpa_printf(MSG_ERROR, "ACS: cannot open info file");
++    /* fail ?! */
++  }
++
++  memset(&cg, 0xFF, sizeof(cg));
++
++  grp_map = iface->conf->acs_policy == ACS_POLICY_REACH ? iface->conf->acs_grp_prio_reach_map : iface->conf->acs_grp_prio_tp_map;
++
++  wpa_printf(MSG_DEBUG, "ACS: recalculate candidate table");
++
++  denominator = base_denominator =
++    iface->conf->acs_penalty_factors[K_BWCCA]    + iface->conf->acs_penalty_factors[K_RSSI] +
++    iface->conf->acs_penalty_factors[K_SNR]      + iface->conf->acs_penalty_factors[K_NF] +
++    iface->conf->acs_penalty_factors[K_NOT80211] + iface->conf->acs_penalty_factors[K_CL] +
++    iface->conf->acs_penalty_factors[K_NOTMYSTA] + iface->conf->acs_penalty_factors[K_DELTA_TX_POWER] +
++    iface->conf->acs_penalty_factors[K_NUMOFBSS] + iface->conf->acs_penalty_factors[K_DYN_BW];
++
++  wpa_printf(MSG_DEBUG, "ACS recalc base denominator %d", denominator);
++
++  acs_print_info_legend(fp);
++  acs_print_info_header_file(fp);
++
++  os_get_reltime(&now);
++
++  for (i = 0; i < mode->num_candidates; i++) {
++    int dyn_bwccs, rssi, nf, snr, non80211evt, ext_sta, num_bss, channel_load, vht_dynamic_bw;
++    int tx_power, cg_idx;
++    denominator = base_denominator;
++    numerator = 0;
++
++    wpa_printf(MSG_DEBUG, "ACS: recalculate X: candidate %d", i);
++
++    acs_print_info_header(MSG_DEBUG);
++    acs_print_cand_no(MSG_DEBUG, mode, i);
++
++    mode->candidates[i].exclude_reason = acs_to_exclude_candidate(iface, i, &now);
++
++    /* skip channels to be excluded */
++    if (mode->candidates[i].exclude_reason == ACS_NO_EXCLUSION) {
++
++      /* CS WLAN dynamic BW/CCS */
++
++      switch (mode->candidates[i].width) {
++      case 20: dyn_bwccs = mode->candidates[i].dynBW20; break;
++      case 40: dyn_bwccs = mode->candidates[i].dynBW40; break;
++      case 80: /* fallthrough - 80p80 and 160 go here */
++      default: dyn_bwccs = mode->candidates[i].dynBW80; break;
++      }
++
++      dyn_bwccs = iface->conf->acs_penalty_factors[K_BWCCA] *
++        MIN(AOCS_NORM_BWCCA, dyn_bwccs); /* normalization, sort of */
++
++      numerator += dyn_bwccs;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN dynamic BW/CCS %d", dyn_bwccs);
++
++      /* CS WLAN RSSI */
++
++      rssi = iface->conf->acs_penalty_factors[K_RSSI] * AOCS_NORM_RSSI * (mode->candidates[i].rssi + 128) / 255;
++      numerator += rssi;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN RSSI %d", rssi);
++
++      /* CS WLAN SNR */
++
++      snr = iface->conf->acs_penalty_factors[K_SNR] * AOCS_NORM_SNR * (mode->candidates[i].snr + 128) / 255;
++      numerator += snr;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN SNR %d", snr);
++
++      /* CS WLAN NF - temporary change to use CWI value instead of NF since NF not available during scan */
++
++      nf = iface->conf->acs_penalty_factors[K_NF] * AOCS_NORM_NF * (mode->candidates[i].cwi_noise /*noise_floor*/ + 128) / 255;
++      numerator += nf;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN NF %d", nf);
++
++      /* CS WLAN not 802.11 RX event */
++
++      non80211evt = iface->conf->acs_penalty_factors[K_NOT80211] * MIN(AOCS_NORM_NOT_80211_EVT, mode->candidates[i].not_80211_rx_evt);
++      numerator += non80211evt;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN not 802.11 %d", non80211evt);
++
++      /* CS WLAN not my STA low RSSI */
++
++      ext_sta = iface->conf->acs_penalty_factors[K_NOTMYSTA] * MIN(AOCS_NORM_EXT_STA, mode->candidates[i].not_my_sta_low_rssi);
++      numerator += ext_sta;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS ext_sta %d", ext_sta);
++
++      /* CS WLAN TX power */
++
++      wpa_printf(MSG_DEBUG, "calc TX power %d max %d pen %d", mode->candidates[i].tx_power, mode->max_tx_power, iface->conf->acs_penalty_factors[K_DELTA_TX_POWER]);
++      tx_power = mode->candidates[i].tx_power - iface->conf->acs_penalty_factors[K_DELTA_TX_POWER];
++      tx_power = iface->conf->acs_penalty_factors[K_DELTA_TX_POWER] * MIN(100, (abs(mode->max_tx_power - tx_power) * 10 / 8));
++      numerator += tx_power;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN tx power %d", tx_power);
++
++      /* CS WLAN num of BSS */
++
++      num_bss = iface->conf->acs_penalty_factors[K_NUMOFBSS] * 100 * mode->candidates[i].num_bss / (mode->num_bss + 1);
++      numerator += num_bss;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN numBSS %d", num_bss);
++
++      /* CS WLAN Channel Load - already normalized */
++
++      channel_load = iface->conf->acs_penalty_factors[K_CL] * mode->candidates[i].channel_load;
++      numerator += channel_load;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN Chan load %d", channel_load);
++
++      /* CS WLAN 80 MHz rank */
++
++      if (iface->conf->acs_vht_dynamic_bw)
++        vht_dynamic_bw = iface->conf->acs_penalty_factors[K_DYN_BW] * MIN(100, AOCS_NORM_DYNAMIC_BW_DISABLED * mode->candidates[i].overlap80);
++      else
++        vht_dynamic_bw = iface->conf->acs_penalty_factors[K_DYN_BW] *
++        MIN(100, AOCS_NORM_DYNAMIC_BW_ENABLED * mode->candidates[i].overlap80 * mode->candidates[i].primary_on_overlap_4080);
++
++      numerator += vht_dynamic_bw;
++
++      wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN 80 rank %d", vht_dynamic_bw);
++
++      /* CI */
++
++      /*  if (cur_time > (chan_update_time + t_sto)) */
++      if (os_reltime_expired(&now, &mode->candidates[i].ts_update, iface->conf->acs_to_degradation[T_STO])) {
++        double n = (double)mode->candidates[i].cwi_noise; /* noise_floor; */
++        double m = (double)mode->min_noise;
++        double ci;
++
++        ci = iface->conf->acs_penalty_factors[K_CI] *
++          (pow(10, n / 5) + (mode->candidates[i].busy_time / mode->candidates[i].total_time) * pow(2, pow(10, n / 10) - pow(10, m / 10)));
++
++        numerator += (int)ci;
++        denominator += iface->conf->acs_penalty_factors[K_CI];
++
++        wpa_printf(MSG_DEBUG, "ACS recalc CS WLAN CI %f", ci);
++      }
++
++      wpa_printf(MSG_DEBUG, "ACS recalc numerator %d denominator %d noise pen %d cust_pen %d", numerator, denominator,
++        iface->conf->acs_chan_noise_penalty[mode->candidates[i].chan], iface->conf->acs_chan_cust_penalty[mode->candidates[i].chan]);
++
++      /* final calculation */
++      mode->candidates[i].rank = (int) iface->conf->acs_chan_noise_penalty[mode->candidates[i].chan] *
++        iface->conf->acs_chan_cust_penalty[mode->candidates[i].chan] *
++        numerator / denominator;
++
++      /* add penalty to avoid switching to DFS channels, thus losing any connectivity during CAC */
++      if (iface->conf->channel) { /* not initial selection */
++        if ((mode->candidates[i].primary != iface->conf->channel) ||
++            (mode->candidates[i].secondary != (iface->conf->channel + iface->conf->secondary_channel * 4)) ||
++            (mode->candidates[i].width > get_num_width(iface->conf->vht_oper_chwidth, iface->conf->secondary_channel)))
++        {
++          mode->candidates[i].rank += mode->candidates[i].radar_affected << 6;
++        }
++      }
++    } else mode->candidates[i].rank = -1;
++
++    acs_print_cand_no_file(fp, mode, i);
++
++    /* skip channels to be excluded */
++    if (mode->candidates[i].exclude_reason != ACS_NO_EXCLUSION) continue;
++
++    /* select calibration group */
++    switch (mode->candidates[i].width) {
++      case 20: cg_idx = (mode->candidates[i].calibrated) ? CALIB_20 : NONCALIB_20;
++        break;
++      case 40: cg_idx = (mode->candidates[i].calibrated) ? CALIB_40 : NONCALIB_40;
++        break;
++      case 80:
++      default: cg_idx = (mode->candidates[i].calibrated) ? CALIB_80 : NONCALIB_80;
++    }
++
++    /* update the best rank in the selected group */
++    if (mode->candidates[i].rank < cg[cg_idx].rank) {
++      cg[cg_idx].rank = mode->candidates[i].rank;
++      cg[cg_idx].cand_idx = i;
++    }
++  }
++
++  for (prio = 0; prio < ACS_NUM_GRP_PRIORITIES; prio++)
++  {
++    if (cg[grp_map[prio]].rank != -1)
++    {
++      int min_rank_cand_idx = cg[grp_map[prio]].cand_idx;
++
++      if (acs_set_new_chan_if_ok(iface, min_rank_cand_idx, switch_reason, fp_hist))
++      {
++        wpa_printf(MSG_DEBUG, "ACS: selected a new channel %d, width %d, secondary %d, center %d, priority group %d candidate idx %d\n",
++          iface->conf->channel,
++          get_num_width(iface->conf->vht_oper_chwidth, mode->candidates[min_rank_cand_idx].secondary),
++          iface->conf->secondary_channel,
++          iface->conf->vht_oper_centr_freq_seg0_idx,
++          prio, min_rank_cand_idx);
++        fprintf(fp, "ACS: selected a new channel %d, width %d, secondary %d, center %d, priority group %d candidate idx %d\n",
++          iface->conf->channel, get_num_width(iface->conf->vht_oper_chwidth,
++            mode->candidates[min_rank_cand_idx].secondary), iface->conf->secondary_channel,
++          iface->conf->vht_oper_centr_freq_seg0_idx, prio, min_rank_cand_idx);
++        fprintf(fp_hist, "selected a new channel %d, width %d, secondary %d, center %d, priority group %d candidate idx %d switch reason %s\n",
++          iface->conf->channel, get_num_width(iface->conf->vht_oper_chwidth,
++            mode->candidates[min_rank_cand_idx].secondary), iface->conf->secondary_channel,
++          iface->conf->vht_oper_centr_freq_seg0_idx, prio, min_rank_cand_idx, sw_reasons[switch_reason]);
++
++        res = TRUE;
++      }
++
++      wpa_printf(MSG_DEBUG, "ACS: exit recalculate, selected prio %d min_rank_cand_idx %d", prio, min_rank_cand_idx);
++      fclose(fp);
++      fclose(fp_hist);
++      return res;
++    }
++  }
++
++  /* if we are still here - use the fallback channel */
++  iface->conf->channel = iface->conf->acs_fallback_chan.primary;
++  iface->conf->vht_oper_chwidth = get_vht_width(iface->conf->acs_fallback_chan.width);
++  iface->conf->secondary_channel = get_secondary_offset(iface->conf->acs_fallback_chan.primary,
++                                                        iface->conf->acs_fallback_chan.secondary);
++  acs_smart_adjust_vht_center_freq(iface, 0);
++  wpa_printf(MSG_DEBUG, "ACS: exit recalculate, using fallback channel");
++  fprintf(fp_hist, "ACS: using fallback channel\n");
++
++  fclose(fp);
++  fclose(fp_hist);
++  return TRUE;
++}
++
++
++static int bt_find_clean_channel(struct hostapd_iface *iface, int width)
++{
++  struct hostapd_hw_modes *mode;
++  struct hostapd_channel_data *chan;
++  int i, affected_start, aff_width;
++
++  WPA_ASSERT((width == 40) || (width == 20));
++
++  mode = iface->current_mode;
++
++  affected_start = acs_chan_to_freq((iface->conf->secondary_channel < 0) ? iface->conf->channel - 4 : iface->conf->channel);
++  aff_width = (iface->conf->ieee80211n && iface->conf->secondary_channel) ? 40 : 20;
++
++  wpa_printf(MSG_DEBUG, "BT is searching for %d MHz channels", width);
++  for (i = 0; i < mode->num_channels; i++) {
++    chan = &mode->channels[i];
++
++    /* Skip incompatible chandefs */
++    if (chan->flag & HOSTAPD_CHAN_DISABLED) continue;
++
++    if (width == 40) {
++      struct hostapd_channel_data *sec_chan;
++
++      sec_chan = hostapd_get_mode_channel(iface, chan->freq + 20);
++      if (!sec_chan) continue;
++      if (sec_chan->flag & HOSTAPD_CHAN_DISABLED) continue;
++    }
++
++    if (channels_overlap(affected_start, aff_width, chan->freq, width)) continue;
++
++    iface->freq = chan->freq;
++    iface->conf->channel = chan->chan;
++    iface->conf->secondary_channel = (width == 40) ? 1 : 0;
++
++    wpa_printf(MSG_DEBUG, "Selected ch. #%d", chan->chan);
++    return TRUE;
++  }
++  return 0;
++}
++
++void acs_push_chandef(struct hostapd_iface *iface, acs_chandef *chan)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  chan->pri = iface->conf->channel;
++  chan->sec = iface->conf->secondary_channel,
++  chan->chwidth = iface->conf->vht_oper_chwidth,
++  chan->cent_freq = iface->conf->vht_oper_centr_freq_seg0_idx;
++  chan->sel_cand = mode->selected_candidate;
++}
++
++void acs_pop_chandef(struct hostapd_iface *iface, acs_chandef *chan)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++
++  iface->conf->channel = chan->pri;
++  iface->conf->secondary_channel = chan->sec;
++  iface->conf->vht_oper_chwidth = chan->chwidth;
++  iface->conf->vht_oper_centr_freq_seg0_idx = chan->cent_freq;
++  mode->selected_candidate = chan->sel_cand;
++}
++
++void hostapd_ltq_update_channel_data(struct hostapd_iface *iface, const u8 *data, size_t data_len)
++{
++  struct channel_data *ch_data = (struct channel_data *) data;
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  int j;
++
++  if (data_len != sizeof(struct channel_data)) wpa_printf(MSG_ERROR, "bad channel data event");
++
++  /* Check if CSA in progress */
++  if (hostapd_csa_in_progress(iface)) {
++    wpa_printf(MSG_DEBUG, "discard update - CSA in progress");
++    return;
++  }
++
++  /* Check if active CAC */
++  if (iface->cac_started) {
++    wpa_printf(MSG_DEBUG, "discard update - CAC in progress");
++    return;
++  }
++
++  if (!iface->conf->acs_init_done)
++  {
++    if (!(ch_data->filled_mask & CHDATA_SCAN_MODE))
++    {
++      if (ch_data->cwi_noise + 128 > iface->conf->acs_to_degradation[D_CWI])
++      {
++        acs_chandef orig_chan;
++        int ret = 0;
++
++        acs_push_chandef(iface, &orig_chan);
++
++        wpa_printf(MSG_DEBUG, "%s called (CAC active: %s, CSA active: %s)",
++          __func__, iface->cac_started ? "yes" : "no",
++          hostapd_csa_in_progress(iface) ? "yes" : "no");
++
++        if (iface->conf->ieee80211n && iface->conf->secondary_channel)
++          ret = bt_find_clean_channel(iface, 40);
++
++        if (!ret)
++          ret = bt_find_clean_channel(iface, 20);
++
++        if (!ret) { /* unable to find a clean channel */
++          /* We cannot do anything about it !!! try to work as is */
++          wpa_printf(MSG_WARNING, "BT failed to find a clean channel, continuing on the same channel");
++        }
++        else {
++          /* Perform channel switch/CSA */
++          if (acs_do_switch_channel(iface, 0) < 0)
++          {
++            wpa_printf(MSG_WARNING, "BT failed to schedule CSA - trying fallback");
++
++            /* back out with channel switch */
++            acs_pop_chandef(iface, &orig_chan);
++
++            hostapd_disable_iface(iface);
++            hostapd_enable_iface(iface);
++          }
++        }
++      }
++      return;
++    }
++  }
++
++  if (iface->acs_update_in_progress) return;
++
++  iface->acs_update_in_progress = 1;
++
++  wpa_printf(MSG_DEBUG, "ACS: parse channel data event");
++  wpa_printf(MSG_DEBUG, "%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d 0x%X",
++    ch_data->channel,
++    ch_data->BW,
++    ch_data->primary,
++    ch_data->secondary,
++    ch_data->freq,
++    ch_data->load,
++    ch_data->noise_floor,
++    ch_data->busy_time,
++    ch_data->total_time,
++    ch_data->calibration,
++    ch_data->num_bss,
++    ch_data->dynBW20,
++    ch_data->dynBW40,
++    ch_data->dynBW80,
++    ch_data->tx_power,
++    ch_data->rssi,
++    ch_data->snr,
++    ch_data->cwi_noise,
++    ch_data->not_80211_rx_evt,
++    ch_data->ext_sta_rx,
++    ch_data->filled_mask);
++
++  for (j = 0; j < mode->num_candidates; j++)
++  {
++    mode->candidates[j].filled_mask = ch_data->filled_mask;
++
++    if (mode->candidates[j].freq == ch_data->freq)
++    {
++      if (ch_data->filled_mask & CHDATA_CALIB) {
++        switch (mode->candidates[j].width) {
++          case 20: mode->candidates[j].calibrated = ch_data->calibration & (1 << CW_20); break;
++          case 40: mode->candidates[j].calibrated = ch_data->calibration & (1 << CW_40); break;
++          case 80: mode->candidates[j].calibrated = ch_data->calibration & (1 << CW_80); break;
++          case 160:mode->candidates[j].calibrated = ch_data->calibration & (1 << CW_160);break;
++          case -160: mode->candidates[j].calibrated = ch_data->calibration & (1 << CW_80_80);
++          default: break;
++        }
++      }
++    }
++
++    if (mode->candidates[j].primary == ch_data->primary)
++    {
++      wpa_printf(MSG_DEBUG, "channel data event update candidate %d chan %d BW %d pri %d sec %d freq %d",
++               j, mode->candidates[j].chan, mode->candidates[j].width, mode->candidates[j].primary, mode->candidates[j].secondary, mode->candidates[j].freq);
++
++      /* overwrite channel data */
++      if (ch_data->filled_mask & CHDATA_NOISE_FLOOR) {
++        mode->candidates[j].noise_floor = ch_data->noise_floor;
++        if (ch_data->noise_floor < mode->min_noise) mode->min_noise = ch_data->noise_floor;
++      }
++
++      if (ch_data->filled_mask & CHDATA_BUSY_TIME) {
++        mode->candidates[j].busy_time = ch_data->busy_time;
++
++        /* DEBUG
++        if (mode->candidates[j].primary == iface->conf->channel)
++          mode->candidates[j].busy_time = 250;*/
++      }
++
++      if (ch_data->filled_mask & CHDATA_TOTAL_TIME) {
++        mode->candidates[j].total_time = ch_data->total_time;
++      }
++
++      if (ch_data->filled_mask & CHDATA_LOAD) {
++        mode->candidates[j].channel_load = ch_data->load;
++      }
++
++      if (ch_data->filled_mask & CHDATA_NUM_BSS) {
++        mode->candidates[j].num_bss = ch_data->num_bss;
++      }
++
++      if (ch_data->filled_mask & CHDATA_DYNBW) { /* these counters are reset by FW */
++        mode->candidates[j].dynBW80 += ch_data->dynBW80;
++        mode->candidates[j].dynBW40 += ch_data->dynBW40;
++        mode->candidates[j].dynBW20 += ch_data->dynBW20;
++      }
++
++      if (ch_data->filled_mask & CHDATA_RSSI) {
++        mode->candidates[j].rssi = ch_data->rssi;
++      }
++
++      if (ch_data->filled_mask & CHDATA_SNR) {
++        mode->candidates[j].snr = ch_data->snr;
++      }
++
++      if (ch_data->filled_mask & CHDATA_CWI_NOISE) {
++        mode->candidates[j].cwi_noise = ch_data->cwi_noise;
++      }
++
++      if (ch_data->filled_mask & CHDATA_NOT_80211_EVT) {
++        mode->candidates[j].not_80211_rx_evt = ch_data->not_80211_rx_evt;
++      }
++
++      if (ch_data->filled_mask & CHDATA_LOW_RSSI) { /* reset by FW on read */
++        mode->candidates[j].not_my_sta_low_rssi += ch_data->ext_sta_rx;
++      }
++
++      if (ch_data->filled_mask & CHDATA_TX_POWER) {
++        mode->candidates[j].tx_power = ch_data->tx_power;
++        if (ch_data->tx_power > mode->max_tx_power) mode->max_tx_power = ch_data->tx_power;
++      }
++    }
++
++    if (ch_data->filled_mask & CHDATA_ALL_BITS)
++    {
++      if (ch_data->filled_mask & CHDATA_SCAN_MODE) {
++        mode->candidates[j].entry_init_done = TRUE;
++        os_get_reltime(&mode->candidates[j].ts_scan);
++      }
++
++      os_get_reltime(&mode->candidates[j].ts_update);
++    }
++  }
++
++  if (!(ch_data->filled_mask & CHDATA_SCAN_MODE)) {
++    acs_chandef cur_chan;
++
++    acs_push_chandef(iface, &cur_chan);
++
++    if (acs_recalc_ranks_and_set_chan(iface, SWR_UPDATE)) {
++      if (acs_do_switch_channel(iface, 0) < 0) {
++        /* back out with channel switch */
++        acs_pop_chandef(iface, &cur_chan);
++      }
++    }
++  }
++
++  iface->acs_update_in_progress = 0;
++}
++
++void acs_update_intolerant_channels(struct hostapd_iface *iface, u8 chan)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  int j, freq;
++
++  freq = acs_chan_to_freq(chan);
++  for (j = 0; j < mode->num_candidates; j++) {
++    if (mode->candidates[j].width == 40 &&
++      channels_overlap(freq, 20, mode->candidates[j].freq, 40)) {
++      mode->candidates[j].intolerant40++;
++      os_get_reltime(&mode->candidates[j].ts_intolerant40);
++    }
++  }
++}
++
++void acs_switch_intolerant(struct hostapd_iface *iface)
++{
++  if (acs_recalc_ranks_and_set_chan(iface, SWR_INTOLERANT))
++    acs_do_switch_channel(iface, 1);
++  else
++    wpa_printf(MSG_ERROR, "Must switch, intolerant !");
++}
++
++void acs_set_radar(struct hostapd_iface *iface, int freq, int chan_width, int cf1)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  int j;
++
++  if (chan_width != 20 || freq == 0) freq = cf1;
++  freq = freq - (chan_width >> 1) + 10;
++
++  for (j = 0; j < mode->num_candidates; j++) {
++    if (channels_overlap(freq, chan_width, mode->candidates[j].freq, mode->candidates[j].width))
++      mode->candidates[j].radar_detected = TRUE;
++  }
++}
++
++void acs_update_radar(struct hostapd_iface *iface)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  int i, j;
++
++  for (j = 0; j < mode->num_candidates; j++) {
++    mode->candidates[j].radar_detected = FALSE;
++
++    for (i = 0; i < mode->num_channels; i++) {
++      struct hostapd_channel_data *chan;
++
++      chan = &iface->current_mode->channels[i];
++
++      if ((chan->freq >= mode->candidates[j].freq) &&
++          (chan->freq <= mode->candidates[j].freq + mode->candidates[j].width)) {
++        if ((chan->flag & HOSTAPD_CHAN_DFS_MASK) == HOSTAPD_CHAN_DFS_UNAVAILABLE)
++          mode->candidates[j].radar_detected = TRUE;
++      }
++    }
++  }
++}
++
++void acs_radar_switch(struct hostapd_iface *iface)
++{
++  struct hostapd_hw_modes *mode = iface->current_mode;
++  int ret;
++  struct hostapd_channel_data *channel = NULL;
++  int secondary_channel = 0;
++  u8 vht_oper_centr_freq_seg0_idx = 0;
++  u8 vht_oper_centr_freq_seg1_idx = 0;
++
++  if (iface->in_scan) {
++    wpa_printf(MSG_WARNING, "Radar during scan !");
++    return;
++  }
++
++  /* For radar simulation */
++  if (iface->conf->dfs_debug_chan) {
++    channel = dfs_get_debug_dfs_chan(iface, &secondary_channel,
++                                     &vht_oper_centr_freq_seg0_idx,
++                                     &vht_oper_centr_freq_seg1_idx);
++  }
++
++  if (channel) {
++    /* set the new channel */
++    iface->conf->channel = channel->chan;
++    iface->conf->secondary_channel = secondary_channel;
++    mode->selected_candidate = -1;
++    iface->conf->vht_oper_centr_freq_seg0_idx = vht_oper_centr_freq_seg0_idx;
++    iface->conf->vht_oper_centr_freq_seg1_idx = vht_oper_centr_freq_seg1_idx;
++    ret = TRUE;
++  }
++  else
++    ret = acs_recalc_ranks_and_set_chan(iface, SWR_RADAR);
++
++  if (ret)
++    acs_do_switch_channel(iface, 1);
++  else
++    wpa_printf(MSG_ERROR, "Must switch, radar !");
++}
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/acs.h hostapd-2.6/src/ap/acs.h
+--- hostapd-2.6-orig/src/ap/acs.h	2017-04-03 14:43:00.885404813 +0300
++++ hostapd-2.6/src/ap/acs.h	2017-04-03 14:44:31.854576007 +0300
+@@ -13,6 +13,23 @@
+ #ifdef CONFIG_ACS
+ 
+ enum hostapd_chan_status acs_init(struct hostapd_iface *iface);
++int acs_recalc_ranks_and_set_chan(struct hostapd_iface *iface, int switch_reason);
++void acs_update_intolerant_channels(struct hostapd_iface *iface, u8 chan);
++void acs_switch_intolerant(struct hostapd_iface *iface);
++void acs_set_radar(struct hostapd_iface *iface, int freq, int chan_width, int cf1);
++void acs_update_radar(struct hostapd_iface *iface);
++void acs_radar_switch(struct hostapd_iface *iface);
++int acs_do_switch_channel(struct hostapd_iface *iface, int block_tx);
++int get_num_width(int vht_width, int secondary);
++int acs_chan_to_freq(int channel);
++
++typedef struct {
++  u8 pri;
++  u8 sec;
++  u8 chwidth;
++  u8 cent_freq;
++  int sel_cand;
++} acs_chandef;
+ 
+ #else /* CONFIG_ACS */
+ 
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/ap_config.c hostapd-2.6/src/ap/ap_config.c
+--- hostapd-2.6-orig/src/ap/ap_config.c	2017-04-03 14:43:00.883404853 +0300
++++ hostapd-2.6/src/ap/ap_config.c	2017-04-03 14:44:31.854576007 +0300
+@@ -18,6 +18,7 @@
+ #include "wpa_auth.h"
+ #include "sta_info.h"
+ #include "ap_config.h"
++#include "drivers/driver.h"
+ 
+ 
+ static void hostapd_config_free_vlan(struct hostapd_bss_config *bss)
+@@ -219,6 +220,95 @@ struct hostapd_config * hostapd_config_d
+ 		return NULL;
+ 	}
+ 	memcpy(conf->acs_numbss_coeflist, acs_numbss_coeflist_defaults, sizeof(acs_numbss_coeflist_defaults));
++
++  { /* SmartACS */
++    int i;
++    int grp_priorities_throughput[ACS_NUM_GRP_PRIORITIES] = { 5, 3, 1, 6, 4, 2 };
++    int grp_priorities_reach[ACS_NUM_GRP_PRIORITIES] = { 1, 3, 5, 2, 4, 6 };
++
++    conf->acs_smart_info_file = strdup("/tmp/acs_smart_info.txt");
++    conf->acs_history_file = strdup("/tmp/acs_history.txt");
++    conf->acs_init_done = 0;
++
++    for (i = 0; i < ACS_MAX_CHANNELS; i++)
++      conf->acs_chan_cust_penalty[i] = 50;
++
++    for (i = 0; i < ACS_MAX_CHANNELS; i++)
++      conf->acs_chan_noise_penalty[i] = 50;
++
++    conf->acs_fallback_chan.primary = 1;
++    conf->acs_fallback_chan.secondary = 0;
++    conf->acs_fallback_chan.width = 20;
++
++    conf->acs_penalty_factors = os_malloc(sizeof(int) * (ACS_NUM_PENALTY_FACTORS + 1));
++    conf->acs_penalty_factors[ACS_NUM_PENALTY_FACTORS] = 0;
++    for (i = 0; i < ACS_NUM_PENALTY_FACTORS; i++) conf->acs_penalty_factors[i] = 1;
++
++    conf->acs_to_degradation = os_malloc(sizeof(int) * (ACS_NUM_DEGRADATION_FACTORS + 1));
++    conf->acs_to_degradation[ACS_NUM_DEGRADATION_FACTORS] = 0;
++    for (i = 0; i < ACS_NUM_DEGRADATION_FACTORS; i++) conf->acs_to_degradation[i] = 1;
++    conf->acs_to_degradation[T_40INTO] = 360;
++    conf->acs_to_degradation[D_CWI] = 50;
++
++    conf->acs_grp_priorities_throughput = os_malloc(sizeof(int) * (ACS_NUM_GRP_PRIORITIES + 1));
++    if (NULL == conf->acs_grp_priorities_throughput) goto fail;
++    memcpy(conf->acs_grp_priorities_throughput, grp_priorities_throughput, sizeof(grp_priorities_throughput));
++    conf->acs_grp_priorities_throughput[ACS_NUM_GRP_PRIORITIES] = -1;
++
++    for (i = 0; conf->acs_grp_priorities_throughput[i] >= 0; i++) {
++      if (conf->acs_grp_priorities_throughput[i] > ACS_NUM_GRP_PRIORITIES) {
++        wpa_printf(MSG_ERROR, "invalid ACS group priorities list entry (throughput policy) %i, priority %i > %i",
++          i, conf->acs_grp_priorities_throughput[i], ACS_NUM_GRP_PRIORITIES);
++      }
++      conf->acs_grp_prio_tp_map[conf->acs_grp_priorities_throughput[i] - 1] = i;
++    }
++    if (i != ACS_NUM_GRP_PRIORITIES) {
++      wpa_printf(MSG_ERROR, "ACS group priorities list (throughput policy) has %i elements instead of %i",
++        i, ACS_NUM_GRP_PRIORITIES);
++      goto fail;
++    }
++
++    conf->acs_grp_priorities_reach = os_malloc(sizeof(int) * (ACS_NUM_GRP_PRIORITIES + 1));
++    if (NULL == conf->acs_grp_priorities_reach) goto fail;
++    memcpy(conf->acs_grp_priorities_reach, grp_priorities_reach, sizeof(grp_priorities_reach));
++    conf->acs_grp_priorities_reach[ACS_NUM_GRP_PRIORITIES] = -1;
++
++    for (i = 0; conf->acs_grp_priorities_reach[i] >= 0; i++) {
++      if (conf->acs_grp_priorities_reach[i] > ACS_NUM_GRP_PRIORITIES) {
++        wpa_printf(MSG_ERROR, "invalid ACS group priorities list entry (reach policy) %i, priority %i > %i",
++          i, conf->acs_grp_priorities_reach[i], ACS_NUM_GRP_PRIORITIES);
++      }
++      conf->acs_grp_prio_reach_map[conf->acs_grp_priorities_reach[i] - 1] = i;
++    }
++    if (i != ACS_NUM_GRP_PRIORITIES) {
++      wpa_printf(MSG_ERROR, "ACS group priorities list (reach policy) has %i elements instead of %i",
++        i, ACS_NUM_GRP_PRIORITIES);
++      goto fail;
++    }
++
++    conf->acs_vht_dynamic_bw = 0;
++    conf->acs_policy = 0;
++
++    conf->acs_switch_thresh = 20;
++
++    return conf;
++
++  fail:
++    wpa_printf(MSG_ERROR, "Failed to allocate memory for configuration data.");
++
++    if (conf->acs_grp_priorities_reach) os_free(conf->acs_grp_priorities_reach);
++    if (conf->acs_grp_priorities_throughput) os_free(conf->acs_grp_priorities_throughput);
++    if (conf->acs_penalty_factors) os_free(conf->acs_penalty_factors);
++    if (conf->acs_to_degradation) os_free(conf->acs_to_degradation);
++    if (conf->acs_smart_info_file) os_free(conf->acs_smart_info_file);
++    if (conf->acs_history_file) os_free(conf->acs_history_file);
++
++    os_free(conf->bss);
++    os_free(conf);
++    os_free(bss->radius);
++    os_free(bss);
++    return NULL;
++  }
+ #endif /* CONFIG_ACS */
+ 
+ 	return conf;
+@@ -637,6 +727,14 @@ void hostapd_config_free(struct hostapd_
+ 	os_free(conf->acs_chan_bias);
+ 	os_free(conf->acs_numbss_info_file);
+ 	os_free(conf->acs_numbss_coeflist);
++
++	/* SmartACS */
++	os_free(conf->acs_smart_info_file);
++	os_free(conf->acs_history_file);
++	os_free(conf->acs_penalty_factors);
++	os_free(conf->acs_to_degradation);
++	os_free(conf->acs_grp_priorities_throughput);
++	os_free(conf->acs_grp_priorities_reach);
+ #endif /* CONFIG_ACS */
+ 	wpabuf_free(conf->lci);
+ 	wpabuf_free(conf->civic);
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/ap_config.h hostapd-2.6/src/ap/ap_config.h
+--- hostapd-2.6-orig/src/ap/ap_config.h	2017-04-03 14:43:00.883404853 +0300
++++ hostapd-2.6/src/ap/ap_config.h	2017-04-03 14:44:31.855575987 +0300
+@@ -600,6 +600,18 @@ struct hostapd_bss_config {
+ };
+ 
+ 
++typedef struct acs_chan {
++  int primary;
++  int secondary;
++  int width;
++} acs_chan;
++
++#define ACS_NUM_PENALTY_FACTORS     11
++#define ACS_NUM_DEGRADATION_FACTORS  7
++#define ACS_NUM_GRP_PRIORITIES       6
++#define ACS_MAX_CHANNELS           197
++#define ACS_MAX_FACTOR             100
++
+ /**
+  * struct hostapd_config - Per-radio interface configuration
+  */
+@@ -712,13 +724,32 @@ struct hostapd_config {
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
+ #ifdef CONFIG_ACS
++	int acs_init_done;
+ 	unsigned int acs_num_scans;
+ 	enum {
+ 		ACS_ALGO_SURVEY = 0,
+-		ACS_ALGO_NUMBSS = 1
++		ACS_ALGO_NUMBSS = 1,
++		ACS_ALGO_SMART  = 2
+ 	} acs_algo;
+ 	char *acs_numbss_info_file;
+ 	int *acs_numbss_coeflist;
++
++	/* SmartACS */
++	char *acs_smart_info_file;
++	char *acs_history_file;
++	struct acs_chan acs_fallback_chan;
++	int *acs_penalty_factors;
++	int acs_chan_cust_penalty[ACS_MAX_CHANNELS];
++	int acs_chan_noise_penalty[ACS_MAX_CHANNELS];
++	int *acs_to_degradation;
++	int *acs_grp_priorities_throughput; // [ACS_NUM_GRP_PRIORITIES];
++	int *acs_grp_priorities_reach; // [ACS_NUM_GRP_PRIORITIES];
++	int acs_grp_prio_reach_map[ACS_NUM_GRP_PRIORITIES];
++	int acs_grp_prio_tp_map[ACS_NUM_GRP_PRIORITIES];
++	int acs_policy;
++	int acs_vht_dynamic_bw;
++	int acs_switch_thresh;
++
+ 	struct acs_bias {
+ 		int channel;
+ 		double bias;
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/dfs.c hostapd-2.6/src/ap/dfs.c
+--- hostapd-2.6-orig/src/ap/dfs.c	2017-04-03 14:43:00.882404873 +0300
++++ hostapd-2.6/src/ap/dfs.c	2017-04-03 14:44:31.855575987 +0300
+@@ -18,6 +18,7 @@
+ #include "ap_drv_ops.h"
+ #include "drivers/driver.h"
+ #include "dfs.h"
++#include "acs.h"
+ 
+ /* Must be aligned with driver structure */
+ struct vendor_cac_data
+@@ -828,7 +829,7 @@ int hostapd_dfs_complete_cac(struct host
+ 	return 0;
+ }
+ 
+-static struct hostapd_channel_data *
++struct hostapd_channel_data *
+ dfs_get_debug_dfs_chan(struct hostapd_iface *iface,
+ 											 int *secondary_channel,
+ 											 u8 *vht_oper_centr_freq_seg0_idx,
+@@ -869,7 +870,7 @@ dfs_get_debug_dfs_chan(struct hostapd_if
+ 	return channel;
+ }
+ 
+-static int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
++int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
+ {
+ 	struct hostapd_channel_data *channel;
+ 	int secondary_channel;
+@@ -1094,13 +1095,23 @@ int hostapd_dfs_radar_detected(struct ho
+ 	set_dfs_state(iface, freq, ht_enabled, chan_offset, chan_width,
+ 		      cf1, cf2, HOSTAPD_CHAN_DFS_UNAVAILABLE);
+ 
++#ifdef CONFIG_ACS
++  if (iface->conf->acs_init_done)
++    acs_set_radar(iface, freq, chan_width_enum_to_freq(chan_width), cf1);
++#endif
++
+ 	/* Skip if reported radar event not overlapped our channels */
+ 	res = dfs_are_channels_overlapped(iface, freq, chan_width, cf1, cf2);
+ 	if (!res)
+ 		return 0;
+ 
+-	/* radar detected while operating, switch the channel. */
+-	res = hostapd_dfs_start_channel_switch(iface);
++#ifdef CONFIG_ACS
++  if (iface->conf->acs_init_done)
++    acs_radar_switch(iface);
++  else
++#endif
++    /* radar detected while operating, switch the channel. */
++    res = hostapd_dfs_start_channel_switch(iface);
+ 
+ 	return res;
+ }
+@@ -1122,6 +1133,11 @@ int hostapd_dfs_nop_finished(struct host
+ 	set_dfs_state(iface, freq, ht_enabled, chan_offset, chan_width,
+ 		      cf1, cf2, HOSTAPD_CHAN_DFS_USABLE);
+ 
++#ifdef CONFIG_ACS
++  if (iface->conf->acs_init_done)
++    acs_update_radar(iface);
++#endif
++
+ 	/* Handle cases where all channels were initially unavailable */
+ 	if (iface->state == HAPD_IFACE_DFS && !iface->cac_started) {
+ 		Boolean dfs_dbg_set_beacon = FALSE;
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/dfs.h hostapd-2.6/src/ap/dfs.h
+--- hostapd-2.6-orig/src/ap/dfs.h	2017-04-03 14:43:00.883404853 +0300
++++ hostapd-2.6/src/ap/dfs.h	2017-04-03 14:44:31.855575987 +0300
+@@ -10,6 +10,7 @@
+ #define DFS_H
+ 
+ int hostapd_handle_dfs(struct hostapd_iface *iface, Boolean *dfs_dbg_set_beacon);
++int hostapd_csa_in_progress(struct hostapd_iface *iface);
+ 
+ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 			     int ht_enabled, int chan_offset, int chan_width,
+@@ -27,5 +28,9 @@ int hostapd_dfs_start_cac(struct hostapd
+ 			  int cf1, int cf2);
+ int hostapd_handle_dfs_offload(struct hostapd_iface *iface);
+ void hostapd_send_dfs_debug_channel_flag(struct hostapd_iface *iface);
++struct hostapd_channel_data *dfs_get_debug_dfs_chan(struct hostapd_iface *iface,
++                                                    int *secondary_channel,
++                                                    u8 *vht_oper_centr_freq_seg0_idx,
++                                                    u8 *vht_oper_centr_freq_seg1_idx);
+ 
+ #endif /* DFS_H */
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/drv_callbacks.c hostapd-2.6/src/ap/drv_callbacks.c
+--- hostapd-2.6-orig/src/ap/drv_callbacks.c	2017-04-03 14:43:00.885404813 +0300
++++ hostapd-2.6/src/ap/drv_callbacks.c	2017-04-03 14:44:31.855575987 +0300
+@@ -1018,7 +1018,15 @@ static void hostapd_event_eapol_rx(struc
+ #endif /* HOSTAPD */
+ 
+ 
+-static struct hostapd_channel_data * hostapd_get_mode_channel(
++static void hostapd_event_ltq_chan_data(struct hostapd_data *hapd,
++  const u8 *data, size_t data_len)
++{
++  struct hostapd_iface *iface = hapd->iface;
++
++  hostapd_ltq_update_channel_data(iface, data, data_len);
++}
++
++struct hostapd_channel_data * hostapd_get_mode_channel(
+ 	struct hostapd_iface *iface, unsigned int freq)
+ {
+ 	int i;
+@@ -1296,6 +1304,13 @@ void wpa_supplicant_event(void *ctx, enu
+ 				       data->ltq_flush_stations.data,
+ 				       data->ltq_flush_stations.data_len);
+ 		break;
++#ifdef CONFIG_ACS
++  case EVENT_LTQ_CHAN_DATA:
++    hostapd_event_ltq_chan_data(hapd,
++      data->ltq_chan_data.data,
++      data->ltq_chan_data.data_len);
++    break;
++#endif
+ 	case EVENT_ASSOC:
+ 		if (!data)
+ 			return;
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/hostapd.c hostapd-2.6/src/ap/hostapd.c
+--- hostapd-2.6-orig/src/ap/hostapd.c	2017-04-03 14:43:00.883404853 +0300
++++ hostapd-2.6/src/ap/hostapd.c	2017-04-03 14:44:31.856575967 +0300
+@@ -938,7 +938,7 @@ static int hostapd_setup_bss(struct host
+ 	if (hapd->started) {
+ 		wpa_printf(MSG_ERROR, "%s: Interface %s was already started",
+ 			   __func__, conf->iface);
+-		return -1;
++		// return -1;  so what ?
+ 	}
+ 	hapd->started = 1;
+ 
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/hostapd.h hostapd-2.6/src/ap/hostapd.h
+--- hostapd-2.6-orig/src/ap/hostapd.h	2017-04-03 14:43:00.881404893 +0300
++++ hostapd-2.6/src/ap/hostapd.h	2017-04-03 14:44:31.856575967 +0300
+@@ -345,6 +345,8 @@ struct hostapd_iface {
+ 
+ 	unsigned int wait_channel_update:1;
+ 	unsigned int cac_started:1;
++	unsigned int acs_update_in_progress:1;
++
+ #ifdef CONFIG_FST
+ 	struct fst_iface *fst;
+ 	const struct wpabuf *fst_ies;
+@@ -452,6 +454,7 @@ struct hostapd_iface {
+ 
+ #ifdef CONFIG_ACS
+ 	unsigned int acs_num_completed_scans;
++  int in_scan;
+ #endif /* CONFIG_ACS */
+ 
+ 	void (*scan_cb)(struct hostapd_iface *iface);
+@@ -521,6 +524,8 @@ int hostapd_probe_req_rx(struct hostapd_
+ 			 int ssi_signal);
+ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 			     int offset, int width, int cf1, int cf2);
++struct hostapd_channel_data * hostapd_get_mode_channel(
++               struct hostapd_iface *iface, unsigned int freq);
+ struct survey_results;
+ void hostapd_event_get_survey(struct hostapd_iface *iface,
+ 			      struct survey_results *survey_results);
+@@ -540,4 +545,9 @@ void fst_hostapd_fill_iface_obj(struct h
+ #endif /* CONFIG_FST */
+ 
+ void hostapd_ltq_clear_old(struct hostapd_iface *iface);
++
++#ifdef CONFIG_ACS
++void hostapd_ltq_update_channel_data(struct hostapd_iface *iface, const u8 *data, size_t data_len);
++#endif
++
+ #endif /* HOSTAPD_H */
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/hw_features.c hostapd-2.6/src/ap/hw_features.c
+--- hostapd-2.6-orig/src/ap/hw_features.c	2017-04-03 14:43:00.881404893 +0300
++++ hostapd-2.6/src/ap/hw_features.c	2017-04-03 14:44:31.856575967 +0300
+@@ -555,6 +555,13 @@ static void ieee80211n_check_scan(struct
+ 
+ 	iface->secondary_ch = iface->conf->secondary_channel;
+ 	if (!oper40) {
++#ifdef CONFIG_ACS
++    if ((iface->conf->acs_algo == ACS_ALGO_SMART) && iface->conf->acs_init_done) {
++      acs_update_intolerant_channels(iface, iface->conf->channel);
++      acs_switch_intolerant(iface);
++      return;
++    }
++#endif
+ 		wpa_printf(MSG_INFO, "20/40 MHz operation not permitted on "
+ 			   "channel pri=%d sec=%d based on overlapping BSSes",
+ 			   iface->conf->channel,
+@@ -687,12 +694,14 @@ static void ap_ht40_scan_retry(void *elo
+ 	else
+ 		ieee80211n_scan_channels_5g(iface, &params);
+ 
++  iface->in_scan = 1;
+ 	ret = hostapd_driver_scan(iface->bss[0], &params);
+ 	iface->num_ht40_scan_tries++;
+ 	os_free(params.freqs);
+ 
+ 	if (ret == -EBUSY &&
+ 	    iface->num_ht40_scan_tries < HT2040_COEX_SCAN_RETRY) {
++    iface->in_scan = 0;
+ 		wpa_printf(MSG_ERROR,
+ 			   "Failed to request a scan of neighboring BSSes ret=%d (%s) - try to scan again (attempt %d)",
+ 			   ret, strerror(-ret), iface->num_ht40_scan_tries);
+@@ -737,6 +746,7 @@ static int ieee80211n_check_40mhz(struct
+ 	else
+ 		ieee80211n_scan_channels_5g(iface, &params);
+ 
++  iface->in_scan = 1;
+ 	ret = hostapd_driver_scan(iface->bss[0], &params);
+ 	os_free(params.freqs);
+ 
+@@ -744,6 +754,7 @@ static int ieee80211n_check_40mhz(struct
+ 		wpa_printf(MSG_ERROR,
+ 			   "Failed to request a scan of neighboring BSSes ret=%d (%s) - try to scan again",
+ 			   ret, strerror(-ret));
++    iface->in_scan = 0;
+ 		iface->num_ht40_scan_tries = 1;
+ 		eloop_cancel_timeout(ap_ht40_scan_retry, iface, NULL);
+ 		eloop_register_timeout(1, 0, ap_ht40_scan_retry, iface, NULL);
+@@ -1093,6 +1104,7 @@ static int hostapd_is_usable_chan(struct
+ 
+ 	for (i = 0; i < iface->current_mode->num_channels; i++) {
+ 		chan = &iface->current_mode->channels[i];
++
+ 		if (chan->chan != channel)
+ 			continue;
+ 
+@@ -1200,9 +1212,12 @@ int hostapd_acs_completed(struct hostapd
+ 		goto out;
+ 	}
+ 
+-	ret = hostapd_check_ht_capab(iface);
+-	if (ret < 0)
+-		goto out;
++  if (iface->conf->acs_algo != ACS_ALGO_SMART) {
++    ret = hostapd_check_ht_capab(iface);
++    if (ret < 0)
++      goto out;
++  } else ret = 0;
++
+ 	if (ret == 1) {
+ 		wpa_printf(MSG_DEBUG, "Interface initialization will be completed in a callback");
+ 		return 0;
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/ieee802_11_ht.c hostapd-2.6/src/ap/ieee802_11_ht.c
+--- hostapd-2.6-orig/src/ap/ieee802_11_ht.c	2017-04-03 14:43:00.882404873 +0300
++++ hostapd-2.6/src/ap/ieee802_11_ht.c	2017-04-03 14:44:31.857575946 +0300
+@@ -19,6 +19,9 @@
+ #include "ieee802_11.h"
+ #include "hw_features.h"
+ #include "ap_drv_ops.h"
++#include "common/hw_features_common.h"
++#include "dfs.h"
++#include "acs.h"
+ 
+ 
+ /*    special case for ASSOC RESP:
+@@ -286,8 +289,10 @@ static int is_40_allowed(struct hostapd_
+ 
+ 	if (iface->conf->secondary_channel > 0)
+ 		sec_freq = pri_freq + 20;
+-	else
++	else if (iface->conf->secondary_channel < 0)
+ 		sec_freq = pri_freq - 20;
++	else
++	  sec_freq = pri_freq;
+ 
+ 	affected_start = (pri_freq + sec_freq) / 2 - 25;
+ 	affected_end = (pri_freq + sec_freq) / 2 + 25;
+@@ -375,6 +380,10 @@ void hostapd_2040_coex_action(struct hos
+ 		for (i = 0; i < ielen - 1; i++) {
+ 			u8 chan = ic_report->variable[i];
+ 
++#ifdef CONFIG_ACS
++    if ((iface->conf->acs_algo == ACS_ALGO_SMART) && iface->conf->acs_init_done)
++      acs_update_intolerant_channels(iface, chan);
++#endif
+ 			if (is_40_allowed(iface, chan))
+ 				continue;
+ 			hostapd_logger(hapd, mgmt->sa,
+@@ -390,6 +399,13 @@ void hostapd_2040_coex_action(struct hos
+ 
+ 	if (!is_ht40_allowed &&
+ 	    (iface->drv_flags & WPA_DRIVER_FLAGS_HT_2040_COEX)) {
++#ifdef CONFIG_ACS
++    if ((iface->conf->acs_algo == ACS_ALGO_SMART) && iface->conf->acs_init_done) {
++      acs_update_intolerant_channels(iface, iface->conf->channel);
++      acs_switch_intolerant(iface);
++      return;
++    }
++#endif
+ 		if (iface->conf->secondary_channel) {
+ 			hostapd_logger(hapd, mgmt->sa,
+ 				       HOSTAPD_MODULE_IEEE80211,
+@@ -419,13 +435,55 @@ static void hostapd_switch_to_20mhz(stru
+ {
+ 	if (iface->drv_flags & WPA_DRIVER_FLAGS_HT_2040_COEX) {
+ 		if (iface->conf->secondary_channel) {
++      struct csa_settings csa_settings;
++      unsigned int i;
++      int err = 1;
++
+ 			hostapd_logger(hapd, mgmt->sa,
+ 				       HOSTAPD_MODULE_IEEE80211,
+ 				       HOSTAPD_LEVEL_INFO,
+ 				       "Switching to 20 MHz operation due to OBSS beacon reception at rssi %d", signal);
+ 			iface->conf->secondary_channel = 0;
+-			ieee802_11_set_beacons(iface);
++
++      /* Check if CSA in progress */
++      if (hostapd_csa_in_progress(iface)) {
++        wpa_printf(MSG_DEBUG, "will NOT switch to a new channel - CSA already in progress");
++        return;
++      }
++
++      /* Check if active CAC */
++      if (iface->cac_started) return;
++
++      /* Setup CSA request */
++      os_memset(&csa_settings, 0, sizeof(csa_settings));
++      csa_settings.cs_count = 5;
++      csa_settings.block_tx = 0;
++
++      err = hostapd_set_freq_params(&csa_settings.freq_params,
++        iface->conf->hw_mode,
++        acs_chan_to_freq(iface->conf->channel),
++        iface->conf->channel,
++        iface->conf->ieee80211n,
++        iface->conf->ieee80211ac,
++        iface->conf->secondary_channel,
++        iface->conf->vht_oper_chwidth,
++        iface->conf->vht_oper_centr_freq_seg0_idx,
++        iface->conf->vht_oper_centr_freq_seg1_idx,
++        iface->current_mode->vht_capab);
++
++      if (err) {
++        wpa_printf(MSG_ERROR, "failed to calculate CSA freq params");
++        /* possibly recover actual iface params */
++        hostapd_disable_iface(iface);
++        return;
++      }
++
++      for (i = 0; i < iface->num_bss; i++) {
++        err = hostapd_switch_channel(iface->bss[i], &csa_settings);
++        if (err) return;
++      }
+ 		}
++
+ 		if (!iface->num_sta_ht40_intolerant) {
+ 			unsigned int delay_time;
+ 			delay_time = OVERLAPPING_BSS_TRANS_DELAY_FACTOR *
+@@ -459,7 +517,14 @@ void hostapd_obss_beacon(struct hostapd_
+ 
+ 		if (le_to_host16(ht_cap->ht_capabilities_info) &
+ 		    HT_CAP_INFO_40MHZ_INTOLERANT) {
+-			hostapd_switch_to_20mhz(hapd, iface, mgmt, rssi_level);
++#ifdef CONFIG_ACS
++      if ((iface->conf->acs_algo == ACS_ALGO_SMART) && iface->conf->acs_init_done) {
++        acs_update_intolerant_channels(iface, iface->conf->channel);
++        acs_switch_intolerant(iface);
++      }
++			else
++#endif
++        hostapd_switch_to_20mhz(hapd, iface, mgmt, rssi_level);
+ 		}
+ 	} else {
+ 		hostapd_switch_to_20mhz(hapd, iface, mgmt, rssi_level);
+@@ -512,6 +577,14 @@ void ht40_intolerant_add(struct hostapd_
+ 	iface->num_sta_ht40_intolerant++;
+ 	eloop_cancel_timeout(ap_ht2040_timeout, iface, NULL);
+ 
++#ifdef CONFIG_ACS
++  if ((iface->conf->acs_algo == ACS_ALGO_SMART) && iface->conf->acs_init_done) {
++    acs_update_intolerant_channels(iface, iface->conf->channel);
++    acs_switch_intolerant(iface);
++    return;
++  }
++#endif
++
+ 	if (iface->conf->secondary_channel &&
+ 	    (iface->drv_flags & WPA_DRIVER_FLAGS_HT_2040_COEX)) {
+ 		iface->conf->secondary_channel = 0;
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/common/ltq-vendor.h hostapd-2.6/src/common/ltq-vendor.h
+--- hostapd-2.6-orig/src/common/ltq-vendor.h	2017-04-03 14:43:00.889404733 +0300
++++ hostapd-2.6/src/common/ltq-vendor.h	2017-04-03 14:44:31.857575946 +0300
+@@ -43,6 +43,7 @@ enum ltq_nl80211_vendor_subcmds {
+ enum ltq_nl80211_vendor_events {
+ 	LTQ_NL80211_VENDOR_EVENT_RX_EAPOL = 0,
+   LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS = 1,
++  LTQ_NL80211_VENDOR_EVENT_CHAN_DATA = 2,
+ };
+ 
+ #endif /* LTQ_VENDOR_H */
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/drivers/driver.h hostapd-2.6/src/drivers/driver.h
+--- hostapd-2.6-orig/src/drivers/driver.h	2017-04-03 14:43:00.877404973 +0300
++++ hostapd-2.6/src/drivers/driver.h	2017-04-03 14:44:31.858575925 +0300
+@@ -157,6 +157,185 @@ struct hostapd_channel_data {
+ 	unsigned int dfs_cac_ms;
+ };
+ 
++#ifdef CONFIG_ACS
++
++struct channel_data
++{
++  u32 channel;
++  int BW;
++  u32 primary;
++  u32 secondary;
++  u32 freq;
++  ///////
++  u32 load;
++  u32 noise_floor;
++  u32 busy_time;
++  u32 total_time;
++  u32 calibration; /* success mask */
++  u32 num_bss;
++  u32 dynBW20;
++  u32 dynBW40;
++  u32 dynBW80;
++  u32 tx_power;
++  u32 rssi;
++  u32 snr;
++  u32 cwi_noise;
++  u32 not_80211_rx_evt;
++  u32 ext_sta_rx;
++
++  u32 filled_mask;
++};
++
++#define CHDATA_NOISE_FLOOR            1
++#define CHDATA_BUSY_TIME              2
++#define CHDATA_TOTAL_TIME             4
++#define CHDATA_CALIB                  8
++#define CHDATA_NUM_BSS           0x0010
++#define CHDATA_DYNBW             0x0020
++#define CHDATA_RSSI              0x0040
++#define CHDATA_SNR               0x0080
++#define CHDATA_CWI_NOISE         0x0100
++#define CHDATA_NOT_80211_EVT     0x0200
++#define CHDATA_LOW_RSSI          0x0400
++#define CHDATA_TX_POWER          0x0800
++#define CHDATA_LOAD              0x1000
++#define CHDATA_SCAN_MODE       0x800000
++#define CHDATA_ALL_BITS        0x0FFFFF
++
++
++/* Channel Selection Normalization factors */
++#define AOCS_NORM_CI                  100
++#define AOCS_NORM_BWCCA               100
++#define AOCS_NORM_RSSI                100
++#define AOCS_NORM_SNR                 100
++#define AOCS_NORM_NF                  100
++#define AOCS_NORM_NOT_80211_EVT       100
++#define AOCS_NORM_EXT_STA             100
++#define AOCS_NORM_DYNAMIC_BW_ENABLED   10
++#define AOCS_NORM_DYNAMIC_BW_DISABLED  10
++
++
++#define ACS_EXCLUDE_RADAR            'r'
++#define ACS_EXCLUDE_INTOLERANT       'i'
++#define ACS_EXCLUDE_OVERLAP40        'o'
++#define ACS_EXCLUDE_PRI_OVERLAP40    'p'
++#define ACS_EXCLUDE_CWI              'c'
++#define ACS_EXCLUDE_DISABLED         'd'
++#define ACS_NO_EXCLUSION             ' '
++
++
++enum {
++  ACS_POLICY_THROUGHPUT,
++  ACS_POLICY_REACH
++};
++
++/* Channel Selection Penalty factors */
++enum {
++  K_CI,
++  K_BWCCA,
++  K_RSSI,
++  K_SNR,
++  K_NF,
++  K_NOT80211,
++  K_CL,
++  K_NOTMYSTA,
++  K_DELTA_TX_POWER,
++  K_NUMOFBSS,
++  K_DYN_BW
++};
++
++/* Timeout and Degradation factors */
++enum {
++  T_RTO,
++  T_LNTO,
++  T_40INTO,
++  T_STO,
++  D_RTO,
++  D_STO,
++  D_CWI
++};
++
++enum {
++  CALIB_20,
++  CALIB_40,
++  CALIB_80,
++  NONCALIB_20,
++  NONCALIB_40,
++  NONCALIB_80
++};
++
++enum {
++  CW_20 = 0,
++  CW_40,
++  CW_80,
++  CW_160,
++  CW_80_80
++};
++
++enum {
++  SWR_INITIAL,
++  SWR_INTOLERANT,
++  SWR_RADAR,
++  SWR_BG_SCAN,
++  SWR_UPDATE,
++  SWR_LAST
++};
++
++
++typedef struct acs_candidate_table
++{	/* index */
++  u32	primary;
++  u32	secondary;
++  u32 freq;
++  int	width;
++  u32 chan; // for cases when different from primary
++//  u32	band;
++
++  /* calculated */
++  int	rank;
++
++  /* updated */
++  Boolean entry_init_done; /* vendor event was received and fields updated */
++
++  int noise_floor;
++  u32	busy_time;
++  u32	total_time;
++  u32	num_bss;
++  u32 num_bss_pri;
++  u32 num_adjacent;
++  u32 calibrated;
++  Boolean radar_affected;
++  Boolean radar_detected;
++  Boolean overlap40;
++  Boolean overlap80;
++  u32	primary_on_overlap_4080;
++  u32	intolerant40;
++  struct os_reltime ts_legacy;       // Timestamp of legacy detection
++  struct os_reltime	ts_scan;         // Timestamp of scan report
++  struct os_reltime ts_overlap40;    // Timestamp of overlapping 40 MHz detected
++  struct os_reltime ts_overlap80;    // Timestamp of overlapping 80 MHz detected
++  struct os_reltime ts_intolerant40; // Timestamp of intolerant 40 MHz detected
++  struct os_reltime ts_update;       // Timestamp of channel parameter update
++  int cwi_noise;
++  u32	dynBW20;
++  u32	dynBW40;
++  u32	dynBW80;
++  u32 tx_power;
++  u32 channel_load;
++  int rssi;
++  int snr;
++  u32 not_80211_rx_evt;
++  u32 not_my_sta_low_rssi;
++  u32 filled_mask;
++
++  char exclude_reason;
++} acs_candidate_table;
++
++/*                      5GHz          80+80 160 */
++#define MAX_CANDIDATES (24 + 24 + 24 + 24 + 24)
++
++#endif /* CONFIG_ACS */
++
+ #define HOSTAPD_MODE_FLAG_HT_INFO_KNOWN BIT(0)
+ #define HOSTAPD_MODE_FLAG_VHT_INFO_KNOWN BIT(1)
+ 
+@@ -220,6 +399,22 @@ struct hostapd_hw_modes {
+ 	u32 ht_tx_bf_capab;
+ 
+ 	unsigned int flags; /* HOSTAPD_MODE_FLAG_* */
++
++#ifdef CONFIG_ACS
++
++  acs_candidate_table candidates[MAX_CANDIDATES]; // MAX_CANDIDATES == all possible bondings
++
++  u32 num_candidates;
++
++  int selected_candidate;
++
++  u32 min_noise;
++
++  u32 num_bss; // over the whole band
++
++  u32 max_tx_power; // over the whole band
++
++#endif /* CONFIG_ACS */
+ };
+ 
+ 
+@@ -3946,6 +4141,7 @@ enum wpa_event_type {
+ 	 */
+ 	EVENT_EAPOL_RX,
+ 	EVENT_LTQ_FLUSH_STATIONS_RX,
++  EVENT_LTQ_CHAN_DATA,
+ 
+ 	/**
+ 	 * EVENT_SIGNAL_CHANGE - Indicate change in signal strength
+@@ -4724,6 +4920,11 @@ union wpa_event_data {
+ 		size_t data_len;
+ 	} ltq_flush_stations;
+ 
++  struct ltq_chan_data {
++    const u8 *data;
++    size_t data_len;
++  } ltq_chan_data;
++
+ 	/**
+ 	 * signal_change - Data for EVENT_SIGNAL_CHANGE events
+ 	 */
+@@ -5005,6 +5206,15 @@ static inline void drv_event_ltq_flush_s
+    wpa_supplicant_event(ctx, EVENT_LTQ_FLUSH_STATIONS_RX, &event);
+ }
+ 
++static inline void drv_event_ltq_chan_data(void *ctx, const u8 *data, size_t data_len)
++{
++  union wpa_event_data event;
++  os_memset(&event, 0, sizeof(event));
++  event.ltq_chan_data.data = data;
++  event.ltq_chan_data.data_len = data_len;
++  wpa_supplicant_event(ctx, EVENT_LTQ_CHAN_DATA, &event);
++}
++
+ /* driver_common.c */
+ void wpa_scan_results_free(struct wpa_scan_results *res);
+ 
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/drivers/driver_common.c hostapd-2.6/src/drivers/driver_common.c
+--- hostapd-2.6-orig/src/drivers/driver_common.c	2017-04-03 14:43:00.876404993 +0300
++++ hostapd-2.6/src/drivers/driver_common.c	2017-04-03 14:44:31.858575925 +0300
+@@ -54,6 +54,7 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(NEW_STA);
+ 	E2S(EAPOL_RX);
+ 	E2S(LTQ_FLUSH_STATIONS_RX);
++  E2S(LTQ_CHAN_DATA);
+ 	E2S(SIGNAL_CHANGE);
+ 	E2S(INTERFACE_ENABLED);
+ 	E2S(INTERFACE_DISABLED);
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/drivers/driver_nl80211_event.c hostapd-2.6/src/drivers/driver_nl80211_event.c
+--- hostapd-2.6-orig/src/drivers/driver_nl80211_event.c	2017-04-03 14:43:00.877404973 +0300
++++ hostapd-2.6/src/drivers/driver_nl80211_event.c	2017-04-03 14:44:31.859575905 +0300
+@@ -1966,6 +1966,14 @@ static void ltq_nl80211_handle_flush_sta
+ 	drv_event_ltq_flush_stations(drv->ctx, data, len);
+ }
+ 
++static void ltq_nl80211_handle_chan_data(struct wpa_driver_nl80211_data *drv,
++				const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive LTQ vendor event: channel data, ctx=%p", drv->ctx);
++
++	drv_event_ltq_chan_data(drv->ctx, data, len);
++}
++
+ static void nl80211_vendor_event_ltq(struct wpa_driver_nl80211_data *drv,
+ 										u32 subcmd, u8 *data, size_t len)
+ {       
+@@ -1976,6 +1984,9 @@ static void nl80211_vendor_event_ltq(str
+ 		case LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS:
+ 			ltq_nl80211_handle_flush_stations(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_CHAN_DATA:
++			ltq_nl80211_handle_chan_data(drv, data, len);
++			break;
+        default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported LTQ vendor event %u", subcmd);
+ 			break;

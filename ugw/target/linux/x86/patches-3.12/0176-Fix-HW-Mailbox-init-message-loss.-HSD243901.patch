@@ -1,0 +1,170 @@
+From 38728b4db6a65937fe5399cc0f3afaf3c62fa342 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Wed, 30 Sep 2015 16:17:18 -0700
+Subject: [PATCH 176/441] Fix HW Mailbox init message loss. HSD243901
+
+---
+ arch/x86/NetIP_SubSystem/netip_subsystem_defs.h |  4 ++
+ arch/x86/NetIP_SubSystem/netip_subsystem_lld.c  | 61 ++++++++++++++++++++++---
+ 2 files changed, 59 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
+@@ -31,6 +31,7 @@
+ #define LINUX_NETIP_SUBSYSTEM_DEFS_H
+ #include  <linux/mutex.h>
+ #include <linux/kthread.h>
++#include <linux/spinlock.h>
+ #include <linux/netip_subsystem.h>
+ 
+ //#define NETSS_DRV_DBG 1
+@@ -95,12 +96,15 @@ typedef struct netss_service_request_msg
+ 
+ struct net_subsystem_drv_data {
+    uint32_t irq_num;          /* The irq number used for Net SubSystem driver */
++   uint32_t pending_interrupts;
++   uint32_t pending_arm11_interrupts;
+    bool netss_driver_initialized;
+    void __iomem *bridge_reg_base; /* Mapped io bridge register base address mmio region2 of Net-IP  */
+    netss_subdevice_mmio_t subdev_mmios[NETSS_SUBDEVICE_MAX];
+    netss_subdev_irq_info_t irqs[NETSS_SUBDEVICE_MAX];
+    netss_subdev_irq_info_t arm11_irqs[NETSS_MAX_ARM11_INTR];
+    struct pci_dev *dev;
++   spinlock_t irq_lock;
+    struct mutex netss_lock;
+    struct task_struct * handshake_thread; /* Thread that exchange messages with netip during boot */
+    netss_msg_info_t netip_msg;
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
+@@ -37,6 +37,7 @@
+ #include <linux/delay.h>
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
++#include <linux/spinlock.h>
+ #include <linux/netip_subsystem.h>
+ #include "netip_subsystem_defs.h"
+ #include <linux/avalanche/generic/avalanche_intc.h>
+@@ -71,6 +72,7 @@ extern netss_sysfs_attributes_info_t g_n
+ 
+ void netss_subdev_register_irq(netss_subdevices_t subdevice, int arm11_int_id, netss_subdev_irq_info_t *irq_info)
+ {
++   spin_lock(&pnetss_drv_data->irq_lock);
+    if(subdevice != NETSS_ARM11) 
+    {
+         pnetss_drv_data->irqs[subdevice].func = irq_info->func;
+@@ -83,8 +85,39 @@ void netss_subdev_register_irq(netss_sub
+     }
+     if(irq_info->func != NULL)
+     {
+-		netss_enable_irq(subdevice);
++        if(subdevice != NETSS_ARM11)
++        {
++            if(pnetss_drv_data->pending_interrupts & (1<<subdevice))
++            {
++                irq_info->func(pnetss_drv_data->irq_num, irq_info->args);
++                netss_ack_irq(subdevice);
++                pnetss_drv_data->pending_interrupts &= ~(1<<subdevice);
++                printk("Cleared pending interrupt for device %d IIR %08x pending %08x\n", subdevice, 
++                            __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET), 
++                                                               pnetss_drv_data->pending_interrupts);
++             }
++        }
++        else
++        {
++            if(pnetss_drv_data->pending_arm11_interrupts & (1<<arm11_int_id))
++            {
++                irq_info->func(pnetss_drv_data->irq_num, irq_info->args);
++                /*Clear interrupt in bridge only if it is present 
++                 *For ARM11 interrupt bundle this might hvae got cleared by some other irq handle */
++                if( __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET) & (1<<subdevice))
++                {
++                    netss_ack_irq(subdevice);   
++                }
++
++                pnetss_drv_data->pending_arm11_interrupts &= ~(1<<arm11_int_id);
++                printk("Cleared pending interrupt for armm11 %d IIR %08x pending %08x\n", arm11_int_id, 
++                               __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET), 
++                                                            pnetss_drv_data->pending_arm11_interrupts);
++            }
++        }
++        netss_enable_irq(subdevice);
+     }
++    spin_unlock(&pnetss_drv_data->irq_lock);
+ }
+ 
+ EXPORT_SYMBOL(netss_subdev_register_irq);
+@@ -176,23 +209,26 @@ static irqreturn_t net_subsystem_isr(int
+     struct net_subsystem_drv_data *pnet_ss = (struct net_subsystem_drv_data *)dev_id;
+     irqreturn_t ret = IRQ_NONE;
+     int i;
++    unsigned long flags;
+     uint32_t volatile reg_val = 0;
+     uint32_t ack_intr = 0;
+ 
++    spin_lock_irqsave(&pnet_ss->irq_lock, flags);
+     reg_val = __raw_readl(pnet_ss->bridge_reg_base + NETIP_BRIDGE_IIR_OFFSET);
+ 
+     NETSS_DBG_PRINT("Net IP ISR called\n");
+     for(i=0; i<NETSS_SUBDEVICE_MAX; i++)
+     {
+         if((reg_val >> i) & 1)  {
+-            /*Prepare interrupt acknowledge mask */
+-            ack_intr |= (1 << i);
+             if(i != NETSS_ARM11) {
+                 if(pnet_ss->irqs[i].func != NULL) {
+                     NETSS_DBG_PRINT("Interrupt of subdevice %d\n", i);
+                     pnet_ss->irqs[i].func(irq, pnet_ss->irqs[i].args);
++                    /*Prepare interrupt acknowledge mask */
++                    ack_intr |= (1 << i);
+                 } else {
+-                    NETSS_DBG_PRINT("No irq registered, ingoring interrupt of NetIP subdevice %d\n", i);
++                    pnet_ss->pending_interrupts |=  (1 << i);
++                    printk("No irq registered for interrupt of subdevice %d, Marking it pending\n", i);
+                 }
+             } else {
+                 int j;
+@@ -203,7 +239,12 @@ static irqreturn_t net_subsystem_isr(int
+                         if(pnet_ss->arm11_irqs[j].func != NULL) 
+                         {
+                             pnet_ss->arm11_irqs[j].func(irq, pnet_ss->arm11_irqs[j].args);
+-
++                            ack_intr |= (1 << i);
++                        }
++                        else
++                        {
++                            pnet_ss->pending_arm11_interrupts |=  (1 << j);
++                            printk("No irq registered for ARM11 interrupt %d, Marking it pending\n", j);
+                         }
+                         /* no need to clear ATOM_INTC here avalanche_intc_clear_status(j); */
+                         /* status clear need to be done by requester */
+@@ -219,6 +260,8 @@ static irqreturn_t net_subsystem_isr(int
+     }
+ 
+     ret = IRQ_HANDLED;
++    spin_unlock_irqrestore(&pnet_ss->irq_lock, flags);
++
+     return ret;
+ }
+ 
+@@ -278,14 +321,20 @@ static int netss_probe(struct pci_dev *p
+       ret = -ENOMEM;
+       goto free_mem;
+    }
++
++   reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
++   __raw_writel((reg_val | 0xFF), pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET);
++   printk(KERN_INFO "Enabling Net IP interrupts except GBE reg %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IER_OFFSET));
++
+    reg_val = __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET);
+    if((reg_val & NETIP_BRIDGE_IRQ_MASK)) {
+       __raw_writel((reg_val & ~NETIP_BRIDGE_IRQ_MASK) , pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET); 
+-      NETSS_DBG_PRINT("Unmasking NetIP interrupts IMR = %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET));
++      printk(KERN_INFO "Unmasking NetIP interrupts IMR = %x\n", __raw_readl(pnetss_drv_data->bridge_reg_base + NETIP_BRIDGE_IMR_OFFSET));
+    }    
+ 
+    pnetss_drv_data->irq_num = pdev->irq;
+    pnetss_drv_data->dev = pdev;
++   spin_lock_init(&pnetss_drv_data->irq_lock);
+    
+    if (request_irq(pnetss_drv_data->irq_num, net_subsystem_isr, 0, NET_SUBSYSTEM_IRQ_NAME, (void *)pnetss_drv_data)){
+       printk(KERN_ERR "HW Mutex: Unable to allocate IRQ\n");

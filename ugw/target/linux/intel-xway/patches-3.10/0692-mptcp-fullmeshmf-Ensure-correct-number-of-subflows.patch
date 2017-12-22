@@ -1,0 +1,278 @@
+diff --git a/include/net/mptcp.h b/include/net/mptcp.h
+index c2b9199..e788b59 100644
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@ -663,6 +663,14 @@ extern struct workqueue_struct *mptcp_wq;
+ 			pr_err(__FILE__ ": " fmt, ##args);	\
+ 	} while (0)
+ 
++typedef enum {
++	MPTCP_ADDR_LOCAL,
++	MPTCP_ADDR_REMOTE
++} mptcp_addr_type_t;
++
++char *mptcp_inet_sock_to_str(struct inet_sock *s);
++bool mptcp_conn_exists(struct tcp_sock *t, mptcp_addr_type_t type, u32 addr);
++
+ /* Iterates over all subflows */
+ #define mptcp_for_each_tp(mpcb, tp)					\
+ 	for ((tp) = (mpcb)->connection_list; (tp); (tp) = (tp)->mptcp->next)
+diff --git a/net/mptcp/mptcp_ctrl.c b/net/mptcp/mptcp_ctrl.c
+index 010dfc7..d9d0cd6 100644
+--- a/net/mptcp/mptcp_ctrl.c
++++ b/net/mptcp/mptcp_ctrl.c
+@@ -80,6 +80,58 @@ bool mptcp_init_failed __read_mostly;
+ struct static_key mptcp_static_key = STATIC_KEY_INIT_FALSE;
+ EXPORT_SYMBOL(mptcp_static_key);
+ 
++char *mptcp_inet_sock_to_str(struct inet_sock *s)
++{
++       static char buf[80];
++       char *str = buf;
++
++       if (s->inet_saddr)
++               str += sprintf(str, "%pI4", &s->inet_saddr);
++
++       if (s->inet_sport)
++               str += sprintf(str, ":%d", ntohs(s->inet_sport));
++
++       if (!s->inet_daddr && !s->inet_dport)
++	       goto exit;
++
++       str += sprintf(str, "->");
++
++       if (s->inet_daddr)
++               str += sprintf(str, "%pI4", &s->inet_daddr);
++
++       if (s->inet_dport)
++               str += sprintf(str, ":%d", ntohs(s->inet_dport));
++exit:
++       return buf;
++}
++
++bool mptcp_conn_exists(struct tcp_sock *t, mptcp_addr_type_t type, u32 addr)
++{
++	bool exists = false;
++	struct inet_sock *s;
++	u32 *paddr;
++
++	for (t = t->mpcb->connection_list; t; t = t->mptcp->next) {
++
++		s = inet_sk((struct sock *) t);
++
++		paddr = (type == MPTCP_ADDR_LOCAL) ?
++				&s->inet_saddr : &s->inet_daddr;
++
++		if (addr == *paddr) {
++			exists = true;
++			break;
++		}
++	}
++
++	if (exists)
++		mptcp_debug("%s: %pI4 conn: %s\n",
++			MPTCP_ADDR_LOCAL ? "loc" : "rem", (void *) &addr,
++			mptcp_inet_sock_to_str(s));
++
++	return exists;
++}
++
+ static int proc_mptcp_path_manager(struct ctl_table *ctl, int write,
+ 				   void __user *buffer, size_t *lenp,
+ 				   loff_t *ppos)
+diff --git a/net/mptcp/mptcp_fullmesh_mf.c b/net/mptcp/mptcp_fullmesh_mf.c
+index 360155b..b3b60c5 100644
+--- a/net/mptcp/mptcp_fullmesh_mf.c
++++ b/net/mptcp/mptcp_fullmesh_mf.c
+@@ -335,11 +335,17 @@ static void mptcp_set_init_addr_bit(struct mptcp_cb *mpcb,
+ }
+ 
+ static void mptcp_v4_subflows(struct sock *meta_sk,
+-			      const struct mptcp_loc4 *loc,
+-			      struct mptcp_rem4 *rem)
++				const struct mptcp_loc4 *loc,
++				struct mptcp_rem4 *rem)
+ {
+ 	int i;
+ 
++	if (mptcp_conn_exists(tcp_sk(meta_sk), MPTCP_ADDR_LOCAL,
++				loc->addr.s_addr) ||
++			mptcp_conn_exists(tcp_sk(meta_sk), MPTCP_ADDR_REMOTE,
++						rem->addr.s_addr))
++		return;
++
+ 	for (i = 1; i < num_subflows; i++)
+ 		mptcp_init4_subsockets(meta_sk, loc, rem);
+ }
+@@ -368,7 +374,7 @@ static void retry_subflow_worker(struct work_struct *work)
+ 	struct sock *meta_sk = mpcb->meta_sk;
+ 	struct mptcp_loc_addr *mptcp_local;
+ 	struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(meta_sk));
+-	int iter = 0, i;
++	int iter = 0;
+ 
+ 	/* We need a local (stable) copy of the address-list. Really, it is not
+ 	 * such a big deal, if the address-list is not 100% up-to-date.
+@@ -396,25 +402,44 @@ next_subflow:
+ 	if (sock_flag(meta_sk, SOCK_DEAD))
+ 		goto exit;
+ 
+-	mptcp_for_each_bit_set(fmp->rem4_bits, i) {
+-		struct fullmesh_rem4 *rem = &fmp->remaddr4[i];
+-		/* Do we need to retry establishing a subflow ? */
+-		if (rem->retry_bitfield) {
+-			int i = mptcp_find_free_index(~rem->retry_bitfield);
+-			struct mptcp_rem4 rem4;
+-
+-			rem->bitfield |= (1 << i);
+-			rem->retry_bitfield &= ~(1 << i);
+-
+-			rem4.addr = rem->addr;
+-			rem4.port = rem->port;
+-			rem4.rem4_id = rem->rem4_id;
+-
+-			mptcp_init4_subsockets(meta_sk, &mptcp_local->locaddr4[i], &rem4);
+-			mptcp_v4_subflows(meta_sk,
+-					  &mptcp_local->locaddr4[i],
+-					  &rem4);
+-			goto next_subflow;
++	{
++		int i, j;
++
++		mptcp_for_each_bit_set(mptcp_local->loc4_bits, i) {
++
++			if (mptcp_conn_exists(tcp_sk(meta_sk),
++					MPTCP_ADDR_LOCAL,
++					mptcp_local->locaddr4[i].addr.s_addr))
++				continue;
++
++			mptcp_for_each_bit_set(fmp->rem4_bits, j) {
++
++				struct fullmesh_rem4 *rem = &fmp->remaddr4[j];
++				struct mptcp_rem4 rem4 = {
++					.addr		= rem->addr,
++					.port		= rem->port,
++					.rem4_id	= rem->rem4_id
++				};
++
++				if (mptcp_conn_exists(tcp_sk(meta_sk),
++						MPTCP_ADDR_REMOTE,
++						fmp->remaddr4[j].addr.s_addr))
++					continue;
++
++				if (!(rem->retry_bitfield && (1 << i)))
++					continue;
++
++				rem->bitfield |= (1 << i);
++				rem->retry_bitfield &= ~(1 << i);
++
++				mptcp_init4_subsockets(meta_sk,
++					&mptcp_local->locaddr4[i], &rem4);
++
++				mptcp_v4_subflows(meta_sk,
++					&mptcp_local->locaddr4[i], &rem4);
++
++				goto next_subflow;
++			}
+ 		}
+ 	}
+ 
+@@ -467,7 +492,6 @@ static void create_subflow_worker(struct work_struct *work)
+ 	struct mptcp_loc_addr *mptcp_local;
+ 	const struct mptcp_fm_ns *fm_ns = fm_get_ns(sock_net(meta_sk));
+ 	int iter = 0, retry = 0;
+-	int i;
+ 
+ 	/* We need a local (stable) copy of the address-list. Really, it is not
+ 	 * such a big deal, if the address-list is not 100% up-to-date.
+@@ -515,36 +539,45 @@ next_subflow:
+ 		goto exit;
+ 
+ 	if (mpcb->master_sk &&
+-	    !tcp_sk(mpcb->master_sk)->mptcp->fully_established)
++		!tcp_sk(mpcb->master_sk)->mptcp->fully_established)
+ 		goto exit;
+ 
+-	mptcp_for_each_bit_set(fmp->rem4_bits, i) {
+-		struct fullmesh_rem4 *rem;
+-		u8 remaining_bits;
++	{
++		int i, j;
+ 
+-		rem = &fmp->remaddr4[i];
+-		remaining_bits = ~(rem->bitfield) & mptcp_local->loc4_bits;
++		mptcp_for_each_bit_set(mptcp_local->loc4_bits, i) {
+ 
+-		/* Are there still combinations to handle? */
+-		if (remaining_bits) {
+-			int i = mptcp_find_free_index(~remaining_bits);
+-			struct mptcp_rem4 rem4;
++			if (mptcp_conn_exists(tcp_sk(meta_sk),
++					MPTCP_ADDR_LOCAL,
++					mptcp_local->locaddr4[i].addr.s_addr))
++				continue;
+ 
+-			rem->bitfield |= (1 << i);
++			mptcp_for_each_bit_set(fmp->rem4_bits, j) {
+ 
+-			rem4.addr = rem->addr;
+-			rem4.port = rem->port;
+-			rem4.rem4_id = rem->rem4_id;
++				struct fullmesh_rem4 *rem = &fmp->remaddr4[j];
++				struct mptcp_rem4 rem4 = {
++					.addr		= rem->addr,
++					.port		= rem->port,
++					.rem4_id	= rem->rem4_id
++				};
+ 
+-			/* If a route is not yet available then retry once */
+-			if (mptcp_init4_subsockets(meta_sk, &mptcp_local->locaddr4[i],
+-						   &rem4) == -ENETUNREACH)
+-				retry = rem->retry_bitfield |= (1 << i);
+-			else
+-				mptcp_v4_subflows(meta_sk,
+-						  &mptcp_local->locaddr4[i],
+-						  &rem4);
+-			goto next_subflow;
++				if (mptcp_conn_exists(tcp_sk(meta_sk),
++						MPTCP_ADDR_REMOTE,
++						fmp->remaddr4[j].addr.s_addr))
++					continue;
++
++				rem->bitfield |= (1 << i);
++
++				if (mptcp_init4_subsockets(meta_sk,
++						&mptcp_local->locaddr4[i],
++						&rem4) == -ENETUNREACH)
++					retry = rem->retry_bitfield |= (1 << i);
++				else
++					mptcp_v4_subflows(meta_sk,
++						&mptcp_local->locaddr4[i],
++						&rem4);
++				goto next_subflow;
++			}
+ 		}
+ 	}
+ 
+@@ -1277,6 +1310,8 @@ static void full_mesh_new_session(const struct sock *meta_sk)
+ 	sa_family_t family;
+ 	bool meta_v4 = meta_sk->sk_family == AF_INET;
+ 
++	mptcp_debug("%s\n", mptcp_inet_sock_to_str(inet_sk(meta_sk)));
++
+ 	/* Init local variables necessary for the rest */
+ 	if (meta_sk->sk_family == AF_INET || mptcp_v6_is_v4_mapped(meta_sk)) {
+ 		saddr.ip = inet_sk(meta_sk)->inet_saddr;
+diff --git a/net/mptcp/mptcp_ipv4.c b/net/mptcp/mptcp_ipv4.c
+index 261201a..4afbd3f 100644
+--- a/net/mptcp/mptcp_ipv4.c
++++ b/net/mptcp/mptcp_ipv4.c
+@@ -428,6 +428,8 @@ int mptcp_init4_subsockets(struct sock *meta_sk, const struct mptcp_loc4 *loc,
+ 	sk_set_socket(sk, meta_sk->sk_socket);
+ 	sk->sk_wq = meta_sk->sk_wq;
+ 
++	mptcp_debug("%s\n", mptcp_inet_sock_to_str(inet_sk(sk)));
++
+ 	return 0;
+ 
+ error:

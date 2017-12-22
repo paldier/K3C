@@ -1,0 +1,1011 @@
+# HG changeset patch
+# Parent e5ffb6427d318a43ff43d77bd862072b2488c568
+
+--- a/arch/x86/pal_cppi41/pal_cppi41.c
++++ b/arch/x86/pal_cppi41/pal_cppi41.c
+@@ -88,6 +88,8 @@
+ #include <linux/avalanche/generic/avalanche_pp_api.h>
+ #include <linux/avalanche/generic/pal_cppi41.h>
+ #include <linux/avalanche/generic/pal_os.h>
++#include <linux/avalanche/generic/pal_osProtect.h>
++#include <linux/avalanche/generic/pal_osProtect_inline.h>
+ 
+ #include "cppi41_hw_mbox_if.h"
+ #include <linux/hw_mailbox.h>
+@@ -396,6 +398,26 @@ static AVALANCHE_PP_RET_e __cppi4AccChOp
+ 	return (PP_RC_SUCCESS);
+ }
+ 
++static AVALANCHE_PP_RET_e __cppi4AccChEnRateLimit(AVALANCHE_PP_ACC_CH_INFO_t *ptr_ch_cfg)
++{
++    AVALANCHE_PP_RET_e rc;
++
++    BUG_ON(!__pdsp_cmd_send);
++
++    rc = __pdsp_cmd_send(PDSP_ID_Accumulator,
++                         PDSP_PREP_CMD(PDSP_ACCUMULATOR_ENABLE_CH_RATE_LIMIT, ptr_ch_cfg->Channel, ptr_ch_cfg->Index),
++                         &(ptr_ch_cfg->Param0Ret),
++                         SIZE_IN_WORD(AVALANCHE_PP_ACC_CH_INFO_t) - SIZE_IN_WORD(Int32) /* Size of the parameters = total size - command size*/,
++                         NULL,   0);
++
++    if (rc)
++    {
++        return (rc + PP_RC_FAILURE);
++    }
++
++    return (PP_RC_SUCCESS);
++}
++
+ PAL_Cppi4AccChHnd PAL_cppi4AccChOpen(PAL_Handle hnd, Cppi4AccumulatorCfg* accCfg)
+ {
+     Uint32 cookie;
+@@ -487,6 +509,33 @@ PAL_Cppi4AccChHnd PAL_cppi4AccChOpen(PAL
+ }
+ EXPORT_SYMBOL(PAL_cppi4AccChOpen);
+ 
++void PAL_cppi4AccChEnRateLimit(Cppi4AccumulatorRateLimitCfg* accCfg)
++{
++    Uint32                      cookie;
++    AVALANCHE_PP_RET_e          rc;
++    AVALANCHE_PP_ACC_CH_INFO_t  ptr_ch_cfg;
++
++    /* Need to protect the accumulator register writes. They are shared with pre-fetcher */
++    PAL_osProtectEntry(PAL_OSPROTECT_INTERRUPT, &cookie);
++
++    ptr_ch_cfg.Index        =   1 ; // Enable Rate Limit
++    ptr_ch_cfg.Channel      =   accCfg->accChanNum ;
++    ptr_ch_cfg.Command      =   0 ;
++    ptr_ch_cfg.Param0Ret    =   (accCfg->retQ);
++    ptr_ch_cfg.Param1       =   (accCfg->upperThreshold << 16) | (accCfg->lowerThreshold);
++    ptr_ch_cfg.Param2       =   0;
++
++    rc = __cppi4AccChEnRateLimit(&ptr_ch_cfg);
++    if (PP_RC_SUCCESS != rc)
++    {
++        PAL_osProtectExit(PAL_OSPROTECT_INTERRUPT, cookie);
++        return;
++    }
++
++    PAL_osProtectExit(PAL_OSPROTECT_INTERRUPT, cookie);
++}
++EXPORT_SYMBOL(PAL_cppi4AccChEnRateLimit);
++
+ int PAL_cppi4AccChClose(PAL_Cppi4AccChHnd hnd, void *closeArgs)
+ {
+     PAL_Cppi4AccChObj *accChObj = (PAL_Cppi4AccChObj *) hnd;
+--- a/include/linux/avalanche/generic/avalanche_pdsp_api.h
++++ b/include/linux/avalanche/generic/avalanche_pdsp_api.h
+@@ -141,14 +141,20 @@ typedef enum
+     PDSP_QOS_CMD_CONFIG_CLUSTER     = 0x83,
+ 
+     // Accumulator  commands
+-    PDSP_ACCUMULATOR_ENABLE_CH      = 0x83,
+-    PDSP_ACCUMULATOR_DISABLE_CH     = 0x84,
++    PDSP_ACCUMULATOR_ENABLE_CH              = 0x83,
++    PDSP_ACCUMULATOR_DISABLE_CH             = 0x84,
++    PDSP_ACCUMULATOR_ENABLE_CH_RATE_LIMIT   = 0x85,
++    PDSP_ACCUMULATOR_ENABLE_RATE_LIMIT      = 0x86,
+ 
+     // Session Cache Commands
+     PDSP_SESSION_CACHE_SESSION_CMD  = 0x83,
+     PDSP_SESSION_CACHE_FLUSH_ALL    = 0x84,
+     PDSP_SESSION_CACHE_SESSION_TIMEOUT  = 0x85,
+ 
++
++    // Moca Commands
++    PDSP_MOCA_SET_PADDING                = 0x83,
++
+ #ifdef CONFIG_WIFI_PROXY
+     //Wifi TX commands
+     PDSP_CMD_WIFI_TX_INIT                = 0x83,
+--- a/include/linux/avalanche/generic/avalanche_pp_api.h
++++ b/include/linux/avalanche/generic/avalanche_pp_api.h
+@@ -120,6 +120,7 @@
+ #define AVALANCHE_PP_MAX_ACCELERATED_SESSIONS           (AVALANCHE_PP_MAX_STATIC_ENTRIES + AVALANCHE_PP_MAX_LUT_ENTRIES)
+ #define AVALANCHE_PP_MAX_ACCELERATED_TDOX_SESSIONS      512
+ #define VPID_IF_NAME_SIZE                               16
++
+ #endif
+ 
+ #ifdef CONFIG_WIFI_MESH_TUNNEL
+@@ -333,13 +334,13 @@ AVALANCHE_PP_PID_RANGE_t;
+ typedef struct // former TI_PP_QOS_QUEUE
+ {
+     Uint8               q_num;                  /* Index of the QOS queue (offset from QOS queue base) */
+-    Uint8               flags;                  /* Control how packets in the queue should be handled. Available options: AVALANCHE_PP_QOS_Q_REALTIME - Disable scaling of the credit. */
++    Uint8               flags;                  /* Control how packets in the queue should be handled */
+     Uint16              egr_q;                  /* Queue manager and queue index of forwarding queue */
+ 
+-    Uint32              it_credit_bytes;        /* The amount of forwarding byte “credit” that the queue receives every 25us. */
+-    Uint16              it_credit_packets;      /* The amount of forwarding packets “credit” that the queue receives every 25us. */
+-    Uint32              max_credit_bytes;       /* The maximum amount of forwarding byte “credit” that the queue is allowed to hold at the end of the 25us iteration. */
+-    Uint16              max_credit_packets;     /* The maximum amount of forwarding byte “credit” that the queue is allowed to hold at the end of the 25us iteration. */
++    Uint32              it_credit_bytes;        /* The amount of forwarding byte ?credit? that the queue receives every 25us. */
++    Uint16              it_credit_packets;      /* The amount of forwarding packets ?credit? that the queue receives every 25us. */
++    Uint32              max_credit_bytes;       /* The maximum amount of forwarding byte ?credit? that the queue is allowed to hold at the end of the 25us iteration. */
++    Uint16              max_credit_packets;     /* The maximum amount of forwarding byte ?credit? that the queue is allowed to hold at the end of the 25us iteration. */
+     Uint32              congst_thrsh_bytes;     /* The size in bytes at which point the QOS queue is considered to be congested. */
+     Uint16              congst_thrsh_packets;   /* The maximum number of packets to be kept in QOS queue */
+ }
+@@ -372,7 +373,9 @@ typedef struct // former TI_PP_QOS_CLST_
+     Uint16                      egr_congst_thrsh_packets2; /* Egress Congestion Pkts Threshold 2 */
+     Uint16                      egr_congst_thrsh_packets3; /* Egress Congestion Pkts Threshold 3 */
+     Uint16                      egr_congst_thrsh_packets4; /* Egress Congestion Pkts Threshold 4 */
+-	Uint8						shaperClusters[4];
++
++    Uint8                       shaperClusters[4];
++
+ }
+ AVALANCHE_PP_QOS_CLST_CFG_t;
+ 
+@@ -784,7 +787,8 @@ typedef enum
+ {
+     PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE             = 1,
+     PP_LOOKUP_FIELD_TUNNEL_TYPE_DsLITE          = 2,
+-    PP_LOOKUP_FIELD_TUNNEL_TYPE_PPPoE           = 3
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_PPPoE           = 3,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_6rd             = 4
+ }PP_LOOKUP_FIELD_TUNNEL_TYPE_e;
+ 
+ typedef enum
+@@ -903,14 +907,30 @@ AVALANCHE_PP_EGRESS_FIELD_ENABLE_e;
+ #if PUMA7_OR_NEWER_SOC_TYPE
+ typedef struct
+ {
++#if defined(__BIG_ENDIAN_BITFIELD)
+     Uint8                               sf_index;
+     Uint8                               res1;
+     Uint16                              do_not_encrypt  :   1,
+-                                        fw_internal     :   3,
++                                        fw_internal     :   2,
++                                        tdox_candidate  :   1,
+                                         high_priority   :   1,
+                                         tdox_ignore_ts  :   1,
+                                         tdox_enabled    :   1,
+                                         tdox_id         :   9;
++
++#elif defined (__LITTLE_ENDIAN_BITFIELD)
++
++   Uint16                               tdox_id         :   9,
++                                        tdox_enabled    :   1,
++                                        tdox_ignore_ts  :   1,
++                                        high_priority   :   1,
++                                        tdox_candidate  :   1,
++                                        fw_internal     :   2,
++                                        do_not_encrypt  :   1;
++
++   Uint8                                res1;
++   Uint8                                sf_index;
++#endif
+ }
+ AVALANCHE_PP_PSI_t;
+ #else
+@@ -1165,11 +1185,20 @@ typedef struct // former TI_PP_SESSION
+      *  leaves the box. */
+     AVALANCHE_PP_EGRESS_SESSION_PROPERTY_t  egress;
+ 
++
++#if defined(PUMA6_SOC_TYPE) && PUMA6_SOC_TYPE
++
+     AVALANCHE_PP_SESSION_TDOX_STATS_t   tdox_stats;
++#else
++    /* Added 12 bytes as reserved until Atom sync */
++    Uint32                  reserved1;
++    Uint32                  reserved2;
++    Uint32                  reserved3;
+ 
+-#if PUMA7_OR_NEWER_SOC_TYPE
+     Uint8                   is_irreg_moca;
+ #endif
++
++
+ }
+ AVALANCHE_PP_SESSION_INFO_t;
+ 
+@@ -1232,10 +1261,8 @@ typedef struct
+ {
+     Uint32  cmp_recv      ;
+     Uint32  cmp_recv_valid;
+-    Uint32  cmp_irq_cnt   ;
+     Uint32  req_sent      ;
+-    Uint32  req_irq_cnt   ;
+-    Uint32  dev_cnt5      ;
++    Uint32  dev_cnt3      ;
+ 
+ } wifi_tx_dev_stats_t;
+ 
+@@ -1243,39 +1270,52 @@ typedef struct
+ {
+     Uint32  req_recv      ;
+     Uint32  req_recv_valid;
+-    Uint32  req_irq_cnt   ;
+     Uint32  cmp_sent      ;
+-    Uint32  cmp_irq_cnt   ;
+-    Uint32  dev_cnt5      ;
++    Uint32  drops         ;
+ } wifi_rx_dev_stats_t;
+ 
+ typedef struct
+ {
+-    /* global */
+-    Uint32  rx_pkts                ;
+-    Uint32  tx_pkts                ;
+-    Uint32  cmp_null_buffer        ;
+-    Uint32  cmp_ring_full          ;
+-    Uint32  cmp_ring_empty         ;
+-    Uint32  cmp_pattern_buffer     ;
+-    Uint32  req_int_desc_starvation;
+-    Uint32  req_ring_full          ;
+-    Uint32  req_ring_empty         ;
+-    Uint32  req_ring_ooo           ;
++    Uint32 rxPkts          ;
++    Uint32 txPkts          ;
++    Uint32 cmpIrqCnt       ;
++    Uint32 reqIrqCnt       ;
++    Uint32 cmpNullBuffer   ;
++    Uint32 cmpPatternBuffer;
++    Uint32 reqOOO          ;
++    Uint32 cmpAddrOOR      ;
++    Uint32 reqAddrOOR      ;
++    Uint32 reqIntDescStarv ;
++    Uint32 seqNumHigh      ;
++    Uint32 seqNumLow       ;
++    Uint32 buffMarked      ;
++    Uint32 buffUnmarked    ;
++    Uint32 cnt14           ;
++    Uint32 cnt15           ;
++    Uint32 cnt16           ;
++    Uint32 cnt17           ;
+ } avalanche_pp_wifi_tx_stats_t;
+ 
+ typedef struct
+ {
+-    Uint32 rx_pkts            ;
+-    Uint32 tx_pkts            ;
+-    Uint32 req_desc_starvation;
+-    Uint32 req_null_buffer    ;
+-    Uint32 req_zero_date_len  ;
+-    Uint32 req_ring_full      ;
+-    Uint32 req_ring_empty     ;
+-    Uint32 cmp_buff_starvation;
+-    Uint32 cmp_ring_full      ;
+-    Uint32 cmp_ring_empty     ;
++    Uint32 rxPkts        ;   
++    Uint32 txPkts        ;   
++    Uint32 reqIrqCnt     ;   
++    Uint32 cmpIrqCnt     ;   
++    Uint32 reqDescStarv  ;
++    Uint32 cmpBuffStarv  ;
++    Uint32 reqNullBuffer ;   
++    Uint32 reqZeroDateLen;   
++    Uint32 reqAddrOOR    ;   
++    Uint32 cmpAddrOOR    ;   
++    Uint32 seqNumHigh    ;   
++    Uint32 seqNumLow     ;   
++    Uint32 buffMarked    ;   
++    Uint32 buffUnmarked  ;   
++    Uint32 cnt14         ;   
++    Uint32 cnt15         ;   
++    Uint32 cnt16         ;   
++    Uint32 cnt17         ;
+ } avalanche_pp_wifi_rx_stats_t;
+ 
+ typedef struct
+@@ -1328,8 +1368,8 @@ typedef struct
+     Uint32      SessionCache_lookup_failures;
+     Uint32      SessionCache_lookup_matches;
+     Uint32      SessionCache_lookup_matches_internal;
+-    Uint32      SessionCache_lookup_matches_external_fifo;
+-    Uint32      SessionCache_lookup_matches_external_not_fifo;
++    Uint32      SessionCache_lru_cleared;
++    Uint32      SessionCache_lookup_matches_external;
+     Uint32      SessionCache_lookup_matches_popped_from_internal;
+     Uint32      SessionCache_no_free_McDMA_channel;
+ 
+@@ -1347,10 +1387,10 @@ typedef struct
+     Uint32      TurboDOX_rx_pkts;
+     Uint32      TurboDOX_pkts_frwrd_to_next_hop;
+     Uint32      TurboDOX_pkts_frwrd_to_qos;
+-    Uint32      TurboDOX_res4;
+-    Uint32      TurboDOX_res5;
+-    Uint32      TurboDOX_res6;
+-    Uint32      TurboDOX_res7;
++    Uint32      TurboDOX_enabled_pkts;
++    Uint32      TurboDOX_qulified_pkts;
++    Uint32      TurboDOX_non_qulified_pkts;
++    Uint32      TurboDOX_suppressed_pkts;
+     //Uint32      TurboDOX_res8; Taken for ReSequencer usage
+     Uint32      ReSequencer_host_rx_pkts;
+ 
+@@ -1389,7 +1429,7 @@ typedef struct
+ 
+     Uint32      Accumulator_rx_pkts;
+     Uint32      Accumulator_interrupts;
+-    Uint32      Accumulator_res3;
++    Uint32      Accumulator_drops;
+     Uint32      Accumulator_res4;
+     Uint32      Accumulator_res5;
+     Uint32      Accumulator_res6;
+@@ -1695,8 +1735,10 @@ typedef struct
+     Uint32                              lut2_histogram[AVALANCHE_PP_LUT_HISTOGRAM_SIZE];
+     Uint32                              lut2_starvation;
+     Uint32                              tdox_starvation;
+-
+-#if defined(PUMA6_SOC_TYPE) && PUMA6_SOC_TYPE
++#if PUMA7_OR_NEWER_SOC_TYPE
++    Uint32                              tdox_sessions;
++    Uint32                              tdox_candidates;
++#else
+     Uint32                              lut1_histogram[AVALANCHE_PP_LUT_HISTOGRAM_SIZE];
+     Uint32                              lut1_starvation;
+     Uint32                              active_lut1_keys;
+@@ -1707,15 +1749,19 @@ AVALANCHE_PP_Misc_Statistics_t;
+ 
+ #if PUMA7_OR_NEWER_SOC_TYPE
+ extern AVALANCHE_PP_RET_e    avalanche_pp_event_init(void);
+-#else
+-extern AVALANCHE_PP_RET_e    avalanche_pp_event_poll_timer_init( void );
+ #endif
++extern AVALANCHE_PP_RET_e    avalanche_pp_event_poll_timer_init( void );
++
+ 
+ #ifndef CONFIG_WIFI_MESH_TUNNEL
+ extern AVALANCHE_PP_RET_e    avalanche_pp_session_tdox_capability_set( Uint32 session_handle, Bool     enable );
++#if PUMA7_OR_NEWER_SOC_TYPE
++extern AVALANCHE_PP_RET_e    avalanche_pp_session_tdox_capability_get( Uint32 session_handle, Bool *   enable, Bool * qualified );
++extern AVALANCHE_PP_RET_e    avalanche_pp_get_tdox_candidate_session( Uint32* session_handle);
++#else
+ extern AVALANCHE_PP_RET_e    avalanche_pp_session_tdox_capability_get( Uint32 session_handle, Bool *   enable );
+ #endif
+-
++#endif
+ extern AVALANCHE_PP_RET_e    avalanche_pp_version_get( AVALANCHE_PP_VERSION_t * version );
+ extern AVALANCHE_PP_RET_e    avalanche_pp_set_mta_mac_address ( Uint8 * mtaAddress );
+ extern AVALANCHE_PP_RET_e    avalanche_pp_get_db_stats ( AVALANCHE_PP_Misc_Statistics_t * stats_ptr );
+@@ -1819,8 +1865,10 @@ struct wifi_proxy_dev_ch_t {
+  * @rx_destQMgr rx pdsp destination queue manager number
+  */
+ struct wifi_proxy_fw_init_info_t {
+-    Uint32 bMgr;
+-    Uint32 bPool;
++    Uint32 rx_bMgr;
++    Uint32 rx_bPool;
++    Uint32 tx_bMgr;
++    Uint32 tx_bPool;
+     Uint32 tx_int_qMgr;
+     Uint32 tx_int_qNum;
+     Uint32 tx_int_cnt;
+@@ -1884,7 +1932,7 @@ typedef enum {
+  * wifi_proxy_add_ch_info_t
+  * @dev_id device id
+  * @tx_ch tx channel configuration, fw to wifi soc
+- * @rx_ch rx channel configuration, wifi soc to fw 
++ * @rx_ch rx channel configuration, wifi soc to fw
+  * @f_mode specify if the device is working in full offload mode
+  * @author iemergi (2/2/2016)
+  */
+@@ -2161,6 +2209,8 @@ typedef     struct
+     Uint32  session_timeout_base_address;
+     Uint32  hop_list_base_address;
+     Uint16  syncQThreshold;
++    Uint8   bAccRateLimitActive;
++    Uint8   mocaPaddingMode;
+ }avalanche_pp_db_address_param_t;
+ /********************************************************************************************************/
+ /* IOCTL commands:
+@@ -2212,3 +2262,4 @@ typedef     struct
+ 
+ #endif //   _AVALANCHE_PP_H
+ 
++
+--- a/include/linux/avalanche/generic/pal.h
++++ b/include/linux/avalanche/generic/pal.h
+@@ -92,5 +92,7 @@
+ #include <linux/avalanche/generic/avalanche_intd.h>
+ #include <linux/avalanche/generic/avalanche_intc.h>
+ #include <linux/avalanche/generic/pal_sys.h>
++#include <linux/avalanche/generic/pal_osTimer.h>
++#include <linux/avalanche/generic/pal_osTimer_inline.h>
+ #endif
+ #endif /* _PAL_H_ */
+--- a/include/linux/avalanche/generic/pal_cppi41.h
++++ b/include/linux/avalanche/generic/pal_cppi41.h
+@@ -462,6 +462,23 @@ typedef struct
+ } Cppi4AccumulatorCfg;
+ 
+ /**
++ * \brief Accumulator channel rate limit configuration
++ *
++ * This defines the accumulator channel properties for a given host mode Tx/Rx channel
++ * An instance of this structure will be part of the channel initial configuration
++ * structure. This structure makes sense only for host mode channels.
++ */
++typedef struct
++{
++    Uint32  accChanNum;         /**< Accumulator channel number */
++    Uint16  retQ;            /**< Host FD Return Queue */
++    Uint16  upperThreshold;  /**< Infra DMA OutQ threshold from which we start dropping packets */
++    Uint16  lowerThreshold;  /**< Infra DMA OutQ threshold from which we stop dropping packets */
++    Uint16  reserved;
++} Cppi4AccumulatorRateLimitCfg;
++
++
++/**
+  *  \brief CPPI4 PAL Accumulator Channel object
+  *
+  *  CPPI4 PAL layer Object - encapsulates all bookeeping and data structures for
+@@ -621,6 +638,17 @@ PAL_Cppi4BD *PAL_cppi4QueuePop(PAL_Cppi4
+ int PAL_cppi4QueueGetEntryCount(PAL_Handle hnd, Cppi4Queue queue, unsigned int *entryCount);
+ 
+ /**
++ *  \brief PAL CPPI 4.1 accumulator channel enable rate limit.
++ *
++ * Sets up an accumulator channel rate limit onfiguration
++ * 
++ *  @param  accCfg        [IN]      Pointer to the accumulator
++ *                        rate limit configuration structure.
++ *
++ */
++void PAL_cppi4AccChEnRateLimit(Cppi4AccumulatorRateLimitCfg* accCfg);
++
++/**
+  *  \brief PAL CPPI 4.1 pdsp_cmd_send registration.
+  *
+  * Sets up the pdsp_cmd_send function callback used by PAL CPPI
+--- a/include/linux/avalanche/generic/pal_osCfg.h
++++ b/include/linux/avalanche/generic/pal_osCfg.h
+@@ -84,7 +84,6 @@
+ #define INLINE
+ 
+ #define PAL_INCLUDE_OSMEM
+-#define PAL_INCLUDE_OSPROTECT
+ #ifdef CONFIG_ARM_AVALANCHE_SOC
+ #define PAL_INCLUDE_OSBUF
+ #define PAL_INCLUDE_OSSEM
+@@ -93,6 +92,7 @@
+ #define PAL_INCLUDE_OSLIST
+ #define PAL_INCLUDE_OSCACHE
+ #define PAL_INCLUDE_OSTIMER
++#define PAL_INCLUDE_OSPROTECT
+ #endif
+ 
+ #endif
+--- /dev/null
++++ b/include/linux/avalanche/generic/pal_osTimer.h
+@@ -0,0 +1,154 @@
++/*
++ * pal_osTimer.h
++ * Description:
++ * See below.
++ *
++ *
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or 
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2008-2014 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify 
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but 
++  WITHOUT ANY WARRANTY; without even the implied warranty of 
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License 
++  along with this program; if not, write to the Free Software 
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution 
++  in the file called LICENSE.GPL.
++
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++  BSD LICENSE 
++
++  Copyright(c) 2008-2014 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without 
++  modification, are permitted provided that the following conditions 
++  are met:
++
++    * Redistributions of source code must retain the above copyright 
++      notice, this list of conditions and the following disclaimer.
++
++    * Redistributions in binary form must reproduce the above copyright 
++      notice, this list of conditions and the following disclaimer in 
++      the documentation and/or other materials provided with the 
++      distribution.
++
++    * Neither the name of Intel Corporation nor the names of its 
++      contributors may be used to endorse or promote products derived 
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++/** \file   pal_osTimer.h
++    \brief  OsTIMER Services Header File
++
++    This file declares OS abstraction services for OS Timers.
++    All services run in the context of the calling thread or program.
++    OsTIMER does not spawn a thread of its own to implement the APIs
++    declared here.
++
++ 
++    \author     PSP Architecture Team
++    \version    1.0
++ */
++
++#ifndef __PAL_OSTIMER_H__
++#define __PAL_OSTIMER_H__
++
++#include "pal_defs.h"
++#include "pal_os.h"
++
++/**
++ * \defgroup PalOSTimer PAL OS Timer Interface
++ * 
++ * PAL OS Timer Interface
++ * @{
++ */
++
++/** \name PAL OS Timer Interface
++ *  PAL OS Timer Interface
++ * @{
++ */
++
++typedef Ptr PAL_OsTimerHandle;
++typedef void (*PAL_OsTimerFunc) (unsigned long);
++
++
++/**
++ * \brief   PAL OS Timer Create
++ * 
++ *      This function creates and initializes a timer with user provided timer
++ *      function. 
++ * \warn    Note that the timer function is called in (software) interrupt
++ *          context and thus all the constraints related to interrupt handlers
++ *          are applicable.
++ * \param   pfn [IN] pointer to timer function 
++ * \param   arg [IN] parameter to be passed to timer function
++ * \param   phTimer [OUT] location to recieve the handle to timer just created
++ * \return  PAL_SOK if succesful, else a suitable error code.
++ */
++PAL_INLINE PAL_Result PAL_osTimerCreate(PAL_OsTimerFunc pfn, 
++                                Uint32 arg, 
++                                PAL_OsTimerHandle* phTimer);
++
++/**
++ * \brief   PAL OS Timer Destroy
++ * 
++ *      This function destroys the specified timer. The timer is stopped if
++ *      active and data associated is cleaned up. 
++ * \param   hTimer [IN] handle to the timer
++ * \return  PAL_SOK if succesful, else a suitable error code.
++ */
++PAL_INLINE PAL_Result PAL_osTimerDestroy(PAL_OsTimerHandle hTimer);
++
++/**
++ * \brief   PAL OS Timer Start
++ * 
++ *      This function activates the specified timer. The timer is areloaded
++ *      with new timeout if already started.
++ * \param   hTimer [IN] handle to the timer
++ * \param   msec [IN] timeout in milli seconds before the timer expires
++ * \return  PAL_SOK if succesful, else a suitable error code.
++ */
++PAL_INLINE PAL_Result PAL_osTimerStart(PAL_OsTimerHandle hTimer, Uint32 msec);
++
++/**
++ * \brief   PAL OS Timer Stop
++ * 
++ *      This function deactivates the specified timer. 
++ * \param   hTimer [IN] handle to the timer
++ * \return  PAL_SOK if succesful, else a suitable error code.
++ */
++PAL_INLINE PAL_Result PAL_osTimerStop(PAL_OsTimerHandle hTimer);
++
++/*@}*/
++/*@}*/
++
++#endif /* _PAL_OSSTIMER_H_ */
+--- /dev/null
++++ b/include/linux/avalanche/generic/pal_osTimer_inline.h
+@@ -0,0 +1,146 @@
++/*
++ * pal_osTimer_inline.h
++ * Description:
++ * See below.
++ *
++ *
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or 
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2008-2014 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify 
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but 
++  WITHOUT ANY WARRANTY; without even the implied warranty of 
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License 
++  along with this program; if not, write to the Free Software 
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution 
++  in the file called LICENSE.GPL.
++
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++  BSD LICENSE 
++
++  Copyright(c) 2008-2014 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without 
++  modification, are permitted provided that the following conditions 
++  are met:
++
++    * Redistributions of source code must retain the above copyright 
++      notice, this list of conditions and the following disclaimer.
++
++    * Redistributions in binary form must reproduce the above copyright 
++      notice, this list of conditions and the following disclaimer in 
++      the documentation and/or other materials provided with the 
++      distribution.
++
++    * Neither the name of Intel Corporation nor the names of its 
++      contributors may be used to endorse or promote products derived 
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++
++/** \file   pal_osTimer_inline.h
++    \brief  OsTIMER Services Source File
++
++    This file implements the OsTIMER services for Linux.
++
++
++    \author     PSP Architecture Team
++    \version    0.1
++*/
++
++#ifndef __PAL_OSTIMER_INLINE_H__
++#define __PAL_OSTIMER_INLINE_H__
++
++#include "pal_os.h"
++#include "pal_defs.h"
++#include <linux/timer.h>
++
++/**
++ * \defgroup PalOSTimer PAL OS Timer Interface
++ * 
++ * PAL OS Timer Interface
++ * @{
++ */
++
++/** \name PAL OS Timer Interface
++ *  PAL OS Timer Interface
++ * @{
++ */
++
++/**
++ * \brief   PAL OS Timer Create 
++ */
++PAL_INLINE PAL_Result PAL_osTimerCreate(PAL_OsTimerFunc pfn, 
++                                Uint32 arg, 
++                                PAL_OsTimerHandle* phTimer)
++{
++    if ((*phTimer =  kmalloc(sizeof(struct timer_list),GFP_KERNEL)) == NULL)
++	{
++        return PAL_OS_ERROR_NO_RESOURCES;
++	}
++
++    setup_timer((struct timer_list *) *phTimer, pfn, arg);
++    return PAL_SOK;
++}
++
++/**
++ * \brief   PAL OS Timer Destroy
++ */
++PAL_INLINE PAL_Result PAL_osTimerDestroy(PAL_OsTimerHandle hTimer)
++{
++    del_timer((struct timer_list*) hTimer); 
++    kfree(hTimer);
++    return PAL_SOK;
++}
++
++/**
++ * \brief   PAL OS Timer Activate
++ */
++PAL_INLINE PAL_Result PAL_osTimerStart(PAL_OsTimerHandle hTimer, Uint32 msec)
++{
++    mod_timer((struct timer_list*) hTimer, msecs_to_jiffies(msec) + jiffies); 
++    return 0;
++}
++
++/**
++ * \brief   PAL OS Timer Deactivate
++ */
++PAL_INLINE PAL_Result PAL_osTimerStop(PAL_OsTimerHandle hTimer)
++{
++    del_timer((struct timer_list*) hTimer); 
++    return 0;
++}
++
++/*@}*/
++/*@}*/
++#endif /* !__PAL_OSTIMER_INLINE_H__ */ 
++
+--- a/include/linux/avalanche/generic/pp_qos_p7.h
++++ b/include/linux/avalanche/generic/pp_qos_p7.h
+@@ -80,7 +80,7 @@
+ #define PP_QOS_MAX_QUEUES            (192)
+ #define PP_QOS_MAX_QUEUES_IN_CLUSTER AVALANCHE_PP_QOS_CLST_MAX_QCNT
+ 
+-#define PP_QOS_MAX_QUEUE_INDEX       (PP_QOS_MAX_QUEUES - 1)
++#define PP_QOS_MAX_QUEUE_INDEX       (PP_QOS_MAX_QUEUES   - 1)
+ #define PP_QOS_MAX_CLUSTER_INDEX     (PP_QOS_MAX_CLUSTERS - 1)
+ 
+ #define PP_QOS_Q_REALTIME_FLAG       (1<<0)
+@@ -529,7 +529,7 @@ PP_QOS_MGR_RET_e pp_qos_free_queue(Uint8
+  *  Returns PP_QOS_RC_SUCCESS if pass.
+  */
+ PP_QOS_MGR_RET_e pp_qos_get_queue_config(Uint8 phy_queue_id, AVALANCHE_PP_QOS_QUEUE_t *queue_cfg);
+-PP_QOS_MGR_RET_e pp_qos_change_queue_it_credits(Uint8 phy_queue_id, Uint32 pkt_credit, Uint32 bytes_credit);
++PP_QOS_MGR_RET_e pp_qos_update_queue_it_credits(Uint8 phy_queue_id, Uint32 pkt_credit, Uint32 bytes_credit);
+ /**
+  *  pp_qos_modify_active_queue - Modify properties for an active
+  *  queue
+@@ -562,7 +562,6 @@ PP_QOS_MGR_RET_e pp_qos_inc_session_cnt_
+  *  Returns PP_QOS_RC_SUCCESS if pass.
+  */
+ PP_QOS_MGR_RET_e pp_qos_dec_session_cnt_for_queue(Uint8 phy_queue_id);
+-
+ /**
+  *  pp_qos_set_queue_shaper - Limit queue to fixed rate (in
+  *  MegaBitPerSec)
+@@ -572,7 +571,6 @@ PP_QOS_MGR_RET_e pp_qos_dec_session_cnt_
+  *  Returns PP_QOS_RC_SUCCESS if pass.
+  */
+ PP_QOS_MGR_RET_e pp_qos_set_queue_shaper(Uint8 phy_queue_id, Uint32 rate_in_mega_bits);
+-
+ /**************/
+ /* VPID       */
+ /**************/
+--- /dev/null
++++ b/include/linux/avalanche/puma7/puma7_cppi_bmgr_pools.h
+@@ -0,0 +1,75 @@
++/*
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2014 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++    Intel Corporation
++    2200 Mission College Blvd.
++    Santa Clara, CA  97052
++
++  BSD LICENSE
++
++  Copyright(c) 2014 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without
++  modification, are permitted provided that the following conditions
++  are met:
++
++    * Redistributions of source code must retain the above copyright
++      notice, this list of conditions and the following disclaimer.
++    * Redistributions in binary form must reproduce the above copyright
++      notice, this list of conditions and the following disclaimer in
++      the documentation and/or other materials provided with the
++      distribution.
++    * Neither the name of Intel Corporation nor the names of its
++      contributors may be used to endorse or promote products derived
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++*/
++
++#define PAL_CPPI_PP_BMGR_POOL_LIST                                                                              \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_SHARED_RX_LOW_512B_BUFFER_POOL)                 /* PAL_CPPI_PP_BUFFER_POOL0  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_SHARED_RX_LOW_2KB_BUFFER_POOL)                  /* PAL_CPPI_PP_BUFFER_POOL1  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_SHARED_RX_LOW_4KB_BUFFER_POOL)                  /* PAL_CPPI_PP_BUFFER_POOL2  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_SHARED_RX_HIGH_BUFFER_POOL)                     /* PAL_CPPI_PP_BUFFER_POOL3  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_WIFI_RX_POOL)                                   /* PAL_CPPI_PP_BUFFER_POOL4  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_WIFI_TX_POOL)                                   /* PAL_CPPI_PP_BUFFER_POOL5  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_BUFFER_POOL6)                                   /* PAL_CPPI_PP_BUFFER_POOL6  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_BUFFER_POOL7)                                   /* PAL_CPPI_PP_BUFFER_POOL7  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_BUFFER_POOL8)                                   /* PAL_CPPI_PP_BUFFER_POOL8  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_PACKET_RAM_512B_BUFFER_POOL)                    /* PAL_CPPI_PP_BUFFER_POOL9  */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_PACKET_RAM_2KB_BUFFER_POOL)                     /* PAL_CPPI_PP_BUFFER_POOL10 */ \
++PAL_CPPI_BMGR_P_ADD(PAL_CPPI_PP_VOICE_DSP_BUFFER_POOL)                          /* PAL_CPPI_PP_BUFFER_POOL11 */
++
+--- a/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h
+@@ -552,7 +552,7 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_FW_RX_EMB_FD_Q_NUM)                              /* PAL_CPPI_PP_QMGR_G2_Q489 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_VOICE_DSP_RX_EMB_FD_Q_NUM)                            /* PAL_CPPI_PP_QMGR_G2_Q490 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_VOICE_INFRA_RX_EMB_FD_Q_NUM)                          /* PAL_CPPI_PP_QMGR_G2_Q491 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q45)                                           /* PAL_CPPI_PP_QMGR_G2_Q492 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_FW_RX_REASSEMBLY_EMB_FD_Q_NUM)                   /* PAL_CPPI_PP_QMGR_G2_Q492 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q46)                                           /* PAL_CPPI_PP_QMGR_G2_Q493 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q47)                                           /* PAL_CPPI_PP_QMGR_G2_Q494 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q48)                                           /* PAL_CPPI_PP_QMGR_G2_Q495 */\
+--- a/include/linux/avalanche/puma7/puma7_cppi_prv.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_prv.h
+@@ -68,6 +68,7 @@
+ #include "puma7_cppi_gqmgr2_q.h"
+ #include "puma7_cppi_dsgqmgr_q.h"
+ #include "puma7_cppi_usqmgr_q.h"
++#include "puma7_cppi_bmgr_pools.h"
+ #ifndef CONFIG_ARM_AVALANCHE_SOC
+ #include <linux/netip_mem_util.h>
+ #endif
+@@ -636,12 +637,13 @@ typedef enum PAL_CPPI_PP_DESC_REGIONs
+ 
+ #define PAL_CPPI_PP_WIFI_FW_TX_FD_BASE                                                      (IO_ADDRESS(0xF3508000))
+ #define PAL_CPPI_PP_WIFI_FW_TX_INTERNAL_EMB_FD_DESC_COUNT                                   (128)
+-#define PAL_CPPI_PP_WIFI_FW_RX_EMB_FD_DESC_COUNT                                            (16384) /* must be aligned to number of buffers allocated by app-cpu for wifi buffers pool */
++#define PAL_CPPI_PP_WIFI_FW_RX_EMB_FD_DESC_COUNT                                            (8192)  /* must be aligned to number of buffers allocated by app-cpu for wifi rx pool */
++#define PAL_CPPI_PP_WIFI_FW_RX_REASSEMBLY_EMB_FD_DESC_COUNT                                 (32)
+ 
+ #ifdef CONFIG_MACH_PUMA7_BOARD
+ #define PAL_CPPI_PP_HOST2PP_LOW_HOST_FD_DESC_COUNT                                          512
+ #define PAL_CPPI_PP_HOST2PP_HI_HOST_FD_DESC_COUNT                                           64
+-#define PAL_CPPI_PP_HOST2PP_LOW_INFRA_EMB_FD_DESC_COUNT                                     512
++#define PAL_CPPI_PP_HOST2PP_LOW_INFRA_EMB_FD_DESC_COUNT                                     2048
+ #define PAL_CPPI_PP_HOST2PP_HI_INFRA_EMB_FD_DESC_COUNT                                      64
+ #else
+ #define PAL_CPPI_PP_HOST2PP_LOW_HOST_FD_DESC_COUNT                                          64
+@@ -695,23 +697,12 @@ typedef enum PAL_CPPI_PP_DESC_REGIONs
+ #define PAL_CPPI_PP_BUF_MGR                     0
+ #define PAL_CPPI_PP_BUF_MGR_BASE                (IO_ADDRESS(0xF9180000))
+ 
++#undef PAL_CPPI_BMGR_P_ADD
++#define PAL_CPPI_BMGR_P_ADD(pNum)       pNum,
++
+ typedef enum PAL_CPPI_PP_BUFFER_POOLs
+ {
+-    PAL_CPPI_PP_BUFFER_POOL0,
+-
+-    PAL_CPPI_PP_SHARED_RX_LOW_512B_BUFFER_POOL = PAL_CPPI_PP_BUFFER_POOL0,
+-    PAL_CPPI_PP_SHARED_RX_LOW_2KB_BUFFER_POOL,
+-    PAL_CPPI_PP_SHARED_RX_LOW_4KB_BUFFER_POOL,
+-    PAL_CPPI_PP_SHARED_RX_HIGH_BUFFER_POOL,
+-    PAL_CPPI_PP_WIFI_RX_TX_POOL,
+-    PAL_CPPI_PP_BUFFER_POOL5,
+-    PAL_CPPI_PP_BUFFER_POOL6,
+-    PAL_CPPI_PP_BUFFER_POOL7,
+-    PAL_CPPI_PP_BUFFER_POOL8,
+-    PAL_CPPI_PP_PACKET_RAM_512B_BUFFER_POOL,
+-    PAL_CPPI_PP_PACKET_RAM_2KB_BUFFER_POOL,
+-    PAL_CPPI_PP_VOICE_DSP_BUFFER_POOL,
+-
++    PAL_CPPI_PP_BMGR_POOL_LIST
+     PAL_CPPI41_BMGR_MAX_POOLS
+ }PAL_CPPI_PP_BUFFER_POOLs_e;
+ 
+@@ -755,11 +746,11 @@ typedef enum PAL_CPPI_PP_BUFFER_POOLs
+ 
+ #define PAL_CPPI_PP_BUFFER_POOL4_COUNT                              0
+ #define PAL_CPPI_PP_BUFFER_POOL4_SIZE                               0
+-#define PAL_CPPI_PP_WIFI_RX_TX_POOL_REF_CNT                         0
++#define PAL_CPPI_PP_WIFI_RX_POOL_REF_CNT                            0
+ 
+ #define PAL_CPPI_PP_BUFFER_POOL5_COUNT                              0
+ #define PAL_CPPI_PP_BUFFER_POOL5_SIZE                               0
+-#define PAL_CPPI_PP_BUFFER_POOL5_REF_CNT                            0
++#define PAL_CPPI_PP_WIFI_TX_POOL_REF_CNT                            0
+ 
+ #define PAL_CPPI_PP_BUFFER_POOL6_COUNT                              0
+ #define PAL_CPPI_PP_BUFFER_POOL6_SIZE                               0
+--- a/include/linux/avalanche/puma7/puma7_npcpu_appcpu_defs.h
++++ b/include/linux/avalanche/puma7/puma7_npcpu_appcpu_defs.h
+@@ -77,16 +77,16 @@ typedef enum npcpu_appcpu_hw_mbox_tags
+     NPCPU_APPCPU_HW_MBOX_TAG_INVALID = -1,
+     NPCPU_APPCPU_HW_MBOX_TAG_BOOT,
+     NPCPU_APPCPU_HW_MBOX_TAG_PM,
+-    NPCPU_APPCPU_HW_MBOX_TAG_MRPC,
++    NPCPU_APPCPU_HW_MBOX_TAG_MRPC,
+     NPCPU_APPCPU_HW_MBOX_TAG_RPC,
+-    NPCPU_APPCPU_HW_MBOX_TAG_ITSTORE,
+-    NPCPU_APPCPU_HW_MBOX_TAG_LAN,
+-    NPCPU_APPCPU_HW_MBOX_TAG_MOCA,
+-    NPCPU_APPCPU_HW_MBOX_TAG_NONE,  /* reserved */
++    NPCPU_APPCPU_HW_MBOX_TAG_ITSTORE,
++    NPCPU_APPCPU_HW_MBOX_TAG_LAN,
++    NPCPU_APPCPU_HW_MBOX_TAG_MOCA,
++    NPCPU_APPCPU_HW_MBOX_TAG_NONE,  /* reserved */
+     NPCPU_APPCPU_HW_MBOX_TAG_CPPI41_MBX,
+     NPCPU_APPCPU_HW_MBOX_TAG_DATAPIPE_MBX,
+-    NPCPU_APPCPU_HW_MBOX_TAG_WIFI_MBX,
+-    NPCPU_APPCPU_HW_MBOX_TAG_DPI_MBX,
++    NPCPU_APPCPU_HW_MBOX_TAG_WIFI_MBX,
++    NPCPU_APPCPU_HW_MBOX_TAG_DPI_MBX,
+     NPCPU_APPCPU_HW_LAST_ENTRY
+ } npcpu_appcpu_hw_mbox_tags_e;
+ 
+--- a/include/linux/avalanche/puma7/synopsys_gbe_interface.h
++++ b/include/linux/avalanche/puma7/synopsys_gbe_interface.h
+@@ -35,6 +35,11 @@
+ 
+ #define __SYNOPSYS_GBE_INTERFACE_H__
+ 
++#ifdef CONFIG_ARM_AVALANCHE_SOC
++#include "avalanche_pp_api.h"
++#else
++#include <linux/avalanche/generic/avalanche_pp_api.h>
++#endif
+ 
+ typedef enum{
+     DWC_ETH_QOS_INTEL_PRIVATE_CMD_START = 50,

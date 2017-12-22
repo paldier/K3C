@@ -1,0 +1,349 @@
+From cc1f5ce234c16a919589101485b66203d23a0c79 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Sun, 27 Nov 2016 18:32:53 +0200
+Subject: [PATCH] rrm: bug fixes
+
+tx_mgmt_power - changed from s8 to u32.
+
+self beacon report - return error when failed.
+
+beacon report response - fix wrong parsing.
+
+sta connect notification - remove redundent space.
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/ctrl_iface.c         |   5 +--
+ src/ap/rrm.c                 | 103 ++++++++++++++++++++++---------------------
+ src/ap/rrm.h                 |   4 +-
+ src/ap/sta_info.c            |   6 +--
+ src/common/ieee802_11_defs.h |   2 +-
+ src/drivers/driver.h         |   2 +-
+ 6 files changed, 60 insertions(+), 62 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index d46377e..a200390 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -3012,9 +3012,8 @@ static int hostapd_ctrl_iface_req_self_beacon(struct hostapd_data *hapd,
+ 		return -1;
+ 	}
+ 
+-	hostapd_handle_self_beacon_req(hapd, random_interval, measurement_duration,
+-			mode);
+-	return 0;
++	return hostapd_handle_self_beacon_req(hapd, random_interval,
++			measurement_duration, mode);
+ }
+ 
+ static int hostapd_ctrl_iface_req_link_measurement(struct hostapd_data *hapd,
+diff --git a/src/ap/rrm.c b/src/ap/rrm.c
+index b2be409..a23f300 100644
+--- a/src/ap/rrm.c
++++ b/src/ap/rrm.c
+@@ -41,13 +41,12 @@ static void hostapd_lci_rep_timeout_handler(void *eloop_data, void *user_ctx)
+ 	hapd->lci_req_active = 0;
+ }
+ 
+-static void hostapd_memory_as_hex(u8 *buf, size_t max_size, const u8 *address,
+-		size_t len)
++static void hostapd_memory_as_hex(char *buf, const u8 *address, int len)
+ {
+-	size_t curr_byte_index;
++	int curr_byte_index;
+ 
+ 	for (curr_byte_index = 0; curr_byte_index < len; curr_byte_index++) {
+-		os_snprintf((char*)buf + curr_byte_index * 3, max_size, "%02x ",
++		os_snprintf(&buf[curr_byte_index * 3], 128, "%02x ",
+ 				address[curr_byte_index]);
+ 	}
+ }
+@@ -120,10 +119,10 @@ static void hostapd_send_general_rrm_report(struct hostapd_data *hapd,
+ 	wpabuf_free(buf);
+ }
+ 
+-void hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd)
++int hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd)
+ {
+ 	struct wpa_scan_results *scan_res = NULL;
+-	int i;
++	int i, found_result = 0;
+ 	int ht = hapd->iconf->ieee80211n && !hapd->conf->disable_11n;
+ 	int vht = hapd->iconf->ieee80211ac && !hapd->conf->disable_11ac;
+ 	u8 op_class, channel, phy_type;
+@@ -137,7 +136,7 @@ void hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd)
+ 	scan_res = hostapd_driver_get_scan_results(hapd);
+ 	if (!scan_res) {
+ 		wpa_printf(MSG_ERROR, "failed to get scan results");
+-		return;
++		return -1;
+ 	}
+ 
+ 	if (scan_res->num == 0) {
+@@ -145,13 +144,14 @@ void hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd)
+ 					" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
+ 					MAC2STR(hapd->own_addr), 0, op_class, channel,
+ 					0, 0, phy_type, 0, 0, MAC2STR(bssid), 0, 0);
+-		return;
++		return 0;
+ 	}
+ 
+ 	for (i = 0; i < scan_res->num; i++) {
+ 		struct wpa_scan_res *bss = scan_res->res[i];
+ 		if (bss->freq == hapd->iface->freq) {
+ 			u8 rcpi = rssi_to_rcpi(bss->level);
++			found_result = 1;
+ 			wpa_msg(hapd->msg_ctx, MSG_INFO,
+ 					RRM_EVENT_SELF_BEACON_REP_RXED MACSTR
+ 					" measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
+@@ -159,6 +159,14 @@ void hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd)
+ 					phy_type, rcpi, 255, MAC2STR(bss->bssid), 0, 0);
+ 		}
+ 	}
++
++	if (!found_result)
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_SELF_BEACON_REP_RXED MACSTR
++					" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++					MAC2STR(hapd->own_addr), 0, op_class, channel,
++					0, 0, phy_type, 0, 0, MAC2STR(bssid), 0, 0);
++
++	return 0;
+ }
+ 
+ void hostapd_handle_sta_beacon_report_scan_results(struct hostapd_iface *iface)
+@@ -286,6 +294,7 @@ static void hostapd_handle_beacon_report_request(struct hostapd_data *hapd,
+ static void hostapd_handle_beacon_report_response(struct hostapd_data *hapd,
+ 		u8 token, const u8 *pos, size_t len, const u8 *sta_addr)
+ {
++	const u8 *end, *attr;
+ 	u8 op_class, channel, frame_info, rcpi, rsni, ant_id;
+ 	u8 measurement_rep_mode = 0;
+ 	u16 measurement_duration;
+@@ -293,12 +302,11 @@ static void hostapd_handle_beacon_report_response(struct hostapd_data *hapd,
+ 	unsigned long long start_time;
+ 	u8 bssid[ETH_ALEN] = {};
+ 
+-	struct beacon_body *frame_body;
+-	struct tlv *tlv;
+-	u8 o_ssid[SSID_MAX_SIZE + 1] = {};
+-	u8 o_rm_capa[TLV_MAX_LENGTH * 3 + 1] = {};
+-	u8 o_vendor_specific[TLV_MAX_LENGTH * 3 + 1] = {};
+-	u8 o_rsni[TLV_MAX_LENGTH * 3 + 1] = {};
++	struct beacon_body frame_body;
++	char o_ssid[128] = "";
++	char o_rm_capa[128] = "";
++	char o_vendor_specific[128] = "";
++	char o_rsni[128] = "";
+ 
+ 	wpa_printf(MSG_DEBUG, "Beacon report token %u len %zu",	token, len);
+ 
+@@ -311,6 +319,8 @@ static void hostapd_handle_beacon_report_response(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
++	end = pos + len;
++
+ 	op_class = pos[3];
+ 	channel = pos[4];
+ 	start_time = WPA_GET_LE64(&pos[5]);
+@@ -331,47 +341,37 @@ static void hostapd_handle_beacon_report_response(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
+-	frame_body = (struct beacon_body*)(pos + 31);
+-	frame_body->timestamp = WPA_GET_LE64(&pos[31]);
+-	frame_body->beacon_int = WPA_GET_LE16(&pos[39]);
+-	frame_body->capab_info = WPA_GET_LE16(&pos[41]);
+-
+-	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30], WLAN_EID_SSID);
+-	if (tlv) {
+-		hostapd_memory_as_hex(o_ssid, SSID_MAX_SIZE, tlv->value, tlv->length);
+-	}
+-
+-	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30],
+-			WLAN_EID_RRM_ENABLED_CAPABILITIES);
+-	if (tlv) {
+-		hostapd_memory_as_hex(o_rm_capa, TLV_MAX_LENGTH, tlv->value, 5);
+-	}
+-
+-	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30], WLAN_EID_RSN);
+-	if (tlv) {
+-		hostapd_memory_as_hex(o_rsni, TLV_MAX_LENGTH, tlv->value, tlv->length);
+-	}
+-
+-	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30],
+-			WLAN_EID_VENDOR_SPECIFIC);
+-	if (tlv) {
+-		hostapd_memory_as_hex(o_vendor_specific, TLV_MAX_LENGTH,
+-				tlv->value, tlv->length);
+-	}
++	frame_body.length = pos[30] - 14;
++	frame_body.timestamp = WPA_GET_LE64(&pos[31]);
++	frame_body.beacon_int = WPA_GET_LE16(&pos[39]);
++	frame_body.capab_info = WPA_GET_LE16(&pos[41]);
++
++	attr = get_ie(&pos[43], frame_body.length, WLAN_EID_SSID);
++	if (attr && attr[1] > 0 && attr[1] <= 32 && attr + attr[1] < end)
++		hostapd_memory_as_hex(o_ssid, &attr[2], attr[1]);
++	attr = get_ie(&pos[43], frame_body.length, WLAN_EID_RRM_ENABLED_CAPABILITIES);
++	if (attr && attr[1] == 5 && attr + attr[1] < end)
++		hostapd_memory_as_hex(o_rm_capa, &attr[2], attr[1]);
++	attr = get_ie(&pos[43], frame_body.length, WLAN_EID_RSN);
++	if (attr && attr[1] >= 2 && attr[1] <= 255 && attr + attr[1] < end)
++		hostapd_memory_as_hex(o_rsni, &attr[2], attr[1]);
++	attr = get_ie(&pos[43], frame_body.length, WLAN_EID_VENDOR_SPECIFIC);
++	if (attr && attr[1] > 0 && attr[1] <= 255 && attr + attr[1] < end)
++		hostapd_memory_as_hex(o_vendor_specific, &attr[2], attr[1]);
+ 
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_BEACON_REP_RXED MACSTR
+ 			" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d timestamp=%llu beacon_int=%d capab_info=%02x ssid=%s rm_capa=%s vendor_specific=%s rsn_info=%s",
+ 			MAC2STR(sta_addr), token, measurement_rep_mode, op_class, channel,
+ 			start_time, measurement_duration, frame_info, rcpi, rsni,
+-			MAC2STR(bssid), ant_id, parent_tsf, frame_body->timestamp,
+-			frame_body->beacon_int, frame_body->capab_info,
++			MAC2STR(bssid), ant_id, parent_tsf, frame_body.timestamp,
++			frame_body.beacon_int, frame_body.capab_info,
+ 			o_ssid, o_rm_capa, o_vendor_specific, o_rsni);
+ }
+ 
+-void hostapd_handle_self_beacon_req(struct hostapd_data *hapd,
++int hostapd_handle_self_beacon_req(struct hostapd_data *hapd,
+ 		u16 random_interval, u16 measurement_duration, u8 mode)
+ {
+-	int ret;
++	int ret = 0;
+ 	const u8 bssid[ETH_ALEN] = {};
+ 
+ 	if ((mode == BEACON_REPORT_MODE_PASSIVE &&
+@@ -385,17 +385,17 @@ void hostapd_handle_self_beacon_req(struct hostapd_data *hapd,
+ 				MAC2STR(hapd->own_addr),
+ 				MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE, 0, 0, 0, 0, 0, 0, 0,
+ 				MAC2STR(bssid), 0, 0);
+-		return;
++		return -1;
+ 	}
+ 
+ 	if (mode == BEACON_REPORT_MODE_TABLE) {
+-		hostapd_handle_self_beacon_report_scan_results(hapd);
++		ret = hostapd_handle_self_beacon_report_scan_results(hapd);
+ 	} else if (mode == BEACON_REPORT_MODE_PASSIVE) {
+ 		hapd->iface->self_beacon_req = 1;
+ 		ret = acs_current_channel_request_scan(hapd->iface);
+-		if (ret)
+-			wpa_printf(MSG_ERROR, "Failed to request scan");
+ 	}
++
++	return ret;
+ }
+ 
+ static void hostapd_handle_channel_load_request(struct hostapd_data *hapd,
+@@ -2108,7 +2108,7 @@ int hostapd_send_link_measurement_req(struct hostapd_data *hapd, const u8 *addr)
+ 	struct wpabuf *buf;
+ 	struct sta_info *sta = NULL;
+ 	int ret, i;
+-	s8 max_tx_power = 0;
++	s8 max_tx_power = 0, tx_power_used = 0;
+ 	mtlk_sta_info_t sta_info;
+ 
+ 	wpa_printf(MSG_DEBUG, "request link measurement: dest addr: " MACSTR
+@@ -2145,6 +2145,7 @@ int hostapd_send_link_measurement_req(struct hostapd_data *hapd, const u8 *addr)
+ 			break;
+ 		}
+ 	}
++	tx_power_used = (s8)(sta_info.TxMgmtPwr / 100);
+ 
+ 	/* Link Measurement request (5)*/
+ 	buf = wpabuf_alloc(5);
+@@ -2159,7 +2160,7 @@ int hostapd_send_link_measurement_req(struct hostapd_data *hapd, const u8 *addr)
+ 	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
+ 	wpabuf_put_u8(buf, WLAN_RRM_LINK_MEASUREMENT_REQUEST);
+ 	wpabuf_put_u8(buf, hapd->link_measurement_token); /* Dialog Token */
+-	wpabuf_put_u8(buf, sta_info.TxMgmtPwr); /* tx power used */
++	wpabuf_put_u8(buf, tx_power_used); /* tx power used */
+ 	wpabuf_put_u8(buf, max_tx_power); /* tx max power */
+ 
+ 	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
+diff --git a/src/ap/rrm.h b/src/ap/rrm.h
+index d975105..056b868 100644
+--- a/src/ap/rrm.h
++++ b/src/ap/rrm.h
+@@ -40,7 +40,7 @@ int hostapd_send_beacon_report_resp(struct hostapd_data *hapd, const u8 *addr,
+ 		u8 frame_info, u8 rcpi, u8 rsni, const u8 *bssid, u8 antenna_id,
+ 		u32 parent_tsf, u8 *ch_width, u8 *ch_center_freq0, u8 *ch_center_freq1,
+ 		u8 *rep_frame_body, u8 *rep_frame_body_length);
+-void hostapd_handle_self_beacon_req(struct hostapd_data *hapd,
++int hostapd_handle_self_beacon_req(struct hostapd_data *hapd,
+ 		u16 random_interval, u16 measurement_duration, u8 mode);
+ int hostapd_send_channel_load_req(struct hostapd_data *hapd, const u8 *addr,
+ 		u16 num_of_repetitions, u8 measurement_request_mode, u8 oper_class,
+@@ -80,7 +80,7 @@ int hostapd_send_sta_statistics_report(struct hostapd_data *hapd, const u8 *addr
+ 		u16 measurement_duration, u8 group_identity,
+ 		const u32 *statistics_group_data, u8 statistics_group_data_len,
+ 		u8 *rep_reason);
+-void hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd);
++int hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd);
+ void hostapd_handle_sta_beacon_report_scan_results(struct hostapd_iface *iface);
+ void hostapd_clean_rrm(struct hostapd_data *hapd);
+ 
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index e646359..5627f26 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1246,7 +1246,6 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		int i, ret, len = 0;
+ #ifdef CONFIG_MBO
+ 		struct mbo_non_pref_chan_info *info;
+-		unsigned int count = 0;
+ #endif /* CONFIG_MBO */
+ 
+ 		/* 4 symbols per rate */
+@@ -1326,15 +1325,14 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		pos += ret;
+ 
+ #ifdef CONFIG_MBO
+-		ret = os_snprintf(pos, end - pos, "cell_capa=%d ", sta->cell_capa);
++		ret = os_snprintf(pos, end - pos, "cell_capa=%d", sta->cell_capa);
+ 		if (os_snprintf_error(end - pos, ret))
+ 			goto free_alloc;
+ 		pos += ret;
+ 
+ 		for (info = sta->non_pref_chan; info; info = info->next) {
+-			ret = os_snprintf(pos, end - pos, "non_pref_chan=%u:%u:%u:",
++			ret = os_snprintf(pos, end - pos, " non_pref_chan=%u:%u:%u:",
+ 							  info->op_class, info->pref, info->reason_code);
+-			count++;
+ 			if (os_snprintf_error(end - pos, ret))
+ 				break;
+ 			pos += ret;
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 5cb3d01..ef82c97 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -742,10 +742,10 @@ struct tlv {
+ };
+ 
+ struct beacon_body {
++	u8 length;
+ 	u64 timestamp;
+ 	le16 beacon_int;
+ 	le16 capab_info;
+-	u8 tlvs[];
+ };
+ 
+ /* HT Capabilities element */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index aa6147d..a7cada7 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1448,7 +1448,7 @@ struct mtlk_wssa_drv_tr181_peer_stats {
+ typedef struct mtlk_sta_info {
+   struct mtlk_wssa_drv_tr181_peer_stats peer_stats;
+   /* u8 stationInfo; */
+-  s8 TxMgmtPwr;
++  u32 TxMgmtPwr;
+ } __attribute__ ((packed)) mtlk_sta_info_t;
+ 
+ struct mtlk_wssa_drv_tr181_vap_stats {
+-- 
+2.10.1
+

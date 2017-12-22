@@ -1,0 +1,493 @@
+# HG changeset patch
+# Parent 07ce0b0b8a19f1d30cb87594b01bff6c998148eb
+
+diff --git a/drivers/net/Kconfig b/drivers/net/Kconfig
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -139,7 +139,6 @@ config MACVLAN
+ config MACVTAP
+ 	tristate "MAC-VLAN based tap driver"
+ 	depends on MACVLAN
+-	depends on INET
+ 	help
+ 	  This adds a specialized tap character device driver that is based
+ 	  on the MAC-VLAN network interface, called macvtap. A macvtap device
+@@ -329,7 +328,6 @@ config IMQ_NUM_DEVS
+ 
+ config TUN
+ 	tristate "Universal TUN/TAP device driver support"
+-	depends on INET
+ 	select CRC32
+ 	---help---
+ 	  TUN/TAP provides packet reception and transmission for user space
+@@ -475,6 +473,12 @@ config VMXNET3
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called vmxnet3.
+ 
++config WIDAN_NETFILTER
++	tristate "WIDAN NetFilter"
++	default y
++	help
++	  WIDAN NetFilter
++
+ source "drivers/net/hyperv/Kconfig"
+ source "drivers/net/lantiq_ptm/Kconfig"
+ 
+diff --git a/drivers/net/Makefile b/drivers/net/Makefile
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -76,3 +76,4 @@ obj-$(CONFIG_NTB_NETDEV) += ntb_netdev.o
+ obj-$(CONFIG_LTQ_PTM)	 += lantiq_ptm/
+ 
+ obj-$(CONFIG_LTQ_PPA) += lantiq_ppa/
++obj-$(CONFIG_WIDAN_NETFILTER) += widan_netf.o
+diff --git a/drivers/net/widan_netf.c b/drivers/net/widan_netf.c
+new file mode 100755
+--- /dev/null
++++ b/drivers/net/widan_netf.c
+@@ -0,0 +1,393 @@
++/*
++ * INTEL CONFIDENTIAL
++ * Copyright 2016 Intel Corporation All Rights Reserved.
++ *
++ * The source code contained or described herein and all documents related to
++ * the source code ("Material") are owned by Intel Corporation or its
++ * suppliers or licensors.  Title to the Material remains with Intel
++ * Corporation or its suppliers and licensors.  The Material contains trade
++ * secrets and proprietary and confidential information of Intel or its
++ * suppliers and licensors.  The Material is protected by worldwide copyright
++ * and trade secret laws and treaty provisions. No part of the Material may
++ * be used, copied, reproduced, modified, published, uploaded, posted,
++ * transmitted, distributed, or disclosed in any way without Intel's prior
++ * express written permission.
++ *
++ * No license under any patent, copyright, trade secret or other intellectual
++ * property right is granted to or conferred upon you by disclosure or
++ * delivery of the Materials,  either expressly, by implication, inducement,
++ * estoppel or otherwise.  Any license under such intellectual property
++ * rights must be express and approved by Intel in writing.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <net/ip.h>
++#include <linux/types.h>
++#include <linux/netfilter_ipv4.h>
++#include <net/ppa_api.h>
++#include <net/ppa_hook.h>
++#include <net/ppa_stack_al.h>
++#include <net/ppa_api_directpath.h>
++#include "widan_netf.h"
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Bao Nguyen");
++MODULE_DESCRIPTION("WIDAN Net Filter");
++static char *backhaul_if = "wlan2";
++module_param(backhaul_if, charp, 0000);
++
++// Registering ppa datapath
++PPA_REG backhaul;
++struct list_head ppa_skb_list;
++spinlock_t skb_list_lock;
++
++void skb_dump(struct sk_buff* skb)
++{
++    char tmp[80];
++    char *p;
++    char *t = tmp;
++    int i;
++    struct iphdr *iph;
++    struct ethhdr* eth;
++
++    iph = ip_hdr(skb);
++    eth = eth_hdr(skb);
++
++    printk(KERN_DEBUG "dump: skb=%x\n", skb);
++    if (eth != NULL) {
++        printk(KERN_DEBUG "dump: eth=%x\n", eth);
++    } else {
++        printk(KERN_DEBUG "dump: eth header is null!!!!\n");
++    }
++    if (iph != NULL) {
++        printk(KERN_DEBUG "dump: iph=%x iph->id=%d\n", iph, iph->id);
++    } else {
++        printk(KERN_DEBUG "dump: iph header is null!!!\n");
++    }
++    printk(KERN_DEBUG "dump: skb->len=%d\n", skb->len);
++    return;
++
++    printk(KERN_DEBUG "dump: skb->data:\n");
++    p = skb->data;
++    for (i = 0; i < skb->len; i++) {
++        t += sprintf(t, "%02x ", *p++ & 0xff);
++        if ((i & 0x0f) == 8) {
++            printk(KERN_DEBUG "dump: %s\n", tmp);
++            t = tmp;
++        }
++    }
++
++    if (i & 0x07)
++      printk(KERN_DEBUG "dump: %s\n", tmp);
++}
++
++
++void print_skb(struct sk_buff* skb)
++{
++    struct sk_buff *skb_temp = skb;
++    __be32 sip,dip;
++    struct iphdr *iph;
++    struct ethhdr* eth;
++
++    printk(KERN_DEBUG "INETF_PPA: skb=%x info skb->len=%d (begin) --->\n", skb, skb->len);
++    printk(KERN_DEBUG "INETF_PPA: skb->protocol=%x\n", skb->protocol);
++
++    while (skb_temp != NULL) {
++        if (skb_temp->dev == NULL) {
++            printk(KERN_ERR "INETF_PPA: skb->dev == null\n");
++        } else {
++            printk(KERN_DEBUG "INETF_PPA: skb->dev = %s\n", skb_temp->dev->name);
++        }
++        skb_temp = skb_temp->next;
++    }
++
++    iph = ip_hdr(skb);
++    sip = iph->saddr;
++    dip = iph->daddr;
++
++    printk(KERN_DEBUG "INETF_PPA: iph->id=%d\n", iph->id);
++
++    if (iph->protocol == IPPROTO_UDP) {
++       printk(KERN_DEBUG "INETF_PPA: UDP protocol packet\n");
++    } else if (iph->protocol == IPPROTO_TCP) {
++       printk(KERN_DEBUG "INETF_PPA: TCP protocol packet\n");
++    } else if (iph->protocol == IPPROTO_ICMP) {
++       printk(KERN_DEBUG "INETF_PPA: ICMP/Ping protocol packet\n");
++    } else {
++       printk(KERN_DEBUG "INETF_PPA: Packet protocol = %d\n", iph->protocol);
++    }
++    printk(KERN_DEBUG "INETF_PPA: Source address: %d.%d.%d.%d\n", NIPQUAD(sip));
++    printk(KERN_DEBUG "INETF_PPA: Destination address: %d.%d.%d.%d\n", NIPQUAD(dip));
++
++    eth = eth_hdr(skb);
++    if (eth == NULL) {
++        printk(KERN_ERR "INETF_PPA: MAC is null\n");
++        return;
++    }
++
++    if (eth->h_source != NULL) {
++        printk(KERN_DEBUG "INETF_PPA: Source MAC = " MAC_FMT " \n", MAC_ARG(eth->h_source));
++    } else {
++        printk(KERN_DEBUG "INETF_PPA: Source MAC is NULL\n" );
++    }
++
++    if (eth->h_dest != NULL) {
++        printk(KERN_DEBUG "INETF_PPA: Destination MAC = " MAC_FMT "\n", MAC_ARG(eth->h_dest));
++    } else {
++        printk(KERN_DEBUG "INETF_PPA: Destination MAC is NULL\n" );
++    }
++
++    printk(KERN_DEBUG "INETF_PPA: skb info (end) <---\n\n");
++
++    return;
++}
++
++
++static int32_t inetf_ppa_fp_stop_tx(struct net_device *netif)
++{
++    printk(KERN_DEBUG "INETF_PPA: inetf_ppa_fp_stop_tx()\n");
++    return 0;
++}
++
++
++static int32_t inetf_ppa_fp_restart_tx(struct net_device *netif)
++{
++    printk(KERN_DEBUG "INETF_PPA: inetf_ppa_fp_restart_tx()\n");
++    return 0;
++}
++
++
++static int32_t inetf_ppa_fp_rx(struct net_device *rxif,
++                               struct net_device *txif,
++                               struct sk_buff *skb,
++                               int32_t len)
++{
++    if (txif) {
++        skb->dev = txif;
++        dev_queue_xmit(skb);
++        return 0;
++    } else if (rxif) {
++        if (netif_running(rxif)) {
++            PPA_SKB_PARAMS *entry;
++
++            // Add to the list to check when this packet is looping back
++            entry = kmalloc(sizeof(PPA_SKB_PARAMS), GFP_ATOMIC);
++            if (entry != NULL) {
++               entry->ret_skb = skb;
++               spin_lock_bh(&skb_list_lock);
++               list_add_tail(&entry->list, &ppa_skb_list);
++               spin_unlock_bh(&skb_list_lock);
++            } else {
++               printk(KERN_ERR "INETF_PPA: unable to add entry\n");
++               goto exit;
++            }
++
++            // Update net device & protocol
++            skb->dev = rxif;
++            skb->protocol = eth_type_trans(skb, rxif);
++            if (netif_rx(skb) == NET_RX_DROP) {
++                printk(KERN_ERR "INETF_PPA: netif_rx() NET_RX_DROP\n");
++            }
++            return 0;
++        }
++    }
++
++exit:
++    dev_kfree_skb_any(skb);
++    return 0;
++}
++
++
++static void register_ppa_dp_cb(PPA_NETIF *net)
++{
++    uint32_t status;
++    uint32_t ppa_dp_if;
++
++    if (ppa_hook_directpath_register_dev_fn == NULL) {
++        printk(KERN_ERR "INETF_PPA: ppa_hook_directpath_register_dev_fn is NULL\n" );
++        return;
++    }
++
++    // Perform registration
++    if (!backhaul.ppa_dp_registered) {
++        ppa_dp_if = -1;
++        status = ppa_hook_directpath_register_dev_fn(&ppa_dp_if,
++                                                     net,
++                                                     &backhaul.callback,
++                                                     PPA_F_DIRECTPATH_REGISTER | PPA_F_DIRECTPATH_ETH_IF | PPE_DIRECTPATH_LEGACY);     
++        if (status == PPA_SUCCESS) {
++            backhaul.ppa_dp_registered = true;
++            backhaul.net_dev = net;
++            backhaul.reg_ppa_if = ppa_dp_if;
++        } else {
++            printk(KERN_ERR "INETF_PPA: Failed PPA registration\n");
++        }
++    }
++
++    return;
++}
++
++static void unregister_ppa_dp(void)
++{
++    uint32_t status;
++
++    if (ppa_hook_directpath_register_dev_fn == NULL) {
++        printk(KERN_ERR "INETF_PPA: ppa_hook_directpath_ex_register_dev_fn is NULL\n" );
++        return;
++    }
++
++    // Un-registration
++    if (backhaul.ppa_dp_registered) {
++        status = ppa_hook_directpath_register_dev_fn(&backhaul.reg_ppa_if,
++                                                     backhaul.net_dev,
++                                                     &backhaul.callback,
++                                                     0);
++        if (status != PPA_SUCCESS) {
++            printk(KERN_ERR "INETF_PPA: Failed PPA un-registration\n");
++        }
++    }
++
++    return;
++}
++
++
++static bool inetf_rx_from_backhaul(const struct net_device *in)
++{
++    if (strcmp(in->name, backhaul_if) == 0) {
++        return true;
++    }
++
++    return false;
++}
++
++
++static unsigned int inetf_ip_ppa(struct sk_buff *skb,
++                                 const struct net_device *in,
++                                 const struct net_device *out)
++{
++    PPA_SKB_PARAMS *entry;
++    struct ethhdr* neth_hdr;
++
++    // NOTE: out can be NULL for some fitering option. Don't check it.
++    if ((skb == NULL) || (in == NULL)) {
++        printk(KERN_ERR "INETF_PPA: NULL parameters. Drop packet\n");
++        return NF_DROP;
++    }
++
++    // Check for loop-back skb
++    spin_lock_bh(&skb_list_lock);
++    if (!list_empty(&ppa_skb_list)) {
++        list_for_each_entry(entry, &ppa_skb_list, list) {
++            if (entry->ret_skb == skb) {
++                list_del(&entry->list);
++                kfree(entry);
++                // Ethernet header is added back in loop-back. Remove it.
++                if (inetf_rx_from_backhaul(in)) {
++                    skb_reset_mac_header(skb);
++                }
++                spin_unlock_bh(&skb_list_lock);
++                return NF_ACCEPT;
++            }
++        }
++    }
++    spin_unlock_bh(&skb_list_lock);
++
++    if (inetf_rx_from_backhaul(in)) {
++        // Register PPA datapath Rx
++        if (!backhaul.ppa_dp_registered) {
++            register_ppa_dp_cb(in);
++        }
++
++        if ((backhaul.ppa_dp_registered) && (backhaul.reg_ppa_if >= 0)) {
++            if (ppa_hook_directpath_send_fn == NULL) {
++                // Datapath is not available. Drop it.
++                printk(KERN_ERR "INETF_PPA: Litepath is not available. Drop this packet\n");
++                return NF_DROP;
++            } else {
++                // Add back Ethernet header
++                skb_push(skb, ETH_HLEN);
++
++                // send to PPA Litepath
++                ppa_hook_directpath_send_fn(backhaul.reg_ppa_if, skb, skb->len, 0);
++                // PPA Litepath took the packet. It will also free the memory if failed.
++                // Therefore, the packet will be stolen by PPA.
++                return NF_STOLEN;
++            }
++        }
++    }
++
++    return NF_ACCEPT;
++}
++
++// TODO: Add IPV6 support
++static unsigned int inetf_ipv4_ppa(unsigned int hooknum,
++                                   struct sk_buff *skb,
++                                   const struct net_device *in,
++                                   const struct net_device *out,
++                                   int (*okfn)(struct sk_buff *))
++{
++    return inetf_ip_ppa(skb, in, out);
++}
++
++
++
++// TODO: Add IPV6 hook
++static struct nf_hook_ops inetf_ipv4_hook = {
++    .hook     = inetf_ipv4_ppa,
++    .owner    = THIS_MODULE,
++    .pf       = PF_INET,
++    .hooknum  = NF_INET_PRE_ROUTING,
++    .priority = NF_IP_PRI_FIRST,
++};
++
++
++static int __init inetf_ppa_init(void)
++{
++    int error = 0;
++
++    INIT_LIST_HEAD(&ppa_skb_list);
++    spin_lock_init(&skb_list_lock);
++
++    // Initialize PPA registration
++    backhaul.ppa_dp_registered    = false;
++    backhaul.reg_ppa_if           = -1;
++    backhaul.callback.stop_tx_fn  = inetf_ppa_fp_stop_tx;
++    backhaul.callback.start_tx_fn = inetf_ppa_fp_restart_tx;
++    backhaul.callback.rx_fn       = inetf_ppa_fp_rx;
++
++    // Register our hooks to IP network stack
++    error = nf_register_hook(&inetf_ipv4_hook);
++    if (error) {
++        printk(KERN_ERR "INETF_PPA: nf_register_hooks() failed error=%d\n", error);
++        return error;
++    }
++
++    return error;
++}
++module_init(inetf_ppa_init);
++
++
++static void __exit inetf_ppa_exit(void)
++{
++    uint32_t status;
++    PPA_SKB_PARAMS *entry;
++
++    // Clean-up the list
++    if (!list_empty(&ppa_skb_list)) {
++        list_for_each_entry(entry, &ppa_skb_list, list) {
++           list_del(&entry->list);
++           kfree(entry);
++        }
++    }
++
++    unregister_ppa_dp();
++    nf_unregister_hook(&inetf_ipv4_hook);
++
++    return;
++}
++module_exit(inetf_ppa_exit);
+diff --git a/drivers/net/widan_netf.h b/drivers/net/widan_netf.h
+new file mode 100755
+--- /dev/null
++++ b/drivers/net/widan_netf.h
+@@ -0,0 +1,47 @@
++/*
++ * INTEL CONFIDENTIAL
++ * Copyright 2016 Intel Corporation All Rights Reserved.
++ *
++ * The source code contained or described herein and all documents related to
++ * the source code ("Material") are owned by Intel Corporation or its
++ * suppliers or licensors.  Title to the Material remains with Intel
++ * Corporation or its suppliers and licensors.  The Material contains trade
++ * secrets and proprietary and confidential information of Intel or its
++ * suppliers and licensors.  The Material is protected by worldwide copyright
++ * and trade secret laws and treaty provisions. No part of the Material may
++ * be used, copied, reproduced, modified, published, uploaded, posted,
++ * transmitted, distributed, or disclosed in any way without Intel's prior
++ * express written permission.
++ *
++ * No license under any patent, copyright, trade secret or other intellectual
++ * property right is granted to or conferred upon you by disclosure or
++ * delivery of the Materials,  either expressly, by implication, inducement,
++ * estoppel or otherwise.  Any license under such intellectual property
++ * rights must be express and approved by Intel in writing.
++ */
++
++#ifndef __WIDAN_NETFILTER___
++#define __WIDAN_NETFILTER__
++
++#define NIPQUAD(addr) \
++               ((unsigned char *)&addr)[0], \
++  ((unsigned char *)&addr)[1], \
++  ((unsigned char *)&addr)[2], \
++  ((unsigned char *)&addr)[3]
++
++#define MAC_FMT "%02x:%02x:%02x:%02x:%02x:%02x"
++#define MAC_ARG(x) ((u8*)(x))[0],((u8*)(x))[1],((u8*)(x))[2],((u8*)(x))[3],((u8*)(x))[4],((u8*)(x))[5]
++
++typedef struct {
++    struct list_head list;
++    struct sk_buff *ret_skb;
++} PPA_SKB_PARAMS;
++
++
++typedef struct {
++    bool      ppa_dp_registered;
++    PPA_NETIF *net_dev;
++    int       reg_ppa_if;
++    PPA_DIRECTPATH_CB callback;
++} PPA_REG;
++#endif

@@ -1,0 +1,466 @@
+From 2bda0a335ebdc8336812fe6493fc9ead88bea3f1 Mon Sep 17 00:00:00 2001
+From: chandrap <prakash1.chandra@intel.com>
+Date: Tue, 8 Sep 2015 15:09:28 -0700
+Subject: [PATCH 155/441] added changes for skb_clone function, pp_packet_info
+ need to be allocated and free for each copy/clone
+
+---
+ include/linux/skbuff.h |  30 +--------
+ net/core/dev.c         |  53 +++++++++-------
+ net/core/skbuff.c      | 163 +++++++++++++++++++++----------------------------
+ 3 files changed, 104 insertions(+), 142 deletions(-)
+ mode change 100644 => 100755 include/linux/skbuff.h
+ mode change 100644 => 100755 net/core/dev.c
+ mode change 100644 => 100755 net/core/skbuff.c
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -581,36 +581,12 @@ struct sk_buff {
+     __u16           mac_header;
+ 
+ #ifdef CONFIG_TI_META_DATA
+-    unsigned int    ti_meta_info;
+-    unsigned int    ti_meta_info2;
++    __u32   ti_meta_info;
++    __u32   ti_meta_info2;
+ #endif /* CONFIG_TI_META_DATA */
+ 
+-#ifdef CONFIG_INTEL_NF_GWMETA_SUPPORT
+-    __u32    ti_gw_meta;
+-#endif /* INTEL_NF_GWMETA_SUPPORT */
+-
+-#ifdef CONFIG_TI_DOCSIS_INPUT_DEV
+-    struct net_device   *ti_docsis_input_dev;
+-#endif /* CONFIG_TI_DOCSIS_INPUT_DEV */
+-
+-#ifdef CONFIG_INTEL_DOCSIS_ICMP_IIF
+-    int         docsis_icmp_iif;
+-#endif /* CONFIG_INTEL_DOCSIS_ICMP_IIF */
+-
+-#ifdef CONFIG_TI_L2_SELECTIVE_FORWARDER
+-    unsigned long long   ti_selective_fwd_dev_info;
+-#endif /* CONFIG_TI_L2_SELECTIVE_FORWARDER */
+-
+ #ifdef CONFIG_TI_PACKET_PROCESSOR
+-    #if PUMA7_OR_NEWER_SOC_TYPE
+     PP_PACKET_INFO_t    *pp_packet_info;
+-    #else
+-    PP_PACKET_INFO_t    pp_packet_info;
+-    #endif
+-    /* Need this field to save the vpid vlan_tci before it will erased
+-     * We will use it in the ingress hook to reproduce 
+-     * the vlan_tci of the real internal vpid's Vlan. */
+-    __u16               vpid_vlan_tci;
+ #endif  /* CONFIG_TI_PACKET_PROCESSOR */
+ 
+     /* These elements must be at the end, see alloc_skb() for details.  */
+@@ -735,7 +711,7 @@ extern void kfree_skb_partial(struct sk_
+ extern bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
+ 			     bool *fragstolen, int *delta_truesize);
+ 
+-#ifdef CONFIG_TI_PACKET_PROCESSOR
++#if CONFIG_TI_PACKET_PROCESSOR &&  PUMA7_OR_NEWER_SOC_TYPE 
+ extern void* __alloc_skb_pp_packet_info(void);
+ extern void kfree_pp_packet_info(void *pp_info);
+ #endif
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3935,29 +3935,36 @@ normal:
+ 
+ static gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
+ {
+-	switch (ret) {
+-	case GRO_NORMAL:
+-		if (netif_receive_skb(skb))
+-			ret = GRO_DROP;
+-		break;
+-
+-	case GRO_DROP:
+-		kfree_skb(skb);
+-		break;
+-
+-	case GRO_MERGED_FREE:
+-		if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
+-			kmem_cache_free(skbuff_head_cache, skb);
+-		else
+-			__kfree_skb(skb);
+-		break;
+-
+-	case GRO_HELD:
+-	case GRO_MERGED:
+-		break;
+-	}
++    switch (ret) {
++        case GRO_NORMAL:
++            if (netif_receive_skb(skb))
++                ret = GRO_DROP;
++            break;
++
++        case GRO_DROP:
++            kfree_skb(skb);
++            break;
++
++        case GRO_MERGED_FREE:
++            if (NAPI_GRO_CB(skb)->free == NAPI_GRO_FREE_STOLEN_HEAD)
++            {
++#if PUMA7_OR_NEWER_SOC_TYPE && CONFIG_TI_PACKET_PROCESSOR
++                kfree_pp_packet_info( (skb)->pp_packet_info );
++#endif
++                kmem_cache_free(skbuff_head_cache, skb);
++            }
++            else
++            {
++                __kfree_skb(skb);
++            }
++            break;
++
++        case GRO_HELD:
++        case GRO_MERGED:
++            break;
++    }
+ 
+-	return ret;
++    return ret;
+ }
+ 
+ static void skb_gro_reset_offset(struct sk_buff *skb)
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -86,22 +86,13 @@
+ #include <trace/events/skb.h>
+ #include <linux/highmem.h>
+ 
+-#ifdef CONFIG_TI_DOCSIS_INPUT_DEV
+-#define DBRIDGE_IFINDEX_CHK(__ifindex, format, args...) \
+-{ \
+-    if (((__ifindex) < 0) || ((__ifindex) >= TI_MAX_DEVICE_INDEX)) \
+-    { \
+-        printk("\n===>>> %s - %d: Currupt " #__ifindex " - %d\n" format, __func__, __LINE__, __ifindex, ##args); \
+-        BUG(); \
+-    } \
+-}
+-#endif
+ 
++int skb_init_intel(struct sk_buff *skb);
+ struct kmem_cache *skbuff_head_cache __read_mostly;
+ static struct kmem_cache *skbuff_fclone_cache __read_mostly;
+ int sysctl_max_skb_frags __read_mostly = MAX_SKB_FRAGS;
+ EXPORT_SYMBOL(sysctl_max_skb_frags);
+-#if PUMA7_OR_NEWER_SOC_TYPE
++#if PUMA7_OR_NEWER_SOC_TYPE && CONFIG_TI_PACKET_PROCESSOR
+ struct kmem_cache *skbuff_pp_info_cache __read_mostly;
+ #endif
+ 
+@@ -196,6 +187,11 @@ struct sk_buff *__alloc_skb_head(gfp_t g
+ 	 * the tail pointer in struct sk_buff!
+ 	 */
+ 	memset(skb, 0, offsetof(struct sk_buff, tail));
++    if(skb_init_intel(skb))
++    {
++        kmem_cache_free(skbuff_head_cache, skb);
++        return NULL;
++    }
+ 	skb->head = NULL;
+ 	skb->truesize = sizeof(struct sk_buff);
+ 	atomic_set(&skb->users, 1);
+@@ -209,13 +205,14 @@ out:
+ #if PUMA7_OR_NEWER_SOC_TYPE
+ void __init intel_cache_init(void)
+ {
++#ifdef CONFIG_TI_PACKET_PROCESSOR
+     skbuff_pp_info_cache = kmem_cache_create("skbuff_pp_info_cache",
+                                              sizeof(PP_PACKET_INFO_t),
+                                              0,
+                                              SLAB_HWCACHE_ALIGN | SLAB_PANIC,
+                                              NULL);
+-}
+ #endif
++}
+ 
+ #ifdef CONFIG_TI_PACKET_PROCESSOR
+ void* __alloc_skb_pp_packet_info(void)
+@@ -238,7 +235,7 @@ void kfree_pp_packet_info(void *pp_info)
+ }
+ EXPORT_SYMBOL(kfree_pp_packet_info);
+ #endif /* CONFIG_TI_PACKET_PROCESSOR */
+-
++#endif
+ /**
+  *  skb_init_intel  -   initialize TI/Intel extensions of sk_buff
+  *  @skb: pointer sk_buff structure
+@@ -248,37 +245,18 @@ EXPORT_SYMBOL(kfree_pp_packet_info);
+  */
+ int skb_init_intel(struct sk_buff *skb)
+ {
+-#if PUMA7_OR_NEWER_SOC_TYPE
++#if PUMA7_OR_NEWER_SOC_TYPE && CONFIG_TI_PACKET_PROCESSOR
+     skb->pp_packet_info = __alloc_skb_pp_packet_info();
+     if (!skb->pp_packet_info)
+     {
+         return -1;
+     }
+ #endif
+-
+ #ifdef CONFIG_TI_META_DATA
+     skb->ti_meta_info = 0;
+     skb->ti_meta_info2= 0;
+ #endif /* CONFIG_TI_META_DATA */
+ 
+-#ifdef CONFIG_INTEL_NF_GWMETA_SUPPORT
+-    skb->ti_gw_meta= 0;
+-#endif /* INTEL_NF_GWMETA_SUPPORT */
+-
+-#ifdef CONFIG_TI_DOCSIS_INPUT_DEV
+-    skb->ti_docsis_input_dev = NULL;
+-#endif /* CONFIG_TI_DOCSIS_INPUT_DEV */
+-
+-#ifdef CONFIG_INTEL_DOCSIS_ICMP_IIF
+-    skb->docsis_icmp_iif = 0;
+-#endif /* CONFIG_INTEL_DOCSIS_ICMP_IIF */
+-
+-
+-#ifdef CONFIG_TI_L2_SELECTIVE_FORWARDER
+-    skb->ti_selective_fwd_dev_info = 0;
+-#endif /* CONFIG_TI_L2_SELECTIVE_FORWARDER */
+-
+-
+ #ifdef CONFIG_TI_PACKET_PROCESSOR
+     memset((void *)SKB_GET_PP_INFO_P(skb), 0, sizeof(*SKB_GET_PP_INFO_P(skb)));
+     SKB_GET_PP_INFO_P(skb)->egress_queue = TI_PPM_EGRESS_QUEUE_INVALID;
+@@ -299,7 +277,6 @@ int skb_init_intel(struct sk_buff *skb)
+     SKB_GET_PP_INFO_P(skb)->ti_match_qos_classifier = NULL;
+     SKB_GET_PP_INFO_P(skb)->ti_match_dsg_filter = NULL;
+ #endif  /* CONFIG_TI_PACKET_PROCESSOR_STATS */
+-
+     return 0;
+ }
+ 
+@@ -324,26 +301,28 @@ int skb_init_intel(struct sk_buff *skb)
+ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
+ 			    int flags, int node)
+ {
+-	struct kmem_cache *cache;
+-	struct skb_shared_info *shinfo;
+-	struct sk_buff *skb;
+-	u8 *data;
+-	bool pfmemalloc;
++    struct kmem_cache *cache;
++    struct skb_shared_info *shinfo;
++    struct sk_buff *skb;
++    u8 *data;
++    bool pfmemalloc;
+ 
+-	cache = (flags & SKB_ALLOC_FCLONE)
+-		? skbuff_fclone_cache : skbuff_head_cache;
++    cache = (flags & SKB_ALLOC_FCLONE)
++        ? skbuff_fclone_cache : skbuff_head_cache;
+ 
+-	if (sk_memalloc_socks() && (flags & SKB_ALLOC_RX))
+-		gfp_mask |= __GFP_MEMALLOC;
++    if (sk_memalloc_socks() && (flags & SKB_ALLOC_RX))
++        gfp_mask |= __GFP_MEMALLOC;
+ 
+-	/* Get the HEAD */
+-	skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);
+-	if (!skb)
+-		goto out;
+-	prefetchw(skb);
++    /* Get the HEAD */
++    skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);
++    if (!skb)
++        goto out;
++    prefetchw(skb);
++
++    
+ 
+-	/* We do our best to align skb_shared_info on a separate cache
+-	 * line. It usually works because kmalloc(X > SMP_CACHE_BYTES) gives
++    /* We do our best to align skb_shared_info on a separate cache
++     * line. It usually works because kmalloc(X > SMP_CACHE_BYTES) gives
+ 	 * aligned memory blocks, unless SLUB/SLAB debug is enabled.
+ 	 * Both skb->head and skb_shared_info are cache line aligned.
+ 	 */
+@@ -381,12 +360,10 @@ struct sk_buff *__alloc_skb(unsigned int
+     memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+     atomic_set(&shinfo->dataref, 1);
+     kmemcheck_annotate_variable(shinfo->destructor_arg);
+-
+     if(skb_init_intel(skb))
+     {
+         goto no_ppinfo;
+     }
+-
+ 	if (flags & SKB_ALLOC_FCLONE) {
+ 		struct sk_buff *child = skb + 1;
+ 		atomic_t *fclone_ref = (atomic_t *) (child + 1);
+@@ -396,6 +373,10 @@ struct sk_buff *__alloc_skb(unsigned int
+ 		skb->fclone = SKB_FCLONE_ORIG;
+ 		atomic_set(fclone_ref, 1);
+ 
++        if(skb_init_intel(child))
++        {
++            goto no_ppinfo;
++        }
+ 		child->fclone = SKB_FCLONE_UNAVAILABLE;
+ 		child->pfmemalloc = pfmemalloc;
+ 	}
+@@ -456,7 +437,6 @@ struct sk_buff *__build_skb(void *data,
+ 	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+ 	atomic_set(&shinfo->dataref, 1);
+ 	kmemcheck_annotate_variable(shinfo->destructor_arg);
+-
+     if(skb_init_intel(skb))
+     {
+         kmem_cache_free(skbuff_head_cache, skb);
+@@ -690,15 +670,27 @@ static void kfree_skbmem(struct sk_buff
+ 	struct sk_buff *other;
+ 	atomic_t *fclone_ref;
+ 
+-	switch (skb->fclone) {
++    switch (skb->fclone) 
++    {
+ 	case SKB_FCLONE_UNAVAILABLE:
++        {
++        #if PUMA7_OR_NEWER_SOC_TYPE && CONFIG_TI_PACKET_PROCESSOR
++            kfree_pp_packet_info( skb->pp_packet_info );
++        #endif
+ 		kmem_cache_free(skbuff_head_cache, skb);
++        }
+ 		break;
+ 
+ 	case SKB_FCLONE_ORIG:
+ 		fclone_ref = (atomic_t *) (skb + 2);
+ 		if (atomic_dec_and_test(fclone_ref))
++        {
++        #if PUMA7_OR_NEWER_SOC_TYPE && CONFIG_TI_PACKET_PROCESSOR
++            kfree_pp_packet_info( (skb  )->pp_packet_info );
++            kfree_pp_packet_info( (skb+1)->pp_packet_info );
++        #endif
+ 			kmem_cache_free(skbuff_fclone_cache, skb);
++        }
+ 		break;
+ 
+ 	case SKB_FCLONE_CLONE:
+@@ -711,7 +703,13 @@ static void kfree_skbmem(struct sk_buff
+ 		skb->fclone = SKB_FCLONE_UNAVAILABLE;
+ 
+ 		if (atomic_dec_and_test(fclone_ref))
++        {
++        #if PUMA7_OR_NEWER_SOC_TYPE && CONFIG_TI_PACKET_PROCESSOR
++            kfree_pp_packet_info( (skb  )->pp_packet_info );
++            kfree_pp_packet_info( (skb-1)->pp_packet_info );
++        #endif
+ 			kmem_cache_free(skbuff_fclone_cache, other);
++        }
+ 		break;
+ 	}
+ }
+@@ -760,9 +758,6 @@ static void skb_release_all(struct sk_bu
+ 
+ void __kfree_skb(struct sk_buff *skb)
+ {
+-#if PUMA7_OR_NEWER_SOC_TYPE & CONFIG_TI_PACKET_PROCESSOR
+-    kfree_pp_packet_info(skb->pp_packet_info);
+-#endif
+ 	skb_release_all(skb);
+ 	kfree_skbmem(skb);
+ }
+@@ -923,26 +918,12 @@ static struct sk_buff *__skb_clone(struc
+ 
+ 	atomic_inc(&(skb_shinfo(skb)->dataref));
+ 	skb->cloned = 1;
+-
+ #ifdef CONFIG_TI_META_DATA
+     C(ti_meta_info);
+     C(ti_meta_info2);
+ #endif /* CONFIG_TI_META_DATA */
+-#ifdef CONFIG_TI_DOCSIS_INPUT_DEV
+-    C(ti_docsis_input_dev);
+-    if (n->ti_docsis_input_dev)
+-    {
+-        DBRIDGE_IFINDEX_CHK(n->ti_docsis_input_dev->ifindex, "dev %p, devname %s, ti_docsis_input_dev %p, ti_docsis_input_dev->name %s", n->dev, n->dev ? n->dev->name : NULL, n->ti_docsis_input_dev, n->ti_docsis_input_dev->name);
+-    }
+-#endif /* CONFIG_TI_DOCSIS_INPUT_DEV */
+-#ifdef CONFIG_INTEL_DOCSIS_ICMP_IIF
+-    C(docsis_icmp_iif);
+-#endif /* CONFIG_INTEL_DOCSIS_ICMP_IIF */
+-#ifdef CONFIG_TI_L2_SELECTIVE_FORWARDER
+-    C(ti_selective_fwd_dev_info);
+-#endif /* CONFIG_TI_L2_SELECTIVE_FORWARDER */
+ #ifdef CONFIG_TI_PACKET_PROCESSOR
+-    memcpy((void *)SKB_GET_PP_INFO_P(n), (void *)SKB_GET_PP_INFO_P(skb), sizeof(*SKB_GET_PP_INFO_P(skb)));
++memcpy((void *)SKB_GET_PP_INFO_P(n), (void *)SKB_GET_PP_INFO_P(skb), sizeof(*SKB_GET_PP_INFO_P(skb)));
+ #ifdef PPP_DEBUG
+     SKB_GET_PP_INFO_P(n)->ppp_packet_info.num_clones++;
+ #ifdef CONFIG_FTRACE
+@@ -1056,11 +1037,14 @@ struct sk_buff *skb_clone(struct sk_buff
+ 
+ 	n = skb + 1;
+ 	if (skb->fclone == SKB_FCLONE_ORIG &&
+-	    n->fclone == SKB_FCLONE_UNAVAILABLE) {
++        n->fclone == SKB_FCLONE_UNAVAILABLE) 
++    {
+ 		atomic_t *fclone_ref = (atomic_t *) (n + 1);
+ 		n->fclone = SKB_FCLONE_CLONE;
+ 		atomic_inc(fclone_ref);
+-	} else {
++    } 
++    else
++    {
+ 		if (skb_pfmemalloc(skb))
+ 			gfp_mask |= __GFP_MEMALLOC;
+ 
+@@ -1068,6 +1052,11 @@ struct sk_buff *skb_clone(struct sk_buff
+ 		if (!n)
+ 			return NULL;
+ 
++        if(skb_init_intel(n))
++        {
++            kmem_cache_free(skbuff_head_cache, n);
++            return NULL;
++        }
+ 		kmemcheck_annotate_bitfield(n, flags1);
+ 		kmemcheck_annotate_bitfield(n, flags2);
+ 		n->fclone = SKB_FCLONE_UNAVAILABLE;
+@@ -1100,22 +1089,6 @@ static void copy_skb_header(struct sk_bu
+     new->ti_meta_info = old->ti_meta_info;
+     new->ti_meta_info2 = old->ti_meta_info2;
+ #endif /* CONFIG_TI_META_DATA */
+-#ifdef CONFIG_INTEL_NF_GWMETA_SUPPORT
+-    new->ti_gw_meta = old->ti_gw_meta;
+-#endif /* INTEL_NF_GWMETA_SUPPORT */
+-#ifdef CONFIG_TI_DOCSIS_INPUT_DEV
+-    new->ti_docsis_input_dev = old->ti_docsis_input_dev ;
+-    if (new->ti_docsis_input_dev)
+-    {
+-        DBRIDGE_IFINDEX_CHK(new->ti_docsis_input_dev->ifindex, "dev %p, devname %s, ti_docsis_input_dev %p, ti_docsis_input_dev->name %s", new->dev, new->dev ? new->dev->name : NULL, new->ti_docsis_input_dev, new->ti_docsis_input_dev->name);
+-    }
+-#endif /* CONFIG_TI_DOCSIS_INPUT_DEV */
+-#ifdef CONFIG_INTEL_DOCSIS_ICMP_IIF
+-    new->docsis_icmp_iif = old->docsis_icmp_iif;
+-#endif /* CONFIG_INTEL_DOCSIS_ICMP_IIF */
+-#ifdef CONFIG_TI_L2_SELECTIVE_FORWARDER
+-    new->ti_selective_fwd_dev_info = old->ti_selective_fwd_dev_info;
+-#endif /* CONFIG_TI_L2_SELECTIVE_FORWARDER */
+ #ifdef CONFIG_TI_PACKET_PROCESSOR
+     memcpy((void *)SKB_GET_PP_INFO_P(new), (void *)SKB_GET_PP_INFO_P(old), sizeof(*SKB_GET_PP_INFO_P(old)));
+ #ifdef PPP_DEBUG
+@@ -3649,10 +3622,16 @@ EXPORT_SYMBOL(__skb_warn_lro_forwarding)
+ 
+ void kfree_skb_partial(struct sk_buff *skb, bool head_stolen)
+ {
+-	if (head_stolen) {
++    if (head_stolen) 
++    {
+ 		skb_release_head_state(skb);
++        #if PUMA7_OR_NEWER_SOC_TYPE && CONFIG_TI_PACKET_PROCESSOR
++            kfree_pp_packet_info( (skb)->pp_packet_info );
++        #endif
+ 		kmem_cache_free(skbuff_head_cache, skb);
+-	} else {
++    }
++    else
++    {
+ 		__kfree_skb(skb);
+ 	}
+ }

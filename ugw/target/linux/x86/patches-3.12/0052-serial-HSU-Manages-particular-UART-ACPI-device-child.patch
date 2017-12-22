@@ -1,0 +1,183 @@
+From 9bc1e2777934c7c85b60117d857df235355adb1d Mon Sep 17 00:00:00 2001
+From: Nicolas SUET <nicolas.suet@intel.com>
+Date: Mon, 9 Mar 2015 16:58:37 +0100
+Subject: [PATCH 052/441] serial: HSU: Manages particular UART ACPI device
+ childs
+
+Manages only one UART default configuration per platform.
+i.e. do not manage one configuration per UART port.
+The port configurations are now dynamically allocated.
+
+As of today, only GPS devices need particular settings as they
+wake up the host through UART inband signals.
+
+Change-Id: Ib9eab309189b88691ece4196c2251463d1073b92
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-26377
+Signed-off-by: Nicolas SUET <nicolas.suet@intel.com>
+Reviewed-on: https://android.intel.com:443/340203
+(cherry picked from commit ee08b42fd912dbaf7cfdd38e0776d8a887eeee5f)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/tty/serial/hsu/hsu_plat.c | 82 ++++++++++++++++++++++++++++++---------
+ 1 file changed, 64 insertions(+), 18 deletions(-)
+
+--- a/drivers/tty/serial/hsu/hsu_plat.c
++++ b/drivers/tty/serial/hsu/hsu_plat.c
+@@ -28,8 +28,7 @@
+ #define CHT_GENERAL_DIS_RTS_N_OVERRIDE (1 << 3)
+ 
+ enum {
+-	hsu_chv_0,
+-	hsu_chv_1,
++	hsu_chv,
+ };
+ 
+ static irqreturn_t wakeup_irq(int irq, void *data)
+@@ -219,21 +218,11 @@ unsigned int cht_hsu_get_uartclk(struct
+ }
+ 
+ static struct hsu_port_cfg hsu_port_cfgs[] = {
+-	[hsu_chv_0] = {
++	[hsu_chv] = {
+ 		.hw_ip = hsu_dw,
+ 		.idle = 20,
+-		.hw_suspend = cht_hsu_hw_suspend,
+-		.hw_resume = cht_hsu_hw_resume,
+-		.hw_reset = cht_hsu_reset,
+-		.get_uartclk = cht_hsu_get_uartclk,
+-		.set_clk = cht_hsu_set_clk,
+-		.hw_context_save = 1,
+-	},
+-	[hsu_chv_1] = {
+-		.hw_ip = hsu_dw,
+-		.idle = 40,
+ 		.pin_cfg = {
+-			.wake_src = rxd_wake,
++			.wake_src = no_wake,
+ 		},
+ 		.hw_set_rts = cht_hw_set_rts,
+ 		.hw_suspend = cht_hsu_hw_suspend,
+@@ -247,10 +236,42 @@ static struct hsu_port_cfg hsu_port_cfgs
+ 
+ #ifdef CONFIG_ACPI
+ static const struct acpi_device_id hsu_acpi_ids[] = {
+-	{ "8086228A", hsu_chv_0 },
++	{ "8086228A", hsu_chv },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(acpi, hsu_acpi_ids);
++
++/* Manages child driver_data as a 32 bits field. */
++#define CHILD_CFG(wake_src, idle) (((wake_src) & 0x3) | ((idle) << 2))
++#define CHILD_CFG_WAKE(cfg)       ((cfg) & 0x3)
++#define CHILD_CFG_IDLE(cfg)       (((cfg) >> 2) & 0x3FFFFFFF)
++
++static const struct acpi_device_id child_acpi_ids[] = {
++	{ "BCM4752" , CHILD_CFG(rxd_wake, 40) },
++	{ "LNV4752" , CHILD_CFG(rxd_wake, 40) },
++	{ "BCM4752E", CHILD_CFG(rxd_wake, 40) },
++	{ "BCM47521", CHILD_CFG(rxd_wake, 40) },
++	{ "INT33A2" , CHILD_CFG(cts_wake, 40) },
++	{ },
++};
++MODULE_DEVICE_TABLE(acpi, child_acpi_ids);
++
++static const struct acpi_device_id *match_device_ids(struct acpi_device *device,
++					const struct acpi_device_id *ids)
++{
++	const struct acpi_device_id *id;
++	struct acpi_hardware_id *hwid;
++
++	if (!device->status.present)
++		return NULL;
++
++	for (id = ids; id->id[0]; id++)
++		list_for_each_entry(hwid, &device->pnp.ids, list)
++			if (!strcmp((char *) id->id, hwid->id))
++				return id;
++
++	return NULL;
++}
+ #endif
+ 
+ #ifdef CONFIG_PM
+@@ -322,8 +343,8 @@ static const struct dev_pm_ops serial_hs
+ 
+ static int serial_hsu_plat_port_probe(struct platform_device *pdev)
+ {
+-	const struct acpi_device_id *id;
+-	struct acpi_device *adev;
++	const struct acpi_device_id *id, *child_id;
++	struct acpi_device *adev, *child;
+ 	struct uart_hsu_port *up;
+ 	int port = pdev->id, irq;
+ 	struct resource *mem, *ioarea;
+@@ -343,13 +364,34 @@ static int serial_hsu_plat_port_probe(st
+ 		return -ENODEV;
+ 	port--;
+ 
+-	cfg = &hsu_port_cfgs[id->driver_data + port];
++	cfg = kmalloc(sizeof(struct hsu_port_cfg), GFP_KERNEL);
++	if (!cfg)
++		return -ENOMEM;
++
++	*cfg = hsu_port_cfgs[id->driver_data];
+ 	cfg->dev = &pdev->dev;
++
++	/* Sets a particular config if required by device child. */
++	list_for_each_entry(child, &adev->children, node) {
++		/* child_id = acpi_match_device(child_acpi_ids, &child->dev); */
++		child_id = match_device_ids(child, child_acpi_ids);
++		if (child_id) {
++			pr_warn("uart(%d) device(%s) wake_src(%ld) idle(%ld)\n",
++				port, child_id->id,
++				CHILD_CFG_WAKE(child_id->driver_data),
++				CHILD_CFG_IDLE(child_id->driver_data));
++
++			cfg->pin_cfg.wake_src =
++				    CHILD_CFG_WAKE(child_id->driver_data);
++			cfg->idle = CHILD_CFG_IDLE(child_id->driver_data);
++		}
++	}
+ #endif
+ 
+ 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!mem) {
+ 		dev_err(&pdev->dev, "no mem resource?\n");
++		kfree(cfg);
+ 		return -EINVAL;
+ 	}
+ 	start = mem->start;
+@@ -358,6 +400,7 @@ static int serial_hsu_plat_port_probe(st
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0) {
+ 		dev_err(&pdev->dev, "no irq resource?\n");
++		kfree(cfg);
+ 		return -ENXIO;
+ 	}
+ 
+@@ -365,6 +408,7 @@ static int serial_hsu_plat_port_probe(st
+ 			pdev->name);
+ 	if (!ioarea) {
+ 		dev_err(&pdev->dev, "HSU region already claimed\n");
++		kfree(cfg);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -373,6 +417,7 @@ static int serial_hsu_plat_port_probe(st
+ 	if (IS_ERR(up)) {
+ 		release_mem_region(mem->start, resource_size(mem));
+ 		dev_err(&pdev->dev, "failed to setup HSU\n");
++		kfree(cfg);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -399,6 +444,7 @@ static int serial_hsu_plat_port_remove(s
+ 
+ 	pm_runtime_forbid(&pdev->dev);
+ 	serial_hsu_port_free(up);
++	kfree(up->port_cfg);
+ 	platform_set_drvdata(pdev, NULL);
+ 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (mem)

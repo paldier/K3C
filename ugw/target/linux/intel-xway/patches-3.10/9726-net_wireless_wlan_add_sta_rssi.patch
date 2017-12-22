@@ -1,0 +1,106 @@
+diff -rupN linux-3.10.12.orig/include/net/cfg80211.h linux-3.10.12.dev/include/net/cfg80211.h
+--- linux-3.10.12.orig/include/net/cfg80211.h	2015-10-15 15:56:16.000000000 +0300
++++ linux-3.10.12.dev/include/net/cfg80211.h	2015-10-16 16:34:09.000000000 +0300
+@@ -704,6 +704,7 @@ struct station_parameters {
+ 	u8 ext_capab_len;
+ 	u8 *resp;
+ 	size_t resp_len;
++	u32 rssi;
+ };
+ 
+ /**
+@@ -782,6 +783,7 @@ int cfg80211_check_station_change(struct
+  * @STATION_INFO_LOCAL_PM: @local_pm filled
+  * @STATION_INFO_PEER_PM: @peer_pm filled
+  * @STATION_INFO_NONPEER_PM: @nonpeer_pm filled
++ * @STATION_INFO_MAX_RSSI: @max_rssi filled
+  */
+ enum station_info_flags {
+ 	STATION_INFO_INACTIVE_TIME	= 1<<0,
+@@ -810,6 +812,7 @@ enum station_info_flags {
+ 	STATION_INFO_NONPEER_PM		= 1<<23,
+ 	STATION_INFO_RX_BYTES64		= 1<<24,
+ 	STATION_INFO_TX_BYTES64		= 1<<25,
++ 	STATION_INFO_MAX_RSSI  		= 1<<26,
+ };
+ 
+ /**
+@@ -959,6 +962,8 @@ struct station_info {
+ 	enum nl80211_mesh_power_mode peer_pm;
+ 	enum nl80211_mesh_power_mode nonpeer_pm;
+ 
++	u32 max_rssi;
++
+ 	/*
+ 	 * Note: Add a new enum station_info_flags value for each new field and
+ 	 * use it to check which fields are initialized.
+diff -rupN linux-3.10.12.orig/include/uapi/linux/nl80211.h linux-3.10.12.dev/include/uapi/linux/nl80211.h
+--- linux-3.10.12.orig/include/uapi/linux/nl80211.h	2015-10-15 16:40:08.000000000 +0300
++++ linux-3.10.12.dev/include/uapi/linux/nl80211.h	2015-10-16 16:39:12.000000000 +0300
+@@ -1555,6 +1555,8 @@ enum nl80211_commands {
+  *	data is in the format defined for the payload of the QoS Map Set element
+  *	in IEEE Std 802.11-2012, 8.4.2.97.
+  *
++ * @NL80211_ATTR_STA_RSSI: Received signal strength indication (u32)
++ *
+  * @NL80211_ATTR_MAX: highest attribute number currently defined
+  * @__NL80211_ATTR_AFTER_LAST: internal use
+  */
+@@ -1883,6 +1885,8 @@ enum nl80211_attrs {
+ 
+ 	NL80211_ATTR_QOS_MAP,
+ 
++	NL80211_ATTR_STA_RSSI,
++
+ 	/* add attributes here, update the policy in nl80211.c */
+ 
+ 	__NL80211_ATTR_AFTER_LAST,
+@@ -2182,6 +2186,7 @@ enum nl80211_sta_info {
+ 	NL80211_STA_INFO_TX_BYTES64,
+ 	NL80211_STA_INFO_CHAIN_SIGNAL,
+ 	NL80211_STA_INFO_CHAIN_SIGNAL_AVG,
++	NL80211_STA_INFO_MAX_RSSI,
+ 
+ 	/* keep last */
+ 	__NL80211_STA_INFO_AFTER_LAST,
+diff -rupN linux-3.10.12.orig/net/wireless/nl80211.c linux-3.10.12.dev/net/wireless/nl80211.c
+--- linux-3.10.12.orig/net/wireless/nl80211.c	2015-10-15 15:56:33.000000000 +0300
++++ linux-3.10.12.dev/net/wireless/nl80211.c	2015-10-16 16:41:27.000000000 +0300
+@@ -260,6 +260,7 @@ static const struct nla_policy nl80211_p
+ 	[NL80211_ATTR_BEACON_TAIL] = { .type = NLA_BINARY,
+ 				       .len = IEEE80211_MAX_DATA_LEN },
+ 	[NL80211_ATTR_STA_AID] = { .type = NLA_U16 },
++	[NL80211_ATTR_STA_RSSI] = { .type = NLA_U32 },
+ 	[NL80211_ATTR_STA_FLAGS] = { .type = NLA_NESTED },
+ 	[NL80211_ATTR_STA_LISTEN_INTERVAL] = { .type = NLA_U16 },
+ 	[NL80211_ATTR_STA_SUPPORTED_RATES] = { .type = NLA_BINARY,
+@@ -3472,6 +3473,10 @@ static int nl80211_send_station(struct s
+ 	    nla_put_u32(msg, NL80211_STA_INFO_INACTIVE_TIME,
+ 			sinfo->inactive_time))
+ 		goto nla_put_failure;
++	if ((sinfo->filled & STATION_INFO_MAX_RSSI) &&
++	    nla_put_u32(msg, NL80211_STA_INFO_MAX_RSSI,
++			sinfo->max_rssi))
++		goto nla_put_failure;
+ 	if ((sinfo->filled & (STATION_INFO_RX_BYTES |
+ 			      STATION_INFO_RX_BYTES64)) &&
+ 	    nla_put_u32(msg, NL80211_STA_INFO_RX_BYTES,
+@@ -4044,6 +4049,9 @@ static int nl80211_new_station(struct sk
+ 	if (!info->attrs[NL80211_ATTR_STA_AID])
+ 		return -EINVAL;
+ 
++	if (!info->attrs[NL80211_ATTR_STA_RSSI])
++		return -EINVAL;
++
+ 	mac_addr = nla_data(info->attrs[NL80211_ATTR_MAC]);
+ 	params.supported_rates =
+ 		nla_data(info->attrs[NL80211_ATTR_STA_SUPPORTED_RATES]);
+@@ -4061,6 +4069,8 @@ static int nl80211_new_station(struct sk
+ 	if (!params.aid || params.aid > IEEE80211_MAX_AID)
+ 		return -EINVAL;
+ 
++	params.rssi = nla_get_u32(info->attrs[NL80211_ATTR_STA_RSSI]);
++
+ 	if (info->attrs[NL80211_ATTR_STA_CAPABILITY]) {
+ 		params.capability =
+ 			nla_get_u16(info->attrs[NL80211_ATTR_STA_CAPABILITY]);

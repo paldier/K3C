@@ -1,0 +1,1558 @@
+# HG changeset patch
+# Parent 58906d95311f1c819c9ec767bcd16e1c5024c850
+add lantiq set clock functionallity for XRX200/XRX300/XRX330 platform
+
+diff --git a/arch/mips/lantiq/clk.c b/arch/mips/lantiq/clk.c
+--- a/arch/mips/lantiq/clk.c
++++ b/arch/mips/lantiq/clk.c
+@@ -15,47 +15,32 @@
+ #include <linux/clkdev.h>
+ #include <linux/err.h>
+ #include <linux/list.h>
+-
+ #include <asm/time.h>
+-#include <asm/irq.h>
+ #include <asm/div64.h>
+-
+ #include <lantiq_soc.h>
+-
+ #include "clk.h"
+ #include "prom.h"
+ 
+-/* lantiq socs have 3 static clocks */
+-static struct clk cpu_clk_generic[4];
+-
+-void clkdev_add_static(unsigned long cpu, unsigned long fpi,
+-			unsigned long io, unsigned long ppe)
+-{
+-	cpu_clk_generic[0].rate = cpu;
+-	cpu_clk_generic[1].rate = fpi;
+-	cpu_clk_generic[2].rate = io;
+-	cpu_clk_generic[3].rate = ppe;
+-}
+-
+ struct clk *clk_get_cpu(void)
+ {
+-	return &cpu_clk_generic[0];
++	return clk_get_sys("cpu", "cpu");
+ }
++EXPORT_SYMBOL_GPL(clk_get_cpu);
+ 
+ struct clk *clk_get_fpi(void)
+ {
+-	return &cpu_clk_generic[1];
++	return clk_get_sys("fpi", "fpi");
+ }
+ EXPORT_SYMBOL_GPL(clk_get_fpi);
+ 
+ struct clk *clk_get_io(void)
+ {
+-	return &cpu_clk_generic[2];
++	return clk_get_sys("io", "io");
+ }
+ 
+ struct clk *clk_get_ppe(void)
+ {
+-	return &cpu_clk_generic[3];
++	return clk_get_sys("ppe", "ppe");
+ }
+ EXPORT_SYMBOL_GPL(clk_get_ppe);
+ 
+@@ -69,33 +54,60 @@ unsigned long clk_get_rate(struct clk *c
+ 	if (unlikely(!clk_good(clk)))
+ 		return 0;
+ 
++#ifndef CONFIG_CPU_FREQ
+ 	if (clk->rate != 0)
+ 		return clk->rate;
++#endif
+ 
+-	if (clk->get_rate != NULL)
+-		return clk->get_rate();
+-
++	if (clk->get_rate != NULL) {
++		clk->rate = clk->get_rate();
++		return clk->rate;
++	}
++#if 0
++	if (clk->parent) {
++		pr_info("derive real clock speed for %s from clock %s ",
++			clk->cl.dev_id,
++			cpu_clk_generic[clk->parent - 1].cl.dev_id);
++		pr_info("with scale data 0x%08X\n", clk->scale_data);
++		return cpu_clk_generic[clk->parent - 1].rate;
++	}
++#endif
+ 	return 0;
+ }
+ EXPORT_SYMBOL(clk_get_rate);
+ 
+ int clk_set_rate(struct clk *clk, unsigned long rate)
+ {
++	int i = 0;
++
+ 	if (unlikely(!clk_good(clk)))
+ 		return 0;
++
+ 	if (clk->rates && *clk->rates) {
+ 		unsigned long *r = clk->rates;
+ 
+-		while (*r && (*r != rate))
++		while (*r && (*r != rate)) {
+ 			r++;
++			i++;
++		}
+ 		if (!*r) {
+ 			pr_err("clk %s.%s: trying to set invalid rate %ld\n",
+ 				clk->cl.dev_id, clk->cl.con_id, rate);
+ 			return -1;
+ 		}
+ 	}
+-	clk->rate = rate;
+-	return 0;
++
++	if (clk->set_rate != NULL) {
++		if (clk->set_rate(rate) == 0) {
++			clk->rate = rate;
++			return 0;
++		}
++	}
++
++	pr_err("trying to set invalid clk %s.%s: rate %ld.\n",
++			clk->cl.dev_id, clk->cl.con_id, rate);
++	pr_err("clk_set_rate not supported for this clk.\n");
++	return -EINVAL;
+ }
+ EXPORT_SYMBOL(clk_set_rate);
+ 
+@@ -170,7 +182,11 @@ void __init plat_time_init(void)
+ 
+ 	ltq_soc_init();
+ 
+-	clk = clk_get_cpu();
++	clk = clk_get_sys("cpu", "cpu");
++	if (clk == NULL) {
++		pr_err("CPU clock structure not found\n");
++		return;
++	}
+ 	mips_hpt_frequency = clk_get_rate(clk) / get_counter_resolution();
+ 	write_c0_compare(read_c0_count());
+ 	pr_info("CPU Clock: %ldMHz\n", clk_get_rate(clk) / 1000000);
+diff --git a/arch/mips/lantiq/clk.h b/arch/mips/lantiq/clk.h
+--- a/arch/mips/lantiq/clk.h
++++ b/arch/mips/lantiq/clk.h
+@@ -26,6 +26,7 @@
+ #define CLOCK_150M	150000000
+ #define CLOCK_166M	166666666
+ #define CLOCK_167M	166666667
++#define CLOCK_180M	180000000
+ #define CLOCK_196_608M	196608000
+ #define CLOCK_200M	200000000
+ #define CLOCK_222M	222000000
+@@ -58,15 +59,32 @@
+ #define CLOCK_50M	50000000
+ #define CLOCK_60M	60000000
+ 
++enum {
++	STATIC_CPU_CLK = 1,
++	STATIC_FPI_CLK,
++	STATIC_IO_CLK,
++	STATIC_PPE_CLK,
++	STATIC_NO_PARENT = 0xff,
++};
++
++struct clk_rates {
++	unsigned int cpu_freq;
++	unsigned int ddr_freq;
++	unsigned int cgu_sys;
++};
++
+ struct clk {
+ 	struct clk_lookup cl;
+ 	unsigned long rate;
+ 	unsigned long *rates;
+ 	unsigned int module;
+ 	unsigned int bits;
++	unsigned int parent;
++	unsigned int scale_data;
+ 	atomic_t refcount;
+ 	bool always_on; /* 0 -- always on or not used, 1 -- configurable */
+ 	unsigned long (*get_rate) (void);
++	int (*set_rate) (unsigned long cpu_freq);
+ 	int (*enable) (struct clk *clk);
+ 	void (*disable) (struct clk *clk);
+ 	int (*activate) (struct clk *clk);
+@@ -74,26 +92,40 @@ struct clk {
+ 	void (*reboot) (struct clk *clk);
+ };
+ 
++/*
+ extern void clkdev_add_static(unsigned long cpu, unsigned long fpi,
+ 				unsigned long io, unsigned long ppe);
++*/
++extern unsigned long ltq_ase_cpu_hz(void);
++extern unsigned long ltq_ase_fpi_hz(void);
++extern unsigned long ltq_ase_pp32_hz(void);
++extern int ltq_ase_set_cpu_hz(unsigned long cpu_freq);
+ 
+ extern unsigned long ltq_danube_cpu_hz(void);
+ extern unsigned long ltq_danube_fpi_hz(void);
+ extern unsigned long ltq_danube_pp32_hz(void);
++extern int ltq_danube_set_cpu_hz(unsigned long cpu_freq);
+ 
+ extern unsigned long ltq_ar9_cpu_hz(void);
+ extern unsigned long ltq_ar9_fpi_hz(void);
++extern unsigned long ltq_ar9_pp32_hz(void);
++extern int ltq_ar9_set_cpu_hz(unsigned long cpu_freq);
+ 
+ extern unsigned long ltq_vr9_cpu_hz(void);
+ extern unsigned long ltq_vr9_fpi_hz(void);
+ extern unsigned long ltq_vr9_pp32_hz(void);
++extern int ltq_vr9_set_cpu_hz(unsigned long cpu_freq);
+ 
+ extern unsigned long ltq_ar10_cpu_hz(void);
+ extern unsigned long ltq_ar10_fpi_hz(void);
+ extern unsigned long ltq_ar10_pp32_hz(void);
++extern int ltq_ar10_set_cpu_hz(unsigned long cpu_freq);
+ 
+ extern unsigned long ltq_grx390_cpu_hz(void);
+ extern unsigned long ltq_grx390_fpi_hz(void);
+ extern unsigned long ltq_grx390_pp32_hz(void);
++extern int ltq_grx390_set_cpu_hz(unsigned long cpu_freq);
++
++unsigned long *ltq_get_avail_scaling_rates(int sel);
+ 
+ #endif
+diff --git a/arch/mips/lantiq/falcon/sysctrl.c b/arch/mips/lantiq/falcon/sysctrl.c
+--- a/arch/mips/lantiq/falcon/sysctrl.c
++++ b/arch/mips/lantiq/falcon/sysctrl.c
+@@ -245,6 +245,8 @@ static inline void clkdev_add_sys(const 
+ 
+ void __init ltq_soc_init(void)
+ {
++	struct clk *clk;
++
+ 	struct device_node *np_status =
+ 		of_find_compatible_node(NULL, NULL, "lantiq,status-falcon");
+ 	struct device_node *np_ebu =
+@@ -303,10 +305,30 @@ void __init ltq_soc_init(void)
+ 	falcon_gpe_enable();
+ 
+ 	/* get our 3 static rates for cpu, fpi and io clocks */
+-	if (ltq_sys1_r32(SYS1_CPU0CC) & CPU0CC_CPUDIV)
+-		clkdev_add_static(CLOCK_200M, CLOCK_100M, CLOCK_200M, 0);
+-	else
+-		clkdev_add_static(CLOCK_400M, CLOCK_100M, CLOCK_200M, 0);
++	clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++	if (clk) {
++		clk->cl.dev_id = "cpu";
++		clk->cl.con_id = "cpu";
++		clk->cl.clk = clk;
++		clk->rate = CLOCK_400M;
++		clkdev_add(&clk->cl);
++	}
++	clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++	if (clk) {
++		clk->cl.dev_id = "fpi";
++		clk->cl.con_id = "fpi";
++		clk->cl.clk = clk;
++		clk->rate = CLOCK_100M;
++		clkdev_add(&clk->cl);
++	}
++	clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++	if (clk) {
++		clk->cl.dev_id = "io";
++		clk->cl.con_id = "io";
++		clk->cl.clk = clk;
++		clk->rate = CLOCK_200M;
++		clkdev_add(&clk->cl);
++	}
+ 
+ 	/* add our clock domains */
+ 	clkdev_add_sys("1d810000.gpio", SYSCTL_SYSETH, SYSCTRL_SYS_ETH_P0);
+diff --git a/arch/mips/lantiq/xway/clk.c b/arch/mips/lantiq/xway/clk.c
+--- a/arch/mips/lantiq/xway/clk.c
++++ b/arch/mips/lantiq/xway/clk.c
+@@ -5,32 +5,245 @@
+  *
+  *  Copyright (C) 2010 John Crispin <blogic@openwrt.org>
+  *  Copyright (C) 2013 Lei Chuanhua <Chuanhua.lei@lantiq.com>
++ *  Copyright (C) 2014 Thomas Bartholomä <t.bartholomae@lantiq.com>
+  */
++#ifdef CONFIG_LTQ_CPUFREQ_DEBUG
++	#define DEBUG
++#endif
+ 
+-#include <linux/io.h>
+-#include <linux/export.h>
+-#include <linux/init.h>
+-#include <linux/clk.h>
++#define pr_fmt(fmt) KBUILD_MODNAME ": " "%s: " ": " fmt,__func__
+ 
++/* used to get access to mips_hpt_frequency */
++#include <asm/time.h>
+ #include <linux/time.h>
+-#include <asm/irq.h>
+-#include <asm/div64.h>
+-
+ #include <lantiq_soc.h>
+-
++#include <cpufreq/ltq_cpufreq.h>
+ #include "../clk.h"
+ 
++#define BARRIER __asm__ __volatile__ (".set noreorder\n\t" \
++			"nop; nop; nop; nop; nop; nop; nop; nop; nop;\n\t" \
++			"nop; nop; nop; nop; nop; nop; nop; nop; nop;\n\t" \
++			".set reorder\n\t")
++/* MPS SRAM Base Address */
++#define MBX_BASEADDR		0xBF200000
++#define MPS_MEM_SEG_DATASIZE	512
++
++/* local platform identifier */
++#define CLK_VR9			0x0
++#define CLK_AR10		0x1
++#define CLK_GRX390		0x2
++
++/* frequency transition identifier */
++/* frequency transition prohibited */
++#define LTQ_NO_TRANS		0x000
++/* frequency transition permitted  */
++#define LTQ_TRANS_PERMIT	0x001
++/* frequency transition critical, need intermediate step */
++#define LTQ_TRANS_CRITICAL	0x002
++/* no state change */
++#define LTQ_STATE_NC		0x100
++/* state change up, means step from lower to higher frequency */
++#define LTQ_STATE_UP		0x200
++/* state change down, means step from higher to lower frequency */
++#define LTQ_STATE_DOWN		0x300
++
++
+ static unsigned int ram_clocks[] = {
+-	CLOCK_167M, CLOCK_133M, CLOCK_111M, CLOCK_83M };
++	CLOCK_167M, CLOCK_133M, CLOCK_111M, CLOCK_83M};
+ #define DDR_HZ ram_clocks[ltq_cgu_r32(CGU_SYS) & 0x3]
+ 
++#ifdef CONFIG_LTQ_CPU_FREQ
++static int ltq_setclk_hz(unsigned long cpu_freq, unsigned long ddr_freq,
++						 unsigned int sel, struct clk_rates *avail_rates);
++
++
++struct ltq_freq_transition {
++	enum ltq_cpufreq_state  old_state; /* oldState */
++	enum ltq_cpufreq_state  new_state; /* newState */
++	int         permit;	/* permission for this transition */
++	enum ltq_cpufreq_state  int_state1;	/* intermediate State1 */
++	enum ltq_cpufreq_state  int_state2;	/* intermediate State2 */
++	int         state_dir; /* state change direction up,down */
++};
++
++static struct clk_rates avail_rates_xrx200[] = {
++	/*     cpu        ddr    cgu_sys*/
++	{600000000, 300000000, 0x02},
++	{500000000, 250000000, 0x13},
++	{500000000, 200000000, 0x12},
++	{393215332, 196607666, 0x22},
++	{333333333, 166666666, 0x32},
++	{125000000, 125000000, 0x80},
++	{0, 0, 0},
++};
++
++/*
++ * Frequency transition table for XRX288
++ * Intermediate states are only relevant if permit = LTQ_TRANS_CRITICAL
++ */
++static struct ltq_freq_transition freq_transition_xrx288[] = {
++/*            oldState     ,     newState     ,     permit        ,
++	  intermediate state1, intermediate stat2     UP/DOWN    */
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_NC},
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D1, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D2, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D2, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D3, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D0, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_NC},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D2, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D3, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D0, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D1, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D2, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D2, LTQ_STATE_NC},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D3, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D0, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D1, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D1, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D2, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_STATE_NC}
++};
++
++static struct clk_rates avail_rates_xrx300[] = {
++	/*     cpu        ddr    cgu_sys*/
++	{600000000, 300000000, 0x101},
++	{500000000, 250000000, 0x001},
++	{300000000, 300000000, 0x111},
++	{300000000, 150000000, 0x112},
++	{250000000, 250000000, 0x011},
++	{250000000, 125000000, 0x012},
++	{150000000, 150000000, 0x122},
++	{125000000, 125000000, 0x022},
++	{0, 0, 0},
++};
++
++/*
++ * Frequency transition table for XRX300
++ * Intermediate states are only relevant if permit = LTQ_TRANS_CRITICAL
++ */
++static struct ltq_freq_transition freq_transition_xrx300[] = {
++/*            oldState     ,     newState     ,     permit        ,
++ intermediate state1, intermediate stat2     UP/DOWN    */
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_NC},
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D1, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D2, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D2, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D3, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D0, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_NC},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D2, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D3, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D0, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D1, LTQ_CPUFREQ_PS_D1, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D1, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D2, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D2, LTQ_STATE_NC},
++	{ LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D3, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_STATE_DOWN},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D0, LTQ_TRANS_PERMIT,
++		LTQ_CPUFREQ_PS_D2, LTQ_CPUFREQ_PS_D1, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D1, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D2, LTQ_TRANS_CRITICAL,
++		LTQ_CPUFREQ_PS_D0, LTQ_CPUFREQ_PS_D0, LTQ_STATE_UP},
++	{ LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_NO_TRANS,
++		LTQ_CPUFREQ_PS_D3, LTQ_CPUFREQ_PS_D3, LTQ_STATE_NC}
++};
++
++static struct clk_rates avail_rates_xrx390[] = {
++	/*     cpu        ddr    cgu_sys*/
++	{600000000, 300000000, 0x001},
++	{300000000, 300000000, 0x011},
++	{300000000, 150000000, 0x012},
++	{150000000, 150000000, 0x022},
++	{666666666, 333333333, 0x201},
++	{333333333, 333333333, 0x211},
++	{333333333, 166666666, 0x212},
++	{166666666, 166666666, 0x222},
++	{720000000, 360000000, 0x401},
++	{360000000, 360000000, 0x411},
++	{360000000, 180000000, 0x412},
++	{180000000, 180000000, 0x422},
++	{0, 0, 0},
++};
++
++#endif
++
+ /* legacy xway clock */
+ #define CGU_SYS			0x10
+ 
+-/* vr9, ar10/grx390*/
++/* vr9, ar10/grx390 register offsets*/
+ #define CGU_SYS_XRX		0x0c
++#define CGU_UPDATE_XRX		0x20
+ #define CGU_IF_CLK_AR10		0x24
+ 
++/* DDR Combo Controller Base Address */
++#define DDR_COMBO_BASE		0xBF801000
++#define DDRCC_R32(reg) (*(volatile u32 *)(DDR_COMBO_BASE+reg))
++#define DDRCC_W32(reg, val) (*(volatile u32 *)(DDR_COMBO_BASE+reg) = val)
++#define DDR_CCR00_XRX		0x0000
++#define DDR_CCR15_XRX		0x00F0
++#define DDR_CCR28_XRX		0x01C0
++#define DDR_PHYR11_XRX		0x04B0
++/* CGU Base Address */
++#define CGU_BASE		0xBF103000
++#define CGU_R32(reg) (*(volatile u32 *)(CGU_BASE+reg))
++#define CGU_W32(reg, val) (*(volatile u32 *)(CGU_BASE+reg) = val)
++
++DEFINE_SPINLOCK(ltq_setclk_lock);
++DECLARE_PER_CPU(struct clock_event_device, mips_clockevent_device);
++
++static inline void ddrcc_w32(int reg, int val)
++{
++	*(volatile u32 *)(DDR_COMBO_BASE+reg) = val;
++}
++
++
++unsigned long ltq_ase_cpu_hz(void)
++{
++	if (ltq_cgu_r32(CGU_SYS) & (1 << 5))
++		return CLOCK_266M;
++	else
++		return CLOCK_133M;
++}
++
++unsigned long ltq_ase_fpi_hz(void)
++{
++	if (ltq_cgu_r32(CGU_SYS) & (1 << 5))
++		return CLOCK_133M;
++	else
++		return CLOCK_133M;
++}
++
++unsigned long ltq_ase_pp32_hz(void)
++{
++	if (ltq_cgu_r32(CGU_SYS) & (1 << 5))
++		return CLOCK_266M;
++	else
++		return CLOCK_133M;
++}
+ 
+ unsigned long ltq_danube_fpi_hz(void)
+ {
+@@ -74,7 +287,6 @@ unsigned long ltq_danube_pp32_hz(void)
+ 		clk = CLOCK_266M;
+ 		break;
+ 	}
+-
+ 	return clk;
+ }
+ 
+@@ -102,6 +314,11 @@ unsigned long ltq_ar9_cpu_hz(void)
+ 		return ltq_ar9_sys_hz();
+ }
+ 
++unsigned long ltq_ar9_pp32_hz(void)
++{
++	return CLOCK_250M;
++}
++
+ unsigned long ltq_vr9_cpu_hz(void)
+ {
+ 	unsigned int cpu_sel;
+@@ -194,7 +411,6 @@ unsigned long ltq_vr9_pp32_hz(void)
+ 		clk = CLOCK_500M;
+ 		break;
+ 	}
+-
+ 	return clk;
+ }
+ 
+@@ -271,7 +487,7 @@ unsigned long ltq_grx390_cpu_hz(void)
+ {
+ 	unsigned int clksys;
+ 	int cpu_fs = ((ltq_cgu_r32(CGU_SYS_XRX) >> 9) & 0x3);
+-	int freq_div = ((ltq_cgu_r32(CGU_SYS_XRX) >> 4) * 0x7);
++	int freq_div = ((ltq_cgu_r32(CGU_SYS_XRX) >> 4) & 0x7);
+ 
+ 	switch (cpu_fs) {
+ 	case 0:
+@@ -302,16 +518,32 @@ unsigned long ltq_grx390_cpu_hz(void)
+ 
+ unsigned long ltq_grx390_fpi_hz(void)
+ {
++	/* fpi clock is derived from ddr_clk */
++	unsigned int clksys;
+ 	int cpu_fs = ((ltq_cgu_r32(CGU_SYS_XRX) >> 9) & 0x3);
++	int freq_div = ((ltq_cgu_r32(CGU_SYS_XRX)) & 0x7);
+ 	switch (cpu_fs) {
+ 	case 0:
+-		return CLOCK_300M;
++		clksys = CLOCK_600M;
++		break;
+ 	case 1:
+-		return CLOCK_333M;
++		clksys = CLOCK_666M;
++		break;
+ 	case 2:
+-		return CLOCK_360M;
++		clksys = CLOCK_720M;
++		break;
+ 	default:
+-		return CLOCK_300M;
++		clksys = CLOCK_600M;
++		break;
++	}
++
++	switch (freq_div) {
++	case 1:
++		return clksys >> 1;
++	case 2:
++		return clksys >> 2;
++	default:
++		return clksys >> 1;
+ 	}
+ }
+ 
+@@ -337,4 +569,405 @@ unsigned long ltq_grx390_pp32_hz(void)
+ 	return clk;
+ }
+ 
++int ltq_ase_set_cpu_hz(unsigned long cpu_freq)
++{
++	return 0;
++}
++int ltq_danube_set_cpu_hz(unsigned long cpu_freq)
++{
++	return 0;
++}
++int ltq_ar9_set_cpu_hz(unsigned long cpu_freq)
++{
++	return 0;
++}
+ 
++#ifdef CONFIG_LTQ_CPU_FREQ
++static int ltq_get_transition_permit(struct ltq_freq_transition *freq_tt,
++									 enum ltq_cpufreq_state old_state,
++									 enum ltq_cpufreq_state new_state,
++									 enum ltq_cpufreq_state *int_state1,
++									 enum ltq_cpufreq_state *int_state2)
++{
++	int i;
++	struct ltq_freq_transition freq_trans;
++
++	for (i = 0; i < 16; i++) {
++		freq_trans = *(freq_tt + i);
++		if (freq_trans.old_state == old_state) {
++			if (freq_trans.new_state == new_state) {
++				*int_state1 = freq_trans.int_state1;
++				*int_state2 = freq_trans.int_state2;
++				return freq_trans.permit | freq_trans.state_dir;
++			}
++		}
++	}
++	return LTQ_NO_TRANS | LTQ_STATE_NC;
++}
++
++int ltq_set_cpu_hz(unsigned int sel,
++				   struct clk_rates *avail_rates,
++				   struct ltq_freq_transition *freq_tt)
++{
++	int ret;
++	struct ltq_cpufreq *clk_cpufreq_p;
++	unsigned long *ddr_freq_p;
++	unsigned long *cpu_freq_p;
++	enum ltq_cpufreq_state intState1 = 0;
++	enum ltq_cpufreq_state intState2 = 0;
++
++	clk_cpufreq_p = ltq_cpufreq_get();
++	if (clk_cpufreq_p == NULL)
++		return -1;
++
++	ddr_freq_p = clk_cpufreq_p->ddr_scaling_rates;
++	if (ddr_freq_p == NULL)
++		return -1;
++
++	cpu_freq_p = clk_cpufreq_p->cpu_scaling_rates;
++	if (ddr_freq_p == NULL)
++		return -1;
++
++
++	/*  Check if we have a critical frequency transition */
++	ret = ltq_get_transition_permit(freq_tt,
++									clk_cpufreq_p->cpufreq_cur_state,
++									clk_cpufreq_p->cpufreq_new_state,
++									&intState1, &intState2);
++	if ((ret & 0xFF) == LTQ_NO_TRANS)
++		return 0; /* nothing to do */
++
++	if ((ret & 0xFF) == LTQ_TRANS_CRITICAL) {
++		ddr_freq_p += intState1 - LTQ_CPUFREQ_PS_D0;
++		cpu_freq_p += intState1 - LTQ_CPUFREQ_PS_D0;
++		ret = ltq_setclk_hz(*cpu_freq_p, *ddr_freq_p, sel,
++							avail_rates);
++		if (ret < 0)
++			return -1;
++
++		if (intState1 != intState2) {
++			ddr_freq_p += intState2 - LTQ_CPUFREQ_PS_D0;
++			cpu_freq_p += intState2 - LTQ_CPUFREQ_PS_D0;
++			ret = ltq_setclk_hz(*cpu_freq_p, *ddr_freq_p, sel,
++								avail_rates);
++			if (ret < 0)
++				return -1;
++		}
++	}
++	ddr_freq_p += clk_cpufreq_p->cpufreq_new_state - LTQ_CPUFREQ_PS_D0;
++	cpu_freq_p += clk_cpufreq_p->cpufreq_new_state - LTQ_CPUFREQ_PS_D0;
++	ret = ltq_setclk_hz(*cpu_freq_p, *ddr_freq_p, sel, avail_rates);
++	return ret;
++}
++#endif /* CONFIG_LTQ_CPU_FREQ */
++
++int ltq_vr9_set_cpu_hz(unsigned long cpu_freq)
++{
++#ifdef CONFIG_LTQ_CPU_FREQ
++	return ltq_set_cpu_hz(CLK_VR9, avail_rates_xrx200,
++						  freq_transition_xrx288);
++#else
++	return -1;
++#endif /* CONFIG_LTQ_CPU_FREQ */
++}
++
++int ltq_ar10_set_cpu_hz(unsigned long cpu_freq)
++{
++#ifdef CONFIG_LTQ_CPU_FREQ
++	return ltq_set_cpu_hz(CLK_AR10, avail_rates_xrx300,
++						  freq_transition_xrx300);
++#else
++	return -1;
++#endif /* CONFIG_LTQ_CPU_FREQ */
++}
++
++int ltq_grx390_set_cpu_hz(unsigned long cpu_freq)
++{
++#ifdef CONFIG_LTQ_CPU_FREQ
++	return ltq_set_cpu_hz(CLK_AR10, avail_rates_xrx390,
++						  freq_transition_xrx300);
++
++#else
++	return -1;
++#endif /* CONFIG_LTQ_CPU_FREQ */
++}
++
++#ifdef CONFIG_LTQ_CPU_FREQ
++extern unsigned long loops_per_jiffy;
++
++static
++inline unsigned long cpufreq_scale(unsigned long old, u_int div, u_int mult)
++{
++#if BITS_PER_LONG == 32
++	u64 result = ((u64) old) * ((u64) mult);
++	do_div(result, div);
++	return(unsigned long) result;
++#elif BITS_PER_LONG == 64
++	unsigned long result = old * ((u64) mult);
++	result /= div;
++	return result;
++#endif
++};
++
++/* Precondition: all CPUS running on the same frequency */
++static int update_sysclock(unsigned long cpu_freq_prev, unsigned long cpu_freq,
++						   struct clocksource *cs)
++{
++	int i, cpu;
++	struct clocksource cs_old;
++	struct clock_event_device *ce = NULL;
++
++	mips_hpt_frequency = cpu_freq / 2;/*half of the CPU frequency*/
++	memcpy(&cs_old, cs, sizeof(cs_old));
++	__clocksource_updatefreq_scale(cs, 1, mips_hpt_frequency);
++	timekeeping_clocksource_update(cs, &cs_old);
++	for_each_cpu(cpu, cpu_possible_mask) {
++		ce = &per_cpu(mips_clockevent_device, cpu);
++		if (ce == NULL) {
++			return -EINVAL;
++		}
++		ce->mult = div_sc((unsigned long)mips_hpt_frequency, 
++						  NSEC_PER_SEC, 32);
++		ce->max_delta_ns    = clockevent_delta2ns(0x7fffffff, ce);
++		ce->min_delta_ns    = clockevent_delta2ns(0x300, ce);
++	}
++
++	/* START: update udelay because of frequency change */
++	/* adjust loops_per_jiffy and udelay here */
++	loops_per_jiffy = cpufreq_scale(loops_per_jiffy, cpu_freq_prev,
++									cpu_freq);
++	/* adjust udelay for each cpu */
++	for (i=0;i<NR_CPUS;i++) {
++		cpu_data[i].udelay_val = loops_per_jiffy;
++	}
++	/* END: update udelay because of frequency change */
++
++	return 0;
++}
++
++static int ltq_ddr_clk_magic_vr9(char *argv, unsigned int cgu_sys)
++{
++	void *start, *end;
++
++	/* Cache the reset code of this function */
++	__asm__ __volatile__ (
++						 "       .set    push\n"
++						 "       .set    mips3\n"
++						 "       la      %0,startpoint_vr9\n"
++						 "       la      %1,endpoint_vr9\n"
++						 "       .set    pop\n"
++						 : "=r" (start), "=r" (end)
++						 :
++						 );
++	memcpy((u8 *)argv, (u8 *)MBX_BASEADDR, MPS_MEM_SEG_DATASIZE);
++
++	/* check if end-start exceeds 512 Byte */
++	if ((end-start) >= MPS_MEM_SEG_DATASIZE)
++		return -EINVAL;
++
++	memcpy((u8 *)MBX_BASEADDR, (u8 *)start, (end - start));
++
++	/* save cgu_sys value to MPS memory for later use */
++	*(volatile u32 *)MBX_BASEADDR = cgu_sys;
++
++	/* jump to MPS memory; skip first 4 byte because of cgu_sys value */
++	__asm__("jr     %0" : : "r"(MBX_BASEADDR+4));
++	__asm__ __volatile__ ("startpoint_vr9:\n");
++	BARRIER;
++	*(volatile u32 *)0xbf401070 |= 0x1;	/* Put DDR into self Refresh mode*/
++	BARRIER;
++	/* wait until DDR controller acknowledge self refresh */
++	while ((*(volatile u32 *)0xbf400400 & 0x2) == 0) {
++		/* check CKE bit */
++	}
++	/* Stop the DDR controller by writing a 0 to the START parameter. */
++	*(volatile u32 *)0xbf401070 &= ~(1<<8);
++	BARRIER;
++	*(volatile u32 *)0xbf103020 = 1;
++	BARRIER;
++	/*
++	  this wait is necessary, otherwise system becomes instable !
++	  CGU_SYS is split into a master register and a shadow register.
++	  write -> master-register; read <- shadow-register.
++	  Takeover from master into shadow triggered by IFX_CGU_UPDATE.
++	  Therefore we have to wait until cgu_sys value is transfered into
++	  shadow register.
++	*/
++	while (*(volatile u32 *)0xbf10300C != *(volatile u32 *)MBX_BASEADDR) {
++	}
++	/*
++	  restart the DDR SDRAM controller by writing a 1 to the START
++	  parameter. This forces the DLL to lock to the new frequency.
++	*/
++	*(volatile u32 *)0xbf401070 |= 0x100;
++	/* check for DLL relock */
++	while ((*(volatile u32 *)0xbf4012f0 & 0x1) == 0) {
++	}
++	/* check for DLL relock */
++	while ((*(volatile u32 *)0xbf401300 & 0x1) == 0) {
++	}
++	/* Put DDR out of self Refresh mode */
++	*(volatile u32 *)0xbf401070 &= ~(1<<0);
++	__asm__("jr     %0" : : "r"(end + 16));
++	__asm__ __volatile__ ("endpoint_vr9:\n");
++	BARRIER;
++	return 0;
++}
++
++static int ltq_ddr_clk_magic_ar10(char *argv, unsigned int cgu_sys)
++{
++	void *start, *end;
++
++	/* check if DDR clk must be changed too. */
++	if ((cgu_sys & 0x7) == (DDRCC_R32(CGU_SYS_XRX) & 0x7)) {
++		/* no DDR clk change; set new CPU clk and trigger update */
++		CGU_W32(CGU_SYS_XRX, (0x80 | cgu_sys));
++		BARRIER;
++		return 0;
++	}
++	/* Cache the reset code of this function */
++	__asm__ __volatile__ (
++						 "       .set    push\n"
++						 "       .set    mips3\n"
++						 "       la      %0,startpoint_ar10\n"
++						 "       la      %1,endpoint_ar10\n"
++						 "       .set    pop\n"
++						 : "=r" (start), "=r" (end)
++						 :
++						 );
++	memcpy((u8 *)argv, (u8 *)MBX_BASEADDR, MPS_MEM_SEG_DATASIZE);
++
++	/* check if end-start exceeds 512 Byte */
++	if ((end-start) >= MPS_MEM_SEG_DATASIZE)
++		return -EINVAL;
++
++	memcpy((u8 *)MBX_BASEADDR, (u8 *)start, (end - start));
++
++	/* save cgu_sys value to MPS memory for later use */
++	*(volatile u32 *)MBX_BASEADDR = cgu_sys;
++
++	/* jump to MPS memory; skip first 4 byte because of cgu_sys value */
++	__asm__("jr     %0" : : "r"(MBX_BASEADDR+4));
++	__asm__ __volatile__ ("startpoint_ar10:\n");
++	BARRIER;
++	/* quick refresh + self refresh mode */
++	DDRCC_W32(DDR_CCR15_XRX, (DDRCC_R32(DDR_CCR15_XRX) | 0x01000001));
++	BARRIER;
++	/* wait until DDR controller acknowledge self refresh. Check CKE bit */
++	while ((DDRCC_R32(DDR_CCR28_XRX) & 0x2) == 0x2) {
++	}
++
++	/* Stop the DDR controller by writing a 0 to the START parameter. */
++	DDRCC_W32(DDR_CCR00_XRX, (DDRCC_R32(DDR_CCR00_XRX) & ~0x1));
++	BARRIER;
++	/* set new frequency and trigger update */
++	CGU_W32(CGU_SYS_XRX, (0x80 | cgu_sys));
++	BARRIER;
++	/*
++	  Restart the DDR controller by writing a 1 to the START parameter.
++	  This forces the DLL to lock to the new frequency.
++	*/
++	DDRCC_W32(DDR_CCR00_XRX, (DDRCC_R32(DDR_CCR00_XRX) | 0x1));
++
++	/* check for DLL relock */
++	while ((DDRCC_R32(DDR_PHYR11_XRX) & 0x1) == 0) {
++	}
++
++	/* Put DDR out of self Refresh mode */
++	DDRCC_W32(DDR_CCR15_XRX, (DDRCC_R32(DDR_CCR15_XRX) & ~0x1));
++	__asm__("jr     %0" : : "r"(end + 16));
++	__asm__ __volatile__ ("endpoint_ar10:\n");
++	BARRIER;
++	return 0;
++}
++
++static int ltq_setclk_hz(unsigned long cpu_freq, unsigned long ddr_freq,
++						 unsigned int sel, struct clk_rates *avail_rates)
++{
++	unsigned long cpu_freq_prev;
++	unsigned long sys_flag;
++	unsigned long dmt_flag;
++	unsigned int vpe_flag, cur_tc;
++	struct clk *clk;
++	char   *argv;
++	unsigned int cgu_sys = 0;
++	int ret_magic = 0;
++	int retval = 0;
++	struct clocksource *cs = clocksource_get_current();
++
++	/* 
++	* First check for MIPS clock source because the following
++	* implementation is only for MIPS cs.
++	*/
++	if (cs == NULL) {
++		pr_err("current clocksource is NULL\n");
++		return -EINVAL;
++	}
++
++	if (0 != strcmp(cs->name, "MIPS")) {
++		pr_err("current clocksource isn't MIPS.\n");
++		return -EINVAL;
++	}
++
++	clk = clk_get_sys("cpu", "cpu");
++	if (IS_ERR(clk)) {
++		pr_err("CPU clk not found.\n");
++		return -EINVAL;
++	}
++
++	cpu_freq_prev = clk_get_rate(clk);
++	while (avail_rates->cpu_freq != 0) {
++		if (avail_rates->cpu_freq == cpu_freq) {
++			if (avail_rates->ddr_freq == ddr_freq) {
++				cgu_sys = avail_rates->cgu_sys;
++				break;
++			}
++		}
++		avail_rates++;
++	}
++	if (cgu_sys == 0) {
++		pr_err("cgu_sys is NULL.\n");
++		return -EINVAL;
++	}
++
++	cur_tc = smp_processor_id();
++	spin_lock_irqsave(&ltq_setclk_lock, sys_flag);
++	/* malloc MPS backup mem */
++	argv = kmalloc(MPS_MEM_SEG_DATASIZE, GFP_KERNEL);
++	if (argv == NULL) {
++		spin_unlock_irqrestore(&ltq_setclk_lock, sys_flag);
++		return -EINVAL;
++	}
++	/* Put MVPE's into 'configuration state' */
++	set_c0_mvpcontrol(MVPCONTROL_VPC);
++	dmt_flag = dmt();
++	vpe_flag = dvpe();
++	/* take system out of configuration state */
++
++	*(volatile u32 *)0xbf10300C = cgu_sys;
++	if (sel == CLK_VR9)
++		ret_magic = ltq_ddr_clk_magic_vr9(argv, cgu_sys);
++	else if (sel == CLK_AR10)
++		ret_magic = ltq_ddr_clk_magic_ar10(argv, cgu_sys);
++
++	BARRIER;
++	memcpy((u8 *)MBX_BASEADDR, (u8 *)argv, MPS_MEM_SEG_DATASIZE);
++	kfree(argv); /* free MPS backup mem */
++
++	emt(dmt_flag);
++	evpe(vpe_flag);
++	/* take system out of configuration state */
++	clear_c0_mvpcontrol(MVPCONTROL_VPC);
++
++	/* update clock source */
++	/* update clock event */
++	/* adjust loops_per_jiffy for udelay */
++	retval = update_sysclock(cpu_freq_prev, cpu_freq, cs);
++	spin_unlock_irqrestore(&ltq_setclk_lock, sys_flag);
++
++	if (ret_magic < 0)
++		pr_err("magic code size overflow\n");
++
++	return retval;
++}
++#endif
+diff --git a/arch/mips/lantiq/xway/sysctrl.c b/arch/mips/lantiq/xway/sysctrl.c
+--- a/arch/mips/lantiq/xway/sysctrl.c
++++ b/arch/mips/lantiq/xway/sysctrl.c
+@@ -362,7 +362,7 @@ static void clkdev_add_pmu(const char *d
+ 
+ /* manage the clock generator */
+ static void clkdev_add_cgu(const char *dev, const char *con,
+-					unsigned int bits)
++				unsigned int bits)
+ {
+ 	struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
+ 
+@@ -453,89 +453,122 @@ static char g_pkt_base[2048] __initdata 
+ static unsigned int g_desc_base[2] __initdata __attribute__((__aligned__(32)));
+ static void __init ltq_dplus_clean(void)
+ {
+-#define IFX_DMA                                 (KSEG1 | 0x1E104100)
+-#define IFX_DMA_BASE                            IFX_DMA
+-#define IFX_DMA_PS(i)                           (volatile u32*)(IFX_DMA_BASE + 0x40 + 0x30 * (i))
+-#define IFX_DMA_PCTRL(i)                        (volatile u32*)(IFX_DMA_BASE + 0x44 + 0x30 * (i))
+-#define IFX_DMA_CS(i)                           (volatile u32*)(IFX_DMA_BASE + 0x18 + 0x38 * (i))
+-#define IFX_DMA_CCTRL(i)                        (volatile u32*)(IFX_DMA_BASE + 0x1C + 0x38 * (i))
+-#define IFX_DMA_CDBA(i)                         (volatile u32*)(IFX_DMA_BASE + 0x20 + 0x38 * (i))
+-#define IFX_DMA_CDLEN(i)                        (volatile u32*)(IFX_DMA_BASE + 0x24 + 0x38 * (i))
+-#define IFX_DMA_CIS(i)                          (volatile u32*)(IFX_DMA_BASE + 0x28 + 0x38 * (i))
+-#define IFX_DMA_CIE(i)                          (volatile u32*)(IFX_DMA_BASE + 0x2C + 0x38 * (i))
+-#define IFX_DMA_IRNEN                           (volatile u32*)(IFX_DMA_BASE + 0xf4)
+-#define IFX_REG_R32(_r)                    __raw_readl((volatile unsigned int *)(_r))
+-#define IFX_REG_W32(_v, _r)               __raw_writel((_v), (volatile unsigned int *)(_r))
+-#define IFX_REG_W32_MASK(_clr, _set, _r)   IFX_REG_W32((IFX_REG_R32((_r)) & ~(_clr)) | (_set), (_r))
+-#define PPE_REG_ADDR(x)     ((volatile unsigned int *)KSEG1ADDR(0x1E180000 | (((x) + 0x4000) << 2)))
++#define IFX_DMA		(KSEG1 | 0x1E104100)
++#define IFX_DMA_BASE	IFX_DMA
++#define IFX_DMA_PS(i)	(volatile u32*)(IFX_DMA_BASE + 0x40 + 0x30 * (i))
++#define IFX_DMA_PCTRL(i) (volatile u32*)(IFX_DMA_BASE + 0x44 + 0x30 * (i))
++#define IFX_DMA_CS(i)	(volatile u32*)(IFX_DMA_BASE + 0x18 + 0x38 * (i))
++#define IFX_DMA_CCTRL(i) (volatile u32*)(IFX_DMA_BASE + 0x1C + 0x38 * (i))
++#define IFX_DMA_CDBA(i)	(volatile u32*)(IFX_DMA_BASE + 0x20 + 0x38 * (i))
++#define IFX_DMA_CDLEN(i) (volatile u32*)(IFX_DMA_BASE + 0x24 + 0x38 * (i))
++#define IFX_DMA_CIS(i)	(volatile u32*)(IFX_DMA_BASE + 0x28 + 0x38 * (i))
++#define IFX_DMA_CIE(i)	(volatile u32*)(IFX_DMA_BASE + 0x2C + 0x38 * (i))
++#define IFX_DMA_IRNEN	(volatile u32*)(IFX_DMA_BASE + 0xf4)
++#define IFX_REG_R32(_r)	__raw_readl((volatile unsigned int *)(_r))
++#define IFX_REG_W32(_v, _r) __raw_writel((_v), (volatile unsigned int *)(_r))
++#define IFX_REG_W32_MASK(_clr, _set, _r)   IFX_REG_W32((IFX_REG_R32((_r)) \
++						& ~(_clr)) | (_set), (_r))
++#define PPE_REG_ADDR(x)   ((volatile unsigned int *)KSEG1ADDR( \
++					0x1E180000 | (((x) + 0x4000) << 2)))
+ 
+-#define DMRX_PGCNT_XRX200                      ((volatile unsigned int *)0xBE235854)
+-#define DMRX_PKTCNT_XRX200                     ((volatile unsigned int *)0xBE235858)
+-#define DSRX_PGCNT_XRX200                      ((volatile unsigned int *)0xBE235C4C)
++#define DMRX_PGCNT_XRX200          ((volatile unsigned int *)0xBE235854)
++#define DMRX_PKTCNT_XRX200         ((volatile unsigned int *)0xBE235858)
++#define DSRX_PGCNT_XRX200          ((volatile unsigned int *)0xBE235C4C)
+ 
+ #define DMRX_PGCNT_XRX300          PPE_REG_ADDR(0x0615)
+ #define DMRX_PKTCNT_XRX300         PPE_REG_ADDR(0x0616)
+ #define DSRX_PGCNT_XRX300          PPE_REG_ADDR(0x0713)
+ 
+-#define AR10_SWIP_MACRO                 0x1E108000
+-#define AR10_SWIP_MACRO_REG(off)        ((volatile unsigned int *)KSEG1ADDR(AR10_SWIP_MACRO + (off) * 4))
+-#define AR10_SWIP_TOP                   (AR10_SWIP_MACRO | (0x0C40 * 4))
+-#define AR10_SWIP_TOP_REG(off)          ((volatile unsigned int *)KSEG1ADDR(AR10_SWIP_TOP + (off) * 4))
+-#define PCE_PCTRL_REG(port, reg)        AR10_SWIP_MACRO_REG(0x480 + (port) * 0xA + (reg))    //  port < 12, reg < 4
+-#define FDMA_PCTRL_REG(port)            AR10_SWIP_MACRO_REG(0xA80 + (port) * 6)  //  port < 7
+-#define SDMA_PCTRL_REG(port)            AR10_SWIP_MACRO_REG(0xBC0 + (port) * 6)  //  port < 7
++#define AR10_SWIP_MACRO            0x1E108000
++#define AR10_SWIP_MACRO_REG(off)   ((volatile unsigned int *)KSEG1ADDR( \
++						AR10_SWIP_MACRO + (off) * 4))
++#define AR10_SWIP_TOP              (AR10_SWIP_MACRO | (0x0C40 * 4))
++#define AR10_SWIP_TOP_REG(off)     ((volatile unsigned int *)KSEG1ADDR( \
++						AR10_SWIP_TOP + (off) * 4))
++/* port < 12, reg < 4 */
++#define PCE_PCTRL_REG(port, reg)   AR10_SWIP_MACRO_REG(0x480 + (port) \
++								* 0xA + (reg))
++#define FDMA_PCTRL_REG(port)       AR10_SWIP_MACRO_REG(0xA80 + (port) * 6)
++#define SDMA_PCTRL_REG(port)       AR10_SWIP_MACRO_REG(0xBC0 + (port) * 6)
+ 
+-    volatile unsigned int *desc_base = (volatile unsigned int *)KSEG1ADDR((unsigned int)g_desc_base);
+-    int i, j, k;
++	volatile unsigned int *desc_base =
++	(volatile unsigned int *)KSEG1ADDR((unsigned int)g_desc_base);
++	int i, j, k;
+ 
+-    for ( i = 0; i < 6; i++ )
+-        IFX_REG_W32_MASK(1, 0, SDMA_PCTRL_REG(i));  //  stop port 0 - 5
++	for (i = 0; i < 6; i++)
++		IFX_REG_W32_MASK(1, 0, SDMA_PCTRL_REG(i));/* stop port 0 - 5 */
+ 
+ 	if (of_machine_is_compatible("lantiq,ar10")) {
+-    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX300) & 0x00FF) == 0 && (IFX_REG_R32(DSRX_PGCNT_XRX300) & 0x00FF) == 0 )
+-       	   return;
++		if ((IFX_REG_R32(DMRX_PGCNT_XRX300) & 0x00FF) == 0 &&
++			(IFX_REG_R32(DSRX_PGCNT_XRX300) & 0x00FF) == 0) {
++			return;
++		}
+ 	}
+ 
+ 	if (of_machine_is_compatible("lantiq,vr9")) {
+-    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX200) & 0x00FF) == 0 && (IFX_REG_R32(DSRX_PGCNT_XRX200) & 0x00FF) == 0 )
+-       	   return;
++		if ((IFX_REG_R32(DMRX_PGCNT_XRX200) & 0x00FF) == 0 &&
++			(IFX_REG_R32(DSRX_PGCNT_XRX200) & 0x00FF) == 0) {
++			return;
++		}
+ 	}
+ 
+-    IFX_REG_W32(0, IFX_DMA_PS(0));
+-    IFX_REG_W32(0x1F68, IFX_DMA_PCTRL(0));
+-    IFX_REG_W32(0, IFX_DMA_IRNEN);  // disable all DMA interrupt
++	IFX_REG_W32(0, IFX_DMA_PS(0));
++	IFX_REG_W32(0x1F68, IFX_DMA_PCTRL(0));
++	IFX_REG_W32(0, IFX_DMA_IRNEN); /* disable all DMA interrupt */
+ 
+-    for ( k = 0; k < 8; k++ ) {
+-        unsigned int imap[8] = {0, 2, 4, 6, 20, 21, 22, 23};
++	for (k = 0; k < 8; k++) {
++		unsigned int imap[8] = {0, 2, 4, 6, 20, 21, 22, 23};
+ 
+-        i = imap[k];
+-        IFX_REG_W32(i, IFX_DMA_CS(0));
+-        IFX_REG_W32_MASK(0, 2, IFX_DMA_CCTRL(0));       //  reset channel
+-        while ( (IFX_REG_R32(IFX_DMA_CCTRL(0)) & 2) );  //  wait until reset finish
+-        IFX_REG_W32(0, IFX_DMA_CIE(0));                 //  disable channel interrupt
+-        IFX_REG_W32(1, IFX_DMA_CDLEN(0));               //  only 1 descriptor
+-        IFX_REG_W32(CPHYSADDR((unsigned int)desc_base), IFX_DMA_CDBA(0));       //  use local variable (array) as descriptor base address
+-        desc_base[0] = 0x80000000 | sizeof(g_pkt_base);
+-        desc_base[1] = CPHYSADDR((unsigned int)g_pkt_base);
++	i = imap[k];
++	IFX_REG_W32(i, IFX_DMA_CS(0));
++	IFX_REG_W32_MASK(0, 2, IFX_DMA_CCTRL(0)); /* reset channel */
++	while ((IFX_REG_R32(IFX_DMA_CCTRL(0)) & 2)) /* wait reset finish */
++	IFX_REG_W32(0, IFX_DMA_CIE(0)); /* disable channel interrupt */
++	IFX_REG_W32(1, IFX_DMA_CDLEN(0)); /* only 1 descriptor */
++	/* use local variable (array) as descriptor base address */
++	IFX_REG_W32(CPHYSADDR((unsigned int)desc_base), IFX_DMA_CDBA(0));
++	desc_base[0] = 0x80000000 | sizeof(g_pkt_base);
++	desc_base[1] = CPHYSADDR((unsigned int)g_pkt_base);
+ 
+-        IFX_REG_W32_MASK(0, 1, IFX_DMA_CCTRL(0));       //  start receiving
+-        while ( 1 ) {
+-            for ( j = 0; j < 1000 && (desc_base[0] & 0x80000000) != 0; j++ );   //  assume packet can be finished within 1000 loops
+-            if ( (desc_base[0] & 0x80000000) != 0 )     //  no more packet
+-                break;
+-            desc_base[0] = 0x80000000 | sizeof(g_pkt_base);
+-        }
+-        IFX_REG_W32_MASK(1, 0, IFX_DMA_CCTRL(0));       //  stop receiving
+-    }
++	IFX_REG_W32_MASK(0, 1, IFX_DMA_CCTRL(0)); /* start receiving */
++	while (1) {
++		/* assume packet can be finished within 1000 loops */
++		for (j = 0; j < 1000 && (desc_base[0]&0x80000000) != 0; j++) {
++		}
++		if ((desc_base[0] & 0x80000000) != 0) /* nopacket */
++			break;
++		desc_base[0] = 0x80000000 | sizeof(g_pkt_base);
++	}
++	IFX_REG_W32_MASK(1, 0, IFX_DMA_CCTRL(0)); /* stop receiving */
++	}
+ 
+ 	if (of_machine_is_compatible("lantiq,ar10")) {
+-    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX300) & 0x00FF) != 0 || (IFX_REG_R32(DMRX_PKTCNT_XRX300) & 0x00FF) != 0 || (IFX_REG_R32(DSRX_PGCNT_XRX300) & 0x00FF) != 0 )
+-		pr_info("%s error: IFX_REG_R32(DMRX_PGCNT_XRX300) = 0x%08x, IFX_REG_R32(DMRX_PKTCNT_XRX300) = 0x%08x, IFX_REG_R32(DSRX_PGCNT_XRX300) = 0x%08x\n", __func__, IFX_REG_R32(DMRX_PGCNT_XRX300), IFX_REG_R32(DMRX_PKTCNT_XRX300), IFX_REG_R32(DSRX_PGCNT_XRX300));
++		if ((IFX_REG_R32(DMRX_PGCNT_XRX300) & 0x00FF) != 0 ||
++			(IFX_REG_R32(DMRX_PKTCNT_XRX300) & 0x00FF) != 0 ||
++			(IFX_REG_R32(DSRX_PGCNT_XRX300) & 0x00FF) != 0) {
++			pr_info("%s error: DMRX_PGCNT_XRX300 = 0x%08x\n",
++					__func__,
++					IFX_REG_R32(DMRX_PGCNT_XRX300));
++			pr_info("DMRX_PKTCNT_XRX300 = 0x%08x\n",
++					IFX_REG_R32(DMRX_PKTCNT_XRX300));
++			pr_info("DSRX_PGCNT_XRX300 = 0x%08x\n",
++					IFX_REG_R32(DSRX_PGCNT_XRX300));
++		}
+ 	}
+ 
+ 	if (of_machine_is_compatible("lantiq,vr9")) {
+-    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX200) & 0x00FF) != 0 || (IFX_REG_R32(DMRX_PKTCNT_XRX200) & 0x00FF) != 0 || (IFX_REG_R32(DSRX_PGCNT_XRX200) & 0x00FF) != 0 )
+-		pr_info("%s error: IFX_REG_R32(DMRX_PGCNT_XRX200) = 0x%08x, IFX_REG_R32(DMRX_PKTCNT_XRX200) = 0x%08x, IFX_REG_R32(DSRX_PGCNT_XRX200) = 0x%08x\n", __func__, IFX_REG_R32(DMRX_PGCNT_XRX300), IFX_REG_R32(DMRX_PKTCNT_XRX200), IFX_REG_R32(DSRX_PGCNT_XRX200));
++		if ((IFX_REG_R32(DMRX_PGCNT_XRX200) & 0x00FF) != 0 ||
++			(IFX_REG_R32(DMRX_PKTCNT_XRX200) & 0x00FF) != 0 ||
++			(IFX_REG_R32(DSRX_PGCNT_XRX200) & 0x00FF) != 0) {
++			pr_info("%s error: DMRX_PGCNT_XRX200 = 0x%08x\n",
++					__func__,
++					IFX_REG_R32(DMRX_PGCNT_XRX200));
++			pr_info("DMRX_PKTCNT_XRX200 = 0x%08x\n",
++					IFX_REG_R32(DMRX_PKTCNT_XRX200));
++			pr_info("DSRX_PGCNT_XRX200 = 0x%08x\n",
++					IFX_REG_R32(DSRX_PGCNT_XRX200));
++
++		}
+ 	}
+ 	return;
+ }
+@@ -575,7 +608,7 @@ void __init ltq_soc_init(void)
+ 	if (!pmu_membase || !ltq_cgu_membase || !ltq_ebu_membase)
+ 		panic("Failed to remap core resources");
+ 
+-	if (of_machine_is_compatible("lantiq,ar10") || 
++	if (of_machine_is_compatible("lantiq,ar10") ||
+ 		of_machine_is_compatible("lantiq,grx390")) {
+ 
+ 		if (of_address_to_resource(np_ebu, 1, &res_hsnand))
+@@ -590,16 +623,17 @@ void __init ltq_soc_init(void)
+ 	if (!ltq_dmanand_membase)
+ 			panic("Failed to remap hsnand resources");
+ 	}
+-	
++
+ 	if (of_machine_is_compatible("lantiq,vr9")) {
+ 		struct resource res_xbar;
+ 		struct device_node *np_xbar =
+-			of_find_compatible_node(NULL, NULL, "lantiq,xbar-xway");
++			of_find_compatible_node(NULL, NULL,
++						"lantiq,xbar-xway");
+ 		if (!np_xbar)
+ 			panic("Failed to load xbar nodes from devicetree");
+ 		if (of_address_to_resource(np_pmu, 0, &res_xbar))
+ 			panic("Failed to get xbar resources");
+-		if(request_mem_region(res_xbar.start, resource_size(&res_xbar),
++		if (request_mem_region(res_xbar.start, resource_size(&res_xbar),
+ 				res_xbar.name) < 0)
+ 			panic("Failed to get xbar resources");
+ 
+@@ -614,7 +648,8 @@ void __init ltq_soc_init(void)
+ 			ltq_dplus_clean();
+ 	}
+ 	/* make sure to unprotect the memory region where flash is located */
+-	ltq_ebu_w32(ltq_ebu_r32(LTQ_EBU_BUSCON0) & ~EBU_WRDIS, LTQ_EBU_BUSCON0);
++	ltq_ebu_w32(ltq_ebu_r32(LTQ_EBU_BUSCON0) & ~EBU_WRDIS,
++			LTQ_EBU_BUSCON0);
+ 
+ 	/* add our generic xway clocks */
+ 	clkdev_add_pmu("10000000.fpi", NULL, 0, 0, PMU_FPI);
+@@ -639,8 +674,10 @@ void __init ltq_soc_init(void)
+ 	if (!of_machine_is_compatible("lantiq,grx390"))
+ 		clkdev_add_pmu("1e116000.mei", "dfe", 1, 0, PMU_DFE);
+ 
+-	if (of_machine_is_compatible("lantiq,ar10"))
+-		clkdev_add_pmu("1e116000.mei", "afe", 1, 2, PMU_ANALOG_DSL_AFE);
++	if (of_machine_is_compatible("lantiq,ar10")) {
++		clkdev_add_pmu("1e116000.mei", "afe", 1, 2,
++				PMU_ANALOG_DSL_AFE);
++	}
+ 
+ 	if (!of_machine_is_compatible("lantiq,ase"))
+ 		clkdev_add_pmu("1e103100.deu", NULL, 1, 0, PMU_DEU);
+@@ -673,41 +710,143 @@ void __init ltq_soc_init(void)
+ 		clkdev_add_pmu("1d900000.pcie", "pdi", 1, 1, PMU1_PCIE_PDI);
+ 		clkdev_add_pmu("1d900000.pcie", "ctl", 1, 1, PMU1_PCIE_CTL);
+ 		/* rc 1 */
+-		clkdev_add_pmu("19000000.pcie", "phy", 1, 2,
++		clkdev_add_pmu("19900000.pcie", "phy", 1, 2,
+ 			PMU_ANALOG_PCIE1_P);
+-		clkdev_add_pmu("19000000.pcie", "msi", 1, 1, PMU1_PCIE1_MSI);
+-		clkdev_add_pmu("19000000.pcie", "pdi", 1, 1, PMU1_PCIE1_PDI);
+-		clkdev_add_pmu("19000000.pcie", "ctl", 1, 1, PMU1_PCIE1_CTL);
++		clkdev_add_pmu("19900000.pcie", "msi", 1, 1, PMU1_PCIE1_MSI);
++		clkdev_add_pmu("19900000.pcie", "pdi", 1, 1, PMU1_PCIE1_PDI);
++		clkdev_add_pmu("19900000.pcie", "ctl", 1, 1, PMU1_PCIE1_CTL);
+ 	}
+ 
+ 	if (of_machine_is_compatible("lantiq,ase")) {
+-		if (ltq_cgu_r32(CGU_SYS) & (1 << 5))
+-			clkdev_add_static(CLOCK_266M, CLOCK_133M,
+-						CLOCK_133M, CLOCK_266M);
+-		else
+-			clkdev_add_static(CLOCK_133M, CLOCK_133M,
+-						CLOCK_133M, CLOCK_133M);
++		struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "cpu";
++			clk->cl.con_id = "cpu";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ase_cpu_hz();
++			clk->set_rate = ltq_ase_set_cpu_hz;
++			clk->get_rate = ltq_ase_cpu_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "fpi";
++			clk->cl.con_id = "fpi";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ase_fpi_hz();
++			clk->get_rate = ltq_ase_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "io";
++			clk->cl.con_id = "io";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ase_fpi_hz();
++			clk->get_rate = ltq_ase_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "ppe";
++			clk->cl.con_id = "ppe";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ase_pp32_hz();
++			clk->get_rate = ltq_ase_pp32_hz;
++			clkdev_add(&clk->cl);
++		}
+ 		clkdev_add_pmu("1e101000.usb", "phy", 1, 0, PMU_USB0_P);
+ 		clkdev_add_pmu("1e180000.etop", "ppe", 1, 0, PMU_PPE);
+ 		clkdev_add_cgu("1e180000.etop", "ephycgu", CGU_EPHY),
+ 		clkdev_add_pmu("1e180000.etop", "ephy", 1, 0, PMU_EPHY);
+ 		clkdev_add_pmu("1e103000.sdio", NULL, 1, 0, PMU_ASE_SDIO);
++
+ 	} else if (of_machine_is_compatible("lantiq,grx390")) {
+-		clkdev_add_static(ltq_grx390_cpu_hz(), ltq_grx390_fpi_hz(),
+-			ltq_grx390_fpi_hz(), ltq_grx390_pp32_hz());
++		struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "cpu";
++			clk->cl.con_id = "cpu";
++			clk->cl.clk = clk;
++			clk->rate = ltq_grx390_cpu_hz();
++			clk->set_rate = ltq_grx390_set_cpu_hz;
++			clk->get_rate = ltq_grx390_cpu_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "fpi";
++			clk->cl.con_id = "fpi";
++			clk->cl.clk = clk;
++			clk->rate = ltq_grx390_fpi_hz();
++			clk->get_rate = ltq_grx390_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "io";
++			clk->cl.con_id = "io";
++			clk->cl.clk = clk;
++			clk->rate = ltq_grx390_fpi_hz();
++			clk->get_rate = ltq_grx390_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "ppe";
++			clk->cl.con_id = "ppe";
++			clk->cl.clk = clk;
++			clk->rate = ltq_grx390_pp32_hz();
++			clk->get_rate = ltq_grx390_pp32_hz;
++			clkdev_add(&clk->cl);
++		}
+ 		clkdev_add_pmu("1e106000.usb", "ctl", 1, 0, PMU_USB1);
+ 		/* rc 2 */
+-		clkdev_add_pmu("1a800000.pcie", "phy", 1, 2,
++		clkdev_add_pmu("19b00000.pcie", "phy", 1, 2,
+ 			PMU_ANALOG_PCIE2_P);
+-		clkdev_add_pmu("1a800000.pcie", "msi", 1, 1, PMU1_PCIE2_MSI);
+-		clkdev_add_pmu("1a800000.pcie", "pdi", 1, 1, PMU1_PCIE2_PDI);
+-		clkdev_add_pmu("1a800000.pcie", "ctl", 1, 1, PMU1_PCIE2_CTL);
++		clkdev_add_pmu("19b00000.pcie", "msi", 1, 1, PMU1_PCIE2_MSI);
++		clkdev_add_pmu("19b00000.pcie", "pdi", 1, 1, PMU1_PCIE2_PDI);
++		clkdev_add_pmu("19b00000.pcie", "ctl", 1, 1, PMU1_PCIE2_CTL);
+ 		clkdev_add_pmu("1e108000.eth", NULL, 1, 0, PMU_SWITCH |
+ 			PMU_PPE_DP);
+ 		clkdev_add_pmu("1da00000.usif", "NULL", 1, 0, PMU_USIF);
+ 	} else if (of_machine_is_compatible("lantiq,ar10")) {
+-		clkdev_add_static(ltq_ar10_cpu_hz(), ltq_ar10_fpi_hz(),
+-			ltq_ar10_fpi_hz(), ltq_ar10_pp32_hz());
++		struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "cpu";
++			clk->cl.con_id = "cpu";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar10_cpu_hz();
++			clk->set_rate = ltq_ar10_set_cpu_hz;
++			clk->get_rate = ltq_ar10_cpu_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "fpi";
++			clk->cl.con_id = "fpi";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar10_fpi_hz();
++			clk->get_rate = ltq_ar10_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "io";
++			clk->cl.con_id = "io";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar10_fpi_hz();
++			clk->get_rate = ltq_ar10_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "ppe";
++			clk->cl.con_id = "ppe";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar10_pp32_hz();
++			clk->get_rate = ltq_ar10_pp32_hz;
++			clkdev_add(&clk->cl);
++		}
+ 		clkdev_add_pmu("1e106000.usb", "ctl", 1, 0, PMU_USB1);
+ 		clkdev_add_pmu("1e108000.eth", NULL, 1, 0, PMU_SWITCH |
+ 			PMU_PPE_DP | PMU_PPE_TC);
+@@ -715,8 +854,43 @@ void __init ltq_soc_init(void)
+ 		clkdev_add_pmu("1f203000.rcu", "gphy", 1, 0, PMU_GPHY);
+ 
+ 	} else if (of_machine_is_compatible("lantiq,vr9")) {
+-		clkdev_add_static(ltq_vr9_cpu_hz(), ltq_vr9_fpi_hz(),
+-				ltq_vr9_fpi_hz(), ltq_vr9_pp32_hz());
++		struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "cpu";
++			clk->cl.con_id = "cpu";
++			clk->cl.clk = clk;
++			clk->rate = ltq_vr9_cpu_hz();
++			clk->set_rate = ltq_vr9_set_cpu_hz;
++			clk->get_rate = ltq_vr9_cpu_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "fpi";
++			clk->cl.con_id = "fpi";
++			clk->cl.clk = clk;
++			clk->rate = ltq_vr9_fpi_hz();
++			clk->get_rate = ltq_vr9_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "io";
++			clk->cl.con_id = "io";
++			clk->cl.clk = clk;
++			clk->rate = ltq_vr9_fpi_hz();
++			clk->get_rate = ltq_vr9_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "ppe";
++			clk->cl.con_id = "ppe";
++			clk->cl.clk = clk;
++			clk->rate = ltq_vr9_pp32_hz();
++			clk->get_rate = ltq_vr9_pp32_hz;
++			clkdev_add(&clk->cl);
++		}
+ 		clkdev_add_pmu("1e101000.usb", "phy", 1, 0, PMU_USB0_P);
+ 		clkdev_add_pmu("1e101000.usb", "ctl", 1, 0,
+ 			PMU_USB0 | PMU_AHBM);
+@@ -739,16 +913,86 @@ void __init ltq_soc_init(void)
+ 		pmu_w32(~0, PMU_PWDSR1);
+ 		pmu_w32(pmu_r32(PMU_PWDSR) & ~PMU_PCIE_CLK, PMU_PWDSR);
+ 	} else if (of_machine_is_compatible("lantiq,ar9")) {
+-		clkdev_add_static(ltq_ar9_cpu_hz(), ltq_ar9_fpi_hz(),
+-				ltq_ar9_fpi_hz(), CLOCK_250M);
++		struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "cpu";
++			clk->cl.con_id = "cpu";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar9_cpu_hz();
++			clk->set_rate = ltq_ar9_set_cpu_hz;
++			clk->get_rate = ltq_ar9_cpu_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "fpi";
++			clk->cl.con_id = "fpi";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar9_fpi_hz();
++			clk->get_rate = ltq_ar9_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "io";
++			clk->cl.con_id = "io";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar9_fpi_hz();
++			clk->get_rate = ltq_ar9_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "ppe";
++			clk->cl.con_id = "ppe";
++			clk->cl.clk = clk;
++			clk->rate = ltq_ar9_pp32_hz();
++			clk->get_rate = ltq_ar9_pp32_hz;
++			clkdev_add(&clk->cl);
++		}
+ 		clkdev_add_pmu("1e101000.usb", "phy", 1, 0, PMU_USB0_P);
+ 		clkdev_add_pmu("1e106000.usb", "phy", 1, 0, PMU_USB1_P);
+ 		clkdev_add_pmu("1e106000.usb", "ctl", 1, 0, PMU_USB1);
+ 		clkdev_add_pmu("1e180000.etop", "switch", 1, 0, PMU_SWITCH);
+ 		clkdev_add_pmu("1e103000.sdio", NULL, 1, 0, PMU_SDIO);
+ 	} else {
+-		clkdev_add_static(ltq_danube_cpu_hz(), ltq_danube_fpi_hz(),
+-				ltq_danube_fpi_hz(), ltq_danube_pp32_hz());
++		struct clk *clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "cpu";
++			clk->cl.con_id = "cpu";
++			clk->cl.clk = clk;
++			clk->rate = ltq_danube_cpu_hz();
++			clk->set_rate = ltq_danube_set_cpu_hz;
++			clk->get_rate = ltq_danube_cpu_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "fpi";
++			clk->cl.con_id = "fpi";
++			clk->cl.clk = clk;
++			clk->rate = ltq_danube_fpi_hz();
++			clk->get_rate = ltq_danube_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "io";
++			clk->cl.con_id = "io";
++			clk->cl.clk = clk;
++			clk->rate = ltq_danube_fpi_hz();
++			clk->get_rate = ltq_danube_fpi_hz;
++			clkdev_add(&clk->cl);
++		}
++		clk = kzalloc(sizeof(struct clk), GFP_KERNEL);
++		if (clk) {
++			clk->cl.dev_id = "ppe";
++			clk->cl.con_id = "ppe";
++			clk->cl.clk = clk;
++			clk->rate = ltq_danube_pp32_hz();
++			clk->get_rate = ltq_danube_pp32_hz;
++			clkdev_add(&clk->cl);
++		}
+ 		clkdev_add_pmu("1e101000.usb", "phy", 1, 0, PMU_USB0_P);
+ 		clkdev_add_pmu("1e103000.sdio", NULL, 1, 0, PMU_SDIO);
+ 	}

@@ -1,0 +1,65 @@
+From 75a022410500cc32572ef8b47cefff1e25d649aa Mon Sep 17 00:00:00 2001
+From: Bryce Poole <Bryce.Poole@intel.com>
+Date: Tue, 2 Feb 2016 12:57:58 -0800
+Subject: [PATCH 256/441] eMMC: Disable interrupt line in kernel
+
+In the suspend function, the host controller interrupts are disabled to
+prevent spurious interrupts while the controller is powered down.
+However, because the first host controller is shared, this corrupts the
+state of the host controller for the ARM side. The change is to disable
+the irq in the kernel and not the host.
+
+NOTE: This assumes that the host is not on a shared interrupt line.
+Should this ever done on a controller that shares a line, it will
+disable all the other devices.
+---
+ drivers/mmc/host/sdhci.c | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+--- a/drivers/mmc/host/sdhci.c
++++ b/drivers/mmc/host/sdhci.c
+@@ -2900,11 +2900,24 @@ int sdhci_runtime_suspend_host(struct sd
+ 		host->flags &= ~SDHCI_NEEDS_RETUNING;
+ 	}
+ 
+-	spin_lock_irqsave(&host->lock, flags);
+-	sdhci_mask_irqs(host, SDHCI_INT_ALL_MASK);
+-	spin_unlock_irqrestore(&host->lock, flags);
++    if (MMC_HOST_SUPPORTS_HW_MUTEX(host->mmc))
++    {
++        /*
++         * This host controller is shared with another processor. Instead of
++         * masking interrupts at the host controller level, do it at the OS
++         * level. Danger: this irq must not be shared, or it will obviously
++         * affect other devices sharing the irq.
++         */
++        disable_irq(host->irq);
++    }
++    else
++    {
++        spin_lock_irqsave(&host->lock, flags);
++        sdhci_mask_irqs(host, SDHCI_INT_ALL_MASK);
++        spin_unlock_irqrestore(&host->lock, flags);
+ 
+-	synchronize_irq(host->irq);
++        synchronize_irq(host->irq);
++    }
+ 
+ 	spin_lock_irqsave(&host->lock, flags);
+ 	host->runtime_suspended = true;
+@@ -2919,6 +2932,15 @@ int sdhci_runtime_resume_host(struct sdh
+ 	unsigned long flags;
+ 	int ret = 0, host_flags = host->flags;
+ 
++    if (MMC_HOST_SUPPORTS_HW_MUTEX(host->mmc))
++    {
++        /*
++         * Unmask the interrupt at the OS level. Corresponds to disable_irq()
++         * call in sdhci_runtime_suspend_host().
++         */
++        enable_irq(host->irq);
++    }
++
+ 	if (host_flags & (SDHCI_USE_SDMA | SDHCI_USE_ADMA)) {
+ 		if (host->ops->enable_dma)
+ 			host->ops->enable_dma(host);

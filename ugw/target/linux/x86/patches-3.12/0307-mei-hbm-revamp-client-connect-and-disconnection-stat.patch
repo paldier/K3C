@@ -1,0 +1,211 @@
+From e0571dbb97d546594603f2a237ef161279115cba Mon Sep 17 00:00:00 2001
+From: Alexander Usyskin <alexander.usyskin@intel.com>
+Date: Mon, 17 Feb 2014 15:13:20 +0200
+Subject: [PATCH 307/441] mei: hbm: revamp client connect and disconnection
+ status
+
+1. Return -ENOTTY on client connect if the requested client was not found
+ on the enumeration list or the client was internally disabled, in the later
+ case FW will return NOT_FOUND.
+2. Return -EBUSY if the client cannot be connected because of resource
+ contention
+3. Change response status enum to have MEI_CL_ prefix
+4. Add function to translate response status to a string
+for more readable logging
+
+Change-Id: I9d85c7a7a2b9eabf81f51dc65b9cb4ced1c7f076
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 11a5a34528b3645800da3bb014993ecdfbcd3b5c)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/client.c | 13 ++++-----
+ drivers/misc/mei/hbm.c    | 67 ++++++++++++++++++++++++++++++-----------------
+ drivers/misc/mei/hw.h     | 16 +++++------
+ drivers/misc/mei/main.c   |  2 +-
+ 4 files changed, 59 insertions(+), 39 deletions(-)
+
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -569,18 +569,19 @@ int mei_cl_connect(struct mei_cl *cl, st
+ 	}
+ 
+ 	mutex_unlock(&dev->device_lock);
+-	rets = wait_event_timeout(dev->wait_recvd_msg,
+-				 (cl->state == MEI_FILE_CONNECTED ||
+-				  cl->state == MEI_FILE_DISCONNECTED),
+-				 mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
++	wait_event_timeout(dev->wait_recvd_msg,
++			(cl->state == MEI_FILE_CONNECTED ||
++			 cl->state == MEI_FILE_DISCONNECTED),
++			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
+ 	mutex_lock(&dev->device_lock);
+ 
+ 	if (cl->state != MEI_FILE_CONNECTED) {
+-		rets = -EFAULT;
++		/* something went really wrong */
++		if (!cl->status)
++			cl->status = -EFAULT;
+ 
+ 		mei_io_list_flush(&dev->ctrl_rd_list, cl);
+ 		mei_io_list_flush(&dev->ctrl_wr_list, cl);
+-		goto out;
+ 	}
+ 
+ 	rets = cl->status;
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -23,6 +23,40 @@
+ #include "hbm.h"
+ #include "hw-me.h"
+ 
++static const char *mei_cl_conn_status_str(enum mei_cl_connect_status status)
++{
++#define MEI_CL_CS(status) case MEI_CL_CONN_##status: return #status
++	switch (status) {
++	MEI_CL_CS(SUCCESS);
++	MEI_CL_CS(NOT_FOUND);
++	MEI_CL_CS(ALREADY_STARTED);
++	MEI_CL_CS(OUT_OF_RESOURCES);
++	MEI_CL_CS(MESSAGE_SMALL);
++	default: return "unknown";
++	}
++#undef MEI_CL_CCS
++}
++
++/**
++ * mei_cl_conn_status_to_errno - convert client connect response
++ * status to error code
++ *
++ * @status: client connect response status
++ *
++ * returns corresponding error code
++ */
++static int mei_cl_conn_status_to_errno(enum mei_cl_connect_status status)
++{
++	switch (status) {
++	case MEI_CL_CONN_SUCCESS:          return 0;
++	case MEI_CL_CONN_NOT_FOUND:        return -ENOTTY;
++	case MEI_CL_CONN_ALREADY_STARTED:  return -EBUSY;
++	case MEI_CL_CONN_OUT_OF_RESOURCES: return -EBUSY;
++	case MEI_CL_CONN_MESSAGE_SMALL:    return -EINVAL;
++	default:                           return -EINVAL;
++	}
++}
++
+ /**
+  * mei_hbm_me_cl_allocate - allocates storage for me clients
+  *
+@@ -111,14 +145,11 @@ static bool is_treat_specially_client(st
+ 		struct hbm_client_connect_response *rs)
+ {
+ 	if (mei_hbm_cl_addr_equal(cl, rs)) {
+-		if (!rs->status) {
++		if (rs->status == MEI_CL_CONN_SUCCESS)
+ 			cl->state = MEI_FILE_CONNECTED;
+-			cl->status = 0;
+-
+-		} else {
++		else
+ 			cl->state = MEI_FILE_DISCONNECTED;
+-			cl->status = -ENODEV;
+-		}
++		cl->status = mei_cl_conn_status_to_errno(rs->status);
+ 		cl->timer_count = 0;
+ 
+ 		return true;
+@@ -438,14 +469,8 @@ static void mei_hbm_cl_disconnect_res(st
+ 	struct mei_cl *cl;
+ 	struct mei_cl_cb *pos = NULL, *next = NULL;
+ 
+-	dev_dbg(&dev->pdev->dev,
+-			"disconnect_response:\n"
+-			"ME Client = %d\n"
+-			"Host Client = %d\n"
+-			"Status = %d\n",
+-			rs->me_addr,
+-			rs->host_addr,
+-			rs->status);
++	dev_dbg(&dev->pdev->dev, "hbm: disconnect response cl:host=%02d me=%02d status=%d\n",
++			rs->me_addr, rs->host_addr, rs->status);
+ 
+ 	list_for_each_entry_safe(pos, next, &dev->ctrl_rd_list.list, list) {
+ 		cl = pos->cl;
+@@ -458,7 +483,7 @@ static void mei_hbm_cl_disconnect_res(st
+ 		dev_dbg(&dev->pdev->dev, "list_for_each_entry_safe in ctrl_rd_list.\n");
+ 		if (mei_hbm_cl_addr_equal(cl, rs)) {
+ 			list_del(&pos->list);
+-			if (!rs->status)
++			if (rs->status == MEI_CL_DISCONN_SUCCESS)
+ 				cl->state = MEI_FILE_DISCONNECTED;
+ 
+ 			cl->status = 0;
+@@ -500,14 +525,9 @@ static void mei_hbm_cl_connect_res(struc
+ 	struct mei_cl *cl;
+ 	struct mei_cl_cb *pos = NULL, *next = NULL;
+ 
+-	dev_dbg(&dev->pdev->dev,
+-			"connect_response:\n"
+-			"ME Client = %d\n"
+-			"Host Client = %d\n"
+-			"Status = %d\n",
+-			rs->me_addr,
+-			rs->host_addr,
+-			rs->status);
++	dev_dbg(&dev->pdev->dev, "hbm: connect response cl:host=%02d me=%02d status=%s\n",
++			rs->me_addr, rs->host_addr,
++			mei_cl_conn_status_str(rs->status));
+ 
+ 	/* if WD or iamthif client treat specially */
+ 
+@@ -532,7 +552,6 @@ static void mei_hbm_cl_connect_res(struc
+ 		if (pos->fop_type == MEI_FOP_CONNECT) {
+ 			if (is_treat_specially_client(cl, rs)) {
+ 				list_del(&pos->list);
+-				cl->status = 0;
+ 				cl->timer_count = 0;
+ 				break;
+ 			}
+--- a/drivers/misc/mei/hw.h
++++ b/drivers/misc/mei/hw.h
+@@ -89,19 +89,19 @@ enum mei_stop_reason_types {
+  * Client Connect Status
+  * used by hbm_client_connect_response.status
+  */
+-enum client_connect_status_types {
+-	CCS_SUCCESS = 0x00,
+-	CCS_NOT_FOUND = 0x01,
+-	CCS_ALREADY_STARTED = 0x02,
+-	CCS_OUT_OF_RESOURCES = 0x03,
+-	CCS_MESSAGE_SMALL = 0x04
++enum mei_cl_connect_status {
++	MEI_CL_CONN_SUCCESS          = 0x00,
++	MEI_CL_CONN_NOT_FOUND        = 0x01,
++	MEI_CL_CONN_ALREADY_STARTED  = 0x02,
++	MEI_CL_CONN_OUT_OF_RESOURCES = 0x03,
++	MEI_CL_CONN_MESSAGE_SMALL    = 0x04
+ };
+ 
+ /*
+  * Client Disconnect Status
+  */
+-enum client_disconnect_status_types {
+-	CDS_SUCCESS = 0x00
++enum  mei_cl_disconnect_status {
++	MEI_CL_DISCONN_SUCCESS = 0x00
+ };
+ 
+ /*
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@ -471,7 +471,7 @@ static int mei_ioctl_connect_client(stru
+ 	if (i < 0 || dev->me_clients[i].props.fixed_address) {
+ 		dev_dbg(&dev->pdev->dev, "Cannot connect to FW Client UUID = %pUl\n",
+ 				&data->in_client_uuid);
+-		rets = -ENODEV;
++		rets = -ENOTTY;
+ 		goto end;
+ 	}
+ 

@@ -1,0 +1,419 @@
+# HG changeset patch
+# Parent 02fe5ec2d6a339162fb4c021c7c1bcf21081119e
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -2626,3 +2626,5 @@ source "crypto/Kconfig"
+ source "arch/x86/kvm/Kconfig"
+ 
+ source "lib/Kconfig"
++
++source "arch/x86/pp_init/Kconfig"
+--- a/arch/x86/Makefile
++++ b/arch/x86/Makefile
+@@ -182,6 +182,7 @@ drivers-$(CONFIG_AVALANCHE_INTD_APPCPU)
+ drivers-$(CONFIG_PAL_CPPI41_APPCPU) += arch/x86/pal_cppi41/
+ drivers-$(CONFIG_HW_MUTEXES)     += arch/x86/hw_mutex/
+ drivers-$(CONFIG_HW_MAILBOX)     += arch/x86/hw_mailbox/
++drivers-$(CONFIG_PP_TX_INIT)     += arch/x86/pp_init/
+ 
+ # must be linked after kernel/
+ drivers-$(CONFIG_OPROFILE) += arch/x86/oprofile/
+--- /dev/null
++++ b/arch/x86/pp_init/Kconfig
+@@ -0,0 +1,12 @@
++#
++# PP init driver configuration
++#
++
++config PP_TX_INIT
++	tristate "PP tx init driver support"
++	default m
++	depends on X86
++	---help---
++	  Remap NP CPU memory to APP CPU and initialize PP tx
++
++
+--- /dev/null
++++ b/arch/x86/pp_init/Makefile
+@@ -0,0 +1,19 @@
++#
++# Copyright (c) 2016, Intel Corporation and its suppliers.
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms and conditions of the GNU General Public License,
++# version 2, as published by the Free Software Foundation.
++#
++# This program is distributed in the hope it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# You should have received a copy of the GNU General Public License along with
++# this program; if not, write to the Free Software Foundation, Inc.,
++# 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++#
++#
++
++obj-$(CONFIG_PP_TX_INIT) := puma7_pp_init.o
+--- /dev/null
++++ b/arch/x86/pp_init/puma7_pp_init.c
+@@ -0,0 +1,358 @@
++/*
++ * puma7_pp_init.c
++ *  Description:
++ * Puma-7 Packet Processor initialization.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/avalanche/generic/avalanche_pp_api.h>
++#include <linux/avalanche/puma7/puma7_pp.h>
++#include <linux/avalanche/generic/pal.h>
++#include <linux/avalanche/generic/pal_cppi41.h>
++#include <linux/avalanche/puma7/puma7_cppi.h>
++#include <linux/avalanche/puma7/puma7_cppi_prv.h>
++#include <linux/avalanche/puma7/puma7.h>
++#include <linux/avalanche/generic/avalanche_intc.h>
++#include <linux/netdevice.h>
++#include <linux/unistd.h>
++#include <linux/interrupt.h>
++#include <linux/netip_subsystem.h>
++
++
++/*Defines*/
++#define PAL_CPPI41_ACC_MAX_PAGE_ENTRIES                32
++#define PAL_CPPI41_ACC_LIST_NULL_TERM                  0
++#define PAL_CPPI41_ACC_PACE_MODE_LASTINTR              1
++#define PAL_CPPI41_ACC_PACE_TICK_CNT                   40
++#define PAL_CPPI41_ACC_MAX_PAGE_COUNT                  2
++
++/*Function decleration*/
++static void __do_tx_complete(unsigned long data);
++static int __init_acc_channel(PAL_Handle pal_hnd, int chan_num, Cppi4Queue queue, PAL_Cppi4AccChHnd *acc_hnd);
++irqreturn_t tx_complete_interrupt(int irq, void *dev);
++Int32 __setup_txcomplete(PAL_Handle palHnd);
++static int replace_npcpu_memory_for_queue(PAL_Handle palHnd, int qnum);
++static int replace_npcpu_memory(PAL_Handle palHnd);
++static int __init tx_comp_init(void);
++static void __exit tx_comp_cleanup (void);
++
++
++/*Declerations*/
++struct tasklet_struct   gTxCompleteTasklet;     /* Tx completion processing tasklet */
++PAL_Cppi4AccChHnd       gTxCompleteAccChHnd[PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT];
++Ptr                     gTxCompleteAccListBase[PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT];
++Cppi4HostDescLinux **gTxCompleteAccList[PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT];
++PAL_Cppi4QueueHnd       gHost2ppFreeHostDescQueueHnd[PAL_CPPI_PP_HOST2PP_INFRA_DMA_CH_COUNT];
++
++static unsigned int q_info[] = {
++    PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM,
++    PAL_CPPI_PP_QMGR_G2_ATOM_HI_INFRA_HOST_FD_Q_NUM,
++    PAL_CPPI_PP_QMGR_G2_RGMII0_HI_INFRA_HOST_FD_Q_NUM,
++    PAL_CPPI_PP_QMGR_G2_RGMII1_HI_INFRA_HOST_FD_Q_NUM,
++    PAL_CPPI_PP_QMGR_G2_SGMII0_HI_INFRA_HOST_FD_Q_NUM,
++    PAL_CPPI_PP_QMGR_G2_SGMII1_HI_INFRA_HOST_FD_Q_NUM,
++    PAL_CPPI_PP_QMGR_G2_HOST2PP_LOW_HOST_FD_Q_NUM,
++    PAL_CPPI_PP_QMGR_G2_HOST2PP_HI_HOST_FD_Q_NUM,
++};
++
++/*Code section*/
++
++static void __do_tx_complete(unsigned long data)
++{
++	Cppi4HostDescLinux *hostDesc;
++	Uint32      packets_processed = 0;
++	Int32       priority;
++
++	/* Start with high priority channel */
++	for (priority = PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT - 1; priority >= 0; priority--) {
++		/* While there are ready pages... */
++		while (avalanche_intd_get_interrupt_count(0, PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(priority))) {
++            int list_entry_count;
++            unsigned long long timeout = 1<<31; /* long timeout */
++
++            do {
++                PAL_CPPI4_CACHE_INVALIDATE(gTxCompleteAccList[priority], sizeof(int *));
++                list_entry_count = be32_to_cpu((unsigned long)*gTxCompleteAccList[priority]);
++                pr_debug("%s:%d: list_entry_count %x\n", __func__, __LINE__, list_entry_count);
++            } while(!list_entry_count && --timeout);
++
++            BUG_ON(!timeout);
++
++            *gTxCompleteAccList[priority] = NULL;
++            PAL_CPPI4_CACHE_INVALIDATE(gTxCompleteAccList[priority], sizeof(int *));
++            gTxCompleteAccList[priority]++;
++
++            while(list_entry_count--) {
++                do {
++                    PAL_CPPI4_CACHE_INVALIDATE(gTxCompleteAccList[priority], sizeof(int *));
++                    hostDesc = (Cppi4HostDescLinux*)(be32_to_cpu((unsigned long)*gTxCompleteAccList[priority]) & QMGR_QUEUE_N_REG_D_DESC_ADDR_MASK);
++                    pr_debug("%s:%d: hostDesc 0x%x\n", __func__, __LINE__, (unsigned long)hostDesc);
++                } while (!hostDesc);
++
++                *gTxCompleteAccList[priority] = NULL;
++                PAL_CPPI4_CACHE_INVALIDATE(gTxCompleteAccList[priority], sizeof(int *));
++                hostDesc = PAL_CPPI4_PHYS_2_VIRT(hostDesc);
++
++                PAL_CPPI4_CACHE_INVALIDATE(hostDesc, PAL_CPPI_PP_QMGR_GLOBAL_DEFAULT_DESC_SIZE);
++
++                dev_kfree_skb_any(be32_to_cpu(hostDesc->skb));
++                hostDesc->skb = NULL;
++
++                /* Queue back the hostDesc to free pool */
++                PAL_cppi4QueuePush(gHost2ppFreeHostDescQueueHnd[priority], (Ptr)PAL_CPPI4_VIRT_2_PHYS(hostDesc), PAL_CPPI4_DESCSIZE_2_QMGRSIZE(PAL_CPPI_PP_QMGR_GLOBAL_DEFAULT_DESC_SIZE), 0);
++
++                packets_processed++;
++                gTxCompleteAccList[priority]++;
++			}
++
++			/* Update the list entry for next time */
++			gTxCompleteAccList[priority] = PAL_cppi4AccChGetNextList(gTxCompleteAccChHnd[priority]);
++
++			/* Decrement number of pages by 1 */
++			avalanche_intd_set_interrupt_count(0, PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(priority), 1);
++		}
++	}
++
++	/* First clear the IRQ in order not to get a false interrupt since INTD is level */
++	avalanche_intc_clear_status(MAP_INTD_TO_INTC(PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_INTV_NUM));
++
++    /* Send INTD EOI */
++	avalanche_intd_write_eoi(PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_INTV_NUM);
++
++	/* It could be that between INTD count decrement and EOI the accumulator will issue another interrupt.
++	   The logic of INTD is such that level will remain active high even after EOI is set, so INTC will
++	   lose the interrupt after ack_irq is done (it now expects INTD polarity change).
++	   Therefore we must check INTD count and if it is not 0 - reschedule the tasklet */
++	for (priority = PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT - 1; priority >= 0; priority--) {
++		if (avalanche_intd_get_interrupt_count(0, PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(priority))) {
++            tasklet_schedule(&gTxCompleteTasklet);
++			return;
++		}
++	}
++
++	avalanche_intc_enable_irq(MAP_INTD_TO_INTC(PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_INTV_NUM));
++}
++
++static int __init_acc_channel(PAL_Handle pal_hnd, int chan_num, Cppi4Queue queue, PAL_Cppi4AccChHnd *acc_hnd)
++{
++	Cppi4AccumulatorCfg cfg;
++	unsigned int accListSize;
++
++	*acc_hnd = NULL;
++
++	cfg.accChanNum             = chan_num;
++	cfg.list.maxPageEntry      = PAL_CPPI41_ACC_MAX_PAGE_ENTRIES;   /* This is entries per page (and we have 2 pages) */
++	cfg.list.listEntrySize     = PAL_CPPI41_ACC_ENTRY_TYPE_D;   /* Only interested in register 'D' which has the desc pointer */
++    cfg.list.listCountMode     = 1;                                 /* 1 => Entry Count Mode */
++    cfg.list.pacingMode        = PAL_CPPI41_ACC_PACE_MODE_LASTINTR; /* Wait for time since last interrupt */
++	cfg.pacingTickCnt          = PAL_CPPI41_ACC_PACE_TICK_CNT;      /* Wait for 1000uS == 1ms */
++	cfg.list.maxPageCnt        = PAL_CPPI41_ACC_MAX_PAGE_COUNT;     /* Use two pages */
++	cfg.list.stallAvoidance    = 1;                             /* Use the stall avoidance feature */
++	cfg.queue                  = queue;
++	cfg.mode                   = 0;
++
++	accListSize = (cfg.list.maxPageEntry * (cfg.list.listEntrySize + 1)) * cfg.list.maxPageCnt * sizeof(Uint32);
++	if (!(cfg.list.listBase = kzalloc(accListSize, GFP_KERNEL))) {
++		pr_err("Unable to allocate list page of size %d\n", accListSize);
++		return -1;
++	}
++
++	PAL_CPPI4_CACHE_WRITEBACK((unsigned long)cfg.list.listBase, accListSize);
++
++	if (!(*acc_hnd = PAL_cppi4AccChOpen(pal_hnd, &cfg))) {
++		pr_err("Unable to open accumulator channel #%d\n", chan_num);
++		kfree(cfg.list.listBase);
++		return -1;
++	}
++
++	return 0;
++}
++
++irqreturn_t tx_complete_interrupt(int irq, void *dev)
++{
++	/* Since the INTD interrupts are level, need to disable the IRQ in order to run the tasklet */
++	avalanche_intc_disable_irq(MAP_INTD_TO_INTC(PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_INTV_NUM));
++
++	tasklet_schedule(&gTxCompleteTasklet);
++
++	return IRQ_RETVAL(1);
++}
++
++
++Int32 __setup_txcomplete(PAL_Handle palHnd)
++{
++	Cppi4Queue  txCmplQ;
++	Cppi4Queue  fdHostQ;
++	Uint8       priority;
++
++	for (priority = 0; priority < PAL_CPPI_PP_HOST2PP_INFRA_DMA_CH_COUNT; priority++) {
++		/************************************************/
++		/* reset Tx complete queue                      */
++		/************************************************/
++		txCmplQ.qMgr = PAL_CPPI_PP_QMGR_G2;
++		txCmplQ.qNum = PAL_CPPI_PP_HOST2PP_TX_COMPLETE_Q_NUM(priority);
++		PAL_cppi4QueueClose(palHnd, PAL_cppi4QueueOpen(palHnd, txCmplQ));
++
++		fdHostQ.qMgr = PAL_CPPI_PP_QMGR_G2;
++		fdHostQ.qNum = PAL_CPPI_PP_HOST2PP_HOST_FD_Q_NUM(priority);
++
++		if (!(gHost2ppFreeHostDescQueueHnd[priority] = PAL_cppi4QueueOpen(palHnd, fdHostQ))) {
++			pr_err("unable to open FD Host Queue #%d for TX Complete task\n", fdHostQ.qNum);
++			return -1;
++		}
++
++		/************************************************/
++		/* Init the Tx complete accumulator channel     */
++		/************************************************/
++		if (__init_acc_channel(palHnd, PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(priority), txCmplQ, &gTxCompleteAccChHnd[priority])) {
++			pr_err("unable to open accumulator channel #%d for TX Complete task\n", PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(priority));
++			return -1;
++		}
++
++		gTxCompleteAccListBase[priority] = gTxCompleteAccList[priority] = PAL_cppi4AccChGetNextList(gTxCompleteAccChHnd[priority]);
++
++		/* request the Tx Complete IRQs - one IRQ per all TX complete priorities */
++		if (priority == 0) {
++            tasklet_init(&gTxCompleteTasklet, __do_tx_complete, 0);
++			if (netss_request_npcpu_irq(MAP_INTD_TO_INTC(PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_INTV_NUM), "TX Complete", tx_complete_interrupt, NULL))
++			{
++				pr_err("unable to get IRQ #%d for TX Complete task\n", MAP_INTD_TO_INTC(PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_INTV_NUM));
++				return -1;
++			}
++		}
++	}
++
++	return 0;
++}
++
++EXPORT_SYMBOL(__setup_txcomplete);
++
++static int replace_npcpu_memory_for_queue(PAL_Handle palHnd, int qnum)
++{
++
++    Cppi4HostDescLinux*    currDesc;
++    unsigned int i, descCount;
++    Cppi4Queue          tmpQ;
++    PAL_Cppi4QueueHnd   tmpQHnd;
++
++    tmpQ.qMgr = PAL_CPPI_PP_QMGR_G2;
++    tmpQ.qNum = qnum;
++    tmpQHnd = PAL_cppi4QueueOpen(NULL, tmpQ);
++
++
++    PAL_cppi4QueueGetEntryCount(palHnd, tmpQ, &descCount);
++    if (0 == descCount)
++    {
++        pr_err("queue num %d is empty, packet data descriptors init failed", qnum);
++        return -1;
++    }
++
++    pr_info("replace_npcpu_memory_for_queue: queue %d has %d descriptors\n", qnum, descCount);
++
++    for (i = 0; i < descCount; i++)
++    {
++        struct sk_buff *skb;
++        /* get a free RX descriptor */
++        if(!(currDesc = (Cppi4HostDescLinux *)PAL_cppi4QueuePop(tmpQHnd)) )
++            return -1;
++
++        currDesc = (Cppi4HostDescLinux *)PAL_CPPI4_PHYS_2_VIRT(currDesc);
++        skb = dev_alloc_skb(PAL_CPPI_PP_QMGR_GLOBAL_DEFAULT_BUFF_SIZE);
++        if (!skb) {
++            pr_err("%s:%d: SKB allocation FAILED\n", __func__, __LINE__);
++            return -1;
++        }
++        skb_reserve (skb, NET_IP_ALIGN);    /* 16 bit align the IP fields. */
++        currDesc->hw.orgBuffLen  = cpu_to_be32(PAL_CPPI_PP_QMGR_GLOBAL_DEFAULT_BUFF_SIZE - NET_IP_ALIGN);
++        currDesc->hw.orgBufPtr   = cpu_to_be32(PAL_CPPI4_VIRT_2_PHYS(skb->data));
++        currDesc->skb = cpu_to_be32(skb);
++
++
++        //PAL_CPPI4_CACHE_WRITEBACK(currDesc, gPpFDqueues[i].descSize);
++        PAL_cppi4QueuePush(tmpQHnd, (Uint32 *)PAL_CPPI4_VIRT_2_PHYS(currDesc), PAL_CPPI4_DESCSIZE_2_QMGRSIZE(PAL_CPPI_PP_QMGR_GLOBAL_DEFAULT_DESC_SIZE), 0);
++    }
++
++    return 0;
++}
++
++static int replace_npcpu_memory(PAL_Handle palHnd)
++{
++    unsigned int qcount;
++
++    for (qcount = 0; qcount < ARRAY_SIZE(q_info); qcount++)
++    {
++        if (replace_npcpu_memory_for_queue(palHnd, q_info[qcount]) < 0) {
++            pr_err("replace memory for queue %d FAILED!\n", q_info[qcount]);
++            return -1;
++        }
++    }
++
++    return 0;
++}
++
++static int __init tx_comp_init(void)
++{
++    int ret = 0;
++    PAL_Handle palHnd;
++    printk("Starting tx driver init\n");
++    
++    if (netip_memmap_init()) {
++        pr_err("%s:%d ERROR; netip memmap failed!\n", __func__, __LINE__);
++        ret = -1;
++        goto tx_comp_exit;
++    }
++    palHnd = PAL_cppi4Init(PAL_CPPI_PP_QMGR_G1_QUEUES_BASE, PAL_CPPI_PP_QMGR_G2_QUEUES_BASE);
++    if (replace_npcpu_memory(palHnd))
++    {
++        pr_err("%s(%d): Error - replace_npcpu_memory failed!\n", __FUNCTION__, __LINE__);
++    	goto tx_comp_exit;
++    }
++
++    if (__setup_txcomplete(palHnd)) {
++        pr_err("%s(%d): Error - setup_txcomplete failed!\n", __FUNCTION__, __LINE__);
++        goto tx_comp_exit;
++    }
++
++tx_comp_exit:
++    return ret;
++}
++
++static void __exit tx_comp_cleanup (void)
++{
++    pr_info("pp init driver cleanup done\n");
++}
++
++module_init(tx_comp_init);
++module_exit(tx_comp_cleanup);
++
++
++MODULE_AUTHOR ("Intel Corporation");
++MODULE_DESCRIPTION (DRV_NAME);
++MODULE_LICENSE("GPL");
++MODULE_VERSION(DRV_VERSION);

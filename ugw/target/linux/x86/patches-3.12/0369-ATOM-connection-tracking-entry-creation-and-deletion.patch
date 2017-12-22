@@ -1,0 +1,756 @@
+From 33495fa1ff2ff5b8719bcfdc175370e7e7ab4995 Mon Sep 17 00:00:00 2001
+From: avelayux <arunkumar.velayutham@intel.com>
+Date: Thu, 24 Mar 2016 04:47:54 -0700
+Subject: [PATCH 369/441] ATOM connection tracking entry creation and deletion
+ event sync btw ATOM and ARM Owner: Arunkumar Velayutham HSD : 1363761
+ Resolution: When there is a connection tracking record timeout happens at
+ ATOM, PP session accleration for this connection at ARM side needs to be
+ verified before deleting the connection from ATOM.Following sequence will
+ happen between ARM and ATOM when there is a conntrack record time occurs at
+ ATOM. 1: ATOM nf_ct_delete will generate TI_CT_DEATH_BY_TIMEOUT event
+ locally. 2: ATOM conntrack_client driver module will handle the
+ TI_CT_DEATH_BY_TIMEOUT event. *log the connection tracking information to
+ workqueue. *worker thread process the CT record and extract the tuple
+ information which is required to regenerate the HASH at ARM side. 3: ATOM
+ conntrack_client driver will initiate a mrpc_call to ARM with the extracted
+ tuple information. 4: ARM conntrack_server driver module handles the
+ mrpc_call from atom as below. *use the tuple information to re-generate the
+ HASH. *if HASH found, fetch the corresponding CT record from ARM. *if ARM CT
+ retrieved successfully, then generate TI_CT_ATOM_DEATH_BY_TIMEOUT event to
+ PP_HIL *PP_HIL will check if there is the a valid PP session associated with
+ this conntrack record. *PP_HIL sets the ti_pp_atom_status_flag to inform
+ conntrack_server module about the session availability. 5: ARM
+ conntrack_server driver moudle will set the MRPC reply extend_timer attribute
+ if a session is associated with this connection tracking record
+
+---
+ drivers/mrpc/Kconfig                 |   6 +
+ drivers/mrpc/core/Makefile           |   1 +
+ drivers/mrpc/core/conntrack_client.c | 514 +++++++++++++++++++++++++++++++++++
+ include/linux/mrpc.h                 |   6 +
+ include/net/netfilter/nf_conntrack.h |  28 +-
+ net/Kconfig                          |   5 +
+ net/netfilter/nf_conntrack_core.c    |  68 ++++-
+ 7 files changed, 619 insertions(+), 9 deletions(-)
+ create mode 100644 drivers/mrpc/core/conntrack_client.c
+
+--- a/drivers/mrpc/Kconfig
++++ b/drivers/mrpc/Kconfig
+@@ -26,3 +26,9 @@ config MRPC_SERVER_EXAMPLE
+     help
+        RPC over HW mailbox example server
+ 
++config MRPC_CONNTRACK_CLIENT
++    bool "ATOM to ARM CONNTRACK RPC over HW Mailbox"
++    depends on MRPC
++    default n
++    help
++       Enable Puma7 conntrack MRPC between ATOM and ARM
+--- a/drivers/mrpc/core/Makefile
++++ b/drivers/mrpc/core/Makefile
+@@ -1 +1,2 @@
+ obj-$(CONFIG_MRPC) += mrpc.o
++obj-$(CONFIG_APPCPU_GW_PP_HANDLE) += conntrack_client.o
+--- /dev/null
++++ b/drivers/mrpc/core/conntrack_client.c
+@@ -0,0 +1,514 @@
++/*
++ *
++ * conntrack_client.c
++ * Description:
++ * Connection Tracking MRPC (RPC over HW Mailbox) module.
++ *
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ":%s:%d " fmt "\n", __func__, __LINE__
++
++/************************************************/
++/**                    Includes                 */
++/************************************************/
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/kernel.h>
++#include <linux/byteorder/generic.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
++#include <linux/random.h>
++#include <linux/err.h>
++#include <linux/notifier.h>
++#include <linux/mrpc.h>
++#include <linux/platform_device.h>
++
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_l3proto.h>
++#include <net/netfilter/nf_conntrack_l4proto.h>
++#include <net/netfilter/nf_conntrack_expect.h>
++#include <net/netfilter/nf_conntrack_helper.h>
++#include <net/netfilter/nf_conntrack_seqadj.h>
++#include <net/netfilter/nf_conntrack_core.h>
++#include <net/netfilter/nf_conntrack_extend.h>
++#include <net/netfilter/nf_conntrack_acct.h>
++#include <net/netfilter/nf_conntrack_ecache.h>
++#include <net/netfilter/nf_conntrack_zones.h>
++#include <net/netfilter/nf_conntrack_tuple.h>
++#include <net/netfilter/nf_conntrack_timestamp.h>
++#include <net/netfilter/nf_conntrack_timeout.h>
++#include <net/netfilter/nf_conntrack_labels.h>
++#include <net/netfilter/nf_conntrack_synproxy.h>
++#include <net/netfilter/nf_nat.h>
++#include <net/netfilter/nf_nat_core.h>
++#include <net/netfilter/nf_nat_helper.h>
++
++#ifdef DEBUG
++#define DBG(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
++#else
++#define DBG(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
++#endif
++
++
++/**************************************************************************
++ ********************* PP Connection Tracking Event Identifiers ***********
++ **************************************************************************/
++/* Base for all connection tracking PP Event identifiers. */
++#define TI_CT_EVENT                  0x30
++/* Event generated when a connection tracking entry has been created. */
++#define TI_CT_ENTRY_CREATED          (TI_CT_EVENT + 0x1)
++/* Event generated when a connection tracking entry has timed-out */
++#define TI_CT_DEATH_BY_TIMEOUT       (TI_CT_EVENT + 0x2)
++/* Event generated when a Netfilter table is being updated. */
++#define TI_CT_NETFILTER_TABLE_UPDATE (TI_CT_EVENT + 0x3)
++/* Event generated once Netfilter decides to drop the packet */
++#define TI_CT_NETFILTER_DISCARD_PKT  (TI_CT_EVENT + 0x4)
++/* Event generated once Netfilter decides to cancel drop acceleration */
++#define TI_CT_NETFILTER_CANCEL_DISCARD_ACCELERATION     (TI_CT_EVENT + 0x5)
++
++#define IP_CT_DIR_ORIGINAL 0
++#define IP_CT_DIR_REPLY 1
++#define CT_MRPC_FALIURE -1
++#define IN_PROGRESS 1
++#define COMPLETE 0
++
++
++static struct platform_device *ct_client_device;
++
++struct ct_client_private {
++    struct platform_device *pdev;
++    struct mrpc_client *mrpc;
++    struct notifier_block ct_event_notifier;
++    struct workqueue_struct *workQ;
++};
++
++static struct ct_client_private *this;
++
++/* tuple information of the timed out connection */
++struct mrpc_conntrack_tuple_info{
++	u32     atomTag;
++	struct nf_conntrack_tuple tuple;
++};
++
++/*reply message from ct server. This will be used to extend the CT timer */
++struct mrpc_conntrack_arm_reply{
++	int  extend_timeout;
++};
++
++struct ct_worker_info {
++    struct work_struct work;
++    struct nf_conn *ct;
++    unsigned long event;
++};
++
++enum {
++	TI_CT_DEATH_BY_TIMEOUT_PROC = 0
++};
++
++static int ct_tuple_info_worker(struct notifier_block *self, unsigned long event, void *ptr);
++
++static struct notifier_block ct_info_notifier_block = {
++      .notifier_call = ct_tuple_info_worker,
++};
++
++ATOMIC_NOTIFIER_HEAD(ct_chain);
++
++static inline int ct_mrpc_call(__u8 procid, struct mrpc_conntrack_tuple_info *ct_tuple_info, struct mrpc_conntrack_arm_reply *reply)
++{
++   struct ct_client_private *priv = this;
++   int ret, errcode;
++   if(!priv)
++   {
++     pr_err("ERROR: Conntrack MRPC client not initialized");
++     return CT_MRPC_FALIURE;
++   }
++
++   ret = mrpc_call(priv->mrpc, procid, ct_tuple_info, sizeof(*ct_tuple_info),
++		   reply, sizeof(*reply), 0, &errcode);
++
++   if (ret || errcode) {
++      pr_err("CONNTRACK_MRPC_CLIENT: ERROR: ret=%d, errcode=%d",ret, errcode);
++      return -1;
++   }
++
++   DBG("CONNTRACK_MRPC_CLIENT: SUCCESS: reply : %d",ntohl(reply->extend_timeout));
++
++   return 0;
++}
++
++int copy_conntrack_tuple_info(struct mrpc_conntrack_tuple_info *ct_tuple_info,
++						const struct nf_conn *ctrack)
++{
++   int i=0,ip_mode = ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num;
++   int protoNum;
++   static int atomTag = 1;
++   ct_tuple_info->atomTag = htonl(atomTag);
++   atomTag++;
++
++   /*copy IP_CT_DIR_ORIGINAL tuple from ct to mrpc_ct.
++    *to re-generate the jhash value, ct_server needs the below information.
++    *we don't need to pass the reply dir as its just the inverse of orig dir.
++    */
++   memset(&ct_tuple_info->tuple,0, sizeof(struct nf_conntrack_tuple));
++   if (ip_mode == AF_INET)
++   {
++     memcpy(ct_tuple_info->tuple.src.u3.all,
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.all,
++	    sizeof(struct in_addr));
++     memcpy(ct_tuple_info->tuple.dst.u3.all,
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u3.all,
++	    sizeof(struct in_addr));
++   }
++   else
++   {
++     memcpy(ct_tuple_info->tuple.src.u3.all,
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.all,
++	    sizeof(struct in6_addr));
++     memcpy(ct_tuple_info->tuple.dst.u3.all,
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u3.all,
++	    sizeof(struct in6_addr));
++   }
++
++   protoNum = ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum;
++
++   switch(protoNum) {
++   case IPPROTO_TCP:
++	ct_tuple_info->tuple.src.u.tcp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.tcp.port;
++	ct_tuple_info->tuple.dst.u.tcp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.tcp.port;
++	break;
++   case IPPROTO_UDP:
++	ct_tuple_info->tuple.src.u.udp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.udp.port;
++	ct_tuple_info->tuple.dst.u.udp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.udp.port;
++	break;
++/*
++   case IPPROTO_ICMP:
++	ct_tuple_info->tuple.src.u.icmp.id =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.icmp.id;
++	ct_tuple_info->tuple.dst.u.icmp.id =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.icmp.id;
++	break;
++*/
++   case IPPROTO_DCCP:
++	ct_tuple_info->tuple.src.u.dccp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.dccp.port;
++	ct_tuple_info->tuple.dst.u.dccp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.dccp.port;
++	break;
++   case IPPROTO_SCTP:
++	ct_tuple_info->tuple.src.u.sctp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.sctp.port;
++	ct_tuple_info->tuple.dst.u.sctp.port =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.sctp.port;
++	break;
++   case IPPROTO_GRE:
++	ct_tuple_info->tuple.src.u.gre.key =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u.gre.key;
++	ct_tuple_info->tuple.dst.u.gre.key =
++	    ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.u.gre.key;
++	break;
++   default:
++	printk(KERN_NOTICE "Protocol %d not supported by mrpc_conntrack_client.\n",protoNum);
++   }
++
++   ct_tuple_info->tuple.src.l3num = htons(ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num);
++
++   ct_tuple_info->tuple.dst.protonum = ctrack->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum;
++}
++
++/* Name: ct_tuple_info_fetcher
++ * Desc: worker function extract the CT tuple information and invoke mrpc_call to ARM.
++ * Input: work_struct
++ */
++static void ct_tuple_info_fetcher(struct work_struct *work_arg)
++{
++   struct ct_worker_info *worker = container_of(work_arg, struct ct_worker_info, work);
++   struct nf_conn *ct = worker->ct;
++   unsigned long event = worker->event;
++   unsigned long extend_ct_time;
++   struct mrpc_conntrack_tuple_info conntrack_tuple_info;
++   struct mrpc_conntrack_arm_reply mrpc_reply;
++   int extend_timeout = 0;
++
++   switch(event)
++   {
++      case TI_CT_ENTRY_CREATED:
++	  /*Do nothing. When there is a connection tracking entry getting created,the ARM side
++	   *init_conntrack generates this event to PP HIL layer.The HIL profile sets the
++	   *ti_pp_status_flag to TI_PP_BYPASS if this connection is associated to an ALG.
++	   *Later, for any new connection nf_conntrack_in at ARM will check for this flag and
++	   *sets the SKB PP_INFO flag to TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS to prevent
++	   *HIL layer from creating the session for this ALG connection.
++	   *We don't need to sync the TI_CT_ENTRY_CREATED event with ARM as the SKB PP_INFO
++	   *flag set/reset is handled locally by ARM.
++	   */
++      break;
++      case TI_CT_DEATH_BY_TIMEOUT:
++	   memset(&conntrack_tuple_info,0,sizeof(struct mrpc_conntrack_tuple_info));
++
++	   /*Copy required tuple information from timeout ct to conntrack_tuple_info.
++	    *This will be MRPC'd to ARM conntrack server module to regenerate the HASH
++	    *and fetch the ARM side CT record for this timeout connection */
++	   copy_conntrack_tuple_info(&conntrack_tuple_info,ct);
++	   printk(KERN_NOTICE "CT Tag %d :proto %d zone %d TUPLE INFO: %pI4:%u->%pI4:%u/%u \n",
++			 ntohl(conntrack_tuple_info.atomTag),
++			 ntohs(conntrack_tuple_info.tuple.src.l3num),
++			 nf_ct_zone(ct),
++			 &conntrack_tuple_info.tuple.src.u3.ip,
++			 conntrack_tuple_info.tuple.src.u.all,
++			 &conntrack_tuple_info.tuple.dst.u3.ip,
++			 conntrack_tuple_info.tuple.dst.u.all,
++			 conntrack_tuple_info.tuple.dst.protonum);
++	   /*Make mrpc_call to ARM to lookup connection tracking tuple*/
++	   ct_mrpc_call(TI_CT_DEATH_BY_TIMEOUT_PROC, &conntrack_tuple_info, &mrpc_reply);
++	   extend_timeout = ntohl(mrpc_reply.extend_timeout);
++	   if(extend_timeout==1)
++	   {
++	    /* The flows are still being accelerated; so keep the connection tracking timer alive */
++	     printk(KERN_NOTICE "ARM replyed to extend timeout. set timer by 60 seconds.\n");
++	    /*reset arm sync wait flag here. So that the nf_ct_delete will handle the 60 sec
++	     *timeout properly.*/
++	    ct->ct_tuple_arm_sync_wait=0;
++
++	     extend_ct_time = (60 * HZ) + jiffies;
++
++	     /*This CT timeout is extended by 60 seconds as the PP session exists in ARM.
++	      * hope this CT record is still alive!.*/
++	     mod_timer(&ct->timeout,extend_ct_time);
++
++	   }
++	   else
++	   {
++	     /* Connection tracking record not found at ARM. Session not getting acclerated.
++	      * go-ahead and delete this CT at ATOM*/
++	     printk(KERN_NOTICE "ARM replyed to KILL conntrack record. delete record.\n");
++	     ct->ti_pp_status_flag |= TI_PP_KILL_CONNTRACK;
++	   }
++      break;
++      default:
++	   printk(KERN_NOTICE "Connection tracking event not supported.");
++  }
++
++  kfree(worker);
++  return;
++}
++
++/*Name: ct_tuple_info_worker
++ *Desc: CT event work queue handler. Submit CT event and CT record to the dedicated workqueue
++ *      for further processing.
++ *Input: notifier chain, CT event and Ptr to the timeout CT record.
++ *Return: NOTIFY_DONE
++ */
++static int ct_tuple_info_worker(struct notifier_block *self, unsigned long event, void *ptr)
++{
++   struct ct_client_private *priv = this;
++   struct ct_worker_info *ct_work_info;
++
++   ct_work_info = kzalloc(sizeof(*ct_work_info), GFP_ATOMIC);
++   if(!ct_work_info)
++   {
++     pr_err("Memory allocation failed for ct_work_info");
++     return NOTIFY_DONE;
++   }
++
++   ct_work_info->ct = (struct nf_conn *)ptr;
++   ct_work_info->event = event;
++   INIT_WORK(&ct_work_info->work, ct_tuple_info_fetcher);
++   queue_work(priv->workQ, &ct_work_info->work);
++
++   return NOTIFY_DONE;
++
++}
++
++/*Name: nf_conn_info_event
++ *Desc: Event notify function used by nf_conntrack module to post CT events to this module.
++ *      conntrack_client_module.
++ *Input:CT event and a ptr to the timeout CT record.
++ */
++nf_conn_info_event(unsigned long event, void *ptr)
++{
++   return atomic_notifier_call_chain(&ct_chain, event, ptr);
++}
++EXPORT_SYMBOL(nf_conn_info_event);
++
++static ssize_t status_show(struct device *dev,
++			   struct device_attribute *attr, char *buf)
++{
++   struct ct_client_private *priv = dev_get_drvdata(dev);
++
++   if(!priv)
++     return -EINVAL;
++
++   return scnprintf(buf, PAGE_SIZE, "status OK\n");
++
++}
++
++static DEVICE_ATTR(status, S_IRUGO, status_show, NULL);
++
++static struct attribute *ct_client_attrs[] = {
++    &dev_attr_status.attr,
++    NULL
++};
++
++static struct attribute_group ct_client_attrs_group = {
++    .attrs = ct_client_attrs,
++};
++
++/* Name: ct_client_driver_probe
++ * Desc: CT driver probe module
++ * Input: platform device.
++ */
++static int ct_client_driver_probe(struct platform_device *pdev)
++{
++  struct ct_client_private *priv;
++  int ret;
++
++  priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++  if(!priv) {
++     pr_err("Memory Allocation Failed at ct_client_driver_probe");
++     return -ENOMEM;
++  }
++
++  dev_set_drvdata(&pdev->dev,priv);
++  priv->pdev = pdev;
++
++  ret = sysfs_create_group(&priv->pdev->dev.kobj, &ct_client_attrs_group);
++  if(ret) {
++      pr_err("sysfs_create_group failed (ret=%d)", ret);
++      return ret;
++  }
++
++  priv->workQ = create_workqueue("Connection tracking MRPC worker");
++  if(!priv->workQ) {
++      pr_err("connection tracking MRPC workerqueue creation failed.");
++      ret = -ENOMEM;
++      goto out_remove_group;
++  }
++
++  priv->mrpc = mrpc_client_register(MRPC_RESERVED_ID_CONNTRACK,
++				    "Connection Tracking Client");
++  if(!priv->mrpc)
++  {
++    pr_err("Failed to register connection tracking MRPC client");
++    ret = -ENODEV;
++    goto out_destroy_workqueue;
++  }
++
++  /* register notifier here */
++  atomic_notifier_chain_register(&ct_chain, &ct_info_notifier_block);
++  this = priv;
++  return 0;
++
++out_destroy_workqueue:
++  flush_workqueue(priv->workQ);
++  destroy_workqueue(priv->workQ);
++out_remove_group:
++  sysfs_remove_group(&priv->pdev->dev.kobj, &ct_client_attrs_group);
++  return 0;
++}
++
++/* Name: ct_client_driver_remove
++ * Desc: CT driver remove module.
++ * Input: platform device.
++ */
++static int ct_client_driver_remove(struct platform_device *pdev)
++{
++  struct ct_client_private *priv = platform_get_drvdata(pdev);
++
++  flush_workqueue(priv->workQ);
++  destroy_workqueue(priv->workQ);
++  mrpc_client_unregister(priv->mrpc);
++  sysfs_remove_group(&priv->pdev->dev.kobj, &ct_client_attrs_group);
++  dev_set_drvdata(&pdev->dev,NULL);
++  this = NULL;
++  return 0;
++}
++
++static struct platform_driver ct_client_driver = {
++     .driver = {
++	 .name = "ct_client_driver",
++     },
++     .probe = ct_client_driver_probe,
++     .remove = ct_client_driver_remove
++};
++
++static struct platform_device *ct_client_device;
++
++/**
++ * Function Name: conntrack_client_init
++ * Desc: Initialize the conntrack client MRPC driver
++ * return : 0 for success, error code otherwise
++ */
++static int __init ct_client_driver_init(void)
++{
++  int ret;
++
++  ret = platform_driver_register(&ct_client_driver);
++  if(ret < 0) {
++      pr_err("Failed to register ct_client_driver: %d\n",ret);
++      return ret;
++  }
++
++  ct_client_device = platform_device_register_simple("ct_client_driver", -1, NULL, 0);
++  if(IS_ERR(ct_client_device)) {
++      pr_err("Failed to register ct_client_device\n");
++      platform_driver_unregister(&ct_client_driver);
++      return PTR_ERR(ct_client_device);
++  }
++
++  return 0;
++
++}
++
++/**
++ * Function name: conntrack_client_exit
++ * Desc: Remove the conntrack client module.
++ * return: 0 for success, error code otherwise
++ */
++static void __exit ct_client_driver_exit(void)
++{
++    platform_device_unregister(ct_client_device);
++    platform_driver_unregister(&ct_client_driver);
++}
++
++/******************************************************/
++/**    Module Declarations                           **/
++/******************************************************/
++module_init(ct_client_driver_init);
++module_exit(ct_client_driver_exit);
++MODULE_AUTHOR("Intel Corporation");
++MODULE_AUTHOR("Arunkumar Velayutham arunkumar.velayutham@intel.com");
++MODULE_DESCRIPTION("Conntrack RPC over Mailbox");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("1.0");
+--- a/include/linux/mrpc.h
++++ b/include/linux/mrpc.h
+@@ -34,6 +34,8 @@
+ #ifndef __HW_MRPC_H__
+ #define __HW_MRPC_H__
+ 
++extern int nf_conn_info_event(unsigned long val, void *v);
++
+ /* error codes */
+ enum {
+     MRPC_SUCCESS = 0,           /* success */
+@@ -71,8 +73,12 @@ struct mrpc_procinfo {
+ enum {
+     MRPC_RESERVED_ID_PP_CONTROL = 0,
+     MRPC_RESERVED_ID_PP_DEBUG,
++    MRPC_RESERVED_ID_PP_PID, /* temporary until PP core and PP HAL are ready */
+     MRPC_RESERVED_ID_NETEVENTS,
+     MRPC_RESERVED_ID_NETHOOKS,
++    MRPC_RESERVED_ID_MODPHY,
++    MRPC_RESERVED_ID_HANDSHAKE,
++    MRPC_RESERVED_ID_CONNTRACK,
+     MRPC_RESERVED_ID_LAST,
+ };
+ 
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -23,9 +23,29 @@
+ #include <linux/netfilter/nf_conntrack_sctp.h>
+ #include <linux/netfilter/nf_conntrack_proto_gre.h>
+ #include <net/netfilter/ipv6/nf_conntrack_icmpv6.h>
+-
+ #include <net/netfilter/nf_conntrack_tuple.h>
+ 
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++/* Flag definitions that are carried in the PP status flag in the connection tracking
++ *  * structure. */
++
++/* Set the flag to indicate that the connection tacking timeout code should execute as
++ *  * such and the entry will be deleted. */
++#define TI_PP_KILL_CONNTRACK       0x1
++
++/* Set the flag to 1 indicates that all packets flowing through the box matching the
++ *  * connection will have their BYPASS flag set. */
++#define TI_PP_BYPASS               0x2
++
++/* Base for all connection tracking PP Event identifiers. */
++#define TI_CT_EVENT                  0x30
++
++/* Event generated when a connection tracking entry has been created. */
++#define TI_CT_ENTRY_CREATED          (TI_CT_EVENT + 0x1)
++
++/* Event generated when a connection tracking entry has timed-out */
++#define TI_CT_DEATH_BY_TIMEOUT       (TI_CT_EVENT + 0x2)
++#endif
+ /* per conntrack: protocol private data */
+ union nf_conntrack_proto {
+ 	/* insert conntrack proto private data here */
+@@ -120,7 +140,11 @@ struct nf_conn {
+ 		unsigned int app_data_len;
+ 	} layer7;
+ #endif
+-
++	int ti_pp_status_flag;
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++	/*flag used to indicate ct client mrpc call in progress b/w ATOM/ARM */
++	int ct_tuple_arm_sync_wait;
++#endif
+ 	/* Storage reserved for other modules, must be the last member */
+ 	union nf_conntrack_proto proto;
+ };
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -335,6 +335,11 @@ endmenu
+ 
+ endmenu
+ 
++#Enable packet processor handling for GW on Atom
++config APPCPU_GW_PP_HANDLE
++	boolean
++	default y
++
+ source "net/ax25/Kconfig"
+ source "net/can/Kconfig"
+ source "net/irda/Kconfig"
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -33,7 +33,9 @@
+ #include <linux/mm.h>
+ #include <linux/nsproxy.h>
+ #include <linux/rculist_nulls.h>
+-
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++#include <linux/mrpc.h>
++#endif
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+@@ -300,23 +302,72 @@ static void nf_ct_dying_timeout(struct n
+ bool nf_ct_delete(struct nf_conn *ct, u32 portid, int report)
+ {
+ 	struct nf_conn_tstamp *tstamp;
+-
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++	if(ct->ct_tuple_arm_sync_wait==1)
++	{
++	   /* Did the HIL profile take over or not? - right after the temp timer expired */
++	   if ((ct->ti_pp_status_flag & TI_PP_KILL_CONNTRACK) == 0)
++	   {
++	      /* reset ct_tuple_arm_sync_wait here to re-generate the timeout event once the
++	       * extended timeout expires again.
++	       */
++	      ct->ct_tuple_arm_sync_wait=0;
++	      printk(KERN_NOTICE "ARM HIL profile extended timeout. Record not deleted for now.\n");
++	      return;  /* HIL Profile took over... */
++	   }
++	   else
++	   {
++	      printk(KERN_NOTICE "Conntrack record getting deleted\n");
++	      /*go ahead and clear the ct record */
++	      tstamp = nf_conn_tstamp_find(ct);
++	      if (tstamp && tstamp->stop == 0)
++		 tstamp->stop = ktime_to_ns(ktime_get_real());
++
++	      if (!nf_ct_is_dying(ct) &&
++		  unlikely(nf_conntrack_event_report(IPCT_DESTROY, ct,
++		  portid, report) < 0)) {
++		  /* destroy event was not delivered */
++		     nf_ct_delete_from_lists(ct);
++		     nf_ct_dying_timeout(ct);
++		     printk(KERN_NOTICE "Conntrack record delete failed\n");
++		     return false;
++	      }
++	      set_bit(IPS_DYING_BIT, &ct->status);
++	      nf_ct_delete_from_lists(ct);
++	      nf_ct_put(ct);
++	      return true;
++	   }
++	}
++	else
++	{
++	  /* Generate an event indicating the connection tracking entry is being deleted. */
++	  nf_conn_info_event(TI_CT_DEATH_BY_TIMEOUT, (void *)ct);
++	  /* conntrack mrpc client is still working on to sync pp info from ARM */
++	  printk(KERN_NOTICE "extend temporary timeout of 2 seconds.\n");
++	  ct->timeout.expires = (1 * HZ) + jiffies;
++	  add_timer(&ct->timeout);
++	  ct->ct_tuple_arm_sync_wait=1;
++	  return;
++	}
++#else /*PP on ATOM specific conntrack ti_hil_pp_event has to go in here */
++	/*go ahead and clear the ct record */
+ 	tstamp = nf_conn_tstamp_find(ct);
+ 	if (tstamp && tstamp->stop == 0)
+-		tstamp->stop = ktime_to_ns(ktime_get_real());
++	    tstamp->stop = ktime_to_ns(ktime_get_real());
+ 
+ 	if (!nf_ct_is_dying(ct) &&
+ 	    unlikely(nf_conntrack_event_report(IPCT_DESTROY, ct,
+ 	    portid, report) < 0)) {
+-		/* destroy event was not delivered */
+-		nf_ct_delete_from_lists(ct);
+-		nf_ct_dying_timeout(ct);
+-		return false;
++	    /* destroy event was not delivered */
++	    nf_ct_delete_from_lists(ct);
++	    nf_ct_dying_timeout(ct);
++	    return false;
+ 	}
+ 	set_bit(IPS_DYING_BIT, &ct->status);
+ 	nf_ct_delete_from_lists(ct);
+ 	nf_ct_put(ct);
+ 	return true;
++#endif
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_delete);
+ 
+@@ -754,6 +805,9 @@ __nf_conntrack_alloc(struct net *net, u1
+ 	       offsetof(struct nf_conn, proto) -
+ 	       offsetof(struct nf_conn, tuplehash[IP_CT_DIR_MAX]));
+ 	spin_lock_init(&ct->lock);
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++	ct->ct_tuple_arm_sync_wait = 0;
++#endif
+ 	ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple = *orig;
+ 	ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode.pprev = NULL;
+ 	ct->tuplehash[IP_CT_DIR_REPLY].tuple = *repl;

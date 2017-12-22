@@ -1,0 +1,162 @@
+diff -Nuar wide-dhcpv6-20080615/ipv6helper.c wide-dhcpv6-20080615_modi/ipv6helper.c
+--- wide-dhcpv6-20080615/ipv6helper.c	1970-01-01 05:30:00.000000000 +0530
++++ wide-dhcpv6-20080615_modi/ipv6helper.c	2011-06-17 19:05:33.052845615 +0530
+@@ -0,0 +1,129 @@
++#include <stdio.h>
++#include <unistd.h>
++#include <stdlib.h>
++#include <string.h>
++#include <arpa/inet.h>
++
++void usage(char *argv0)
++{
++	fprintf(stderr,
++	    "usage: %s command [-t sixrd] [-p prefix] [-l prefixlength] [-i localipv4] [-m masklen]\n", argv0);
++	exit(1);
++}
++
++int print_ipv6_addr(uint8_t *d, uint8_t *dst_buf, uint32_t size)
++{
++    return  snprintf(dst_buf, size,"%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
++        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
++
++}
++int main(int argc, char **argv)
++{
++	int opt;
++	char *argv0 = argv[0];
++        uint8_t addr_ipv6[64], tun_ipv6_addr[64], br0_ipv6_addr[64];
++        struct in_addr ipv4_dst_str;
++        struct in6_addr ipv6_dst_addr;
++        int ret;
++        uint8_t  *d;
++        uint32_t *i;
++        int ipv4masklen;
++        int prefixlen;
++        uint32_t maskedipv4;
++        int result, remainder,j;
++        uint32_t ipv4;
++        int ret_ipv4;
++
++	while ((opt = getopt(argc, argv, "t:p:l:i:m:")) != -1) {
++		switch(opt) 
++		{
++		case 't':
++			if (strcmp(optarg, "sixrd") == 0) {
++				 if (argc < 11)
++					usage(argv0);
++			}
++			else {
++				usage(argv0);
++				return -1;
++			}
++			break;
++		case 'p':
++			ret = inet_pton(AF_INET6, optarg, &ipv6_dst_addr);
++			if (ret <= 0 ) {
++				strncpy(addr_ipv6, optarg, sizeof(addr_ipv6)-2);
++				strcat(addr_ipv6,"::");
++				ret = inet_pton(AF_INET6, addr_ipv6, &ipv6_dst_addr);
++				if (ret <= 0 ) {
++					return -2;
++				}
++			}
++			break;
++		case 'l':
++			prefixlen = atoi(optarg);
++			break;
++		case 'i':
++			ret_ipv4 = inet_pton(AF_INET, optarg, &ipv4_dst_str);
++			if (ret_ipv4 <= 0) {
++				return -3;
++			}
++			break;
++		case 'm':
++			ipv4masklen = atoi(optarg);
++			break;
++		case '?':
++			usage(argv0);
++			return -4;
++		default:
++			usage(argv0);
++			return -5;
++		}
++	}
++
++        d = (uint8_t *) &ipv6_dst_addr.s6_addr;
++        i = (uint32_t *)&ipv6_dst_addr.s6_addr32;
++        i[0] = ntohl(i[0]);
++        i[1] = ntohl(i[1]);
++        i[2] = ntohl(i[2]);
++        i[3] = ntohl(i[3]);
++        ipv4 = ipv4_dst_str.s_addr;
++        ipv4 = ntohl(ipv4);
++        if((prefixlen + (32-ipv4masklen)) > 64) {
++                return -6;
++        }
++        if (ipv4masklen == 32)
++                maskedipv4=0;
++        else
++                maskedipv4=     (ipv4 << ipv4masklen );
++        result= prefixlen / 32;
++        remainder = prefixlen % 32;
++        if (((prefixlen - 1) / 32) >= 2) {
++                return -7;
++        }
++        if (remainder == 0)
++                i[result]= 0;
++        i[result]=      ((i[result] >> (32 - remainder)) << (32 - remainder) ) | (maskedipv4 >> remainder ) ;
++        for (j=1; (result+j)<4;j++)
++                i[result+j]= 0;
++        if (remainder != 0)
++                i[result+1] |= (maskedipv4 << (32 - remainder)) ;
++        i[3] |= 1;
++        i[0] = htonl(i[0]);
++        i[1] = htonl(i[1]);
++        i[2] = htonl(i[2]);
++        i[3] = htonl(i[3]);
++        ipv4 = htonl(ipv4);
++	print_ipv6_addr(d, tun_ipv6_addr, sizeof(tun_ipv6_addr));
++        printf("%s ", tun_ipv6_addr);
++        i[1] = ntohl(i[1]);
++        i[2] = ntohl(i[2]);
++        if ((prefixlen + (32-ipv4masklen)) < 64) {
++                i[1] |= 1;
++        }
++        else
++                i[2] |= 1;
++        i[1] = htonl(i[1]);
++        i[2] = htonl(i[2]);
++	print_ipv6_addr(d, br0_ipv6_addr, sizeof(br0_ipv6_addr));
++        printf("%s\n", br0_ipv6_addr);
++	return (0);
++}
+diff -Nuar wide-dhcpv6-20080615/Makefile.in wide-dhcpv6-20080615_modi/Makefile.in
+--- wide-dhcpv6-20080615/Makefile.in	2011-06-17 19:05:14.124845557 +0530
++++ wide-dhcpv6-20080615_modi/Makefile.in	2011-06-17 19:05:57.912798632 +0530
+@@ -45,7 +45,7 @@
+ LIBOBJS=@LIBOBJS@
+ LIBS=	@LIBS@
+ CC=	@CC@
+-TARGET=	dhcp6c dhcp6s dhcp6relay dhcp6ctl
++TARGET=	dhcp6c dhcp6s dhcp6relay dhcp6ctl ipv6helper
+ 
+ INSTALL=@INSTALL@
+ INSTALL_PROGRAM=@INSTALL_PROGRAM@
+@@ -64,6 +64,7 @@
+ 	base64.o auth.o dhcp6_ctl.o $(GENSRCS:%.c=%.o)
+ RELAYOBJS =	dhcp6relay.o dhcp6relay_script.o common.o timer.o
+ CTLOBJS= dhcp6_ctlclient.o base64.o auth.o
++IPV6HPLOBJS=	ipv6helper.o
+ CLEANFILES+=	y.tab.h
+ 
+ all:	$(TARGET)
+@@ -75,6 +76,8 @@
+ 	$(CC) $(LDFLAGS) -o $@ $(RELAYOBJS) $(LIBOBJS) $(LIBS)
+ dhcp6ctl: $(CTLOBJS)
+ 	$(CC) $(LDFLAGS) -o $@ $(CTLOBJS) $(LIBOBJS) $(LIBS)
++ipv6helper: $(IPV6HPLOBJS)
++	$(CC) $(LDFLAGS) -o $@ $(IPV6HPLOBJS)
+ 
+ cfparse.c y.tab.h: cfparse.y
+ 	@YACC@ -d cfparse.y

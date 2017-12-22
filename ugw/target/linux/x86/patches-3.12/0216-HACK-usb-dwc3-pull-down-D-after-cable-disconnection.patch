@@ -1,0 +1,118 @@
+From 3066fa0948c4bdec1ba8cab4ae70d7b74dfc4770 Mon Sep 17 00:00:00 2001
+From: David Cohen <david.a.cohen@intel.com>
+Date: Thu, 19 Mar 2015 17:08:12 +0100
+Subject: [PATCH 216/441] HACK: usb: dwc3: pull down D+/- after cable
+ disconnection
+
+This is a tricky situation that can only be cleanly solved when ULPI bus is
+available for usb phy driver.
+
+When cable is removed, dwc3 will enter in autosuspend mode (if pm runtime is
+enabled). If USB cable is reconnected before suspend is actually called, the
+charger detection module will be unable to detect CDP charging mode because
+D+/D- will still be in connected state. In order to allow CDP connection again,
+we need to pull down D+/D- to notify USB host we are disconnected.
+
+Change-Id: I581bbc26c631bfedea54ab8c4e8ff531b4b2dc99
+Signed-off-by: David Cohen <david.a.cohen@intel.com>
+(cherry picked from commit 95e08ae4ab5f220afeb9175b138dde23770ebe50)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/usb/dwc3/core.c   | 31 +++++++++++++++++++++++++++++++
+ drivers/usb/dwc3/core.h   |  4 ++++
+ drivers/usb/dwc3/gadget.c |  2 ++
+ 3 files changed, 37 insertions(+)
+
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -209,6 +209,9 @@ cleanup:
+ #define PWCTRL_SW_CONTROL (1 << 0)
+ #define TUSB1211_POWER_CONTROL_SET 0x3E
+ #define TUSB1211_EYE_DIAGRAM_TUNING 0x4f
++#define TUSB1211_OTG_CTRL		0xa
++#define TUSB1211_OTG_CTRL_DPPULLDOWN	(1 << 1)
++#define TUSB1211_OTG_CTRL_DMPULLDOWN	(1 << 2)
+ 
+ static void set_phy_eye_optim(struct dwc3 *dwc)
+ {
+@@ -219,6 +222,28 @@ static void set_phy_eye_optim(struct dwc
+ 		dev_err(dwc->dev, "Tuning ULPI phy eye diagram failed.\n");
+ }
+ 
++/*
++ * This is a tricky situation that can only be cleanly solved when ULPI bus
++ * is available for usb phy driver:
++ * When cable is removed, dwc3 will enter in autosuspend mode (if pm runtime is
++ * enabled). If USB cable is reconnected before suspend is actually called,
++ * the charger detection module will be unable to detect CDP charging mode
++ * because D+/D- will still be in connected state. In order to allow CDP
++ * connection again, we need to pull down D+/D- to notify USB host we are
++ * disconnected.
++ */
++void dwc3_set_phy_dpm_pulldown(struct dwc3 *dwc, int pull_down)
++{
++	u32 reg;
++
++	reg = ulpi_read(dwc, TUSB1211_OTG_CTRL);
++	if (pull_down)
++		reg |= TUSB1211_OTG_CTRL_DPPULLDOWN | TUSB1211_OTG_CTRL_DMPULLDOWN;
++	else
++		reg &= ~(TUSB1211_OTG_CTRL_DPPULLDOWN | TUSB1211_OTG_CTRL_DMPULLDOWN);
++	ulpi_write(dwc, reg, TUSB1211_OTG_CTRL);
++}
++
+ static void dwc3_check_ulpi(struct dwc3 *dwc)
+ {
+ 	if (ulpi_read(dwc, ULPI_VENDOR_ID_LOW) < 0)
+@@ -555,6 +580,10 @@ static int dwc3_handle_otg_notification(
+ 	case USB_EVENT_VBUS:
+ 		dev_info(dwc->dev, "DWC3 OTG Notify USB_EVENT_VBUS\n");
+ 		last_value = event;
++		if (dwc->dpm_pulled_down) {
++			dwc3_set_phy_dpm_pulldown(dwc, 0);
++			dwc->dpm_pulled_down = 0;
++		}
+ 		pm_runtime_get(dwc->dev);
+ 		state = NOTIFY_OK;
+ 		break;
+@@ -907,6 +936,8 @@ static int dwc3_suspend_common(struct de
+ 
+ 	dwc3_suspend_phy(dwc, true);
+ 
++	dwc->dpm_pulled_down = 0;
++
+ 	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
+ 	usb_phy_shutdown(dwc->usb3_phy);
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -737,6 +737,7 @@ struct dwc3 {
+ 	atomic_t		suspend_depth;
+ 
+ 	struct delayed_work	watchdog;
++	int			dpm_pulled_down;
+ };
+ 
+ /* -------------------------------------------------------------------------- */
+@@ -888,6 +889,9 @@ struct dwc3_gadget_ep_cmd_params {
+ void dwc3_set_mode(struct dwc3 *dwc, u32 mode);
+ int dwc3_gadget_resize_tx_fifos(struct dwc3 *dwc);
+ 
++/* remove me when ulpi bus is exported to usb phy */
++void dwc3_set_phy_dpm_pulldown(struct dwc3 *dwc, int pull_down);
++
+ #if IS_ENABLED(CONFIG_USB_DWC3_HOST) || IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE)
+ int dwc3_host_init(struct dwc3 *dwc);
+ void dwc3_host_exit(struct dwc3 *dwc);
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -2220,6 +2220,8 @@ static void dwc3_gadget_disconnect_inter
+ 	if (dwc->runtime_suspend) {
+ 		pm_runtime_mark_last_busy(dwc->dev);
+ 		pm_runtime_put_autosuspend(dwc->dev);
++		dwc3_set_phy_dpm_pulldown(dwc, 1);
++		dwc->dpm_pulled_down = 1;
+ 	}
+ }
+ 

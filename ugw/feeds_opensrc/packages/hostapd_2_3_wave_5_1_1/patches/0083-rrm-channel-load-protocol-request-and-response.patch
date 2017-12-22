@@ -1,0 +1,921 @@
+From 67e0370a9421faf3c9eaba0c5404b04c052a9ffd Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Wed, 23 Nov 2016 14:12:20 +0200
+Subject: [PATCH 3/6] rrm: channel load protocol - request and response
+
+To enable the support of channel load measurement from the conf file:
+rrm_channel_load=1
+
+To enable the support of manipulate the link measurements from conf file:
+rrm_manipulate_measurement=1
+if this flag is enabled, then upon channel load measurement request
+from the STA, the AP will make the measurements and notify the "AP-Manager"
+instead of sending the response.
+
+Request from AP to STA: (cli_command)
+req_channel_load <dst> <num_of_repetitions> <measurement_req_mode>
+<op_class> <channel> <rand_int> <duration> [ch_load_rep=<0-2>,<0-255>]
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Response from STA to AP: (notification)
+RRM-CHANNEL-LOAD-RECEIVED <ifname> <sta_mac_addr>
+measurement_rep_mode=<measurement_rep_mode> op_class=<op_class>
+channel=<channel> start_time=<start_time> duration=<duration>
+channel_load=<channel_load>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Request from STA to AP: (notification)
+RRM-CHANNEL-LOAD-REQUEST-RECEIVED <ifname> <sta_mac_addr>
+dialog_token=<dialog_token> measurement_token=<measurement_token>
+measurement_rep_mode=<measurement_rep_mode> op_class=<op_class>
+channel=<channel> start_time=<start_time> duration=<duration>
+channel_load=<channel_load>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Response from AP to STA: (cli_command)
+report_channel_load <dst> <dialog_token> <measurement_token>
+<measurement_rep_mode> <op_class> <channel> <start_time> <duration>
+<channel_load>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/config_file.c        |   3 +
+ hostapd/ctrl_iface.c         | 392 +++++++++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c        |  24 +++
+ src/ap/hostapd.h             |   1 +
+ src/ap/rrm.c                 | 288 +++++++++++++++++++++++++++++++
+ src/ap/rrm.h                 |  10 ++
+ src/common/ieee802_11_defs.h |   1 +
+ src/common/wpa_ctrl.h        |   3 +
+ src/drivers/driver.h         |   1 +
+ 9 files changed, 723 insertions(+)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index b107654..3e0c578 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3919,6 +3919,9 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 	} else if (os_strcmp(buf, "rrm_link_measurement") == 0) {
+ 		if (atoi(pos))
+ 			bss->radio_measurements[0] |= WLAN_RRM_CAPS_LINK_MEASUREMENT;
++	} else if (os_strcmp(buf, "rrm_channel_load") == 0) {
++		if (atoi(pos))
++			bss->radio_measurements[1] |= WLAN_RRM_CAPS_CHANNEL_LOAD;
+ 	} else if (os_strcmp(buf, "rrm_manipulate_measurement") == 0) {
+ 		bss->rrm_manipulate_measurement = atoi(pos);
+ 	} else if (os_strcmp(buf, "rrm_sta_statistics") == 0) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index fac4714..8fda80c 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -3219,6 +3219,392 @@ exit:
+ 			rep_reason_p);
+ }
+ 
++static int hostapd_ctrl_iface_req_channel_load(struct hostapd_data *hapd, char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	char *token, *context = NULL;
++	char *pos, *cmd_end;
++	int op_class, channel, random_interval, measurement_duration;
++	int num_of_repetitions, measurement_request_mode;
++
++	u8 rep_cond, ch_load_ref_val;
++	u8 *rep_cond_p = NULL, *ch_load_ref_val_p = NULL;
++
++	u8 channel_width, channel_center_frequency0, channel_center_frequency1;
++	u8 *channel_width_p = NULL;
++	u8 *channel_center_frequency0_p = NULL, *channel_center_frequency1_p = NULL;
++
++	cmd_end = cmd + strlen(cmd);
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_CHANNEL_LOAD - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - number of repetitions is missing");
++		return -1;
++	}
++	num_of_repetitions = atoi(token);
++	if (num_of_repetitions < 0 || num_of_repetitions > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - number of repetitions is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - measurement request mode is missing");
++		return -1;
++	}
++	measurement_request_mode = atoi(token);
++	if (measurement_request_mode < 0 || measurement_request_mode > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - measurement request mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - operating class is missing");
++		return -1;
++	}
++	op_class = atoi(token);
++	if (op_class <= 0 || op_class > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - operation class is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_CHANNEL_LOAD - channel is missing");
++		return -1;
++	}
++	channel = atoi(token);
++	if (channel <= 0 || channel > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - channel value is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - random interval is missing");
++		return -1;
++	}
++	random_interval = atoi(token);
++	if (random_interval < 0 || random_interval > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - random interval out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_CHANNEL_LOAD - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REQ_CHANNEL_LOAD - measurement duration out of range");
++		return -1;
++	}
++
++	/* optional tokens */
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		/* we've reached the end of command (no optinal arguments) */
++		goto exit;
++	}
++
++	pos = os_strstr(token, "ch_load_rep=");
++	if (pos) {
++		int cond, ref_val;
++		char *end, *comma;
++		pos += 12;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma = os_strchr(pos, ',');
++		if (!comma || comma == pos || comma >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - channel load reporting format is invalid");
++			return -1;
++		}
++		cond = atoi(pos);
++		if (cond < 0 || cond > 2) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - channel load reporting condition is invalid");
++			return -1;
++		}
++		comma++;
++		ref_val = atoi(comma);
++		if (ref_val < 0 || ref_val > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - channel load reporting ref val is invalid");
++			return -1;
++		}
++		rep_cond = (u8) cond;
++		rep_cond_p = &rep_cond;
++		ch_load_ref_val = (u8) ref_val;
++		ch_load_ref_val_p = &ch_load_ref_val;
++	}
++
++	pos = os_strstr(token, "wide_band_ch_switch=");
++	if (pos) {
++		int ch_width, ch_center_freq0, ch_center_freq1;
++		char *end, *comma1, *comma2;
++		pos += 20;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma2++;
++		ch_width = atoi(pos);
++		if (ch_width < 0 || ch_width > 3) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - channel width is invalid");
++			return -1;
++		}
++		ch_center_freq0 = atoi(comma1);
++		if (ch_center_freq0 < 0 || ch_center_freq0 > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - channel center frequency 0 is invalid");
++			return -1;
++		}
++		ch_center_freq1 = atoi(comma2);
++		if (ch_center_freq1 < 0 || ch_center_freq1 > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_CHANNEL_LOAD - channel center frequency 1 is invalid");
++			return -1;
++		}
++		channel_width = (u8) ch_width;
++		channel_width_p = &channel_width;
++		channel_center_frequency0 = (u8) ch_center_freq0;
++		channel_center_frequency0_p = &channel_center_frequency0;
++		channel_center_frequency1 = (u8) ch_center_freq1;
++		channel_center_frequency1_p = &channel_center_frequency1;
++	}
++
++exit:
++	return hostapd_send_channel_load_req(hapd, addr, num_of_repetitions,
++			measurement_request_mode, op_class, channel, random_interval,
++			measurement_duration, rep_cond_p, ch_load_ref_val_p,
++			channel_width_p, channel_center_frequency0_p,
++			channel_center_frequency1_p);
++}
++
++static int hostapd_ctrl_iface_report_channel_load(struct hostapd_data *hapd,
++		char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	char *token, *context = NULL;
++	char *pos, *cmd_end;
++	int op_class, channel, measurement_duration;
++	int dialog_token, measurement_token, measurement_rep_mode, channel_load;
++	u64 start_time;
++
++	u8 channel_width, channel_center_frequency0, channel_center_frequency1;
++	u8 *channel_width_p = NULL;
++	u8 *channel_center_frequency0_p = NULL, *channel_center_frequency1_p = NULL;
++
++	cmd_end = cmd + strlen(cmd);
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REPORT_CHANNEL_LOAD - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - dialog_token is missing");
++		return -1;
++	}
++	dialog_token = atoi(token);
++	if (dialog_token <= 0 || dialog_token > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - dialog_token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - measurement_token is missing");
++		return -1;
++	}
++	measurement_token = atoi(token);
++	if (measurement_token <= 0 || measurement_token > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - measurement_token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - measurement_rep_mode is missing");
++		return -1;
++	}
++	measurement_rep_mode = atoi(token);
++	if (measurement_rep_mode < 0 || measurement_rep_mode > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - measurement_rep_mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - operating class is missing");
++		return -1;
++	}
++	op_class = atoi(token);
++	if (op_class <= 0 || op_class > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - operation class is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR, "CTRL: REPORT_CHANNEL_LOAD - channel is missing");
++		return -1;
++	}
++	channel = atoi(token);
++	if (channel <= 0 || channel > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - channel value is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - start_time is missing");
++		return -1;
++	}
++	start_time = strtoull (token, NULL, 10);
++	if (start_time <= 0) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - start_time out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REPORT_CHANNEL_LOAD - measurement duration out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_CHANNEL_LOAD - channel_load is missing");
++		return -1;
++	}
++	channel_load = atoi(token);
++	if (channel_load < 0 || channel_load > 0xff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REPORT_CHANNEL_LOAD - channel_load out of range");
++		return -1;
++	}
++
++	/* optional tokens */
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		/* we've reached the end of command (no optinal arguments) */
++		goto exit;
++	}
++
++	pos = os_strstr(token, "wide_band_ch_switch=");
++	if (pos) {
++		int ch_width, ch_center_freq0, ch_center_freq1;
++		char *end, *comma1, *comma2;
++		pos += 20;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_CHANNEL_LOAD - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_CHANNEL_LOAD - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma2++;
++		ch_width = atoi(pos);
++		if (ch_width < 0 || ch_width > 3) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_CHANNEL_LOAD - channel width is invalid");
++			return -1;
++		}
++		ch_center_freq0 = atoi(comma1);
++		if (ch_center_freq0 < 0 || ch_center_freq0 > 255) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_CHANNEL_LOAD - channel center frequency 0 is invalid");
++			return -1;
++		}
++		ch_center_freq1 = atoi(comma2);
++		if (ch_center_freq1 < 0 || ch_center_freq1 > 255) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_CHANNEL_LOAD - channel center frequency 1 is invalid");
++			return -1;
++		}
++		channel_width = (u8) ch_width;
++		channel_width_p = &channel_width;
++		channel_center_frequency0 = (u8) ch_center_freq0;
++		channel_center_frequency0_p = &channel_center_frequency0;
++		channel_center_frequency1 = (u8) ch_center_freq1;
++		channel_center_frequency1_p = &channel_center_frequency1;
++	}
++
++exit:
++	return hostapd_send_channel_load_report(hapd, addr, dialog_token,
++			measurement_token, measurement_rep_mode, op_class, channel,
++			start_time, measurement_duration, channel_load, channel_width_p,
++			channel_center_frequency0_p, channel_center_frequency1_p);
++}
++
+ static int hostapd_ctrl_iface_set_neighbor(struct hostapd_data *hapd, char *buf)
+ {
+ 	struct wpa_ssid_value ssid;
+@@ -5061,6 +5447,12 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "REQ_BEACON ", 11) == 0) {
+ 		if (hostapd_ctrl_iface_req_beacon(hapd, buf + 11))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "REQ_CHANNEL_LOAD ", 17) == 0) {
++		if (hostapd_ctrl_iface_req_channel_load(hapd, buf + 17))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "REPORT_CHANNEL_LOAD ", 20) == 0) {
++		if (hostapd_ctrl_iface_report_channel_load(hapd, buf + 20))
++			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_LINK_MEASUREMENT ", 21) == 0) {
+ 		if (hostapd_ctrl_iface_req_link_measurement(hapd, buf + 21))
+ 			reply_len = -1;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index c322017..9223d23 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1322,6 +1322,28 @@ static int hostapd_cli_cmd_req_beacon(struct wpa_ctrl *ctrl, int argc,
+ }
+ 
+ 
++static int hostapd_cli_cmd_req_channel_load(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 7) {
++		printf("Invalid req_channel_load command: needs at least 7 arguments: - dest address, number of repetitions, measurement request mode, operating class, channel, random interval, measurement duration, + some optional arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REQ_CHANNEL_LOAD", 7, argc, argv);
++}
++
++static int hostapd_cli_cmd_report_channel_load(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 9) {
++		printf("Invalid req_channel_load command: needs at least 9 arguments: - dest address, dialog_token, measurement_token, measurement_rep_mode, op_class, channel, start time, duration, channel_load + some optional arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REPORT_CHANNEL_LOAD", 9, argc, argv);
++}
++
+ 
+ static int hostapd_cli_cmd_req_link_measurement(struct wpa_ctrl *ctrl, int argc,
+ 	     char *argv[])
+@@ -1858,6 +1880,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "req_lci", hostapd_cli_cmd_req_lci, NULL, NULL },
+ 	{ "req_range", hostapd_cli_cmd_req_range, NULL, NULL },
+ 	{ "req_beacon", hostapd_cli_cmd_req_beacon, NULL, NULL },
++	{ "req_channel_load", hostapd_cli_cmd_req_channel_load, NULL, NULL },
++	{ "report_channel_load", hostapd_cli_cmd_report_channel_load, NULL, NULL },
+ 	{ "req_link_measurement", hostapd_cli_cmd_req_link_measurement, NULL, NULL },
+ 	{ "link_measurement_report", hostapd_cli_cmd_link_measurement_report, NULL, NULL },
+ 	{ "req_sta_statistics", hostapd_cli_cmd_req_sta_statistics, NULL, NULL },
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index fa12382..db569ae 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -305,6 +305,7 @@ struct hostapd_data {
+ 	u8 lci_req_token;
+ 	u8 range_req_token;
+ 	u8 beacon_req_token;
++	u8 channel_load_token;
+ 	u8 link_measurement_token;
+ 	u8 sta_statistics_token;
+ 	unsigned int lci_req_active:1;
+diff --git a/src/ap/rrm.c b/src/ap/rrm.c
+index fcfa5e5..a489601 100644
+--- a/src/ap/rrm.c
++++ b/src/ap/rrm.c
+@@ -154,6 +154,119 @@ static void hostapd_handle_beacon_report(struct hostapd_data *hapd, u8 token,
+ 			rcpi, rsni, MAC2STR(bssid), ant_id, parent_tsf);
+ }
+ 
++static void hostapd_handle_channel_load_request(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr,
++		u16 num_of_repetition)
++{
++	const u8 *ie, *end;
++	u8 op_class, channel, measurement_token;
++	u8 ch_load_rep_cond = 0, ch_load_ref_val = 0;
++	u8 channel_load = 0, measurement_rep_mode = 0;
++	u16 measurement_duration_report = 0;
++	u64 start_time = 0;
++	mtlk_radio_info_t radio_info;
++
++	end = pos + len;
++	measurement_token = pos[0];
++	op_class = pos[3];
++	channel = pos[4];
++
++	if (!(hapd->conf->radio_measurements[1] & WLAN_RRM_CAPS_CHANNEL_LOAD)) {
++		wpa_printf(MSG_ERROR, "channel load in RRM is not supported");
++		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_CHANNEL_LOAD);
++		return;
++	}
++
++	if (channel != hapd->iface->conf->channel) {
++		wpa_printf(MSG_DEBUG, "requested channel (%d) is not supported, only the current AP channel (%d) is supported",
++				channel, hapd->iface->conf->channel);
++		measurement_rep_mode |= REP_MODE_REFUSED_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_CHANNEL_LOAD);
++		return;
++	}
++
++	if (hostapd_drv_get_radio_info(hapd, &radio_info)) {
++		wpa_printf(MSG_ERROR, "failed to get radio measurements");
++		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_CHANNEL_LOAD);
++		return;
++	}
++
++	if ((ie = get_ie(&pos[9], end - &pos[9], 1)) && (ie[1] == 2)) {
++		ch_load_rep_cond = ie[2];
++		ch_load_ref_val = ie[3];
++	}
++
++	measurement_duration_report = 255;
++	start_time = radio_info.tsf_start_time;
++	channel_load = radio_info.load;
++
++	if ((ch_load_rep_cond == 1) && (ch_load_ref_val > channel_load)) {
++		wpa_printf(MSG_DEBUG, "ch_load is less than ch_load ref val");
++		return;
++	}
++
++	if ((ch_load_rep_cond == 2) && (ch_load_ref_val < channel_load)) {
++		wpa_printf(MSG_DEBUG, "ch_load is greater than ch_load ref val");
++		return;
++	}
++
++	if (!hapd->conf->rrm_manipulate_measurement)
++		hostapd_send_channel_load_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode, op_class, channel,
++				start_time, measurement_duration_report, channel_load,
++				NULL, NULL, NULL);
++	else
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_CHANNEL_LOAD_REQUEST_RXED MACSTR
++			" dialog_token=%d measurement_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d channel_load=%d",
++			MAC2STR(sta_addr), token, measurement_token, measurement_rep_mode,
++			op_class, channel, start_time, measurement_duration_report,
++			channel_load);
++}
++
++static void hostapd_handle_channel_load_report(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr)
++{
++	u8 op_class, channel, channel_load, measurement_rep_mode;
++	u16 measurement_duration;
++	u64 start_time;
++	char wide_band_ch_switch[30];
++
++	wpa_printf(MSG_DEBUG, "channel load token %u len %zu",	token, len);
++
++	measurement_rep_mode = pos[1];
++	if (measurement_rep_mode != 0) {
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_CHANNEL_LOAD_RXED MACSTR
++				" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d channel_load=%d",
++				MAC2STR(sta_addr), measurement_rep_mode, 0, 0, 0, 0, 0);
++		return;
++	}
++
++	op_class = pos[3];
++	channel = pos[4];
++	start_time = WPA_GET_BE64(&pos[5]);
++	measurement_duration = WPA_GET_BE16(&pos[13]);
++	channel_load = pos[15];
++
++	wide_band_ch_switch[0] = '\0';
++	if (pos[16] == 163 && pos[17] == 5 && pos[18] == 194 && pos[19] == 3)
++		os_snprintf(wide_band_ch_switch, sizeof(wide_band_ch_switch),
++			" wide_band_ch_switch=%d,%d,%d", pos[20], pos[21], pos[22]);
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_CHANNEL_LOAD_RXED MACSTR
++			" measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d channel_load=%d%s",
++			MAC2STR(sta_addr), measurement_rep_mode, op_class, channel,
++			start_time, measurement_duration, channel_load,
++			wide_band_ch_switch);
++}
++
+ static void build_statistics_group_str(char *statistics_group_data_str,
+ 		u32 *statistics_group_data, int statistics_group_data_len)
+ {
+@@ -351,6 +464,10 @@ static void hostapd_handle_radio_msmt_request(struct hostapd_data *hapd,
+ 		wpa_printf(MSG_DEBUG, "Measurement request type %u", ie[4]);
+ 
+ 		switch (ie[4]) {
++		case MEASURE_TYPE_CHANNEL_LOAD:
++			hostapd_handle_channel_load_request(hapd, token, ie + 2, ie[1],
++					mgmt->sa, num_of_repetition);
++			break;
+ 		case MEASURE_TYPE_STA_STATISTICS:
+ 			hostapd_handle_sta_statistics_request(hapd, token, ie + 2, ie[1],
+ 					mgmt->sa, num_of_repetition);
+@@ -398,6 +515,10 @@ static void hostapd_handle_radio_msmt_report(struct hostapd_data *hapd,
+ 		case MEASURE_TYPE_BEACON:
+ 			hostapd_handle_beacon_report(hapd, token, ie + 2, ie[1]);
+ 			break;
++		case MEASURE_TYPE_CHANNEL_LOAD:
++			hostapd_handle_channel_load_report(hapd, token, ie + 2, ie[1],
++					mgmt->sa);
++			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG,
+ 				   "Measurement report type %u is not supported", ie[4]);
+@@ -1132,6 +1253,173 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 	return 0;
+ }
+ 
++int hostapd_send_channel_load_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode, u8 oper_class,
++		u8 channel, u16 random_interval, u16 measurement_duration, u8 *rep_cond,
++		u8 *ch_load_ref_val, u8 *ch_width, u8 *ch_center_freq0,
++		u8 *ch_center_freq1)
++{
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	u8 *len;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "request channel load: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "request channel load: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[1] & WLAN_RRM_CAPS_CHANNEL_LOAD)) {
++		wpa_printf(MSG_ERROR,
++			   "request channel load: Destination station does not support channel load in RRM");
++		return -1;
++	}
++
++	/* Measurement request (5) + Measurement element with channel load (11) + optional sub-elements (255)*/
++	buf = wpabuf_alloc(5 + 11 + 255);
++	if (!buf)
++		return -1;
++
++	hapd->channel_load_token++;
++	if (!hapd->channel_load_token) /* For wraparounds */
++		hapd->channel_load_token++;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.2 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REQUEST);
++	wpabuf_put_u8(buf, hapd->channel_load_token); /* Dialog Token */
++	wpabuf_put_be16(buf, num_of_repetitions); /* Number of Repetitions */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.21 */
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REQUEST);
++	len = wpabuf_put(buf, 1); /* Length will be set later */
++
++	wpabuf_put_u8(buf, hapd->channel_load_token); /* Measurement Token */
++	wpabuf_put_u8(buf, measurement_request_mode); /* Measurement Request Mode */
++	wpabuf_put_u8(buf, MEASURE_TYPE_CHANNEL_LOAD); /* Measurement Type */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.21.5 */
++	wpabuf_put_u8(buf, oper_class); /* Operating class */
++	wpabuf_put_u8(buf, channel); /* Channel Number */
++	wpabuf_put_be16(buf, random_interval); /* Randomization Interval */
++	wpabuf_put_be16(buf, measurement_duration); /* Measurement Duration */
++
++	/* optional sub-elements should go here */
++	if (rep_cond && ch_load_ref_val) {
++		wpabuf_put_u8(buf, 1); /* channel load reporting sub element id */
++		wpabuf_put_u8(buf, 2);
++		wpabuf_put_u8(buf, *rep_cond);
++		wpabuf_put_u8(buf, *ch_load_ref_val);
++	}
++
++	if (ch_width && ch_center_freq0 && ch_center_freq1) {
++		wpabuf_put_u8(buf, 163); /* wide bandwidth channel switch sub element id */
++		wpabuf_put_u8(buf, 5);   /* sub element length */
++		wpabuf_put_u8(buf, 194); /* wide bandwidth channel switch element id */
++		wpabuf_put_u8(buf, 3); 	 /* element length */
++		wpabuf_put_u8(buf, *ch_width);
++		wpabuf_put_u8(buf, *ch_center_freq0);
++		wpabuf_put_u8(buf, *ch_center_freq1);
++	}
++
++	/* category + Action + measurement type + token + reps + EID + len = 7 */
++	*len = wpabuf_len(buf) - 7;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++	return ret;
++}
++
++int hostapd_send_channel_load_report(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u8 op_class, u8 channel, u64 start_time, u16 measurement_duration,
++		u8 channel_load, u8 *ch_width, u8 *ch_center_freq0, u8 *ch_center_freq1)
++{
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	u8 *len;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "channel load report: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "channel load report: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[1] & WLAN_RRM_CAPS_CHANNEL_LOAD)) {
++		wpa_printf(MSG_ERROR,
++			   "channel load report: Destination station does not support channel load in RRM");
++		return -1;
++	}
++
++	/* Measurement report (3) + Measurement element with channel load (18) + optional sub-elements (255)*/
++	buf = wpabuf_alloc(3 + 18 + 255);
++	if (!buf)
++		return -1;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.3 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REPORT);
++	wpabuf_put_u8(buf, dialog_token); /* Dialog Token */
++
++	/* IEEE P802.11-REVmc/D5.0, 9.4.2.22 */
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REPORT);
++	len = wpabuf_put(buf, 1); /* Length will be set later */
++
++	wpabuf_put_u8(buf, measurement_token); /* Measurement Token */
++	wpabuf_put_u8(buf, measurement_rep_mode); /* Measurement Report Mode */
++	wpabuf_put_u8(buf, MEASURE_TYPE_CHANNEL_LOAD); /* Measurement Type */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.22.5 */
++	wpabuf_put_u8(buf, op_class); /* Operating class */
++	wpabuf_put_u8(buf, channel); /* Channel Number */
++	wpabuf_put_data(buf, (const void *) &start_time, 8); /* actual measurement start time */
++	wpabuf_put_be16(buf, measurement_duration); /* Measurement Duration */
++	wpabuf_put_u8(buf, channel_load); /* channel_load */
++
++	if (ch_width && ch_center_freq0 && ch_center_freq1) {
++		wpabuf_put_u8(buf, 163); /* wide bandwidth channel switch sub element id */
++		wpabuf_put_u8(buf, 5);   /* sub element length */
++		wpabuf_put_u8(buf, 194); /* wide bandwidth channel switch element id */
++		wpabuf_put_u8(buf, 3); 	 /* element length */
++		wpabuf_put_u8(buf, *ch_width);
++		wpabuf_put_u8(buf, *ch_center_freq0);
++		wpabuf_put_u8(buf, *ch_center_freq1);
++	}
++
++	/* Action + measurement type + token + EID + len = 5 */
++	*len = wpabuf_len(buf) - 5;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++	return ret;
++}
++
+ 
+ int hostapd_send_link_measurement_req(struct hostapd_data *hapd, const u8 *addr)
+ {
+diff --git a/src/ap/rrm.h b/src/ap/rrm.h
+index d6374e3..a2c9790 100644
+--- a/src/ap/rrm.h
++++ b/src/ap/rrm.h
+@@ -31,6 +31,16 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 		struct wpa_ssid_value* ssid, u8* rep_cond, u8* rep_cond_threshold,
+ 		u8* rep_detail,	const u8* ap_ch_rep, unsigned int ap_ch_rep_len,
+ 		const u8* req_elem, unsigned int req_elem_len);
++int hostapd_send_channel_load_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode, u8 oper_class,
++		u8 channel, u16 random_interval, u16 measurement_duration, u8 *rep_cond,
++		u8 *ch_load_ref_val, u8 *ch_width, u8 *ch_center_freq0,
++		u8 *ch_center_freq1);
++int hostapd_send_channel_load_report(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u8 op_class, u8 channel, u64 start_time, u16 measurement_duration,
++		u8 channel_load, u8 *ch_width, u8 *ch_center_freq0,
++		u8 *ch_center_freq1);
+ int hostapd_send_link_measurement_req(struct hostapd_data *hapd,
+ 		const u8 *addr);
+ int hostapd_send_link_measurement_report(struct hostapd_data *hapd,
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 1d7bc2e..9ed078d 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -373,6 +373,7 @@
+ #define WLAN_RRM_CAPS_BEACON_REPORTING_CONDITIONS_MEASUREMENT BIT(7)
+ #define WLAN_RRM_CAPS_NEIGHBOR_REPORT BIT(1)
+ /* byte 2 (out of 5) */
++#define WLAN_RRM_CAPS_CHANNEL_LOAD BIT(1)
+ #define WLAN_RRM_CAPS_STATISTICS_MEASUREMENT BIT(3)
+ #define WLAN_RRM_CAPS_LCI_MEASUREMENT BIT(4)
+ /* byte 5 (out of 5) */
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index a21b5da..1dcad09 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -245,6 +245,9 @@ extern "C" {
+ #define RRM_EVENT_BEACON_REP_RXED "RRM-BEACON-REP-RECEIVED "
+ #define RRM_EVENT_BEACON_REP_FAILED "RRM-BEACON-REP-REQUEST-FAILED "
+ 
++#define RRM_EVENT_CHANNEL_LOAD_RXED "RRM-CHANNEL-LOAD-RECEIVED "
++#define RRM_EVENT_CHANNEL_LOAD_REQUEST_RXED "RRM-CHANNEL-LOAD-REQUEST-RECEIVED "
++
+ 
+ #define RRM_EVENT_LINK_MEASUREMENT_RXED "RRM-LINK-MEASUREMENT-RECEIVED "
+ #define RRM_EVENT_LINK_MEASUREMENT_REQUEST_RXED \
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 284652b..eba18dd 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1499,6 +1499,7 @@ struct mtlk_wssa_drv_tr181_hw_stats {
+ typedef struct mtlk_radio_info {
+   struct mtlk_wssa_drv_tr181_hw hw;
+   struct mtlk_wssa_drv_tr181_hw_stats hw_stats;
++  u64 tsf_start_time;
+   u8 load;
+   u32 tx_pwr_cfg;
+   u8 num_tx_antennas;
+-- 
+2.10.1
+

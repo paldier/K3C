@@ -1,0 +1,886 @@
+diff -Nuar netifd-2015-09-27/CMakeLists.txt netifd-2015-09-27_modif/CMakeLists.txt
+--- netifd-2015-09-27/CMakeLists.txt	2015-11-18 20:34:17.000000000 +0530
++++ netifd-2015-09-27_modif/CMakeLists.txt	2016-06-01 19:55:19.771610891 +0530
+@@ -15,7 +15,7 @@
+ 	interface.c interface-ip.c interface-event.c
+ 	iprule.c proto.c proto-static.c proto-shell.c
+ 	config.c device.c bridge.c vlan.c alias.c
+-	macvlan.c ubus.c vlandev.c wireless.c)
++	macvlan.c ubus.c vlandev.c wireless.c bonding.c)
+ 
+ 
+ SET(LIBS
+diff -Nuar netifd-2015-09-27/bonding.c netifd-2015-09-27_modif/bonding.c
+--- netifd-2015-09-27/bonding.c	1970-01-01 05:30:00.000000000 +0530
++++ netifd-2015-09-27_modif/bonding.c	2016-06-01 19:55:33.827851064 +0530
+@@ -0,0 +1,587 @@
++/*
++ * netifd - network interface daemon
++ * Copyright (C) 2014 Andreas Huebner (cowardly stolen from bridge.c)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <stdlib.h>
++
++#include <assert.h>
++
++
++#include "netifd.h"
++#include "device.h"
++#include "interface.h"
++#include "system.h"
++
++enum {
++    BOND_ATTR_IFNAME,
++    BOND_ATTR_MODE,
++    __BOND_ATTR_MAX
++
++
++
++
++
++
++
++};
++
++static const struct blobmsg_policy bond_attrs[__BOND_ATTR_MAX] = {
++    [BOND_ATTR_IFNAME] = { "ifname", BLOBMSG_TYPE_ARRAY },
++    [BOND_ATTR_MODE] = { "mode", BLOBMSG_TYPE_ARRAY },
++
++
++
++
++
++
++
++};
++
++static const struct uci_blob_param_info bond_attr_info[__BOND_ATTR_MAX] = {
++    [BOND_ATTR_IFNAME] = { .type = BLOBMSG_TYPE_STRING },
++};
++
++static const struct uci_blob_param_list bond_attr_list = {
++    .n_params = __BOND_ATTR_MAX,
++    .params = bond_attrs,
++    .info = bond_attr_info,
++
++    .n_next = 1,
++    .next = { &device_attr_list },
++};
++
++static struct device *bond_create(const char *name, struct blob_attr *attr);
++static void bond_config_init(struct device *dev);
++static void bond_free(struct device *dev);
++static void bond_dump_info(struct device *dev, struct blob_buf *buf);
++enum dev_change_type
++bond_reload(struct device *dev, struct blob_attr *attr);
++
++const struct device_type bond_device_type = {
++    .name = "Bond",
++    .config_params = &bond_attr_list,
++
++    .create = bond_create,
++    .config_init = bond_config_init,
++    .reload = bond_reload,
++    .free = bond_free,
++    .dump_info = bond_dump_info,
++};
++
++struct bond_state {
++    struct device dev;
++    device_state_cb set_state;
++
++    struct blob_attr *config_data;
++    struct bridge_config config;
++    struct blob_attr *ifnames;
++    bool active;
++    bool force_active;
++
++    struct bond_member *primary_port;
++    struct vlist_tree members;
++    int n_present;
++};
++
++struct bond_member {
++    struct vlist_node node;
++    struct bond_state *bst;
++    struct device_user dev;
++    bool present;
++    char name[];
++};
++
++static void
++bond_reset_primary(struct bond_state *bst)
++{
++    struct bond_member *bm;
++
++    if (!bst->primary_port &&
++        (bst->dev.settings.flags & DEV_OPT_MACADDR))
++        return;
++
++    bst->primary_port = NULL;
++    bst->dev.settings.flags &= ~DEV_OPT_MACADDR;
++    vlist_for_each_element(&bst->members, bm, node) {
++        uint8_t *macaddr;
++
++        if (!bm->present)
++            continue;
++
++        bst->primary_port = bm;
++        if (bm->dev.dev->settings.flags & DEV_OPT_MACADDR)
++            macaddr = bm->dev.dev->settings.macaddr;
++        else
++            macaddr = bm->dev.dev->orig_settings.macaddr;
++        memcpy(bst->dev.settings.macaddr, macaddr, 6);
++        bst->dev.settings.flags |= DEV_OPT_MACADDR;
++        return;
++    }
++}
++
++static int
++bond_disable_member(struct bond_member *bm)
++{
++    struct bond_state *bst = bm->bst;
++
++    if (!bm->present)
++        return 0;
++
++    system_bond_delslave(&bst->dev, bm->dev.dev);
++    device_release(&bm->dev);
++
++    return 0;
++}
++
++static int
++bond_enable_member(struct bond_member *bm)
++{
++    struct bond_state *bst = bm->bst;
++    int ret;
++
++    if (!bm->present)
++        return 0;
++
++    ret = device_claim(&bm->dev);
++    if (ret < 0)
++        goto error;
++
++    ret = system_bond_addslave(&bst->dev, bm->dev.dev);
++    if (ret < 0) {
++        D(DEVICE, "Bridge device %s could not be added\n", bm->dev.dev->ifname);
++        goto error;
++    }
++
++    return 0;
++
++error:
++    bm->present = false;
++    bst->n_present--;
++    return ret;
++}
++
++static void
++bond_remove_member(struct bond_member *bm)
++{
++    struct bond_state *bst = bm->bst;
++
++    if (!bm->present)
++        return;
++
++    if (bm == bst->primary_port);
++        bond_reset_primary(bst);
++
++    if (bst->dev.active)
++        bond_disable_member(bm);
++
++    bm->present = false;
++    bm->bst->n_present--;
++
++    if (bst->config.bridge_empty)
++        return;
++
++    bst->force_active = false;
++    if (bst->n_present == 0)
++        device_set_present(&bst->dev, false);
++}
++
++static void
++bond_free_member(struct bond_member *bm)
++{
++    struct device *dev = bm->dev.dev;
++
++//    bond_remove_member(bm); // TODO
++    device_remove_user(&bm->dev);
++
++    /*
++     * When reloading the config and moving a device from one bridge to
++     * another, the other bridge may have tried to claim this device
++     * before it was removed here.
++     * Ensure that claiming the device is retried by toggling its present
++     * state
++     */
++    if (dev->present) {
++        device_set_present(dev, false);
++        device_set_present(dev, true);
++    }
++
++    free(bm);
++}
++
++static void
++bond_member_cb(struct device_user *dev, enum device_event ev)
++{
++    struct bond_member *bm = container_of(dev, struct bond_member, dev);
++    struct bond_state *bst = bm->bst;
++
++    switch (ev) {
++    case DEV_EVENT_ADD:
++        assert(!bm->present);
++
++        bm->present = true;
++        bst->n_present++;
++
++        if (bst->dev.active)
++            bond_enable_member(bm);
++        else if (bst->n_present == 1)
++            device_set_present(&bst->dev, true);
++
++        break;
++    case DEV_EVENT_REMOVE:
++        if (dev->hotplug) {
++            vlist_delete(&bst->members, &bm->node);
++            return;
++        }
++
++        if (bm->present)
++            bond_remove_member(bm);
++
++        break;
++    default:
++        return;
++    }
++}
++
++static int
++bond_set_down(struct bond_state *bst)
++{
++    struct bond_member *bm;
++
++    bst->set_state(&bst->dev, false);
++
++    vlist_for_each_element(&bst->members, bm, node)
++        bond_disable_member(bm);
++
++    system_bond_delmaster(&bst->dev);
++
++    return 0;
++}
++
++static int
++bond_set_up(struct bond_state *bst)
++{
++    struct bond_member *bm;
++    int ret;
++
++    if (!bst->force_active && !bst->n_present)
++        return -ENOENT;
++
++    ret = system_bond_addmaster(&bst->dev); // TODO "&bst->config" was 2nd parameter, but it can probably be dumped from bond.c
++    if (ret < 0)
++        goto out;
++
++    vlist_for_each_element(&bst->members, bm, node)
++        bond_enable_member(bm);
++
++    if (!bst->force_active && !bst->n_present) {
++        /* initialization of all member interfaces failed */
++        system_bond_delmaster(&bst->dev);
++        device_set_present(&bst->dev, false);
++        return -ENOENT;
++    }
++
++    bond_reset_primary(bst);
++    ret = bst->set_state(&bst->dev, true);
++    if (ret < 0)
++        bond_set_down(bst);
++
++out:
++    return ret;
++}
++
++static int
++bond_set_state(struct device *dev, bool up)
++{
++    struct bond_state *bst;
++
++    bst = container_of(dev, struct bond_state, dev);
++
++    if (up)
++        return bond_set_up(bst);
++    else
++        return bond_set_down(bst);
++}
++
++static struct bond_member *
++bond_create_member(struct bond_state *bst, struct device *dev, bool hotplug)
++{
++    struct bond_member *bm;
++
++    bm = calloc(1, sizeof(*bm) + strlen(dev->ifname) + 1);
++    bm->bst = bst;
++    bm->dev.cb = bond_member_cb;
++    bm->dev.hotplug = hotplug;
++    strcpy(bm->name, dev->ifname);
++    bm->dev.dev = dev;
++    vlist_add(&bst->members, &bm->node, bm->name);
++    if (hotplug)
++        bm->node.version = -1;
++
++    return bm;
++}
++
++static void
++bond_member_update(struct vlist_tree *tree, struct vlist_node *node_new,
++             struct vlist_node *node_old)
++{
++    struct bond_member *bm;
++    struct device *dev;
++
++    if (node_new) {
++        bm = container_of(node_new, struct bond_member, node);
++
++        if (node_old) {
++            free(bm);
++            return;
++        }
++
++        dev = bm->dev.dev;
++        bm->dev.dev = NULL;
++        device_add_user(&bm->dev, dev);
++    }
++
++
++    if (node_old) {
++        bm = container_of(node_old, struct bond_member, node);
++        bond_free_member(bm);
++    }
++}
++
++
++static void
++bond_add_member(struct bond_state *bst, const char *name)
++{
++    struct device *dev;
++
++    dev = device_get(name, true);
++    if (!dev)
++        return;
++
++    bond_create_member(bst, dev, false);
++}
++
++static int
++bond_hotplug_add(struct device *dev, struct device *member)
++{
++    struct bond_state *bst = container_of(dev, struct bond_state, dev);
++
++    bond_create_member(bst, member, true);
++
++    return 0;
++}
++
++static int
++bond_hotplug_del(struct device *dev, struct device *member)
++{
++    struct bond_state *bst = container_of(dev, struct bond_state, dev);
++    struct bond_member *bm;
++
++    bm = vlist_find(&bst->members, member->ifname, bm, node);
++    if (!bm)
++        return UBUS_STATUS_NOT_FOUND;
++
++    vlist_delete(&bst->members, &bm->node);
++    return 0;
++}
++
++static int
++bond_hotplug_prepare(struct device *dev)
++{
++    struct bond_state *bst;
++
++    bst = container_of(dev, struct bond_state, dev);
++    bst->force_active = true;
++    device_set_present(&bst->dev, true);
++
++    return 0;
++}
++
++static const struct device_hotplug_ops bond_ops = {
++    .prepare = bond_hotplug_prepare,
++    .add = bond_hotplug_add,
++    .del = bond_hotplug_del
++};
++
++static void
++bond_free(struct device *dev)
++{
++    struct bond_state *bst;
++
++    bst = container_of(dev, struct bond_state, dev);
++    vlist_flush_all(&bst->members);
++    free(bst);
++}
++
++static void
++bond_dump_info(struct device *dev, struct blob_buf *b)
++{
++    struct bond_state *bst;
++    struct bond_member *bm;
++    void *list;
++
++    bst = container_of(dev, struct bond_state, dev);
++
++    system_if_dump_info(dev, b);
++    list = blobmsg_open_array(b, "bridge-members");
++
++    vlist_for_each_element(&bst->members, bm, node)
++        blobmsg_add_string(b, NULL, bm->dev.dev->ifname);
++
++    blobmsg_close_array(b, list);
++}
++
++static void
++bond_config_init(struct device *dev)
++{
++    struct bond_state *bst;
++    struct blob_attr *cur;
++    int rem;
++
++    bst = container_of(dev, struct bond_state, dev);
++
++    if (bst->config.bridge_empty) {
++        bst->force_active = true;
++        device_set_present(&bst->dev, true);
++    }
++
++    if (!bst->ifnames)
++        return;
++
++    vlist_update(&bst->members);
++    blobmsg_for_each_attr(cur, bst->ifnames, rem) {
++        bond_add_member(bst, blobmsg_data(cur));
++    }
++    vlist_flush(&bst->members);
++}
++
++static void
++bond_apply_settings(struct bond_state *bst, struct blob_attr **tb)
++{
++#if 0
++    struct bond_config *cfg = &bst->config;
++    struct blob_attr *cur;
++
++    /* defaults */
++    cfg->stp = false;
++    cfg->forward_delay = 2;
++    cfg->igmp_snoop = false;
++    cfg->bond_empty = false;
++    cfg->priority = 0x7FFF;
++
++    if ((cur = tb[BRIDGE_ATTR_STP]))
++        cfg->stp = blobmsg_get_bool(cur);
++
++    if ((cur = tb[BRIDGE_ATTR_FORWARD_DELAY]))
++        cfg->forward_delay = blobmsg_get_u32(cur);
++
++    if ((cur = tb[BRIDGE_ATTR_PRIORITY]))
++        cfg->priority = blobmsg_get_u32(cur);
++
++    if ((cur = tb[BRIDGE_ATTR_IGMP_SNOOP]))
++        cfg->igmp_snoop = blobmsg_get_bool(cur);
++
++    if ((cur = tb[BRIDGE_ATTR_AGEING_TIME])) {
++        cfg->ageing_time = blobmsg_get_u32(cur);
++        cfg->flags |= BRIDGE_OPT_AGEING_TIME;
++    }
++
++    if ((cur = tb[BRIDGE_ATTR_HELLO_TIME])) {
++        cfg->hello_time = blobmsg_get_u32(cur);
++        cfg->flags |= BRIDGE_OPT_HELLO_TIME;
++    }
++
++    if ((cur = tb[BRIDGE_ATTR_MAX_AGE])) {
++        cfg->max_age = blobmsg_get_u32(cur);
++        cfg->flags |= BRIDGE_OPT_MAX_AGE;
++    }
++
++    if ((cur = tb[BRIDGE_ATTR_BRIDGE_EMPTY]))
++        cfg->bond_empty = blobmsg_get_bool(cur);
++#endif
++}
++
++enum dev_change_type
++bond_reload(struct device *dev, struct blob_attr *attr)
++{
++    struct blob_attr *tb_dev[__DEV_ATTR_MAX];
++    struct blob_attr *tb_br[__BOND_ATTR_MAX];
++    enum dev_change_type ret = DEV_CONFIG_APPLIED;
++    unsigned long diff;
++    struct bond_state *bst;
++
++    BUILD_BUG_ON(sizeof(diff) < __BOND_ATTR_MAX / 8);
++    BUILD_BUG_ON(sizeof(diff) < __DEV_ATTR_MAX / 8);
++
++    bst = container_of(dev, struct bond_state, dev);
++
++    blobmsg_parse(device_attr_list.params, __DEV_ATTR_MAX, tb_dev,
++        blob_data(attr), blob_len(attr));
++    blobmsg_parse(bond_attrs, __BOND_ATTR_MAX, tb_br,
++        blob_data(attr), blob_len(attr));
++
++    bst->ifnames = tb_br[BOND_ATTR_IFNAME];
++    device_init_settings(dev, tb_dev);
++    bond_apply_settings(bst, tb_br); // TODO This copies settings over from the blob_attr table to the "struct bond_config"
++
++    if (bst->config_data) {
++        struct blob_attr *otb_dev[__DEV_ATTR_MAX];
++        struct blob_attr *otb_br[__BOND_ATTR_MAX];
++
++        blobmsg_parse(device_attr_list.params, __DEV_ATTR_MAX, otb_dev,
++            blob_data(bst->config_data), blob_len(bst->config_data));
++
++        diff = 0;
++        uci_blob_diff(tb_dev, otb_dev, &device_attr_list, &diff);
++        /* if (diff & ~(1 << DEV_ATTR_IFNAME))
++            ret = DEV_CONFIG_RESTART; */
++
++        blobmsg_parse(bond_attrs, __BOND_ATTR_MAX, otb_br,
++            blob_data(bst->config_data), blob_len(bst->config_data));
++
++        diff = 0;
++        uci_blob_diff(tb_br, otb_br, &bond_attr_list, &diff);
++        if (diff & ~(1 << BOND_ATTR_IFNAME))
++            ret = DEV_CONFIG_RESTART;
++
++        bond_config_init(dev);
++    }
++
++    bst->config_data = attr;
++    return ret;
++}
++
++static struct device *
++bond_create(const char *name, struct blob_attr *attr)
++{
++    struct bond_state *bst;
++    struct device *dev;
++
++    bst = calloc(1, sizeof(*bst));
++    if (!bst)
++        return NULL;
++
++    dev = &bst->dev;
++    device_init(dev, &bond_device_type, name);
++    dev->config_pending = true;
++
++    bst->set_state = dev->set_state;
++    dev->set_state = bond_set_state;
++
++    dev->hotplug_ops = &bond_ops;
++
++    vlist_init(&bst->members, avl_strcmp, bond_member_update);
++    bst->members.keep_old = true;
++    bond_reload(dev, attr);
++
++    return dev;
++}
+diff -Nuar netifd-2015-09-27/config.c netifd-2015-09-27_modif/config.c
+--- netifd-2015-09-27/config.c	2015-11-18 20:34:17.000000000 +0530
++++ netifd-2015-09-27_modif/config.c	2016-06-01 19:55:46.227062902 +0530
+@@ -72,6 +72,26 @@
+ 	return 0;
+ }
+ 
++static int
++config_parse_bond_interface(struct uci_section *s)
++{
++    char *name;
++
++    name = alloca(strlen(s->e.name) + 6);
++    sprintf(name, "bond-%s", s->e.name);
++    blobmsg_add_string(&b, "name", name);
++
++    uci_to_blob(&b, s, bond_device_type.config_params);
++    if (!device_create(name, &bond_device_type, b.head)) {
++        D(INTERFACE, "Failed to create bonding for interface '%s'\n", s->e.name);
++        return -EINVAL;
++    }
++
++    blob_buf_init(&b, 0);
++    blobmsg_add_string(&b, "ifname", name);
++    return 0;
++}
++
+ static void
+ config_parse_interface(struct uci_section *s, bool alias)
+ {
+@@ -94,6 +114,10 @@
+ 
+ 		bridge = true;
+ 	}
++	else if (type && !strcmp(type, "bond")) {
++	        if (config_parse_bond_interface(s))
++			return;
++	}	
+ 
+ 	uci_to_blob(&b, s, &interface_attr_list);
+ 
+diff -Nuar netifd-2015-09-27/device.h netifd-2015-09-27_modif/device.h
+--- netifd-2015-09-27/device.h	2015-11-18 20:34:17.000000000 +0530
++++ netifd-2015-09-27_modif/device.h	2016-06-01 19:55:52.267167248 +0530
+@@ -206,6 +206,7 @@
+ 
+ extern const struct uci_blob_param_list device_attr_list;
+ extern const struct device_type simple_device_type;
++extern const struct device_type bond_device_type;
+ extern const struct device_type bridge_device_type;
+ extern const struct device_type tunnel_device_type;
+ extern const struct device_type macvlan_device_type;
+diff -Nuar netifd-2015-09-27/system-dummy.c netifd-2015-09-27_modif/system-dummy.c
+--- netifd-2015-09-27/system-dummy.c	2015-11-18 20:34:17.000000000 +0530
++++ netifd-2015-09-27_modif/system-dummy.c	2016-06-01 19:55:59.403289044 +0530
+@@ -30,6 +30,30 @@
+ 	return 0;
+ }
+ 
++int system_bond_addmaster(struct device *bond)
++{
++    D(SYSTEM, "ip link add name %s type bond\n", bond->ifname);
++    return 0;
++}
++
++int system_bond_delmaster(struct device *bond)
++{
++    D(SYSTEM, "ip link del dev %s\n", bond->ifname);
++    return 0;
++}
++
++int system_bond_addslave(struct device *bond, struct device *dev)
++{
++    D(SYSTEM, "ip link set dev %s master %s\n", dev->ifname, bond->ifname);
++    return 0;
++}
++
++int system_bond_delslave(struct device *bond, struct device *dev)
++{
++    D(SYSTEM, "ip link set dev %s nomaster\n", dev->ifname);
++    return 0;
++}
++
+ int system_bridge_addbr(struct device *bridge, struct bridge_config *cfg)
+ {
+ 	D(SYSTEM, "brctl addbr %s\n", bridge->ifname);
+diff -Nuar netifd-2015-09-27/system-linux.c netifd-2015-09-27_modif/system-linux.c
+--- netifd-2015-09-27/system-linux.c	2015-11-18 20:34:17.000000000 +0530
++++ netifd-2015-09-27_modif/system-linux.c	2016-06-01 19:56:05.659396982 +0530
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2013 Jo-Philipp Wich <jow@openwrt.org>
+  * Copyright (C) 2013 Steven Barth <steven@midlink.org>
+  * Copyright (C) 2014 Gioacchino Mazzurco <gio@eigenlab.org>
++ * Copyright (C) 2014 Andreas Huebner
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2
+@@ -831,6 +832,170 @@
+ {
+ 	return (unsigned long) val * 100;
+ }
++int
++system_bond_addmaster(struct device *bond)
++{
++    struct nl_msg *msg;
++    struct ifinfomsg ifi = {
++        .ifi_family = AF_UNSPEC,
++        .ifi_type = 0,
++        .ifi_index = 0,
++        .ifi_flags = 0,
++        .ifi_change = 0xFFFFFFFF,
++    };
++    struct nlattr *linkinfo;
++
++    msg = nlmsg_alloc_simple(RTM_NEWLINK, NLM_F_ACK | NLM_F_REQUEST
++                          | NLM_F_CREATE | NLM_F_EXCL);
++    if (!msg)
++        return -1;
++
++    if (nlmsg_append(msg, &ifi, sizeof(ifi), 0))
++        return -1;
++
++    nla_put_string(msg, IFLA_IFNAME, bond->ifname);
++
++    if (!(linkinfo = nla_nest_start(msg, IFLA_LINKINFO)))
++        goto nla_put_failure;
++
++    nla_put_string(msg, IFLA_INFO_KIND, "bond");
++
++    nla_nest_end(msg, linkinfo);
++
++    return system_rtnl_call(msg);
++
++nla_put_failure:
++    nlmsg_free(msg);
++    return -ENOMEM;
++}
++
++int
++system_bond_delmaster(struct device *bond)
++{
++    struct nl_msg *msg;
++    struct ifinfomsg ifi = {
++        .ifi_family = AF_UNSPEC,
++        .ifi_type = 0,
++        .ifi_index = 0,
++        .ifi_flags = 0,
++        .ifi_change = 0xFFFFFFFF,
++    };
++    unsigned int ifi_master;
++
++    ifi_master = if_nametoindex(bond->ifname);
++    if (ifi_master == 0)
++        return -1;
++
++    ifi.ifi_index = ifi_master;
++
++    D(SYSTEM, "Master \"%s\" (index = %u, %u)\n",
++        bond->ifname, ifi_master, bond->ifindex);
++
++    msg = nlmsg_alloc_simple(RTM_DELLINK, NLM_F_ACK| NLM_F_REQUEST);
++    if (!msg)
++        return -1;
++
++    if (nlmsg_append(msg, &ifi, sizeof(ifi), 0))
++        return -1;
++
++    return system_rtnl_call(msg);
++}
++
++int
++system_bond_addslave(struct device *bond, struct device *dev)
++{
++    // TODO might need to bring the device down first!!
++
++    struct nl_msg *msg;
++    struct ifinfomsg ifi = {
++        .ifi_family = AF_UNSPEC,
++        .ifi_type = 0,
++        .ifi_index = 0,
++        .ifi_flags = 0,
++        .ifi_change = 0xFFFFFFFF,
++    };
++    unsigned int ifi_master;
++    unsigned int ifi_slave;
++
++    ifi_master = if_nametoindex(bond->ifname);
++    if (ifi_master == 0)
++        return -1;
++
++    ifi_slave = if_nametoindex(dev->ifname);
++    if (ifi_slave == 0)
++        return -1;
++
++    ifi.ifi_index = ifi_slave;
++
++    D(SYSTEM, "Master \"%s\" (index = %u, %u), Slave \"%s\" (index = %u, %u)\n",
++        bond->ifname, ifi_master, bond->ifindex, dev->ifname, ifi_slave, dev->ifindex);
++
++    msg = nlmsg_alloc_simple(RTM_NEWLINK, NLM_F_ACK | NLM_F_REQUEST);
++    if (!msg)
++        return -1;
++
++    if (nlmsg_append(msg, &ifi, sizeof(ifi), 0))
++        return -1;
++
++    nla_put_u32(msg, IFLA_MASTER, ifi_master); // TODO bond->ifindex gives me "0" here, dunno why
++
++    int ret = system_rtnl_call(msg);
++
++    D(SYSTEM, "***** ret = %i\n", ret);
++    errno -= ret;
++    perror("This went wrong");
++
++    return ret;
++}
++
++int
++system_bond_delslave(struct device *bond, struct device *dev)
++{
++    // TODO might need to bring the device down first!!
++
++    struct nl_msg *msg;
++    struct ifinfomsg ifi = {
++        .ifi_family = AF_UNSPEC,
++        .ifi_type = 0,
++        .ifi_index = 0,
++        .ifi_flags = 0,
++        .ifi_change = 0xFFFFFFFF,
++    };
++    unsigned int ifi_master;
++    unsigned int ifi_slave;
++
++    ifi_master = if_nametoindex(bond->ifname);
++    if (ifi_master == 0)
++        return -1;
++
++    ifi_slave = if_nametoindex(dev->ifname);
++    if (ifi_slave == 0)
++        return -1;
++
++    ifi.ifi_index = ifi_slave;
++
++    D(SYSTEM, "Master \"%s\" (index = %u, %u), Slave \"%s\" (index = %u, %u)\n",
++        bond->ifname, ifi_master, bond->ifindex, dev->ifname, ifi_slave, dev->ifindex);
++
++    msg = nlmsg_alloc_simple(RTM_NEWLINK, NLM_F_ACK | NLM_F_REQUEST);
++    if (!msg)
++        return -1;
++
++    if (nlmsg_append(msg, &ifi, sizeof(ifi), 0))
++        return -1;
++
++    /* Setting IFLA_MASTER to if_index 0 deletes the master from this dev */
++    nla_put_u32(msg, IFLA_MASTER, 0);
++
++    int ret = system_rtnl_call(msg);
++
++    D(SYSTEM, "***** ret = %i\n", ret);
++    errno -= ret;
++    perror("This went wrong");
++
++    return ret;
++}
++
+ 
+ int system_bridge_addbr(struct device *bridge, struct bridge_config *cfg)
+ {
+diff -Nuar netifd-2015-09-27/system.h netifd-2015-09-27_modif/system.h
+--- netifd-2015-09-27/system.h	2015-11-18 20:34:17.000000000 +0530
++++ netifd-2015-09-27_modif/system.h	2016-06-01 19:56:11.555496624 +0530
+@@ -100,6 +100,11 @@
+ 
+ int system_init(void);
+ 
++int system_bond_addmaster(struct device *bond);
++int system_bond_delmaster(struct device *bond);
++int system_bond_addslave(struct device *bond, struct device *dev);
++int system_bond_delslave(struct device *bond, struct device *dev);
++
+ int system_bridge_addbr(struct device *bridge, struct bridge_config *cfg);
+ int system_bridge_delbr(struct device *bridge);
+ int system_bridge_addif(struct device *bridge, struct device *dev);

@@ -1,0 +1,121 @@
+# HG changeset patch
+# Parent 8fcad220328bd516a6dbb94445eca0cadc1aeaad
+
+diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
+--- a/drivers/net/ethernet/lantiq/Kconfig
++++ b/drivers/net/ethernet/lantiq/Kconfig
+@@ -85,6 +85,12 @@ config LTQ_TOE_DRIVER
+         default n
+         ---help---
+         Lantiq TOE (TCP Offload Engine) driver for XRX500 series.
++config OFFLOAD_FWD_MARK
++	bool "Enable offload fwd mark for the packets already forwarded by switch"
++				depends on LTQ_ETH_XRX500
++				default y
++				---help---
++				Lantiq switch offload for broadcast/multicast packets
+ 
+ source "drivers/net/ethernet/lantiq/datapath/Kconfig"
+ source "drivers/net/ethernet/lantiq/switch-api/Kconfig"
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -52,10 +52,13 @@ static int xrx500_mdio_probe(struct net_
+ static int ltq_gsw_pmac_init(void);
+ 
+ #define LTQ_RXCSUM
+-
+ #define DRV_MODULE_NAME             "lantiq_eth_drv_xrx500"
+ #define DRV_MODULE_VERSION          "1.1"
+ 
++#ifdef CONFIG_OFFLOAD_FWD_MARK
++#define SWITCH_ID 									12345
++#define SWITCH_ID2 									23456
++#endif
+ /* length of time before we decide the hardware is borked,
+  * and dev->eth_tx_timeout() should be called to fix the problem
+  */
+@@ -268,6 +271,12 @@ static void eth_rx(struct net_device *de
+ 	if (dev->features & NETIF_F_RXCSUM) {
+ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 	}
++#ifdef CONFIG_OFFLOAD_FWD_MARK
++		if(strncmp(dev->name, wan_iface, IFNAMSIZ) == 0)
++			skb->offload_fwd_mark = SWITCH_ID2;
++		else
++			skb->offload_fwd_mark = SWITCH_ID;
++#endif
+     pr_debug ("passing to stack: protocol: %x\n", skb->protocol);
+     netif_rx(skb);
+     priv->stats.rx_packets++;
+@@ -1111,8 +1120,15 @@ static int xrx500_of_iface(struct xrx500
+ 	ltq_eth_drv_eth_addr_setup(hw->devs[hw->num_devs], priv->id);
+ 
+ 	/* register the actual device */
+-	if (!register_netdev(hw->devs[hw->num_devs]))
++	if (!register_netdev(hw->devs[hw->num_devs])){
++#ifdef CONFIG_OFFLOAD_FWD_MARK
++		if(strncmp(hw->devs[hw->num_devs]->name, wan_iface, IFNAMSIZ) == 0)
++			hw->devs[hw->num_devs]->offload_fwd_mark = SWITCH_ID2;
++		else
++			hw->devs[hw->num_devs]->offload_fwd_mark = SWITCH_ID;
++#endif
+ 		hw->num_devs++;
++	}
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1243,6 +1243,10 @@ struct net_device {
+ 	struct cpu_rmap		*rx_cpu_rmap;
+ #endif
+ 
++#ifdef CONFIG_OFFLOAD_FWD_MARK
++	u32 offload_fwd_mark; 
++#endif
++
+ 	/* These may be needed for future network-power-down code. */
+ 
+ 	/*
+@@ -1343,6 +1347,7 @@ struct net_device {
+ 	int group;
+ 
+ 	struct pm_qos_request	pm_qos_req;
++
+ };
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -550,6 +550,9 @@ struct sk_buff {
+ #ifdef CONFIG_NETWORK_EXTMARK
+ 	__u32			extmark;
+ #endif
++#ifdef CONFIG_OFFLOAD_FWD_MARK
++	__u32 offload_fwd_mark; 
++#endif
+ 	union {
+ 		__u32		mark;
+ 		__u32		dropcount;
+diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2854,6 +2854,15 @@ int dev_queue_xmit(struct sk_buff *skb)
+ 
+ 	skb_update_prio(skb);
+ 
++#ifdef CONFIG_OFFLOAD_FWD_MARK
++ /* Don't forward if offload device already forwarded */
++ if (skb->offload_fwd_mark &&
++     skb->offload_fwd_mark == dev->offload_fwd_mark) {
++   consume_skb(skb);
++   rc = NET_XMIT_SUCCESS;
++   goto out;
++ } 
++#endif
+ 	txq = netdev_pick_tx(dev, skb);
+ 	q = rcu_dereference_bh(txq->qdisc);
+ 

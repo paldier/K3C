@@ -1,0 +1,59 @@
+From 775734528083f1cd5121d5a5ce1010fc5ef72a46 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Mon, 3 Mar 2014 00:21:28 +0200
+Subject: [PATCH 322/441] mei: me: do not reset when less than expected data is
+ received
+
+There is a race in ME hardware between data copy for host and interrupt
+delivery. An interrupt can be delivered prior to whole data copied for the
+host to read but rather then going trough the reset we just merely need to
+wait for the next interrupt.
+
+The bug is visible in read/write stress with multiple connections per client
+
+This is a regression caused as a side effect of the commit:
+commit 544f94601409653f07ae6e22d4a39e3a90dceead
+mei: do not run reset flow from the interrupt thread
+
+Change-Id: I1e27ef33c5008500e8f22a69171e7a79cc9052f7
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Cc: stable <stable@vger.kernel.org> # 3.14
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9bfc717ed08f541fbd4345854592565a776850e3)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/hw-me.c     | 9 +++++++++
+ drivers/misc/mei/interrupt.c | 2 +-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -520,7 +520,16 @@ irqreturn_t mei_me_irq_thread_handler(in
+ 	while (slots > 0) {
+ 		dev_dbg(&dev->pdev->dev, "slots to read = %08x\n", slots);
+ 		rets = mei_irq_read_handler(dev, &complete_list, &slots);
++		/* There is a race between ME write and interrupt delivery:
++		 * Not all data is always available immediately after the
++		 * interrupt, so try to read again on the next interrupt.
++		 */
++		if (rets == -ENODATA)
++			break;
++
+ 		if (rets && dev->dev_state != MEI_DEV_RESETTING) {
++			dev_err(&dev->pdev->dev, "mei_irq_read_handler ret = %d.\n",
++						rets);
+ 			schedule_work(&dev->reset_work);
+ 			goto end;
+ 		}
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -351,7 +351,7 @@ int mei_irq_read_handler(struct mei_devi
+ 		dev_err(&dev->pdev->dev, "less data available than length=%08x.\n",
+ 				*slots);
+ 		/* we can't read the message */
+-		ret = -EBADMSG;
++		ret = -ENODATA;
+ 		goto end;
+ 	}
+ 

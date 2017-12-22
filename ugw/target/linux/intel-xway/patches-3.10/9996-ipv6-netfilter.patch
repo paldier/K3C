@@ -1,0 +1,55 @@
+# HG changeset patch
+# Parent c51c39888f483cc930e0c6e4f50daf69e8c32470
+
+diff --git a/include/uapi/linux/icmpv6.h b/include/uapi/linux/icmpv6.h
+--- a/include/uapi/linux/icmpv6.h
++++ b/include/uapi/linux/icmpv6.h
+@@ -117,6 +117,7 @@ struct icmp6hdr {
+ #define ICMPV6_PORT_UNREACH		4
+ #define ICMPV6_POLICY_FAIL		5
+ #define ICMPV6_REJECT_ROUTE		6
++#define ICMPV6_POLICY_FAIL_TO_GATEWAY   8
+ 
+ /*
+  *	Codes for Time Exceeded
+diff --git a/include/uapi/linux/netfilter_ipv6/ip6t_REJECT.h b/include/uapi/linux/netfilter_ipv6/ip6t_REJECT.h
+--- a/include/uapi/linux/netfilter_ipv6/ip6t_REJECT.h
++++ b/include/uapi/linux/netfilter_ipv6/ip6t_REJECT.h
+@@ -11,7 +11,8 @@ enum ip6t_reject_with {
+ 	IP6T_ICMP6_PORT_UNREACH,
+ 	IP6T_ICMP6_ECHOREPLY,
+ 	IP6T_TCP_RESET,
+-	IP6T_ICMP6_POLICY_FAIL
++	IP6T_ICMP6_POLICY_FAIL,
++	IP6T_ICMP6_POLICY_FAIL_TO_GATEWAY /* case for handling ICMPV6_DEST_UNREACH to gateway */
+ };
+ 
+ struct ip6t_reject_info {
+diff --git a/net/ipv6/netfilter/ip6t_REJECT.c b/net/ipv6/netfilter/ip6t_REJECT.c
+--- a/net/ipv6/netfilter/ip6t_REJECT.c
++++ b/net/ipv6/netfilter/ip6t_REJECT.c
+@@ -178,6 +178,13 @@ send_unreach(struct net *net, struct sk_
+ {
+ 	if (hooknum == NF_INET_LOCAL_OUT && skb_in->dev == NULL)
+ 		skb_in->dev = net->loopback_dev;
++       if(code == ICMPV6_POLICY_FAIL_TO_GATEWAY) {
++               struct ipv6hdr *ip6 = ipv6_hdr(skb_in);
++       /* Send the ICMPV6_DEST_UNREACH to the gateway */
++               ip6->saddr = net->ipv6.fib6_main_tbl->tb6_root.leaf->rt6i_gateway;
++               code  = ICMPV6_POLICY_FAIL;
++       }
++
+ 
+ 	icmpv6_send(skb_in, ICMPV6_DEST_UNREACH, code, 0);
+ }
+@@ -214,6 +221,10 @@ reject_tg6(struct sk_buff *skb, const st
+ 	case IP6T_ICMP6_POLICY_FAIL:
+ 		send_unreach(net, skb, ICMPV6_POLICY_FAIL, par->hooknum);
+ 		break;
++	case IP6T_ICMP6_POLICY_FAIL_TO_GATEWAY:
++               send_unreach(net, skb, ICMPV6_POLICY_FAIL_TO_GATEWAY, par->hooknum);
++               break;
++
+ 
+ 	default:
+ 		net_info_ratelimited("case %u not handled yet\n", reject->with);

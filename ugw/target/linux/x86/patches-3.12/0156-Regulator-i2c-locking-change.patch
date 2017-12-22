@@ -1,0 +1,120 @@
+From 30345eadeb3221c1bee2bac1c7e2f73669b3840d Mon Sep 17 00:00:00 2001
+From: Vinay Patel <vinay.r.patel@intel.com>
+Date: Wed, 16 Sep 2015 12:27:43 -0700
+Subject: [PATCH 156/441] Regulator: i2c locking change
+
+---
+ drivers/regulator/int34d9-regulator.c       | 68 +----------------------------
+ include/linux/regulator/int34d9-regulator.h |  9 ----
+ 2 files changed, 2 insertions(+), 75 deletions(-)
+
+--- a/drivers/regulator/int34d9-regulator.c
++++ b/drivers/regulator/int34d9-regulator.c
+@@ -30,43 +30,11 @@ static DEFINE_MUTEX(puma7_rohm_mutex);
+ static s32 puma7_rohm_pmic_write(struct puma7_rohm_pmic *pmic, u8 reg, u8 val)
+ {
+    s32 ret_val;
+-   u32 interface_value = 0;
+-   u32 timeout = PUMA7_PUNIT_I2C_REQ_TIMEOUT;
+ 
+    mutex_lock(&puma7_rohm_mutex);
+ 
+-   if(iosf_mbi_available()) {
+-      // I2C_INTERFACE_REQUESTED 1:1
+-      // request i2c interface
+-      ret_val = iosf_mbi_modify(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_WRITE_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, PUMA7_PUNIT_I2C_REQ, PUMA7_PUNIT_I2C_REQ);
+-      if (ret_val < 0) goto puma7_pmic_wr_err;
++   ret_val = i2c_smbus_write_byte_data(pmic->client, reg, val);
+       
+-      ret_val = iosf_mbi_read(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_READ_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, &interface_value);
+-      if (ret_val < 0) goto puma7_pmic_wr_err;
+-
+-      // I2C_INTERFACE_GRANTED 0:0
+-      // check if i2c interface is granted
+-      while (!(interface_value & PUMA7_PUNIT_I2C_GRANTED)) {   
+-         msleep(1);
+-         ret_val = iosf_mbi_read(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_READ_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, &interface_value);
+-         if (ret_val < 0) goto puma7_pmic_wr_err;
+-
+-         timeout--;
+-         if(timeout == 0) {
+-            ret_val = -EBUSY;
+-            goto puma7_pmic_wr_err;
+-         }
+-      } 
+-      ret_val = i2c_smbus_write_byte_data(pmic->client, reg, val);
+-   } else {
+-      ret_val = -ENODEV;
+-   }
+-
+-puma7_pmic_wr_err:
+-   if(interface_value & PUMA7_PUNIT_I2C_GRANTED) {
+-      //release i2c interface
+-      ret_val = iosf_mbi_write(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_WRITE_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, PUMA7_HOST_I2C_RELINQUISH);
+-   }
+    mutex_unlock(&puma7_rohm_mutex);
+    
+    return ret_val;
+@@ -75,43 +43,11 @@ puma7_pmic_wr_err:
+ static s32 puma7_rohm_pmic_read(struct puma7_rohm_pmic *pmic, u8 reg)
+ {
+    s32 ret_val;
+-   u32 interface_value = 0;
+-   u32 timeout = PUMA7_PUNIT_I2C_REQ_TIMEOUT;
+ 
+    mutex_lock(&puma7_rohm_mutex);
+    
+-   if(iosf_mbi_available()) {
+-      // I2C_INTERFACE_REQUESTED 1:1
+-      // request i2c interface
+-      ret_val = iosf_mbi_modify(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_WRITE_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, PUMA7_PUNIT_I2C_REQ, PUMA7_PUNIT_I2C_REQ);
+-      if (ret_val < 0) goto puma7_pmic_rd_err;
+-      
+-      ret_val = iosf_mbi_read(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_READ_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, &interface_value);
+-      if (ret_val < 0) goto puma7_pmic_rd_err;
++   ret_val = i2c_smbus_read_byte_data(pmic->client, reg);
+ 
+-      // I2C_INTERFACE_GRANTED 0:0
+-      // check if i2c interface is granted
+-      while (!(interface_value & PUMA7_PUNIT_I2C_GRANTED)) {   
+-         msleep(1);
+-         ret_val = iosf_mbi_read(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_READ_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, &interface_value);
+-         if (ret_val < 0) goto puma7_pmic_rd_err;
+-         
+-         timeout--;
+-         if(timeout == 0) {
+-            ret_val = -EBUSY;
+-            goto puma7_pmic_rd_err;
+-         }
+-      } 
+-      ret_val = i2c_smbus_read_byte_data(pmic->client, reg);
+-   } else {
+-      ret_val = -ENODEV;
+-   }
+-
+-puma7_pmic_rd_err:
+-   if(interface_value & PUMA7_PUNIT_I2C_GRANTED) {
+-      //release i2c interface
+-      ret_val = iosf_mbi_write(PUMA7_PUNIT_PORT_ID, PUMA7_PUNIT_WRITE_OPCODE, PUMA7_PUNIT_I2C_INTF_REG, PUMA7_HOST_I2C_RELINQUISH);
+-   }
+    mutex_unlock(&puma7_rohm_mutex);
+ 
+    return ret_val;
+--- a/include/linux/regulator/int34d9-regulator.h
++++ b/include/linux/regulator/int34d9-regulator.h
+@@ -35,15 +35,6 @@ enum PUMA7_ROHM_REGULATOR_SUPPLIES {
+    PUMA7_ROHM_SUPPLY_NUMBER
+ };
+ 
+-#define PUMA7_PUNIT_PORT_ID         0x04
+-#define PUMA7_PUNIT_I2C_INTF_REG    0x10E
+-#define PUMA7_PUNIT_READ_OPCODE     0x06
+-#define PUMA7_PUNIT_WRITE_OPCODE    0x07
+-#define PUMA7_PUNIT_I2C_REQ         0x02   
+-#define PUMA7_PUNIT_I2C_GRANTED     0x01
+-#define PUMA7_HOST_I2C_RELINQUISH   0x00
+-#define PUMA7_PUNIT_I2C_REQ_TIMEOUT 3000    
+-
+ #define PUMA7_ROHM_PMIC_MODE_ACTIVE          0x1
+ #define PUMA7_ROHM_PMIC_MODE_BBU             0x2
+ #define PUMA7_ROHM_PMIC_MODE_FAST_STANDBY    0x4

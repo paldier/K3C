@@ -1,0 +1,96 @@
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -876,8 +876,13 @@ static void hostapd_event_ltq_flush_stat
+                const u8 *data, size_t data_len)
+ {
+   struct hostapd_iface *iface = hapd->iface;
++  s32 flush;
+ 
+-  hostapd_ltq_clear_old(iface);
++  if (data_len != sizeof(s32))
++    flush = LTQ_FLUSH_RADIO;
++  else
++    flush = *((s32*)data);
++  hostapd_ltq_clear_old(iface, flush);
+ }
+ 
+ static void hostapd_event_ltq_chan_data(struct hostapd_data *hapd,
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -144,26 +144,43 @@ static void hostapd_clear_old(struct hos
+ 	}
+ }
+ 
+-void hostapd_ltq_clear_old(struct hostapd_iface *iface)
++void hostapd_ltq_clear_old(struct hostapd_iface *iface, s32 flush)
+ {
+-   size_t j;
+-   struct hostapd_data *hapd = iface->bss[0];
++  size_t j;
++  struct hostapd_data *hapd = iface->bss[0];
+ 
+-   wpa_printf(MSG_DEBUG, "Clean up STA DB");
+-   /*
+-    * Deauthenticate all stations since the new configuration may not
+-    * allow them to use the BSS anymore.
+-    */
+-   for (j = 0; j < iface->num_bss; j++) {
++  wpa_printf(MSG_DEBUG, "Clean up STA DB");
++  if (flush == LTQ_FLUSH_RADIO) {
++    /*
++     * Deauthenticate all stations since the new configuration may not
++     * allow them to use the BSS anymore.
++     */
++    for (j = 0; j < iface->num_bss; j++) {
+       hostapd_flush_old_stations(iface->bss[j],
+-                  WLAN_REASON_PREV_AUTH_NOT_VALID);
++        WLAN_REASON_PREV_AUTH_NOT_VALID);
+       hostapd_broadcast_wep_clear(iface->bss[j]);
+ 
+ #ifndef CONFIG_NO_RADIUS
+-      /* TODO: update dynamic data based on changed configuration
+-       * items (e.g., open/close sockets, etc.) */
++    /* TODO: update dynamic data based on changed configuration
++     * items (e.g., open/close sockets, etc.) */
+       radius_client_flush(iface->bss[j]->radius, 0);
+ #endif /* CONFIG_NO_RADIUS */
++    }
++  } else {
++    if (flush >= iface->num_bss) {
++      wpa_printf(MSG_ERROR, "Invalid BSS index %d", flush);
++      return;
++    }
++    hapd = iface->bss[flush];
++    hostapd_flush_old_stations(hapd,
++      WLAN_REASON_PREV_AUTH_NOT_VALID);
++    hostapd_broadcast_wep_clear(hapd);
++
++#ifndef CONFIG_NO_RADIUS
++  /* TODO: update dynamic data based on changed configuration
++   * items (e.g., open/close sockets, etc.) */
++    radius_client_flush(hapd->radius, 0);
++#endif /* CONFIG_NO_RADIUS */
+   }
+ 
+   wpa_printf(MSG_DEBUG, "Send sync_done command");
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -13,6 +13,9 @@
+ #include "ap_config.h"
+ #include "drivers/driver.h"
+ 
++#define LTQ_FLUSH_RADIO (-1)
++
++
+ struct wpa_ctrl_dst;
+ struct radius_server_data;
+ struct upnp_wps_device_sm;
+@@ -440,7 +443,7 @@ const struct hostapd_eap_user *
+ hostapd_get_eap_user(struct hostapd_data *hapd, const u8 *identity,
+ 		     size_t identity_len, int phase2);
+ 
+-void hostapd_ltq_clear_old(struct hostapd_iface *iface);
++void hostapd_ltq_clear_old(struct hostapd_iface *iface, s32 flush);
+ 
+ #ifdef CONFIG_ACS
+ void hostapd_ltq_update_channel_data(struct hostapd_iface *iface, const u8 *data, size_t data_len);

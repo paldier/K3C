@@ -1,0 +1,437 @@
+From 33cf73eb017e7f19fa3815e20ca5986ca39036b6 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Tue, 21 Jun 2016 12:48:54 -0700
+Subject: [PATCH 434/441] hw_mailbox: Fix critical Klocwork defects
+
+Klocwork scan identified some error handling bugs, which can cause
+kernel oops if the apis are used with invalid params. Fix is to return
+error if the parameters are not valid.
+
+Signed-off-by: Emmanuel Jillela <emmanuel.jillela@intel.com>
+---
+ arch/x86/hw_mailbox/hw_mbox_drv.c        | 200 ++++++++++++++++++++++++++-----
+ arch/x86/hw_mailbox/hw_mbox_mem_access.h |   6 +
+ include/linux/hw_mbox_defs.h             |  13 +-
+ 3 files changed, 187 insertions(+), 32 deletions(-)
+
+--- a/arch/x86/hw_mailbox/hw_mbox_drv.c
++++ b/arch/x86/hw_mailbox/hw_mbox_drv.c
+@@ -32,7 +32,7 @@
+  */
+ 
+ #define DRV_NAME    "Intel(R) HW_MBOX Controller Driver"
+-#define DRV_VERSION "0.0.3"
++#define DRV_VERSION "0.0.4"
+ 
+ /************************************************************************/
+ /*     INCLUDES                                                         */
+@@ -1390,12 +1390,30 @@ int hwMbox_getChannelConfig(hw_mbox_Mast
+     if (cfg == NULL)
+     {
+         PRINTK_ERR("cfg == NULL!");
+-        return -1;
++        return (-1);
++    }
++
++    if (!HW_MBOX_MID_VALIDITY_CHECK(peer))
++    {
++        PRINTK_ERR("invalid mid value! [peer = %d]",
++                   peer);
++        return (-1);
++    }
++
++    if (!HW_MBOX_TYPE_IS_VALID(mboxType))
++    {
++        PRINTK_ERR("invalid mbox type value! [mboxType = %d]",
++                   mboxType);
++        return (-1);
+     }
+ 
+     CHECK_IS_DRV_INITIALIZED(return (-1));
+ 
+-    CHECK_FIND_CID_IN_LUT(peer, mboxType, isPeerCommander, return (-1), paramCID);
++    CHECK_FIND_CID_IN_LUT(peer,
++                          mboxType,
++                          isPeerCommander,
++                          return (-1),
++                          paramCID);
+ 
+     memcpy(cfg, &CHN_CFG(paramCID), HW_MBOX_CHANNEL_CONFIG_SIZE);
+ 
+@@ -1813,9 +1831,6 @@ int hwMbox_sendOpcode(hw_mbox_Masters_e
+     hwMbox_opcode_t opFlds = { 0 };
+     hwMbox_opcodeMessage_t *pOpcodeMsg;
+ 
+-    /* Initialize with default output value: */
+-    *replyDataLen = 0;
+-
+     CHECK_IS_DRV_INITIALIZED(return (-1));
+ 
+     if (replyDataLen == NULL)
+@@ -1824,6 +1839,9 @@ int hwMbox_sendOpcode(hw_mbox_Masters_e
+         return (-1);
+     }
+ 
++    /* Initialize with default output value: */
++    *replyDataLen = 0;
++
+     DPRINTK("send Opcode to %s(%d) [tag %u with %uB of data]",
+             HW_MBOX_MASTER_GET_NAME(subject), subject,
+             tag, opcodeDataLen);
+@@ -2396,7 +2414,18 @@ int hwMbox_unregisterRecvOpcode(hw_mbox_
+ 
+     CHECK_IS_DRV_INITIALIZED(return (-1));
+ 
+-    CHECK_FIND_CID_IN_LUT(commander, hw_mbox_opcode, CID_LUT_PEER_IS_COMMANDER, return (-1), paramCID);
++    if (!HW_MBOX_MID_VALIDITY_CHECK(commander))
++    {
++        PRINTK_ERR("invalid commander value! [commander = %d]",
++                   commander);
++        return (-1);
++    }
++
++    CHECK_FIND_CID_IN_LUT(commander,
++                          hw_mbox_opcode,
++                          CID_LUT_PEER_IS_COMMANDER,
++                          return (-1),
++                          paramCID);
+ 
+     if (CHN_RECV_OPCODE_GET_INDEX(paramCID) == CHN_RECV_OPCODE_INDEX_INVALID)
+     {
+@@ -3109,7 +3138,7 @@ static int proc_dump_recvOpTagsDb_show(s
+  *         configuration, previously set by supervisor.
+  *  \return [ 0 on success /(-1) on error ].
+  **************************************************************************/
+-int hwMbox_initAfterStarted(void)
++static int hwMbox_initAfterStarted(void)
+ {
+     Uint32 paramCID;
+ 
+@@ -3174,7 +3203,9 @@ int hwMbox_initAfterStarted(void)
+         if (HW_MBOX_CHN_CFG_VALID_GET(paramCID) == True)
+         {
+             DPRINTK("channel %d is assigned!", paramCID);
++
+             HW_MBOX_CHANNEL_CONFIG_GET_TO_STRUCT(paramCID, &chnConfig);
++
+             DPRINTK("found new static channel (cid=%d): %s MBOX, %s(%d) -> %s(%d) [%uB of SRAM]",
+                     paramCID, HW_MBOX_TYPE_STR(chnConfig.mboxType),
+                     HW_MBOX_MASTER_GET_NAME(chnConfig.commander), chnConfig.commander,
+@@ -3191,16 +3222,19 @@ int hwMbox_initAfterStarted(void)
+                     /* some channels might already be assigned [like initial RecvOp]... */
+                     hwMbox_setChannelConfig(chnConfig);
+ 
+-                    /* if this master is the commander it should reset SRAM
+-                       [Note: at this point it must be possible since START must be already set] */
+-
+-                    if (chnConfig.commander == HW_MBOX_MID)
++                    if (chnConfig.memBuff.size > 0)
+                     {
+-                        DPRINTK("cid=%d has this master as commander, do initial SRAM reset...", paramCID);
+-                        DPRINTK("cid=%d resetting %uB of SRAM at start offset 0x%08x...",
+-                                paramCID, chnConfig.memBuff.size, chnConfig.memBuff.start);
++                        /* if this master is the commander it should reset SRAM
++                           [Note: at this point it must be possible since START must be already set] */
++
++                        if (chnConfig.commander == HW_MBOX_MID)
++                        {
++                            DPRINTK("cid=%d has this master as commander, do initial SRAM reset...", paramCID);
++                            DPRINTK("cid=%d resetting %uB of SRAM at start offset 0x%08x...",
++                                    paramCID, chnConfig.memBuff.size, chnConfig.memBuff.start);
+ 
+-                        HW_MBOX_RESET_SRAM(chnConfig.memBuff.start, chnConfig.memBuff.size);
++                            HW_MBOX_RESET_SRAM(chnConfig.memBuff.start, chnConfig.memBuff.size);
++                        }
+                     }
+                 }
+                 else
+@@ -3227,7 +3261,7 @@ int hwMbox_initAfterStarted(void)
+  *  \param[in] config - struct containing channel's configuration.
+  *  \return [ 0 on success /(-1) on error ].
+  **************************************************************************/
+-int hwMbox_setChannelConfig(hw_mbox_channelConfig_t config)
++static int hwMbox_setChannelConfig(hw_mbox_channelConfig_t config)
+ {
+     static int recvOpcodeChannelsCount = 0;
+     Uint32 paramCID;
+@@ -3235,11 +3269,41 @@ int hwMbox_setChannelConfig(hw_mbox_chan
+ 
+     paramCID = config.cid;
+ 
++    /* Verify channel configuration validity: */
++
++    if (!HW_MBOX_MID_VALIDITY_CHECK(config.commander))
++    {
++        PRINTK_ERR("channel configuration is not valid! [invalid commander value (%d)]",
++                   config.commander);
++        return (-1);
++    }
++
++    if (!HW_MBOX_MID_VALIDITY_CHECK(config.subject))
++    {
++        PRINTK_ERR("channel configuration is not valid! [invalid subject value (%d)]",
++                   config.subject);
++        return (-1);
++    }
++
++    if (!HW_MBOX_CID_VALIDITY_CHECK(config.cid))
++    {
++        PRINTK_ERR("channel configuration is not valid! [invalid cid value (%u)]",
++                   config.cid);
++        return (-1);
++    }
++
++    if (!HW_MBOX_TYPE_IS_VALID(config.mboxType))
++    {
++        PRINTK_ERR("channel configuration is not valid! [invalid mbox type value (%d)]",
++                   config.mboxType); 
++        return (-1);
++    }
++
+     DPRINTK("cid %d: update configuration in DB", paramCID);
+ 
+     /* recv Opcode channel... */
+-    if ((config.mboxType == hw_mbox_opcode) &&
+-        (config.subject == HW_MBOX_MID))
++    if ( (config.mboxType == hw_mbox_opcode) &&
++         (config.subject == HW_MBOX_MID) )
+     {
+         if (recvOpcodeChannelsCount == HW_MBOX_OPCODE_RECV_COUNT)
+         {
+@@ -3318,8 +3382,8 @@ int hwMbox_setChannelConfig(hw_mbox_chan
+ 
+     CHN_SET_ASSIGNED(paramCID, True);
+ 
+-    if ((config.mboxType == hw_mbox_opcode) &&
+-        (config.subject == HW_MBOX_MID))
++    if ( (config.mboxType == hw_mbox_opcode) &&
++         (config.subject == HW_MBOX_MID) )
+     {
+         /* recv Opcode channel: create the required infrastructure... */
+ 
+@@ -3369,15 +3433,19 @@ int hwMbox_setChannelConfig(hw_mbox_chan
+  *  \param[in] isValid - valid/invalid.
+  *  \return [ 0 on success /(-1) on error ].
+  **************************************************************************/
+-int hwMbox_setChannelValid(Uint32 paramCID, Bool isValid)
++static int hwMbox_setChannelValid(Uint32 paramCID, Bool isValid)
+ {
+-    DPRINTK("cid %d: set%s valid in DB", paramCID, ((isValid)?(""):(" NOT")));
+-
+     if (!HW_MBOX_CID_VALIDITY_CHECK(paramCID))
+     {
++        PRINTK_ERR("invalid cid value! [paramCID = %u]",
++                   paramCID);
++
+         return (-1);
+     }
+ 
++    DPRINTK("cid %d: set%s valid in DB",
++            paramCID, ((isValid) ? ("") : (" NOT")));
++
+     if (!CHN_IS_ASSIGNED(paramCID))
+     {
+         PRINTK_ERR("Trying to modify Valid for channel %d that has not been assigned!", paramCID);
+@@ -3408,15 +3476,15 @@ int hwMbox_setChannelValid(Uint32 paramC
+         SET_CID_IN_LUT( CHN_CFG_GET_SUBJECT(paramCID),
+                         CHN_CFG_GET_TYPE(paramCID),
+                         False,
+-                        ((isValid)?(paramCID):(HW_MBOX_CID_INVALID)) );
++                        ((isValid) ? (paramCID) : (HW_MBOX_CID_INVALID)) );
+     }
+-    else
++    else if (CHN_CFG_GET_SUBJECT(paramCID) == HW_MBOX_MID)
+     {
+         /* Master is subject on this channel [peer is commander]: */
+         SET_CID_IN_LUT( CHN_CFG_GET_COMMANDER(paramCID),
+                         CHN_CFG_GET_TYPE(paramCID),
+                         True,
+-                        ((isValid)?(paramCID):(HW_MBOX_CID_INVALID)) );
++                        ((isValid) ? (paramCID) : (HW_MBOX_CID_INVALID)) );
+     }
+ 
+     return 0;
+@@ -3436,7 +3504,7 @@ int hwMbox_setChannelValid(Uint32 paramC
+  *  \attnetion this is just the wait, if you need a lock then acquire it before...
+  *  \return [ 0 on success / error otherwise ].
+  **************************************************************************/
+-int hwMbox_waitForChannelInterrupt(int cid, int timeoutInMsec, HW_MBOX_STATUS_e *pHwMboxStatus)
++static int hwMbox_waitForChannelInterrupt(int cid, int timeoutInMsec, HW_MBOX_STATUS_e *pHwMboxStatus)
+ {
+     long rc = 0;
+     wait_queue_head_t *pWq; /* pointer to the wait queue we should wait on */
+@@ -4091,11 +4159,22 @@ static long chnint_ioctl(struct file *fi
+             DPRINTK("[CHN_DEV_CID%d]: Received HW_MBOX_CHN_DEV_IOCTL_LOCK_CMD",
+                     dev->chn_cid);
+ 
++            if ( (CHN_CFG_GET_COMMANDER(dev->chn_cid) != HW_MBOX_MID) &&
++                 (CHN_CFG_GET_SUBJECT(dev->chn_cid) != HW_MBOX_MID) )
++            {
++                PRINTK_ERR("[CHN_DEV_CID%d]: current master %s(%d) is neither commander nor subject of the channel!!!",
++                           dev->chn_cid, HW_MBOX_MASTER_GET_NAME(HW_MBOX_MID), HW_MBOX_MID);
++
++                status = HW_MBOX_STATUS_NOK;
++                ret = -1;
++                break;
++            }
++
+             if (CHN_CFG_GET_COMMANDER(dev->chn_cid) == HW_MBOX_MID)
+             {
+                 peer = CHN_CFG_GET_SUBJECT(dev->chn_cid);
+             }
+-            else
++            else if (CHN_CFG_GET_SUBJECT(dev->chn_cid) == HW_MBOX_MID)
+             {
+                 peer = CHN_CFG_GET_COMMANDER(dev->chn_cid);
+             }
+@@ -4132,7 +4211,8 @@ static long chnint_ioctl(struct file *fi
+         }
+         default:
+         {
+-            PRINTK_ERR("Invalid IOCTL(0x%08x) has been received!", cmd);
++            PRINTK_ERR("[CHN_DEV_CID%d]: invalid IOCTL(0x%08x) has been received!",
++                       dev->chn_cid, cmd);
+             ret = -1;
+             break;
+         }
+@@ -5320,6 +5400,20 @@ static int hwMbox_sendCmdMsg(hw_mbox_Mas
+ 
+     CHECK_IS_DRV_INITIALIZED(return -ENETDOWN);
+ 
++    if (!HW_MBOX_MID_VALIDITY_CHECK(subject))
++    {
++        PRINTK_ERR("invalid subject value! [subject = %d]",
++                   subject);
++        return (-1);
++    }
++
++    if (!HW_MBOX_SOCKETS_APPID_VALIDITY_CHECK(paramAppID))
++    {
++        PRINTK_ERR("invalid appId value! [paramAppID = %u]",
++                   paramAppID);
++        return (-1);
++    }
++
+     if (!IS_MASTER_INIT(subject))
+     {
+         DPRINTK("master %s(%d) is not initialized!",
+@@ -5368,6 +5462,20 @@ static int hwMbox_sendReplyMsg(hw_mbox_M
+ 
+     CHECK_IS_DRV_INITIALIZED(return -ENETDOWN);
+ 
++    if (!HW_MBOX_MID_VALIDITY_CHECK(commander))
++    {
++        PRINTK_ERR("invalid commander value! [commander = %d]",
++                   commander);
++        return (-1);
++    }
++
++    if (!HW_MBOX_SOCKETS_APPID_VALIDITY_CHECK(paramAppID))
++    {
++        PRINTK_ERR("invalid appId value! [paramAppID = %u]",
++                   paramAppID);
++        return (-1);
++    }
++
+     CHECK_FIND_CID_IN_LUT(commander,
+                           HW_MBOX_PROTOCOL_BY_APPID(paramAppID),
+                           CID_LUT_PEER_IS_COMMANDER,
+@@ -5772,6 +5880,20 @@ static int hwMbox_recvReplyMsg(hw_mbox_M
+ 
+     CHECK_IS_DRV_INITIALIZED(return (-1));
+ 
++    if (!HW_MBOX_MID_VALIDITY_CHECK(subject))
++    {
++        PRINTK_ERR("invalid subject value! [subject = %d]",
++                   subject);
++        return (-1);
++    }
++
++    if (!HW_MBOX_SOCKETS_APPID_VALIDITY_CHECK(paramAppID))
++    {
++        PRINTK_ERR("invalid appId value! [paramAppID = %u]",
++                   paramAppID);
++        return (-1);
++    }
++
+     if (!IS_MASTER_INIT(subject))
+     {
+         DPRINTK("master %s(%d) is not initialized!",
+@@ -5786,7 +5908,9 @@ static int hwMbox_recvReplyMsg(hw_mbox_M
+                           paramCID);
+ 
+     /* We should always use the channel's WQ: */
+-    DPRINTK("cid %d: before WAIT_FOR_CHN_INTR sem=%d", paramCID, CHN_LOCK(paramCID).count);
++    DPRINTK("cid %d: before WAIT_FOR_CHN_INTR sem=%d",
++            paramCID, CHN_LOCK(paramCID).count);
++
+     WAIT_FOR_CHN_INTR(paramCID, CHN_INTR_DEFAULT_TIMEOUT_MSEC);
+ 
+     retVal = _hwMbox_RecvMsg(paramCID,
+@@ -5829,6 +5953,20 @@ static int hwMbox_recvCmdMsg(hw_mbox_Mas
+ 
+     CHECK_IS_DRV_INITIALIZED(return -ENETDOWN);
+ 
++    if (!HW_MBOX_MID_VALIDITY_CHECK(commander))
++    {
++        PRINTK_ERR("invalid commander value! [commander = %d]",
++                   commander);
++        return (-1);
++    }
++
++    if (!HW_MBOX_SOCKETS_APPID_VALIDITY_CHECK(paramAppID))
++    {
++        PRINTK_ERR("invalid appId value! [paramAppID = %u]",
++                   paramAppID);
++        return (-1);
++    }
++
+     paramProto = HW_MBOX_PROTOCOL_BY_APPID(paramAppID);
+ 
+     CHECK_FIND_CID_IN_LUT(commander,
+--- a/arch/x86/hw_mailbox/hw_mbox_mem_access.h
++++ b/arch/x86/hw_mailbox/hw_mbox_mem_access.h
+@@ -1405,6 +1405,7 @@ do{ \
+ */
+ #define HW_MBOX_CHANNEL_CONFIG_GET_TO_STRUCT(paramCID, _pChnConfig) \
+ do{ \
++    memset((_pChnConfig), 0, HW_MBOX_CHANNEL_CONFIG_SIZE);                         \
+     (_pChnConfig)->cid = paramCID;                                                 \
+     (_pChnConfig)->mboxType = HW_MBOX_CHN_CFG_TYPE_GET(paramCID);                  \
+     (_pChnConfig)->commander = HW_MBOX_CHN_CFG_COMMANDER_GET(paramCID);            \
+@@ -1414,6 +1415,11 @@ do{ \
+         /* Channel has SRAM */                                                     \
+         (_pChnConfig)->memBuff.start = HW_MBOX_MEMORY_MAP_START_GET(paramCID);     \
+     }                                                                              \
++    else                                                                           \
++    {                                                                              \
++        /* Channel has NO SRAM */                                                  \
++        (_pChnConfig)->memBuff.start = 0;                                          \
++    }                                                                              \
+ } while (0)
+ 
+ /*! \def HW_MBOX_OPCODE_FIELDS_GET_TO_STRUCT( _cmdRegVal, _pOpcodeFlds)
+--- a/include/linux/hw_mbox_defs.h
++++ b/include/linux/hw_mbox_defs.h
+@@ -541,9 +541,20 @@ typedef enum hw_mbox_type
+     hw_mbox_event,        /* Event   */
+     hw_mbox_opcode,       /* Opcode (generic HW MBOX command-response protocol) */
+ 
+-    HW_MBOX_TYPE_COUNT    /* Should always be last... */
++    /* Don't add any values after this line!!! */
++
++    HW_MBOX_TYPE_ONE_AFTER_LAST,
++    HW_MBOX_TYPE_LAST = (HW_MBOX_TYPE_ONE_AFTER_LAST - 1),
++    HW_MBOX_TYPE_COUNT
+ } hw_mbox_type_e;
+ 
++/*! \def HW_MBOX_TYPE_IS_VALID( _mboxType )
++    \brief check whether <_mboxType> is a valid HW_MBOX type.
++    \param[in] _mboxType - value to check.
++*/
++#define HW_MBOX_TYPE_IS_VALID( _mboxType ) \
++    ( ( ( _mboxType ) >= 0 ) && ( ( _mboxType ) <= HW_MBOX_TYPE_LAST ) )
++
+ /*! \def HW_MBOX_TYPE_STR(mboxType)
+     \brief gets a string according to <mboxType>
+     \attention <mboxType> should be a value from hw_mbox_type_e

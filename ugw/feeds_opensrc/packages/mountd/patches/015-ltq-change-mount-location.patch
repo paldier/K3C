@@ -1,0 +1,168 @@
+Index: mountd-0.1/lib/autofs.c
+===================================================================
+--- mountd-0.1.orig/lib/autofs.c	2013-02-06 18:02:57.000000000 +0530
++++ mountd-0.1/lib/autofs.c	2013-02-06 18:03:22.000000000 +0530
+@@ -38,30 +38,30 @@
+ 
+ void umount_autofs(void)
+ {
+-	system_printf("umount %s 2> /dev/null", "/tmp/run/mountd/");
++	system_printf("umount %s 2> /dev/null", "/mnt/usb/.run/mountd/");
+ }
+ 
+ static int mount_autofs(void)
+ {
+ 	int pipefd[2];
+ 	struct stat st;
+-	log_printf("trying to mount %s as the autofs root\n", "/tmp/run/mountd/");
+-	if(is_mounted(0, "/tmp/run/mountd/"))
++	log_printf("trying to mount %s as the autofs root\n", "/mnt/usb/.run/mountd/");
++	if(is_mounted(0, "/mnt/usb/.run/mountd/"))
+ 	{
+-		log_printf("%s is already mounted\n", "/tmp/run/mountd/");
++		log_printf("%s is already mounted\n", "/mnt/usb/.run/mountd/");
+ 		return -1;
+ 	}
+ 	fdout = fdin = -1;
+-	mkdir("/tmp/run/mountd/", 0555);
++	mkdir("/mnt/usb/.run/mountd/", 0555);
+ 	if(pipe(pipefd) < 0)
+ 	{
+ 		log_printf("failed to get kernel pipe\n");
+ 		return -1;
+ 	}
+ 	if(system_printf("/bin/mount -t autofs -o fd=%d,pgrp=%u,minproto=5,maxproto=5 \"mountd(pid%u)\" %s",
+-		pipefd[1], (unsigned) getpgrp(), getpid(), "/tmp/run/mountd/") != 0)
++		pipefd[1], (unsigned) getpgrp(), getpid(), "/mnt/usb/.run/mountd/") != 0)
+ 	{
+-		log_printf("unable to mount autofs on %s\n", "/tmp/run/mountd/");
++		log_printf("unable to mount autofs on %s\n", "/mnt/usb/.run/mountd/");
+ 		close(pipefd[0]);
+ 		close(pipefd[1]);
+ 		return -1;
+@@ -70,13 +70,13 @@
+ 	close(pipefd[1]);
+ 	fdout = pipefd[0];
+ 
+-	fdin = open("/tmp/run/mountd/", O_RDONLY);
++	fdin = open("/mnt/usb/.run/mountd/", O_RDONLY);
+ 	if(fdin < 0)
+ 	{
+ 		umount_autofs();
+ 		return -1;
+ 	}
+-	stat("/tmp/run/mountd/", &st);
++	stat("/mnt/usb/.run/mountd/", &st);
+ 	return 0;
+ }
+ 
+@@ -96,9 +96,9 @@
+ {
+ 	struct stat st;
+ 	log_printf("kernel is requesting a mount -> %s\n", pkt->name);
+-	chdir("/tmp/run/mountd/");
++	chdir("/mnt/usb/.run/mountd/");
+ 	if (lstat(pkt->name, &st) == -1 || (S_ISDIR(st.st_mode) && st.st_dev == dev)) {
+-		if(!mount_new("/tmp/run/mountd/", (char*)pkt->name))
++		if(!mount_new("/mnt/usb/.run/mountd/", (char*)pkt->name))
+ 		{
+ 			send_ready(pkt->wait_queue_token);
+ 		} else {
+@@ -117,7 +117,7 @@
+ {
+ 	struct autofs_packet_expire pkt;
+ 	while(ioctl(fdin, AUTOFS_IOC_EXPIRE, &pkt) == 0)
+-		mount_remove("/tmp/run/mountd/", pkt.name);
++		mount_remove("/mnt/usb/.run/mountd/", pkt.name);
+ }
+ 
+ static int fullread(void *ptr, size_t len)
+@@ -193,8 +193,8 @@
+ 	else
+ 		snprintf(uci_path, 31, "/tmp/mounts/");
+ 	uci_path[31] = '\0';
+-	mkdir("/tmp/run/", 0555);
+-	mkdir("/tmp/mounts", 0555);
++	mkdir("/mnt/usb/.run/", 0555);
++	if(!p) mkdir("/tmp/mounts", 0555);
+ 	system_printf("rm -rf %s*", uci_path);
+ 	if(uci_timeout < 16)
+ 		uci_timeout = 16;
+Index: mountd-0.1/lib/mount.c
+===================================================================
+--- mountd-0.1.orig/lib/mount.c	2013-02-06 18:02:57.000000000 +0530
++++ mountd-0.1/lib/mount.c	2013-02-06 18:03:22.000000000 +0530
+@@ -111,7 +111,7 @@
+ 	}
+ 	ucix_add_option_int(ctx, mountd, mountd, "mounted", mounted);
+ 	ucix_add_option_int(ctx, mountd, mountd, "total", size);
+-	system_printf("echo -n %llu > /tmp/run/mountd_size", size);
++	system_printf("echo -n %llu > /mnt/usb/.run/mountd_size", size);
+ 	ucix_save_state(ctx, "mountd");
+ 	ucix_cleanup(ctx);
+ }
+@@ -159,10 +159,12 @@
+ 	if((!mount->ignore) && (mount->fs > MBR) && (mount->fs <= EXT4))
+ 	{
+ 		log_printf("new mount : %s -> %s (%s)\n", name, dev, fs_names[mount->fs]);
+-		snprintf(tmp, 64, "%s%s", uci_path, name);
+-		snprintf(tmp2, 64, "/tmp/run/mountd/%s", dev);
++		snprintf(tmp, 64, "%s/%s", uci_path, serial);
++		mkdir(tmp, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH); /* Create intermediate directory with dev serial number */
++		snprintf(tmp, 64, "%s/%s/%s", uci_path, serial, name);
++		snprintf(tmp2, 64, "../.run/mountd/%s", dev); /* Use releative symlink for anonymous ftp to access */
+ 		symlink(tmp2, tmp);
+-		mount_new("/tmp/run/mountd/", dev);
++		mount_new("/mnt/usb/.run/mountd/", dev);
+ 	}
+ }
+ 
+@@ -437,12 +439,14 @@
+ 		if(!s)
+ 			return;
+ 		snprintf(tmp, 64, "part%s", &dev[3]);
+-		snprintf(node, 64, "Disc-%s", &dev[2]);
+-		if(node[5] >= 'a' && node[5] <= 'z')
++		//snprintf(node, 64, "Disc-%s", &dev[2]); /* This code mount with names Disc-A1, Disc-A2, Disc-B1, Disc-B2 etc. based on sda1, sda2, sdb1 etc */
++		snprintf(node, 64, "Disc-%s", &dev[3]); /* New Change: Mount with names Disc-1, Disc-2 etc. instead of Disc-A1, Disc-A2, Disc-B1 etc.
++				because we group Disc-* folders under seperate folders with device serial name. */
++		/* if(node[5] >= 'a' && node[5] <= 'z') // This code not needed for above change
+ 		{
+ 			node[5] -= 'a';
+ 			node[5] += 'A';
+-		}
++		} */
+ 		ctx = ucix_init("mountd");
+ 		p = ucix_get_option(ctx, "mountd", s, tmp);
+ 		ucix_cleanup(ctx);
+@@ -542,13 +546,15 @@
+ 	{
+ 		if(mount->mounted)
+ 		{
+-			snprintf(tmp, 256, "%s%s", "/tmp/run/mountd/", mount->name);
++			snprintf(tmp, 256, "%s%s", "/mnt/usb/.run/mountd/", mount->name);
+ 			log_printf("%s has dissappeared ... unmounting\n", tmp);
+-			snprintf(tmp, 256, "%s%s", "/tmp/run/mountd/", mount->dev);
++			snprintf(tmp, 256, "%s%s", "/mnt/usb/.run/mountd/", mount->dev);
+ 			system_printf("/bin/umount %s", tmp);
+ 			rmdir(tmp);
+-			snprintf(tmp, 64, "%s%s", uci_path, mount->name);
++			snprintf(tmp, 64, "%s/%s/%s", uci_path, mount->serial, mount->name);
+ 			unlink(tmp);
++			snprintf(tmp, 64, "%s/%s", uci_path, mount->serial);
++			rmdir(tmp); /* Remove intermediate directory */
+ 			system_printf("rmmod fuse");
+ 			system_printf("rmmod ext2; rmmod ext3; rmmod ext4");
+ 			system_printf("rmmod jbd; rmmod jbd2; rmmod mbcache; rmmod crc16");
+@@ -715,8 +721,10 @@
+ 			p->next->prev = p->prev;
+ 			p = p->next;
+ 			log_printf("removing %s\n", q->dev);
+-			snprintf(tmp, 64, "%s%s", uci_path, q->name);
++			snprintf(tmp, 64, "%s/%s/%s", uci_path, q->serial, q->name);
+ 			unlink(tmp);
++			snprintf(tmp, 64, "%s/%s", uci_path, q->serial);
++			rmdir(tmp);
+ 			system_printf("/etc/mountd/event remove %s %s", q->dev, q->name);
+ 			free(q);
+ 			mount_dump_uci_state();

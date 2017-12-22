@@ -1,0 +1,429 @@
+diff --git a/net/ipv4/ip_gre.c b/net/ipv4/ip_gre.c
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@ -753,7 +753,7 @@ static int ipgre_tunnel_validate(struct 
+ 
+ static int ipgre_tap_validate(struct nlattr *tb[], struct nlattr *data[])
+ {
+-	__be32 daddr;
++	__be32 daddr = 0;
+ 
+ 	if (tb[IFLA_ADDRESS]) {
+ 		if (nla_len(tb[IFLA_ADDRESS]) != ETH_ALEN)
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1321,7 +1321,7 @@ ssize_t	ip_append_page(struct sock *sk, 
+ 		i = skb_shinfo(skb)->nr_frags;
+ 		if (len > size)
+ 			len = size;
+-		if (skb_can_coalesce(skb, i, page, offset)) {
++		if (i <= MAX_SKB_FRAGS && skb_can_coalesce(skb, i, page, offset)) {
+ 			skb_frag_size_add(&skb_shinfo(skb)->frags[i-1], len);
+ 		} else if (i < MAX_SKB_FRAGS) {
+ 			get_page(page);
+@@ -1522,8 +1522,12 @@ struct sk_buff *ip_make_skb(struct sock 
+ 	cork.addr = 0;
+ 	cork.opt = NULL;
+ 	err = ip_setup_cork(sk, &cork, ipc, rtp);
+-	if (err)
++	if (err) {
++		if(err == -EFAULT && cork.opt) {
++			kfree(cork.opt);
++		}
+ 		return ERR_PTR(err);
++	}
+ 
+ 	err = __ip_append_data(sk, fl4, &queue, &cork,
+ 			       &current->task_frag, getfrag,
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -503,7 +503,7 @@ static struct net_device *ipmr_reg_vif(s
+ 	if (mrt->id == RT_TABLE_DEFAULT)
+ 		sprintf(name, "pimreg");
+ 	else
+-		sprintf(name, "pimreg%u", mrt->id);
++		snprintf(name, sizeof(name), "pimreg%u", mrt->id);
+ 
+ 	dev = alloc_netdev(0, name, reg_vif_setup);
+ 
+@@ -634,6 +634,10 @@ static void ipmr_destroy_unres(struct mr
+ 	while ((skb = skb_dequeue(&c->mfc_un.unres.unresolved))) {
+ 		if (ip_hdr(skb)->version == 0) {
+ 			struct nlmsghdr *nlh = (struct nlmsghdr *)skb_pull(skb, sizeof(struct iphdr));
++			if(nlh == NULL) {
++				kfree_skb(skb);
++				continue;
++			}
+ 			nlh->nlmsg_type = NLMSG_ERROR;
+ 			nlh->nlmsg_len = nlmsg_msg_size(sizeof(struct nlmsgerr));
+ 			skb_trim(skb, nlh->nlmsg_len);
+@@ -920,6 +924,10 @@ static void ipmr_cache_resolve(struct ne
+ 	while ((skb = __skb_dequeue(&uc->mfc_un.unres.unresolved))) {
+ 		if (ip_hdr(skb)->version == 0) {
+ 			struct nlmsghdr *nlh = (struct nlmsghdr *)skb_pull(skb, sizeof(struct iphdr));
++			if(nlh == NULL) {
++				kfree_skb(skb);
++				continue;
++			}
+ 
+ 			if (__ipmr_fill_mroute(mrt, skb, c, nlmsg_data(nlh)) > 0) {
+ 				nlh->nlmsg_len = skb_tail_pointer(skb) -
+diff --git a/net/ipv4/netfilter/ipt_webstr.c b/net/ipv4/netfilter/ipt_webstr.c
+--- a/net/ipv4/netfilter/ipt_webstr.c
++++ b/net/ipv4/netfilter/ipt_webstr.c
+@@ -51,12 +51,12 @@
+ 
+ #define split(word, wordlist, next, delim) \
+     for (next = wordlist, \
+-	strncpy(word, next, sizeof(word)), \
++	snprintf(word, sizeof(word), "%s", next), \
+ 	word[(next=strstr(next, delim)) ? strstr(word, delim) - word : sizeof(word) - 1] = '\0', \
+ 	next = next ? next + sizeof(delim) - 1 : NULL ; \
+ 	strlen(word); \
+ 	next = next ? : "", \
+-	strncpy(word, next, sizeof(word)), \
++	snprintf(word, sizeof(word), "%s",  next), \
+ 	word[(next=strstr(next, delim)) ? strstr(word, delim) - word : sizeof(word) - 1] = '\0', \
+ 	next = next ? next + sizeof(delim) - 1 : NULL)
+ 
+diff --git a/net/ipv4/netfilter/nf_nat_rtsp.c b/net/ipv4/netfilter/nf_nat_rtsp.c
+--- a/net/ipv4/netfilter/nf_nat_rtsp.c
++++ b/net/ipv4/netfilter/nf_nat_rtsp.c
+@@ -168,7 +168,7 @@ rtsp_mangle_tran(struct nf_conn *ct, enu
+      
+ 	int off_adj = 0 ;
+ 	struct nf_conn_nat *nat; /*= nfct_nat(ct);*/
+-	struct nf_nat_seq *this_way;
++	struct nf_nat_seq *this_way = NULL;
+ 
+          ct = exp->master;
+ 	get_skb_tcpdata(*pskb, &ptcp, &tcplen);
+@@ -399,8 +399,7 @@ rtsp_mangle_tran(struct nf_conn *ct, enu
+ 
+                         		/* issue : corrupts the packet*/
+                                         memset (tran_dst, '\0', 32);
+-                                        strncpy (tran_dst,"destination=",12);
+-                                        strncat (tran_dst, szextaddr, extaddrlen);
++					snprintf(tran_dst, sizeof(tran_dst), "destination=%s", szextaddr);
+ 
+                                          off_mangle = (ptran-ptcp)+off; /* (datalen1 - ( (pdata1+datalen1) - ptran)); */
+ 					 diff = (extaddrlen + 12) - (diff1 - 1) ;
+@@ -504,8 +503,10 @@ rtsp_mangle_tran(struct nf_conn *ct, enu
+ 		off = nextparamoff;
+ 	}
+ 
+-	this_way = &nat->seq[dir];
+-	if (this_way->offset_after != off_adj) {
++	if(nat) {
++		this_way = &nat->seq[dir];
++	}
++	if (this_way && this_way->offset_after != off_adj) {
+ 		printk ("inside ----------------- corpos %d %d \n", off_adj, this_way->offset_after);
+ 
+ 		this_way->offset_after = off_adj;
+@@ -567,7 +568,7 @@ help_out(struct sk_buff **pskb, enum ip_
+     uint    linelen;
+     uint    off;
+    
+-    struct nf_conn *ct ;
++    struct nf_conn *ct = NULL;
+  
+     get_skb_tcpdata(*pskb, &ptcp, &tcplen);
+     DEBUGP(" INSIDE nat help_out \n");
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -2579,6 +2579,9 @@ void tcp_xmit_retransmit_queue(struct so
+ 			last_lost = tp->retransmit_high;
+ 	} else {
+ 		skb = tcp_write_queue_head(sk);
++		if(skb == NULL) {
++			return;
++		}
+ 		last_lost = tp->snd_una;
+ 	}
+ 
+diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -779,7 +779,7 @@ static inline int ip6gre_xmit_ipv4(struc
+ 	struct ip6_tnl *t = netdev_priv(dev);
+ 	const struct iphdr  *iph = ip_hdr(skb);
+ 	int encap_limit = -1;
+-	struct flowi6 fl6;
++	struct flowi6 fl6 = {0};
+ 	__u8 dsfield;
+ 	__u32 mtu;
+ 	int err;
+@@ -816,7 +816,7 @@ static inline int ip6gre_xmit_ipv6(struc
+ 	struct ipv6hdr *ipv6h = ipv6_hdr(skb);
+ 	int encap_limit = -1;
+ 	__u16 offset;
+-	struct flowi6 fl6;
++	struct flowi6 fl6 = {0};
+ 	__u8 dsfield;
+ 	__u32 mtu;
+ 	int err;
+@@ -882,7 +882,7 @@ static int ip6gre_xmit_other(struct sk_b
+ {
+ 	struct ip6_tnl *t = netdev_priv(dev);
+ 	int encap_limit = -1;
+-	struct flowi6 fl6;
++	struct flowi6 fl6={0};
+ 	__u32 mtu;
+ 	int err;
+ 
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -1079,7 +1079,7 @@ ip4ip6_tnl_xmit(struct sk_buff *skb, str
+ 	struct ip6_tnl *t = netdev_priv(dev);
+ 	const struct iphdr  *iph = ip_hdr(skb);
+ 	int encap_limit = -1;
+-	struct flowi6 fl6;
++	struct flowi6 fl6 = {0};
+ 	__u8 dsfield;
+ 	__u32 mtu;
+ 	int err;
+@@ -1121,7 +1121,7 @@ ip6ip6_tnl_xmit(struct sk_buff *skb, str
+ 	struct ipv6hdr *ipv6h = ipv6_hdr(skb);
+ 	int encap_limit = -1;
+ 	__u16 offset;
+-	struct flowi6 fl6;
++	struct flowi6 fl6 = {0};
+ 	__u8 dsfield;
+ 	__u32 mtu;
+ 	int err;
+diff --git a/net/ipv6/ip6mr.c b/net/ipv6/ip6mr.c
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -856,6 +856,10 @@ static void ip6mr_destroy_unres(struct m
+ 	while((skb = skb_dequeue(&c->mfc_un.unres.unresolved)) != NULL) {
+ 		if (ipv6_hdr(skb)->version == 0) {
+ 			struct nlmsghdr *nlh = (struct nlmsghdr *)skb_pull(skb, sizeof(struct ipv6hdr));
++			if(!nlh) {
++				kfree_skb(skb);
++				continue;
++			}
+ 			nlh->nlmsg_type = NLMSG_ERROR;
+ 			nlh->nlmsg_len = nlmsg_msg_size(sizeof(struct nlmsgerr));
+ 			skb_trim(skb, nlh->nlmsg_len);
+@@ -1115,6 +1119,10 @@ static void ip6mr_cache_resolve(struct n
+ 	while((skb = __skb_dequeue(&uc->mfc_un.unres.unresolved))) {
+ 		if (ipv6_hdr(skb)->version == 0) {
+ 			struct nlmsghdr *nlh = (struct nlmsghdr *)skb_pull(skb, sizeof(struct ipv6hdr));
++			if(!nlh) {
++				ip6_mr_forward(net, mrt, skb, c);
++				continue;
++			}
+ 
+ 			if (__ip6mr_fill_mroute(mrt, skb, c, nlmsg_data(nlh)) > 0) {
+ 				nlh->nlmsg_len = skb_tail_pointer(skb) - (u8 *)nlh;
+diff --git a/net/key/af_key.c b/net/key/af_key.c
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@ -1326,7 +1326,7 @@ static int pfkey_getspi(struct sock *sk,
+ 
+ 	if (hdr->sadb_msg_seq) {
+ 		x = xfrm_find_acq_byseq(net, DUMMY_MARK, hdr->sadb_msg_seq);
+-		if (x && !xfrm_addr_equal(&x->id.daddr, xdaddr, family)) {
++		if (x && xdaddr && !xfrm_addr_equal(&x->id.daddr, xdaddr, family)) {
+ 			xfrm_state_put(x);
+ 			x = NULL;
+ 		}
+@@ -3043,7 +3043,11 @@ static int pfkey_send_policy_notify(stru
+ 	case XFRM_MSG_DELPOLICY:
+ 	case XFRM_MSG_NEWPOLICY:
+ 	case XFRM_MSG_UPDPOLICY:
+-		return key_notify_policy(xp, dir, c);
++		if(xp) {
++			return key_notify_policy(xp, dir, c);
++		} else {
++			return 0;
++		}
+ 	case XFRM_MSG_FLUSHPOLICY:
+ 		if (c->data.type != XFRM_POLICY_TYPE_MAIN)
+ 			break;
+diff --git a/net/netfilter/nf_conntrack_expect.c b/net/netfilter/nf_conntrack_expect.c
+--- a/net/netfilter/nf_conntrack_expect.c
++++ b/net/netfilter/nf_conntrack_expect.c
+@@ -46,6 +46,9 @@ void nf_ct_unlink_expect_report(struct n
+ 	struct nf_conn_help *master_help = nfct_help(exp->master);
+ 	struct net *net = nf_ct_exp_net(exp);
+ 
++	if(!master_help) {
++		return;
++	}
+ 	NF_CT_ASSERT(master_help);
+ 	NF_CT_ASSERT(!timer_pending(&exp->timeout));
+ 
+@@ -322,6 +325,9 @@ static int nf_ct_expect_insert(struct nf
+ 	/* two references : one for hash insert, one for the timer */
+ 	atomic_add(2, &exp->use);
+ 
++	if(!master_help) {
++		return 0;
++	}
+ 	hlist_add_head(&exp->lnode, &master_help->expectations);
+ 	master_help->expecting[exp->class]++;
+ 
+@@ -358,6 +364,9 @@ static void evict_oldest_expect(struct n
+ 	struct nf_conn_help *master_help = nfct_help(master);
+ 	struct nf_conntrack_expect *exp, *last = NULL;
+ 
++	if(!master_help)
++		return;
++
+ 	hlist_for_each_entry(exp, &master_help->expectations, lnode) {
+ 		if (exp->class == new->class)
+ 			last = exp;
+@@ -514,6 +523,7 @@ static int exp_seq_show(struct seq_file 
+ 	struct nf_conntrack_helper *helper;
+ 	struct hlist_node *n = v;
+ 	char *delim = "";
++	struct nf_conn_help *nfc =NULL;
+ 
+ 	expect = hlist_entry(n, struct nf_conntrack_expect, hnode);
+ 
+@@ -541,7 +551,10 @@ static int exp_seq_show(struct seq_file 
+ 	if (expect->flags & NF_CT_EXPECT_USERSPACE)
+ 		seq_printf(s, "%sUSERSPACE", delim);
+ 
+-	helper = rcu_dereference(nfct_help(expect->master)->helper);
++	nfc = nfct_help(expect->master);
++	if(nfc == NULL)
++		return 0;
++	helper = rcu_dereference(nfc->helper);
+ 	if (helper) {
+ 		seq_printf(s, "%s%s", expect->flags ? " " : "", helper->name);
+ 		if (helper->expect_policy[expect->class].name)
+diff --git a/net/netfilter/nf_conntrack_h323_main.c b/net/netfilter/nf_conntrack_h323_main.c
+--- a/net/netfilter/nf_conntrack_h323_main.c
++++ b/net/netfilter/nf_conntrack_h323_main.c
+@@ -263,7 +263,7 @@ static int expect_rtp_rtcp(struct sk_buf
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+-	__be16 port;
++	__be16 port = 0;
+ 	__be16 rtp_port, rtcp_port;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *rtp_exp;
+@@ -338,7 +338,7 @@ static int expect_t120(struct sk_buff *s
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+-	__be16 port;
++	__be16 port = 0;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *exp;
+ 	typeof(nat_t120_hook) nat_t120;
+@@ -684,7 +684,7 @@ static int expect_h245(struct sk_buff *s
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+-	__be16 port;
++	__be16 port = 0;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *exp;
+ 	typeof(nat_h245_hook) nat_h245;
+@@ -804,7 +804,7 @@ static int expect_callforwarding(struct 
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+-	__be16 port;
++	__be16 port = 0;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *exp;
+ 	typeof(nat_callforwarding_hook) nat_callforwarding;
+@@ -861,10 +861,10 @@ static int process_setup(struct sk_buff 
+ 			 Setup_UUIE *setup)
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+-	int ret;
+-	int i;
+-	__be16 port;
+-	union nf_inet_addr addr;
++	int ret=0;
++	int i=0;
++	__be16 port=0;
++	union nf_inet_addr addr={0};
+ 	typeof(set_h225_addr_hook) set_h225_addr;
+ 
+ 	pr_debug("nf_ct_q931: Setup\n");
+@@ -1293,7 +1293,7 @@ static int expect_q931(struct sk_buff *s
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+ 	int i;
+-	__be16 port;
++	__be16 port = 0;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *exp;
+ 	typeof(nat_q931_hook) nat_q931;
+@@ -1367,7 +1367,7 @@ static int process_gcf(struct sk_buff *s
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+-	__be16 port;
++	__be16 port=0;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *exp;
+ 
+@@ -1534,7 +1534,7 @@ static int process_arq(struct sk_buff *s
+ {
+ 	const struct nf_ct_h323_master *info = nfct_help_data(ct);
+ 	int dir = CTINFO2DIR(ctinfo);
+-	__be16 port;
++	__be16 port = 0;
+ 	union nf_inet_addr addr;
+ 	typeof(set_h225_addr_hook) set_h225_addr;
+ 
+@@ -1579,7 +1579,7 @@ static int process_acf(struct sk_buff *s
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+-	__be16 port;
++	__be16 port = 0;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *exp;
+ 	typeof(set_sig_addr_hook) set_sig_addr;
+@@ -1646,7 +1646,7 @@ static int process_lcf(struct sk_buff *s
+ {
+ 	int dir = CTINFO2DIR(ctinfo);
+ 	int ret = 0;
+-	__be16 port;
++	__be16 port = 0;
+ 	union nf_inet_addr addr;
+ 	struct nf_conntrack_expect *exp;
+ 
+diff --git a/net/netfilter/nf_nat_helper.c b/net/netfilter/nf_nat_helper.c
+--- a/net/netfilter/nf_nat_helper.c
++++ b/net/netfilter/nf_nat_helper.c
+@@ -51,8 +51,14 @@ adjust_tcp_sequence(u32 seq,
+ {
+ 	enum ip_conntrack_dir dir = CTINFO2DIR(ctinfo);
+ 	struct nf_conn_nat *nat = nfct_nat(ct);
+-	struct nf_nat_seq *this_way = &nat->seq[dir];
++	struct nf_nat_seq *this_way = NULL;
+ 
++	if(nat != NULL)
++		this_way = &nat->seq[dir];
++
++	if(this_way == NULL) {
++		return;
++	}
+ 	pr_debug("adjust_tcp_sequence: seq = %u, sizediff = %d\n",
+ 		 seq, sizediff);
+ 
+@@ -90,6 +96,9 @@ s16 nf_nat_get_offset(const struct nf_co
+ 		return 0;
+ 
+ 	this_way = &nat->seq[dir];
++	if(this_way == NULL) {
++		return 0;
++	}
+ 	spin_lock_bh(&nf_nat_seqofs_lock);
+ 	offset = after(seq, this_way->correction_pos)
+ 		 ? this_way->offset_after : this_way->offset_before;

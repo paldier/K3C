@@ -1,0 +1,545 @@
+--- a/Makefile
++++ b/Makefile
+@@ -24,11 +24,11 @@ BINDIR =	/usr/local/sbin
+ MANDIR =	/usr/local/man
+ CC =		gcc
+ CDEFS =		${SSL_DEFS} ${SSL_INC}
+-CFLAGS =	-O ${CDEFS}
++CFLAGS =	-O ${CDEFS} $(IFX_INCLUDE)
+ #CFLAGS =	-g ${CDEFS}
+ LDFLAGS =	-s
+ #LDFLAGS =	-g
+-LDLIBS =	${SSL_LIBS} ${SYSV_LIBS} ${CRYPT_LIB}
++LDLIBS =	${SSL_LIBS} ${SYSV_LIBS} ${CRYPT_LIB} -ldl
+ 
+ all:		mini_httpd htpasswd
+ 
+@@ -44,6 +44,10 @@ match.o:	match.c match.h
+ tdate_parse.o:	tdate_parse.c tdate_parse.h
+ 	${CC} ${CFLAGS} -c tdate_parse.c
+ 
++#Added to support changes made by CONFIG_FEATURE_IFX_WEB_SUPPORT
++LIBRARIES += -ldl -lpthread
++#LIBRARIES += -ldl -lpthread -L/vobs/comac_amazon_lxdb1.1/build//root_filesystem//lib -lifx_common
++
+ mime_encodings.h: mime_encodings.txt
+ 	rm -f mime_encodings.h
+ 	sed < mime_encodings.txt > mime_encodings.h \
+--- a/mime_types.txt
++++ b/mime_types.txt
+@@ -53,6 +53,7 @@ gtar	application/x-gtar
+ hdf	application/x-hdf
+ hqx	application/mac-binhex40
+ htm	text/html; charset=%s
++asp	text/html; charset=%s
+ html	text/html; charset=%s
+ ice	x-conference/x-cooltalk
+ ief	image/ief
+--- a/mini_httpd.c
++++ b/mini_httpd.c
+@@ -71,7 +71,48 @@
+ #endif /* USE_SSL */
+ 
+ extern char* crypt( const char* key, const char* setting );
++/*for supporting CGI  */
++#include "ifx_config.h"
++#include <dlfcn.h>
++/*for supporting CGI  */
++typedef int (*IFX_SENDHEADERS) (int responseNum, char *redirectURL);
++typedef int (*IFX_READ) (int, void *, int);
++typedef int (*IFX_WRITE) (int, const void *, int);
++typedef void (*IFX_GETHEADERDATA) (const char *, char **);
++
++struct ifx_exportFuncList {
++	IFX_SENDHEADERS ifx_sendHeaders;
++	IFX_READ ifx_read;
++	IFX_WRITE ifx_write;
++	IFX_GETHEADERDATA ifx_getHeaderData;
++	void *dlHandle;
++};
+ 
++#define IFX_LIB "/lib/libifx_httpd.so"
++
++#ifdef DMALLOC
++   #include "dmalloc.h"
++#endif
++
++//#define LTQ_APP_DEBUG
++#ifdef LTQ_APP_DEBUG
++#define dsyslog syslog
++#else
++#define dsyslog 
++#endif
++
++int (*ifx_function_ptr)(struct ifx_exportFuncList *);
++struct ifx_exportFuncList ifx_exportedFunc;
++
++char *error;
++int i;
++void *dlHandle = NULL;
++
++static void sendHeaders(int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod,char *redirectURL);
++int (*ifx_psendGoform)(const char *,const char *, const char *, int, const char *,const char *,const char *,int,int) = NULL;
++int (*ifx_psendDHTMLFile)(char *,const char *,int,int,int *) = NULL;
++int (*ifx_AuthHandler_ptr)(const char *,int,int) = NULL;
++/*for supporting CGI  */
+ 
+ #if defined(AF_INET6) && defined(IN6_IS_ADDR_V4MAPPED)
+ #define USE_IPV6
+@@ -126,16 +167,16 @@ typedef long long int64_t;
+ #endif /* DEFAULT_CERTFILE */
+ #endif /* USE_SSL */
+ #ifndef DEFAULT_USER
+-#define DEFAULT_USER "nobody"
++#define DEFAULT_USER "admin"
+ #endif /* DEFAULT_USER */
+ #ifndef CGI_NICE
+ #define CGI_NICE 10
+ #endif /* CGI_NICE */
+ #ifndef CGI_PATH
+-#define CGI_PATH "/usr/local/bin:/usr/ucb:/bin:/usr/bin"
++#define CGI_PATH "/usr/local/bin:/usr/ucb:/bin:/usr/bin:/usr/web"
+ #endif /* CGI_PATH */
+ #ifndef CGI_LD_LIBRARY_PATH
+-#define CGI_LD_LIBRARY_PATH "/usr/local/lib:/usr/lib"
++#define CGI_LD_LIBRARY_PATH "/usr/local/lib:/usr/lib:/usr/web"
+ #endif /* CGI_LD_LIBRARY_PATH */
+ #ifndef AUTH_FILE
+ #define AUTH_FILE ".htpasswd"
+@@ -259,7 +300,7 @@ static void send_error( int s, char* tit
+ static void send_error_body( int s, char* title, char* text );
+ static int send_error_file( char* filename );
+ static void send_error_tail( void );
+-static void add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod );
++static void add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod,char *redirectURL );
+ static void start_request( void );
+ static void add_to_request( char* str, size_t len );
+ static char* get_request_line( void );
+@@ -267,8 +308,8 @@ static void start_response( void );
+ static void add_to_response( char* str, size_t len );
+ static void send_response( void );
+ static void send_via_write( int fd, off_t size );
+-static ssize_t my_read( char* buf, size_t size );
+-static ssize_t my_write( char* buf, size_t size );
++static ssize_t my_read(int fd, char* buf, size_t size );
++static ssize_t my_write(int fd, char* buf, size_t size );
+ #ifdef HAVE_SENDFILE
+ static int my_sendfile( int fd, int socket, off_t offset, size_t nbytes );
+ #endif /* HAVE_SENDFILE */
+@@ -302,6 +343,39 @@ static int snprintf( char* str, size_t s
+ #endif /* NO_SNPRINTF */
+ 
+ 
++
++/****************************************************************************
++ *
++ > $Function: getHeaderData()
++ *
++ * $Description: gets HTTP header value for the given field.
++ *
++ * $Parameter:
++ *      headerField . . . The field to be get.
++ *		headerData	. . . The corresponding value
++ *
++ *
++ ****************************************************************************/
++void getHeaderData(const char *headerField,char **headerData)
++{
++	if(strncasecmp(headerField,"Referer",strlen("Referer")) == 0)
++	{
++		*headerData = referer;
++	}else if(strncasecmp(headerField,"Host",strlen("Host")) == 0)
++	{
++		*headerData = host;
++	}
++	else if(strncasecmp(headerField,"Remote IP",strlen("Remote IP")) == 0)
++	{
++		*headerData = ntoa( &client_addr ); 
++	}
++	else if(strncasecmp(headerField,"User-Agent",strlen("User-Agent")) == 0)
++	{
++		*headerData = useragent;
++	}
++}
++
++
+ int
+ main( int argc, char** argv )
+     {
+@@ -562,6 +636,51 @@ main( int argc, char** argv )
+ 	}
+ #endif /* USE_SSL */
+ 
++  dlHandle = dlopen (IFX_LIB, RTLD_LAZY);
++  if (!dlHandle)
++  {
++    fprintf (stderr, "%s\n", dlerror());
++    fprintf(stderr,"\n  Error : dlopen fails.\n");
++    exit(0);
++  }
++
++  ifx_function_ptr = dlsym(dlHandle,"ifx_RegisterFunc");
++  if ((error = dlerror()) != NULL)
++  {
++    fprintf (stderr, "%s\n", error);
++    fprintf(stderr,"Error : dlsym fails. Cannot find ifx_RegisterFunc\n");
++    //return start_ptr - rcv_buff;
++  }else
++  {
++    ifx_exportedFunc.ifx_sendHeaders = (IFX_SENDHEADERS)sendHeaders;
++    ifx_exportedFunc.ifx_read = (IFX_READ)my_read;
++    ifx_exportedFunc.ifx_write = (IFX_WRITE)my_write;
++    ifx_exportedFunc.ifx_getHeaderData = (IFX_GETHEADERDATA)getHeaderData;
++    ifx_exportedFunc.dlHandle = dlHandle;
++    syslog( LOG_INFO, "Try to call ifx_RegisterFunc");
++    i = (*ifx_function_ptr)(&ifx_exportedFunc);
++    if(i < 0){
++       syslog( LOG_INFO, "###ifx_RegisterFunc returned error %d",i);
++       dlclose(dlHandle);
++       dlHandle = NULL;
++    }else{
++      ifx_psendGoform = dlsym(dlHandle,"ifx_sendGoform");
++      if ((error = dlerror()) != NULL){
++       syslog( LOG_INFO, "dlsym fails. Cannot find ifx_sendGoform");
++      }
++      ifx_psendDHTMLFile = dlsym(dlHandle,"ifx_sendDHTMLFile");
++      if ((error = dlerror()) != NULL){
++       syslog( LOG_INFO, "dlsym fails. Cannot find ifx_sendDHTMLFile");
++      }
++      ifx_AuthHandler_ptr = dlsym(dlHandle,"ifx_AuthHandler");
++      if ((error = dlerror()) != NULL)
++      {
++       syslog( LOG_INFO, "dlsym fails. Cannot find ifx_AuthHandler");
++      }
++    }
++  }
++//  signal(SIGPIPE, SIG_IGN); //XXX : Added to make the server ignore premature close sent by the IE.
++
+     if ( ! debug )
+ 	{
+ 	/* Make ourselves a daemon. */
+@@ -848,6 +967,10 @@ main( int argc, char** argv )
+ 	    }
+ 	(void) close( conn_fd );
+ 	}
++	if(dlHandle){
++            dlclose(dlHandle);
++            syslog( LOG_INFO, "Dlclose completed");
++	}
+     }
+ 
+ 
+@@ -1129,7 +1252,7 @@ handle_request( void )
+     int r, file_len, i;
+     const char* index_names[] = {
+ 	"index.html", "index.htm", "index.xhtml", "index.xht", "Default.htm",
+-	"index.cgi" };
++	"index.cgi", "login.asp" };
+ 
+     /* Set up the timeout for reading. */
+ #ifdef HAVE_SIGSET
+@@ -1189,7 +1312,7 @@ handle_request( void )
+     for (;;)
+ 	{
+ 	char buf[10000];
+-	int r = my_read( buf, sizeof(buf) );
++	int r = my_read(conn_fd,buf, sizeof(buf) );
+ 	if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+ 	    continue;
+ 	if ( r <= 0 )
+@@ -1312,8 +1435,10 @@ handle_request( void )
+     r = stat( file, &sb );
+     if ( r < 0 )
+ 	r = get_pathinfo();
+-    if ( r < 0 )
+-	send_error( 404, "Not Found", "", "File not found." );
++   if ( r < 0 ){
++        	   
++    syslog( LOG_INFO, "File not found.");
++    } 
+     file_len = strlen( file );
+     if ( ! S_ISDIR( sb.st_mode ) )
+ 	{
+@@ -1454,7 +1579,7 @@ do_file( void )
+     char fixed_mime_type[500];
+     char* cp;
+     int fd;
+-
++    int writtenCount;
+     /* Check authorization for this directory. */
+     (void) strncpy( buf, file, sizeof(buf) );
+     cp = strrchr( buf, '/' );
+@@ -1503,37 +1628,61 @@ do_file( void )
+ 	{
+ 	add_headers(
+ 	    304, "Not Modified", "", mime_encodings, fixed_mime_type,
+-	    (off_t) -1, sb.st_mtime );
++	    (off_t) -1, sb.st_mtime,NULL);
+ 	send_response();
+ 	return;
+ 	}
+     add_headers(
+ 	200, "Ok", "", mime_encodings, fixed_mime_type, sb.st_size,
+-	sb.st_mtime );
++	sb.st_mtime,NULL);
+     send_response();
+-    if ( method == METHOD_HEAD )
++    if ( method == METHOD_HEAD)
+ 	return;
+-
+-    if ( sb.st_size > 0 )	/* ignore zero-length files */
++/*   if ( sb.st_size > 0 )
+ 	{
++
++
+ #ifdef HAVE_SENDFILE
+ 
+ #ifndef USE_SSL
+ 	(void) my_sendfile( fd, conn_fd, 0, sb.st_size );
+-#else /* USE_SSL */
++#else 
+ 	if ( do_ssl )
+ 	    send_via_write( fd, sb.st_size );
+ 	else
+ 	    (void) my_sendfile( fd, conn_fd, 0, sb.st_size );
+-#endif /* USE_SSL */
++#endif
+ 
+-#else /* HAVE_SENDFILE */
++#else 
+ 
+    	send_via_write( fd, sb.st_size );
+ 
+-#endif /* HAVE_SENDFILE */
+-	}
+-
++#endif
++	}*/
++ if ( sb.st_size > 0 )
++	         {
++	int count;
++	 int bNewFile = 1;
++                 memset(buf,0x00,sizeof(buf));
++         while ((count = my_read(fd, buf,sb.st_size)) > 0) {
++		      if ((strstr(fixed_mime_type,"html") != NULL ) || (strstr(file,"asp") != NULL)
++							                                ){
++			                                     //ifx_psendDHTMLFile
++        writtenCount = (*ifx_psendDHTMLFile)(buf,host,count,conn_fd,&bNewFile);
++        if (writtenCount != count && writtenCount >= 0)  {
++               if(lseek(fd,writtenCount - count,SEEK_CUR) == -1){
++                              fprintf(stderr,"lseek failed ERROR\n");
++                }
++           }
++         }
++        else {
++                 if (my_write(conn_fd, buf, count ) != count)
++                                  break;
++              }
++                 memset(buf,0x00,sizeof(buf));
++                 bNewFile = 0;
++        }
++		 }
+     (void) close( fd );
+     }
+ 
+@@ -1624,7 +1773,7 @@ do_dir( void )
+ 	SERVER_URL, SERVER_SOFTWARE );
+     add_to_buf( &contents, &contents_size, &contents_len, buf, buflen );
+ 
+-    add_headers( 200, "Ok", "", "", "text/html; charset=%s", contents_len, sb.st_mtime );
++    add_headers( 200, "Ok", "", "", "text/html; charset=%s", contents_len, sb.st_mtime,NULL);
+     if ( method != METHOD_HEAD )
+ 	add_to_response( contents, contents_len );
+     send_response();
+@@ -1741,6 +1890,19 @@ do_cgi( void )
+ 	    exit( 0 );
+ 	    }
+ 	(void) close( p[1] );
++
++ /*   if(ifx_AuthHandler_ptr){
++          if((*ifx_AuthHandler_ptr)(file,p[0],p[1]) == 1)  
++            syslog( LOG_INFO, "ifx_AuthHandler_ptr failed"); 
++      }*/	  
++  if (strncmp(file, "goform", 6) == 0){
++      if(ifx_psendGoform)
++        (*ifx_psendGoform)(file,get_method_str(method),query,content_length,cookie, content_type,host,p[0],p[1]);
++      else
++         send_error( 403, "Forbidden", "", "You must supply a local referer." );
++    }
++
++
+ 	if ( p[0] != STDIN_FILENO )
+ 	    {
+ 	    (void) dup2( p[0], STDIN_FILENO );
+@@ -1872,7 +2034,7 @@ cgi_interpose_input( int wfd )
+ 	}
+     while ( c < content_length )
+ 	{
+-	r = my_read( buf, MIN( sizeof(buf), content_length - c ) );
++	r = my_read(conn_fd,buf, MIN( sizeof(buf), content_length - c ) );
+ 	if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+ 	    {
+ 	    sleep( 1 );
+@@ -1937,7 +2099,7 @@ cgi_interpose_output( int rfd, int parse
+ 	** and proceed to the echo phase.
+ 	*/
+ 	char http_head[] = "HTTP/1.0 200 OK\015\012";
+-	(void) my_write( http_head, sizeof(http_head) );
++	(void) my_write(conn_fd,http_head, sizeof(http_head) );
+ 	}
+     else
+ 	{
+@@ -2015,10 +2177,10 @@ cgi_interpose_output( int rfd, int parse
+ 	    }
+ 	(void) snprintf(
+ 	    buf, sizeof(buf), "HTTP/1.0 %d %s\015\012", status, title );
+-	(void) my_write( buf, strlen( buf ) );
++	(void) my_write(conn_fd,buf, strlen( buf ) );
+ 
+ 	/* Write the saved headers. */
+-	(void) my_write( headers, headers_len );
++	(void) my_write(conn_fd,headers, headers_len );
+ 	}
+ 
+     /* Echo the rest of the output. */
+@@ -2034,7 +2196,7 @@ cgi_interpose_output( int rfd, int parse
+ 	    goto done;
+ 	for (;;)
+ 	    {
+-	    r2 = my_write( buf, r );
++	    r2 = my_write(conn_fd,buf, r );
+ 	    if ( r2 < 0 && ( errno == EINTR || errno == EAGAIN ) )
+ 		{
+ 		sleep( 1 );
+@@ -2256,7 +2418,7 @@ auth_check( char* dirname )
+ 	syslog(
+ 	    LOG_ERR, "%.80s auth file %.80s could not be opened - %m",
+ 	    ntoa( &client_addr ), authpath );
+-	send_error( 403, "Forbidden", "", "File is protected." );
++	send_error( 403, "Forbidden", "", "File is protected 3." );
+ 	}
+ 
+     /* Read it. */
+@@ -2337,7 +2499,7 @@ static void
+ send_error( int s, char* title, char* extra_header, char* text )
+     {
+     add_headers(
+-	s, title, extra_header, "", "text/html; charset=%s", (off_t) -1, (time_t) -1 );
++	s, title, extra_header, "", "text/html; charset=%s", (off_t) -1, (time_t) -1,NULL);
+ 
+     send_error_body( s, title, text );
+ 
+@@ -2442,7 +2604,7 @@ send_error_tail( void )
+ 
+ 
+ static void
+-add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod )
++add_headers( int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod,char *redirectURL )
+     {
+     time_t now, expires;
+     char timebuf[100];
+@@ -2469,6 +2631,11 @@ add_headers( int s, char* title, char* e
+ 	buflen = snprintf( buf, sizeof(buf), "Cache-Control: no-cache,no-store\015\012" );
+ 	add_to_response( buf, buflen );
+ 	}
++   if(status == 302)
++       {
++	 buflen = snprintf( buf, sizeof(buf), "Location: %s\015\012",redirectURL);
++         add_to_response( buf, buflen );	 
++       }
+     if ( extra_header != (char*) 0 && extra_header[0] != '\0' )
+ 	{
+ 	buflen = snprintf( buf, sizeof(buf), "%s\015\012", extra_header );
+@@ -2484,7 +2651,7 @@ add_headers( int s, char* title, char* e
+ 	buflen = snprintf( buf, sizeof(buf), "Content-Type: %s\015\012", mt );
+ 	add_to_response( buf, buflen );
+ 	}
+-    if ( bytes >= 0 )
++  /*  if ( bytes >= 0 )
+ 	{
+ 	buflen = snprintf(
+ 	    buf, sizeof(buf), "Content-Length: %lld\015\012", (int64_t) bytes );
+@@ -2494,7 +2661,7 @@ add_headers( int s, char* title, char* e
+ 	{
+ 	buflen = snprintf( buf, sizeof(buf), "P3P: %s\015\012", p3p );
+ 	add_to_response( buf, buflen );
+-	}
++	}*/
+     if ( max_age >= 0 )
+ 	{
+ 	expires = now + max_age;
+@@ -2504,15 +2671,15 @@ add_headers( int s, char* title, char* e
+ 	    "Cache-Control: max-age=%d\015\012Expires: %s\015\012", max_age, timebuf );
+ 	add_to_response( buf, buflen );
+ 	}
+-    if ( mod != (time_t) -1 )
++ /*   if ( mod != (time_t) -1 )
+ 	{
+ 	(void) strftime(
+ 	    timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &mod ) );
+ 	buflen = snprintf( buf, sizeof(buf), "Last-Modified: %s\015\012", timebuf );
+ 	add_to_response( buf, buflen );
+-	}
+-    buflen = snprintf( buf, sizeof(buf), "Connection: close\015\012\015\012" );
+-    add_to_response( buf, buflen );
++	}*/
++     buflen = snprintf( buf, sizeof(buf), "Connection: close\015\012\015\012" );
++      add_to_response( buf, buflen );
+     }
+ 
+ 
+@@ -2573,7 +2740,7 @@ add_to_response( char* str, size_t len )
+ static void
+ send_response( void )
+     {
+-    (void) my_write( response, response_len );
++    (void) my_write(conn_fd,response, response_len );
+     }
+ 
+ 
+@@ -2586,7 +2753,7 @@ send_via_write( int fd, off_t size )
+ 	void* ptr = mmap( 0, size_size, PROT_READ, MAP_PRIVATE, fd, 0 );
+ 	if ( ptr != (void*) -1 )
+ 	    {
+-	    (void) my_write( ptr, size_size );
++	    (void) my_write(conn_fd,ptr, size_size );
+ 	    (void) munmap( ptr, size_size );
+ 	    }
+ #ifdef MADV_SEQUENTIAL
+@@ -2614,7 +2781,7 @@ send_via_write( int fd, off_t size )
+ 		return;
+ 	    for (;;)
+ 		{
+-		r2 = my_write( buf, r );
++		r2 = my_write(conn_fd,buf, r );
+ 		if ( r2 < 0 && ( errno == EINTR || errno == EAGAIN ) )
+ 		    {
+ 		    sleep( 1 );
+@@ -2630,7 +2797,7 @@ send_via_write( int fd, off_t size )
+ 
+ 
+ static ssize_t
+-my_read( char* buf, size_t size )
++my_read(int conn_fd, char* buf, size_t size )
+     {
+ #ifdef USE_SSL
+     if ( do_ssl )
+@@ -2644,7 +2811,7 @@ my_read( char* buf, size_t size )
+ 
+ 
+ static ssize_t
+-my_write( char* buf, size_t size )
++my_write(int conn_fd,char* buf, size_t size )
+     {
+ #ifdef USE_SSL
+     if ( do_ssl )
+@@ -3553,3 +3720,9 @@ snprintf( char* str, size_t size, const 
+     return r;
+     }
+ #endif /* NO_SNPRINTF */
++
++static void sendHeaders(int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod,char *redirectURL)
++{
++  add_headers(s,title,extra_header,me, mt,b,mod,redirectURL );     
++  send_response(); 
++}	

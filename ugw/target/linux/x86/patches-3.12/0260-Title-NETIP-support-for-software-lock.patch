@@ -1,0 +1,230 @@
+From 773c93bc8adacca855215087bd154b6cd0ab6fa0 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Wed, 17 Feb 2016 20:26:41 -0700
+Subject: [PATCH 260/441] Title: NETIP support for software lock Issue: Jira:
+ CPM-232 IssueType: Feature Resolution: Use existing soft locks around hw
+ mutexes when NetIP is off Impact:
+
+Change-Id: I81cd603931856d7b8001df976b1d9777c97fb1d1
+---
+ arch/x86/NetIP_SubSystem/netip_subsystem_pm.c |  7 +++
+ arch/x86/hw_mutex/hw_mutex_lld.c              | 29 +++++++++---
+ include/linux/hw_mutex.h                      |  3 +-
+ kernel/hwmutex.c                              | 65 +++++++++++++++++++++++++++
+ 4 files changed, 98 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
+@@ -47,6 +47,7 @@ extern int cm_mode;
+ extern int RCE_Floor;
+ extern int RCE_Filter;
+ 
++void hw_mutex_handle_suspend_resume(bool suspending);
+ void netss_sysfs_clean_up(uint32_t available_services);
+ 
+ int __netss_set_service_level(uint32_t level);
+@@ -1076,6 +1077,9 @@ int netss_runtime_suspend(struct device
+          printk(KERN_ERR "Service id %d is not in disable state, current state is %d\n", i, level);
+       }
+    }
++   /**Indicate that NetIP is suspending. 
++    * Save the HW Mutex locks acquired by Atom locally, while NetIP is off */
++   hw_mutex_handle_suspend_resume(1); 
+    /** 1. Call the platform driver API */
+    puma_netip_notify_state(3);
+    /** 2. Turn off NetIP clock */
+@@ -1093,6 +1097,9 @@ int netss_runtime_resume(struct device *
+    uint32_t level;
+ 
+    mutex_lock(&g_netss_sysfs_attributes_info.lock);
++   /** Indicate that NetIP is resuming from suspend state
++    * Acquire the HW Mutexes that are being held by Atom*/
++   hw_mutex_handle_suspend_resume(0);
+    level = g_netss_sysfs_attributes_info.service_level;
+    netss_send_service_request_msg(level);
+    mutex_unlock(&g_netss_sysfs_attributes_info.lock);
+--- a/arch/x86/hw_mutex/hw_mutex_lld.c
++++ b/arch/x86/hw_mutex/hw_mutex_lld.c
+@@ -60,7 +60,12 @@ static inline struct hw_master*hw_mutex_
+  */
+ static inline void __hw_mutex_clear_interrupt_status(struct hw_master * pmaster)
+ {
+-	hw_mutex_set_reg(pmaster->reg_base + HW_MUTEX_INTR,HW_MUTEX_INTR_IC_BIT(pmaster->master)); 
++        if(atomic_read(&pmaster->dev_is_off)) {
++           /**It should never happen because when we are suspended we just use soft locks around HW Mutexes */
++           printk("ERROR: Clearing HW Mutex interrupt when netip is off\n");
++        } else {
++	   hw_mutex_set_reg(pmaster->reg_base + HW_MUTEX_INTR,HW_MUTEX_INTR_IC_BIT(pmaster->master)); 
++        }
+ }
+ 
+ /* __hw_mutex_is_waiting - check whether we're waiting for the HW mutex
+@@ -71,7 +76,9 @@ static inline void __hw_mutex_clear_inte
+ static inline uint8_t  __hw_mutex_is_waiting(struct hw_mutex *hmutex)
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+-
++        if(atomic_read(&pmaster->dev_is_off)) {
++           return (HW_MUTEX_REQUESTING == atomic_read(&hmutex->status));
++        }
+ 	return hw_mutex_read_and_test_bits(pmaster->reg_base + hw_mutex_waits[pmaster->master],BIT(hmutex->lock_name));
+ }
+ 
+@@ -83,6 +90,9 @@ static inline uint8_t  __hw_mutex_is_wai
+ static inline uint8_t __hw_mutex_is_locked(struct hw_mutex *hmutex)
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
++        if(atomic_read(&pmaster->dev_is_off)) {
++           return (HW_MUTEX_LOCKED == atomic_read(&hmutex->status));
++        }
+ 	return hw_mutex_read_and_test_bits(pmaster->reg_base + hw_mutex_owns[pmaster->master], BIT(hmutex->lock_name));
+ }
+ 
+@@ -98,6 +108,10 @@ static inline int __lock_hw_mutex(struct
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+ 	int retval = 0;
++        if(atomic_read(&pmaster->dev_is_off)) {
++           atomic_set(&hmutex->status,HW_MUTEX_LOCKED);
++           return 1;
++        }
+ 	if (!force) {
+ 		if (unlikely(__hw_mutex_is_waiting(hmutex))) return 0;
+ 		else if (unlikely(__hw_mutex_is_locked(hmutex))) return 1;
+@@ -120,7 +134,10 @@ static inline int __lock_hw_mutex(struct
+ static inline void __unlock_hw_mutex(struct hw_mutex *hmutex)
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+-
++        if(atomic_read(&pmaster->dev_is_off)) {
++           atomic_set(&hmutex->status,HW_MUTEX_UNLOCKED);
++           return;
++        }
+ 	if (unlikely(!__hw_mutex_is_locked(hmutex))) return ;
+ 	hw_mutex_set_reg(pmaster->reg_base + hw_mutex_locks[pmaster->master] + (hmutex->lock_name<<2),HW_MUTEX_MTX_UNLOCK_BIT);
+ 	atomic_set(&hmutex->status,HW_MUTEX_UNLOCKED);
+@@ -144,8 +161,7 @@ void lock_hw_mutex_as_different_master(s
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+ 	int retval = 0;
+-	
+-    /* Make sure we're doing a new request */
++        if(atomic_read(&pmaster->dev_is_off)) return;
+  	retval = hw_mutex_read_and_test_bits(pmaster->reg_base + hw_mutex_locks[MASTER_ARM11] + (hmutex->lock_name<<2),HW_MUTEX_MTX_UNLOCK_BIT);
+     printk("HW Mutex: Lock as diff master %d\n", retval);
+ }
+@@ -157,6 +173,7 @@ void unlock_hw_mutex_as_different_master
+ {
+ 	struct hw_master * pmaster = hw_mutex_to_master(hmutex);
+ 
++        if(atomic_read(&pmaster->dev_is_off)) return;
+ 	hw_mutex_set_reg(pmaster->reg_base + hw_mutex_locks[MASTER_ARM11] + (hmutex->lock_name<<2),HW_MUTEX_MTX_UNLOCK_BIT);
+ }
+ 
+@@ -361,6 +378,8 @@ void hw_mutex_register_with_netss(void)
+       pmaster->hw_mutexes[i].owner = NULL;
+       atomic_set(&pmaster->hw_mutexes[i].status,HW_MUTEX_UNLOCKED);
+    }
++   /**Set that HW mutex device is on */
++   atomic_set(&pmaster->dev_is_off, 0);
+ 
+    if (!use_sw_mutex_only) {
+        pmaster->reg_base = (void __iomem *)ioremap_nocache(hwmutex_mmio.base,hwmutex_mmio.size);
+--- a/include/linux/hw_mutex.h
++++ b/include/linux/hw_mutex.h
+@@ -121,8 +121,9 @@ struct hw_master {
+ 	void __iomem *reg_base;			/* Mapped io reg base address */
+ 	struct pci_dev *dev;	
+ 	struct hw_mutex hw_mutexes[HW_MUTEX_TOTAL];
+-	struct hw_mutex_operations *ops;	
++	struct hw_mutex_operations *ops;
+     bool use_sw_mutex_only;         /* Indicates the NetIP driver is unavailable */
++    atomic_t dev_is_off;             /* Indicates the HW Mutex is suspended or off, because of whether NetIP is off or on */
+ }__attribute__((aligned(4)));
+ 
+ /* Abstraction oprations of a HW mutex */
+--- a/kernel/hwmutex.c
++++ b/kernel/hwmutex.c
+@@ -53,6 +53,26 @@ struct hw_master *hw_master_glob = NULL;
+ #define to_hw_mutex(mutex) (&hw_master_glob->hw_mutexes[mutex])
+ #define to_use_sw_mutex_only() (hw_master_glob->use_sw_mutex_only)
+ 
++/**There are irq locks around HW Mutexes which can be used for synchronization 
++ * between ISR and other apis */
++#define HW_MUTEX_TAKE_ALL_IRQ_LOCKS() do { int i=0; \
++                                            for(i=0;i<HW_MUTEX_TOTAL;i++) \
++                                            { \
++                                               spin_lock(&hw_master_glob->hw_mutexes[i].irq_lock); \
++                                            } \
++                                       } while (0);
++
++#define HW_MUTEX_RELEASE_ALL_IRQ_LOCKS() do { int i=0; \
++                                            for(i=0;i<HW_MUTEX_TOTAL;i++) \
++                                            { \
++                                               spin_unlock(&hw_master_glob->hw_mutexes[i].irq_lock); \
++                                            } \
++                                       } while (0);
++
++
++
++
++
+ /* hw_mutex_is_locked - check whether the current master owns the mutex or not
+  * @mutex: the mutex number to be checked
+  *
+@@ -417,6 +437,7 @@ void hw_mutex_unlock(uint8_t mutex)
+     spin_unlock_irqrestore(&hmutex->irq_lock,flags);
+     hw_mutex_clear_owner(hmutex);
+     hmutex->lock_count = 0;
++    //printk("UNLOCK: device is off %d\n", hw_master_glob->dev_is_off);
+     mutex_unlock(&hmutex->data_mutex);
+     mutex_unlock(&hmutex->soft_lock);
+ }
+@@ -461,3 +482,47 @@ void hw_mutex_unregister(struct hw_maste
+    hw_master_glob = NULL;
+ }
+ EXPORT_SYMBOL(hw_mutex_unregister);
++
++void hw_mutex_handle_suspend_resume(bool suspending)
++{
++   int i=0;
++   struct hw_mutex_operations *hmutex_ops = to_hw_mutex_ops();
++
++   /**Take all irq locks around all HW mutexs to stop any other accesses */
++   HW_MUTEX_TAKE_ALL_IRQ_LOCKS();
++   
++   /**If resuming indicate that device is on now, to restore mutexes at HW level */
++   if(!suspending) atomic_set(&hw_master_glob->dev_is_off,0);
++
++   for(i=0; i< HW_MUTEX_TOTAL; i++)
++   {
++      struct hw_mutex  * hmutex = to_hw_mutex(i);
++      if(atomic_read(&hmutex->status) == HW_MUTEX_LOCKED)
++      {
++         if(suspending)
++         {
++            /**Release the mutex at HW level */
++            hmutex_ops->unlock(hmutex);
++            /**But maintain the locked status of the mutex in software 
++            * so that when resumed HW level mutex lock can be acquired */
++            atomic_set(&hmutex->status, HW_MUTEX_LOCKED);
++         }
++         else
++         {
++            /**Restore Mutex at HW level forcefully*/
++            if(0 == hmutex_ops->lock(hmutex, 1))
++            {
++               printk("Failed to acquire HW Mutex %d\n", i);
++            }
++         }
++      }
++   }
++   /**From now on, mutex lock is always successful, and status is maintained
++    * only at software level */
++   if(suspending) atomic_set(&hw_master_glob->dev_is_off, suspending);
++   
++   /**Release all irq locks around all HW mutexs */
++   HW_MUTEX_RELEASE_ALL_IRQ_LOCKS();
++   return;
++}
++EXPORT_SYMBOL(hw_mutex_handle_suspend_resume);

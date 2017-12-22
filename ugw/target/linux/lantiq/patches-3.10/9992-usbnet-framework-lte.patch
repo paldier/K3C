@@ -1,0 +1,463 @@
+# HG changeset patch
+# Parent 23f7ff7b90ca0f7020d8a601b609080ae5658c6e
+
+diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
+--- a/drivers/net/usb/Kconfig
++++ b/drivers/net/usb/Kconfig
+@@ -533,5 +533,11 @@ config USB_VL600
+ 
+ 	  http://ubuntuforums.org/showpost.php?p=10589647&postcount=17
+ 
++config USB_LTE_SIERRA_HL7548
++	tristate "Support Sierra Wireless HL7548 on GRX220-L2"
++#	depends on USB_NET_CDC_NCM && USB_ACM
++	default m
++	help
++		Support Sierra Wireless HL7548 on GRX220-L2
+ 
+ endmenu
+diff --git a/drivers/net/usb/Makefile b/drivers/net/usb/Makefile
+--- a/drivers/net/usb/Makefile
++++ b/drivers/net/usb/Makefile
+@@ -34,4 +34,4 @@ obj-$(CONFIG_USB_NET_CDC_NCM)	+= cdc_ncm
+ obj-$(CONFIG_USB_VL600)		+= lg-vl600.o
+ obj-$(CONFIG_USB_NET_QMI_WWAN)	+= qmi_wwan.o
+ obj-$(CONFIG_USB_NET_CDC_MBIM)	+= cdc_mbim.o
+-
++obj-$(CONFIG_USB_LTE_SIERRA_HL7548)	+= sierra_lte_reset.o 
+diff --git a/drivers/net/usb/cdc_ncm.c b/drivers/net/usb/cdc_ncm.c
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@ -516,7 +516,11 @@ advance:
+ 	 * unless they are configured first.  Toggle the altsetting to
+ 	 * force a reset
+ 	 */
+-	usb_set_interface(dev->udev, iface_no, data_altsetting);
++	/* Temporary workaround for Fibocom LTE module.
++	 * The Fibocom module can not activate the alternative setting
++	 * in the last interface if setting data interface first. 
++	 */
++	/*usb_set_interface(dev->udev, iface_no, data_altsetting);*/
+ 	temp = usb_set_interface(dev->udev, iface_no, 0);
+ 	if (temp)
+ 		goto error2;
+@@ -1096,8 +1100,7 @@ next_ndp:
+ #if defined(MEMCPY_FOR_ZERO_GAP)
+ 			
+ #define PPA_ALIGN			8
+-			if(x%2==1)
+-			{
++			// Do the skb_reserve 8 bit for PMAC/CMB buffer 
+ 				//printk(KERN_INFO "[SH] x=%d, alloc_skb and memcpy\n",x);
+ 				skb = alloc_skb (len + PPA_ALIGN, GFP_ATOMIC);
+ 				if(!skb)
+@@ -1107,11 +1110,10 @@ next_ndp:
+ 				memcpy(skb->data, skb_in->data + offset, len);
+ 				if (destMacSet && skb->data) {
+ 					memcpy(skb->data, destMac, 6);
+-				}		
++				}
++				skb_set_tail_pointer(skb, len);
+ 				
+-			}
+-			else{
+-#endif		//MEMCPY_FOR_ZERO_GAP		
++#else	
+ 				skb = skb_clone(skb_in, GFP_ATOMIC);
+ 				if (!skb)
+ 					goto error;
+@@ -1122,9 +1124,7 @@ next_ndp:
+ 				}
+ 				skb_set_tail_pointer(skb, len);
+ //				printk(KERN_EMERG " %08x/%08x/%04x",(uint32_t)(skb->data),(uint32_t)(skb->data)+(uint32_t)(skb->len),skb->len);
+-#if defined(MEMCPY_FOR_ZERO_GAP)
+-    	}
+-#endif    //MEMCPY_FOR_ZERO_GAP
++#endif
+ 
+ #if defined(USLEEP_DELAY)
+ 			//printk(KERN_INFO "usleep 1\n");
+diff --git a/drivers/net/usb/sierra_lte_reset.c b/drivers/net/usb/sierra_lte_reset.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/usb/sierra_lte_reset.c
+@@ -0,0 +1,154 @@
++/******************************************************************************
++**
++** FILE NAME    : sw_reset.c
++** PROJECT      : UGW-6.x
++** MODULES      : GPIO for sw reset
++**
++** DATE         : 16 May 2014
++** AUTHOR       :
++** DESCRIPTION  : SW Reset Push Button Driver
++** COPYRIGHT    : Copyright (c) 2014
++**                Lantiq Communications
++**
++**    This program is free software; you can redistribute it and/or modify
++**    it under the terms of the GNU General Public License as published by
++**    the Free Software Foundation; either version 2 of the License, or
++**    (at your option) any later version.
++**
++** HISTORY
++** $Date        $Author         $Comment
++** 16 May 2014
++*******************************************************************************/
++
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/signal.h>
++#include <linux/sched.h>
++#include <linux/timer.h>
++#include <linux/interrupt.h>
++#include <linux/major.h>
++#include <linux/string.h>
++#include <linux/fs.h>
++#include <linux/proc_fs.h>
++#include <linux/fcntl.h>
++#include <linux/ptrace.h>
++#include <linux/mm.h>
++#include <linux/ioport.h>
++#include <linux/init.h>
++#include <linux/delay.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/version.h>
++#include <linux/poll.h>
++#include <linux/proc_fs.h>
++#include <linux/version.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <lantiq_soc.h>
++#include <lantiq_ssc.h>
++#include <lantiq_irq.h>
++#include <linux/gpio.h>
++#include <linux/of.h>
++#include <linux/of_irq.h>
++#include <linux/of_gpio.h>
++#include <linux/platform_device.h>
++
++#define DEBUG  printk
++
++struct timer_list pwr_on_timer;
++unsigned int pwr_on_sierra_lte=0;
++int lte_pwr_on_ngpio=-1;
++
++static void pwr_on_timer_func(unsigned long arg)
++{
++	if(pwr_on_sierra_lte== 0) //init
++	{
++		printk(KERN_DEBUG "******************** %s: pull GPIO %d (output 1)low for 2 seconds. ********************\n", __func__, lte_pwr_on_ngpio);
++		gpio_direction_output( lte_pwr_on_ngpio, 1); //pull low for 2000ms, output 1 to pull low POWER_ON pin
++		pwr_on_sierra_lte = 1;
++		mod_timer(&pwr_on_timer, jiffies+ HZ*2); 
++	} else {
++		printk(KERN_DEBUG "******************* %s: power on done, pull high (output 0) GPIO %d again and del itself   ********************\n", __func__, lte_pwr_on_ngpio);
++		gpio_direction_output( lte_pwr_on_ngpio, 0); //pull high back, output 0 to pull high
++		del_timer(&pwr_on_timer);
++	}
++}
++
++
++int ltq_swreset_init(void)
++{
++
++	int ret=0;
++
++	if(pwr_on_sierra_lte==0){
++		printk("[SHLEE] bring up sierra lte module in 10 seconds after when USB core ready........\n");
++		ret = gpio_request(lte_pwr_on_ngpio, "LTE_PWR_ON");
++		if(ret<0)
++			printk("%s: Failed to request GPIO %d as LTE_PWR_ON PIN and return with %d\n", __func__,lte_pwr_on_ngpio, ret);
++		else {
++//		gpio_direction_output(lte_pwr_on_ngpio, 1);
++		#if 1
++			init_timer(&pwr_on_timer);
++			pwr_on_timer.function = pwr_on_timer_func;
++			pwr_on_timer.data = 1;
++			pwr_on_timer.expires = jiffies + 10* HZ;
++			add_timer(&pwr_on_timer);
++		#endif
++		}	
++	}
++  return 0;
++
++}
++
++void ltq_swreset_cleanup_module(void)
++{
++
++}
++
++static int ltq_sierra_lte_reset_driver_probe(struct platform_device *pdev)
++{
++	
++	struct device_node *node = pdev->dev.of_node;
++	DEBUG ("ltq_sierra_lte_reset_driver_probe !!\n");
++
++	lte_pwr_on_ngpio = of_get_named_gpio(node,"lte_pwr_on",0);
++	if(!gpio_is_valid(lte_pwr_on_ngpio)){
++		printk ("Could not read 'lte_pwr_on' from device tree!\n");
++		return -ENODEV;
++	}
++
++	DEBUG ("ltq_sierra_lte_reset_driver: lte_pwr_on_ngpio = %u\n", lte_pwr_on_ngpio);
++
++	ltq_swreset_init ();
++
++	return 0;
++}
++
++static int ltq_sierra_lte_reset_driver_remove(struct platform_device *pdev)
++{
++	DEBUG ("ltq_swreset_driver_remove!\n");
++	ltq_swreset_cleanup_module ();
++	return 0;
++}
++
++static const struct of_device_id ltq_sierra_lte_match[] = {
++	{ .compatible = "lantiq,sierra_lte" },
++	{},
++};
++
++static struct platform_driver ltq_sierra_lte_reset_driver = {
++	.probe = ltq_sierra_lte_reset_driver_probe,
++	.remove = ltq_sierra_lte_reset_driver_remove,
++	.driver = {
++		.name = "lantiq,sierra_lte",
++		.owner = THIS_MODULE,
++		.of_match_table = ltq_sierra_lte_match,
++	},
++};
++
++module_platform_driver(ltq_sierra_lte_reset_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("LTQ Sierra HL7548 LTE Reset driver");
+diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -549,8 +549,10 @@ void usbnet_skb_return (struct usbnet *d
+ 					return;
+ 				}
+ 				dev_dbg(&dev->udev->dev, "ppa_hook_directpath_send_fn status %d", fpstatus);
+-				skb_pull(skb,ETH_HLEN);
++				// should not touch the unavailable skb anymore since ppa_hook_directpath_send_fn will call netif_rx after failed acceleration
++				//skb_pull(skb,ETH_HLEN);
+ 				if(usbnet_addr_monitor) printk(KERN_INFO "     Go PPA NOK %d  Try kernel\n",fpstatus);
++				return; //directly return
+ 			}
+ 		}
+ 	#endif
+@@ -558,7 +560,9 @@ void usbnet_skb_return (struct usbnet *d
+ 	if (status != NET_RX_SUCCESS)
+ 		netif_dbg(dev, rx_err, dev->net,
+ 			  "netif_rx status %d\n", status);
++	#ifdef USBNET_PPA_DP
+ 	if(usbnet_addr_monitor) printk(KERN_INFO "     Go KERNEL status:%d \n",status);
++	#endif
+ }
+ EXPORT_SYMBOL_GPL(usbnet_skb_return);
+ 
+@@ -661,13 +665,32 @@ static int rx_submit (struct usbnet *dev
+ 	unsigned long		lockflags;
+ 	size_t			size = dev->rx_urb_size;
+ 
++	/* 
++	 * Calculate how many extra headroom is needed then allocate the skb with the proper length
++	 */
++#if !defined(USBNET_NOOFFSET) || defined(USBNET_EXTRAOFFSET)
++	size_t headroom = 0;
++#if defined(USBNET_PPA_DP) && defined(USBNET_NOOFFSET)
++	headroom += ((dev->usbnet_ppadp_on) ? 0 : NET_IP_ALIGN);
++#else
++	headroom += NET_IP_ALIGN;
++#endif
++#if defined(USBNET_EXTRAOFFSET)
++	headroom += USBNET_EXTRAOFFSET;
++#endif
++	size += headroom;
++#endif
++
+ 	/* prevent rx skb allocation when error ratio is high */
+ 	if (test_bit(EVENT_RX_KILL, &dev->flags)) {
+ 		usb_free_urb(urb);
+ 		return -ENOLINK;
+ 	}
+-	if(size>2048)	skb = netdev_alloc_skb (dev->net,size);
+-	else			skb = netdev_alloc_skb (dev->net,2048);
++	if(size > 2048) {
++		skb = __netdev_alloc_skb(dev->net, size, flags);
++	} else {
++		skb = __netdev_alloc_skb(dev->net, 2048, flags);
++	}
+ 	if (!skb) {
+ 		netif_dbg(dev, rx_err, dev->net, "no rx skb\n");
+ 		usbnet_defer_kevent (dev, EVENT_RX_MEMORY);
+@@ -676,16 +699,7 @@ static int rx_submit (struct usbnet *dev
+ 	}
+ 
+ #if !defined(USBNET_NOOFFSET) || defined(USBNET_EXTRAOFFSET)
+-	skb_reserve (skb, 0
+-	#if defined(USBNET_PPA_DP) && defined(USBNET_NOOFFSET)
+-		+ ( ( dev->usbnet_ppadp_on)?0:NET_IP_ALIGN )
+-	#else
+-		+ NET_IP_ALIGN
+-	#endif
+-	#if defined(USBNET_EXTRAOFFSET)
+-		+ USBNET_EXTRAOFFSET
+-	#endif
+-		);
++	skb_reserve (skb, headroom);
+ #endif
+ 
+ 	entry = (struct skb_data *) skb->cb;
+@@ -789,8 +803,9 @@ static void rx_complete (struct urb *urb
+ 	skb_put (skb, urb->actual_length);
+ 	state = rx_done;
+ 	entry->urb = NULL;
+-
++#ifdef USBNET_PPA_DP
+ 	register_ppadp(dev->net);
++#endif	
+ 	switch (urb_status) {
+ 	/* success */
+ 	case 0:
+@@ -1056,6 +1071,7 @@ EXPORT_SYMBOL_GPL(usbnet_unlink_rx_urbs)
+ 				if(ppa_hook_directpath_register_dev_fn)
+ 					ppa_hook_directpath_register_dev_fn(&if_id,netdev, &usbnet_ppafp_cb, 0);
+ 			}
++			udev->usbnet_ppadp_on=0;
+ 			udev->usbnet_ppadp_ifid=-1;
+ 			usbnet_ppadp_occupied=0;
+ 			bridge_mode_running=0;
+@@ -1166,6 +1182,8 @@ int usbnet_stop (struct net_device *net)
+ 		if( dev->usbnet_ppadp_ifid >= 0)
+ 		{
+ 			uint32_t if_id;
++			if_id = dev->usbnet_ppadp_ifid;
++			printk("<%s> Unregister if_id: %d\n",__FUNCTION__, if_id);
+ 			if( ppa_hook_directpath_rx_stop_fn)
+ 				ppa_hook_directpath_rx_stop_fn(dev->usbnet_ppadp_ifid,0);
+ 			if(ppa_hook_directpath_register_dev_fn)
+@@ -1755,43 +1773,49 @@ netdev_tx_t usbnet_start_xmit (struct sk
+ 	unsigned long		flags;
+ 	int retval;
+ 
+-	#ifdef USBNET_PPA_DP
+-if(usbnet_addr_monitor)
+-{
+-	unsigned char *base;
+-	base=skb->data;
+-	printk(KERN_INFO "usbnet_start_xmit() INPUT SRC[%03d.%03d.%03d.%03d/%02X:%02X:%02X:%02X:%02X:%02X] DST[%03d.%03d.%03d.%03d/%02X:%02X:%02X:%02X:%02X:%02X]\n"
++#ifdef USBNET_PPA_DP
++    if(usbnet_addr_monitor)
++	{
++  		if(skb != NULL){ //NCM/MBIM tx_timer_cb will send with NULL skb for starting the transmission of remain SKBs
++			unsigned char *base;
++			base=skb->data;
++			printk(KERN_INFO "usbnet_start_xmit() INPUT SRC[%03d.%03d.%03d.%03d/%02X:%02X:%02X:%02X:%02X:%02X] DST[%03d.%03d.%03d.%03d/%02X:%02X:%02X:%02X:%02X:%02X]\n"
+ 			,*(base+26 + 0),*(base+26 + 1),*(base+26 + 2),*(base+26 + 3)
+ 			,*(base+6 + 0),*(base+6 + 1),*(base+6 + 2),*(base+6 + 3),*(base+6 + 4),*(base+6 + 5)
+ 			,*(base+30 + 0),*(base+30 + 1),*(base+30 + 2),*(base+30 + 3)
+ 			,*(base+0 + 0),*(base+0 + 1),*(base+0 + 2),*(base+0 + 3),*(base+0 + 4),*(base+0 + 5)
+-	);
+-}
+-	#endif
++			);
++  		}
++	}
++#endif
+ 
+-//For UL IOP issue (Anritsu and some Live network
++//For UL IOP issue (Anritsu and some Live network)
+ #if 1
+-	if(	skb->data[ETH_HLEN]==0x45
+-//		&& skb->data[ETH_HLEN+9]==0x06
++	if(	skb != NULL && skb->data[ETH_HLEN] == 0x45 && skb->len < 60
++	//	&& skb->data[ETH_HLEN+9]==0x06
+ 	) //check if ipv4 and tcp packets
+ 	{
+-		length = skb->data[ETH_HLEN+3];
++		length = skb->data[ETH_HLEN+3];	
+ 		if(length + ETH_HLEN < skb->len)  //check length
+ 			skb_trim(skb, length + ETH_HLEN);
+-	}
++}
+ #endif
+ 
+ 	// some devices want funky USB-level framing, for
+ 	// win32 driver (usually) and/or hardware quirks
+ 	if (info->tx_fixup) {
++
+ 		skb = info->tx_fixup (dev, skb, GFP_ATOMIC);
++
+ 		if (!skb) {
+ 			/* packet collected; minidriver waiting for more */
+ 			if (info->flags & FLAG_MULTI_PACKET)
+ 				goto not_drop;
++
+ 			netif_dbg(dev, tx_err, dev->net, "can't tx_fixup skb\n");
+ 			goto drop;
+ 		}
++
+ 	}
+ 	length = skb->len;
+ 
+@@ -1810,7 +1834,7 @@ if(usbnet_addr_monitor)
+ 		unsigned char *nbuf;
+ 		nbuf=kmalloc(skb->len,GFP_KERNEL);
+ 		memcpy(nbuf,skb->data,skb->len);
+-		dma_cache_wback_inv(nbuf,skb->len);
++		dma_cache_wback_inv((unsigned long) nbuf,skb->len);
+ 		usb_fill_bulk_urb (urb, dev->udev, dev->out,
+ 				nbuf, skb->len, tx_complete_urb, skb);
+ 	}
+@@ -1839,7 +1863,6 @@ if(usbnet_addr_monitor)
+ 	}
+ 
+ 	spin_lock_irqsave(&dev->txq.lock, flags);
+-
+ 	retval = usb_autopm_get_interface_async(dev->intf);
+ 	if (retval < 0) {
+ 		spin_unlock_irqrestore(&dev->txq.lock, flags);
+@@ -1900,7 +1923,9 @@ drop:
+ not_drop:
+ 		if (skb)
+ 			dev_kfree_skb_any (skb);
+-		usb_free_urb (urb);
++		if (urb != NULL)
++			usb_free_urb (urb);
++		return NETDEV_TX_OK;
+ 	} else
+ 		netif_dbg(dev, tx_queued, dev->net,
+ 			  "> tx, len %d, type 0x%x\n", length, skb->protocol);
+@@ -2183,6 +2208,11 @@ usbnet_probe (struct usb_interface *udev
+ 		/* WWAN devices should always be named "wwan%d" */
+ 		if ((dev->driver_info->flags & FLAG_WWAN) != 0)
+ 			strcpy(net->name, "wwan%d");
++#if 1
++         /* RNDIS devices should always be named "lte%d" in LTQ platform */
++		if ((dev->driver_info->flags & FLAG_FRAMING_RN) != 0)
++			strcpy(net->name, "lte%d");
++#endif
+ 
+ 		/* devices that cannot do ARP */
+ 		if ((dev->driver_info->flags & FLAG_NOARP) != 0)
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -625,8 +625,10 @@ static void acm_port_shutdown(struct tty
+ 		usb_kill_urb(acm->ctrlurb);
+ 		for (i = 0; i < ACM_NW; i++)
+ 			usb_kill_urb(acm->wb[i].urb);
+-		for (i = 0; i < acm->rx_buflimit; i++)
++		for (i = 0; i < acm->rx_buflimit; i++) {
+ 			usb_kill_urb(acm->read_urbs[i]);
++			msleep(1);
++		}
+ 		acm->control->needs_remote_wakeup = 0;
+ 		if (!pm_err)
+ 			usb_autopm_put_interface(acm->control);

@@ -1,0 +1,213 @@
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index 7e72aa0..b9e278d 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -365,7 +365,7 @@ int hostapd_sta_add(struct hostapd_data *hapd,
+ 		    const struct ieee80211_vht_capabilities *vht_capab,
+ 		    u32 flags, u8 qosinfo, u8 vht_opmode, int supp_p2p_ps,
+ 		    int set, struct ieee80211_mgmt *last_assoc_req, 
+-		    size_t last_assoc_req_len)
++		    size_t last_assoc_req_len, int ssi_signal)
+ {
+ 	struct hostapd_sta_add_params params;
+ 
+@@ -391,6 +391,7 @@ int hostapd_sta_add(struct hostapd_data *hapd,
+ 	params.set = set;
+ 	params.last_assoc_req = last_assoc_req;
+ 	params.last_assoc_req_len = last_assoc_req_len;
++	params.ssi_signal = ssi_signal;
+ 	return hapd->driver->sta_add(hapd->drv_priv, &params);
+ }
+ 
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 3cea827..6562911 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -44,7 +44,7 @@ int hostapd_sta_add(struct hostapd_data *hapd,
+ 		    const struct ieee80211_vht_capabilities *vht_capab,
+ 		    u32 flags, u8 qosinfo, u8 vht_opmode, int supp_p2p_ps,
+ 		    int set, struct ieee80211_mgmt *last_assoc_req,
+-		    size_t last_assoc_req_len);
++		    size_t last_assoc_req_len, int ssi_signal);
+ int hostapd_set_privacy(struct hostapd_data *hapd, int enabled);
+ int hostapd_set_generic_elem(struct hostapd_data *hapd, const u8 *elem,
+ 			     size_t elem_len);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index ac9f8d4..2a6418c 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -980,7 +980,8 @@ int auth_sae_init_committed(struct hostapd_data *hapd, struct sta_info *sta)
+ 
+ 
+ static void handle_auth(struct hostapd_data *hapd,
+-			const struct ieee80211_mgmt *mgmt, size_t len)
++			const struct ieee80211_mgmt *mgmt, size_t len,
++      int ssi_signal)
+ {
+ 	u16 auth_alg, auth_transaction, status_code;
+ 	u16 resp = WLAN_STATUS_SUCCESS;
+@@ -1239,6 +1240,7 @@ static void handle_auth(struct hostapd_data *hapd,
+ 	identity = NULL;
+ 	sta->radius_cui = radius_cui;
+ 	radius_cui = NULL;
++	sta->ssi_signal = ssi_signal;
+ 
+ 	sta->flags &= ~WLAN_STA_PREAUTH;
+ 	ieee802_1x_notify_pre_auth(sta->eapol_sm, 0);
+@@ -1278,7 +1280,7 @@ static void handle_auth(struct hostapd_data *hapd,
+ 				WLAN_STA_AUTHORIZED);
+ 
+ 		if (hostapd_sta_add(hapd, sta->addr, 0, 0, NULL, 0, 0,
+-				    NULL, NULL, sta->flags, 0, 0, 0, 0, NULL, 0)) {
++				    NULL, NULL, sta->flags, 0, 0, 0, 0, NULL, 0, 0)) {
+ 			hostapd_logger(hapd, sta->addr,
+ 				       HOSTAPD_MODULE_IEEE80211,
+ 				       HOSTAPD_LEVEL_NOTICE,
+@@ -1908,7 +1910,7 @@ static int add_associated_sta(struct hostapd_data *hapd,
+ 			    sta->flags | WLAN_STA_ASSOC, sta->qosinfo,
+ 			    sta->vht_opmode, sta->p2p_ie ? 1 : 0,
+ 			    sta->added_unassoc, sta->last_assoc_req, 
+-			    sta->last_assoc_req_len)) {
++			    sta->last_assoc_req_len, sta->ssi_signal)) {
+ 		hostapd_logger(hapd, sta->addr,
+ 			       HOSTAPD_MODULE_IEEE80211, HOSTAPD_LEVEL_NOTICE,
+ 			       "Could not %s STA to kernel driver",
+@@ -2078,7 +2080,7 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ static void handle_assoc(struct hostapd_data *hapd,
+ 			 const struct ieee80211_mgmt *mgmt, size_t len,
+-			 int reassoc)
++			 int reassoc, int ssi_signal)
+ {
+ 	u16 capab_info, listen_interval, seq_ctrl, fc;
+ 	u16 resp = WLAN_STATUS_SUCCESS, reply_res;
+@@ -2224,6 +2226,7 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	}
+ 
+ 	sta->listen_interval = listen_interval;
++	sta->ssi_signal = ssi_signal;
+ 
+ 	if (hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G)
+ 		sta->flags |= WLAN_STA_NONERP;
+@@ -2712,20 +2715,21 @@ int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len,
+ 	if (hapd->iconf->track_sta_max_num)
+ 		sta_track_add(hapd->iface, mgmt->sa);
+ 
++ 	wpa_printf(MSG_INFO, "ssi_signal:%d", fi->ssi_signal);
+ 	switch (stype) {
+ 	case WLAN_FC_STYPE_AUTH:
+ 		wpa_printf(MSG_DEBUG, "mgmt::auth");
+-		handle_auth(hapd, mgmt, len);
++		handle_auth(hapd, mgmt, len, fi->ssi_signal);
+ 		ret = 1;
+ 		break;
+ 	case WLAN_FC_STYPE_ASSOC_REQ:
+ 		wpa_printf(MSG_DEBUG, "mgmt::assoc_req");
+-		handle_assoc(hapd, mgmt, len, 0);
++		handle_assoc(hapd, mgmt, len, 0, fi->ssi_signal);
+ 		ret = 1;
+ 		break;
+ 	case WLAN_FC_STYPE_REASSOC_REQ:
+ 		wpa_printf(MSG_DEBUG, "mgmt::reassoc_req");
+-		handle_assoc(hapd, mgmt, len, 1);
++		handle_assoc(hapd, mgmt, len, 1, fi->ssi_signal);
+ 		ret = 1;
+ 		break;
+ 	case WLAN_FC_STYPE_DISASSOC:
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 736d45b..3d9f13d 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -201,6 +201,7 @@ struct sta_info {
+ #endif /* CONFIG_SAE */
+ 
+ 	u32 session_timeout; /* valid only if session_timeout_set == 1 */
++	u32 ssi_signal; /* dBm */
+ 
+ 	/* Last Authentication/(Re)Association Request/Action frame sequence
+ 	 * control */
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index 310dbc4..a91b810 100644
+diff --git a/src/common/ltq-vendor.h b/src/common/ltq-vendor.h
+index 7a4015f..2c01c52 100644
+--- a/src/common/ltq-vendor.h
++++ b/src/common/ltq-vendor.h
+@@ -35,7 +35,7 @@ enum ltq_nl80211_vendor_subcmds {
+ 	LTQ_NL80211_VENDOR_SUBCMD_FREE_AID = 2,
+ 	LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL = 3,
+ 	LTQ_NL80211_VENDOR_SUBCMD_COUNTRY_CODE = 4,
+-  LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE = 5,
++	LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE = 5,
+ 	LTQ_NL80211_VENDOR_SUBCMD_DFS_DEBUG = 6,
+ };
+ 
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index e2f4e4a..bac43c1 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1463,6 +1463,7 @@ struct hostapd_sta_add_params {
+ 	int support_p2p_ps;
+ 	struct ieee80211_mgmt *last_assoc_req;
+ 	size_t last_assoc_req_len;
++	int ssi_signal;
+ };
+ 
+ struct mac_address {
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 30f6a78..d3a98c0 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3882,6 +3882,10 @@ static int wpa_driver_nl80211_sta_add(void *priv,
+ 			goto fail;
+ 	}
+ 	if (!params->set) {
++		/* RSSI */
++		wpa_printf(MSG_DEBUG, "  * ssi_signal=%d", params->ssi_signal);
++		nla_put_u32(msg, NL80211_ATTR_STA_RSSI, (u32)params->ssi_signal);
++
+ 		if (params->aid) {
+ 			wpa_printf(MSG_DEBUG, "  * aid=%u", params->aid);
+ 			if (nla_put_u16(msg, NL80211_ATTR_STA_AID, params->aid))
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 43ec870..581d1de 100644
+diff --git a/src/drivers/nl80211_copy.h b/src/drivers/nl80211_copy.h
+index 2206941..b7db28d 100644
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -1705,6 +1705,8 @@ enum nl80211_commands {
+  *	data is in the format defined for the payload of the QoS Map Set element
+  *	in IEEE Std 802.11-2012, 8.4.2.97.
+  *
++ * @NL80211_ATTR_STA_RSSI: Received signal strength indication (u32)
++ *
+  * @NL80211_ATTR_MAC_HINT: MAC address recommendation as initial BSS
+  * @NL80211_ATTR_WIPHY_FREQ_HINT: frequency of the recommended initial BSS
+  *
+@@ -2196,6 +2198,8 @@ enum nl80211_attrs {
+ 
+ 	NL80211_ATTR_QOS_MAP,
+ 
++	NL80211_ATTR_STA_RSSI,
++
+ 	NL80211_ATTR_MAC_HINT,
+ 	NL80211_ATTR_WIPHY_FREQ_HINT,
+ 
+@@ -2510,6 +2514,7 @@ enum nl80211_sta_bss_param {
+ 	NL80211_STA_BSS_PARAM_SHORT_SLOT_TIME,
+ 	NL80211_STA_BSS_PARAM_DTIM_PERIOD,
+ 	NL80211_STA_BSS_PARAM_BEACON_INTERVAL,
++	NL80211_STA_BSS_PARAM_RSSI,
+ 
+ 	/* keep last */
+ 	__NL80211_STA_BSS_PARAM_AFTER_LAST,
+@@ -2609,6 +2614,7 @@ enum nl80211_sta_info {
+ 	NL80211_STA_INFO_TX_BYTES64,
+ 	NL80211_STA_INFO_CHAIN_SIGNAL,
+ 	NL80211_STA_INFO_CHAIN_SIGNAL_AVG,
++	NL80211_STA_INFO_MAX_RSSI,
+ 	NL80211_STA_INFO_EXPECTED_THROUGHPUT,
+ 	NL80211_STA_INFO_RX_DROP_MISC,
+ 	NL80211_STA_INFO_BEACON_RX,
+-- 
+1.8.3.4
+

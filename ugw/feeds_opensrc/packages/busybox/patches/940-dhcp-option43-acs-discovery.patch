@@ -1,0 +1,169 @@
+Index: busybox-1.17.1/networking/udhcp/common.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/common.c	2012-05-30 13:15:01.845009000 +0530
++++ busybox-1.17.1/networking/udhcp/common.c	2012-05-30 13:17:45.153125000 +0530
+@@ -771,9 +771,9 @@
+ *******************************************************************/
+ int writenullmsg(uint32_t iIpaddr){
+ 	int iRetrn = 0;
+-
+-	iRetrn = writemsg( TR69_FIFO, NULL, 2,iIpaddr);
+-
++#if CONFIG_PACKAGE_LTQ_DEVM
++	iRetrn = writemsg( TR69_FIFO, NULL, 2,iIpaddr, IFX_IPC_APP_ID_DHCPD);
++#endif
+ 	return iRetrn;
+ }
+ 
+@@ -885,7 +885,7 @@
+ The data of the message sent is only needed in ADD
+ For a delete or write only the ipaddr matters
+ ********************************************************************************************/
+-int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr){
++int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr, uint8_t inFrom){
+ 	int iFd, iRet;
+ 	x_IFX_IPC_Msg xMsg = {0};
+ 	char string[380] = {'\0'};
+@@ -898,14 +898,21 @@
+ 		return -1; //error
+ 
+ 
+-	xMsg.xHdr.ucFrom = IFX_IPC_APP_ID_DHCP;
++	xMsg.xHdr.ucFrom = inFrom;
+ 	xMsg.xHdr.ucTo = operation;
+ 	xMsg.xHdr.uiReserved = htonl(ipaddr);
+ 
+ 	// data is meaningful only in add
+ 	if(operation == 1){
+ 		log1( " WRITEMSG : FORM STRING TO BE POSTED \n");
+-		string_len =  form_vsi_string(msg+4, string);
++
++		if(inFrom == IFX_IPC_APP_ID_DHCPD){
++			string_len =  form_vsi_string(msg+4, string);
++		}
++		else{
++			string_len = strlen(msg);
++			memcpy(string, (void *)msg, string_len);
++		}
+ 		if(string_len < 0){
+ 			log1( "Failure in forminmg string data");
+ 			return -1;
+Index: busybox-1.17.1/networking/udhcp/common.h
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/common.h	2012-05-30 13:15:01.685080000 +0530
++++ busybox-1.17.1/networking/udhcp/common.h	2012-05-30 13:15:01.923009000 +0530
+@@ -137,6 +137,8 @@
+ //#define DHCP_NIS_DOMAIN       0x28
+ //#define DHCP_NIS_SERVER       0x29
+ //#define DHCP_NTP_SERVER       0x2a
++//#define DHCP_OPTION_43        0x2b
++#define DHCP_VEND_ID   			0x2b
+ //#define DHCP_WINS_SERVER      0x2c
+ #define DHCP_REQUESTED_IP       0x32 /* sent by client if specific IP is wanted */
+ #define DHCP_LEASE_TIME         0x33
+@@ -197,7 +199,8 @@
+ #if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
+ /* added for TR-111 */
+ #define VSI_ENTERPRISE_NO_DSL	3561
+-#define IFX_IPC_APP_ID_DHCP		211
++#define IFX_IPC_APP_ID_DHCPD		211
++#define IFX_IPC_APP_ID_DHCPC		212
+ 
+ #define OPT_VSI_ENTPNO_LEN 4
+ #define SUBOPT_CODE		0
+@@ -265,7 +268,7 @@
+ uint8_t *get_vsi_option(uint8_t *pVSO, uint32_t iEnterpriseNo, uint8_t option_len);
+ int writenullmsg(uint32_t ipaddr);
+ int form_vsi_string(uint8_t *pVSD,char *string);
+-int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr);
++int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr, uint8_t inFrom);
+ void ifx_init_tr111_vars(void);
+ #endif
+ 
+Index: busybox-1.17.1/networking/udhcp/dhcpc.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpc.c	2012-05-30 13:15:01.691080000 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpc.c	2012-05-30 13:16:00.136419000 +0530
+@@ -867,8 +867,8 @@
+ 	int timeout; /* must be signed */
+ 	unsigned already_waited_sec;
+ 	unsigned opt;
+-	int max_fd;
+-	int retval;
++	int max_fd, iRet;
++	int retval, len_venid;
+ 	struct timeval tv;
+ 	struct dhcp_packet packet;
+ 	fd_set rfds;
+@@ -1304,6 +1304,25 @@
+ 		case RENEW_REQUESTED:
+ 		case REBINDING:
+ 			if (*message == DHCPACK) {
++#if CONFIG_PACKAGE_LTQ_DEVM
++				temp = udhcp_get_option(&packet, DHCP_VEND_ID);
++				if(!temp){
++					bb_error_msg("no acs url in message");
++				}
++				else {
++					len_venid = (int)*(temp-1);
++					if ( (3 < len_venid) && (len_venid < 256)){
++						iRet = writemsg(TR69_FIFO, temp, 1, packet.yiaddr, IFX_IPC_APP_ID_DHCPC);
++
++						if(iRet <= 0){
++							bb_error_msg("couldn't write any data to TR69 fifo ");
++						}
++					}
++					else{
++						bb_error_msg("acs url length is more than expected");
++					}
++				}
++#endif
+ 				temp = udhcp_get_option(&packet, DHCP_LEASE_TIME);
+ 				if (!temp) {
+ 					bb_error_msg("no lease time with ACK, using 1 hour lease");
+Index: busybox-1.17.1/networking/udhcp/dhcpd.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpd.c	2012-05-30 13:15:01.885001000 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpd.c	2012-05-30 13:17:13.262652000 +0530
+@@ -901,10 +901,11 @@
+ 
+                             log1(
+                                   "VIVEK : DHCPD : DHCPREQUEST RECVD : GETTING IANA SPECIFIC VSI DATA and writing msg to TR69  \n");
++#if CONFIG_PACKAGE_LTQ_DEVM
+                             // now post this buffer to TR69 stack
+                             iRet =
+                                 writemsg(TR69_FIFO, pVsiMessage, 1,
+-                                         lease->lease_nip);
++                                         lease->lease_nip, IFX_IPC_APP_ID_DHCPD);
+                             if(iRet <= 0) {
+                                 log1(
+                                       "couldn't write any data to TR69 fifo");
+@@ -915,6 +916,7 @@
+                         }
+ #endif
+ #endif
++#endif
+ 				break;
+ 			}
+ 			if (server_id_opt    /* client is in SELECTING state */
+@@ -1001,10 +1003,11 @@
+                                                pVSI[-1]);
+                             log1(
+                                   "VIVEK : DHCPD : INFORM RECVD : GETTING IANA SPECIFIC VSI DATA and writing msg to TR69  \n");
++#if CONFIG_PACKAGE_LTQ_DEVM
+ 
+                             iRet =
+                                 writemsg(TR69_FIFO, pVsiMessage, 1,
+-                                         packet.yiaddr);
++                                         packet.yiaddr, IFX_IPC_APP_ID_DHCPD);
+                             if(iRet <= 0) {
+                                 log1(
+                                       "couldn't write any data to TR69 fifo");
+@@ -1015,6 +1018,7 @@
+                         }
+ #endif
+ #endif
++#endif
+ 			break;
+ 		}
+ 	}

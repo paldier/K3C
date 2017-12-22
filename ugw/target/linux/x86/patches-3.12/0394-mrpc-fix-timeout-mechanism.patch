@@ -1,0 +1,489 @@
+From 93708348596781533ce7a3bf5245593eb8d38526 Mon Sep 17 00:00:00 2001
+From: "Eliyahu, Tomer B" <tomer.b.eliyahu@intel.com>
+Date: Wed, 13 Apr 2016 18:26:47 +0300
+Subject: [PATCH 394/441] mrpc: fix timeout mechanism
+
+fix mrpc bug when client timeouts and response arrives asynchronicly.
+
+Change-Id: I0134b6f10a0abd1d5b8c1f195e20d77ab23ee96d
+Signed-off-by: Eliyahu, Tomer B <tomer.b.eliyahu@intel.com>
+---
+ drivers/mrpc/core/mrpc.c               | 118 ++++++++++++++++++++++++---------
+ drivers/mrpc/examples/client_example.c |   2 +-
+ drivers/mrpc/examples/server_example.c |  55 +++++++++++----
+ 3 files changed, 129 insertions(+), 46 deletions(-)
+
+--- a/drivers/mrpc/core/mrpc.c
++++ b/drivers/mrpc/core/mrpc.c
+@@ -51,9 +51,12 @@
+ #include <linux/mrpc.h>
+ #include <linux/avalanche/puma7/puma7_npcpu_appcpu_defs.h>
+ 
++#define DRIVER_VERSION "1.0.0"
++
+ /************************************************/
+ /**           Structures & Enums                */
+ /************************************************/
++
+ #ifdef DEBUG
+ #define DBG(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
+ #else
+@@ -80,6 +83,7 @@ enum mrpc_msg_type {
+ /* mrpc header structure */
+ struct mrpc_hdr {
+     __be32 signature;       /* mrpc signature */
++    __be32 cookie;	    /* message cookie */
+     __u8 msg_type;          /* message type */
+     __be32 id;              /* client/server id */
+     __u8 proc;              /* proc id */
+@@ -113,7 +117,9 @@ struct mrpc_client {
+     wait_queue_head_t wait;     /* Client wait queue for replies */
+     unsigned long timeout;      /* default timeout[ms] when using mrpc_call */
+     struct mrpc_hdr *rep;       /* Client reply pointer */
+-    spinlock_t rep_lock;        /* Client reply spinlock */
++    struct mrpc_hdr req;        /* Client current request header */
++    spinlock_t spinlock;        /* Client spinlock */
++    unsigned int seq;		/* Client sequence counter */
+ };
+ #define to_mrpc_client(x) container_of(x, struct mrpc_client, kobj)
+ 
+@@ -122,6 +128,7 @@ struct mrpc_server_work {
+     struct work_struct work;
+     struct mrpc_server *server; /* server pointer */
+     __u8 proc;                  /* procedure id */
++    __be32 cookie;              /* client cookie */
+     void *arg;                  /* argument pointer */
+     ssize_t arg_len;            /* argument length */
+     void *rep;                  /* reply pointer */
+@@ -190,6 +197,7 @@ static inline void copy_header(struct mr
+     h1->proc = h2->proc;
+     h1->ret = ntohl(h2->ret);
+     h1->id = ntohl(h2->id);
++    h1->cookie = ntohl(h2->cookie);
+     h1->msg_type = h2->msg_type;
+     if (h1->msg_type == MRPC_ERROR_MSG) {
+         h1->h_errcode = ntohl(h2->h_errcode);
+@@ -271,7 +279,7 @@ static inline int server_send_error(stru
+  * @return 0 for success, error code otherwise
+  */
+ static inline int server_send_reply(struct mrpc_server *s, u8 proc,
+-                                    void *rep, ssize_t replen,
++				    __be32 cookie, void *rep, ssize_t replen,
+                                     int retval)
+ {
+     struct mrpc_hdr *hdr;
+@@ -298,11 +306,13 @@ static inline int server_send_reply(stru
+     hdr->signature = htonl(0x4d525043); /* MRPC in ASCII */
+     hdr->msg_type = MRPC_REPLY_MSG;
+     hdr->id = htonl(s->id);
++    hdr->cookie = htonl(cookie);
+     hdr->proc = proc;
+     hdr->ret = htonl(retval);
+     hdr->h_replen = htonl(replen);
+     memcpy(hdr->h_rep, rep, replen);
+     mutex_lock(&s->lock);
++    DBG("%s: send reply [cookie=0x%08x, proc=%d]", s->name, cookie, proc);
+     ret = hwMbox_sendOpcode(s->mrpc->other_cpu, s->mrpc->tag, (Uint8 *)hdr,
+                             size + sizeof(hwMbox_opcodeMessage_t),
+                             size, &reply_len);
+@@ -334,11 +344,12 @@ static void mrpc_server_worker(struct wo
+     proc_t cb = s->procs[work->proc].p_func;
+     int ret;
+ 
+-    DBG("S: %s(%d) worker: calling proc %d", s->name, s->id, work->proc);
++    DBG("S: %s(%d) worker: calling proc %d [cookie=0x%08x]",
++	    s->name, s->id, work->proc, work->cookie);
+ 
+     ret = cb(work->arg, work->arg_len, work->rep, work->rep_len);
+ 
+-    server_send_reply(s, work->proc, work->rep, work->rep_len, ret);
++    server_send_reply(s, work->proc, work->cookie, work->rep, work->rep_len, ret);
+ 
+     kfree(work->arg);
+     kfree(work->rep);
+@@ -370,13 +381,14 @@ static int server_handle_call(struct mrp
+     mutex_unlock(&mrpc->lock);
+ 
+     if (!server) {
+-        pr_err("invalid server");
++        pr_err("invalid server (id=%d)", ntohl(hdr->id));
+         err = MRPC_ERR_SERVER_NOT_READY;
+         goto out_err;
+     }
+ 
+     if (hdr->proc > server->num_procs - 1) {
+-        pr_err("invalid proc");
++        pr_err("[S%d (%s)] invalid proc (%d)",
++		server->id, server->name, hdr->proc);
+         err = MRPC_ERR_INVALID_PROC;
+         goto out_err;
+     }
+@@ -384,31 +396,34 @@ static int server_handle_call(struct mrp
+     procinfo = server->procs[hdr->proc];
+     if (procinfo.p_arglen != ntohl(hdr->h_arglen) &&
+         procinfo.p_arglen != -1) {
+-        pr_err("invalid proc arglen");
++        pr_err("[S%d (%s)] invalid proc arglen (%d)",
++		server->id, server->name, ntohl(hdr->h_arglen));
+         err = MRPC_ERR_ARGLEN_MISMATCH;
+         goto out_err;
+     }
+ 
+     if (procinfo.p_replen != ntohl(hdr->h_replen) &&
+         procinfo.p_replen != -1) {
+-        pr_err("invalid proc replen");
++        pr_err("[S%d (%s)] invalid proc replen (%d)",
++		server->id, server->name, ntohl(hdr->h_replen));
+         err = MRPC_ERR_REPLEN_MISMATCH;
+         goto out_err;
+     }
+ 
+     work = kzalloc(sizeof(*work), GFP_KERNEL);
+     if (!work) {
+-        pr_err("memory allocation failed");
++        pr_err("[S%d (%s)] memory allocation failed", server->id, server->name);
+         err = -ENOMEM;
+         goto out_err;
+     }
+ 
+     work->server = server;
+     work->proc = hdr->proc;
++    work->cookie = ntohl(hdr->cookie);
+     work->arg_len = ntohl(hdr->h_arglen);
+     work->arg = kzalloc(work->arg_len, GFP_KERNEL);
+     if (!work->arg) {
+-        pr_err("memory allocation failed");
++        pr_err("[S%d (%s)] memory allocation failed", server->id, server->name);
+         err = -ENOMEM;
+         goto free_work;
+     }
+@@ -416,14 +431,15 @@ static int server_handle_call(struct mrp
+     work->rep_len = ntohl(hdr->h_replen);
+     work->rep = kzalloc(work->rep_len, GFP_KERNEL);
+     if (!work->rep) {
+-        pr_err("memory allocation failed");
++        pr_err("[S%d (%s)] memory allocation failed", server->id, server->name);
+         err = -ENOMEM;
+         goto free_arg;
+     }
+ 
+     INIT_WORK(&work->work, mrpc_server_worker);
+     queue_work(server->wq, &work->work);
+-    DBG("call message queued");
++    DBG("[S%d (%s)] call message queued [cookie=0x%08x]",
++	 server->id, server->name, work->cookie);
+     return 0;
+ 
+ free_arg:
+@@ -459,17 +475,16 @@ static int client_handle_reply(struct mr
+     mutex_unlock(&mrpc->lock);
+ 
+     if (!client) {
+-        pr_err("invalid client");
++        pr_err("invalid client (id=%d)", ntohl(hdr->id));
+         return MRPC_ERR_INVALID_CLIENT;
+     }
+ 
+-    BUG_ON(client->rep);
+     if (hdr->msg_type == MRPC_REPLY_MSG)
+         size += replen;
+ 
+     rep = kzalloc(size, GFP_KERNEL);
+     if (!rep) {
+-        pr_err("memory allocation failed");
++        pr_err("[C%d (%s)] memory allocation failed", client->id, client->name);
+         return -ENOMEM;
+     }
+ 
+@@ -477,12 +492,30 @@ static int client_handle_reply(struct mr
+     if (hdr->msg_type == MRPC_REPLY_MSG)
+         memcpy(rep->h_rep, hdr->h_rep, replen);
+ 
+-    spin_lock(&client->rep_lock);
++    spin_lock(&client->spinlock);
++    if (!client->req.signature) {
++	pr_err("[C%d (%s)] DROP response: rep->cookie=0x%08x", client->id,
++		client->name, rep->cookie);
++	goto drop;
++    }
++    if (rep->cookie != ntohl(client->req.cookie)) {
++	pr_err("[C%d (%s)] DROP response: rep->cookie=0x%08x, req.cookie=0x%08x",
++		client->id, client->name, rep->cookie, ntohl(client->req.cookie));
++	goto drop;
++    }
++
++    BUG_ON(client->rep); 
+     client->rep = rep;
+-    spin_unlock(&client->rep_lock);
++    spin_unlock(&client->spinlock);
++
+     wake_up(&client->wait);
+ 
+-    DBG("message reply receive success");
++    DBG("[C%d (%s)] message reply receive success", client->id, client->name);
++    return 0;
++
++drop:
++    spin_unlock(&client->spinlock);
++    kfree(rep);
+     return 0;
+ }
+ 
+@@ -582,21 +615,23 @@ int mrpc_call(struct mrpc_client *c, __u
+     size = arg_len + sizeof(*hdr);
+     max_size = c->mrpc->txch_cfg.memBuff.size;
+     if (size + sizeof(hwMbox_opcodeMessage_t) > max_size) {
+-        pr_err("message too long: client %s(%d) arg_len = %d",
+-               c->name, c->id, arg_len);
++        pr_err("[C%d (%s)] message too long: arg_len = %d",
++               c->id, c->name, arg_len);
+         return MRPC_ERR_MSG_TOO_BIG;
+     }
+ 
+     hdr = kzalloc(size + sizeof(hwMbox_opcodeMessage_t), GFP_KERNEL);
+     if (!hdr) {
+-        pr_err("memory allocation failed (header_len(%d)+arg_len(%d)=%d bytes",
+-               sizeof(*hdr), arg_len, sizeof(*hdr) + arg_len);
++        pr_err("[C%d (%s)] memory allocation failed "
++	       "(header_len(%d)+arg_len(%d)=%d bytes",
++               c->id, c->name, sizeof(*hdr), arg_len, sizeof(*hdr) + arg_len);
+         return -ENOMEM;
+     }
+ 
+     hdr->signature = htonl(0x4d525043); /* MRPC in ASCII */
+     hdr->msg_type = MRPC_CALL_MSG;
+     hdr->id = htonl(c->id);
++    hdr->cookie = htonl(c->seq++);
+     hdr->proc = proc;
+     hdr->h_arglen = htonl(arg_len);
+     hdr->h_replen = htonl(rep_len);
+@@ -604,21 +639,26 @@ int mrpc_call(struct mrpc_client *c, __u
+ 
+     mutex_lock(&c->lock);
+     BUG_ON(c->rep);
++    BUG_ON(c->req.signature); 
++    memcpy(&c->req, hdr, sizeof(*hdr));
++    mb();
+     ret = hwMbox_sendOpcode(c->mrpc->other_cpu, c->mrpc->tag, (Uint8 *)hdr,
+                             size + sizeof(hwMbox_opcodeMessage_t),
+                             size, &reply_len);
+     if (ret) {
+-        pr_err("hwMbox_sendOpcode returned error, ret=%d", ret);
++        pr_err("[C%d (%s)] hwMbox_sendOpcode returned error, ret=%d",
++		c->id, c->name, ret);
+         if (reply_len > 0) {
+             *errcode = ((hwMbox_opcodeMessage_t *)hdr)->msgData.msgStatus.status;
+-            pr_err("hw_mbox return error %d", *errcode);
++            pr_err("[C%d (%s)] hw_mbox return error %d",
++		    c->id, c->name, *errcode);
+             ret = MRPC_ERR_HWMBOX_ERROR;
+         }
+         goto out_err;
+     }
+ 
+     if (reply_len > 0) {
+-        pr_err("server error");
++        pr_err("[C%d (%s)] server error", c->id, c->name);
+         ret = MRPC_ERR_SERVER_ERROR;
+         *errcode = ntohl(*(int *)hdr);
+         goto out_err;
+@@ -627,13 +667,21 @@ int mrpc_call(struct mrpc_client *c, __u
+     timeout = timeout ? timeout : c->timeout;
+     ret = wait_event_timeout(c->wait, c->rep,
+                              msecs_to_jiffies(timeout));
++    spin_lock(&c->spinlock);
+     if (ret == 0) {
+-        pr_err("client %s(id%d) timeout waiting for proc %d", c->name, c->id, proc);
+-        ret = -ETIMEDOUT;
+-        goto out_err;
++	DBG("[C%d (%s)] wait_event timeout [cookie=0x%08x]", c->id, c->name,
++	     ntohl(c->req.cookie));
++	/* The response might have arrived after we timed out. If not, it is really a time out event */
++	if (!c->rep) {
++		pr_err("[C%d (%s)] time out waiting for proc %d [cookie=0x%08x]",
++			c->id, c->name, proc, ntohl(c->req.cookie));
++		ret = -ETIMEDOUT;
++		goto out_err;
++	}
+     }
+ 
+     BUG_ON(!c->rep);
++    BUG_ON(c->rep->cookie != ntohl(c->req.cookie));
+     BUG_ON(c->rep->id != c->id);
+     BUG_ON(c->rep->proc != proc);
+ 
+@@ -649,7 +697,7 @@ int mrpc_call(struct mrpc_client *c, __u
+         memcpy(rep, c->rep->h_rep, rep_len);
+         break;
+     default:
+-        pr_err("%s(%d): unknown msg_type=%d", c->name, c->id, c->rep->msg_type);
++        pr_err("[C%d (%s)] unknown msg_type=%d", c->id, c->name, c->rep->msg_type);
+         dump_header(c->rep, false);
+         BUG();
+     }
+@@ -657,10 +705,12 @@ int mrpc_call(struct mrpc_client *c, __u
+     kfree(c->rep);
+     c->rep = NULL;
+ out_err:
++    memset(&c->req, 0, sizeof(c->req));
++    spin_unlock(&c->spinlock);
+     mutex_unlock(&c->lock);
+     kfree(hdr);
+-    DBG("client %s(%d) call proc %d done (ret=%d, errcode=%d)",
+-        c->name, c->id, proc, ret, *errcode);
++    DBG("[C%d (%s)] call proc %d done (ret=%d, errcode=%d)",
++        c->id, c->name, proc, ret, *errcode);
+     return ret;
+ }
+ EXPORT_SYMBOL(mrpc_call);
+@@ -736,7 +786,7 @@ struct mrpc_client *mrpc_client_register
+     }
+ 
+     mutex_init(&client->lock);
+-    spin_lock_init(&client->rep_lock);
++    spin_lock_init(&client->spinlock);
+     init_waitqueue_head(&client->wait);
+     client->mrpc = mrpc;
+     client->id = id;
+@@ -970,10 +1020,12 @@ static ssize_t status_show(struct device
+         return -EINVAL;
+ 
+     len = scnprintf(buf, PAGE_SIZE, "mrpc driver status:\n");
+-    len += scnprintf(buf + len, PAGE_SIZE - len, "cpu: %s\n"
++    len += scnprintf(buf + len, PAGE_SIZE - len, "version: %s\n"
++						 "cpu: %s\n"
+                                                  "tag: 0x%x\n"
+                                                  "max_tx_msg_sz: %d[bytes]\n"
+                                                  "max_rx_msg_sz: %d[bytes]\n",
++		     DRIVER_VERSION,
+                      mrpc->this_cpu == HW_MBOX_MASTER_NP_CPU ? "NP-CPU" : "APP-CPU",
+                      mrpc->tag,
+                      mrpc->txch_cfg.memBuff.size,
+--- a/drivers/mrpc/examples/client_example.c
++++ b/drivers/mrpc/examples/client_example.c
+@@ -281,7 +281,7 @@ static ssize_t client_call(struct kobjec
+     if (kstrtoul(buf, 10, &val))
+         return -EINVAL;
+ 
+-    if (val > ARRAY_SIZE(example_client_functions))
++    if (val > ARRAY_SIZE(example_client_functions) - 1)
+         return -EFAULT;
+ 
+     list_for_each_entry(c, &db.clients, list) {
+--- a/drivers/mrpc/examples/server_example.c
++++ b/drivers/mrpc/examples/server_example.c
+@@ -46,6 +46,7 @@
+ #include <linux/mutex.h>
+ #include <linux/workqueue.h>
+ #include <linux/random.h>
++#include <linux/delay.h>
+ #include <linux/mrpc.h>
+ #include "mrpc_examples.h"
+ 
+@@ -57,6 +58,22 @@
+ #define DBG(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
+ #endif
+ 
++struct server {
++    struct list_head list;
++    char name[MAX_NAME_SIZE];
++    struct mrpc_server *mrpc;
++};
++
++struct servers_database {
++    struct list_head servers;
++    struct mutex lock;
++    struct kobject *kobj;
++};
++
++static struct servers_database db;
++static unsigned int num_servers = 1;
++static unsigned int delay = 0;
++
+ /**
+  * demo_proc_0 - server side implementation of proc id 0
+  * 
+@@ -73,6 +90,7 @@
+ static int demo_proc_0(void *arg, ssize_t arglen, void *rep, ssize_t replen)
+ {
+     DBG("SUCCESS");
++    ssleep(delay);
+     return 0;
+ }
+ 
+@@ -101,6 +119,7 @@ static int demo_proc_1(void *arg, ssize_
+     DBG("SUCCESS: arg=%u, arglen=%d, sending unsigned int random reply=%u",
+            ntohl(*p_arg), arglen, ntohl(*p_rep));
+ 
++    ssleep(delay);
+     return 0;
+ }
+ 
+@@ -135,6 +154,7 @@ static int demo_proc_2(void *arg, ssize_
+            ntohl(p_arg->a), p_arg->str1, p_arg->str2, ntohl(p_arg->x),
+            ntohl(p_rep->b), p_rep->str1, p_rep->str2, ntohs(p_rep->y));
+ 
++    ssleep(delay);
+     return 0;
+ }
+ 
+@@ -155,6 +175,7 @@ static int demo_proc_2(void *arg, ssize_
+ static int demo_proc_3(void *arg, ssize_t arglen, void *rep, ssize_t replen)
+ {
+     DBG("SIMULATE ERROR - no device");
++    ssleep(delay);
+     return -ENODEV;
+ }
+ 
+@@ -185,6 +206,7 @@ static int demo_proc_4(void *arg, ssize_
+     }
+ 
+     DBG("SUCCESS: Sent back %d elements", num);
++    ssleep(delay);
+     return 0;
+ }
+ 
+@@ -196,22 +218,31 @@ static struct mrpc_procinfo example_serv
+     PROC(DEMO_PROC_4, demo_proc_4),
+ };
+ 
+-struct server {
+-    struct list_head list;
+-    char name[MAX_NAME_SIZE];
+-    struct mrpc_server *mrpc;
+-};
++static ssize_t delay_get(struct kobject *kobj, struct kobj_attribute *attr,
++                         const char *buf, size_t count)
++{
++	return scnprintf(buf, PAGE_SIZE, "%d seconds\n", delay);
++}
+ 
+-struct servers_database {
+-    struct list_head servers;
+-    struct mutex lock;
+-    struct kobject *kobj;
+-};
++static ssize_t delay_set(struct kobject *kobj,
++                         struct kobj_attribute *attr,
++                         const char *buf, size_t n)
++{
++	unsigned long val;
+ 
+-static struct servers_database db;
+-static unsigned int num_servers = 1;
++	if (kstrtoul(buf, 10, &val))
++	    return -EINVAL;
++
++	delay = val;
++
++	return n;
++}
++
++static struct kobj_attribute delay_attribute =
++    __ATTR(delay, S_IWUGO|S_IRUGO, delay_get, delay_set);
+ 
+ static struct attribute *server_attrs[] = {
++    &delay_attribute.attr,
+     NULL,
+ };
+ 

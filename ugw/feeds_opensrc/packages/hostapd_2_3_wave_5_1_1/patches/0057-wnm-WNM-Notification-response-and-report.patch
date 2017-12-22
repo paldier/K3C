@@ -1,0 +1,178 @@
+From 0d4893600fba88caffe3319ee095e97062b76e38 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Thu, 18 Aug 2016 19:23:13 +0300
+Subject: [PATCH 57/69] wnm: WNM-Notification response and report
+
+Upon receiving WNM-Notification request from an associated station, do the following:
+1. send WNM-Notification response to the STA.
+2. Issue a ctrl_iface event.
+the event format is:
+"AP-STA-WNM-NOTIF <sta mac addr> cell_capa=<0-3>
+ [non_pref_chan=<op_class>:<pref>:<reason_code>:<reason_detail>:<channel1>,<channel2>,...]".
+---
+ src/ap/wnm_ap.c              | 101 +++++++++++++++++++++++++++++++++++++++++++
+ src/common/ieee802_11_defs.h |  12 +++++
+ src/common/wpa_ctrl.h        |   2 +
+ 3 files changed, 115 insertions(+)
+
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 41d50ce..823b1d1 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -377,6 +377,103 @@ static void ieee802_11_rx_bss_trans_mgmt_resp(struct hostapd_data *hapd,
+ 		    pos, end - pos);
+ }
+ 
++static int ieee802_11_send_wnm_notification_resp(struct hostapd_data *hapd,
++					 const u8 *addr, u8 dialog_token)
++{
++	struct ieee80211_mgmt *mgmt;
++	int res;
++	size_t len;
++
++	mgmt = os_zalloc(sizeof(*mgmt));
++	if (mgmt == NULL) {
++		wpa_printf(MSG_DEBUG, "MLME: Failed to allocate buffer for "
++			   "WNM-notification Response action frame");
++		return -1;
++	}
++	os_memcpy(mgmt->da, addr, ETH_ALEN);
++	os_memcpy(mgmt->sa, hapd->own_addr, ETH_ALEN);
++	os_memcpy(mgmt->bssid, hapd->own_addr, ETH_ALEN);
++	mgmt->frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT, WLAN_FC_STYPE_ACTION);
++	mgmt->u.action.category = WLAN_ACTION_WNM;
++	mgmt->u.action.u.wnm_notification_resp.action = WNM_NOTIFICATION_RESP;
++	mgmt->u.action.u.wnm_notification_resp.dialogtoken = dialog_token;
++	mgmt->u.action.u.wnm_notification_resp.status_code = 0; /* Notification Acknowledged */
++	len = 1 + sizeof(mgmt->u.action.u.wnm_notification_resp);
++
++	res = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
++				      mgmt->da, &mgmt->u.action.category, len);
++
++	if (!res)
++		wpa_printf(MSG_DEBUG, "Successfully sent WNM-Notification Response frame");
++	else
++		wpa_printf(MSG_DEBUG, "Failed to send WNM-Notification Response frame");
++
++	os_free(mgmt);
++
++	return res;
++}
++
++static void report_notification_req(struct hostapd_data *hapd, const u8 *addr)
++{
++	char *buf, *pos, *end;
++	int buflen = 512;
++	int ret;
++	struct sta_info *sta;
++#ifdef CONFIG_MBO
++	struct mbo_non_pref_chan_info *info;
++	unsigned int count = 0;
++	u8 i;
++#endif /* CONFIG_MBO */
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta)
++		return;
++
++	buf = os_malloc(buflen);
++	if (!buf)
++		return;
++	pos = buf;
++	end = buf + buflen;
++
++	ret = os_snprintf(pos, end - pos, MACSTR, MAC2STR(sta->addr));
++	if (os_snprintf_error(end - pos, ret))
++		goto free_alloc;
++	pos += ret;
++
++#ifdef CONFIG_MBO
++	ret = os_snprintf(pos, end - pos, " cell_capa=%d ", sta->cell_capa);
++	if (os_snprintf_error(end - pos, ret))
++		goto free_alloc;
++	pos += ret;
++
++	for (info = sta->non_pref_chan; info; info = info->next) {
++		ret = os_snprintf(pos, end - pos, "non_pref_chan=%u:%u:%u:%u:",
++						  info->op_class, info->pref, info->reason_code,
++						  info->reason_detail);
++		count++;
++		if (os_snprintf_error(end - pos, ret))
++			break;
++		pos += ret;
++		for (i = 0; i < info->num_channels; i++) {
++			ret = os_snprintf(pos, end - pos, "%u%s", info->channels[i],
++					i + 1 < info->num_channels ? "," : " ");
++			if (os_snprintf_error(end - pos, ret))
++				break;
++			pos += ret;
++		}
++	}
++#endif
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_WNM_NOTIF "%s", buf);
++
++	if (hapd->msg_ctx_parent &&
++	    hapd->msg_ctx_parent != hapd->msg_ctx)
++		wpa_msg_no_global(hapd->msg_ctx_parent, MSG_INFO,
++				AP_STA_WNM_NOTIF "%s", buf);
++
++free_alloc:
++	os_free(buf);
++}
+ 
+ static void ieee802_11_rx_wnm_notification_req(struct hostapd_data *hapd,
+ 					       const u8 *addr, const u8 *buf,
+@@ -398,9 +495,13 @@ static void ieee802_11_rx_wnm_notification_req(struct hostapd_data *hapd,
+ 		    buf, len);
+ 	if (type == WLAN_EID_VENDOR_SPECIFIC)
+ 		mbo_ap_wnm_notification_req(hapd, addr, buf, len);
++
++	report_notification_req(hapd, addr);
++	ieee802_11_send_wnm_notification_resp(hapd, addr, dialog_token);
+ }
+ 
+ 
++
+ int ieee802_11_rx_wnm_action_ap(struct hostapd_data *hapd,
+ 				const struct ieee80211_mgmt *mgmt, size_t len)
+ {
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 858db5d..00da77e 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -643,6 +643,18 @@ struct ieee80211_mgmt {
+ 				} STRUCT_PACKED wnm_sleep_resp;
+ 				struct {
+ 					u8 action;
++					u8 dialogtoken;
++					u8 type;
++					u8 variable[];
++				} STRUCT_PACKED wnm_notification_req;
++				struct {
++					u8 action;
++					u8 dialogtoken;
++					u8 status_code;
++					u8 variable[];
++				} STRUCT_PACKED wnm_notification_resp;
++				struct {
++					u8 action;
+ 					u8 variable[];
+ 				} STRUCT_PACKED public_action;
+ 				struct {
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index e28d393..cb7b45a 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -294,6 +294,8 @@ extern "C" {
+ #define HOSTAPD_DISCONNECTED "HOSTAPD-DISCONNECTED"
+ #define UNCONNECTED_STA_RSSI "UNCONNECTED-STA-RSSI "
+ 
++#define AP_STA_WNM_NOTIF "AP-STA-WNM-NOTIF "
++
+ /* BSS command information masks */
+ 
+ #define WPA_BSS_MASK_ALL		0xFFFDFFFF
+-- 
+1.8.3.4
+

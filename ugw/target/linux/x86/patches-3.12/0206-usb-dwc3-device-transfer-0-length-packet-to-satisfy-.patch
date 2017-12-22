@@ -1,0 +1,61 @@
+From 903e474d295d12aae1615c1def68698ea0e02907 Mon Sep 17 00:00:00 2001
+From: Jiebing Li <jiebing.li@intel.com>
+Date: Wed, 30 Jul 2014 15:13:28 +0800
+Subject: [PATCH 206/441] usb/dwc3-device: transfer 0-length packet to satisfy
+ host request
+
+The current driver may have enumeration issue if the control transfer
+length of the data stage is multiple of max packet size.
+
+This patch provides a fix by issuing another Start Transfer in
+case that host is trying to move an extra 0-length packet.
+
+This implemantation follows point 5 section 8.4.2 of DWC3 databook 2.50a.
+
+Change-Id: Iecd367160c4797de0f6a91c1ba83c96bd75f3d9e
+Signed-off-by: Jiebing Li <jiebing.li@intel.com>
+(cherry picked from commit 46b3573ee4ef93e45554e7bbe96dedd49395ae02)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/usb/dwc3/ep0.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+--- a/drivers/usb/dwc3/ep0.c
++++ b/drivers/usb/dwc3/ep0.c
+@@ -771,6 +771,9 @@ static void dwc3_ep0_complete_data(struc
+ 
+ 	dwc->ep0_next_event = DWC3_EP0_NRDY_STATUS;
+ 
++	if (list_empty(&ep0->request_list))
++		return;
++
+ 	r = next_request(&ep0->request_list);
+ 	ur = &r->request;
+ 
+@@ -1019,6 +1022,25 @@ static void dwc3_ep0_xfernotready(struct
+ 			return;
+ 		}
+ 
++		/*
++		 * Per databook, if an XferNotready(Data) is received after
++		 * XferComplete(Data), one possible reason is host is trying
++		 * to complete data stage by moving a 0-length packet.
++		 *
++		 * REVISIT in case of other cases
++		 */
++		if (dwc->ep0_next_event == DWC3_EP0_NRDY_STATUS) {
++			u32		size = 0;
++			struct dwc3_ep *dep = dwc->eps[event->endpoint_number];
++
++			if (dep->number == 0)
++				size = dep->endpoint.maxpacket;
++
++			dwc3_ep0_start_trans(dwc, dep->number,
++				dwc->ctrl_req_addr, size,
++				DWC3_TRBCTL_CONTROL_DATA);
++		}
++
+ 		break;
+ 
+ 	case DEPEVT_STATUS_CONTROL_STATUS:

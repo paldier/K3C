@@ -1,0 +1,122 @@
+From 3e9bc8a3b8c3c8fe88a21fb6ec86a2d26ea8bc9e Mon Sep 17 00:00:00 2001
+From: yairweis <yair.weiss@intel.com>
+Date: Thu, 18 Feb 2016 15:12:12 +0200
+Subject: [PATCH 2/3] synopsys: export mdio operations
+
+---
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c    |   94 +++++++++-----------
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_mdio.c   |   25 ++++++
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c    |    2 +
+ .../net/ethernet/synopsys/DWC_ETH_QOS_yheader.h    |    2 +
+ 4 files changed, 73 insertions(+), 50 deletions(-)
+
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
+@@ -1964,7 +1964,7 @@ static int write_phy_regs(int phy_id, in
+    int ret = Y_SUCCESS;
+    /* Wait for any previous MII read/write operation to complete */
+    while (DWC_REG_RD_BIT(MAC_MDIO_AR, MAC_MDIO_AR_GB) && --retryCount)
+-      mdelay(1);
++      udelay(10);
+    if (!retryCount) {
+       ret = -Y_FAILURE;
+    } else {
+@@ -1984,17 +1984,6 @@ static int write_phy_regs(int phy_id, in
+       VAR32_SET_FIELD(varMAC_MDIOAR, MAC_MDIO_AR_GMIIR, phy_reg);
+       VAR32_SET_FIELD(varMAC_MDIOAR, MAC_MDIO_AR_PA, phy_id);
+       DWC_REG_WR(MAC_MDIO_AR, varMAC_MDIOAR);
+-
+-      /* Delay operation 10uSec */
+-      udelay(10);
+-      /* Wait for MII write operation to complete */
+-      retryCount = 1000;
+-      while (DWC_REG_RD_BIT(MAC_MDIO_AR, MAC_MDIO_AR_GB) && --retryCount)
+-         mdelay(1);
+-      if (!retryCount)
+-         ret = -Y_FAILURE;
+-   }
+-
+    return ret;
+ }
+ 
+@@ -2013,7 +2002,7 @@ static int read_phy_regs(int phy_id, int
+    int ret = Y_SUCCESS;
+    /* Wait for any previous MII read/write operation to complete */
+    while (DWC_REG_RD_BIT(MAC_MDIO_AR, MAC_MDIO_AR_GB) && --retryCount)
+-      mdelay(1);
++      udelay(10);
+    if (!retryCount) {
+       ret = -Y_FAILURE;
+    } else {
+@@ -2037,7 +2026,7 @@ static int read_phy_regs(int phy_id, int
+       /* Wait for MII write operation to complete */
+       retryCount = 1000;
+       while (DWC_REG_RD_BIT(MAC_MDIO_AR, MAC_MDIO_AR_GB) && --retryCount)
+-         mdelay(1);
++         udelay(10);
+       if (!retryCount) {
+          ret = -Y_FAILURE;
+       } else {
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_mdio.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_mdio.c
+@@ -34,6 +34,31 @@
+  */
+ #include "DWC_ETH_QOS_yheader.h"
+ 
++extern struct DWC_ETH_QOS_prv_data *pdata_p;
++
++#define MDIO_ADDR_LANTIQ 31
++
++INT DWC_ETH_QOS_mdio_read_ext(int regaddr, int *phydata)
++{
++	if (!pdata_p){
++		printk(KERN_ALERT "%s:%d: pdata is null\n", __func__, __LINE__);
++		return 0;
++	}
++	return DWC_ETH_QOS_mdio_read_direct(pdata_p, MDIO_ADDR_LANTIQ,
++					   (regaddr & 0x1F), phydata);
++}
++EXPORT_SYMBOL(DWC_ETH_QOS_mdio_read_ext);
++
++INT DWC_ETH_QOS_mdio_write_ext(int regaddr, int phydata)
++{
++	if (!pdata_p) {
++		printk(KERN_ALERT "%s:%d: pdata is null\n", __func__, __LINE__);
++		return 0;
++	}
++	return DWC_ETH_QOS_mdio_write_direct(pdata_p, MDIO_ADDR_LANTIQ,
++					    (regaddr & 0x1F), phydata);
++}
++EXPORT_SYMBOL(DWC_ETH_QOS_mdio_write_ext);
+ /*!
+ * \brief read MII PHY register, function called by the driver alone
+ *
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
+@@ -368,6 +368,7 @@ void DWC_ETH_QOS_init_all_fptrs(struct D
+    DWC_ETH_QOS_init_function_ptrs_desc(&pdata->desc_if);
+ }
+ 
++struct DWC_ETH_QOS_prv_data *pdata_p;
+ /*!
+ * \brief API to initialize the device.
+ *
+@@ -476,6 +477,7 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+    dev->base_addr = dwc_eth_qos_pci_base_addr;
+    SET_NETDEV_DEV(dev, &pdev->dev);
+    pdata = netdev_priv(dev);
++	 pdata_p = pdata;
+    DWC_ETH_QOS_init_all_fptrs(pdata);
+    hw_if = &(pdata->hw_if);
+    desc_if = &(pdata->desc_if);
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
+@@ -1241,6 +1241,8 @@ int DWC_ETH_QOS_mdio_read_direct(struct
+ 				 int phyaddr, int phyreg, int *phydata);
+ int DWC_ETH_QOS_mdio_write_direct(struct DWC_ETH_QOS_prv_data *pdata,
+ 				  int phyaddr, int phyreg, int phydata);
++INT DWC_ETH_QOS_mdio_read_ext(int regaddr, int *phydata);
++INT DWC_ETH_QOS_mdio_write_ext(int regaddr, int phydata);
+ void dbgpr_regs(void);
+ void dump_phy_registers(struct DWC_ETH_QOS_prv_data *);
+ void dump_tx_desc(struct DWC_ETH_QOS_prv_data *pdata, int first_desc_idx,

@@ -1,0 +1,365 @@
+# HG changeset patch
+# Parent f71d6f11689e192ccf6757d1819643127808fcf1
+
+diff --git a/common/Kconfig b/common/Kconfig
+--- a/common/Kconfig
++++ b/common/Kconfig
+@@ -172,6 +172,10 @@ config CMD_RUN
+ 	 bool "run"
+      default y
+ 
++config CMD_ROT
++     bool "rot"
++	 depends on DRIVER_GRX500 && MANUBOOT_OTP_SUPPORT
++
+ config CMD_SAVEENV
+      bool "saveenv"
+ 	 default y
+diff --git a/common/Makefile b/common/Makefile
+--- a/common/Makefile
++++ b/common/Makefile
+@@ -131,6 +131,7 @@ COBJS-y += cmd_pcmcia.o
+ COBJS-$(CONFIG_CMD_PORTIO) += cmd_portio.o
+ COBJS-$(CONFIG_CMD_REGINFO) += cmd_reginfo.o
+ COBJS-$(CONFIG_CMD_REISER) += cmd_reiser.o
++COBJS-$(CONFIG_CMD_ROT) += cmd_rot.o
+ COBJS-$(CONFIG_CMD_SATA) += cmd_sata.o
+ COBJS-$(CONFIG_CMD_SF) += cmd_sf.o
+ COBJS-$(CONFIG_CMD_SCSI) += cmd_scsi.o
+@@ -169,6 +170,7 @@ COBJS-$(CONFIG_CMD_UPGRADE) += upgrade.o
+ COBJS-$(CONFIG_CMD_WDT) += cmd_wdt.o
+ COBJS-$(CONFIG_CMD_AUTH) += cmd_auth.o
+ COBJS-$(CONFIG_CMD_BOOT_TOS) += cmd_secboot.o
++COBJS-$(CONFIG_MANUBOOT_OTP_SUPPORT) += otp.o
+ 
+ COBJS	:= $(sort $(COBJS-y))
+ SRCS	:= $(AOBJS:.o=.S) $(COBJS:.o=.c)
+@@ -189,6 +191,30 @@ all:	$(LIB) $(AOBJS)
+ $(obj)../tools/envcrc:
+ 	$(MAKE) -C ../tools
+ 
++ifeq ($(CONFIG_MANUBOOT_OTP_SUPPORT)$(CONFIG_GRX500_BOOT_4KEC_ONLY),yy)
++OTP_H := otp_bin.h
++# OTP_HEX := $(shell hexdump -ve '1/1 "%02x"' $(CONFIG_MANUBOOT_OTP)  )
++
++# old method depend on hexdump
++# .PHONY : $(OTP_H)
++# $(OTP_H):
++#	@echo "Generate OTP content"
++# 	-@rm -f  $(TOPDIR)/include/$(OTP_H)
++# 	@$(TOPDIR)/scripts_platform/hex2array.pl oem_keys $(OTP_HEX) > $(TOPDIR)/include/$(OTP_H)
++
++.PHONY : $(OTP_H)
++$(OTP_H):
++	@echo "Generate OTP content"
++	-@rm -f  $(TOPDIR)/include/$(OTP_H)
++	@$(TOPDIR)/scripts_platform/bin2array.pl $(CONFIG_MANUBOOT_OTP) $(TOPDIR)/include/$(OTP_H) oem_keys
++
++# phony target to force it to rebuild otp_bin.h everytime
++otp.c: $(OTP_H)
++
++# WW: TODO this run multiple time since they add sinclude $(obj).depend below
++# oh well but it still work
++endif
++
+ #########################################################################
+ 
+ # defines $(obj).depend target
+diff --git a/common/cmd_rot.c b/common/cmd_rot.c
+new file mode 100644
+--- /dev/null
++++ b/common/cmd_rot.c
+@@ -0,0 +1,79 @@
++/************************************************************************
++*
++*   Copyright: Lantiq Asia Pacific Pte Ltd
++*   Author:    William Widjaja
++*
++*   Additional U-boot command to allow otp programming when Root of Trust Transfer mode
++*
++*   Revision:  1.0
++*
++************************************************************************/
++
++#include <common.h>
++#include <command.h>
++#include <asm/boot.h>
++#include <asm/addrspace.h>
++
++extern u32 otp_prog_signal(void);
++extern void otp_prog_wait_cmd(void);
++extern int otp_prog_execute(void);
++
++int rot_prog(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
++{
++    u32 ret = 0;
++
++    if (argc != 2) {
++        printf("Wrong Number of arguements given!\n");
++        cmd_usage(cmdtp);
++        return -1;
++    }
++
++    #ifdef CONFIG_GRX500_BOOT_4KEC_ONLY
++    /* do it directly without need to go through wait cmd */
++    ret = otp_prog_execute();
++    #else
++    ret = otp_prog_signal();
++    #endif
++
++    /* otp programming result check
++     * 0 = otp program success
++     * 1 = invalid param
++     * 2 = otp content not word / 4 bytes aligned
++     * 3 = otp program failure
++    */
++    switch(ret){
++        case 0 :
++            printf("OTP program success!\n");
++            break;
++        case 1 :
++            printf("ERROR: Invalid parameters!\n");
++            break;
++        case 2 :
++            printf("ERROR: otp content not word / 4 bytes aligned!\n");
++            break;
++        case 3 :
++            printf("ERROR: otp program failure!\n");
++            break;
++        default :
++            printf("ERROR: Unknown!\n");
++            break;
++    }
++
++    return (int)ret;
++}
++
++int do_rot(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
++{
++    if (strcmp(argv[1], "prog_key") == 0)
++        return rot_prog(cmdtp, flag, argc, argv);
++
++    cmd_usage(cmdtp);
++
++    return 0;
++}
++
++U_BOOT_CMD(rot, 5, 1, do_rot,
++    "Command to Program OTP Production Keys",
++    "rot prog_key\n"
++);
++
+diff --git a/common/otp.c b/common/otp.c
+new file mode 100644
+--- /dev/null
++++ b/common/otp.c
+@@ -0,0 +1,152 @@
++/*
++ * otp.c
++ *
++ * (C) Copyright 1-March-2016
++ * simple OTP programming for GRX500 SoC
++*/
++
++#include <common.h>
++#if defined(OTP_IN_FSB) | defined(CONFIG_GRX500_BOOT_4KEC_ONLY)
++#include <otp_bin.h>
++#endif /* defined(OTP_IN_FSB) | defined(CONFIG_GRX500_BOOT_4KEC_ONLY) */
++
++#define DEBUG_OTP_PROG
++
++#include <asm/boot.h>
++#define SRAM_OTPADDR    MPS_DDR_LOC
++#define SRAM_OTPSIZE    MPS_SIZE_LOC
++
++/* if you like your own MAGIC and param location, undef below*/
++//#define IPCMAGIC        0x344B6563          /* ASCII: 4Kec */
++//#define SRAM_OTPADDR    0xbf807ff4
++//#define SRAM_OTPSIZE    0xbf807ff8
++//#define SRAMFLAG        0xbf807ffc
++
++#define OTP_BASE_ADDR 0xbe200000
++//#define OTP_BASE_ADDR 0xbf806000
++
++#ifdef DEBUG_OTP_PROG
++#define REG_OEMC        0xb6080128
++
++//! Field OTP_PGM_STA - OTP Program Status
++#define OEM_C_OTP_PGM_STA_POS 29
++//! Field OTP_PGM_STA - OTP Program Status
++#define OEM_C_OTP_PGM_STA_MASK 0x60000000u
++//! Constant NOR - No Response
++#define CONST_OEM_C_OTP_PGM_STA_NOR 0x0
++//! Constant PASS
++#define CONST_OEM_C_OTP_PGM_STA_PASS 0x1
++//! Constant REV - reserved.
++#define CONST_OEM_C_OTP_PGM_STA_REV 0x2
++//! Constant FAIL - Programming failed
++#define CONST_OEM_C_OTP_PGM_STA_FAIL 0x3
++
++#endif /* DEBUG_OTP_PROG */
++
++/*
++ * !<WW: forgive me, but the XOR give the truth table i want
++ * simple explanation :
++ * this otp.c is common for both FSB and uboot
++ * in normal manufacturing boot mode
++ * - [4KEC] FSB -> program OTP , [IAP]UBOOT -> signal to FSB through cmd
++ * in 4kec only manufacturing boot mode, only 4kec cpu is active
++ * - [4KEC] FSB -> do nothing , [4KEC]UBOOT -> cmd to program otp directly.
++*/
++#if ((!defined(OTP_IN_FSB)) ^ defined(CONFIG_GRX500_BOOT_4KEC_ONLY))
++
++u32 otp_prog_signal(void)
++{
++    #if 0 /* directly from header file now */
++    /* tell where is otp content and size is*/
++    REG32(SRAM_OTPADDR) = oem_keys;
++    REG32(SRAM_OTPSIZE) = sizeof(oem_keys);
++    #endif
++
++    /* flag 4kec for start otp programming */
++    REG32(SRAMFLAG) = IPCMAGIC;
++
++    asm("sync");
++
++    /* wait till 4kec finish  */
++    while (IPCMAGIC == REG32(SRAMFLAG))
++        ;
++
++    /* otp programming result check in REG32(SRAM_OTPADDR)
++     * 0 = otp program success
++     * 1 = invalid param
++     * 2 = otp content not word / 4 bytes aligned
++     * 3 = otp program failure
++    */
++
++    return REG32(SRAM_OTPADDR);
++}
++
++void otp_prog_wait_cmd(void)
++{
++
++    /* poll */
++    while (IPCMAGIC != REG32(SRAMFLAG))
++
++    return;
++}
++
++#else /* ((!defined(OTP_IN_FSB)) ^ defined(CONFIG_GRX500_BOOT_4KEC_ONLY)) */
++
++int otp_prog_execute(void)
++{
++    u32 i;
++    u32 size;
++    u8* p_oem_keys=NULL;
++    #ifdef DEBUG_OTP_PROG
++    u32 oemc = 0;
++    #endif /* DEBUG_OTP_PROG */
++
++    /* poll */
++    // while (IPCMAGIC != REG32(SRAMFLAG))
++        ;
++
++    p_oem_keys = oem_keys;
++    size       = sizeof(oem_keys);
++
++    /* safety , if located outside lower 256 MB DDR */
++    if (!p_oem_keys ||
++        (((u32)p_oem_keys) & 0x1FFFFFFF) >= 0x10000000 ||
++        (((u32)(p_oem_keys + size - 1)) & 0x1FFFFFFF) >= 0x10000000 ) {
++        REG32(SRAM_OTPADDR) = 1;
++        goto exit;
++    }
++
++    /* safety, if more than 2KB or not word aligned */
++    if (size == 0 ||
++        size % 4 != 0 ||
++        size > 2048) {
++        REG32(SRAM_OTPADDR) = 2;
++        goto exit;
++    }
++
++    for (i=0; i < size; i+= sizeof(u32) ) {
++        REG32(OTP_BASE_ADDR + i) = *((u32*)(p_oem_keys+i));
++
++        #ifdef DEBUG_OTP_PROG
++        oemc = REG32(REG_OEMC);
++        oemc = (oemc & OEM_C_OTP_PGM_STA_MASK) >> OEM_C_OTP_PGM_STA_POS;
++
++        if (oemc == CONST_OEM_C_OTP_PGM_STA_FAIL){
++            REG32(SRAM_OTPADDR) = 3;
++            goto exit;
++        }
++        #endif /* DEBUG_OTP_PROG */
++    }
++
++    REG32(SRAM_OTPADDR) = 0;
++
++    exit:
++    /* notify iap for finish */
++    REG32(SRAMFLAG) = 0x00000000UL;
++
++    return ((int)REG32(SRAM_OTPADDR));
++}
++
++#endif /* ((!defined(OTP_IN_FSB)) ^ defined(CONFIG_GRX500_BOOT_4KEC_ONLY)) */
++
++
+diff --git a/include/otp_bin.h b/include/otp_bin.h
+new file mode 100644
+--- /dev/null
++++ b/include/otp_bin.h
+@@ -0,0 +1,1 @@
++unsigned char oem_keys[]={0x41, 0xff, 0x08, 0xc6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x06, 0x05, 0x04, 0x0b, 0x0a, 0x09, 0x08, 0x0f, 0x0e, 0x0d, 0x0c, 0x03, 0x02, 0x01, 0x00, 0x07, 0x06, 0x05, 0x04, 0x0b, 0x0a, 0x09, 0x08, 0x0f, 0x0e, 0x0d, 0x0c, 0xf7, 0x27, 0x8f, 0xd3, 0xc1, 0xff, 0x10, 0x88, 0x00, 0x00, 0x00, 0x00, 0x85, 0x8b, 0x45, 0xf1, 0x0e, 0xd0, 0xbb, 0x95, 0x29, 0x0f, 0x18, 0x82, 0x78, 0x53, 0xb0, 0xc9, 0x12, 0x4f, 0xcf, 0xb7, 0x74, 0x7c, 0x68, 0xb4, 0x54, 0xd0, 0x46, 0x50, 0x55, 0x89, 0xfc, 0x6c, 0x4c, 0x36, 0x83, 0x33, 0x77, 0x18, 0x71, 0x30, 0x4d, 0xc1, 0x3b, 0x3d, 0x17, 0x8b, 0x9a, 0xcf, 0x0d, 0x9c, 0x01, 0x94, 0xbb, 0xdb, 0x2b, 0x56, 0x5e, 0xfb, 0xc7, 0x93, 0x69, 0x87, 0xc7, 0x9b, 0x93, 0x8e, 0xa4, 0x17, 0x01, 0xff, 0x23, 0xc3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00, 0x81, 0x06, 0x64, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x24, 0xfb, 0x27, 0xaf, 0x49, 0x49, 0xba, 0xff, 0x5f, 0x91, 0x1d, 0xdf, 0x45, 0xf4, 0x5e, 0x37, 0xc0, 0xaa, 0x33, 0x0d, 0x91, 0xd1, 0xc0, 0xa4, 0x43, 0x5e, 0xf4, 0xb3, 0x29, 0x93, 0x40, 0xf9, 0x12, 0xe4, 0xaa, 0xb6, 0x90, 0x72, 0x4e, 0x81, 0xf8, 0x00, 0x16, 0x1e, 0xea, 0x71, 0xbd, 0xde, 0x90, 0xb4, 0xdc, 0xc5, 0x72, 0x96, 0xb3, 0x7f, 0xfa, 0xee, 0xac, 0x39, 0x87, 0x55, 0xc6, 0x8a, 0x2d, 0xb4, 0x63, 0xdf, 0x4b, 0xef, 0x01, 0x95, 0x1c, 0xe0, 0x20, 0x3f, 0x3b, 0x6d, 0x06, 0x71, 0x95, 0x7e, 0x00, 0x2a, 0xc5, 0xe7, 0x04, 0xae, 0xdf, 0x3d, 0x44, 0x92, 0x93, 0x9e, 0x69, 0xee, 0x67, 0x3a, 0x6a, 0x8e, 0x88, 0xf8, 0xa1, 0x37, 0x35, 0x3c, 0xf5, 0x9e, 0xbd, 0x07, 0x07, 0xde, 0xcd, 0x60, 0xbc, 0x31, 0xd2, 0x1c, 0xa2, 0x94, 0x19, 0x0e, 0x4f, 0x17, 0x95, 0x4e, 0x84, 0x1c, 0xed, 0xdd, 0x6c, 0x2f};
+diff --git a/scripts_platform/bin2array.pl b/scripts_platform/bin2array.pl
+new file mode 100755
+--- /dev/null
++++ b/scripts_platform/bin2array.pl
+@@ -0,0 +1,45 @@
++#!/usr/bin/perl
++# perl script from binary to C array
++# 1-March-2016 Author William Widjaja
++
++use warnings;
++use strict;
++
++my $name;
++my $buffer;
++my $byte;
++
++if(@ARGV < 3){
++	print "not enough arguments\n";
++    print "Syntax: ./bin2array.pl <input-file> <output-file> <array-name>\n";
++	print "example: ./bin2array.pl data.bin output.h data_array\n";
++    exit;
++}
++
++open(INFILE, "<$ARGV[0]") or die("\ninput open fail\n");
++open(OUTFILE, ">$ARGV[1]") or die("\nOutput file open fail\n");
++$name = $ARGV[2];
++
++binmode INFILE;
++binmode OUTFILE;
++
++print OUTFILE "unsigned char ";
++print OUTFILE $name;
++print OUTFILE "[]={";
++
++while (read (INFILE, $buffer, 1))
++{
++    $byte = unpack("H2",$buffer);
++   
++    print OUTFILE "0x$byte";
++   
++    if (!eof(INFILE)) {
++        print OUTFILE ", ";
++	}
++   
++};
++
++print OUTFILE "};\n";
++
++close INFILE;
++close OUTFILE;
+\ No newline at end of file

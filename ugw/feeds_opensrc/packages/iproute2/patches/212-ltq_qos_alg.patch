@@ -1,0 +1,351 @@
+--- a/Makefile
++++ b/Makefile
+@@ -29,7 +29,7 @@ ADDLIB+=ipx_ntop.o ipx_pton.o
+ CC = gcc
+ HOSTCC = gcc
+ DEFINES += -D_GNU_SOURCE
+-CCOPTS = -O2 $(EXTRA_CCOPTS)
++CCOPTS = -O2 $(EXTRA_CCOPTS) -DCONFIG_LTQ_ALG_QOS
+ WFLAGS := -Wall -Wstrict-prototypes  -Wmissing-prototypes
+ WFLAGS += -Wmissing-declarations -Wold-style-definition -Wformat=2
+ 
+--- a/tc/f_u32.c
++++ b/tc/f_u32.c
+@@ -23,9 +23,41 @@
+ #include <linux/if.h>
+ #include <linux/if_ether.h>
+ 
++#ifdef CONFIG_LTQ_ALG_QOS
++#include <sys/ioctl.h>
++// A copy of the variables in the linux/netfilter_ipv4/ip_conntrack.h
++#define IFX_ALG_APP_ICMP        0x01000000
++#define IFX_ALG_APP_FTP         0x02000000
++#define IFX_ALG_APP_PPTP        0x03000000
++#define IFX_ALG_APP_SIP         0x04000000
++#define IFX_ALG_APP_CUSEEME     0x05000000
++#define IFX_ALG_APP_H323        0x06000000
++#define IFX_ALG_APP_RTSP        0x07000000
++#define IFX_ALG_APP_IPSEC       0x08000000
++
++
++#define IFX_ALG_PROTO_CTRL      0x00
++#define IFX_ALG_PROTO_RTP       0x00010000
++#define IFX_ALG_PROTO_RTCP      0x00020000
++#define IFX_ALG_PROTO_DATA      0x00030000
++
++#define DEBUG 
++
++#endif
++
++
+ #include "utils.h"
+ #include "tc_util.h"
+ 
++#ifdef CONFIG_LTQ_ALG_QOS
++static int parse_appl_group (int *argc_p, char ***argv_p, struct tc_u32_sel *sel);
++static int parse_proto (int *argc_p, char ***argv_p, struct tc_u32_sel *sel);
++static int parse_phy_port (int *argc_p, char ***argv_p, struct tc_u32_sel *sel);
++static int parse_phy_port_value (int *argc_p, char ***argv_p, int *key, int *mask);
++#endif
++
++
++
+ extern int show_pretty;
+ 
+ static void explain(void)
+@@ -222,6 +254,101 @@ static int parse_at(int *argc_p, char **
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_LTQ_ALG_QOS
++int parse_appl_proto (int *argc_p, char ***argv_p, int *key, int *mask)
++{
++        int argc = *argc_p;
++        char **argv = *argv_p;
++       
++        DEBUG("\n inside parse_appl_proto\n ");
++
++        if (argc <= 0)
++            return -1;
++
++        if (strcmp(*argv, "rtp") == 0) {
++                NEXT_ARG();
++
++                fprintf (stderr, "Application protocol is RTP\n");
++
++                *key |= IFX_ALG_PROTO_RTP;
++                *mask |= 0x00ff0000;
++        }
++
++        if (strcmp(*argv, "control") == 0) {
++                NEXT_ARG();
++
++                fprintf (stderr, "Application protocol is Control\n");
++
++                *key |= IFX_ALG_PROTO_CTRL;
++                *mask |= 0x00ff0000;
++        }
++
++       if (strcmp(*argv, "rtcp") == 0) {
++                NEXT_ARG();
++
++                fprintf (stderr, "Application protocol is RTCP\n");
++
++                *key |= IFX_ALG_PROTO_RTCP;
++                *mask |= 0x00ff0000;
++        }
++
++       if (strcmp(*argv, "data") == 0) {
++                NEXT_ARG();
++
++                fprintf (stderr, "Application protocol is data\n");
++
++                *key |= IFX_ALG_PROTO_DATA;
++                *mask |= 0x00ff0000;
++        }
++
++        *argc_p = argc;
++        *argv_p = argv;
++        return 0;
++}
++
++int parse_phy_port_value (int *argc_p, char ***argv_p, int *key, int *mask)
++{
++        int argc = *argc_p;
++        char **argv = *argv_p;
++        int fd; // Socket to get the ifindex of the device
++        struct ifreq ifrq;
++
++         DEBUG("\n inside parse_phy_port_value \n ");
++
++        if (argc <= 0)
++            return -1;
++
++        if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
++                fprintf (stderr,
++                            "socket open failure in parse_phy_port_value\n");
++                return 1; /** exit (1); **/
++            }
++
++        fprintf (stderr, "Application protocol is %s\n", *argv);
++
++        strncpy(ifrq.ifr_name, *argv, sizeof(ifrq.ifr_name));
++
++        if (ioctl(fd, SIOCGIFINDEX, &ifrq) < 0)
++        {
++                fprintf (stderr,
++                            "ioctl failure in parse_phy_port_value\n");
++                return 1; /** exit (1); **/
++            }
++
++        *key = ifrq.ifr_ifindex;
++        *mask = 0x000000ff;
++
++        fprintf (stderr, "The key value is %d\n", *key);
++
++        *argc_p = argc;
++        *argv_p = argv;
++        return 0;
++}
++#endif
++
++
++
++
+ 
+ static int parse_u32(int *argc_p, char ***argv_p, struct tc_u32_sel *sel,
+ 		     int off, int offmask)
+@@ -321,6 +448,37 @@ static int parse_u8(int *argc_p, char **
+ 	return res;
+ }
+ 
++#ifdef CONFIG_LTQ_ALG_QOS
++static int pack_appl_group (int *argc_p, char ***argv_p, struct tc_u32_sel *sel, int off, int offmask, __u32 proto)
++{
++        int res = -1;
++        int argc = *argc_p;
++        char **argv = *argv_p;
++        __u32 key;
++        __u32 mask;
++
++        key = proto;
++        mask = 0xff000000;
++
++        argc--; argv++;
++     
++      DEBUG("\n inside pack_appl_group\n ");
++
++        if (argc > 0 && strcmp(argv[0], "appl_proto") == 0) {
++             NEXT_ARG();
++             if (parse_appl_proto (&argc, &argv, (int *)&key, (int *)&mask))
++                   return -1;
++        }
++
++        res = pack_key32 (sel, key, mask, off, offmask);
++        *argc_p = argc;
++        *argv_p = argv;
++        return res;
++}
++#endif
++
++
++
+ static int parse_ip_addr(int *argc_p, char ***argv_p, struct tc_u32_sel *sel,
+ 			 int off)
+ {
+@@ -533,7 +691,25 @@ static int parse_ip(int *argc_p, char **
+ 		NEXT_ARG();
+ 		res = parse_u8(&argc, &argv, sel, 21, 0);
+ 	} else
+-		return -1;
++#ifdef CONFIG_LTQ_ALG_QOS
++        if (matches(*argv, "appl_group") == 0) {
++            NEXT_ARG();
++            res = parse_appl_group (&argc, &argv, sel);
++            //goto done;
++        }
++        else if (matches(*argv, "appl_proto") == 0) {
++                NEXT_ARG();
++                res = parse_proto (&argc, &argv, sel);
++             //   goto done;
++        }
++         else if (matches(*argv, "phy_port") == 0) {
++                NEXT_ARG();
++                res = parse_phy_port (&argc, &argv, sel);
++              //  goto done;
++        }
++        else
++#endif
++		   return -1;
+ 
+ 	*argc_p = argc;
+ 	*argv_p = argv;
+@@ -657,6 +833,128 @@ static int parse_icmp(int *argc_p, char
+ 	return res;
+ }
+ 
++#ifdef CONFIG_LTQ_ALG_QOS
++static int parse_appl_group (int *argc_p, char ***argv_p, struct tc_u32_sel *sel)
++{
++    int res = -1;
++    int argc = *argc_p;
++    char **argv = *argv_p;
++
++    if (argc < 2)
++        return -1;
++
++         DEBUG("\n inside parse_appl_group \n ");
++   
++    if (strcmp(*argv, "icmp") == 0) {
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, 0x01000000);
++        goto done;
++    }
++
++    if (strcmp(*argv, "sip") == 0) {
++        //fprintf (stderr, "Application group is SIP\n");
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, IFX_ALG_APP_SIP);  // Last argument should change for SIP
++        goto done;
++    }
++
++    if (strcmp(*argv, "ipsec") == 0) {
++        //fprintf (stderr, "Application group is IPSEC\n");
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, IFX_ALG_APP_IPSEC);    // Last argument should change for IPSEC
++        goto done;
++    }
++
++    if (strcmp(*argv, "pptp") == 0) {
++        //fprintf (stderr, "Application group is pptp\n");
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, IFX_ALG_APP_PPTP); // Last argument should change for PPTP
++        goto done;
++    }
++
++    if (strcmp(*argv, "real") == 0) {
++        //fprintf (stderr, "Application group is real\n");
++        //res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, 0x07010000); // Last argument should change for RealAudio/Video
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, IFX_ALG_APP_RTSP);
++        goto done;
++    }
++  if (strcmp(*argv, "netmeeting") == 0) {
++        //fprintf (stderr, "Application group is netmeeting\n");
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, 0x06000000);   // Last argument should change for Netmeeting
++        goto done;
++    }
++#if 0
++    if (strcmp(*argv, "cuseeme") == 0) {
++        //fprintf (stderr, "Application group is cuseeme\n");
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, IFX_ALG_APP_CUSEEME);  // Last argument should change for cuseeme
++        goto done;
++    }
++#endif
++
++    if (strcmp(*argv, "ftp") == 0) {
++        //fprintf (stderr, "Application group is IPSEC\n");
++       
++           DEBUG("\n inside argv = FTP \n ");
++         
++        res = pack_appl_group (&argc, &argv, sel, 0x1000, 0, IFX_ALG_APP_FTP);  // Last argument should change for ftp
++        goto done;
++    }
++
++    return -1;
++
++done:
++    *argc_p = argc;
++    *argv_p = argv;
++    return res;
++}
++
++static int parse_phy_port (int *argc_p, char ***argv_p, struct tc_u32_sel *sel)
++{
++    int res = -1;
++    int argc = *argc_p;
++    char **argv = *argv_p;
++    __u32 key;
++    __u32 mask;
++
++    if (argc < 2)
++        return -1;
++
++    res = parse_phy_port_value (&argc, &argv, (int *)&key, (int *)&mask);
++    if (res)
++        return -1;
++
++    res = pack_key32 (sel, key, mask, 0x1000, 0);
++    if (res)
++        return -1;
++
++    argc--; argv++;
++    *argc_p = argc;
++    *argv_p = argv;
++    return res;
++}
++
++
++static int parse_proto (int *argc_p, char ***argv_p, struct tc_u32_sel *sel)
++{
++    int res = -1;
++    int argc = *argc_p;
++    char **argv = *argv_p;
++    __u32 key;
++    __u32 mask;
++
++    res = parse_appl_proto (&argc, &argv, (int *)&key, (int *)&mask);
++    if (res)
++        return -1;
++
++    res = pack_key32 (sel, key, mask, 0x1000, 0);
++    if (res)
++        return -1;
++
++    *argc_p = argc;
++    *argv_p = argv;
++    return res;
++}
++#endif
++
++
++
++
+ static int parse_mark(int *argc_p, char ***argv_p, struct nlmsghdr *n)
+ {
+ 	int res = -1;

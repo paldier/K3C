@@ -1,0 +1,277 @@
+From 79d6c9d556af683b10390681024d9539b126d14c Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Fri, 26 Apr 2013 17:50:32 -0700
+Subject: [PATCH 091/105] MIPS: MIPS32 R2 SYNC optimization
+
+SYNC instruction usage optimization specific to IMGTEC (MIPS Tech) cores.
+It takes into account the knowledge of CM2 serialization and removes
+some SYNC's (SYNC 0 is very destructive for CPU pipelines).
+
+It also introduces using L2-only SYNC feature in CM2 for non-IOCU CPUs.
+This feature again boosts multi-core performance by avoiding SYNC 0.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+(cherry picked from commit b97798fccb59bce6d9c3d33d549365e39cfe948a)
+---
+ arch/mips/include/asm/cpu-features.h |    6 +++
+ arch/mips/include/asm/cpu.h          |    2 +
+ arch/mips/include/asm/gcmpregs.h     |    8 ++++-
+ arch/mips/include/asm/mipsregs.h     |    1 +
+ arch/mips/mm/c-r4k.c                 |   13 +++++---
+ arch/mips/mm/sc-mips.c               |   11 +++++-
+ arch/mips/mti-malta/malta-int.c      |   58 ++++++++++++++++++++++++++++-----
+ 7 files changed, 82 insertions(+), 17 deletions(-)
+
+diff --git a/arch/mips/include/asm/cpu-features.h b/arch/mips/include/asm/cpu-features.h
+index 0648403..82628b7 100644
+--- a/arch/mips/include/asm/cpu-features.h
++++ b/arch/mips/include/asm/cpu-features.h
+@@ -129,6 +129,12 @@
+ #ifndef cpu_has_local_ebase
+ #define cpu_has_local_ebase	1
+ #endif
++#ifndef cpu_has_cm2
++#define cpu_has_cm2             (cpu_data[0].options & MIPS_CPU_CM2)
++#endif
++#ifndef cpu_has_cm2_l2sync
++#define cpu_has_cm2_l2sync      (cpu_data[0].options & MIPS_CPU_CM2_L2SYNC)
++#endif
+ 
+ /*
+  * I-Cache snoops remote store.	 This only matters on SMP.  Some multiprocessors
+diff --git a/arch/mips/include/asm/cpu.h b/arch/mips/include/asm/cpu.h
+index ec62551..c5c49b0 100644
+--- a/arch/mips/include/asm/cpu.h
++++ b/arch/mips/include/asm/cpu.h
+@@ -333,6 +333,8 @@ enum cpu_type_enum {
+ #define MIPS_CPU_SEGMENTS       0x02000000 /* CPU supports memory segmentation */
+ #define MIPS_CPU_EVA            0x04000000 /* CPU supports EVA functionality */
+ #define MIPS_CPU_TLBINV         0x08000000 /* CPU supports TLBINV/F */
++#define MIPS_CPU_CM2            0x10000000 /* CPU has CM2 */
++#define MIPS_CPU_CM2_L2SYNC     0x20000000 /* CPU has CM2 L2-only SYNC feature */
+ 
+ /*
+  * CPU ASE encodings
+diff --git a/arch/mips/include/asm/gcmpregs.h b/arch/mips/include/asm/gcmpregs.h
+index d47c537..02abcdc 100644
+--- a/arch/mips/include/asm/gcmpregs.h
++++ b/arch/mips/include/asm/gcmpregs.h
+@@ -73,7 +73,10 @@
+ #define GCMP_GCB_GCMEO_OFS		0x0058	/* Global CM Error Multiple */
+ #define	 GCMP_GCB_GMEO_ERROR_2ND_SHF	0
+ #define	 GCMP_GCB_GMEO_ERROR_2ND_MSK	GCMPGCBMSK(GMEO_ERROR_2ND, 5)
+-#define GCMP_GCB_GICBA_OFS		0x0080	/* Global Interrupt Controller Base Address */
++#define GCMP_GCB_GCMCUS_OFS             0x0060  /* GCR Custom Base */
++#define GCMP_GCB_GCMCST_OFS             0x0068  /* GCR Custom Status */
++#define GCMP_GCB_GCML2S_OFS             0x0070  /* Global L2 only Sync Register */
++#define GCMP_GCB_GICBA_OFS              0x0080  /* Global Interrupt Controller Base Address */
+ #define	 GCMP_GCB_GICBA_BASE_SHF	17
+ #define	 GCMP_GCB_GICBA_BASE_MSK	GCMPGCBMSK(GICBA_BASE, 15)
+ #define	 GCMP_GCB_GICBA_EN_SHF		0
+@@ -127,4 +130,7 @@
+ extern int __init gcmp_probe(unsigned long, unsigned long);
+ extern int __init gcmp_niocu(void);
+ extern void __init gcmp_setregion(int, unsigned long, unsigned long, int);
++extern unsigned long _gcmp_base;
++#define GCMP_L2SYNC_OFFSET              0x8000
++
+ #endif /* _ASM_GCMPREGS_H */
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+index d5b5213..f98431c 100644
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -1005,6 +1005,7 @@ do {									\
+ #define write_c0_epc(val)	__write_ulong_c0_register($14, 0, val)
+ 
+ #define read_c0_prid()		__read_32bit_c0_register($15, 0)
++#define read_c0_cmgcrbase()     __read_ulong_c0_register($15, 3)
+ 
+ #define read_c0_config()	__read_32bit_c0_register($16, 0)
+ #define read_c0_config1()	__read_32bit_c0_register($16, 1)
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index 1e1d423..ea5885f 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -662,7 +662,7 @@ static inline void local_r4k_flush_cache_page(void *args)
+ 	if ((mm == current->active_mm) && (pte_val(*ptep) & _PAGE_VALID)) {
+ 		if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc)) {
+ 			r4k_blast_dcache_user_page(addr);
+-			if (exec && !cpu_has_ic_fills_f_dc)
++			if (exec && (!cpu_has_cm2) && !cpu_has_ic_fills_f_dc)
+ 				wmb();
+ 			if (exec && !cpu_icache_snoops_remote_store)
+ 				r4k_blast_scache_page(addr);
+@@ -684,7 +684,7 @@ static inline void local_r4k_flush_cache_page(void *args)
+ 
+ 		if (cpu_has_dc_aliases || (exec && !cpu_has_ic_fills_f_dc)) {
+ 			r4k_blast_dcache_page(addr);
+-			if (exec && !cpu_has_ic_fills_f_dc)
++			if (exec && (!cpu_has_cm2) && !cpu_has_ic_fills_f_dc)
+ 				wmb();
+ 			if (exec && !cpu_icache_snoops_remote_store)
+ 				r4k_blast_scache_page(addr);
+@@ -759,7 +759,8 @@ static inline void local_r4k_mips_flush_data_cache_range(void *args)
+ 	blast_dcache_range(start, end);
+ 
+ 	if ((vma->vm_flags & VM_EXEC) && !cpu_has_ic_fills_f_dc) {
+-		wmb();
++		if (!cpu_has_cm2)
++			wmb();
+ 
+ 		/* vma is given for exec check only, mmap is current,
+ 		   so - no non-current vma page flush, just user or kernel */
+@@ -808,7 +809,8 @@ static inline void local_r4k_flush_icache_range_ipi(void *args)
+ 		R4600_HIT_CACHEOP_WAR_IMPL;
+ 		protected_blast_dcache_range(start, end);
+ 
+-		wmb();
++		if (!cpu_has_cm2)
++			wmb();
+ 	}
+ 
+ 	protected_blast_icache_range(start, end);
+@@ -901,7 +903,8 @@ static void r4k_dma_cache_wback_inv(unsigned long addr, unsigned long size)
+ 	preempt_enable();
+ 
+ 	bc_wback_inv(addr, size);
+-	__sync();
++	if (!cpu_has_cm2_l2sync)
++		__sync();
+ }
+ 
+ static void r4k_dma_cache_inv(unsigned long addr, unsigned long size)
+diff --git a/arch/mips/mm/sc-mips.c b/arch/mips/mm/sc-mips.c
+index d413d5a..a29a0d9 100644
+--- a/arch/mips/mm/sc-mips.c
++++ b/arch/mips/mm/sc-mips.c
+@@ -7,6 +7,7 @@
+ #include <linux/mm.h>
+ 
+ #include <asm/mipsregs.h>
++#include <asm/gcmpregs.h>
+ #include <asm/bcache.h>
+ #include <asm/cacheops.h>
+ #include <asm/page.h>
+@@ -23,8 +24,11 @@
+  */
+ static void mips_sc_wback_inv(unsigned long addr, unsigned long size)
+ {
+-	__sync();
++	if (!cpu_has_cm2)
++		__sync();
+ 	blast_scache_range(addr, addr + size);
++	if (cpu_has_cm2_l2sync)
++		*(unsigned long *)(_gcmp_base + GCMP_L2SYNC_OFFSET) = 0;
+ }
+ 
+ /*
+@@ -76,6 +80,8 @@ static inline int mips_sc_is_activated(struct cpuinfo_mips *c)
+ 	case CPU_34K:
+ 	case CPU_1004K:
+ 	case CPU_74K:
++	case CPU_PROAPTIV:	/* proAptiv havn't L2B capability but ... */
++	case CPU_INTERAPTIV:
+ 	case CPU_BMIPS5000:
+ 		if (config2 & (1 << 12))
+ 			return 0;
+@@ -139,6 +145,7 @@ int __cpuinit mips_sc_init(void)
+ 	if (found) {
+ 		mips_sc_enable();
+ 		bcops = &mips_sc_ops;
+-	}
++	} else
++		cpu_data[0].options &= ~MIPS_CPU_CM2_L2SYNC;
+ 	return found;
+ }
+diff --git a/arch/mips/mti-malta/malta-int.c b/arch/mips/mti-malta/malta-int.c
+index 66f91b8..cf95747 100644
+--- a/arch/mips/mti-malta/malta-int.c
++++ b/arch/mips/mti-malta/malta-int.c
+@@ -422,7 +422,9 @@ static struct gic_intr_map gic_intr_map[GIC_NUM_INTRS] = {
+  */
+ int __init gcmp_probe(unsigned long addr, unsigned long size)
+ {
+-	if ((mips_revision_sconid != MIPS_REVISION_SCON_ROCIT)  &&
++	unsigned long confaddr = 0;
++
++	if ((mips_revision_sconid != MIPS_REVISION_SCON_ROCIT) &&
+ 	    (mips_revision_sconid != MIPS_REVISION_SCON_GT64120)) {
+ 		gcmp_present = 0;
+ 		pr_debug("GCMP NOT present\n");
+@@ -432,12 +434,50 @@ int __init gcmp_probe(unsigned long addr, unsigned long size)
+ 	if (gcmp_present >= 0)
+ 		return gcmp_present;
+ 
+-	_gcmp_base = (unsigned long) ioremap_nocache(GCMP_BASE_ADDR, GCMP_ADDRSPACE_SZ);
+-	_msc01_biu_base = (unsigned long) ioremap_nocache(MSC01_BIU_REG_BASE, MSC01_BIU_ADDRSPACE_SZ);
+-	gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK) == GCMP_BASE_ADDR;
++	if (cpu_has_mips_r2 && (read_c0_config3() & MIPS_CONF3_CMGCR)) {
++		/* try CMGCRBase */
++		confaddr = read_c0_cmgcrbase() << 4;
++		_gcmp_base = (unsigned long) ioremap_nocache(confaddr, GCMP_ADDRSPACE_SZ);
++		gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK) == confaddr;
++		if (gcmp_present) {
++			/* reassign it to 'addr' */
++			if (addr != confaddr)
++				GCMPGCB(GCMPB) = (GCMPGCB(GCMPB) & ~GCMP_GCB_GCMPB_GCMPBASE_MSK) | addr;
++			_gcmp_base = (unsigned long) ioremap_nocache(addr , GCMP_ADDRSPACE_SZ);
++			gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK) == confaddr;
++			confaddr = addr;
++			if (!gcmp_present) {
++				/* reassignment failed, try CMGCRBase again */
++				confaddr = read_c0_cmgcrbase() << 4;
++				_gcmp_base = (unsigned long) ioremap_nocache(confaddr, GCMP_ADDRSPACE_SZ);
++				gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK) == confaddr;
++			}
++		}
++	}
++	if (gcmp_present <= 0) {
++		/* try addr */
++		_gcmp_base = (unsigned long) ioremap_nocache(addr, GCMP_ADDRSPACE_SZ);
++		gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK) == addr;
++		confaddr = addr;
++	}
++	if (gcmp_present <= 0) {
++		/* try GCMP_BASE_ADDR */
++		_gcmp_base = (unsigned long) ioremap_nocache(GCMP_BASE_ADDR, GCMP_ADDRSPACE_SZ);
++		gcmp_present = (GCMPGCB(GCMPB) & GCMP_GCB_GCMPB_GCMPBASE_MSK) == GCMP_BASE_ADDR;
++		confaddr = GCMP_BASE_ADDR;
++	}
++//        _msc01_biu_base = (unsigned long) ioremap_nocache(MSC01_BIU_REG_BASE, MSC01_BIU_ADDRSPACE_SZ);
+ 
+-	if (gcmp_present)
+-		pr_debug("GCMP present\n");
++	if (gcmp_present) {
++		printk("GCMP present\n");
++		if (GCMPGCB(GCMPREV) >= 6)
++			cpu_data[0].options |= MIPS_CPU_CM2;
++		if (cpu_has_cm2 && (size > 0x8000)) {
++			GCMPGCB(GCML2S) = (confaddr + 0x8000) | 1;
++			cpu_data[0].options |= MIPS_CPU_CM2_L2SYNC;
++			printk("L2-only SYNC available\n");
++		}
++	}
+ 	return gcmp_present;
+ }
+ 
+@@ -578,8 +618,6 @@ void __init arch_init_irq(void)
+ 		gic_resched_int_base = gic_call_int_base - NR_CPUS;
+ 		fill_ipi_map();
+ #endif
+-		gic_init(GIC_BASE_ADDR, GIC_ADDRSPACE_SZ, gic_intr_map,
+-				ARRAY_SIZE(gic_intr_map), MIPS_GIC_IRQ_BASE);
+ 		if (!gcmp_present) {
+ 			/* Enable the GIC */
+ 			i = REG(_msc01_biu_base, MSC01_SC_CFG);
+@@ -587,6 +625,8 @@ void __init arch_init_irq(void)
+ 				(i | (0x1 << MSC01_SC_CFG_GICENA_SHF));
+ 			pr_debug("GIC Enabled\n");
+ 		}
++		gic_init(GIC_BASE_ADDR, GIC_ADDRSPACE_SZ, gic_intr_map,
++				ARRAY_SIZE(gic_intr_map), MIPS_GIC_IRQ_BASE);
+ #if defined(CONFIG_MIPS_MT_SMP)
+ 		/* set up ipi interrupts */
+ 		if (cpu_has_vint) {
+-- 
+1.7.1
+

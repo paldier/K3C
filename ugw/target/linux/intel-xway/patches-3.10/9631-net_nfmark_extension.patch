@@ -1,0 +1,590 @@
+This patch adds extmark, extended mark, inside skbuff struct
+
+diff --git a/include/linux/extmark.h b/include/linux/extmark.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/extmark.h
+@@ -0,0 +1,38 @@
++#ifndef _LINUX_EXTMARK_H
++#define _LINUX_EXTMARK_H
++
++/* Bit counting starts from Least significant bit, 0..31*/
++
++#define CPEID_START_BIT_POS 0
++#define CPEID_NO_OF_BITS 6
++#define CPEID_MASK 0x3f
++
++#define QUEPRIO_START_BIT_POS 6
++#define QUEPRIO_NO_OF_BITS 4
++#define QUEPRIO_MASK 0x3c0
++
++#define SUBQUEUE_START_BIT_POS 10
++#define SUBQUEUE_NO_OF_BITS 3
++#define SUBQUEUE_MASK 0x1c00
++
++#define ACCELSEL_START_BIT_POS 13
++#define ACCELSEL_NO_OF_BITS 1
++#define ACCELSEL_MASK 0x2000
++
++#define VPRIO_START_BIT_POS 14
++#define VPRIO_NO_OF_BITS 3
++#define VPRIO_MASK 0x1c000
++
++#define VLANID_START_BIT_POS 17
++#define VLANID_NO_OF_BITS 12
++#define VLANID_MASK 0x1ffe0000
++
++#define PPE_START_BIT_POS 29
++#define PPE_NO_OF_BITS 1
++#define PPE_MASK 0x20000000
++
++#define LROSESS_START_BIT_POS 31
++#define LROSESS_NO_OF_BITS 1
++#define LROSESS_MASK 0x80000000
++
++#endif
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -35,6 +35,10 @@
+ #include <linux/netdev_features.h>
+ #include <net/flow_keys.h>
+ 
++#ifdef CONFIG_NETWORK_EXTMARK
++#include <linux/extmark.h>
++#endif
++
+ /* reccommended as it's faster*/
+ #define GET_DATA_FROM_MARK_OPT(mark, mask, pos, value) value = ((mark & mask) >> pos)
+ #define SET_DATA_FROM_MARK_OPT(mark, mask, pos, value) mark &= ~mask; mark |= ((value << pos) & mask)
+@@ -515,6 +519,9 @@ struct sk_buff {
+ #ifdef CONFIG_NETWORK_SECMARK
+ 	__u32			secmark;
+ #endif
++#ifdef CONFIG_NETWORK_EXTMARK
++	__u32			extmark;
++#endif
+ 	union {
+ 		__u32		mark;
+ 		__u32		dropcount;
+diff --git a/include/uapi/linux/netfilter/xt_extmark.h b/include/uapi/linux/netfilter/xt_extmark.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/linux/netfilter/xt_extmark.h
+@@ -0,0 +1,15 @@
++#ifndef _XT_EXTMARK_H
++#define _XT_EXTMARK_H
++
++#include <linux/types.h>
++
++struct xt_extmark_tginfo2 {
++	__u32 extmark, mask;
++};
++
++struct xt_extmark_mtinfo1 {
++	__u32 extmark, mask;
++	__u8 invert;
++};
++
++#endif /*_XT_EXTMARK_H*/
+diff --git a/include/uapi/linux/netfilter_bridge/ebt_extmark_m.h b/include/uapi/linux/netfilter_bridge/ebt_extmark_m.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/linux/netfilter_bridge/ebt_extmark_m.h
+@@ -0,0 +1,16 @@
++#ifndef __LINUX_BRIDGE_EBT_EXTMARK_M_H
++#define __LINUX_BRIDGE_EBT_EXTMARK_M_H
++
++#include <linux/types.h>
++
++#define EBT_EXTMARK_AND 0x01
++#define EBT_EXTMARK_OR 0x02
++#define EBT_EXTMARK_MASK (EBT_EXTMARK_AND | EBT_EXTMARK_OR)
++struct ebt_extmark_m_info {
++	unsigned long extmark, mask;
++	__u8 invert;
++	__u8 bitmask;
++};
++#define EBT_EXTMARK_MATCH "extmark_m"
++
++#endif
+diff --git a/include/uapi/linux/netfilter_bridge/ebt_extmark_t.h b/include/uapi/linux/netfilter_bridge/ebt_extmark_t.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/linux/netfilter_bridge/ebt_extmark_t.h
+@@ -0,0 +1,23 @@
++#ifndef __LINUX_BRIDGE_EBT_EXTMARK_T_H
++#define __LINUX_BRIDGE_EBT_EXTMARK_T_H
++
++/* The target member is reused for adding new actions, the
++ * value of the real target is -1 to -NUM_STANDARD_TARGETS.
++ * For backward compatibility, the 4 lsb (2 would be enough,
++ * but let's play it safe) are kept to designate this target.
++ * The remaining bits designate the action. By making the set
++ * action 0xfffffff0, the result will look ok for older
++ * versions. [September 2006] */
++#define EXTMARK_SET_VALUE (0xfffffff0)
++#define EXTMARK_OR_VALUE  (0xffffffe0)
++#define EXTMARK_AND_VALUE (0xffffffd0)
++#define EXTMARK_XOR_VALUE (0xffffffc0)
++
++struct ebt_extmark_t_info {
++	unsigned long extmark;
++	/* EBT_ACCEPT, EBT_DROP, EBT_CONTINUE or EBT_RETURN */
++	int target;
++};
++#define EBT_EXTMARK_TARGET "extmark"
++
++#endif
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -103,6 +103,13 @@ config NETWORK_SECMARK
+ 	  to nfmark, but designated for security purposes.
+ 	  If you are unsure how to answer this question, answer N.
+ 
++config NETWORK_EXTMARK
++	bool "Extended Marking"
++	help
++	  This enables extended marking in sk_buff strucure. This is
++	  extension of nfmark.
++	  If you are unsure how to answer this question, answer N.
++
+ config NETWORK_PHY_TIMESTAMPING
+ 	bool "Timestamping in PHY devices"
+ 	help
+diff --git a/net/bridge/netfilter/Kconfig b/net/bridge/netfilter/Kconfig
+--- a/net/bridge/netfilter/Kconfig
++++ b/net/bridge/netfilter/Kconfig
+@@ -107,6 +107,16 @@ config BRIDGE_EBT_MARK
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
++config BRIDGE_EBT_EXTMARK
++	tristate "ebt: extmark filter support"
++	help
++	  This option adds the extmark match, which allows matching frames based on
++	  the 'extmark' value in the frame. This can be set by the extmark target.
++	  This value is the same as the one used in the iptables mark match and
++	  target.
++
++	  To compile it as a module, choose M here.  If unsure, say N.
++
+ config BRIDGE_EBT_PKTTYPE
+ 	tristate "ebt: packet type filter support"
+ 	help
+@@ -162,6 +172,16 @@ config BRIDGE_EBT_MARK_T
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
++config BRIDGE_EBT_EXTMARK_T
++	tristate "ebt: extmark target support"
++	help
++	  This option adds the extmark target, which allows marking frames by
++	  setting the 'extmark' value in the frame.
++	  This value is the same as the one used in the iptables mark match and
++	  target.
++
++	  To compile it as a module, choose M here.  If unsure, say N.
++
+ config BRIDGE_EBT_REDIRECT
+ 	tristate "ebt: redirect target support"
+ 	help
+diff --git a/net/bridge/netfilter/Makefile b/net/bridge/netfilter/Makefile
+--- a/net/bridge/netfilter/Makefile
++++ b/net/bridge/netfilter/Makefile
+@@ -17,6 +17,7 @@ obj-$(CONFIG_BRIDGE_EBT_IP) += ebt_ip.o
+ obj-$(CONFIG_BRIDGE_EBT_IP6) += ebt_ip6.o
+ obj-$(CONFIG_BRIDGE_EBT_LIMIT) += ebt_limit.o
+ obj-$(CONFIG_BRIDGE_EBT_MARK) += ebt_mark_m.o
++obj-$(CONFIG_BRIDGE_EBT_EXTMARK) += ebt_extmark_m.o
+ obj-$(CONFIG_BRIDGE_EBT_PKTTYPE) += ebt_pkttype.o
+ obj-$(CONFIG_BRIDGE_EBT_STP) += ebt_stp.o
+ obj-$(CONFIG_BRIDGE_EBT_VLAN) += ebt_vlan.o
+@@ -24,6 +25,7 @@ obj-$(CONFIG_BRIDGE_EBT_VLAN) += ebt_vla
+ # targets
+ obj-$(CONFIG_BRIDGE_EBT_ARPREPLY) += ebt_arpreply.o
+ obj-$(CONFIG_BRIDGE_EBT_MARK_T) += ebt_mark.o
++obj-$(CONFIG_BRIDGE_EBT_EXTMARK_T) += ebt_extmark.o
+ obj-$(CONFIG_BRIDGE_EBT_DNAT) += ebt_dnat.o
+ obj-$(CONFIG_BRIDGE_EBT_REDIRECT) += ebt_redirect.o
+ obj-$(CONFIG_BRIDGE_EBT_SNAT) += ebt_snat.o
+diff --git a/net/bridge/netfilter/ebt_extmark.c b/net/bridge/netfilter/ebt_extmark.c
+new file mode 100644
+--- /dev/null
++++ b/net/bridge/netfilter/ebt_extmark.c
+@@ -0,0 +1,110 @@
++/*
++ *  ebt_extmark
++ *
++ *	Authors:
++ *	Bart De Schuymer <bdschuym@pandora.be>
++ *
++ *  July, 2002
++ *
++ */
++
++/* The extmark target can be used in any chain,
++ * I believe adding a mangle table just for extmarking is total overkill.
++ * Marking a frame doesn't really change anything in the frame anyway.
++ */
++
++#include <linux/module.h>
++#include <linux/netfilter/x_tables.h>
++#include <linux/netfilter_bridge/ebtables.h>
++#include <linux/netfilter_bridge/ebt_extmark_t.h>
++
++static unsigned int
++ebt_extmark_tg(struct sk_buff *skb, const struct xt_action_param *par)
++{
++	const struct ebt_extmark_t_info *info = par->targinfo;
++	int action = info->target & -16;
++
++	if (action == EXTMARK_SET_VALUE)
++		skb->extmark = info->extmark;
++	else if (action == EXTMARK_OR_VALUE)
++		skb->extmark |= info->extmark;
++	else if (action == EXTMARK_AND_VALUE)
++		skb->extmark &= info->extmark;
++	else
++		skb->extmark ^= info->extmark;
++
++	return info->target | ~EBT_VERDICT_BITS;
++}
++
++static int ebt_extmark_tg_check(const struct xt_tgchk_param *par)
++{
++	const struct ebt_extmark_t_info *info = par->targinfo;
++	int tmp;
++
++	tmp = info->target | ~EBT_VERDICT_BITS;
++	if (BASE_CHAIN && tmp == EBT_RETURN)
++		return -EINVAL;
++	if (tmp < -NUM_STANDARD_TARGETS || tmp >= 0)
++		return -EINVAL;
++	tmp = info->target & ~EBT_VERDICT_BITS;
++	if (tmp != EXTMARK_SET_VALUE && tmp != EXTMARK_OR_VALUE &&
++	    tmp != EXTMARK_AND_VALUE && tmp != EXTMARK_XOR_VALUE)
++		return -EINVAL;
++	return 0;
++}
++#ifdef CONFIG_COMPAT
++struct compat_ebt_extmark_t_info {
++	compat_ulong_t extmark;
++	compat_uint_t target;
++};
++
++static void extmark_tg_compat_from_user(void *dst, const void *src)
++{
++	const struct compat_ebt_extmark_t_info *user = src;
++	struct ebt_extmark_t_info *kern = dst;
++
++	kern->extmark = user->extmark;
++	kern->target = user->target;
++}
++
++static int extmark_tg_compat_to_user(void __user *dst, const void *src)
++{
++	struct compat_ebt_extmark_t_info __user *user = dst;
++	const struct ebt_extmark_t_info *kern = src;
++
++	if (put_user(kern->extmark, &user->extmark) ||
++	    put_user(kern->target, &user->target))
++		return -EFAULT;
++	return 0;
++}
++#endif
++
++static struct xt_target ebt_extmark_tg_reg __read_mostly = {
++	.name		= "extmark",
++	.revision	= 0,
++	.family		= NFPROTO_BRIDGE,
++	.target		= ebt_extmark_tg,
++	.checkentry	= ebt_extmark_tg_check,
++	.targetsize	= sizeof(struct ebt_extmark_t_info),
++#ifdef CONFIG_COMPAT
++	.compatsize	= sizeof(struct compat_ebt_extmark_t_info),
++	.compat_from_user = extmark_tg_compat_from_user,
++	.compat_to_user	= extmark_tg_compat_to_user,
++#endif
++	.me		= THIS_MODULE,
++};
++
++static int __init ebt_extmark_init(void)
++{
++	return xt_register_target(&ebt_extmark_tg_reg);
++}
++
++static void __exit ebt_extmark_fini(void)
++{
++	xt_unregister_target(&ebt_extmark_tg_reg);
++}
++
++module_init(ebt_extmark_init);
++module_exit(ebt_extmark_fini);
++MODULE_DESCRIPTION("Ebtables: Packet extmark modification");
++MODULE_LICENSE("GPL");
+diff --git a/net/bridge/netfilter/ebt_extmark_m.c b/net/bridge/netfilter/ebt_extmark_m.c
+new file mode 100644
+--- /dev/null
++++ b/net/bridge/netfilter/ebt_extmark_m.c
+@@ -0,0 +1,98 @@
++/*
++ *  ebt_extmark_m
++ *
++ *	Authors:
++ *	Bart De Schuymer <bdschuym@pandora.be>
++ *
++ *  July, 2002
++ *
++ */
++#include <linux/module.h>
++#include <linux/netfilter/x_tables.h>
++#include <linux/netfilter_bridge/ebtables.h>
++#include <linux/netfilter_bridge/ebt_extmark_m.h>
++
++static bool
++ebt_extmark_mt(const struct sk_buff *skb, struct xt_action_param *par)
++{
++	const struct ebt_extmark_m_info *info = par->matchinfo;
++
++	if (info->bitmask & EBT_EXTMARK_OR)
++		return !!(skb->extmark & info->mask) ^ info->invert;
++	return ((skb->extmark & info->mask) == info->extmark) ^ info->invert;
++}
++
++static int ebt_extmark_mt_check(const struct xt_mtchk_param *par)
++{
++	const struct ebt_extmark_m_info *info = par->matchinfo;
++
++	if (info->bitmask & ~EBT_EXTMARK_MASK)
++		return -EINVAL;
++	if ((info->bitmask & EBT_EXTMARK_OR) && (info->bitmask & EBT_EXTMARK_AND))
++		return -EINVAL;
++	if (!info->bitmask)
++		return -EINVAL;
++	return 0;
++}
++
++
++#ifdef CONFIG_COMPAT
++struct compat_ebt_extmark_m_info {
++	compat_ulong_t extmark, mask;
++	uint8_t invert, bitmask;
++};
++
++static void extmark_mt_compat_from_user(void *dst, const void *src)
++{
++	const struct compat_ebt_extmark_m_info *user = src;
++	struct ebt_extmark_m_info *kern = dst;
++
++	kern->extmark = user->extmark;
++	kern->mask = user->mask;
++	kern->invert = user->invert;
++	kern->bitmask = user->bitmask;
++}
++
++static int extmark_mt_compat_to_user(void __user *dst, const void *src)
++{
++	struct compat_ebt_extmark_m_info __user *user = dst;
++	const struct ebt_extmark_m_info *kern = src;
++
++	if (put_user(kern->extmark, &user->extmark) ||
++	    put_user(kern->mask, &user->mask) ||
++	    put_user(kern->invert, &user->invert) ||
++	    put_user(kern->bitmask, &user->bitmask))
++		return -EFAULT;
++	return 0;
++}
++#endif
++
++static struct xt_match ebt_extmark_mt_reg __read_mostly = {
++	.name		= "extmark_m",
++	.revision	= 0,
++	.family		= NFPROTO_BRIDGE,
++	.match		= ebt_extmark_mt,
++	.checkentry	= ebt_extmark_mt_check,
++	.matchsize	= sizeof(struct ebt_extmark_m_info),
++#ifdef CONFIG_COMPAT
++	.compatsize	= sizeof(struct compat_ebt_extmark_m_info),
++	.compat_from_user = extmark_mt_compat_from_user,
++	.compat_to_user	= extmark_mt_compat_to_user,
++#endif
++	.me		= THIS_MODULE,
++};
++
++static int __init ebt_extmark_m_init(void)
++{
++	return xt_register_match(&ebt_extmark_mt_reg);
++}
++
++static void __exit ebt_extmark_m_fini(void)
++{
++	xt_unregister_match(&ebt_extmark_mt_reg);
++}
++
++module_init(ebt_extmark_m_init);
++module_exit(ebt_extmark_m_fini);
++MODULE_DESCRIPTION("Ebtables: Packet extmark match");
++MODULE_LICENSE("GPL");
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -770,6 +770,9 @@ static void __copy_skb_header(struct sk_
+ #endif
+ 	new->pfmemalloc		= old->pfmemalloc;
+ 	new->protocol		= old->protocol;
++#ifdef CONFIG_NETWORK_EXTMARK
++	new->extmark		= old->extmark;
++#endif
+ 	new->mark		= old->mark;
+ 	new->skb_iif		= old->skb_iif;
+ 	__nf_copy(new, old);
+diff --git a/net/netfilter/Kconfig b/net/netfilter/Kconfig
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -449,6 +449,12 @@ config NETFILTER_XT_MARK
+ 	"Use netfilter MARK value as routing key") and can also be used by
+ 	other subsystems to change their behavior.
+ 
++config NETFILTER_XT_EXTMARK
++	tristate 'extended nfmark target and match support'
++	default m if NETFILTER_ADVANCED=n
++	---help---
++	This option adds the "EXTMARK" target and "extmark" match.
++
+ config NETFILTER_XT_CONNMARK
+ 	tristate 'ctmark target and match support'
+ 	depends on NF_CONNTRACK
+@@ -649,6 +655,15 @@ config NETFILTER_XT_TARGET_MARK
+ 	(e.g. when running oldconfig). It selects
+ 	CONFIG_NETFILTER_XT_MARK (combined mark/MARK module).
+ 
++config NETFILTER_XT_TARGET_EXTMARK
++	tristate '"EXTMARK" target support'
++	depends on NETFILTER_ADVANCED
++	select NETFILTER_XT_EXTMARK
++	---help---
++	This is a backwards-compat option for the user's convenience
++	(e.g. when running oldconfig). It selects
++	CONFIG_NETFILTER_XT_EXTMARK (combined mark/MARK module).
++
+ config NETFILTER_XT_TARGET_NETMAP
+ 	tristate '"NETMAP" target support'
+ 	depends on NF_NAT
+@@ -1067,6 +1082,15 @@ config NETFILTER_XT_MATCH_MARK
+ 	(e.g. when running oldconfig). It selects
+ 	CONFIG_NETFILTER_XT_MARK (combined mark/MARK module).
+ 
++config NETFILTER_XT_MATCH_EXTMARK
++	tristate '"extmark" match support'
++	depends on NETFILTER_ADVANCED
++	select NETFILTER_XT_EXTMARK
++	---help---
++	This is a backwards-compat option for the user's convenience
++	(e.g. when running oldconfig). It selects
++	CONFIG_NETFILTER_XT_EXTMARK (combined mark/MARK module).
++
+ config NETFILTER_XT_MATCH_MULTIPORT
+ 	tristate '"multiport" Multiple port match support'
+ 	depends on NETFILTER_ADVANCED
+diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -69,6 +69,7 @@ obj-$(CONFIG_NETFILTER_XTABLES) += x_tab
+ 
+ # combos
+ obj-$(CONFIG_NETFILTER_XT_MARK) += xt_mark.o
++obj-$(CONFIG_NETFILTER_XT_EXTMARK) += xt_extmark.o
+ obj-$(CONFIG_NETFILTER_XT_CONNMARK) += xt_connmark.o
+ obj-$(CONFIG_NETFILTER_XT_SET) += xt_set.o
+ obj-$(CONFIG_NF_NAT) += xt_nat.o
+diff --git a/net/netfilter/xt_extmark.c b/net/netfilter/xt_extmark.c
+new file mode 100644
+--- /dev/null
++++ b/net/netfilter/xt_extmark.c
+@@ -0,0 +1,84 @@
++/*
++ *	xt_extmark - Netfilter module to match NFEXTMARK value
++ *
++ *	(C) 1999-2001 Marc Boucher <marc@mbsi.ca>
++ *	Copyright © CC Computer Consultants GmbH, 2007 - 2008
++ *	Jan Engelhardt <jengelh@medozas.de>
++ *
++ *	This program is free software; you can redistribute it and/or modify
++ *	it under the terms of the GNU General Public License version 2 as
++ *	published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/skbuff.h>
++
++#include <linux/netfilter/xt_extmark.h>
++#include <linux/netfilter/x_tables.h>
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Marc Boucher <marc@mbsi.ca>");
++MODULE_DESCRIPTION("Xtables: packet extmark operations");
++MODULE_ALIAS("ipt_extmark");
++MODULE_ALIAS("ip6t_extmark");
++MODULE_ALIAS("ipt_EXTMARK");
++MODULE_ALIAS("ip6t_EXTMARK");
++
++static unsigned int
++extmark_tg(struct sk_buff *skb, const struct xt_action_param *par)
++{
++	const struct xt_extmark_tginfo2 *info = par->targinfo;
++
++	skb->extmark = (skb->extmark & ~info->mask) ^ info->extmark;
++	return XT_CONTINUE;
++}
++
++static bool
++extmark_mt(const struct sk_buff *skb, struct xt_action_param *par)
++{
++	const struct xt_extmark_mtinfo1 *info = par->matchinfo;
++
++	return ((skb->extmark & info->mask) == info->extmark) ^ info->invert;
++}
++
++static struct xt_target extmark_tg_reg __read_mostly = {
++	.name           = "EXTMARK",
++	.revision       = 2,
++	.family         = NFPROTO_UNSPEC,
++	.target         = extmark_tg,
++	.targetsize     = sizeof(struct xt_extmark_tginfo2),
++	.me             = THIS_MODULE,
++};
++
++static struct xt_match extmark_mt_reg __read_mostly = {
++	.name           = "extmark",
++	.revision       = 1,
++	.family         = NFPROTO_UNSPEC,
++	.match          = extmark_mt,
++	.matchsize      = sizeof(struct xt_extmark_mtinfo1),
++	.me             = THIS_MODULE,
++};
++
++static int __init extmark_mt_init(void)
++{
++	int ret;
++
++	ret = xt_register_target(&extmark_tg_reg);
++	if (ret < 0)
++		return ret;
++	ret = xt_register_match(&extmark_mt_reg);
++	if (ret < 0) {
++		xt_unregister_target(&extmark_tg_reg);
++		return ret;
++	}
++	return 0;
++}
++
++static void __exit extmark_mt_exit(void)
++{
++	xt_unregister_match(&extmark_mt_reg);
++	xt_unregister_target(&extmark_tg_reg);
++}
++
++module_init(extmark_mt_init);
++module_exit(extmark_mt_exit);

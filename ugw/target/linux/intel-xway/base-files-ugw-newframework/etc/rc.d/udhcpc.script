@@ -1,0 +1,222 @@
+#!/bin/sh
+
+#705221:Pramod start
+if [ ! "$CONFIGLOADED" ]; then
+	if [ -r /etc/rc.d/config.sh ]; then
+		. /etc/rc.d/config.sh 2>/dev/null
+		CONFIGLOADED="1"
+	fi
+fi
+
+if [ ! "$ENVLOADED" ]; then
+	if [ -r /etc/rc.conf ]; then
+		 . /etc/rc.conf 2> /dev/null
+		ENVLOADED="1"
+	fi
+fi
+#705221:Pramod end
+
+# TBD : check if interface name is 'pppXX'
+# if so, then refer to ppp section else ip section
+# currently hard coded to refer to ip section
+i=0
+while [ $i -lt $wan_ip_Count ]
+do
+	eval wan_iface='$'wanip_${i}_iface
+	if [ "$wan_iface" = "$interface" ]; then
+		eval addr_type='$'wanip_${i}_addrType
+		if [ "$addr_type" = "1" ]; then
+			eval link_type='$'wanip_${i}_linkType
+			# TBD : retrieve DNS from DNS CFG section in case of static config
+			# eval dns_override='$'wanip_${i}_DNSOverride
+			# eval file_dns='$'wanip_${i}_DNSServers
+			wan_idx=$i
+			wan_t="ip"
+			wan_type_i="IP"
+			break
+		fi
+	fi
+	i=`expr $i + 1`
+done
+
+if [ "$link_type" -ne "4" ]; then # PPPoE
+				echo "/sbin/ifconfig $interface $ip broadcast $BROADCAST netmask $NETMASK up" > /tmp/dhcp_log
+
+if [ "$1x" = "x" ]; then
+	echo "Error: should be called from udhcpc"
+else #[
+
+#[ -z "$1" ] && echo "Error: should be called from udhcpc" && exit 1
+
+	RESOLV_CONF="/etc/resolv.conf"
+	[ -n "$broadcast" ] && BROADCAST="$broadcast"
+	[ -n "$subnet" ] && NETMASK="$subnet"
+	[ -n "$mtu" ] && MTU="$mtu"
+	if [ -n "$CONFIG_FEATURE_IFX_TR69_DEVICE" -a "$CONFIG_FEATURE_IFX_TR69_DEVICE" = "1" ]; then
+		# lan dhcp config
+		case "$1" in
+			deconfig)
+				/sbin/ifconfig $interface 0.0.0.0
+		
+				;;
+			renew)
+				echo "IP renewing..."
+				;;
+			bound)
+				if [ -n "$BROADCAST" ]; then
+					/sbin/ifconfig $interface $ip broadcast $BROADCAST netmask $NETMASK up
+				else
+					if  [ "$link_type" = "2" ]; then
+						/sbin/ifconfig $interface $ip netmask $NETMASK pointopoint $router up
+					else  
+						/sbin/ifconfig $interface $ip netmask $NETMASK up
+					fi
+				fi
+
+				# add default route with gateway from env - router
+				route add default gw $router
+
+				# read each dns server ip address from env and put in /etc/resolv.conf
+				echo -n > /etc/resolv.conf
+				for i in $dns ; do
+					echo "nameserver $i" >> /etc/resolv.conf
+				done
+				
+				;;
+		esac
+	else
+		case "$1" in
+			deconfig)
+				/sbin/ifconfig $interface 0.0.0.0
+				echo "calling stop_wan_services ${wan_t} $wan_idx" >> /tmp/1dhcp_log
+                                source /etc/rc.d/wanservices_routines.sh
+                                stop_wan_services ${wan_t} $wan_idx
+				
+				# If LTE, then update LTE status as inactive.
+				eval wan_mode='$'wanip_${wan_idx}_wanMode
+				if [ "$wan_mode" = "7" -a -f /tmp/cwan_status.txt ]; then
+						sed -i 's/cellWanSta.*/cellWanSta 0/g' /tmp/cwan_status.txt
+				fi
+
+				#705184:Pramod start
+				# TBD
+				#if [ "$CONFIG_PACKAGE_LTQ_DEVM" = "1" ]; then
+				#	# call event utility with interface down
+				#	/usr/sbin/ifx_event_util "WAN_INTERFACE" "DOWN" "wan_main" "wan_index" "$wan_idx"
+				#fi
+				#705184:Pramod end
+				;;
+			renew)
+				echo "IP renewing..."
+				;;
+			leasefail)
+				echo "IP Lease Failed..."
+				# Switch on the RED Internet LED - unable to contact DHCP Server
+
+				if [ -n "`/bin/cat /tmp/adsl_status | grep "7"`" ]; then
+					if [ "$CONFIG_FEATURE_LED" = "1" ]; then
+						if [ ! -f /sys/class/leds/internet_red_led/ ] ; then
+							echo none > /sys/class/leds/internet_led/trigger
+							echo 0 > /sys/class/leds/internet_led/brightness
+						fi
+					fi	
+					if [ "$CONFIG_FEATURE_LED_INTERNET_RED" = "1" ]; then
+						if [ ! -f /sys/class/leds/internet_red_led/ ] ; then
+		        	        		echo none > /sys/class/leds/internet_red_led/trigger
+		                			echo 1 > /sys/class/leds/internet_red_led/brightness
+						fi
+					fi	
+				else
+					if [ "$CONFIG_FEATURE_LED" = "1" ]; then
+						if [ ! -f /sys/class/leds/internet_red_led/ ] ; then
+							echo none > /sys/class/leds/internet_led/trigger
+			                		echo 0 > /sys/class/leds/internet_led/brightness
+						fi
+					fi	
+					if [ "$CONFIG_FEATURE_LED_INTERNET_RED" = "1" ]; then
+						if [ ! -f /sys/class/leds/internet_red_led/ ] ; then
+		        	        		echo none > /sys/class/leds/internet_red_led/trigger
+		                			echo 0 > /sys/class/leds/internet_red_led/brightness
+						fi
+					fi	
+				fi
+				;;
+			bound)
+				# First stop all the existing services
+				echo "calling stop_wan_services ${wan_t} $wan_idx" >> /tmp/1dhcp_log
+                                source /etc/rc.d/wanservices_routines.sh
+                                stop_wan_services ${wan_t} $wan_idx
+
+				echo "/sbin/ifconfig $interface $ip broadcast $BROADCAST netmask $NETMASK up" >> /tmp/1dhcp_log
+				if [ -n "$BROADCAST" ]; then
+					/sbin/ifconfig $interface $ip broadcast $BROADCAST netmask $NETMASK up
+				else 
+                                        if  [ "$link_type" = "2" ]; then
+                                                /sbin/ifconfig $interface $ip netmask $NETMASK pointopoint $router up
+					else
+						/sbin/ifconfig $interface $ip netmask $NETMASK up
+					fi
+				fi
+
+				count=1
+				for i in $router ; do
+						ROUTER="$ROUTER ROUTER$count $i"
+					count=$(( $count + 1 ))
+				done
+
+				# If LTE, then update LTE status as active.
+				eval wan_mode='$'wanip_${wan_idx}_wanMode
+				if [ "$wan_mode" = "7" -a -f /tmp/cwan_status.txt ]; then
+						sed -i 's/cellWanSta.*/cellWanSta 1/g' /tmp/cwan_status.txt
+				fi
+
+				eval dns_override='$'wanip_${wan_idx}_dnsoverride
+				# TBD : retrieve DNS from DNS CFG section in case of static config
+				if [ "$dns_override" = "1" ]; then # if DNS Override set get the DNS Servers' IP From Server
+					count=1
+					for i in $dns ; do
+						DNS_ARG="$DNS_ARG DNS$count $i"
+						count=$(( $count + 1 ))
+					done
+					/usr/sbin/status_oper SET "Wan${wan_type_i}${wan_idx}_DNS_SERVER" $DNS_ARG
+				else # if DNS Override is disabled get the DNS Servers' IP from rc.conf
+					eval file_dns='$'wanip_${wan_idx}_dnsservers
+#					dns_servers=`echo $file_dns | tr -s "," " "`
+					ORG_IFS=$IFS
+					IFS=","
+					count=1
+					for i in $dns_servers ; do
+						DNS_ARG="$DNS_ARG DNS$count $i"
+						count=$(( $count + 1 ))
+					done
+					IFS="$ORG_IFS"
+					/usr/sbin/status_oper SET "Wan${wan_type_i}${wan_idx}_DNS_SERVER" $DNS_ARG
+				fi
+	
+				/usr/sbin/status_oper SET "Wan${wan_type_i}${wan_idx}_GATEWAY" $ROUTER
+	
+				#705183:Pramod start
+				# TBD
+				if [ "$CONFIG_PACKAGE_LTQ_DEVM" = "1" ]; then
+				#	# call event utility for interface up
+					/usr/sbin/ifx_event_util "WAN_INTERFACE" "UP" "wan_ip" "wan_index" "$wan_idx"
+	
+				#	# TBD : can old type be ppp and new type be ip ? check with ipv6 team
+					old_ip=`/usr/sbin/status_oper GET "Wan${wan_t}${wan_idx}_IF_Info" IP`
+					if [ "$old_ip" != "$ip" ]; then
+						# call event utility with the new local ipaddress and wan index
+						/usr/sbin/ifx_event_util "WAN_IPADDRESS" "MOD" "wan_ip" "ipAddr" "$ip" "wan_index" "$wan_idx"
+					fi
+				fi
+				#705183:Pramod end
+	
+	
+				echo "calling start_wan_services ${wan_t} $wan_idx" >> /tmp/1dhcp_log
+				source /etc/rc.d/wanservices_routines.sh
+				start_wan_services ${wan_t} $wan_idx
+				;;
+		esac
+	fi
+fi #]
+fi
+	#exit 0

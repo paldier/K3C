@@ -1,0 +1,108 @@
+From ae9ec93b9a675c4e8d04bdc973764ff37ee4c305 Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Mon, 5 Sep 2016 16:21:20 +0300
+Subject: [PATCH 17/69] hostapd: mask out ht vht mcs bits
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ src/ap/ieee802_11_ht.c  |  6 ++++++
+ src/ap/ieee802_11_vht.c | 54 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/src/ap/ieee802_11_ht.c b/src/ap/ieee802_11_ht.c
+index 4bb827e..59fea56 100644
+--- a/src/ap/ieee802_11_ht.c
++++ b/src/ap/ieee802_11_ht.c
+@@ -525,6 +525,7 @@ void hostapd_get_ht_capab(struct hostapd_data *hapd,
+ 			  struct ieee80211_ht_capabilities *neg_ht_cap)
+ {
+ 	u16 cap;
++	int i;
+ 
+ 	if (ht_cap == NULL)
+ 		return;
+@@ -550,6 +551,11 @@ void hostapd_get_ht_capab(struct hostapd_data *hapd,
+ 		cap &= ~HT_CAP_INFO_RX_STBC_MASK;
+ 
+ 	neg_ht_cap->ht_capabilities_info = host_to_le16(cap);
++
++	/* mask out supported MCS set vs our own MCS set */
++	for (i = 0; i < sizeof(neg_ht_cap->supported_mcs_set); i++) {
++		neg_ht_cap->supported_mcs_set[i] = ht_cap->supported_mcs_set[i] & hapd->iface->current_mode->mcs_set[i];
++	}
+ }
+ 
+ 
+diff --git a/src/ap/ieee802_11_vht.c b/src/ap/ieee802_11_vht.c
+index 0841898..208a772 100644
+--- a/src/ap/ieee802_11_vht.c
++++ b/src/ap/ieee802_11_vht.c
+@@ -418,6 +418,38 @@ u16 set_sta_vht_opmode(struct hostapd_data *hapd, struct sta_info *sta,
+ 	return WLAN_STATUS_SUCCESS;
+ }
+ 
++#ifndef MIN
++#define MIN(x,y) ((x) < (y) ? (x) : (y))
++#endif
++
++static inline u16 limit_rx_tx_highest (u16 x, u16 y) {
++	u16 res = 0;
++	x = le_to_host16(x);
++	y = le_to_host16(y);
++	if (!x)
++		res = y;
++	else if (!y)
++		res = x;
++	else
++		res = MIN(x, y);
++	return host_to_le16(res);
++}
++
++static inline u16 limit_rx_tx_map (u16 x, u16 y) {
++	u16 res = 0;
++	int i;
++	for (i = 0; i < 16; i+=2) {
++		u16 mask = 3 << i;
++		u16 r1 = x & mask;
++		u16 r2 = y & mask;
++		if (r1 == mask || r2 == mask) {
++			res |= mask;
++		} else {
++			res |= MIN(r1, r2);
++		}
++	}
++	return res;
++}
+ 
+ void hostapd_get_vht_capab(struct hostapd_data *hapd,
+ 			   struct ieee80211_vht_capabilities *vht_cap,
+@@ -479,4 +511,26 @@ void hostapd_get_vht_capab(struct hostapd_data *hapd,
+ 		cap &= ~VHT_CAP_RXSTBC_MASK;
+ 
+ 	neg_vht_cap->vht_capabilities_info = host_to_le32(cap);
++
++	/* mask out supported MCS set vs our own MCS set */
++	{
++		u16 our_mcs_set[4];
++
++		os_memcpy(our_mcs_set, hapd->iface->current_mode->vht_mcs_set, sizeof(our_mcs_set));
++		/* RX highest vs our TX highest*/
++		neg_vht_cap->vht_supported_mcs_set.rx_highest =
++			limit_rx_tx_highest(neg_vht_cap->vht_supported_mcs_set.rx_highest, our_mcs_set[3]);
++
++		/* TX highest vs our RX highest*/
++		neg_vht_cap->vht_supported_mcs_set.tx_highest =
++			limit_rx_tx_highest(neg_vht_cap->vht_supported_mcs_set.tx_highest, our_mcs_set[1]);
++
++		/* RX map vs our TX map */
++		neg_vht_cap->vht_supported_mcs_set.rx_map =
++			limit_rx_tx_map(neg_vht_cap->vht_supported_mcs_set.rx_map, our_mcs_set[2]);
++
++		/* TX map vs our RX map */
++		neg_vht_cap->vht_supported_mcs_set.tx_map =
++			limit_rx_tx_map(neg_vht_cap->vht_supported_mcs_set.tx_map, our_mcs_set[0]);
++	}
+ }
+-- 
+1.8.3.4
+

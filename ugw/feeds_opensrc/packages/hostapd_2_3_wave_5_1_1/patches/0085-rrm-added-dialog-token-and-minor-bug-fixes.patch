@@ -1,0 +1,1213 @@
+From 88a6de2d633b98d6525fb473b7a6bf4c708f2f7a Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Wed, 23 Nov 2016 14:44:14 +0200
+Subject: [PATCH 5/6] rrm: added dialog token and minor bug fixes
+
+added dialog token as return to the cli rrm get functions
+and added dialog token to rrm response notifications.
+
+split the vap measurements to 2 different structs
+
+bug fixes
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/ctrl_iface.c         | 251 ++++++++++++---------------------------
+ src/ap/ap_drv_ops.h          |   4 +-
+ src/ap/rrm.c                 | 273 ++++++++++++++++++++-----------------------
+ src/common/ieee802_11_defs.h |   6 +
+ src/drivers/driver.h         |  17 +--
+ src/drivers/driver_nl80211.c |  12 +-
+ src/utils/common.c           |  21 ++++
+ src/utils/common.h           |   1 +
+ 8 files changed, 247 insertions(+), 338 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 792fc6f..0793b7e 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2594,11 +2594,13 @@ exit:
+ 			ap_ch_rep_len, req_elem_p, req_elem_len);
+ }
+ 
+-static int hostapd_ctrl_iface_req_link_measurement(struct hostapd_data *hapd,
+ 		char *cmd)
+ {
++static int hostapd_ctrl_iface_req_link_measurement(struct hostapd_data *hapd,
++		char *cmd, char *buf, size_t buflen)
+ 	u8 addr[ETH_ALEN];
+ 	char *token, *context = NULL;
++	int ret_dialog_token;
+ 
+ 	token = str_token(cmd, " ", &context);
+ 	if (!token || hwaddr_aton(token, addr)) {
+@@ -2606,7 +2608,11 @@ static int hostapd_ctrl_iface_req_link_measurement(struct hostapd_data *hapd,
+ 		return -1;
+ 	}
+ 
+-	return hostapd_send_link_measurement_req(hapd, addr);
++	ret_dialog_token = hostapd_send_link_measurement_req(hapd, addr);
++
++	if (ret_dialog_token < 0)
++		return -1;
++	return os_snprintf(buf, buflen, "dialog_token=%d\n", ret_dialog_token);
+ }
+ 
+ static int hostapd_ctrl_iface_link_measurement_report(struct hostapd_data *hapd,
+@@ -2928,13 +2934,15 @@ static int parse_trigger_reporting_counters(char *token, char *pos, char *str,
+ 	return 0;
+ }
+ 
+-static int hostapd_ctrl_iface_req_sta_statistics(struct hostapd_data *hapd, char *cmd)
++static int hostapd_ctrl_iface_req_sta_statistics(struct hostapd_data *hapd,
++		char *cmd, char *buf, size_t buflen)
+ {
+ 	u8 addr[ETH_ALEN], peer_addr[ETH_ALEN];
+ 	char *token, *context = NULL;
+ 	int group_identity, random_interval, measurement_duration;
+ 	int num_of_repetitions, measurement_request_mode, ret;
+ 	char *pos, *cmd_end;
++	int ret_dialog_token;
+ 
+ 	struct rrm_trig_rep_counters trig_rep_sta_counters;
+ 	struct rrm_trig_rep_counters *trig_rep_sta_counters_p = NULL;
+@@ -3053,10 +3061,15 @@ static int hostapd_ctrl_iface_req_sta_statistics(struct hostapd_data *hapd, char
+ 		trig_rep_rsna_counters_p = &trig_rep_rsna_counters;
+ 
+ exit:
+-	return hostapd_send_sta_statistics_req(hapd, addr, num_of_repetitions,
+-			measurement_request_mode, peer_addr, random_interval,
+-			measurement_duration, group_identity, trig_rep_sta_counters_p,
+-			trig_rep_qos_sta_counters_p, trig_rep_rsna_counters_p);
++	ret_dialog_token =  hostapd_send_sta_statistics_req(hapd, addr,
++			num_of_repetitions, measurement_request_mode, peer_addr,
++			random_interval, measurement_duration, group_identity,
++			trig_rep_sta_counters_p, trig_rep_qos_sta_counters_p,
++			trig_rep_rsna_counters_p);
++
++	if (ret_dialog_token < 0)
++		return -1;
++	return os_snprintf(buf, buflen, "dialog_token=%d\n", ret_dialog_token);
+ }
+ 
+ static int hostapd_ctrl_iface_report_sta_statistics(struct hostapd_data *hapd,
+@@ -3219,13 +3232,15 @@ exit:
+ 			rep_reason_p);
+ }
+ 
+-static int hostapd_ctrl_iface_req_channel_load(struct hostapd_data *hapd, char *cmd)
++static int hostapd_ctrl_iface_req_channel_load(struct hostapd_data *hapd,
++		char *cmd, char *buf, size_t buflen)
+ {
+ 	u8 addr[ETH_ALEN];
+ 	char *token, *context = NULL;
+ 	char *pos, *cmd_end;
+ 	int op_class, channel, random_interval, measurement_duration;
+ 	int num_of_repetitions, measurement_request_mode;
++	int ret_dialog_token;
+ 
+ 	u8 rep_cond, ch_load_ref_val;
+ 	u8 *rep_cond_p = NULL, *ch_load_ref_val_p = NULL;
+@@ -3410,11 +3425,15 @@ static int hostapd_ctrl_iface_req_channel_load(struct hostapd_data *hapd, char *
+ 	}
+ 
+ exit:
+-	return hostapd_send_channel_load_req(hapd, addr, num_of_repetitions,
+-			measurement_request_mode, op_class, channel, random_interval,
+-			measurement_duration, rep_cond_p, ch_load_ref_val_p,
+-			channel_width_p, channel_center_frequency0_p,
++	ret_dialog_token = hostapd_send_channel_load_req(hapd, addr,
++			num_of_repetitions, measurement_request_mode, op_class, channel,
++			random_interval, measurement_duration, rep_cond_p,
++			ch_load_ref_val_p, channel_width_p, channel_center_frequency0_p,
+ 			channel_center_frequency1_p);
++
++	if (ret_dialog_token < 0)
++		return -1;
++	return os_snprintf(buf, buflen, "dialog_token=%d\n", ret_dialog_token);
+ }
+ 
+ static int hostapd_ctrl_iface_report_channel_load(struct hostapd_data *hapd,
+@@ -3605,13 +3624,15 @@ exit:
+ 			channel_center_frequency0_p, channel_center_frequency1_p);
+ }
+ 
+-static int hostapd_ctrl_iface_req_noise_histogram(struct hostapd_data *hapd, char *cmd)
++static int hostapd_ctrl_iface_req_noise_histogram(struct hostapd_data *hapd,
++		char *cmd, char *buf, size_t buflen)
+ {
+ 	u8 addr[ETH_ALEN];
+ 	char *token, *context = NULL;
+ 	char *pos, *cmd_end;
+ 	int op_class, channel, random_interval, measurement_duration;
+ 	int num_of_repetitions, measurement_request_mode;
++	int ret_dialog_token;
+ 
+ 	u8 rep_cond, anpi_ref_val;
+ 	u8 *rep_cond_p = NULL, *anpi_ref_val_p = NULL;
+@@ -3796,11 +3817,15 @@ static int hostapd_ctrl_iface_req_noise_histogram(struct hostapd_data *hapd, cha
+ 	}
+ 
+ exit:
+-	return hostapd_send_noise_histogram_req(hapd, addr, num_of_repetitions,
+-			measurement_request_mode, op_class, channel, random_interval,
+-			measurement_duration, rep_cond_p, anpi_ref_val_p,
++	ret_dialog_token = hostapd_send_noise_histogram_req(hapd, addr,
++			num_of_repetitions, measurement_request_mode, op_class, channel,
++			random_interval, measurement_duration, rep_cond_p, anpi_ref_val_p,
+ 			channel_width_p, channel_center_frequency0_p,
+ 			channel_center_frequency1_p);
++
++	if (ret_dialog_token < 0)
++		return -1;
++	return os_snprintf(buf, buflen, "dialog_token=%d\n", ret_dialog_token);
+ }
+ 
+ static int hostapd_ctrl_iface_report_noise_histogram(struct hostapd_data *hapd,
+@@ -4484,11 +4509,6 @@ int hostapd_ctrl_iface_get_sta_measurements(struct hostapd_data *hapd,
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+-  ret = os_snprintf(buf + len, buflen - len, "TxMgmtPwr=%d\n",
+-    sta_info.TxMgmtPwr);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "ErrorsSent=UNKNOWN\n");
+   if (ret >= buflen - len || ret < 0)
+     return len;
+@@ -4523,7 +4543,7 @@ int hostapd_ctrl_iface_get_vap_measurements(struct hostapd_data *hapd,
+   const char *cmd, char *buf, size_t buflen)
+ {
+   int ret, len = 0;
+-  struct mtlk_wssa_drv_tr181_vap_stats vap_stats;
++  struct mtlk_vap_info vap_info;
+ 
+   hapd = get_bss_index(cmd, hapd->iface);
+   if (hapd == NULL) {
+@@ -4533,7 +4553,7 @@ int hostapd_ctrl_iface_get_vap_measurements(struct hostapd_data *hapd,
+     return ret;
+   }
+ 
+-  ret = hostapd_drv_get_vap_measurements(hapd, &vap_stats);
++  ret = hostapd_drv_get_vap_measurements(hapd, &vap_info);
+   if (ret) {
+     ret = os_snprintf(buf, buflen, "FAIL: vap measurements\n");
+     if (ret < 0 || (size_t) ret >= buflen)
+@@ -4564,237 +4584,111 @@ int hostapd_ctrl_iface_get_vap_measurements(struct hostapd_data *hapd,
+   len += ret;
+   /* Device.WiFi.SSID.{i}.Stats. */
+   ret = os_snprintf(buf + len, buflen - len, "BytesSent=%d\n",
+-    vap_stats.traffic_stats.BytesSent);
++		  vap_info.vap_stats.traffic_stats.BytesSent);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "BytesReceived=%d\n",
+-    vap_stats.traffic_stats.BytesReceived);
++		  vap_info.vap_stats.traffic_stats.BytesReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "PacketsSent=%d\n",
+-    vap_stats.traffic_stats.PacketsSent);
++		  vap_info.vap_stats.traffic_stats.PacketsSent);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "PacketsReceived=%d\n",
+-    vap_stats.traffic_stats.PacketsReceived);
++		  vap_info.vap_stats.traffic_stats.PacketsReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "ErrorsSent=%d\n",
+-    vap_stats.error_stats.ErrorsSent);
++		  vap_info.vap_stats.error_stats.ErrorsSent);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "RetransCount=%d\n",
+-    vap_stats.RetransCount);
++		  vap_info.vap_stats.RetransCount);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "FailedRetransCount=%d\n",
+-    vap_stats.FailedRetransCount);
++		  vap_info.vap_stats.FailedRetransCount);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "RetryCount=%d\n",
+-    vap_stats.RetryCount);
++		  vap_info.vap_stats.RetryCount);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "MultipleRetryCount=%d\n",
+-    vap_stats.MultipleRetryCount);
++		  vap_info.vap_stats.MultipleRetryCount);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "ACKFailureCount=%d\n",
+-    vap_stats.ACKFailureCount);
++		  vap_info.vap_stats.ACKFailureCount);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "AggregatedPacketCount=%d\n",
+-    vap_stats.AggregatedPacketCount);
++		  vap_info.vap_stats.AggregatedPacketCount);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "ErrorsReceived=%d\n",
+-    vap_stats.error_stats.ErrorsReceived);
++		  vap_info.vap_stats.error_stats.ErrorsReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "UnicastPacketsSent=%d\n",
+-    vap_stats.traffic_stats.UnicastPacketsSent);
++		  vap_info.vap_stats.traffic_stats.UnicastPacketsSent);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "UnicastPacketsReceived=%d\n",
+-    vap_stats.traffic_stats.UnicastPacketsReceived);
++		  vap_info.vap_stats.traffic_stats.UnicastPacketsReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "DiscardPacketsSent=%d\n",
+-    vap_stats.error_stats.DiscardPacketsSent);
++		  vap_info.vap_stats.error_stats.DiscardPacketsSent);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "DiscardPacketsReceived=%d\n",
+-    vap_stats.error_stats.DiscardPacketsReceived);
++		  vap_info.vap_stats.error_stats.DiscardPacketsReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "MulticastPacketsSent=%d\n",
+-    vap_stats.traffic_stats.MulticastPacketsSent);
++		  vap_info.vap_stats.traffic_stats.MulticastPacketsSent);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len,
+     "MulticastPacketsReceived=%d\n",
+-    vap_stats.traffic_stats.MulticastPacketsReceived);
++	vap_info.vap_stats.traffic_stats.MulticastPacketsReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len,
+     "BroadcastPacketsSent=%d\n",
+-    vap_stats.traffic_stats.BroadcastPacketsSent);
++	vap_info.vap_stats.traffic_stats.BroadcastPacketsSent);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len,
+     "BroadcastPacketsReceived=%d\n",
+-    vap_stats.traffic_stats.BroadcastPacketsReceived);
++	vap_info.vap_stats.traffic_stats.BroadcastPacketsReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+   ret = os_snprintf(buf + len, buflen - len,
+     "UnknownProtoPacketsReceived=%d\n",
+-    vap_stats.UnknownProtoPacketsReceived);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "RTSSuccessCount=%d\n",
+-    vap_stats.RTSSuccessCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "RTSFailureCount=%d\n",
+-    vap_stats.RTSFailureCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "TransmittedAMSDUCount=%d\n",
+-    vap_stats.TransmittedAMSDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "FailedAMSDUCount=%d\n",
+-    vap_stats.FailedAMSDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "TransmittedOctetsInAMSDUCount=%lld\n",
+-    vap_stats.TransmittedOctetsInAMSDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "AMSDUAckFailureCount=%d\n",
+-    vap_stats.AMSDUAckFailureCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "ReceivedAMSDUCount=%d\n",
+-    vap_stats.ReceivedAMSDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "ReceivedOctetsInAMSDUCount=%lld\n",
+-    vap_stats.ReceivedOctetsInAMSDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "TransmittedAMPDUCount=%d\n",
+-    vap_stats.TransmittedAMPDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "TransmittedMPDUsInAMPDUCount=%d\n",
+-    vap_stats.TransmittedMPDUsInAMPDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "TransmittedOctetsInAMPDUCount=%lld\n",
+-    vap_stats.TransmittedOctetsInAMPDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "AMPDUReceivedCount=%d\n",
+-    vap_stats.AMPDUReceivedCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "MPDUInReceivedAMPDUCount=%d\n",
+-    vap_stats.MPDUInReceivedAMPDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "ReceivedOctetsInAMPDUCount=%lld\n",
+-    vap_stats.ReceivedOctetsInAMPDUCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "ImplicitBARFailureCount=%d\n",
+-    vap_stats.ImplicitBARFailureCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "ExplicitBARFailureCount=%d\n",
+-    vap_stats.ExplicitBARFailureCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "TwentyMHzFrameTransmittedCount=%d\n",
+-    vap_stats.TwentyMHzFrameTransmittedCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "FortyMHzFrameTransmittedCount=%d\n",
+-    vap_stats.FortyMHzFrameTransmittedCount);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "SwitchChannel20To40=%d\n",
+-    vap_stats.SwitchChannel20To40);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "SwitchChannel40To20=%d\n",
+-    vap_stats.SwitchChannel40To20);
+-  if (ret >= buflen - len || ret < 0)
+-    return len;
+-  len += ret;
+-  ret = os_snprintf(buf + len, buflen - len,
+-    "FrameDuplicateCount=%d\n",
+-    vap_stats.FrameDuplicateCount);
++	vap_info.vap_stats.UnknownProtoPacketsReceived);
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
+@@ -5878,27 +5772,28 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "REQ_BEACON ", 11) == 0) {
+ 		if (hostapd_ctrl_iface_req_beacon(hapd, buf + 11))
+ 			reply_len = -1;
+-	} else if (os_strncmp(buf, "REQ_CHANNEL_LOAD ", 17) == 0) {
+-		if (hostapd_ctrl_iface_req_channel_load(hapd, buf + 17))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "REQ_CHANNEL_LOAD ", 17) == 0) {
++		reply_len = hostapd_ctrl_iface_req_channel_load(hapd, buf + 17,
++				reply, reply_size);
+ 	} else if (os_strncmp(buf, "REPORT_CHANNEL_LOAD ", 20) == 0) {
+ 		if (hostapd_ctrl_iface_report_channel_load(hapd, buf + 20))
+ 			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_NOISE_HISTOGRAM ", 20) == 0) {
+-		if (hostapd_ctrl_iface_req_noise_histogram(hapd, buf + 20))
+-			reply_len = -1;
++		reply_len = hostapd_ctrl_iface_req_noise_histogram(hapd, buf + 20,
++				reply, reply_size);
+ 	} else if (os_strncmp(buf, "REPORT_NOISE_HISTOGRAM ", 23) == 0) {
+ 		if (hostapd_ctrl_iface_report_noise_histogram(hapd, buf + 23))
+ 			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_LINK_MEASUREMENT ", 21) == 0) {
+-		if (hostapd_ctrl_iface_req_link_measurement(hapd, buf + 21))
+-			reply_len = -1;
++		reply_len = hostapd_ctrl_iface_req_link_measurement(hapd, buf + 21,
++				reply, reply_size);
+ 	} else if (os_strncmp(buf, "LINK_MEASUREMENT_REPORT ", 24) == 0) {
+ 		if (hostapd_ctrl_iface_link_measurement_report(hapd, buf + 24))
+ 			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_STA_STATISTICS ", 19) == 0) {
+-		if (hostapd_ctrl_iface_req_sta_statistics(hapd, buf + 19))
+-			reply_len = -1;
++		reply_len = hostapd_ctrl_iface_req_sta_statistics(hapd, buf + 19,
++				reply, reply_size);
+ 	} else if (os_strncmp(buf, "REPORT_STA_STATISTICS ", 22) == 0) {
+ 		if (hostapd_ctrl_iface_report_sta_statistics(hapd, buf + 22))
+ 			reply_len = -1;
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 1069bff..8d9f5b3 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -386,12 +386,12 @@ static inline int hostapd_drv_get_sta_measurements(struct hostapd_data *hapd,
+ }
+ 
+ static inline int hostapd_drv_get_vap_measurements(struct hostapd_data *hapd,
+-  struct mtlk_wssa_drv_tr181_vap_stats *vap_stats)
++		struct mtlk_vap_info *vap_info)
+ {
+   if (hapd->driver == NULL || hapd->driver->get_vap_measurements == NULL)
+     return -ENOTSUP;
+ 
+-  return hapd->driver->get_vap_measurements(hapd->drv_priv, vap_stats);
++  return hapd->driver->get_vap_measurements(hapd->drv_priv, vap_info);
+ }
+ 
+ static inline int hostapd_drv_get_radio_info(struct hostapd_data *hapd,
+diff --git a/src/ap/rrm.c b/src/ap/rrm.c
+index 53fef90..dfd55ff 100644
+--- a/src/ap/rrm.c
++++ b/src/ap/rrm.c
+@@ -22,9 +22,6 @@
+ 
+ #define HOSTAPD_RRM_REQUEST_TIMEOUT 5
+ 
+-#define REP_MODE_INCAPBLE_BIT BIT(1)
+-#define REP_MODE_REFUSED_BIT  BIT(2)
+-#define REP_MODE_LATE_BIT     BIT(3)
+ 
+ static void hostapd_lci_rep_timeout_handler(void *eloop_data, void *user_ctx)
+ {
+@@ -74,18 +71,7 @@ static void hostapd_handle_range_report(struct hostapd_data *hapd, u8 token,
+ 	wpa_printf(MSG_DEBUG, "Range report token %u len %zu", token, len);
+ }
+ 
+-
+-static void hostapd_beacon_rep_timeout_handler(void *eloop_data, void *user_ctx)
+-{
+-	struct hostapd_data *hapd = eloop_data;
+-
+-	wpa_printf(MSG_DEBUG, "RRM: beacon request (token %u) timed out",
+-			hapd->beacon_req_token);
+-	hapd->beacon_req_active = 0;
+-	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_BEACON_REP_FAILED);
+-}
+-
+-static void hostapd_send_general_rrm_incapble_report(struct hostapd_data *hapd,
++static void hostapd_send_general_rrm_report(struct hostapd_data *hapd,
+ 		const u8 *sta_addr,u8 dialog_token, u8 measurement_token,
+ 		u8 measurement_rep_mode, enum measure_type measure_type)
+ {
+@@ -161,7 +147,7 @@ static void hostapd_handle_channel_load_request(struct hostapd_data *hapd,
+ 	const u8 *ie, *end;
+ 	u8 op_class, channel, measurement_token;
+ 	u8 ch_load_rep_cond = 0, ch_load_ref_val = 0;
+-	u8 channel_load = 0, measurement_rep_mode = 0;
++	u8 channel_load = 0;
+ 	u16 measurement_duration_report = 0;
+ 	u64 start_time = 0;
+ 	mtlk_radio_info_t radio_info;
+@@ -173,9 +159,8 @@ static void hostapd_handle_channel_load_request(struct hostapd_data *hapd,
+ 
+ 	if (!(hapd->conf->radio_measurements[1] & WLAN_RRM_CAPS_CHANNEL_LOAD)) {
+ 		wpa_printf(MSG_ERROR, "channel load in RRM is not supported");
+-		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE,
+ 				MEASURE_TYPE_CHANNEL_LOAD);
+ 		return;
+ 	}
+@@ -183,18 +168,16 @@ static void hostapd_handle_channel_load_request(struct hostapd_data *hapd,
+ 	if (channel != hapd->iface->conf->channel) {
+ 		wpa_printf(MSG_DEBUG, "requested channel (%d) is not supported, only the current AP channel (%d) is supported",
+ 				channel, hapd->iface->conf->channel);
+-		measurement_rep_mode |= REP_MODE_REFUSED_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_REFUSE,
+ 				MEASURE_TYPE_CHANNEL_LOAD);
+ 		return;
+ 	}
+ 
+ 	if (hostapd_drv_get_radio_info(hapd, &radio_info)) {
+ 		wpa_printf(MSG_ERROR, "failed to get radio measurements");
+-		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE,
+ 				MEASURE_TYPE_CHANNEL_LOAD);
+ 		return;
+ 	}
+@@ -218,17 +201,18 @@ static void hostapd_handle_channel_load_request(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
+-	if (!hapd->conf->rrm_manipulate_measurement)
++	if (!hapd->conf->rrm_manipulate_measurement) {
+ 		hostapd_send_channel_load_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode, op_class, channel,
+-				start_time, measurement_duration_report, channel_load,
++				measurement_token, MEASUREMENT_REPORT_MODE_ACCEPT, op_class,
++				channel, start_time, measurement_duration_report, channel_load,
+ 				NULL, NULL, NULL);
+-	else
++	} else {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_CHANNEL_LOAD_REQUEST_RXED MACSTR
+ 			" dialog_token=%d measurement_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d channel_load=%d",
+-			MAC2STR(sta_addr), token, measurement_token, measurement_rep_mode,
+-			op_class, channel, start_time, measurement_duration_report,
+-			channel_load);
++			MAC2STR(sta_addr), token, measurement_token,
++			MEASUREMENT_REPORT_MODE_ACCEPT, op_class, channel, start_time,
++			measurement_duration_report, channel_load);
++	}
+ }
+ 
+ static void hostapd_handle_channel_load_report(struct hostapd_data *hapd,
+@@ -244,15 +228,15 @@ static void hostapd_handle_channel_load_report(struct hostapd_data *hapd,
+ 	measurement_rep_mode = pos[1];
+ 	if (measurement_rep_mode != 0) {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_CHANNEL_LOAD_RXED MACSTR
+-				" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d channel_load=%d",
+-				MAC2STR(sta_addr), measurement_rep_mode, 0, 0, 0, 0, 0);
++				" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d channel_load=%d",
++				MAC2STR(sta_addr), token, measurement_rep_mode, 0, 0, 0, 0, 0);
+ 		return;
+ 	}
+ 
+ 	op_class = pos[3];
+ 	channel = pos[4];
+-	start_time = WPA_GET_BE64(&pos[5]);
+-	measurement_duration = WPA_GET_BE16(&pos[13]);
++	start_time = WPA_GET_LE64(&pos[5]);
++	measurement_duration = WPA_GET_LE16(&pos[13]);
+ 	channel_load = pos[15];
+ 
+ 	wide_band_ch_switch[0] = '\0';
+@@ -261,8 +245,8 @@ static void hostapd_handle_channel_load_report(struct hostapd_data *hapd,
+ 			" wide_band_ch_switch=%d,%d,%d", pos[20], pos[21], pos[22]);
+ 
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_CHANNEL_LOAD_RXED MACSTR
+-			" measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d channel_load=%d%s",
+-			MAC2STR(sta_addr), measurement_rep_mode, op_class, channel,
++			" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d channel_load=%d%s",
++			MAC2STR(sta_addr), token, measurement_rep_mode, op_class, channel,
+ 			start_time, measurement_duration, channel_load,
+ 			wide_band_ch_switch);
+ }
+@@ -272,9 +256,8 @@ static void hostapd_handle_noise_histogram_request(struct hostapd_data *hapd,
+ 		u16 num_of_repetition)
+ {
+ 	const u8 *ie, *end;
+-	u8 op_class, channel, measurement_token;
++	u8 op_class, channel, measurement_token, ant_id = 0, anpi = 0;
+ 	u8 noise_histogram_rep_cond = 0, noise_histogram_ref_val = 0;
+-	u8 measurement_rep_mode = 0, ant_id = 0, anpi = 0;
+ 	u8 ipi_density[RRM_NOISE_HISTO_IPI_DENSITY_SIZE] = {};
+ 	u16 measurement_duration_report = 0;
+ 	u64 start_time = 0;
+@@ -289,9 +272,8 @@ static void hostapd_handle_noise_histogram_request(struct hostapd_data *hapd,
+ 
+ 	if (!(hapd->conf->radio_measurements[1] & WLAN_RRM_CAPS_NOISE_HISTOGRAM)) {
+ 		wpa_printf(MSG_ERROR, "noise histogram in RRM is not supported");
+-		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE,
+ 				MEASURE_TYPE_NOISE_HIST);
+ 		return;
+ 	}
+@@ -299,18 +281,16 @@ static void hostapd_handle_noise_histogram_request(struct hostapd_data *hapd,
+ 	if (channel != hapd->iface->conf->channel) {
+ 		wpa_printf(MSG_DEBUG, "requested channel (%d) is not supported, only the current AP channel (%d) is supported",
+ 				channel, hapd->iface->conf->channel);
+-		measurement_rep_mode |= REP_MODE_REFUSED_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_REFUSE,
+ 				MEASURE_TYPE_NOISE_HIST);
+ 		return;
+ 	}
+ 
+ 	if (hostapd_drv_get_radio_info(hapd, &radio_info)) {
+ 		wpa_printf(MSG_ERROR, "failed to get radio measurements");
+-		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE,
+ 				MEASURE_TYPE_NOISE_HIST);
+ 		return;
+ 	}
+@@ -348,17 +328,18 @@ static void hostapd_handle_noise_histogram_request(struct hostapd_data *hapd,
+ 		cur += ret;
+ 	}
+ 
+-	if (!hapd->conf->rrm_manipulate_measurement)
++	if (!hapd->conf->rrm_manipulate_measurement) {
+ 		hostapd_send_noise_histogram_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode, op_class, channel,
+-				start_time, measurement_duration_report, ant_id, anpi,
++				measurement_token, MEASUREMENT_REPORT_MODE_ACCEPT, op_class,
++				channel, start_time, measurement_duration_report, ant_id, anpi,
+ 				ipi_density, NULL, NULL, NULL);
+-	else
++	} else {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_NOISE_HISTOGRAM_REQUEST_RXED MACSTR
+ 			" dialog_token=%d measurement_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d antenna_id=%d anpi=%d%s",
+-			MAC2STR(sta_addr), token, measurement_token, measurement_rep_mode,
+-			op_class, channel, start_time, measurement_duration_report, ant_id,
+-			anpi, ipi_density_str);
++			MAC2STR(sta_addr), token, measurement_token,
++			MEASUREMENT_REPORT_MODE_ACCEPT, op_class, channel, start_time,
++			measurement_duration_report, ant_id, anpi, ipi_density_str);
++	}
+ }
+ 
+ static void hostapd_handle_noise_histogram_report(struct hostapd_data *hapd,
+@@ -377,15 +358,16 @@ static void hostapd_handle_noise_histogram_report(struct hostapd_data *hapd,
+ 	measurement_rep_mode = pos[1];
+ 	if (measurement_rep_mode != 0) {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_NOISE_HISTOGRAM_RXED MACSTR
+-				" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d antenna_id=%d anpi=%d ipi=0,0,0,0,0,0,0,0,0,0,0",
+-				MAC2STR(sta_addr), measurement_rep_mode, 0, 0, 0, 0, 0, 0);
++				" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d antenna_id=%d anpi=%d ipi=0,0,0,0,0,0,0,0,0,0,0",
++				MAC2STR(sta_addr), token, measurement_rep_mode,
++				0, 0, 0, 0, 0, 0);
+ 		return;
+ 	}
+ 
+ 	op_class = pos[3];
+ 	channel = pos[4];
+-	start_time = WPA_GET_BE64(&pos[5]);
+-	measurement_duration = WPA_GET_BE16(&pos[13]);
++	start_time = WPA_GET_LE64(&pos[5]);
++	measurement_duration = WPA_GET_LE16(&pos[13]);
+ 	ant_id = pos[15];
+ 	anpi = pos[16];
+ 
+@@ -406,8 +388,8 @@ static void hostapd_handle_noise_histogram_report(struct hostapd_data *hapd,
+ 			" wide_band_ch_switch=%d,%d,%d", pos[32], pos[33], pos[34]);
+ 
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_NOISE_HISTOGRAM_RXED MACSTR
+-			" measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d antenna_id=%d anpi=%d%s%s",
+-			MAC2STR(sta_addr), measurement_rep_mode, op_class, channel,
++			" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d antenna_id=%d anpi=%d%s%s",
++			MAC2STR(sta_addr), token, measurement_rep_mode, op_class, channel,
+ 			start_time, measurement_duration, ant_id, anpi, ipi_density,
+ 			wide_band_ch_switch);
+ }
+@@ -434,31 +416,29 @@ static void hostapd_handle_sta_statistics_request(struct hostapd_data *hapd,
+ 		u16 num_of_repetition)
+ {
+ 	u8 peer_addr[ETH_ALEN];
+-	u8 measurement_token, group_identity, measurement_rep_mode = 0;
++	u8 measurement_token, group_identity;
+ 	u16 measurement_duration_report = 0;
+ 	u32 statistics_group_data[RRM_STA_STATISTICS_GROUP_DATA_SIZE] = {};
+ 	u32 statistics_group_data_len = 0;
+ 	char statistics_group_data_str[128] = {};
+-	struct mtlk_wssa_drv_tr181_vap_stats vap_stats;
++	struct mtlk_vap_info vap_info;
+ 
+ 	measurement_token = pos[0];
+-	hwaddr_compact_aton((const char *) &pos[3], peer_addr);
++	os_memcpy(peer_addr, &pos[3], ETH_ALEN);
+ 	group_identity = pos[12];
+ 
+ 	if (!(hapd->conf->radio_measurements[1] & WLAN_RRM_CAPS_STATISTICS_MEASUREMENT)) {
+ 		wpa_printf(MSG_ERROR, "sta statistics in RRM is not supported");
+-		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE,
+ 				MEASURE_TYPE_STA_STATISTICS);
+ 		return;
+ 	}
+ 
+-	if (hostapd_drv_get_vap_measurements(hapd, &vap_stats)) {
++	if (hostapd_drv_get_vap_measurements(hapd, &vap_info)) {
+ 		wpa_printf(MSG_ERROR, "failed to get vap measurements");
+-		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE,
+ 				MEASURE_TYPE_STA_STATISTICS);
+ 		return;
+ 	}
+@@ -466,50 +446,50 @@ static void hostapd_handle_sta_statistics_request(struct hostapd_data *hapd,
+ 	statistics_group_data_len =
+ 			hostapd_get_statistics_group_data_len(group_identity);
+ 	if (group_identity == 1) {
+-		statistics_group_data[0] = vap_stats.RetryCount;
+-		statistics_group_data[1] = vap_stats.MultipleRetryCount;
+-		statistics_group_data[2] = vap_stats.FrameDuplicateCount;
+-		statistics_group_data[3] = vap_stats.RTSSuccessCount;
+-		statistics_group_data[4] = vap_stats.RTSFailureCount;
+-		statistics_group_data[5] = vap_stats.ACKFailureCount;
++		statistics_group_data[0] = vap_info.vap_stats.RetryCount;
++		statistics_group_data[1] = vap_info.vap_stats.MultipleRetryCount;
++		statistics_group_data[2] = vap_info.FrameDuplicateCount;
++		statistics_group_data[3] = vap_info.RTSSuccessCount;
++		statistics_group_data[4] = vap_info.RTSFailureCount;
++		statistics_group_data[5] = vap_info.vap_stats.ACKFailureCount;
+ 		build_statistics_group_str(statistics_group_data_str,
+ 				statistics_group_data, statistics_group_data_len);
+ 	} else if (group_identity == 11) {
+-		statistics_group_data[0] = vap_stats.TransmittedAMSDUCount;
+-		statistics_group_data[1] = vap_stats.FailedAMSDUCount;
+-		statistics_group_data[2] = vap_stats.RetryCount;
+-		statistics_group_data[3] = vap_stats.MultipleRetryCount;
++		statistics_group_data[0] = vap_info.TransmittedAMSDUCount;
++		statistics_group_data[1] = vap_info.FailedAMSDUCount;
++		statistics_group_data[2] = vap_info.vap_stats.RetryCount;
++		statistics_group_data[3] = vap_info.vap_stats.MultipleRetryCount;
+ 		os_memcpy(&statistics_group_data[4],
+-				&vap_stats.TransmittedOctetsInAMSDUCount,
+-				sizeof(vap_stats.TransmittedOctetsInAMSDUCount));
+-		statistics_group_data[6] = vap_stats.AMSDUAckFailureCount;
+-		statistics_group_data[7] = vap_stats.ReceivedAMSDUCount;
++				&vap_info.TransmittedOctetsInAMSDUCount,
++				sizeof(vap_info.TransmittedOctetsInAMSDUCount));
++		statistics_group_data[6] = vap_info.AMSDUAckFailureCount;
++		statistics_group_data[7] = vap_info.ReceivedAMSDUCount;
+ 		os_memcpy(&statistics_group_data[8],
+-				&vap_stats.ReceivedOctetsInAMSDUCount,
+-				sizeof(vap_stats.ReceivedOctetsInAMSDUCount));
++				&vap_info.ReceivedOctetsInAMSDUCount,
++				sizeof(vap_info.ReceivedOctetsInAMSDUCount));
+ 		build_statistics_group_str(statistics_group_data_str,
+ 						statistics_group_data, statistics_group_data_len);
+ 	} else if (group_identity == 12) {
+-		statistics_group_data[0] = vap_stats.TransmittedAMPDUCount;
+-		statistics_group_data[1] = vap_stats.TransmittedMPDUsInAMPDUCount;
++		statistics_group_data[0] = vap_info.TransmittedAMPDUCount;
++		statistics_group_data[1] = vap_info.TransmittedMPDUsInAMPDUCount;
+ 		os_memcpy(&statistics_group_data[2],
+-				&vap_stats.TransmittedOctetsInAMPDUCount,
+-				sizeof(vap_stats.TransmittedOctetsInAMPDUCount));
+-		statistics_group_data[4] = vap_stats.AMPDUReceivedCount;
+-		statistics_group_data[5] = vap_stats.MPDUInReceivedAMPDUCount;
++				&vap_info.TransmittedOctetsInAMPDUCount,
++				sizeof(vap_info.TransmittedOctetsInAMPDUCount));
++		statistics_group_data[4] = vap_info.AMPDUReceivedCount;
++		statistics_group_data[5] = vap_info.MPDUInReceivedAMPDUCount;
+ 		os_memcpy(&statistics_group_data[6],
+-				&vap_stats.ReceivedOctetsInAMPDUCount,
+-				sizeof(vap_stats.ReceivedOctetsInAMPDUCount));
++				&vap_info.ReceivedOctetsInAMPDUCount,
++				sizeof(vap_info.ReceivedOctetsInAMPDUCount));
+ 		statistics_group_data[8] = 0; /* AMPDUDelimiterCRCErrorCount unknown */
+ 		build_statistics_group_str(statistics_group_data_str,
+ 						statistics_group_data, statistics_group_data_len);
+ 	} else if (group_identity == 13) {
+-		statistics_group_data[0] = vap_stats.ImplicitBARFailureCount;
+-		statistics_group_data[1] = vap_stats.ExplicitBARFailureCount;
+-		statistics_group_data[2] = vap_stats.SwitchChannel20To40
+-								 + vap_stats.SwitchChannel40To20;
+-		statistics_group_data[3] = vap_stats.TwentyMHzFrameTransmittedCount;
+-		statistics_group_data[4] = vap_stats.FortyMHzFrameTransmittedCount;
++		statistics_group_data[0] = vap_info.ImplicitBARFailureCount;
++		statistics_group_data[1] = vap_info.ExplicitBARFailureCount;
++		statistics_group_data[2] = vap_info.SwitchChannel20To40
++								 + vap_info.SwitchChannel40To20;
++		statistics_group_data[3] = vap_info.TwentyMHzFrameTransmittedCount;
++		statistics_group_data[4] = vap_info.FortyMHzFrameTransmittedCount;
+ 		statistics_group_data[5] = 0; /* TwentyMHzFrameReceivedCount unknown */
+ 		statistics_group_data[6] = 0; /* FortyMHzFrameReceivedCount unknown */
+ 		statistics_group_data[7] = 0; /* PSMPUTTGrantDuration unknown */
+@@ -519,24 +499,24 @@ static void hostapd_handle_sta_statistics_request(struct hostapd_data *hapd,
+ 	} else {
+ 		wpa_printf(MSG_ERROR, "group_identity number %d is not supported",
+ 				group_identity);
+-		measurement_rep_mode |= REP_MODE_REFUSED_BIT;
+-		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_REFUSE,
+ 				MEASURE_TYPE_STA_STATISTICS);
+ 		return;
+ 	}
+ 
+-	if (!hapd->conf->rrm_manipulate_measurement)
++	if (!hapd->conf->rrm_manipulate_measurement) {
+ 		hostapd_send_sta_statistics_report(hapd, sta_addr, token,
+-				measurement_token, measurement_rep_mode,
++				measurement_token, MEASUREMENT_REPORT_MODE_ACCEPT,
+ 				measurement_duration_report, group_identity,
+ 				statistics_group_data, statistics_group_data_len, NULL);
+-	else
++	} else {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_STA_STATISTICS_REQUEST_RXED MACSTR
+ 			" dialog_token=%d measurement_token=%d measurement_rep_mode=%d duration=%d group_identity=%d%s",
+-			MAC2STR(sta_addr), token, measurement_token, measurement_rep_mode,
+-			measurement_duration_report, group_identity,
+-			statistics_group_data_str);
++			MAC2STR(sta_addr), token, measurement_token,
++			MEASUREMENT_REPORT_MODE_ACCEPT, measurement_duration_report,
++			group_identity, statistics_group_data_str);
++	}
+ }
+ 
+ static void hostapd_handle_sta_statistics_report(struct hostapd_data *hapd,
+@@ -553,12 +533,12 @@ static void hostapd_handle_sta_statistics_report(struct hostapd_data *hapd,
+ 	measurement_rep_mode = pos[1];
+ 	if (measurement_rep_mode != 0) {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_STA_STATISTICS_RXED MACSTR
+-				" measurement_rep_mode=%d duration=%d group_identity=%d statistics_group_data=0,0,0,0,0,0,0",
+-				MAC2STR(sta_addr), measurement_rep_mode, 0, 0);
++				" dialog_token=%d measurement_rep_mode=%d duration=%d group_identity=%d statistics_group_data=0,0,0,0,0,0,0",
++				MAC2STR(sta_addr), token, measurement_rep_mode, 0, 0);
+ 		return;
+ 	}
+ 
+-	measurement_duration = WPA_GET_BE16(&pos[3]);
++	measurement_duration = WPA_GET_LE16(&pos[3]);
+ 	group_identity = pos[5];
+ 
+ 	statistics_group_data_len =
+@@ -582,9 +562,10 @@ static void hostapd_handle_sta_statistics_report(struct hostapd_data *hapd,
+ 			" rep_reason=%d", pos[8 + statistics_group_data_len]);
+ 
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_STA_STATISTICS_RXED MACSTR
+-			" measurement_rep_mode=%d duration=%d group_identity=%d%s%s",
+-			MAC2STR(sta_addr), measurement_rep_mode, measurement_duration,
+-			group_identity, statistics_group_data, rep_reason);
++			" dialog_token=%d measurement_rep_mode=%d duration=%d group_identity=%d%s%s",
++			MAC2STR(sta_addr), token, measurement_rep_mode,
++			measurement_duration, group_identity, statistics_group_data,
++			rep_reason);
+ }
+ 
+ static void hostapd_handle_radio_msmt_request(struct hostapd_data *hapd,
+@@ -597,7 +578,7 @@ static void hostapd_handle_radio_msmt_request(struct hostapd_data *hapd,
+ 
+ 	end = buf + len;
+ 	token = mgmt->u.action.u.rrm.dialog_token;
+-	num_of_repetition = WPA_GET_BE16(mgmt->u.action.u.rrm.variable);
++	num_of_repetition = WPA_GET_LE16(mgmt->u.action.u.rrm.variable);
+ 	pos = mgmt->u.action.u.rrm.variable;
+ 
+ 	while ((ie = get_ie(pos, end - pos, WLAN_EID_MEASURE_REQUEST))) {
+@@ -726,8 +707,8 @@ static void hostapd_handle_link_msmt_report(struct hostapd_data *hapd,
+ 	}
+ 
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_LINK_MEASUREMENT_RXED MACSTR
+-			" tpc_report=%d,%d rx_ant_id=%d tx_ant_id=%d rcpi=%d rsni=%d%s%s",
+-			MAC2STR(mgmt->sa), link_msmt_report.tpc.tx_power,
++			" dialog_token=%d tpc_report=%d,%d rx_ant_id=%d tx_ant_id=%d rcpi=%d rsni=%d%s%s",
++			MAC2STR(mgmt->sa), token, link_msmt_report.tpc.tx_power,
+ 			link_msmt_report.tpc.link_margin, link_msmt_report.rx_ant_id,
+ 			link_msmt_report.tx_ant_id, link_msmt_report.rcpi,
+ 			link_msmt_report.rsni, dmg_margin_str, dmg_adapt_str);
+@@ -739,7 +720,6 @@ static void hostapd_handle_link_msmt_request(struct hostapd_data *hapd,
+ 	struct hostapd_iface *iface = hapd->iface;
+ 	struct hostapd_hw_modes *mode = iface->current_mode;
+ 	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
+-	const u8 *pos;
+ 	int i;
+ 	u8 token;
+ 
+@@ -749,7 +729,6 @@ static void hostapd_handle_link_msmt_request(struct hostapd_data *hapd,
+ 	os_memset(&link_msmt_report, 0, sizeof(link_msmt_report));
+ 
+ 	token = mgmt->u.action.u.rrm.dialog_token;
+-	pos = mgmt->u.action.u.rrm.variable;
+ 
+ 	if (!(hapd->conf->radio_measurements[0] & WLAN_RRM_CAPS_LINK_MEASUREMENT)) {
+ 		wpa_printf(MSG_DEBUG, "AP not support link measurement, token %u",
+@@ -778,31 +757,26 @@ static void hostapd_handle_link_msmt_request(struct hostapd_data *hapd,
+ 		}
+ 	}
+ 
+-	if (!(hostapd_drv_get_radio_info(hapd, &radio_info))) {
+-		if (radio_info.num_tx_antennas == 1)
+-			link_msmt_report.tx_ant_id = 1;
+-		else if (radio_info.num_tx_antennas > 1)
+-			link_msmt_report.tx_ant_id = 255; /* multiple antennas */
+-
+-		/* the rx antenna id is 1 in case of 1 antenna exist
+-		 * or unique configuration of multiple antennas */
+-		link_msmt_report.rx_ant_id = radio_info.num_rx_antennas;
++	if (hostapd_drv_get_radio_info(hapd, &radio_info)) {
++		wpa_printf(MSG_ERROR, "failed to get radio measurements");
++		return;
+ 	}
+ 
+-	if (!ssi_signal)
+-		link_msmt_report.rcpi = 255; /* not available */
+-	else if (ssi_signal < -110)
+-		link_msmt_report.rcpi = 0;
+-	else if (ssi_signal >= 0)
+-		link_msmt_report.rcpi = 220;
+-	else
+-		link_msmt_report.rcpi = (ssi_signal + 110) * 2;
++	if (radio_info.num_tx_antennas == 1)
++		link_msmt_report.tx_ant_id = 1;
++	else if (radio_info.num_tx_antennas > 1)
++		link_msmt_report.tx_ant_id = 255; /* multiple antennas */
++	/* the rx antenna id is 1 in case of 1 antenna exist
++	 * or unique configuration of multiple antennas */
++	link_msmt_report.rx_ant_id = radio_info.num_rx_antennas;
++
++	link_msmt_report.rcpi = rssi_to_rcpi(ssi_signal);
+ 	link_msmt_report.rsni = 255; /* 255 indicates that RSNI is not available */
+ 
+-	if (!hapd->conf->rrm_manipulate_measurement)
++	if (!hapd->conf->rrm_manipulate_measurement) {
+ 		hostapd_send_link_measurement_report(hapd, mgmt->sa, link_msmt_report,
+ 				NULL, NULL);
+-	else
++	} else {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO,
+ 				RRM_EVENT_LINK_MEASUREMENT_REQUEST_RXED MACSTR
+ 				" dialog_token=%d rx_ant_id=%d tx_ant_id=%d rcpi=%d rsni=%d tpc_report=%d,%d",
+@@ -811,6 +785,7 @@ static void hostapd_handle_link_msmt_request(struct hostapd_data *hapd,
+ 				link_msmt_report.rcpi, link_msmt_report.rsni,
+ 				link_msmt_report.tpc.tx_power,
+ 				link_msmt_report.tpc.link_margin);
++	}
+ }
+ 
+ static u16 hostapd_parse_location_lci_req_age(const u8 *buf, size_t len)
+@@ -1493,7 +1468,9 @@ int hostapd_send_channel_load_req(struct hostapd_data *hapd, const u8 *addr,
+ 	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
+ 				      wpabuf_head(buf), wpabuf_len(buf));
+ 	wpabuf_free(buf);
+-	return ret;
++	if (ret)
++		return -1;
++	return hapd->channel_load_token;
+ }
+ 
+ int hostapd_send_channel_load_report(struct hostapd_data *hapd, const u8 *addr,
+@@ -1660,7 +1637,9 @@ int hostapd_send_noise_histogram_req(struct hostapd_data *hapd, const u8 *addr,
+ 	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
+ 				      wpabuf_head(buf), wpabuf_len(buf));
+ 	wpabuf_free(buf);
+-	return ret;
++	if (ret)
++		return -1;
++	return hapd->noise_histogram_token;
+ }
+ 
+ int hostapd_send_noise_histogram_report(struct hostapd_data *hapd, const u8 *addr,
+@@ -1809,7 +1788,9 @@ int hostapd_send_link_measurement_req(struct hostapd_data *hapd, const u8 *addr)
+ 	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
+ 				      wpabuf_head(buf), wpabuf_len(buf));
+ 	wpabuf_free(buf);
+-	return ret;
++	if (ret)
++		return -1;
++	return hapd->link_measurement_token;
+ }
+ 
+ int hostapd_send_link_measurement_report(struct hostapd_data *hapd,
+@@ -1986,7 +1967,9 @@ int hostapd_send_sta_statistics_req(struct hostapd_data *hapd, const u8 *addr,
+ 	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
+ 				      wpabuf_head(buf), wpabuf_len(buf));
+ 	wpabuf_free(buf);
+-	return ret;
++	if (ret)
++		return -1;
++	return hapd->sta_statistics_token;
+ }
+ 
+ int hostapd_send_sta_statistics_report(struct hostapd_data *hapd, const u8 *addr,
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 898f46c..fb90727 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1640,6 +1640,12 @@ struct dmg_link_adaptation_ack {
+ 	le32 ref_timestamp;
+ } STRUCT_PACKED;
+ 
++/* IEEE Std 802.11-2012 Figure 8-141 - Measurement Report Mode field */
++#define MEASUREMENT_REPORT_MODE_ACCEPT 0
++#define MEASUREMENT_REPORT_MODE_REJECT_LATE BIT(0)
++#define MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE BIT(1)
++#define MEASUREMENT_REPORT_MODE_REJECT_REFUSE BIT(2)
++
+ /* IEEE Std 802.11ad-2012 - Multi-band element */
+ struct multi_band_ie {
+ 	u8 eid; /* WLAN_EID_MULTI_BAND */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index eba18dd..aa6147d 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1454,10 +1454,6 @@ typedef struct mtlk_sta_info {
+ struct mtlk_wssa_drv_tr181_vap_stats {
+   struct mtlk_wssa_driver_traffic_stats traffic_stats;
+   struct mtlk_wssa_peer_error_stats error_stats;
+-  u64 TransmittedOctetsInAMSDUCount;
+-  u64 ReceivedOctetsInAMSDUCount;
+-  u64 TransmittedOctetsInAMPDUCount;
+-  u64 ReceivedOctetsInAMPDUCount;
+   u32 RetransCount;
+   u32 FailedRetransCount;
+   u32 RetryCount;
+@@ -1465,6 +1461,14 @@ struct mtlk_wssa_drv_tr181_vap_stats {
+   u32 ACKFailureCount;
+   u32 AggregatedPacketCount;
+   u32 UnknownProtoPacketsReceived;
++} __attribute__ ((packed));
++
++struct mtlk_vap_info {
++  struct mtlk_wssa_drv_tr181_vap_stats vap_stats;
++  u64 TransmittedOctetsInAMSDUCount;
++  u64 ReceivedOctetsInAMSDUCount;
++  u64 TransmittedOctetsInAMPDUCount;
++  u64 ReceivedOctetsInAMPDUCount;
+   u32 RTSSuccessCount;
+   u32 RTSFailureCount;
+   u32 TransmittedAMSDUCount;
+@@ -3725,11 +3729,10 @@ struct wpa_driver_ops {
+   /**
+    * get_vap_measurements - Get VAP measurements
+    * @priv: Private driver interface data
+-   * @vap_stats: Pointer to VAP statistics structure (filled by the function)
++   * @vap_info: Pointer to VAP statistics structure (filled by the function)
+    * Returns: 0 on success, -1 on failure
+    */
+-  int (*get_vap_measurements)(void *priv,
+-    struct mtlk_wssa_drv_tr181_vap_stats *vap_stats);
++  int (*get_vap_measurements)(void *priv, struct mtlk_vap_info *vap_info);
+ 
+   /**
+    * get_radio_info - Get radio info
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index af8d2ec..e85c823 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -5760,13 +5760,13 @@ out:
+ 
+ 
+ int nl80211_get_vap_measurements(void *priv,
+-  struct mtlk_wssa_drv_tr181_vap_stats *vap_stats)
++		struct mtlk_vap_info *vap_info)
+ {
+   int ret;
+   struct wpabuf *rsp;
+ 
+-  /* sizeof(*vap_stats) + NLA_HDRLEN + NLA_ALLIGN */
+-  rsp = wpabuf_alloc(NLA_ALIGN(sizeof(struct nlattr) + sizeof(*vap_stats)));
++  /* sizeof(*vap_info) + NLA_HDRLEN + NLA_ALLIGN */
++  rsp = wpabuf_alloc(NLA_ALIGN(sizeof(struct nlattr) + sizeof(*vap_info)));
+   if (!rsp) {
+     return -ENOBUFS;
+   }
+@@ -5779,14 +5779,14 @@ int nl80211_get_vap_measurements(void *priv,
+       "failed: %i (%s)", ret, strerror(-ret));
+     goto out;
+   }
+-  if (rsp->used != sizeof(*vap_stats)) {
++  if (rsp->used != sizeof(*vap_info)) {
+     ret = -EMSGSIZE;
+     wpa_printf(MSG_ERROR, "nl80211: driver returned %d bytes instead of %d",
+-      rsp->used, sizeof(*vap_stats));
++      rsp->used, sizeof(*vap_info));
+     goto out;
+   }
+ 
+-  memcpy(vap_stats, rsp->buf, sizeof(*vap_stats));
++  memcpy(vap_info, rsp->buf, sizeof(*vap_info));
+   wpa_printf(MSG_DEBUG, "nl80211: Received VAP measurements");
+ 
+ out:
+diff --git a/src/utils/common.c b/src/utils/common.c
+index 04a533a..c8764a5 100644
+--- a/src/utils/common.c
++++ b/src/utils/common.c
+@@ -1200,3 +1200,24 @@ int str_starts(const char *str, const char *start)
+ {
+ 	return os_strncmp(str, start, os_strlen(start)) == 0;
+ }
++
++/*
++ * rssi_to_rcpi - convert RSSI to RCPI
++ * @rssi: RSSI to convert
++ * Returns: RCPI corresponding to the given RSSI value, or 255 if not available.
++ *
++ * It's possible to estimate RCPI based on RSSI in dBm. This calculation will
++ * not reflect the correct value for high rates, but it's good enough for Action
++ * frames which are transmitted with up to 24 Mbps rates.
++ */
++u8 rssi_to_rcpi(int rssi)
++{
++	if (!rssi)
++		return 255; /* not available */
++	else if (rssi < -110)
++		return 0;
++	else if (rssi > 0)
++		return 220;
++	else
++		return (rssi + 110) * 2;
++}
+diff --git a/src/utils/common.h b/src/utils/common.h
+index 7785677..8842864 100644
+--- a/src/utils/common.h
++++ b/src/utils/common.h
+@@ -552,6 +552,7 @@ int is_ctrl_char(char c);
+ 
+ int str_starts(const char *str, const char *start);
+ 
++u8 rssi_to_rcpi(int rssi);
+ 
+ /*
+  * gcc 4.4 ends up generating strict-aliasing warnings about some very common
+-- 
+2.10.1
+

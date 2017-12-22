@@ -1,0 +1,102 @@
+diff -Naur a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2015-06-23 15:28:20.327240000 +0530
++++ b/CMakeLists.txt	2015-06-19 15:16:58.337342000 +0530
+@@ -1,11 +1,11 @@
+ cmake_minimum_required(VERSION 2.6)
+ 
+ PROJECT(umbim C)
+-ADD_DEFINITIONS(-Os -ggdb -Wall -Werror --std=gnu99 -Wmissing-declarations)
++ADD_DEFINITIONS(-Os -ggdb -fPIC -Wall -Werror --std=gnu99 -Wmissing-declarations)
+ 
+ SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
+ 
+-SET(SOURCES cli.c mbim-enum.c mbim-dev.c mbim-msg.c )
++SET(SOURCES mbim-enum.c mbim-dev.c mbim-msg.c )
+ 
+ SET(LIBS ubox)
+ 
+@@ -13,10 +13,10 @@
+   ADD_DEFINITIONS(-DDEBUG -g3)
+ ENDIF()
+ 
+-ADD_EXECUTABLE(umbim ${SOURCES})
++ADD_LIBRARY(umbim SHARED ${SOURCES})
+ 
+ TARGET_LINK_LIBRARIES(umbim ${LIBS})
+ 
+ INSTALL(TARGETS umbim
+-	RUNTIME DESTINATION sbin
++	LIBRARY DESTINATION lib
+ )
+diff -Naur a/mbim-dev.c b/mbim-dev.c
+--- a/mbim-dev.c	2015-06-23 15:28:20.407247000 +0530
++++ b/mbim-dev.c	2015-06-24 19:26:26.253113000 +0530
+@@ -27,6 +27,7 @@
+ 
+ uint8_t mbim_buffer[MBIM_BUFFER_SIZE];
+ static struct uloop_fd mbim_fd;
++static int32_t first_run = 1;
+ static uint32_t expected;
+ int no_close;
+ 
+@@ -66,7 +67,7 @@
+ 		perror("writing data failed: ");
+ 	} else {
+ 		expected = le32toh(hdr->type) | 0x80000000;
+-		uloop_timeout_set(&tout, 15000);
++		uloop_timeout_set(&tout, 30000);
+ 	}
+ 	return ret;
+ }
+@@ -113,13 +114,16 @@
+ 			return_code = -le32toh(msg->status_code);
+ 		else
+ 			return_code = current_handler->response(msg->buffer, le32toh(msg->buffer_length));
+-		if (return_code < 0)
++		if (return_code < 0) {
+ 			no_close = 0;
++		}
+ 		mbim_send_close_msg();
+ 		break;
+ 	case MBIM_MESSAGE_TYPE_CLOSE_DONE:
+ 		uloop_end();
+ 		break;
++	case MBIM_MESSAGE_TYPE_INDICATE_STATUS:
++		break;
+ 	case MBIM_MESSAGE_TYPE_FUNCTION_ERROR:
+ 		no_close = 0;
+ 		mbim_send_close_msg();
+@@ -131,11 +135,15 @@
+ void
+ mbim_open(const char *path)
+ {
+-	mbim_fd.cb = mbim_recv;
+-	mbim_fd.fd = open(path, O_RDWR);
+-	if (mbim_fd.fd < 1) {
+-		perror("open failed: ");
+-		exit(-1);
++	if (first_run) {
++		uloop_init();
++		mbim_fd.fd = open(path, O_RDWR);
++		mbim_fd.cb = mbim_recv;
++		if (mbim_fd.fd < 1) {
++			perror("open");
++//			exit(-1);
++		}
++		uloop_fd_add(&mbim_fd, ULOOP_READ);
++		first_run = 0;
+ 	}
+-	uloop_fd_add(&mbim_fd, ULOOP_READ);
+ }
+diff -Naur a/mbim.h b/mbim.h
+--- a/mbim.h	2015-06-23 15:28:20.420253000 +0530
++++ b/mbim.h	2015-06-23 18:06:35.776151000 +0530
+@@ -18,7 +18,7 @@
+ #include <stdint.h>
+ #include <sys/types.h>
+ 
+-#define MBIM_BUFFER_SIZE	1024
++#define MBIM_BUFFER_SIZE	4096
+ 
+ extern int return_code;
+ extern int verbose;

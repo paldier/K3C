@@ -1,0 +1,193 @@
+From 168401d92e2eb2769f6cf96cc90194386aa0e11b Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Mon, 16 Sep 2013 23:44:43 +0300
+Subject: [PATCH 270/441] mei: propagate error from write routines instead of
+ ENODEV
+
+ENODEV will cause application to try to reconnect since
+it assumes that device went through the reset
+write errors are not always fatal it can happen due to
+resource contention
+
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 2ebf8c94d431078d93599ba56efa58bf850078a1)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/amthif.c    | 24 +++++++++++++-----------
+ drivers/misc/mei/client.c    | 17 +++++++++--------
+ drivers/misc/mei/hbm.c       |  2 +-
+ drivers/misc/mei/interrupt.c | 20 +++++++++++++-------
+ 4 files changed, 36 insertions(+), 27 deletions(-)
+
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@ -313,13 +313,13 @@ static int mei_amthif_send_cmd(struct me
+ 		mei_hdr.me_addr = dev->iamthif_cl.me_client_id;
+ 		mei_hdr.reserved = 0;
+ 		dev->iamthif_msg_buf_index += mei_hdr.length;
+-		if (mei_write_message(dev, &mei_hdr,
+-					(unsigned char *)dev->iamthif_msg_buf))
+-			return -ENODEV;
++		ret = mei_write_message(dev, &mei_hdr, dev->iamthif_msg_buf);
++		if (ret)
++			return ret;
+ 
+ 		if (mei_hdr.msg_complete) {
+ 			if (mei_cl_flow_ctrl_reduce(&dev->iamthif_cl))
+-				return -ENODEV;
++				return -EIO;
+ 			dev->iamthif_flow_control_pending = true;
+ 			dev->iamthif_state = MEI_IAMTHIF_FLOW_CONTROL;
+ 			dev_dbg(&dev->pdev->dev, "add amthif cb to write waiting list\n");
+@@ -459,6 +459,7 @@ int mei_amthif_irq_write_complete(struct
+ 	struct mei_msg_hdr mei_hdr;
+ 	size_t len = dev->iamthif_msg_buf_size - dev->iamthif_msg_buf_index;
+ 	u32 msg_slots = mei_data2slots(len);
++	int rets;
+ 
+ 	mei_hdr.host_addr = cl->host_client_id;
+ 	mei_hdr.me_addr = cl->me_client_id;
+@@ -481,16 +482,17 @@ int mei_amthif_irq_write_complete(struct
+ 	dev_dbg(&dev->pdev->dev, MEI_HDR_FMT,  MEI_HDR_PRM(&mei_hdr));
+ 
+ 	*slots -=  msg_slots;
+-	if (mei_write_message(dev, &mei_hdr,
+-		dev->iamthif_msg_buf + dev->iamthif_msg_buf_index)) {
+-			dev->iamthif_state = MEI_IAMTHIF_IDLE;
+-			cl->status = -ENODEV;
+-			list_del(&cb->list);
+-			return -ENODEV;
++	rets = mei_write_message(dev, &mei_hdr,
++			dev->iamthif_msg_buf + dev->iamthif_msg_buf_index);
++	if (rets) {
++		dev->iamthif_state = MEI_IAMTHIF_IDLE;
++		cl->status = rets;
++		list_del(&cb->list);
++		return rets;
+ 	}
+ 
+ 	if (mei_cl_flow_ctrl_reduce(cl))
+-		return -ENODEV;
++		return -EIO;
+ 
+ 	dev->iamthif_msg_buf_index += mei_hdr.length;
+ 	cl->status = 0;
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -755,6 +755,7 @@ int mei_cl_irq_write_complete(struct mei
+ 	struct mei_msg_hdr mei_hdr;
+ 	size_t len = cb->request_buffer.size - cb->buf_idx;
+ 	u32 msg_slots = mei_data2slots(len);
++	int rets;
+ 
+ 	mei_hdr.host_addr = cl->host_client_id;
+ 	mei_hdr.me_addr = cl->me_client_id;
+@@ -778,11 +779,12 @@ int mei_cl_irq_write_complete(struct mei
+ 			cb->request_buffer.size, cb->buf_idx);
+ 
+ 	*slots -=  msg_slots;
+-	if (mei_write_message(dev, &mei_hdr,
+-			cb->request_buffer.data + cb->buf_idx)) {
+-		cl->status = -ENODEV;
++	rets = mei_write_message(dev, &mei_hdr,
++			cb->request_buffer.data + cb->buf_idx);
++	if (rets) {
++		cl->status = rets;
+ 		list_move_tail(&cb->list, &cmpl_list->list);
+-		return -ENODEV;
++		return rets;
+ 	}
+ 
+ 	cl->status = 0;
+@@ -791,7 +793,7 @@ int mei_cl_irq_write_complete(struct mei
+ 
+ 	if (mei_hdr.msg_complete) {
+ 		if (mei_cl_flow_ctrl_reduce(cl))
+-			return -ENODEV;
++			return -EIO;
+ 		list_move_tail(&cb->list, &dev->write_waiting_list.list);
+ 	}
+ 
+@@ -860,10 +862,9 @@ int mei_cl_write(struct mei_cl *cl, stru
+ 	mei_hdr.reserved = 0;
+ 
+ 
+-	if (mei_write_message(dev, &mei_hdr, buf->data)) {
+-		rets = -EIO;
++	rets = mei_write_message(dev, &mei_hdr, buf->data);
++	if (rets)
+ 		goto err;
+-	}
+ 
+ 	cl->writing_state = MEI_WRITING;
+ 	cb->buf_idx = mei_hdr.length;
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -185,7 +185,7 @@ int mei_hbm_start_req(struct mei_device
+ 		dev_err(&dev->pdev->dev, "version message write failed\n");
+ 		dev->dev_state = MEI_DEV_RESETTING;
+ 		mei_reset(dev, 1);
+-		return -ENODEV;
++		return -EIO;
+ 	}
+ 	dev->hbm_state = MEI_HBM_START;
+ 	dev->init_clients_timer = MEI_CLIENTS_INIT_TIMEOUT;
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -216,9 +216,11 @@ static int mei_cl_irq_read(struct mei_cl
+ 			   s32 *slots, struct mei_cl_cb *cmpl_list)
+ {
+ 	struct mei_device *dev = cl->dev;
+-
+ 	u32 msg_slots = mei_data2slots(sizeof(struct hbm_flow_control));
+ 
++	int ret;
++
++
+ 	if (*slots < msg_slots) {
+ 		/* return the cancel routine */
+ 		list_del(&cb->list);
+@@ -227,12 +229,14 @@ static int mei_cl_irq_read(struct mei_cl
+ 
+ 	*slots -= msg_slots;
+ 
+-	if (mei_hbm_cl_flow_control_req(dev, cl)) {
+-		cl->status = -ENODEV;
++	ret = mei_hbm_cl_flow_control_req(dev, cl);
++	if (ret) {
++		cl->status = ret;
+ 		cb->buf_idx = 0;
+ 		list_move_tail(&cb->list, &cmpl_list->list);
+-		return -ENODEV;
++		return ret;
+ 	}
++
+ 	list_move_tail(&cb->list, &dev->read_list.list);
+ 
+ 	return 0;
+@@ -254,6 +258,7 @@ static int mei_cl_irq_ioctl(struct mei_c
+ 			   s32 *slots, struct mei_cl_cb *cmpl_list)
+ {
+ 	struct mei_device *dev = cl->dev;
++	int ret;
+ 
+ 	u32 msg_slots =
+ 		mei_data2slots(sizeof(struct hbm_client_connect_request));
+@@ -268,11 +273,12 @@ static int mei_cl_irq_ioctl(struct mei_c
+ 
+ 	cl->state = MEI_FILE_CONNECTING;
+ 
+-	if (mei_hbm_cl_connect_req(dev, cl)) {
+-		cl->status = -ENODEV;
++	ret = mei_hbm_cl_connect_req(dev, cl);
++	if (ret) {
++		cl->status = ret;
+ 		cb->buf_idx = 0;
+ 		list_del(&cb->list);
+-		return -ENODEV;
++		return ret;
+ 	}
+ 
+ 	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);

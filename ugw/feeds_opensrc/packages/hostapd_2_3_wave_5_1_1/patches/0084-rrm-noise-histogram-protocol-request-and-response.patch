@@ -1,0 +1,1014 @@
+From 7af82359d711e461f36f9360cd1603e1431c8ff3 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Wed, 16 Nov 2016 18:48:25 +0200
+Subject: [PATCH 4/6] rrm: noise histogram protocol - request and response
+
+To enable the support of noise histogram measurement from the conf file:
+rrm_noise_histogram=1
+
+To enable the support of manipulate the noise histogram measurements
+from conf file:
+rrm_manipulate_measurement=1
+if this flag is enabled, then upon noise histogram  measurement request
+from the STA, the AP will make the measurements and notify the "AP-Manager"
+instead of sending the response.
+
+Request from AP to STA: (cli_command)
+req_noise_histogram <dst> <num_of_repetitions> <measurement_req_mode>
+<op_class> <channel> <rand_int> <duration>
+[noise_histogram_rep=<0-2>,<0-255>]
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Response from STA to AP: (notification)
+RRM-NOISE-HISTOGRAM-RECEIVED <ifname> <sta_mac_addr>
+measurement_rep_mode=<measurement_rep_mode> op_class=<op_class>
+channel=<channel> start_time=<start_time> duration=<duration>
+antenna_id=<ant_id> anpi=<anpi>
+ipi=<11 octets with comma delimiter between each one>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Request from STA to AP: (notification)
+RRM-NOISE-HISTOGRAM-REQUEST-RECEIVED <ifname> <sta_mac_addr>
+dialog_token=<dialog_token> measurement_token=<measurement_token>
+measurement_rep_mode=<measurement_rep_mode> op_class=<op_class>
+channel=<channel> start_time=<start_time> duration=<duration>
+antenna_id=<ant_id> anpi=<anpi>
+ipi=<11 octets with comma delimiter between each one>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Response from AP to STA: (cli_command)
+report_noise_histogram <dst> <dialog_token> <measurement_token>
+<measurement_rep_mode> <op_class> <channel> <start_time> <duration>
+<ant_id> <anpi> <ipi(no11 octets with comma delimiter between each one)>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/config_file.c        |   3 +
+ hostapd/ctrl_iface.c         | 437 +++++++++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c        |  23 +++
+ src/ap/hostapd.h             |   1 +
+ src/ap/rrm.c                 | 324 ++++++++++++++++++++++++++++++++
+ src/ap/rrm.h                 |  11 ++
+ src/common/cli.h             |   2 +-
+ src/common/ieee802_11_defs.h |   1 +
+ src/common/wpa_ctrl.h        |   3 +
+ 9 files changed, 804 insertions(+), 1 deletion(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 3e0c578..710e58f 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3927,6 +3927,9 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 	} else if (os_strcmp(buf, "rrm_sta_statistics") == 0) {
+ 		if (atoi(pos))
+ 			bss->radio_measurements[1] |= WLAN_RRM_CAPS_STATISTICS_MEASUREMENT;
++	} else if (os_strcmp(buf, "rrm_noise_histogram") == 0) {
++		if (atoi(pos))
++			bss->radio_measurements[1] |= WLAN_RRM_CAPS_NOISE_HISTOGRAM;
+ 	} else if (os_strcmp(buf, "gas_address3") == 0) {
+ 		bss->gas_address3 = atoi(pos);
+ 	} else if (os_strcmp(buf, "ftm_responder") == 0) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 8fda80c..792fc6f 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -3605,6 +3605,437 @@ exit:
+ 			channel_center_frequency0_p, channel_center_frequency1_p);
+ }
+ 
++static int hostapd_ctrl_iface_req_noise_histogram(struct hostapd_data *hapd, char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	char *token, *context = NULL;
++	char *pos, *cmd_end;
++	int op_class, channel, random_interval, measurement_duration;
++	int num_of_repetitions, measurement_request_mode;
++
++	u8 rep_cond, anpi_ref_val;
++	u8 *rep_cond_p = NULL, *anpi_ref_val_p = NULL;
++
++	u8 channel_width, channel_center_frequency0, channel_center_frequency1;
++	u8 *channel_width_p = NULL;
++	u8 *channel_center_frequency0_p = NULL, *channel_center_frequency1_p = NULL;
++
++	cmd_end = cmd + strlen(cmd);
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_NOISE_HISTOGRAM - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - number of repetitions is missing");
++		return -1;
++	}
++	num_of_repetitions = atoi(token);
++	if (num_of_repetitions < 0 || num_of_repetitions > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - number of repetitions is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - measurement request mode is missing");
++		return -1;
++	}
++	measurement_request_mode = atoi(token);
++	if (measurement_request_mode < 0 || measurement_request_mode > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - measurement request mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - operating class is missing");
++		return -1;
++	}
++	op_class = atoi(token);
++	if (op_class <= 0 || op_class > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - operation class is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_NOISE_HISTOGRAM - channel is missing");
++		return -1;
++	}
++	channel = atoi(token);
++	if (channel <= 0 || channel > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - channel value is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - random interval is missing");
++		return -1;
++	}
++	random_interval = atoi(token);
++	if (random_interval < 0 || random_interval > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - random interval out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_NOISE_HISTOGRAM - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REQ_NOISE_HISTOGRAM - measurement duration out of range");
++		return -1;
++	}
++
++	/* optional tokens */
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		/* we've reached the end of command (no optinal arguments) */
++		goto exit;
++	}
++
++	pos = os_strstr(token, "noise_histogram_rep=");
++	if (pos) {
++		int cond, ref_val;
++		char *end, *comma;
++		pos += 20;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma = os_strchr(pos, ',');
++		if (!comma || comma == pos || comma >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - noise histogram reporting format is invalid");
++			return -1;
++		}
++		cond = atoi(pos);
++		if (cond < 0 || cond > 2) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - noise histogram reporting condition is invalid");
++			return -1;
++		}
++		comma++;
++		ref_val = atoi(comma);
++		if (ref_val < 0 || ref_val > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - channel load reporting ref val is invalid");
++			return -1;
++		}
++		rep_cond = (u8) cond;
++		rep_cond_p = &rep_cond;
++		anpi_ref_val = (u8) ref_val;
++		anpi_ref_val_p = &anpi_ref_val;
++	}
++
++	pos = os_strstr(token, "wide_band_ch_switch=");
++	if (pos) {
++		int ch_width, ch_center_freq0, ch_center_freq1;
++		char *end, *comma1, *comma2;
++		pos += 20;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma2++;
++		ch_width = atoi(pos);
++		if (ch_width < 0 || ch_width > 3) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - channel width is invalid");
++			return -1;
++		}
++		ch_center_freq0 = atoi(comma1);
++		if (ch_center_freq0 < 0 || ch_center_freq0 > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - channel center frequency 0 is invalid");
++			return -1;
++		}
++		ch_center_freq1 = atoi(comma2);
++		if (ch_center_freq1 < 0 || ch_center_freq1 > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_NOISE_HISTOGRAM - channel center frequency 1 is invalid");
++			return -1;
++		}
++		channel_width = (u8) ch_width;
++		channel_width_p = &channel_width;
++		channel_center_frequency0 = (u8) ch_center_freq0;
++		channel_center_frequency0_p = &channel_center_frequency0;
++		channel_center_frequency1 = (u8) ch_center_freq1;
++		channel_center_frequency1_p = &channel_center_frequency1;
++	}
++
++exit:
++	return hostapd_send_noise_histogram_req(hapd, addr, num_of_repetitions,
++			measurement_request_mode, op_class, channel, random_interval,
++			measurement_duration, rep_cond_p, anpi_ref_val_p,
++			channel_width_p, channel_center_frequency0_p,
++			channel_center_frequency1_p);
++}
++
++static int hostapd_ctrl_iface_report_noise_histogram(struct hostapd_data *hapd,
++		char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	char *token, *context = NULL, *ipi_density_pos;
++	char *pos, *cmd_end;
++	int op_class, channel, measurement_duration, anpi, ant_id;
++	int dialog_token, measurement_token, measurement_rep_mode, i;
++	u64 start_time;
++	u8 ipi_density[RRM_NOISE_HISTO_IPI_DENSITY_SIZE] = {};
++
++	u8 channel_width, channel_center_frequency0, channel_center_frequency1;
++	u8 *channel_width_p = NULL;
++	u8 *channel_center_frequency0_p = NULL, *channel_center_frequency1_p = NULL;
++
++	cmd_end = cmd + strlen(cmd);
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REPORT_NOISE_HISTOGRAM - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - dialog_token is missing");
++		return -1;
++	}
++	dialog_token = atoi(token);
++	if (dialog_token <= 0 || dialog_token > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - dialog_token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - measurement_token is missing");
++		return -1;
++	}
++	measurement_token = atoi(token);
++	if (measurement_token <= 0 || measurement_token > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - measurement_token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - measurement_rep_mode is missing");
++		return -1;
++	}
++	measurement_rep_mode = atoi(token);
++	if (measurement_rep_mode < 0 || measurement_rep_mode > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - measurement_rep_mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - operating class is missing");
++		return -1;
++	}
++	op_class = atoi(token);
++	if (op_class <= 0 || op_class > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - operation class is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR, "CTRL: REPORT_NOISE_HISTOGRAM - channel is missing");
++		return -1;
++	}
++	channel = atoi(token);
++	if (channel <= 0 || channel > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - channel value is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - start_time is missing");
++		return -1;
++	}
++	start_time = strtoull (token, NULL, 10);
++	if (start_time <= 0) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - start_time out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REPORT_NOISE_HISTOGRAM - measurement duration out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - ant_id is missing");
++		return -1;
++	}
++	ant_id = atoi(token);
++	if (ant_id < 0 || ant_id > 0xff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REPORT_NOISE_HISTOGRAM - ant_id out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - anpi is missing");
++		return -1;
++	}
++	anpi = atoi(token);
++	if (anpi < 0 || anpi > 0xff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REPORT_NOISE_HISTOGRAM - anpi out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - ipi_density[0] is missing");
++		return -1;
++	}
++	ipi_density[0] = atoi(token);
++	if ((ipi_density[0] < 0) || (ipi_density[0] > 0xff)) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REPORT_NOISE_HISTOGRAM - ipi_density[0] is out of range");
++		return -1;
++	}
++
++	ipi_density_pos = token;
++	for (i = 1; i < RRM_NOISE_HISTO_IPI_DENSITY_SIZE; i++) {
++		ipi_density_pos = os_strchr(ipi_density_pos, ',');
++		if (!ipi_density_pos) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_NOISE_HISTOGRAM - ipi_density[%d] is missing", i);
++			return -1;
++		}
++		ipi_density_pos++;
++		ipi_density[i] = atoi(ipi_density_pos);
++		if ((ipi_density[i] < 0) || (ipi_density[i] > 0xff)) {
++			wpa_printf(MSG_ERROR,
++				   "CTRL: REPORT_NOISE_HISTOGRAM - ipi_density[%d] is out of range", i);
++			return -1;
++		}
++	}
++
++	/* optional tokens */
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		/* we've reached the end of command (no optinal arguments) */
++		goto exit;
++	}
++
++	pos = os_strstr(token, "wide_band_ch_switch=");
++	if (pos) {
++		int ch_width, ch_center_freq0, ch_center_freq1;
++		char *end, *comma1, *comma2;
++		pos += 20;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_NOISE_HISTOGRAM - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_NOISE_HISTOGRAM - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma2++;
++		ch_width = atoi(pos);
++		if (ch_width < 0 || ch_width > 3) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_NOISE_HISTOGRAM - channel width is invalid");
++			return -1;
++		}
++		ch_center_freq0 = atoi(comma1);
++		if (ch_center_freq0 < 0 || ch_center_freq0 > 255) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_NOISE_HISTOGRAM - channel center frequency 0 is invalid");
++			return -1;
++		}
++		ch_center_freq1 = atoi(comma2);
++		if (ch_center_freq1 < 0 || ch_center_freq1 > 255) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_NOISE_HISTOGRAM - channel center frequency 1 is invalid");
++			return -1;
++		}
++		channel_width = (u8) ch_width;
++		channel_width_p = &channel_width;
++		channel_center_frequency0 = (u8) ch_center_freq0;
++		channel_center_frequency0_p = &channel_center_frequency0;
++		channel_center_frequency1 = (u8) ch_center_freq1;
++		channel_center_frequency1_p = &channel_center_frequency1;
++	}
++
++exit:
++	return hostapd_send_noise_histogram_report(hapd, addr, dialog_token,
++			measurement_token, measurement_rep_mode, op_class, channel,
++			start_time, measurement_duration, ant_id, anpi, ipi_density,
++			channel_width_p, channel_center_frequency0_p,
++			channel_center_frequency1_p);
++}
++
+ static int hostapd_ctrl_iface_set_neighbor(struct hostapd_data *hapd, char *buf)
+ {
+ 	struct wpa_ssid_value ssid;
+@@ -5453,6 +5884,12 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "REPORT_CHANNEL_LOAD ", 20) == 0) {
+ 		if (hostapd_ctrl_iface_report_channel_load(hapd, buf + 20))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "REQ_NOISE_HISTOGRAM ", 20) == 0) {
++		if (hostapd_ctrl_iface_req_noise_histogram(hapd, buf + 20))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "REPORT_NOISE_HISTOGRAM ", 23) == 0) {
++		if (hostapd_ctrl_iface_report_noise_histogram(hapd, buf + 23))
++			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_LINK_MEASUREMENT ", 21) == 0) {
+ 		if (hostapd_ctrl_iface_req_link_measurement(hapd, buf + 21))
+ 			reply_len = -1;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 9223d23..5b68ada 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1344,6 +1344,27 @@ static int hostapd_cli_cmd_report_channel_load(struct wpa_ctrl *ctrl, int argc,
+ 	return hostapd_cli_cmd(ctrl, "REPORT_CHANNEL_LOAD", 9, argc, argv);
+ }
+ 
++static int hostapd_cli_cmd_req_noise_histogram(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 7) {
++		printf("Invalid req_noise_histogram command: needs at least 7 arguments: - dest address, number of repetitions, measurement request mode, operating class, channel, random interval, measurement duration, + some optional arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REQ_NOISE_HISTOGRAM", 7, argc, argv);
++}
++
++static int hostapd_cli_cmd_report_noise_histogram(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 11) {
++		printf("Invalid report_noise_histogram command: needs at least 11 arguments: - dest address, dialog_token, measurement_token, measurement_rep_mode, op_class, channel, start time, duration, ant_id, anpi, ipi + some optional arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REPORT_NOISE_HISTOGRAM", 11, argc, argv);
++}
+ 
+ static int hostapd_cli_cmd_req_link_measurement(struct wpa_ctrl *ctrl, int argc,
+ 	     char *argv[])
+@@ -1882,6 +1903,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "req_beacon", hostapd_cli_cmd_req_beacon, NULL, NULL },
+ 	{ "req_channel_load", hostapd_cli_cmd_req_channel_load, NULL, NULL },
+ 	{ "report_channel_load", hostapd_cli_cmd_report_channel_load, NULL, NULL },
++	{ "req_noise_histogram", hostapd_cli_cmd_req_noise_histogram, NULL, NULL },
++	{ "report_noise_histogram", hostapd_cli_cmd_report_noise_histogram, NULL, NULL },
+ 	{ "req_link_measurement", hostapd_cli_cmd_req_link_measurement, NULL, NULL },
+ 	{ "link_measurement_report", hostapd_cli_cmd_link_measurement_report, NULL, NULL },
+ 	{ "req_sta_statistics", hostapd_cli_cmd_req_sta_statistics, NULL, NULL },
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index db569ae..be54d68 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -306,6 +306,7 @@ struct hostapd_data {
+ 	u8 range_req_token;
+ 	u8 beacon_req_token;
+ 	u8 channel_load_token;
++	u8 noise_histogram_token;
+ 	u8 link_measurement_token;
+ 	u8 sta_statistics_token;
+ 	unsigned int lci_req_active:1;
+diff --git a/src/ap/rrm.c b/src/ap/rrm.c
+index a489601..53fef90 100644
+--- a/src/ap/rrm.c
++++ b/src/ap/rrm.c
+@@ -267,6 +267,151 @@ static void hostapd_handle_channel_load_report(struct hostapd_data *hapd,
+ 			wide_band_ch_switch);
+ }
+ 
++static void hostapd_handle_noise_histogram_request(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr,
++		u16 num_of_repetition)
++{
++	const u8 *ie, *end;
++	u8 op_class, channel, measurement_token;
++	u8 noise_histogram_rep_cond = 0, noise_histogram_ref_val = 0;
++	u8 measurement_rep_mode = 0, ant_id = 0, anpi = 0;
++	u8 ipi_density[RRM_NOISE_HISTO_IPI_DENSITY_SIZE] = {};
++	u16 measurement_duration_report = 0;
++	u64 start_time = 0;
++	char ipi_density_str[64], *cur, *end_str;
++	int ret, i;
++	mtlk_radio_info_t radio_info;
++
++	end = pos + len;
++	measurement_token = pos[0];
++	op_class = pos[3];
++	channel = pos[4];
++
++	if (!(hapd->conf->radio_measurements[1] & WLAN_RRM_CAPS_NOISE_HISTOGRAM)) {
++		wpa_printf(MSG_ERROR, "noise histogram in RRM is not supported");
++		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_NOISE_HIST);
++		return;
++	}
++
++	if (channel != hapd->iface->conf->channel) {
++		wpa_printf(MSG_DEBUG, "requested channel (%d) is not supported, only the current AP channel (%d) is supported",
++				channel, hapd->iface->conf->channel);
++		measurement_rep_mode |= REP_MODE_REFUSED_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_NOISE_HIST);
++		return;
++	}
++
++	if (hostapd_drv_get_radio_info(hapd, &radio_info)) {
++		wpa_printf(MSG_ERROR, "failed to get radio measurements");
++		measurement_rep_mode |= REP_MODE_INCAPBLE_BIT;
++		hostapd_send_general_rrm_incapble_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode,
++				MEASURE_TYPE_NOISE_HIST);
++		return;
++	}
++
++	if ((ie = get_ie(&pos[9], end - &pos[9], 1)) && (ie[1] == 2)) {
++		noise_histogram_rep_cond = ie[2];
++		noise_histogram_ref_val = ie[3];
++	}
++
++	anpi = radio_info.hw_stats.Noise;
++	start_time = radio_info.tsf_start_time;
++
++	/* the rx antenna id is 1 in case of 1 antenna exist
++	 * or unique configuration of multiple antennas */
++	ant_id = radio_info.num_rx_antennas;
++
++	if ((noise_histogram_rep_cond == 1) && (noise_histogram_ref_val > anpi)) {
++		wpa_printf(MSG_DEBUG, "anpi is less than anpi ref val");
++		return;
++	}
++
++	if ((noise_histogram_rep_cond == 2) && (noise_histogram_ref_val < anpi)) {
++		wpa_printf(MSG_DEBUG, "anpi is greater than anpi ref val");
++		return;
++	}
++
++	cur = ipi_density_str;
++	end_str = ipi_density_str + 64;
++	ret = os_snprintf(cur, end_str - cur, " ipi=");
++	cur += ret;
++
++	for (i = 0; i < RRM_NOISE_HISTO_IPI_DENSITY_SIZE; i++) {
++		ret = os_snprintf(cur, end_str - cur, "%d%s", ipi_density[i],
++				i + 1 < RRM_NOISE_HISTO_IPI_DENSITY_SIZE ? "," : " ");
++		cur += ret;
++	}
++
++	if (!hapd->conf->rrm_manipulate_measurement)
++		hostapd_send_noise_histogram_report(hapd, sta_addr, token,
++				measurement_token, measurement_rep_mode, op_class, channel,
++				start_time, measurement_duration_report, ant_id, anpi,
++				ipi_density, NULL, NULL, NULL);
++	else
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_NOISE_HISTOGRAM_REQUEST_RXED MACSTR
++			" dialog_token=%d measurement_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d antenna_id=%d anpi=%d%s",
++			MAC2STR(sta_addr), token, measurement_token, measurement_rep_mode,
++			op_class, channel, start_time, measurement_duration_report, ant_id,
++			anpi, ipi_density_str);
++}
++
++static void hostapd_handle_noise_histogram_report(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr)
++{
++	u8 op_class, channel, measurement_rep_mode, ant_id, anpi, i;
++	u16 measurement_duration;
++	u64 start_time;
++	char ipi_density[64] = {};
++	char *cur, *end;
++	char wide_band_ch_switch[30];
++	int ret;
++
++	wpa_printf(MSG_DEBUG, "noise histogram token %u len %zu", token, len);
++
++	measurement_rep_mode = pos[1];
++	if (measurement_rep_mode != 0) {
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_NOISE_HISTOGRAM_RXED MACSTR
++				" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d antenna_id=%d anpi=%d ipi=0,0,0,0,0,0,0,0,0,0,0",
++				MAC2STR(sta_addr), measurement_rep_mode, 0, 0, 0, 0, 0, 0);
++		return;
++	}
++
++	op_class = pos[3];
++	channel = pos[4];
++	start_time = WPA_GET_BE64(&pos[5]);
++	measurement_duration = WPA_GET_BE16(&pos[13]);
++	ant_id = pos[15];
++	anpi = pos[16];
++
++	cur = ipi_density;
++	end = ipi_density + 64;
++	ret = os_snprintf(cur, end - cur, " ipi=");
++	cur += ret;
++
++	for (i = 0; i < RRM_NOISE_HISTO_IPI_DENSITY_SIZE; i++) {
++		ret = os_snprintf(cur, end - cur, "%d%s", pos[17 + i],
++				i + 1 < RRM_NOISE_HISTO_IPI_DENSITY_SIZE ? "," : " ");
++		cur += ret;
++	}
++
++	wide_band_ch_switch[0] = '\0';
++	if (pos[28] == 163 && pos[29] == 5 && pos[30] == 194 && pos[31] == 3)
++		os_snprintf(wide_band_ch_switch, sizeof(wide_band_ch_switch),
++			" wide_band_ch_switch=%d,%d,%d", pos[32], pos[33], pos[34]);
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_NOISE_HISTOGRAM_RXED MACSTR
++			" measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d antenna_id=%d anpi=%d%s%s",
++			MAC2STR(sta_addr), measurement_rep_mode, op_class, channel,
++			start_time, measurement_duration, ant_id, anpi, ipi_density,
++			wide_band_ch_switch);
++}
++
+ static void build_statistics_group_str(char *statistics_group_data_str,
+ 		u32 *statistics_group_data, int statistics_group_data_len)
+ {
+@@ -468,6 +613,10 @@ static void hostapd_handle_radio_msmt_request(struct hostapd_data *hapd,
+ 			hostapd_handle_channel_load_request(hapd, token, ie + 2, ie[1],
+ 					mgmt->sa, num_of_repetition);
+ 			break;
++		case MEASURE_TYPE_NOISE_HIST:
++			hostapd_handle_noise_histogram_request(hapd, token, ie + 2, ie[1],
++					mgmt->sa, num_of_repetition);
++			break;
+ 		case MEASURE_TYPE_STA_STATISTICS:
+ 			hostapd_handle_sta_statistics_request(hapd, token, ie + 2, ie[1],
+ 					mgmt->sa, num_of_repetition);
+@@ -519,6 +668,10 @@ static void hostapd_handle_radio_msmt_report(struct hostapd_data *hapd,
+ 			hostapd_handle_channel_load_report(hapd, token, ie + 2, ie[1],
+ 					mgmt->sa);
+ 			break;
++		case MEASURE_TYPE_NOISE_HIST:
++			hostapd_handle_noise_histogram_report(hapd, token, ie + 2, ie[1],
++					mgmt->sa);
++			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG,
+ 				   "Measurement report type %u is not supported", ie[4]);
+@@ -1420,6 +1573,177 @@ int hostapd_send_channel_load_report(struct hostapd_data *hapd, const u8 *addr,
+ 	return ret;
+ }
+ 
++int hostapd_send_noise_histogram_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode, u8 oper_class,
++		u8 channel, u16 random_interval, u16 measurement_duration, u8 *rep_cond,
++		u8 *anpi_ref_val, u8 *ch_width, u8 *ch_center_freq0,
++		u8 *ch_center_freq1)
++{
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	u8 *len;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "request noise histogram: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "request noise histogram: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[1] & WLAN_RRM_CAPS_NOISE_HISTOGRAM)) {
++		wpa_printf(MSG_ERROR,
++			   "request noise histogram: Destination station does not support noise histogram in RRM");
++		return -1;
++	}
++
++	/* Measurement request (5) + Measurement element with noise histogram (11) + optional sub-elements (255)*/
++	buf = wpabuf_alloc(5 + 11 + 255);
++	if (!buf)
++		return -1;
++
++	hapd->noise_histogram_token++;
++	if (!hapd->noise_histogram_token) /* For wraparounds */
++		hapd->noise_histogram_token++;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.2 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REQUEST);
++	wpabuf_put_u8(buf, hapd->noise_histogram_token); /* Dialog Token */
++	wpabuf_put_be16(buf, num_of_repetitions); /* Number of Repetitions */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.21 */
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REQUEST);
++	len = wpabuf_put(buf, 1); /* Length will be set later */
++
++	wpabuf_put_u8(buf, hapd->noise_histogram_token); /* Measurement Token */
++	wpabuf_put_u8(buf, measurement_request_mode); /* Measurement Request Mode */
++	wpabuf_put_u8(buf, MEASURE_TYPE_NOISE_HIST); /* Measurement Type */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.21.6 */
++	wpabuf_put_u8(buf, oper_class); /* Operating class */
++	wpabuf_put_u8(buf, channel); /* Channel Number */
++	wpabuf_put_be16(buf, random_interval); /* Randomization Interval */
++	wpabuf_put_be16(buf, measurement_duration); /* Measurement Duration */
++
++	/* optional sub-elements should go here */
++	if (rep_cond && anpi_ref_val) {
++		wpabuf_put_u8(buf, 1); /* channel load reporting sub element id */
++		wpabuf_put_u8(buf, 2);
++		wpabuf_put_u8(buf, *rep_cond);
++		wpabuf_put_u8(buf, *anpi_ref_val);
++	}
++
++	if (ch_width && ch_center_freq0 && ch_center_freq1) {
++		wpabuf_put_u8(buf, 163); /* wide bandwidth channel switch sub element id */
++		wpabuf_put_u8(buf, 5);   /* sub element length */
++		wpabuf_put_u8(buf, 194); /* wide bandwidth channel switch element id */
++		wpabuf_put_u8(buf, 3); 	 /* element length */
++		wpabuf_put_u8(buf, *ch_width);
++		wpabuf_put_u8(buf, *ch_center_freq0);
++		wpabuf_put_u8(buf, *ch_center_freq1);
++	}
++
++	/* category + Action + measurement type + token + reps + EID + len = 7 */
++	*len = wpabuf_len(buf) - 7;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++	return ret;
++}
++
++int hostapd_send_noise_histogram_report(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u8 op_class, u8 channel, u64 start_time, u16 measurement_duration,
++		u8 ant_id, u8 anpi, u8 *ipi_density, u8 *ch_width, u8 *ch_center_freq0,
++		u8 *ch_center_freq1)
++{
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	u8 *len;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "noise histogram report: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "noise histogram report: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[1] & WLAN_RRM_CAPS_NOISE_HISTOGRAM)) {
++		wpa_printf(MSG_ERROR,
++			   "noise histogram report: Destination station does not support noise histogram in RRM");
++		return -1;
++	}
++
++	/* Measurement report (3) + Measurement element with noise histogram (25) + optional sub-elements (255)*/
++	buf = wpabuf_alloc(3 + 25 + 255);
++	if (!buf)
++		return -1;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.3 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REPORT);
++	wpabuf_put_u8(buf, dialog_token); /* Dialog Token */
++
++	/* IEEE P802.11-REVmc/D5.0, 9.4.2.22 */
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REPORT);
++	len = wpabuf_put(buf, 1); /* Length will be set later */
++
++	wpabuf_put_u8(buf, measurement_token); /* Measurement Token */
++	wpabuf_put_u8(buf, measurement_rep_mode); /* Measurement Report Mode */
++	wpabuf_put_u8(buf, MEASURE_TYPE_NOISE_HIST); /* Measurement Type */
++
++	/* IEEE P802.11-REVmc/D6.0, 9.4.2.22.6 */
++	wpabuf_put_u8(buf, op_class); /* Operating class */
++	wpabuf_put_u8(buf, channel); /* Channel Number */
++	wpabuf_put_data(buf, (const void *) &start_time, 8); /* actual measurement start time */
++	wpabuf_put_be16(buf, measurement_duration); /* Measurement Duration */
++	wpabuf_put_u8(buf, ant_id); /* antenna id */
++	wpabuf_put_u8(buf, anpi); /* anpi */
++
++	for (i = 0; i < 11; i++)
++		wpabuf_put_u8(buf, ipi_density[i]);
++
++	if (ch_width && ch_center_freq0 && ch_center_freq1) {
++		wpabuf_put_u8(buf, 163); /* wide bandwidth channel switch sub element id */
++		wpabuf_put_u8(buf, 5);   /* sub element length */
++		wpabuf_put_u8(buf, 194); /* wide bandwidth channel switch element id */
++		wpabuf_put_u8(buf, 3); 	 /* element length */
++		wpabuf_put_u8(buf, *ch_width);
++		wpabuf_put_u8(buf, *ch_center_freq0);
++		wpabuf_put_u8(buf, *ch_center_freq1);
++	}
++
++	/* Action + measurement type + token + EID + len = 5 */
++	*len = wpabuf_len(buf) - 5;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++	return ret;
++}
+ 
+ int hostapd_send_link_measurement_req(struct hostapd_data *hapd, const u8 *addr)
+ {
+diff --git a/src/ap/rrm.h b/src/ap/rrm.h
+index a2c9790..3b44b97 100644
+--- a/src/ap/rrm.h
++++ b/src/ap/rrm.h
+@@ -17,6 +17,7 @@
+  */
+ #define RRM_RANGE_REQ_MAX_RESPONDERS 16
+ 
++#define RRM_NOISE_HISTO_IPI_DENSITY_SIZE   11
+ #define RRM_STA_STATISTICS_GROUP_DATA_SIZE 13
+ 
+ void hostapd_handle_radio_measurement(struct hostapd_data *hapd,
+@@ -41,6 +42,16 @@ int hostapd_send_channel_load_report(struct hostapd_data *hapd, const u8 *addr,
+ 		u8 op_class, u8 channel, u64 start_time, u16 measurement_duration,
+ 		u8 channel_load, u8 *ch_width, u8 *ch_center_freq0,
+ 		u8 *ch_center_freq1);
++int hostapd_send_noise_histogram_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode, u8 oper_class,
++		u8 channel, u16 random_interval, u16 measurement_duration, u8 *rep_cond,
++		u8 *anpi_ref_val, u8 *ch_width, u8 *ch_center_freq0,
++		u8 *ch_center_freq1);
++int hostapd_send_noise_histogram_report(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u8 op_class, u8 channel, u64 start_time, u16 measurement_duration,
++		u8 ant_id, u8 anpi, u8 *ipi_density, u8 *ch_width, u8 *ch_center_freq0,
++		u8 *ch_center_freq1);
+ int hostapd_send_link_measurement_req(struct hostapd_data *hapd,
+ 		const u8 *addr);
+ int hostapd_send_link_measurement_report(struct hostapd_data *hapd,
+diff --git a/src/common/cli.h b/src/common/cli.h
+index 41ef329..7dfe867 100644
+--- a/src/common/cli.h
++++ b/src/common/cli.h
+@@ -41,7 +41,7 @@ int get_cmd_arg_num(const char *str, int pos);
+ int write_cmd(char *buf, size_t buflen, const char *cmd, int argc,
+ 	      char *argv[]);
+ 
+-#define max_args 10
++#define max_args 15
+ int tokenize_cmd(char *cmd, char *argv[]);
+ 
+ #endif /* CLI_H */
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 9ed078d..898f46c 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -374,6 +374,7 @@
+ #define WLAN_RRM_CAPS_NEIGHBOR_REPORT BIT(1)
+ /* byte 2 (out of 5) */
+ #define WLAN_RRM_CAPS_CHANNEL_LOAD BIT(1)
++#define WLAN_RRM_CAPS_NOISE_HISTOGRAM BIT(2)
+ #define WLAN_RRM_CAPS_STATISTICS_MEASUREMENT BIT(3)
+ #define WLAN_RRM_CAPS_LCI_MEASUREMENT BIT(4)
+ /* byte 5 (out of 5) */
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index 1dcad09..ccd2d61 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -248,6 +248,9 @@ extern "C" {
+ #define RRM_EVENT_CHANNEL_LOAD_RXED "RRM-CHANNEL-LOAD-RECEIVED "
+ #define RRM_EVENT_CHANNEL_LOAD_REQUEST_RXED "RRM-CHANNEL-LOAD-REQUEST-RECEIVED "
+ 
++#define RRM_EVENT_NOISE_HISTOGRAM_RXED "RRM-NOISE-HISTOGRAM-RECEIVED "
++#define RRM_EVENT_NOISE_HISTOGRAM_REQUEST_RXED \
++	"RRM-NOISE-HISTOGRAM-REQUEST-RECEIVED "
+ 
+ #define RRM_EVENT_LINK_MEASUREMENT_RXED "RRM-LINK-MEASUREMENT-RECEIVED "
+ #define RRM_EVENT_LINK_MEASUREMENT_REQUEST_RXED \
+-- 
+2.10.1
+

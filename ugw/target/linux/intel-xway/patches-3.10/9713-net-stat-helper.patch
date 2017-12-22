@@ -1,0 +1,1170 @@
+# HG changeset patch
+# Parent f7a728b455c9e3f5c50c852dccc5f3f352967e50
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2971,4 +2971,9 @@ do {								\
+ #define PTYPE_HASH_SIZE	(16)
+ #define PTYPE_HASH_MASK	(PTYPE_HASH_SIZE - 1)
+ 
++#if (defined(CONFIG_LTQ_STAT_HELPER) || defined(CONFIG_LTQ_STAT_HELPER_MODULE))
++extern struct rtnl_link_stats64* (*dev_get_extended_stats64_fn)(struct net_device *dev,
++					     struct rtnl_link_stats64 *storage);
++#endif
++
+ #endif	/* _LINUX_NETDEVICE_H */
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -56,6 +56,7 @@ source "net/unix/Kconfig"
+ source "net/xfrm/Kconfig"
+ source "net/iucv/Kconfig"
+ source "net/lantiq/Kconfig"
++source "net/lantiq/stat_helper/Kconfig"
+ 
+ config INET
+ 	bool "TCP/IP networking"
+diff --git a/net/Makefile b/net/Makefile
+--- a/net/Makefile
++++ b/net/Makefile
+@@ -22,6 +22,7 @@ obj-$(CONFIG_UNIX)		+= unix/
+ obj-$(CONFIG_NET)		+= ipv6/
+ obj-y += mcast_helper_reg.o
+ obj-$(CONFIG_LANTIQ_MCAST_HELPER) += lantiq/
++obj-$(CONFIG_LTQ_STAT_HELPER) += lantiq/stat_helper/
+ obj-$(CONFIG_PACKET)		+= packet/
+ obj-$(CONFIG_NET_KEY)		+= key/
+ obj-$(CONFIG_BRIDGE)		+= bridge/
+diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5640,6 +5640,12 @@ void netdev_stats_to_stats64(struct rtnl
+ }
+ EXPORT_SYMBOL(netdev_stats_to_stats64);
+ 
++#if (defined(CONFIG_LTQ_STAT_HELPER) || defined(CONFIG_LTQ_STAT_HELPER_MODULE))
++struct rtnl_link_stats64* (*dev_get_extended_stats64_fn)(struct net_device *dev,
++					     struct rtnl_link_stats64 *storage) = NULL;
++EXPORT_SYMBOL(dev_get_extended_stats64_fn);
++#endif
++
+ /**
+  *	dev_get_stats	- get network device statistics
+  *	@dev: device to get statistics from
+@@ -5663,6 +5669,10 @@ struct rtnl_link_stats64 *dev_get_stats(
+ 	} else {
+ 		netdev_stats_to_stats64(storage, &dev->stats);
+ 	}
++#if (defined(CONFIG_LTQ_STAT_HELPER) || defined(CONFIG_LTQ_STAT_HELPER_MODULE))
++	if (dev_get_extended_stats64_fn)
++		dev_get_extended_stats64_fn(dev, storage);
++#endif
+ 	storage->rx_dropped += atomic_long_read(&dev->rx_dropped);
+ 	return storage;
+ }
+diff --git a/net/lantiq/stat_helper/Kconfig b/net/lantiq/stat_helper/Kconfig
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/Kconfig
+@@ -0,0 +1,27 @@
++#
++# Stat helper configuration
++#
++
++config LTQ_STAT_HELPER
++	bool "Stat Helper support"
++	default n
++	help
++		Stat helper support
++
++choice
++   prompt "Stat Helper Platform Selection"
++   default LTQ_STAT_HELPER_XRX330
++   
++   config LTQ_STAT_HELPER_XRX200
++      depends on LTQ_STAT_HELPER
++      bool "xRX200"
++
++   config LTQ_STAT_HELPER_XRX300
++      depends on LTQ_STAT_HELPER
++      bool "xRX300"
++   
++   config LTQ_STAT_HELPER_XRX330
++      depends on LTQ_STAT_HELPER
++      bool "xRX330"
++
++endchoice
+diff --git a/net/lantiq/stat_helper/Makefile b/net/lantiq/stat_helper/Makefile
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/Makefile
+@@ -0,0 +1,4 @@
++obj-$(CONFIG_LTQ_STAT_HELPER) += stat_helper.o platform/stat_helper_platform.o
++obj-$(CONFIG_LTQ_STAT_HELPER_XRX330) += platform/xrx330/stat_helper_xrx330.o
++obj-$(CONFIG_LTQ_STAT_HELPER_XRX300) += platform/xrx300/stat_helper_xrx300.o
++obj-$(CONFIG_LTQ_STAT_HELPER_XRX200) += platform/xrx200/stat_helper_xrx200.o
+diff --git a/net/lantiq/stat_helper/platform/stat_helper_platform.c b/net/lantiq/stat_helper/platform/stat_helper_platform.c
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/stat_helper_platform.c
+@@ -0,0 +1,29 @@
++#include <linux/netdevice.h>
++#include <linux/types.h>
++#include <switch-api/lantiq_ethsw_api.h>
++
++#include "stat_helper_platform.h"
++
++void _stat_helper_get_switch_rmon_counters(int8_t *switch_dev, uint8_t port, stat_helper_dev_stats64_t *stats)
++{
++	LTQ_ETHSW_API_HANDLE switch_api_fd;
++	IFX_ETHSW_RMON_cnt_t param;
++
++	memset(&param, 0, sizeof(IFX_ETHSW_RMON_cnt_t));
++
++	switch_api_fd = ltq_ethsw_api_kopen(switch_dev);
++
++	param.nPortId = port;
++	ltq_ethsw_api_kioctl(switch_api_fd, IFX_ETHSW_RMON_GET, (unsigned int)&param);
++
++	stats->rx_packets += (uint64_t)param.nRxGoodPkts;
++	stats->tx_packets += (uint64_t)param.nTxGoodPkts;
++	stats->rx_bytes += param.nRxGoodBytes;
++	stats->tx_bytes += param.nTxGoodBytes;
++	stats->rx_errors += param.nRxFCSErrorPkts + param.nRxUnderSizeErrorPkts + param.nRxOversizeErrorPkts + param.nRxAlignErrorPkts;
++	stats->rx_dropped += (uint64_t)param.nRxDroppedPkts;
++	stats->tx_dropped += (uint64_t)param.nTxDroppedPkts;
++	stats->multicast += (uint64_t)param.nRxMulticastPkts;
++
++	ltq_ethsw_api_kclose(switch_api_fd);
++}
+diff --git a/net/lantiq/stat_helper/platform/stat_helper_platform.h b/net/lantiq/stat_helper/platform/stat_helper_platform.h
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/stat_helper_platform.h
+@@ -0,0 +1,46 @@
++
++#ifndef STAT_HELPER_PLATFORM_H
++#define STAT_HELPER_PLATFORM_H
++
++#define CONFIG_SWITCH_DEV "/dev/switch_api/0"
++
++#define CONFIG_SWITCH_MAX_LAN_PORT	6
++
++typedef struct stat_helper_lan_physport_list {
++	int32_t port_num;
++	int32_t port[CONFIG_SWITCH_MAX_LAN_PORT];
++} stat_helper_physport_list_t;
++
++typedef struct stat_helper_dev_stats64 {
++	uint64_t	rx_packets;		/* total packets received	*/
++	uint64_t	tx_packets;		/* total packets transmitted	*/
++	uint64_t	rx_bytes;		/* total bytes received 	*/
++	uint64_t	tx_bytes;		/* total bytes transmitted	*/
++	uint64_t	rx_errors;		/* bad packets received		*/
++	uint64_t	tx_errors;		/* packet transmit problems	*/
++	uint64_t	rx_dropped;		/* no space in linux buffers	*/
++	uint64_t	tx_dropped;		/* no space available in linux	*/
++	uint64_t	multicast;		/* multicast packets received	*/
++} stat_helper_dev_stats64_t;
++
++/* FIXME : identify a MACVALN interface as an upper layer interface */
++#define _stat_helper_is_upper_layer_dev(dev) ((dev->type == ARPHRD_PPP) \
++										   || (dev->type == ARPHRD_TUNNEL) \
++										   || (dev->type == ARPHRD_TUNNEL6) \
++										   || (dev->type == ARPHRD_SIT) \
++										   || (dev->priv_flags & IFF_802_1Q_VLAN) \
++										   || (dev->priv_flags & IFF_EBRIDGE))
++
++#define _stat_helper_is_ethlan_basedev(dev) (!strcmp(dev->name, "eth0"))
++#define _stat_helper_is_ethlan_portdev(dev) (!strncmp(dev->name, "eth0_", 5))
++#define _stat_helper_is_ethwan_basedev(dev) (!strcmp(dev->name, "eth1"))
++#define _stat_helper_is_ptmwan_basedev(dev) (!strcmp(dev->name, "ptm0"))
++#define _stat_helper_is_atmwan_basedev(dev) (dev->priv_flags & IFF_BR2684)
++
++extern void _stat_helper_get_switch_rmon_counters(int8_t *switch_dev, uint8_t port, stat_helper_dev_stats64_t *stats);
++
++extern struct rtnl_link_stats64*
++stat_helper_platform_dev_get_extended_stats64(struct net_device *dev,
++									 struct rtnl_link_stats64 *storage);
++
++#endif
+diff --git a/net/lantiq/stat_helper/platform/xrx200/stat_helper_xrx200.c b/net/lantiq/stat_helper/platform/xrx200/stat_helper_xrx200.c
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/xrx200/stat_helper_xrx200.c
+@@ -0,0 +1,200 @@
++#include <linux/netdevice.h>
++#include <linux/if_arp.h>
++#include <linux/if.h>
++
++#include <net/ppa_api.h>
++
++#include "../stat_helper_platform.h"
++#include "stat_helper_xrx200.h"
++
++struct rtnl_link_stats64*
++stat_helper_platform_dev_get_extended_stats64(struct net_device *dev,
++									 struct rtnl_link_stats64 *storage)
++{
++	stat_helper_dev_stats64_t stats;
++	PPA_NETIF_ACCEL_STATS ppa_stats;
++
++	/* Loopback, or any other Unknown interface */
++	if ( (dev->type == ARPHRD_LOOPBACK) || (dev->type == ARPHRD_NONE) || (dev->type == ARPHRD_VOID) ) {
++		return storage;
++	}
++
++	/* Upper layer interface, such as PPP, Dslite, 6RD, VLAN, Bridge, MACVLAN etc. */
++	if (_stat_helper_is_upper_layer_dev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Currently packet counters are not available from PPA */
++		/* FIXME : Some extra bytes are there depending on the interface layer */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW and SW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL | PPA_F_NETIF_SW_ACCEL));
++		}
++
++		/* add with ppa HW and SW accelerated stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes + ppa_stats.sw_accel_stats.rx_bytes;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes + ppa_stats.sw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* Ethernet LAN interface, say eth0 */
++	else if (_stat_helper_is_ethlan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++		int32_t i;
++		stat_helper_physport_list_t portlist = {0};
++
++		/* Accumulate all the LAN ports switch counters */
++		if (_stat_helper_get_all_lan_physport(&portlist)) {
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get all the lan switch port stats */
++		for (i = 0; i < portlist.port_num; i++) {
++			_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, portlist.port[i], &stats);
++		}
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++
++	/* Ethernet LAN port interface, such as eth0_1, eth0_2, eth0_3, eth0_4 and so on. */
++	} else if (_stat_helper_is_ethlan_portdev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++		int32_t physport = -1;
++
++		if ( (physport = _stat_helper_get_physport_by_dev(dev)) < 0) {
++			/* No physical port exists */
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get switch port stats */
++		_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, physport, &stats);
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		/* FIXME : Currently, PPA session counters are used */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW and SW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL | PPA_F_NETIF_SW_ACCEL));
++		}
++
++		/* add with ppa HW and SW accelerated session stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes + ppa_stats.sw_accel_stats.rx_bytes;
++#endif
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++	}
++
++	/* Ethernet WAN interface, say eth1 */
++	else if (_stat_helper_is_ethwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++
++		int32_t physport = -1;
++
++		if ( (physport = _stat_helper_get_physport_by_dev(dev)) < 0) {
++			/* No physical port exists */
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get switch port stats */
++		_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, physport, &stats);
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++	}
++
++	/* PTM WAN interface, say ptm0 */
++	else if (_stat_helper_is_ptmwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++
++#if 0
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPE port MIB stats and HW accelerated session stats (only for tx_bytes) */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_PORT_MIB | PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with PPE port MIB stats */
++		storage->rx_packets += ppa_stats.port_mib_stats.ig_fast_brg_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_udp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_tcp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_mc_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_udp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_tcp_pkts;
++		storage->rx_bytes += ppa_stats.port_mib_stats.ig_fast_brg_bytes
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_bytes
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_bytes;
++		storage->tx_packets += ppa_stats.port_mib_stats.eg_fast_pkts;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++		storage->rx_dropped += ppa_stats.port_mib_stats.ig_drop_pkts;
++#endif
++#else
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW accelerated session stats (only for tx_bytes) */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with PPA HW accelerated session stats (only for tx_bytes) */
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* ATM WAN interface, such as nas0, nas1 and so on */
++	else if (_stat_helper_is_atmwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Currently packet counters are not available from PPA */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with ppa HW accelerated session stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* Do nothing for any other interface */
++
++	return storage;
++}
+diff --git a/net/lantiq/stat_helper/platform/xrx200/stat_helper_xrx200.h b/net/lantiq/stat_helper/platform/xrx200/stat_helper_xrx200.h
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/xrx200/stat_helper_xrx200.h
+@@ -0,0 +1,39 @@
++
++#ifndef STAT_HELPER_VR9_H
++#define STAT_HELPER_VR9_H
++
++#define CONFIG_SWITCH_WAN_PORT		5
++#define CONFIG_SWITCH_LAN_PORT_1	4
++#define CONFIG_SWITCH_LAN_PORT_2	2
++#define CONFIG_SWITCH_LAN_PORT_3	1
++#define CONFIG_SWITCH_LAN_PORT_4	0
++
++static inline int32_t _stat_helper_get_physport_by_dev(struct net_device *dev)
++{
++	if (!strcmp(dev->name, "eth0_1")) {
++		return CONFIG_SWITCH_LAN_PORT_1;
++	} else if (!strcmp(dev->name, "eth0_2")) {
++		return CONFIG_SWITCH_LAN_PORT_2;
++	} else if (!strcmp(dev->name, "eth0_3")) {
++		return CONFIG_SWITCH_LAN_PORT_3;
++	} else if (!strcmp(dev->name, "eth0_4")) {
++		return CONFIG_SWITCH_LAN_PORT_4;
++	} else if (!strcmp(dev->name, "eth1")) {
++		return CONFIG_SWITCH_WAN_PORT;
++	} else {
++		return -1;
++	}
++}
++
++static inline int32_t _stat_helper_get_all_lan_physport(stat_helper_physport_list_t *portlist)
++{
++	portlist->port_num = 4;
++	portlist->port[0] = CONFIG_SWITCH_LAN_PORT_1;
++	portlist->port[1] = CONFIG_SWITCH_LAN_PORT_2;
++	portlist->port[2] = CONFIG_SWITCH_LAN_PORT_3;
++	portlist->port[3] = CONFIG_SWITCH_LAN_PORT_4;
++
++	return 0;
++}
++
++#endif
+diff --git a/net/lantiq/stat_helper/platform/xrx300/stat_helper_xrx300.c b/net/lantiq/stat_helper/platform/xrx300/stat_helper_xrx300.c
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/xrx300/stat_helper_xrx300.c
+@@ -0,0 +1,200 @@
++#include <linux/netdevice.h>
++#include <linux/if_arp.h>
++#include <linux/if.h>
++
++#include <net/ppa_api.h>
++
++#include "../stat_helper_platform.h"
++#include "stat_helper_xrx300.h"
++
++struct rtnl_link_stats64*
++stat_helper_platform_dev_get_extended_stats64(struct net_device *dev,
++									 struct rtnl_link_stats64 *storage)
++{
++	stat_helper_dev_stats64_t stats;
++	PPA_NETIF_ACCEL_STATS ppa_stats;
++
++	/* Loopback, or any other Unknown interface */
++	if ( (dev->type == ARPHRD_LOOPBACK) || (dev->type == ARPHRD_NONE) || (dev->type == ARPHRD_VOID) ) {
++		return storage;
++	}
++
++	/* Upper layer interface, such as PPP, Dslite, 6RD, VLAN, Bridge, MACVLAN etc. */
++	if (_stat_helper_is_upper_layer_dev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Currently packet counters are not available from PPA */
++		/* FIXME : Some extra bytes are there depending on the interface layer */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW and SW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL | PPA_F_NETIF_SW_ACCEL));
++		}
++
++		/* add with ppa HW and SW accelerated stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes + ppa_stats.sw_accel_stats.rx_bytes;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes + ppa_stats.sw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* Ethernet LAN interface, say eth0 */
++	else if (_stat_helper_is_ethlan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++		int32_t i;
++		stat_helper_physport_list_t portlist = {0};
++
++		/* Accumulate all the LAN ports switch counters */
++		if (_stat_helper_get_all_lan_physport(&portlist)) {
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get all the lan switch port stats */
++		for (i = 0; i < portlist.port_num; i++) {
++			_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, portlist.port[i], &stats);
++		}
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++
++	/* Ethernet LAN port interface, such as eth0_1, eth0_2, eth0_3, eth0_4 and so on. */
++	} else if (_stat_helper_is_ethlan_portdev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++		int32_t physport = -1;
++
++		if ( (physport = _stat_helper_get_physport_by_dev(dev)) < 0) {
++			/* No physical port exists */
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get switch port stats */
++		_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, physport, &stats);
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		/* FIXME : Currently, PPA session counters are used */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW and SW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL | PPA_F_NETIF_SW_ACCEL));
++		}
++
++		/* add with ppa HW and SW accelerated session stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes + ppa_stats.sw_accel_stats.rx_bytes;
++#endif
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++	}
++
++	/* Ethernet WAN interface, say eth1 */
++	else if (_stat_helper_is_ethwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++
++		int32_t physport = -1;
++
++		if ( (physport = _stat_helper_get_physport_by_dev(dev)) < 0) {
++			/* No physical port exists */
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get switch port stats */
++		_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, physport, &stats);
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++	}
++
++	/* PTM WAN interface, say ptm0 */
++	else if (_stat_helper_is_ptmwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++
++#if 0
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPE port MIB stats and HW accelerated session stats (only for tx_bytes) */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_PORT_MIB | PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with PPE port MIB stats */
++		storage->rx_packets += ppa_stats.port_mib_stats.ig_fast_brg_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_udp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_tcp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_mc_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_udp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_tcp_pkts;
++		storage->rx_bytes += ppa_stats.port_mib_stats.ig_fast_brg_bytes
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_bytes
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_bytes;
++		storage->tx_packets += ppa_stats.port_mib_stats.eg_fast_pkts;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++		storage->rx_dropped += ppa_stats.port_mib_stats.ig_drop_pkts;
++#endif
++#else
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW accelerated session stats (only for tx_bytes) */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with PPA HW accelerated session stats (only for tx_bytes) */
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* ATM WAN interface, such as nas0, nas1 and so on */
++	else if (_stat_helper_is_atmwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Currently packet counters are not available from PPA */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with ppa HW accelerated session stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* Do nothing for any other interface */
++
++	return storage;
++}
+diff --git a/net/lantiq/stat_helper/platform/xrx300/stat_helper_xrx300.h b/net/lantiq/stat_helper/platform/xrx300/stat_helper_xrx300.h
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/xrx300/stat_helper_xrx300.h
+@@ -0,0 +1,39 @@
++
++#ifndef STAT_HELPER_AR10_H
++#define STAT_HELPER_AR10_H
++
++#define CONFIG_SWITCH_WAN_PORT		5
++#define CONFIG_SWITCH_LAN_PORT_1	1
++#define CONFIG_SWITCH_LAN_PORT_2	4
++#define CONFIG_SWITCH_LAN_PORT_3	2
++#define CONFIG_SWITCH_LAN_PORT_4	0
++
++static inline int32_t _stat_helper_get_physport_by_dev(struct net_device *dev)
++{
++	if (!strcmp(dev->name, "eth0_1")) {
++		return CONFIG_SWITCH_LAN_PORT_1;
++	} else if (!strcmp(dev->name, "eth0_2")) {
++		return CONFIG_SWITCH_LAN_PORT_2;
++	} else if (!strcmp(dev->name, "eth0_3")) {
++		return CONFIG_SWITCH_LAN_PORT_3;
++	} else if (!strcmp(dev->name, "eth0_4")) {
++		return CONFIG_SWITCH_LAN_PORT_4;
++	} else if (!strcmp(dev->name, "eth1")) {
++		return CONFIG_SWITCH_WAN_PORT;
++	} else {
++		return -1;
++	}
++}
++
++static inline int32_t _stat_helper_get_all_lan_physport(stat_helper_physport_list_t *portlist)
++{
++	portlist->port_num = 4;
++	portlist->port[0] = CONFIG_SWITCH_LAN_PORT_1;
++	portlist->port[1] = CONFIG_SWITCH_LAN_PORT_2;
++	portlist->port[2] = CONFIG_SWITCH_LAN_PORT_3;
++	portlist->port[3] = CONFIG_SWITCH_LAN_PORT_4;
++
++	return 0;
++}
++
++#endif
+diff --git a/net/lantiq/stat_helper/platform/xrx330/stat_helper_xrx330.c b/net/lantiq/stat_helper/platform/xrx330/stat_helper_xrx330.c
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/xrx330/stat_helper_xrx330.c
+@@ -0,0 +1,187 @@
++#include <linux/netdevice.h>
++#include <linux/if_arp.h>
++#include <linux/if.h>
++
++#include <net/ppa_api.h>
++
++#include "../stat_helper_platform.h"
++#include "stat_helper_xrx330.h"
++
++struct rtnl_link_stats64*
++stat_helper_platform_dev_get_extended_stats64(struct net_device *dev,
++									 struct rtnl_link_stats64 *storage)
++{
++	stat_helper_dev_stats64_t stats;
++	PPA_NETIF_ACCEL_STATS ppa_stats;
++
++	/* Loopback, or any other Unknown interface */
++	if ( (dev->type == ARPHRD_LOOPBACK) || (dev->type == ARPHRD_NONE) || (dev->type == ARPHRD_VOID) ) {
++		return storage;
++	}
++
++	/* Upper layer interface, such as PPP, Dslite, 6RD, VLAN, Bridge, MACVLAN etc. */
++	if (_stat_helper_is_upper_layer_dev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Currently packet counters are not available from PPA */
++		/* FIXME : Some extra bytes are there depending on the interface layer */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW and SW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL | PPA_F_NETIF_SW_ACCEL));
++		}
++
++		/* add with ppa HW and SW accelerated stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes + ppa_stats.sw_accel_stats.rx_bytes;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes + ppa_stats.sw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* Ethernet LAN interface, say eth0 */
++	else if (_stat_helper_is_ethlan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++		int32_t i;
++		stat_helper_physport_list_t portlist = {0};
++
++		/* Accumulate all the LAN ports switch counters */
++		if (_stat_helper_get_all_lan_physport(&portlist)) {
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get all the lan switch port stats */
++		for (i = 0; i < portlist.port_num; i++) {
++			_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, portlist.port[i], &stats);
++		}
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++
++	/* Ethernet LAN port interface, such as eth0_1, eth0_2, eth0_3, eth0_4 and so on. */
++	} else if (_stat_helper_is_ethlan_portdev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++		int32_t physport = -1;
++
++		if ( (physport = _stat_helper_get_physport_by_dev(dev)) < 0) {
++			/* No physical port exists */
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get switch port stats */
++		_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, physport, &stats);
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		/* FIXME : Currently, PPA session counters are used */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW and SW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL | PPA_F_NETIF_SW_ACCEL));
++		}
++
++		/* add with ppa HW and SW accelerated session stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes + ppa_stats.sw_accel_stats.rx_bytes;
++#endif
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++	}
++
++	/* Ethernet WAN interface, say eth1 */
++	else if (_stat_helper_is_ethwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains MIPS and PPE FW counters */
++
++		int32_t physport = -1;
++
++		if ( (physport = _stat_helper_get_physport_by_dev(dev)) < 0) {
++			/* No physical port exists */
++			return storage;
++		}
++
++		memset(&stats, 0, sizeof(stat_helper_dev_stats64_t));
++
++		/* get switch port stats */
++		_stat_helper_get_switch_rmon_counters(CONFIG_SWITCH_DEV, physport, &stats);
++
++		storage->rx_packets = stats.rx_packets - storage->rx_dropped; /* NOTE : exclude switch port drops */
++		storage->tx_packets = stats.tx_packets;
++		/* FIXME : Here, switch accelerated counters are missing in storage->rx_bytes */
++		storage->tx_bytes = stats.tx_bytes;
++		storage->rx_errors += stats.rx_errors;
++		storage->tx_errors += stats.tx_errors;
++		storage->rx_dropped += stats.rx_dropped;
++		storage->tx_dropped += stats.tx_dropped;
++	}
++
++	/* PTM WAN interface, say ptm0 */
++	else if (_stat_helper_is_ptmwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPE port MIB stats and HW accelerated session stats (only for tx_bytes) */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_PORT_MIB | PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with PPE port MIB stats */
++		storage->rx_packets += ppa_stats.port_mib_stats.ig_fast_brg_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_udp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_tcp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_mc_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_udp_pkts
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_tcp_pkts;
++		storage->rx_bytes += ppa_stats.port_mib_stats.ig_fast_brg_bytes
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv4_bytes
++								+ ppa_stats.port_mib_stats.ig_fast_rt_ipv6_bytes;
++		storage->tx_packets += ppa_stats.port_mib_stats.eg_fast_pkts;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++		storage->rx_dropped += ppa_stats.port_mib_stats.ig_drop_pkts;
++#endif
++	}
++
++	/* ATM WAN interface, such as nas0, nas1 and so on */
++	else if (_stat_helper_is_atmwan_basedev(dev)) {
++		/* NOTE : Linux driver maintains only MIPS counters */
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* FIXME : Currently packet counters are not available from PPA */
++
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++		/* get PPA HW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL));
++		}
++
++		/* add with ppa HW accelerated session stats */
++		storage->rx_bytes += ppa_stats.hw_accel_stats.rx_bytes;
++		storage->tx_bytes += ppa_stats.hw_accel_stats.tx_bytes;
++#endif
++	}
++
++	/* Do nothing for any other interface */
++
++	return storage;
++}
+diff --git a/net/lantiq/stat_helper/platform/xrx330/stat_helper_xrx330.h b/net/lantiq/stat_helper/platform/xrx330/stat_helper_xrx330.h
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/platform/xrx330/stat_helper_xrx330.h
+@@ -0,0 +1,39 @@
++
++#ifndef STAT_HELPER_VRX218_H
++#define STAT_HELPER_VRX218_H
++
++#define CONFIG_SWITCH_WAN_PORT		5
++#define CONFIG_SWITCH_LAN_PORT_1	3
++#define CONFIG_SWITCH_LAN_PORT_2	1
++#define CONFIG_SWITCH_LAN_PORT_3	4
++#define CONFIG_SWITCH_LAN_PORT_4	2
++
++static inline int32_t _stat_helper_get_physport_by_dev(struct net_device *dev)
++{
++	if (!strcmp(dev->name, "eth0_1")) {
++		return CONFIG_SWITCH_LAN_PORT_1;
++	} else if (!strcmp(dev->name, "eth0_2")) {
++		return CONFIG_SWITCH_LAN_PORT_2;
++	} else if (!strcmp(dev->name, "eth0_3")) {
++		return CONFIG_SWITCH_LAN_PORT_3;
++	} else if (!strcmp(dev->name, "eth0_4")) {
++		return CONFIG_SWITCH_LAN_PORT_4;
++	} else if (!strcmp(dev->name, "eth1")) {
++		return CONFIG_SWITCH_WAN_PORT;
++	} else {
++		return -1;
++	}
++}
++
++static inline int32_t _stat_helper_get_all_lan_physport(stat_helper_physport_list_t *portlist)
++{
++	portlist->port_num = 4;
++	portlist->port[0] = CONFIG_SWITCH_LAN_PORT_1;
++	portlist->port[1] = CONFIG_SWITCH_LAN_PORT_2;
++	portlist->port[2] = CONFIG_SWITCH_LAN_PORT_3;
++	portlist->port[3] = CONFIG_SWITCH_LAN_PORT_4;
++
++	return 0;
++}
++
++#endif
+diff --git a/net/lantiq/stat_helper/stat_helper.c b/net/lantiq/stat_helper/stat_helper.c
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/stat_helper.c
+@@ -0,0 +1,217 @@
++/******************************************************************************
++**
++** FILE NAME    : stat_helper.c
++** AUTHOR       : 
++** DESCRIPTION  : Counter and Statistics Helper module
++** COPYRIGHT    :      Copyright (c) 2014
++**              Lantiq Deutschland GmbH 
++**
++**    This program is free software; you can redistribute it and/or modify
++**    it under the terms of the GNU General Public License as published by
++**    the Free Software Foundation; either version 2 of the License, or
++**    (at your option) any later version.
++**
++** HISTORY
++** $Date         $Author                $Comment
++**                                   
++*******************************************************************************/
++
++/******************************************************************************
++ *				Includes				      *
++ ******************************************************************************/
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++
++#ifdef CONFIG_PROC_FS
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++
++/* Root directory node for module proc entries */
++static struct proc_dir_entry *proc_root = NULL;
++#endif /* CONFIG_PROC_FS */
++
++#include <linux/netdevice.h>
++#include <linux/rcupdate.h>
++
++/* Kernel helper include */
++#include <linux/string.h>
++
++#include <net/ppa_api.h>
++
++#include "stat_helper.h"
++#include "platform/stat_helper_platform.h"
++
++#define STAT_HELPER_DEBUG 0
++
++/******************************************************************************
++ *				Local Functions				      *
++ ******************************************************************************/
++static struct rtnl_link_stats64*
++stat_helper_dev_get_extended_stats64(struct net_device *dev,
++									 struct rtnl_link_stats64 *storage)
++{
++#if (STAT_HELPER_DEBUG == 0)
++	stat_helper_platform_dev_get_extended_stats64(dev, storage);
++#endif
++
++	return storage;
++}
++
++#if STAT_HELPER_DEBUG
++static struct rtnl_link_stats64 *stat_helper_dev_get_stats(struct net_device *dev,
++                    struct rtnl_link_stats64 *storage)
++{
++    const struct net_device_ops *ops = dev->netdev_ops;
++
++    if (ops->ndo_get_stats64) {
++        memset(storage, 0, sizeof(*storage));
++        ops->ndo_get_stats64(dev, storage);
++    } else if (ops->ndo_get_stats) {
++        netdev_stats_to_stats64(storage, ops->ndo_get_stats(dev));
++    } else {
++        netdev_stats_to_stats64(storage, &dev->stats);
++    }
++	stat_helper_platform_dev_get_extended_stats64(dev, storage);
++    storage->rx_dropped += atomic_long_read(&dev->rx_dropped);
++    return storage;
++}
++#endif
++
++#ifdef CONFIG_PROC_FS
++static status stat_helper_get_ndo_stats(struct seq_file *seq)
++{
++	struct net *net = &init_net;
++	struct net_device *dev;
++	struct rtnl_link_stats64 temp;
++	const struct rtnl_link_stats64 *stats = NULL;
++	PPA_NETIF_ACCEL_STATS ppa_stats;
++
++	rcu_read_lock();
++	for_each_netdev_rcu(net, dev) {
++		//printk("Device name : %s  - Device type : %u, Device priv_flags : 0x%04X\n", dev->name, dev->type, dev->priv_flags);
++		memset(&ppa_stats, 0, sizeof(PPA_NETIF_ACCEL_STATS));
++
++#if STAT_HELPER_DEBUG
++		stats = stat_helper_dev_get_stats(dev, &temp);
++#else
++		stats = dev_get_stats(dev, &temp);
++#endif
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++		/* Get PPA HW and SW accelerated session stats */
++		if (ppa_hook_get_netif_accel_stats_fn) {
++			ppa_hook_get_netif_accel_stats_fn(dev->name, &ppa_stats, (PPA_F_NETIF_HW_ACCEL | PPA_F_NETIF_SW_ACCEL));
++		}
++#endif
++
++		seq_printf(seq, "%6s: %7llu %7llu %4llu %4llu %7llu %7llu  "
++			   "%8llu %7llu %4llu %4llu %7llu %7llu\n",
++			   dev->name, stats->rx_bytes, stats->rx_packets,
++			   stats->rx_errors, stats->rx_dropped + stats->rx_missed_errors,
++			   ppa_stats.hw_accel_stats.rx_bytes, ppa_stats.sw_accel_stats.rx_bytes,
++			   stats->tx_bytes, stats->tx_packets,
++			   stats->tx_errors, stats->tx_dropped,
++			   ppa_stats.hw_accel_stats.tx_bytes, ppa_stats.sw_accel_stats.tx_bytes);
++	}
++	rcu_read_unlock();
++
++	return STAT_HELPER_SUCCESS;
++}
++
++static int stat_helper_proc_read(struct seq_file *seq, void *v) 
++{
++	int ret = STAT_HELPER_SUCCESS;
++	int len = 0;
++
++	if (!MODULE_GET)
++		return ret;
++
++	len = seq->size - seq->count;
++
++	seq_puts(seq, "Inter-|   Receive                                 "
++		      " |  Transmit\n"
++		      " face |bytes    packets errs drop hw-accl sw-accl "
++		      " |bytes    packets errs drop hw-accl sw-accl\n");
++
++	/* Get NDO status */
++	stat_helper_get_ndo_stats(seq);
++
++	ret = 0;
++
++	MODULE_PUT;
++	return ret;
++}
++
++static int stat_helper_proc_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, stat_helper_proc_read, NULL);
++}
++
++static const struct file_operations stat_helper_proc_fops = {
++	.owner = THIS_MODULE,
++	.open = stat_helper_proc_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static int _stat_helper_proc_init(void)
++{
++#if STAT_HELPER_DEBUG
++	printk(KERN_INFO "STAT_HELPER: creating proc interfaces\n");
++#endif
++	proc_root = proc_mkdir("stat_helper", init_net.proc_net);
++	if (!proc_create("dev", 0, proc_root, &stat_helper_proc_fops)) {
++		printk(KERN_ERR "STAT_HELPER: failed to create proc entry 'dev'\n");
++		return STAT_HELPER_FAILURE;
++	}
++
++	return STAT_HELPER_SUCCESS;
++}
++
++static int _stat_helper_proc_deinit(void)
++{
++#if STAT_HELPER_DEBUG
++	printk(KERN_INFO "STAT_HELPER: removing proc interfaces\n");
++#endif
++	remove_proc_entry("dev", proc_root);
++	proc_remove(proc_root);
++	proc_root = NULL;
++	return STAT_HELPER_SUCCESS;
++}
++#endif /* CONFIG_PROC_FS */
++
++/******************************************************************************
++ *				Global Functions			      *
++ ******************************************************************************/
++static int __init stat_helper_init_module(void)
++{
++	rcu_assign_pointer(dev_get_extended_stats64_fn, stat_helper_dev_get_extended_stats64);
++#ifdef CONFIG_PROC_FS
++	_stat_helper_proc_init();
++#endif
++#if STAT_HELPER_DEBUG
++	printk("Successfully loaded stat helper module.\n");
++#endif
++	return 0;
++}
++
++static void __exit stat_helper_exit_module(void)
++{
++#ifdef CONFIG_PROC_FS
++	_stat_helper_proc_deinit();
++#endif
++	rcu_assign_pointer(dev_get_extended_stats64_fn, NULL);
++#if STAT_HELPER_DEBUG
++	printk("Successfully unloaded stat helper module.\n");
++#endif
++}
++
++module_init(stat_helper_init_module);
++module_exit(stat_helper_exit_module);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Copyright © 2015 Lantiq");
++MODULE_DESCRIPTION("Lantiq Stat Helper Module");
+diff --git a/net/lantiq/stat_helper/stat_helper.h b/net/lantiq/stat_helper/stat_helper.h
+new file mode 100644
+--- /dev/null
++++ b/net/lantiq/stat_helper/stat_helper.h
+@@ -0,0 +1,18 @@
++/*
++ *
++ * stat_helper.h - Counter and Statistic Module header file.
++ *
++ */
++
++#ifndef STAT_HELPER_H
++#define STAT_HELPER_H
++
++#define MODULE_GET      try_module_get(THIS_MODULE)
++#define MODULE_PUT      module_put(THIS_MODULE)
++
++typedef enum {
++	STAT_HELPER_FAILURE = -1,
++	STAT_HELPER_SUCCESS = 0,
++} status;
++
++#endif /* STAT_HELPER_H */

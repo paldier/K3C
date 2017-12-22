@@ -1,0 +1,136 @@
+#
+# Copyright (C) 2007 OpenWrt.org
+#
+# This is free software, licensed under the GNU General Public License v2.
+# See /LICENSE for more information.
+#
+
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=net-snmp
+PKG_VERSION:=5.1
+PKG_RELEASE:=1
+
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_URL:=
+PKG_MD5SUM:=f5f491564812db5d8783daa538c49186
+PKG_NO_AUTORECONF=y
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+PKG_DEFAULT_CUSTOM_SOURCE_DIR:=$(TOPDIR)/../../../wlnsw/wireline_sw_linux26/open_snmp
+
+
+include $(INCLUDE_DIR)/package.mk
+include $(INCLUDE_DIR)/package-version-override.mk
+
+define Package/$(PKG_NAME)
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=Net SNMP Support
+  URL:=
+endef
+
+define Package/$(PKG_NAME)/description
+  Net SNMP Support
+endef
+
+define Package/$(PKG_NAME)/config
+$(call Package/$(PKG_NAME)/override_version)
+$(call Package/$(PKG_NAME)/override_source_path)
+	config IFX_CONFIG_SNMP_ATM_MIB
+		default y
+		depends on PACKAGE_net-snmp
+		bool 'ATM MIB Support'
+	config IFX_CONFIG_SNMP_ADSL_MIB"
+		default y
+		depends on PACKAGE_net-snmp
+		bool 'ADSL MIB Support'
+endef
+
+CONFIGURE_ARGS = \
+    --with-c-compiler=$(TARGET_CC) \
+    --disable-shadow --disable-libinet6 --disable-ipv6
+
+IFX_INCLUDE = -I$(STAGING_DIR)/usr/include
+IFX_INCLUDE += -DIFX_SMALL_FOOTPRINT -DIFX_SKIP_API_INCL
+IFX_APIS_DIR:=$(BUILD_DIR)/ifx_IFXAPIs
+
+#configure
+	make distclean
+	if [ "$BUILD_2MB_PACKAGE" = "1" ]; then
+		display_info "Configuring for 2MB pkg"
+		cp -f configure_2MB_pkg current_configuration
+		cp -f configure_2MB configure
+		cp -f Makefile.rules.2MB_pkg Makefile.rules
+	elif [ "$IFX_CONFIG_SNMPv1" = "1" ]; then
+		display_info "Configuring for SNMPv1"
+		cp -f configure_snmpv1_pkg current_configuration
+		cp -f configure_full configure
+		cp -f Makefile.rules.full Makefile.rules
+	elif [ "$IFX_CONFIG_SNMPv3" = "1" ]; then
+		display_info "Configuring for SNMPv3"
+		cp -f configure_snmpv3_pkg current_configuration
+		cp -f configure_full configure
+		cp -f Makefile.rules.full Makefile.rules 
+		IFX_CFLAGS="${IFX_CFLAGS} -DIFX_CONFIG_SNMPv3" 
+	fi
+
+	chmod a+x current_configuration
+	AR=${IFX_AR} AS=${IFX_AS} LD=${IFX_LD} NM=${IFX_NM} CC=${IFX_CC}  RANLIB=${IFX_RANLIB} BUILDCC=${IFX_HOSTCC} CXX=${IFX_CXX} OBJCOPY=${IFX_OBJCOPY} OBJDUMP=${IFX_OBJDUMP} IFX_CFLAGS=${IFX_CFLAGS} IFX_LDFLAGS=${IFX_LDFLAGS} TARGET=${TARGET} HOST=${HOST} BUILD=${BUILD} BUILD_ROOTFS_DIR=${BUILD_ROOTFS_DIR} IFX_CONFIG_SNMP_TRANSPORTS=${IFX_CONFIG_SNMP_TRANSPORTS} IFX_CONFIG_MIB_MODULES=${IFX_CONFIG_MIB_MODULES} ./current_configuration
+
+#compile 
+if [ "$BUILD_2MB_PACKAGE" = "1" ]; then
+	IFX_CFLAGS="${IFX_CFLAGS} -DHAVE_MINIMAL_HELPERS -DHAVE_MINIMAL_LIBSUPPORT -DHAVE_OPTIMIZED_CODE"
+else 
+	IFX_CFLAGS="${IFX_CFLAGS}"
+fi
+
+if [ "$IFX_CONFIG_SNMPv3" = "1" ]; then
+	IFX_CFLAGS="${IFX_CFLAGS} -DIFX_CONFIG_SNMPv3" 
+fi
+
+#chandrav, for ilmid
+if [ "$IFX_CONFIG_TR037" = "1" ]; then
+        IFX_CFLAGS="${IFX_CFLAGS} -DIFX_CONFIG_TR037"
+fi
+
+make IFX_CFLAGS="${IFX_CFLAGS}" IFX_LDFLAGS="${IFX_LDFLAGS}" all
+ifx_error_check $? 
+
+if [ "$BUILD_2MB_PACKAGE" = "1" ]; then
+	install -d $BUILD_ROOTFS_DIR/usr/sbin/
+	cp -f snmpd $BUILD_ROOTFS_DIR/usr/sbin/
+else
+	make -C agent install  IFX_CFLAGS="${IFX_CFLAGS}" IFX_LDFLAGS="${IFX_LDFLAGS}"  
+	ifx_error_check $? 
+
+	make -C snmplib install IFX_CFLAGS="${IFX_CFLAGS}" IFX_LDFLAGS="${IFX_LDFLAGS}" 
+	ifx_error_check $?
+
+	rm -f ${BUILD_ROOTFS_DIR}usr/lib/libnetsnmp*.a
+	rm -f ${BUILD_ROOTFS_DIR}usr/lib/libnetsnmp*.la
+	${IFX_STRIP} --strip-unneeded ${BUILD_ROOTFS_DIR}usr/lib/libnetsnmp*
+fi
+
+${IFX_STRIP} -R.note -R.comment ${BUILD_ROOTFS_DIR}usr/sbin/snmp*
+define Build/Compile
+	$(MAKE) -C $(PKG_BUILD_DIR) $(TARGET_CONFIGURE_OPTS) IFX_CFLAGS="$(IFX_CFLAGS) $(IFX_INCLUDE)" IFX_LDFLAGS="$(IFX_LDFLAGS)" all
+endef
+
+define Package/$(PKG_NAME)/install
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(MAKE) -C $(PKG_BUILD_DIR) $(TARGET_CONFIGURE_OPTS) IFX_CFLAGS="$(IFX_CFLAGS) $(IFX_INCLUDE)" IFX_LDFLAGS="$(IFX_LDFLAGS)" INSTALLROOT=$(1) install
+	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/ftpd/ftpd $(1)/usr/sbin/
+endef
+
+define Build/Clean
+	if [ -d $(PKG_BUILD_DIR) ]; then $(MAKE) -C $(PKG_BUILD_DIR) clean; \
+	rm -f ${BUILD_ROOTFS_DIR}usr/lib/libnetsnmp*; \
+	rm -f ${BUILD_ROOTFS_DIR}usr/sbin/snmp*; \
+	$(MAKE) -C $(PKG_BUILD_DIR) distclean; \
+	$(RM) $(PKG_BUILD_DIR)/ipk; fi
+endef
+
+define distclean
+
+endif
+$(eval $(call BuildPackage,$(PKG_NAME)))

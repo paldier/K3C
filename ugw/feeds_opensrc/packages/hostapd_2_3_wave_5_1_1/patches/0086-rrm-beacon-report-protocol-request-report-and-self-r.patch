@@ -1,0 +1,1500 @@
+From 9eecb4abd7cd02ed3a8687fc399d2a381ede6e6d Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Wed, 23 Nov 2016 15:24:32 +0200
+Subject: [PATCH] rrm: beacon report protocol - request, report and self report
+
+To enable the support of beacon report measurement from the conf file:
+passive: rrm_beacon_report_passive=1
+table:   rrm_beacon_report_table=1
+active measurements is not supported bu the AP.
+
+To enable the support of manipulate the beacon report measurements
+from conf file:
+rrm_manipulate_measurement=1
+if this flag is enabled, then upon beacon report  measurement request
+from the STA, the AP will make the measurements and notify the "AP-Manager"
+instead of sending the response.
+
+Request from AP to STA: (cli_command)
+req_beacon <dst> <num_of_repetitions> <measurement_req_mode> <op_class>
+<channel> <rand_int> <duration> <mode-"active"/"passive"/"table"> <bssid>
+[beacon_rep=<0-10>,<0-255>]
+[rep_detail=<0-2>]
+[ssid=<ssid>] [rep_detail=<0-2>] [rep_cond=<0-10>,<0-255>]
+[ap_ch_report=[<channel 1>[,<channel 2>[..,<channel N>]]]
+[req_elements=[<element 1>[,<element 2>[..,<element N>]]]
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+
+Response from STA to AP: (notification)
+RRM-BEACON-REP-RECEIVED <ifname> <sta_mac_addr> dialog_token=<dialog_token>
+measurement_rep_mode=<measurement_rep_mode> op_class=<op_class>
+channel=<channel> start_time=<start_time> duration=<duration>
+frame_info=<frame_info> rcpi=<rcpi> rsni=<rsni> bssid=<bssid>
+antenna_id=<ant_id> parent_tsf=<tsf>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+[timestamp=<time_stamp> beacon_int=<beacon_int>]
+all the below data is in HEX:
+[capab_info=<capab_info> ssid=<ssid> rm_capa=<rm_capa>
+vendor_specific=<vendor_specific> rsn_info=<rsn_info>]
+
+Request from STA to AP: (notification)
+RRM-BEACON-REP-REQUEST-RECEIVED <ifname> <sta_mac_addr>
+dialog_token=<dialog_token> measurement_token=<measurement_token>
+measurement_rep_mode=<measurement_rep_mode> op_class=<op_class>
+channel=<channel> start_time=<start_time> duration=<duration>
+frame_info=<frame_info> rcpi=<rcpi> rsni=<rsni> bssid=<bssid>
+antenna_id=<ant_id> parent_tsf=<tsf>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+[timestamp=<time_stamp> beacon_int=<beacon_int>]
+all the below data is in HEX:
+[capab_info=<capab_info> ssid=<ssid> rm_capa=<rm_capa>
+vendor_specific=<vendor_specific> rsn_info=<rsn_info>]
+
+Response from AP to STA: (cli_command)
+report_beacon <dst> <dialog_token> <measurement_token>
+<measurement_rep_mode> <op_class> <channel> <start_time>
+<duration> <frame_info> <rcpi> <rsni> <bssid> <ant_id> <tsf>
+[wide_band_ch_switch=<new channel width>,
+<new channel center frequency segment 0>,
+<new channel center frequency segment 1>]
+[rep_frame_body=<length>,<frame_body hexdump>]
+
+Self beacon request: (cli_command)
+req_self_beacon <rand_int> <duration>
+<mode-"active"/"passive"/"table">
+
+Self beacon respone: (notification)
+RRM-SELF-BEACON-REP-RECEIVED <ifname> <sta_mac_addr>
+measurement_rep_mode=<measurement_rep_mode> op_class=<op_class>
+channel=<channel> start_time=<start_time> duration=<duration>
+frame_info=<frame_info> rcpi=<rcpi> rsni=<rsni> bssid=<bssid>
+antenna_id=<ant_id> parent_tsf=<tsf>
+
+increased the receiving pending buf size from 256 to 512
+because the beacon report notifications was too long.
+
+the measurement of the beacon report could be done only on the
+current channel that the AP works.
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/config_file.c        |   9 +
+ hostapd/ctrl_iface.c         | 443 +++++++++++++++++++++++++++++++++++++-
+ hostapd/hostapd_cli.c        |  33 ++-
+ src/ap/acs.c                 |  33 +++
+ src/ap/acs.h                 |   1 +
+ src/ap/hostapd.h             |   4 +-
+ src/ap/rrm.c                 | 497 +++++++++++++++++++++++++++++++++++++------
+ src/ap/rrm.h                 |  14 +-
+ src/common/ieee802_11_defs.h |  32 +++
+ src/common/wpa_ctrl.h        |   3 +-
+ 10 files changed, 993 insertions(+), 76 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 710e58f..e7b8e2f 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3930,6 +3930,15 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 	} else if (os_strcmp(buf, "rrm_noise_histogram") == 0) {
+ 		if (atoi(pos))
+ 			bss->radio_measurements[1] |= WLAN_RRM_CAPS_NOISE_HISTOGRAM;
++	} else if (os_strcmp(buf, "rrm_beacon_report_passive") == 0) {
++		if (atoi(pos))
++			bss->radio_measurements[0] |= WLAN_RRM_CAPS_BEACON_PASSIVE_MEASUREMENT;
++	} else if (os_strcmp(buf, "rrm_beacon_report_active") == 0) {
++		if (atoi(pos))
++			bss->radio_measurements[0] |= WLAN_RRM_CAPS_BEACON_ACTIVE_MEASUREMENT;
++	} else if (os_strcmp(buf, "rrm_beacon_report_table") == 0) {
++		if (atoi(pos))
++			bss->radio_measurements[0] |= WLAN_RRM_CAPS_BEACON_TABLE_MEASUREMENT;
+ 	} else if (os_strcmp(buf, "gas_address3") == 0) {
+ 		bss->gas_address3 = atoi(pos);
+ 	} else if (os_strcmp(buf, "ftm_responder") == 0) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 0793b7e..d46377e 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2376,13 +2376,16 @@ static int hostapd_ctrl_iface_mbo_bss_assoc_disallow(struct hostapd_data *hapd,
+ }
+ #endif /* CONFIG_MBO */
+ 
+-static int hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd)
++static int hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd,
++		char *buf, size_t buflen)
+ {
+ 	u8 addr[ETH_ALEN], bssid[ETH_ALEN];
+ 	char *token, *context = NULL;
+ 	char *pos, *cmd_end;
+ 	int op_class, channel, random_interval, mode, measurement_duration;
+ 	struct wpa_ssid_value ssid, *ssid_p = NULL;
++	int num_of_repetitions, measurement_request_mode;
++	int ret_dialog_token;
+ 
+ 	u8 rep_cond, rep_cond_threshold;
+ 	u8* rep_cond_p = NULL, *rep_cond_threshold_p = NULL;
+@@ -2395,6 +2398,10 @@ static int hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd)
+ 	u8* req_elem_p = NULL;
+ 	unsigned int req_elem_len = 0;
+ 
++	u8 channel_width, channel_center_frequency0, channel_center_frequency1;
++	u8 *channel_width_p = NULL;
++	u8 *channel_center_frequency0_p = NULL, *channel_center_frequency1_p = NULL;
++
+ 	cmd_end = cmd + strlen(cmd);
+ 
+ 	token = str_token(cmd, " ", &context);
+@@ -2406,6 +2413,32 @@ static int hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd)
+ 	token = str_token(cmd, " ", &context);
+ 	if (!token) {
+ 		wpa_printf(MSG_ERROR,
++				"CTRL: REQ_BEACON - number of repetitions is missing");
++		return -1;
++	}
++	num_of_repetitions = atoi(token);
++	if (num_of_repetitions < 0 || num_of_repetitions > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_BEACON - number of repetitions is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_BEACON - measurement request mode is missing");
++		return -1;
++	}
++	measurement_request_mode = atoi(token);
++	if (measurement_request_mode < 0 || measurement_request_mode > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_BEACON - measurement request mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
+ 			   "CTRL: REQ_BEACON - operating class is missing");
+ 		return -1;
+ 	}
+@@ -2493,11 +2526,11 @@ static int hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd)
+ 		ssid_p = &ssid;
+ 	}
+ 
+-	pos = os_strstr(token, "rep_cond=");
++	pos = os_strstr(token, "beacon_rep=");
+ 	if (pos) {
+ 		int cond, threshold;
+ 		char *end, *comma;
+-		pos += 9;
++		pos += 11;
+ 		end = os_strchr(pos, ' ');
+ 		if (!end) {
+ 			end = pos + os_strlen(pos);
+@@ -2587,17 +2620,406 @@ static int hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd)
+ 			req_elem_p = req_elem;
+ 		}
+ 	}
++
++	pos = os_strstr(token, "wide_band_ch_switch=");
++	if (pos) {
++		int ch_width, ch_center_freq0, ch_center_freq1;
++		char *end, *comma1, *comma2;
++		pos += 20;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_BEACON - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_BEACON - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma2++;
++		ch_width = atoi(pos);
++		if (ch_width < 0 || ch_width > 3) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_BEACON - channel width is invalid");
++			return -1;
++		}
++		ch_center_freq0 = atoi(comma1);
++		if (ch_center_freq0 < 0 || ch_center_freq0 > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_BEACON - channel center frequency 0 is invalid");
++			return -1;
++		}
++		ch_center_freq1 = atoi(comma2);
++		if (ch_center_freq1 < 0 || ch_center_freq1 > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REQ_BEACON - channel center frequency 1 is invalid");
++			return -1;
++		}
++		channel_width = (u8) ch_width;
++		channel_width_p = &channel_width;
++		channel_center_frequency0 = (u8) ch_center_freq0;
++		channel_center_frequency0_p = &channel_center_frequency0;
++		channel_center_frequency1 = (u8) ch_center_freq1;
++		channel_center_frequency1_p = &channel_center_frequency1;
++	}
++
+ exit:
+-	return hostapd_send_beacon_req(hapd, addr, op_class, channel,
+-			random_interval, measurement_duration, mode, bssid, ssid_p,
+-			rep_cond_p, rep_cond_threshold_p,rep_detail_p, ap_ch_rep_p,
+-			ap_ch_rep_len, req_elem_p, req_elem_len);
++	ret_dialog_token = hostapd_send_beacon_req(hapd, addr, op_class, channel,
++			num_of_repetitions, measurement_request_mode, random_interval,
++			measurement_duration, mode, bssid, ssid_p, rep_cond_p,
++			rep_cond_threshold_p,rep_detail_p, ap_ch_rep_p, ap_ch_rep_len,
++			req_elem_p, req_elem_len, channel_width_p,
++			channel_center_frequency0_p, channel_center_frequency1_p);
++
++	if (ret_dialog_token < 0)
++		return -1;
++	return os_snprintf(buf, buflen, "dialog_token=%d\n", ret_dialog_token);
+ }
+ 
++static int hostapd_ctrl_iface_report_beacon(struct hostapd_data *hapd,
+ 		char *cmd)
+ {
++	char *token, *context = NULL;
++	char *pos, *cmd_end;
++	u8 addr[ETH_ALEN], bssid[ETH_ALEN];
++	int op_class, channel, measurement_duration, dialog_token;
++	int measurement_token, measurement_rep_mode;
++	int frame_info, rcpi, rsni, antenna_id, parent_tsf;
++	unsigned long long start_time;
++
++	u8 channel_width, channel_center_frequency0, channel_center_frequency1;
++	u8 *channel_width_p = NULL;
++	u8 *channel_center_frequency0_p = NULL, *channel_center_frequency1_p = NULL;
++	u8 rep_frame_body_length,  rep_frame_body[256];
++	u8 *rep_frame_body_p = NULL, *rep_frame_body_length_p = NULL;
++
++	cmd_end = cmd + strlen(cmd);
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REP_BEACON - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - dialog token is missing");
++		return -1;
++	}
++	dialog_token = atoi(token);
++	if (dialog_token < 0 || dialog_token > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - dialog token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - measurement token is missing");
++		return -1;
++	}
++	measurement_token = atoi(token);
++	if (measurement_token < 0 || measurement_token > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - measurement token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - measurement mode is missing");
++		return -1;
++	}
++	measurement_rep_mode = atoi(token);
++	if (measurement_rep_mode < 0 || measurement_rep_mode > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - measurement mode is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - operation class is missing");
++		return -1;
++	}
++	op_class = atoi(token);
++	if (op_class < 0 || op_class > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - operation class is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - channel is missing");
++		return -1;
++	}
++	channel = atoi(token);
++	if (channel < 0 || channel > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - channel is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - start time is missing");
++		return -1;
++	}
++	start_time = strtoull(token, NULL, 10);
++	if (start_time < 0) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - start time is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REQ_BEACON - measurement duration out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - frame info is missing");
++		return -1;
++	}
++	frame_info = atoi(token);
++	if (frame_info < 0 || frame_info > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - frame info is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - rcpi is missing");
++		return -1;
++	}
++	rcpi = atoi(token);
++	if (rcpi < 0 || rcpi > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - rcpi is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - rsni is missing");
++		return -1;
++	}
++	rsni = atoi(token);
++	if (rsni < 0 || rsni > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - rsni is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, bssid)) {
++		wpa_printf(MSG_ERROR, "CTRL: REP_BEACON - bad BSSID address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - antenna id is missing");
++		return -1;
++	}
++	antenna_id = atoi(token);
++	if (antenna_id < 0 || antenna_id > 255) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - antenna id is out of range");
++		return -1;
++	}
++
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - parent tsf is missing");
++		return -1;
++	}
++	parent_tsf = atoi(token);
++	if (parent_tsf < 0 || parent_tsf > 0xffffffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REP_BEACON - parent tsf is out of range");
++		return -1;
++	}
++
++	/* optional tokens */
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		/* we've reached the end of command (no optinal arguments) */
++		goto exit;
++	}
++
++	pos = os_strstr(token, "rep_frame_body=");
++	if (pos) {
++		int length;
++		char *end, *comma;
++		pos += 15;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma = os_strchr(pos, ',');
++		if (!comma || comma == pos || comma >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REP_BEACON - reported frame body format is invalid");
++			return -1;
++		}
++		comma++;
++		length = atoi(pos);
++		if (length < 0 || length > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REP_BEACON - reported frame body length is invalid");
++			return -1;
++		}
++		os_memcpy(rep_frame_body, comma, length);
++		rep_frame_body_length = (u8) length;
++		rep_frame_body_length_p = &rep_frame_body_length;
++		rep_frame_body_p = (u8 *)rep_frame_body;
++	}
++
++	pos = os_strstr(token, "wide_band_ch_switch=");
++	if (pos) {
++		int ch_width, ch_center_freq0, ch_center_freq1;
++		char *end, *comma1, *comma2;
++		pos += 20;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REP_BEACON - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REP_BEACON - wide_band_ch_switch format is invalid");
++			return -1;
++		}
++		comma2++;
++		ch_width = atoi(pos);
++		if (ch_width < 0 || ch_width > 3) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REP_BEACON - channel width is invalid");
++			return -1;
++		}
++		ch_center_freq0 = atoi(comma1);
++		if (ch_center_freq0 < 0 || ch_center_freq0 > 255) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REPORT_CHANNEL_LOAD - channel center frequency 0 is invalid");
++			return -1;
++		}
++		ch_center_freq1 = atoi(comma2);
++		if (ch_center_freq1 < 0 || ch_center_freq1 > 255) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: REP_BEACON - channel center frequency 1 is invalid");
++			return -1;
++		}
++		channel_width = (u8) ch_width;
++		channel_width_p = &channel_width;
++		channel_center_frequency0 = (u8) ch_center_freq0;
++		channel_center_frequency0_p = &channel_center_frequency0;
++		channel_center_frequency1 = (u8) ch_center_freq1;
++		channel_center_frequency1_p = &channel_center_frequency1;
++	}
++
++exit:
++	return hostapd_send_beacon_report_resp(hapd, addr, dialog_token,
++			measurement_token, measurement_rep_mode, op_class, channel,
++			start_time, measurement_duration, frame_info, rcpi, rsni,
++			bssid, antenna_id, parent_tsf, channel_width_p,
++			channel_center_frequency0_p, channel_center_frequency1_p,
++			rep_frame_body_p, rep_frame_body_length_p);
++}
++
++static int hostapd_ctrl_iface_req_self_beacon(struct hostapd_data *hapd,
++		char *cmd)
++{
++	char *token, *context = NULL;
++	int random_interval, mode, measurement_duration;
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_SELF_BEACON - random interval is missing");
++		return -1;
++	}
++	random_interval = atoi(token);
++	if (random_interval < 0 || random_interval > 0xffff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_SELF_BEACON - random interval out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REQ_SELF_BEACON - measurement duration is missing");
++		return -1;
++	}
++	measurement_duration = atoi(token);
++	if (measurement_duration < 0 || measurement_duration > 0xffff) {
++		wpa_printf(MSG_ERROR,
++				"CTRL: REQ_SELF_BEACON - measurement duration out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_SELF_BEACON - mode is missing");
++		return -1;
++	}
++	if (!os_strcmp(token, "passive")) {
++		mode = 0;
++	} else if (!os_strcmp(token, "active")) {
++		mode = 1;
++	} else if (!os_strcmp(token, "table")) {
++		mode = 2;
++	} else {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_BEACON - mode is invalid");
++		return -1;
++	}
++
++	hostapd_handle_self_beacon_req(hapd, random_interval, measurement_duration,
++			mode);
++	return 0;
++}
++
+ static int hostapd_ctrl_iface_req_link_measurement(struct hostapd_data *hapd,
+ 		char *cmd, char *buf, size_t buflen)
++{
+ 	u8 addr[ETH_ALEN];
+ 	char *token, *context = NULL;
+ 	int ret_dialog_token;
+@@ -5770,8 +6192,13 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (hostapd_ctrl_iface_req_range(hapd, buf + 10))
+ 			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_BEACON ", 11) == 0) {
+-		if (hostapd_ctrl_iface_req_beacon(hapd, buf + 11))
++		reply_len = hostapd_ctrl_iface_req_beacon(hapd, buf + 11,
++				reply, reply_size);
++	} else if (os_strncmp(buf, "REPORT_BEACON ", 14) == 0) {
++		if (hostapd_ctrl_iface_report_beacon(hapd, buf + 14))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "REQ_SELF_BEACON ", 16) == 0) {
++		if (hostapd_ctrl_iface_req_self_beacon(hapd, buf + 16))
+ 			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_CHANNEL_LOAD ", 17) == 0) {
+ 		reply_len = hostapd_ctrl_iface_req_channel_load(hapd, buf + 17,
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 5b68ada..93eafa8 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1313,12 +1313,35 @@ static int hostapd_cli_cmd_req_range(struct wpa_ctrl *ctrl, int argc,
+ static int hostapd_cli_cmd_req_beacon(struct wpa_ctrl *ctrl, int argc,
+ 	     char *argv[])
+ {
+-	if (argc < 7) {
+-		printf("Invalid req_beacon command: needs at least 7 arguments: - dest address, operating class, channel, random interval, measurement duration, mode, bssid, + some optianl arguments\n");
++	if (argc < 9) {
++		printf("Invalid req_beacon command: needs at least 9 arguments: - dest address, num of repetitions, measurement request mode, operating class, channel, random interval, measurement duration, mode, bssid, + some optianl arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REQ_BEACON", 9, argc, argv);
++}
++
++
++static int hostapd_cli_cmd_report_beacon(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 14) {
++		printf("Invalid report_beacon command: needs at least 14 arguments: - dest address, dialog_token, measurement token, measurement report mode, operating class, channel, start time, measurement duration, feame info, rcpi, rsni, bssid, ant_id, tsf + some optianl arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "REPORT_BEACON", 14, argc, argv);
++}
++
++static int hostapd_cli_cmd_req_self_beacon(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 3) {
++		printf("Invalid req_self_beacon command: needs at least 3 arguments: - random interval, measurement duration, mode\n");
+ 		return -1;
+ 	}
+ 
+-	return hostapd_cli_cmd(ctrl, "REQ_BEACON", 7, argc, argv);
++	return hostapd_cli_cmd(ctrl, "REQ_SELF_BEACON", 3, argc, argv);
+ }
+ 
+ 
+@@ -1901,6 +1924,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "req_lci", hostapd_cli_cmd_req_lci, NULL, NULL },
+ 	{ "req_range", hostapd_cli_cmd_req_range, NULL, NULL },
+ 	{ "req_beacon", hostapd_cli_cmd_req_beacon, NULL, NULL },
++	{ "report_beacon", hostapd_cli_cmd_report_beacon, NULL, NULL },
++	{ "req_self_beacon", hostapd_cli_cmd_req_self_beacon, NULL, NULL },
+ 	{ "req_channel_load", hostapd_cli_cmd_req_channel_load, NULL, NULL },
+ 	{ "report_channel_load", hostapd_cli_cmd_report_channel_load, NULL, NULL },
+ 	{ "req_noise_histogram", hostapd_cli_cmd_req_noise_histogram, NULL, NULL },
+@@ -2061,7 +2086,7 @@ static void hostapd_cli_recv_pending(struct wpa_ctrl *ctrl, int in_read,
+ 	if (ctrl_conn == NULL)
+ 		return;
+ 	while (wpa_ctrl_pending(ctrl)) {
+-		char buf[256];
++		char buf[512];
+ 		size_t len = sizeof(buf) - 1;
+ 		if (wpa_ctrl_recv(ctrl, buf, &len) == 0) {
+ 			buf[len] = '\0';
+diff --git a/src/ap/acs.c b/src/ap/acs.c
+index 9bf88ab..c662b7a 100644
+--- a/src/ap/acs.c
++++ b/src/ap/acs.c
+@@ -24,6 +24,7 @@
+ #include "beacon.h"
+ #include <assert.h>
+ #include "acs.h"
++#include "rrm.h"
+ 
+ /*
+  * Automatic Channel Selection
+@@ -3027,3 +3028,35 @@ void acs_set_radar(struct hostapd_iface *iface)
+   else
+     wpa_printf(MSG_ERROR, "Must switch, radar !");
+ }
++
++static void acs_current_channel_scan_complete(struct hostapd_iface *iface)
++{
++	if (iface->self_beacon_req) {
++		hostapd_handle_self_beacon_report_scan_results(iface->bss[0]);
++	} else {
++		hostapd_handle_sta_beacon_report_scan_results(iface);
++	}
++}
++
++int acs_current_channel_request_scan(struct hostapd_iface *iface)
++{
++	struct wpa_driver_scan_params params;
++
++	os_memset(&params, 0, sizeof(params));
++	params.freqs = os_calloc(1 + 1, sizeof(params.freqs[0]));
++	if (params.freqs == NULL)
++		return -1;
++
++	params.freqs[0] = iface->freq;
++	iface->scan_cb = acs_current_channel_scan_complete;
++
++	if (hostapd_driver_scan(iface->bss[0], &params) < 0) {
++		wpa_printf(MSG_ERROR, "ACS: Failed to request initial scan");
++		acs_cleanup(iface);
++		os_free(params.freqs);
++		return -1;
++	}
++
++	os_free(params.freqs);
++	return 0;
++}
+diff --git a/src/ap/acs.h b/src/ap/acs.h
+index 7b45e60..16feaa0 100644
+--- a/src/ap/acs.h
++++ b/src/ap/acs.h
+@@ -19,6 +19,7 @@ void acs_set_radar(struct hostapd_iface *iface);
+ int acs_do_switch_channel(struct hostapd_iface *iface, int block_tx);
+ int get_num_width(int vht_width, int secondary);
+ int acs_chan_to_freq(int channel);
++int acs_current_channel_request_scan(struct hostapd_iface *iface);
+ 
+ typedef struct {
+   u8 pri;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index be54d68..daf7656 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -311,7 +311,6 @@ struct hostapd_data {
+ 	u8 sta_statistics_token;
+ 	unsigned int lci_req_active:1;
+ 	unsigned int range_req_active:1;
+-	unsigned int beacon_req_active:1;
+ };
+ 
+ 
+@@ -354,6 +353,7 @@ struct hostapd_iface {
+ 	unsigned int wait_channel_update:1;
+ 	unsigned int cac_started:1;
+ 	unsigned int acs_update_in_progress:1;
++	unsigned int self_beacon_req:1;
+ 
+ #ifdef CONFIG_FST
+ 	struct fst_iface *fst;
+@@ -476,6 +476,8 @@ struct hostapd_iface {
+ 
+ 	struct dl_list sta_seen; /* struct hostapd_sta_info */
+ 	unsigned int num_sta_seen;
++
++	struct beacon_request last_beacon_req;
+ };
+ 
+ /* hostapd.c */
+diff --git a/src/ap/rrm.c b/src/ap/rrm.c
+index dfd55ff..b2be409 100644
+--- a/src/ap/rrm.c
++++ b/src/ap/rrm.c
+@@ -19,9 +19,18 @@
+ #include "wpa_debug.h"
+ #include "common/wpa_ctrl.h"
+ #include "utils/common.h"
++#include "acs.h"
+ 
+ #define HOSTAPD_RRM_REQUEST_TIMEOUT 5
+ 
++static void hostapd_build_beacon_report_resp(struct wpabuf *buf,
++		u8 measurement_token, u8 measurement_rep_mode, u8 op_class, u8 channel,
++		u64 start_time, u8 measurement_duration, u8 frame_info, u8 rcpi,
++		u8 rsni, const u8 *bssid, u8 antenna_id, u32 parent_tsf, u8 *ch_width,
++		u8 *ch_center_freq0, u8 *ch_center_freq1, u8 *rep_frame_body,
++		u8 *rep_frame_body_length);
++static int hostapd_send_beacon_report_with_header(struct hostapd_data *hapd,
++		const u8 *addr, const u8* data, int len, u8 dialog_token);
+ 
+ static void hostapd_lci_rep_timeout_handler(void *eloop_data, void *user_ctx)
+ {
+@@ -32,6 +41,16 @@ static void hostapd_lci_rep_timeout_handler(void *eloop_data, void *user_ctx)
+ 	hapd->lci_req_active = 0;
+ }
+ 
++static void hostapd_memory_as_hex(u8 *buf, size_t max_size, const u8 *address,
++		size_t len)
++{
++	size_t curr_byte_index;
++
++	for (curr_byte_index = 0; curr_byte_index < len; curr_byte_index++) {
++		os_snprintf((char*)buf + curr_byte_index * 3, max_size, "%02x ",
++				address[curr_byte_index]);
++	}
++}
+ 
+ static void hostapd_handle_lci_report(struct hostapd_data *hapd, u8 token,
+ 				      const u8 *pos, size_t len)
+@@ -101,43 +120,282 @@ static void hostapd_send_general_rrm_report(struct hostapd_data *hapd,
+ 	wpabuf_free(buf);
+ }
+ 
+-static void hostapd_handle_beacon_report(struct hostapd_data *hapd, u8 token,
+-					const u8 *pos, size_t len)
++void hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd)
++{
++	struct wpa_scan_results *scan_res = NULL;
++	int i;
++	int ht = hapd->iconf->ieee80211n && !hapd->conf->disable_11n;
++	int vht = hapd->iconf->ieee80211ac && !hapd->conf->disable_11ac;
++	u8 op_class, channel, phy_type;
++	const u8 bssid[ETH_ALEN] = {};
++
++	phy_type = ieee80211_get_phy_type(hapd->iface->freq, ht, vht);
++	ieee80211_freq_to_channel_ext(hapd->iface->freq,
++			hapd->iconf->secondary_channel, hapd->iconf->vht_oper_chwidth,
++			&op_class, &channel);
++
++	scan_res = hostapd_driver_get_scan_results(hapd);
++	if (!scan_res) {
++		wpa_printf(MSG_ERROR, "failed to get scan results");
++		return;
++	}
++
++	if (scan_res->num == 0) {
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_SELF_BEACON_REP_RXED MACSTR
++					" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++					MAC2STR(hapd->own_addr), 0, op_class, channel,
++					0, 0, phy_type, 0, 0, MAC2STR(bssid), 0, 0);
++		return;
++	}
++
++	for (i = 0; i < scan_res->num; i++) {
++		struct wpa_scan_res *bss = scan_res->res[i];
++		if (bss->freq == hapd->iface->freq) {
++			u8 rcpi = rssi_to_rcpi(bss->level);
++			wpa_msg(hapd->msg_ctx, MSG_INFO,
++					RRM_EVENT_SELF_BEACON_REP_RXED MACSTR
++					" measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++					MAC2STR(hapd->own_addr), 0, op_class, channel, bss->tsf, 0,
++					phy_type, rcpi, 255, MAC2STR(bss->bssid), 0, 0);
++		}
++	}
++}
++
++void hostapd_handle_sta_beacon_report_scan_results(struct hostapd_iface *iface)
++{
++	struct wpa_scan_results *scan_res = NULL;
++	struct wpabuf *buf;
++	const u8 *pos;
++	int i, len;
++	int ht = iface->bss[0]->iconf->ieee80211n
++			&& !iface->bss[0]->conf->disable_11n;
++	int vht = iface->bss[0]->iconf->ieee80211ac
++			&& !iface->bss[0]->conf->disable_11ac;
++	u8 op_class, channel, phy_type;
++	const u8 bssid[ETH_ALEN] = {};
++
++	phy_type = ieee80211_get_phy_type(iface->freq, ht, vht);
++	ieee80211_freq_to_channel_ext(iface->freq,
++			iface->bss[0]->iconf->secondary_channel,
++			iface->bss[0]->iconf->vht_oper_chwidth,
++			&op_class, &channel);
++
++	buf = wpabuf_alloc(3 + IEEE80211_MAX_MMPDU_SIZE);
++	if (!buf) {
++		wpa_printf(MSG_ERROR, "buffer allocation failed");
++		return;
++	}
++
++	scan_res = hostapd_driver_get_scan_results(iface->bss[0]);
++	if (!scan_res) {
++		wpa_printf(MSG_ERROR, "failed to get scan results");
++		return;
++	}
++
++	for (i = 0; i < scan_res->num; i++) {
++		struct wpa_scan_res *bss = scan_res->res[i];
++		if (bss->freq == iface->freq) {
++			u8 rcpi = rssi_to_rcpi(bss->level);
++			if (!iface->bss[0]->conf->rrm_manipulate_measurement) {
++				hostapd_build_beacon_report_resp(buf,
++						iface->last_beacon_req.measurement_token, 0,
++						op_class, channel, bss->tsf, 0, phy_type, rcpi, 255,
++						bss->bssid, 0, 0, NULL, NULL, NULL, NULL, NULL);
++			} else {
++				wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO,
++						RRM_EVENT_BEACON_REQUEST_RXED MACSTR
++						" dialog_token=%d measurement_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++						MAC2STR(iface->last_beacon_req.src_addr),
++						iface->last_beacon_req.dialog_token,
++						iface->last_beacon_req.measurement_token,
++						0, op_class, channel, bss->tsf,
++						0, phy_type, rcpi, 255, MAC2STR(bss->bssid), 0, 0);
++			}
++		}
++	}
++
++	if (!iface->bss[0]->conf->rrm_manipulate_measurement) {
++		len = wpabuf_len(buf);
++		pos = wpabuf_head_u8(buf);
++		hostapd_send_beacon_report_with_header(iface->bss[0],
++				iface->last_beacon_req.src_addr, pos, len,
++				iface->last_beacon_req.dialog_token);
++	} else if (scan_res->num == 0) {
++		/* no results notifications */
++		wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO,
++				RRM_EVENT_BEACON_REQUEST_RXED MACSTR
++				" dialog_token=%d measurement_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++				MAC2STR(iface->last_beacon_req.src_addr),
++				iface->last_beacon_req.dialog_token,
++				iface->last_beacon_req.measurement_token,
++				0, op_class, channel, 0, 0, phy_type,
++				0, 0, MAC2STR(bssid), 0, 0);
++	}
++
++	wpabuf_free(buf);
++}
++
++static void hostapd_handle_beacon_report_request(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr,
++		u16 num_of_repetition)
++{
++	u8 channel, measurement_token, beacon_measurement_mode;
++	int ret;
++
++	measurement_token = pos[0];
++	channel = pos[4];
++	beacon_measurement_mode = pos[9];
++
++	if ((beacon_measurement_mode == BEACON_REPORT_MODE_PASSIVE &&
++		!(hapd->conf->radio_measurements[0] & WLAN_RRM_CAPS_BEACON_PASSIVE_MEASUREMENT))
++		|| (beacon_measurement_mode == BEACON_REPORT_MODE_TABLE &&
++		!(hapd->conf->radio_measurements[0] & WLAN_RRM_CAPS_BEACON_TABLE_MEASUREMENT))
++		|| (beacon_measurement_mode == BEACON_REPORT_MODE_ACTIVE))
++	{
++		wpa_printf(MSG_ERROR, "beacon report in RRM is not supported");
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE,
++				MEASURE_TYPE_BEACON);
++		return;
++	}
++
++	if ((channel != hapd->iface->conf->channel)
++			&& (channel != 0) && (channel != 255)) {
++		wpa_printf(MSG_DEBUG, "requested channel (%d) is not supported, only the current AP channel (%d) is supported",
++				channel, hapd->iface->conf->channel);
++		hostapd_send_general_rrm_report(hapd, sta_addr, token,
++				measurement_token, MEASUREMENT_REPORT_MODE_REJECT_REFUSE,
++				MEASURE_TYPE_BEACON);
++		return;
++	}
++
++	os_memcpy(hapd->iface->last_beacon_req.src_addr, sta_addr, ETH_ALEN);
++	hapd->iface->last_beacon_req.dialog_token = token;
++	hapd->iface->last_beacon_req.measurement_token = measurement_token;
++
++	if (beacon_measurement_mode == BEACON_REPORT_MODE_TABLE) {
++		hostapd_handle_sta_beacon_report_scan_results(hapd->iface);
++	} else if (beacon_measurement_mode == BEACON_REPORT_MODE_PASSIVE) {
++		hapd->iface->self_beacon_req = 0;
++		ret = acs_current_channel_request_scan(hapd->iface);
++		if (ret)
++			wpa_printf(MSG_ERROR, "Failed to request scan");
++	}
++}
++
++static void hostapd_handle_beacon_report_response(struct hostapd_data *hapd,
++		u8 token, const u8 *pos, size_t len, const u8 *sta_addr)
+ {
+ 	u8 op_class, channel, frame_info, rcpi, rsni, ant_id;
++	u8 measurement_rep_mode = 0;
+ 	u16 measurement_duration;
+ 	u32 parent_tsf;
+ 	unsigned long long start_time;
+-	u8 bssid[ETH_ALEN];
++	u8 bssid[ETH_ALEN] = {};
+ 
+-	if (!hapd->beacon_req_active || hapd->beacon_req_token != token) {
+-		wpa_printf(MSG_DEBUG, "Unexpected beacon report, token %u",
+-			   token);
++	struct beacon_body *frame_body;
++	struct tlv *tlv;
++	u8 o_ssid[SSID_MAX_SIZE + 1] = {};
++	u8 o_rm_capa[TLV_MAX_LENGTH * 3 + 1] = {};
++	u8 o_vendor_specific[TLV_MAX_LENGTH * 3 + 1] = {};
++	u8 o_rsni[TLV_MAX_LENGTH * 3 + 1] = {};
++
++	wpa_printf(MSG_DEBUG, "Beacon report token %u len %zu",	token, len);
++
++	measurement_rep_mode = pos[1];
++	if (measurement_rep_mode != 0) {
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_BEACON_REP_RXED MACSTR
++				" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++				MAC2STR(sta_addr), token, measurement_rep_mode, 0, 0, 0, 0, 0,
++				0, 0, MAC2STR(bssid), 0, 0);
+ 		return;
+ 	}
+ 
+-	wpa_printf(MSG_DEBUG, "Beacon report token %u len %zu",	token, len);
++	op_class = pos[3];
++	channel = pos[4];
++	start_time = WPA_GET_LE64(&pos[5]);
++	measurement_duration = WPA_GET_LE16(&pos[13]);
++	frame_info = pos[15];
++	rcpi = pos[16];
++	rsni = pos[17];
++	os_memcpy(bssid, &pos[18], ETH_ALEN);
++	ant_id = pos[24];
++	parent_tsf = WPA_GET_LE32(&pos[25]);
++
++	if ((len <= 29) || (pos[29] != 1)) { /* No sub-elements */
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_BEACON_REP_RXED MACSTR
++				" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++				MAC2STR(sta_addr), token, measurement_rep_mode, op_class,
++				channel, start_time, measurement_duration, frame_info, rcpi,
++				rsni, MAC2STR(bssid), ant_id, parent_tsf);
++		return;
++	}
++
++	frame_body = (struct beacon_body*)(pos + 31);
++	frame_body->timestamp = WPA_GET_LE64(&pos[31]);
++	frame_body->beacon_int = WPA_GET_LE16(&pos[39]);
++	frame_body->capab_info = WPA_GET_LE16(&pos[41]);
++
++	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30], WLAN_EID_SSID);
++	if (tlv) {
++		hostapd_memory_as_hex(o_ssid, SSID_MAX_SIZE, tlv->value, tlv->length);
++	}
++
++	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30],
++			WLAN_EID_RRM_ENABLED_CAPABILITIES);
++	if (tlv) {
++		hostapd_memory_as_hex(o_rm_capa, TLV_MAX_LENGTH, tlv->value, 5);
++	}
++
++	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30], WLAN_EID_RSN);
++	if (tlv) {
++		hostapd_memory_as_hex(o_rsni, TLV_MAX_LENGTH, tlv->value, tlv->length);
++	}
++
++	tlv = (struct tlv*)get_ie(frame_body->tlvs, pos[30],
++			WLAN_EID_VENDOR_SPECIFIC);
++	if (tlv) {
++		hostapd_memory_as_hex(o_vendor_specific, TLV_MAX_LENGTH,
++				tlv->value, tlv->length);
++	}
+ 
+-	hapd->beacon_req_active = 0;
+-	eloop_cancel_timeout(hostapd_beacon_rep_timeout_handler, hapd, NULL);
+-
+-	pos += 3;
+-	op_class = pos[0];
+-	channel = pos[1];
+-	/* not sure if its BE or LE */
+-	start_time = WPA_GET_BE64(&pos[2]);
+-	measurement_duration = WPA_GET_BE16(&pos[10]);
+-	frame_info = pos[12];
+-	rcpi = pos[13];
+-	rsni = pos[14];
+-	os_memcpy(bssid, &pos[15], ETH_ALEN);
+-	ant_id = pos[21];
+-	parent_tsf = WPA_GET_BE32(&pos[22]);
+-
+-	wpa_msg(hapd->msg_ctx, MSG_INFO,
+-			RRM_EVENT_BEACON_REP_RXED "op_class=%d channel=%d start_time=%llu duration=%d frame_info=%02x rcpi=%02x rsni=%02x bssid=" MACSTR " antenna_id=%02x parent_tsf=%08x",
+-			op_class, channel, start_time, measurement_duration, frame_info,
+-			rcpi, rsni, MAC2STR(bssid), ant_id, parent_tsf);
++	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_BEACON_REP_RXED MACSTR
++			" dialog_token=%d measurement_rep_mode=%d op_class=%d channel=%d start_time=%llu duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d timestamp=%llu beacon_int=%d capab_info=%02x ssid=%s rm_capa=%s vendor_specific=%s rsn_info=%s",
++			MAC2STR(sta_addr), token, measurement_rep_mode, op_class, channel,
++			start_time, measurement_duration, frame_info, rcpi, rsni,
++			MAC2STR(bssid), ant_id, parent_tsf, frame_body->timestamp,
++			frame_body->beacon_int, frame_body->capab_info,
++			o_ssid, o_rm_capa, o_vendor_specific, o_rsni);
++}
++
++void hostapd_handle_self_beacon_req(struct hostapd_data *hapd,
++		u16 random_interval, u16 measurement_duration, u8 mode)
++{
++	int ret;
++	const u8 bssid[ETH_ALEN] = {};
++
++	if ((mode == BEACON_REPORT_MODE_PASSIVE &&
++		!(hapd->conf->radio_measurements[0] & WLAN_RRM_CAPS_BEACON_PASSIVE_MEASUREMENT))
++		|| (mode == BEACON_REPORT_MODE_TABLE &&
++		!(hapd->conf->radio_measurements[0] & WLAN_RRM_CAPS_BEACON_TABLE_MEASUREMENT))
++		|| (mode == BEACON_REPORT_MODE_ACTIVE))
++	{
++		wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_SELF_BEACON_REP_RXED MACSTR
++				" measurement_rep_mode=%d op_class=%d channel=%d start_time=%d duration=%d frame_info=%d rcpi=%d rsni=%d bssid=" MACSTR " antenna_id=%d parent_tsf=%d",
++				MAC2STR(hapd->own_addr),
++				MEASUREMENT_REPORT_MODE_REJECT_INCAPABLE, 0, 0, 0, 0, 0, 0, 0,
++				MAC2STR(bssid), 0, 0);
++		return;
++	}
++
++	if (mode == BEACON_REPORT_MODE_TABLE) {
++		hostapd_handle_self_beacon_report_scan_results(hapd);
++	} else if (mode == BEACON_REPORT_MODE_PASSIVE) {
++		hapd->iface->self_beacon_req = 1;
++		ret = acs_current_channel_request_scan(hapd->iface);
++		if (ret)
++			wpa_printf(MSG_ERROR, "Failed to request scan");
++	}
+ }
+ 
+ static void hostapd_handle_channel_load_request(struct hostapd_data *hapd,
+@@ -598,6 +856,10 @@ static void hostapd_handle_radio_msmt_request(struct hostapd_data *hapd,
+ 			hostapd_handle_noise_histogram_request(hapd, token, ie + 2, ie[1],
+ 					mgmt->sa, num_of_repetition);
+ 			break;
++		case MEASURE_TYPE_BEACON:
++			hostapd_handle_beacon_report_request(hapd, token, ie + 2, ie[1],
++					mgmt->sa, num_of_repetition);
++			break;
+ 		case MEASURE_TYPE_STA_STATISTICS:
+ 			hostapd_handle_sta_statistics_request(hapd, token, ie + 2, ie[1],
+ 					mgmt->sa, num_of_repetition);
+@@ -643,7 +905,8 @@ static void hostapd_handle_radio_msmt_report(struct hostapd_data *hapd,
+ 					mgmt->sa);
+ 			break;
+ 		case MEASURE_TYPE_BEACON:
+-			hostapd_handle_beacon_report(hapd, token, ie + 2, ie[1]);
++			hostapd_handle_beacon_report_response(hapd, token, ie + 2, ie[1],
++					mgmt->sa);
+ 			break;
+ 		case MEASURE_TYPE_CHANNEL_LOAD:
+ 			hostapd_handle_channel_load_report(hapd, token, ie + 2, ie[1],
+@@ -1224,11 +1487,13 @@ int hostapd_send_range_req(struct hostapd_data *hapd, const u8 *addr,
+ }
+ 
+ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode,
+ 		u8 oper_class, u8 channel, u16 random_interval,
+ 		u16 measurement_duration, u8 mode, const u8* bssid,
+ 		struct wpa_ssid_value* ssid, u8* rep_cond, u8* rep_cond_threshold,
+ 		u8* rep_detail,	const u8* ap_ch_rep, unsigned int ap_ch_rep_len,
+-		const u8* req_elem, unsigned int req_elem_len)
++		const u8* req_elem, unsigned int req_elem_len, u8 *ch_width,
++		u8 *ch_center_freq0, u8 *ch_center_freq1)
+ {
+ 	struct wpabuf *buf;
+ 	struct sta_info *sta = NULL;
+@@ -1255,11 +1520,11 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 		return -1;
+ 	}
+ 
+-	if ((mode == 0 &&
++	if ((mode == BEACON_REPORT_MODE_PASSIVE &&
+ 		!(sta->rrm_enabled_capa[0] & WLAN_RRM_CAPS_BEACON_PASSIVE_MEASUREMENT))
+-		|| (mode == 1 &&
++		|| (mode == BEACON_REPORT_MODE_ACTIVE &&
+ 		!(sta->rrm_enabled_capa[0] & WLAN_RRM_CAPS_BEACON_ACTIVE_MEASUREMENT))
+-		|| (mode == 2 &&
++		|| (mode == BEACON_REPORT_MODE_TABLE &&
+ 		!(sta->rrm_enabled_capa[0] & WLAN_RRM_CAPS_BEACON_TABLE_MEASUREMENT)))
+ 	{
+ 		wpa_printf(MSG_ERROR,
+@@ -1274,15 +1539,6 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 		return -1;
+ 	}
+ 
+-	if (hapd->beacon_req_active) {
+-		wpa_printf(MSG_DEBUG,
+-			   "Request range: Beacon request is already in process; overriding");
+-		hapd->beacon_req_active = 0;
+-		eloop_register_timeout(HOSTAPD_RRM_REQUEST_TIMEOUT, 0,
+-				       hostapd_beacon_rep_timeout_handler, hapd,
+-				       NULL);
+-	}
+-
+ 	/* Measurement request (5) + Measurement element with beacon (18) + optional sub-elements (255)*/
+ 	buf = wpabuf_alloc(5 + 18 + 255);
+ 	if (!buf)
+@@ -1295,26 +1551,22 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 	/* IEEE P802.11-REVmc/D5.0, 9.6.7.2 */
+ 	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
+ 	wpabuf_put_u8(buf, WLAN_RRM_RADIO_MEASUREMENT_REQUEST);
+-	wpabuf_put_u8(buf, hapd->beacon_req_token); /* Dialog Token */
+-	wpabuf_put_le16(buf, 0); /* Number of Repetitions */
++	wpabuf_put_u8(buf, hapd->beacon_req_token);
++	wpabuf_put_le16(buf, num_of_repetitions);
+ 
+ 	/* IEEE P802.11-REVmc/D5.0, 9.4.2.21 */
+ 	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REQUEST);
+ 	len = wpabuf_put(buf, 1); /* Length will be set later */
+ 
+-	wpabuf_put_u8(buf, 1); /* Measurement Token */
+-	/*
+-	 * Parallel and Enable bits are 0; Duration, Request, and Report are
+-	 * reserved.
+-	 */
+-	wpabuf_put_u8(buf, 0); /* Measurement Request Mode */
+-	wpabuf_put_u8(buf, MEASURE_TYPE_BEACON); /* Measurement Type */
++	wpabuf_put_u8(buf, hapd->beacon_req_token); /* Measurement Token */
++	wpabuf_put_u8(buf, measurement_request_mode);
++	wpabuf_put_u8(buf, MEASURE_TYPE_BEACON);
+ 
+ 	/* IEEE P802.11-REVmc/D4.0, 8.4.2.20.7 */
+-	wpabuf_put_u8(buf, oper_class /*hapd->iface->cs_oper_class*/); /* Operating class */
+-	wpabuf_put_u8(buf, channel /*hapd->iface->conf->channel*/); /* Channel Number */
+-	wpabuf_put_le16(buf, random_interval); /* Randomization Interval */
+-	wpabuf_put_le16(buf, measurement_duration); /* Measurement Duration */
++	wpabuf_put_u8(buf, oper_class);
++	wpabuf_put_u8(buf, channel);
++	wpabuf_put_le16(buf, random_interval);
++	wpabuf_put_le16(buf, measurement_duration);
+ 	wpabuf_put_u8(buf, mode); /* Measurement Mode */
+ 	if (!bssid) {
+ 		/* use wildcard BSSID instead of a specific BSSID */
+@@ -1364,6 +1616,16 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 		wpabuf_put_data(buf, req_elem, req_elem_len); /* data */
+ 	}
+ 
++	if (ch_width && ch_center_freq0 && ch_center_freq1) {
++		wpabuf_put_u8(buf, 163); /* wide bandwidth channel switch sub element id */
++		wpabuf_put_u8(buf, 5);   /* sub element length */
++		wpabuf_put_u8(buf, 194); /* wide bandwidth channel switch element id */
++		wpabuf_put_u8(buf, 3); 	 /* element length */
++		wpabuf_put_u8(buf, *ch_width);
++		wpabuf_put_u8(buf, *ch_center_freq0);
++		wpabuf_put_u8(buf, *ch_center_freq1);
++	}
++
+ 	/* Action + measurement type + token + reps + EID + len = 7 */
+ 	*len = wpabuf_len(buf) - 7;
+ 
+@@ -1371,14 +1633,129 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 				      wpabuf_head(buf), wpabuf_len(buf));
+ 	wpabuf_free(buf);
+ 	if (ret)
+-		return ret;
++		return -1;
+ 
+-	hapd->beacon_req_active = 1;
++	return hapd->beacon_req_token;
++}
+ 
+-	eloop_register_timeout(HOSTAPD_RRM_REQUEST_TIMEOUT, 0,
+-			       hostapd_beacon_rep_timeout_handler, hapd, NULL);
++static void hostapd_build_beacon_report_resp(struct wpabuf *buf,
++		u8 measurement_token, u8 measurement_rep_mode, u8 op_class, u8 channel,
++		u64 start_time, u8 measurement_duration, u8 frame_info, u8 rcpi,
++		u8 rsni, const u8 *bssid, u8 antenna_id, u32 parent_tsf, u8 *ch_width,
++		u8 *ch_center_freq0, u8 *ch_center_freq1, u8 *rep_frame_body,
++		u8 *rep_frame_body_length)
++{
++	u8 *len;
+ 
+-	return 0;
++	wpabuf_put_u8(buf, WLAN_EID_MEASURE_REPORT);
++	len = wpabuf_put(buf, 1); /* Length will be set later */
++	wpabuf_put_u8(buf, measurement_token);
++	wpabuf_put_u8(buf, measurement_rep_mode); /* report mode */
++	wpabuf_put_u8(buf, MEASURE_TYPE_BEACON); /* report type */
++
++	wpabuf_put_u8(buf, op_class); /* op class */
++	wpabuf_put_u8(buf, channel); /* channel number */
++	wpabuf_put_data(buf, &start_time, 8); /* start time */
++	wpabuf_put_be16(buf, measurement_duration); /* duration */
++	wpabuf_put_u8(buf, frame_info); /* frame info */
++	wpabuf_put_u8(buf, rcpi); /* rcpi */
++	wpabuf_put_u8(buf, rsni); /* rsni */
++	wpabuf_put_data(buf, bssid, ETH_ALEN); /* bssid */
++	wpabuf_put_u8(buf, antenna_id); /* antenna id */
++	wpabuf_put_be32(buf, parent_tsf); /* parent TSF */
++
++	if (ch_width && ch_center_freq0 && ch_center_freq1) {
++		wpabuf_put_u8(buf, 163); /* wide bandwidth channel switch sub element id */
++		wpabuf_put_u8(buf, 5);   /* sub element length */
++		wpabuf_put_u8(buf, 194); /* wide bandwidth channel switch element id */
++		wpabuf_put_u8(buf, 3); 	 /* element length */
++		wpabuf_put_u8(buf, *ch_width);
++		wpabuf_put_u8(buf, *ch_center_freq0);
++		wpabuf_put_u8(buf, *ch_center_freq1);
++	}
++
++	if (rep_frame_body && rep_frame_body_length) {
++		wpabuf_put_u8(buf, 1); /* reported frame body subelemnt id */
++		wpabuf_put_u8(buf, *rep_frame_body_length);
++		wpabuf_put_data(buf, rep_frame_body, *rep_frame_body_length);
++	}
++
++	/* Action + measurement type + token + EID + len = 5 */
++	*len = wpabuf_len(buf) - 5;
++}
++
++static int hostapd_send_beacon_report_with_header(struct hostapd_data *hapd,
++		const u8 *addr, const u8* data, int len, u8 dialog_token)
++{
++	struct wpabuf *report;
++	struct sta_info *sta = NULL;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "beacon report response: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "beacon report response: Destination address is not connected");
++		return -1;
++	}
++
++	report = wpabuf_alloc(3 + len);
++	if (!report)
++		return -1;
++
++	wpabuf_put_u8(report, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(report, WLAN_RRM_RADIO_MEASUREMENT_REPORT);
++	wpabuf_put_u8(report, dialog_token);
++
++	if (len)
++		wpabuf_put_data(report, data, len);
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++					wpabuf_head(report), wpabuf_len(report));
++
++	wpabuf_free(report);
++	return ret;
++}
++
++int hostapd_send_beacon_report_resp(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u8 op_class, u8 channel, u64 start_time, u8 measurement_duration,
++		u8 frame_info, u8 rcpi, u8 rsni, const u8 *bssid, u8 antenna_id,
++		u32 parent_tsf, u8 *ch_width, u8 *ch_center_freq0, u8 *ch_center_freq1,
++		u8 *rep_frame_body, u8 *rep_frame_body_length)
++{
++	struct wpabuf *buf;
++	int ret;
++	int len;
++	const u8 *pos;
++
++	buf = wpabuf_alloc(3 + IEEE80211_MAX_MMPDU_SIZE);
++	if (!buf)
++		return -1;
++
++	hostapd_build_beacon_report_resp(buf, measurement_token,
++			measurement_rep_mode, op_class, channel, start_time,
++			measurement_duration, frame_info, rcpi, rsni, bssid, antenna_id,
++			parent_tsf, ch_width, ch_center_freq0, ch_center_freq1,
++			rep_frame_body, rep_frame_body_length);
++
++	len = wpabuf_len(buf);
++	pos = wpabuf_head_u8(buf);
++
++	ret = hostapd_send_beacon_report_with_header(hapd, addr, pos, len,
++			dialog_token);
++
++	wpabuf_free(buf);
++	return ret;
+ }
+ 
+ int hostapd_send_channel_load_req(struct hostapd_data *hapd, const u8 *addr,
+@@ -2058,6 +2435,4 @@ void hostapd_clean_rrm(struct hostapd_data *hapd)
+ 	hapd->lci_req_active = 0;
+ 	eloop_cancel_timeout(hostapd_range_rep_timeout_handler, hapd, NULL);
+ 	hapd->range_req_active = 0;
+-	eloop_cancel_timeout(hostapd_beacon_rep_timeout_handler, hapd, NULL);
+-	hapd->beacon_req_active = 0;
+ }
+diff --git a/src/ap/rrm.h b/src/ap/rrm.h
+index 3b44b97..d975105 100644
+--- a/src/ap/rrm.h
++++ b/src/ap/rrm.h
+@@ -27,11 +27,21 @@ int hostapd_send_range_req(struct hostapd_data *hapd, const u8 *addr,
+ 			   u16 random_interval, u8 min_ap,
+ 			   const u8 *responders, unsigned int n_responders);
+ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
++		u16 num_of_repetitions, u8 measurement_request_mode,
+ 		u8 oper_class, u8 channel, u16 random_interval,
+ 		u16 measurement_duration, u8 mode, const u8* bssid,
+ 		struct wpa_ssid_value* ssid, u8* rep_cond, u8* rep_cond_threshold,
+ 		u8* rep_detail,	const u8* ap_ch_rep, unsigned int ap_ch_rep_len,
+-		const u8* req_elem, unsigned int req_elem_len);
++		const u8* req_elem, unsigned int req_elem_len, u8 *ch_width,
++		u8 *ch_center_freq0, u8 *ch_center_freq1);
++int hostapd_send_beacon_report_resp(struct hostapd_data *hapd, const u8 *addr,
++		u8 dialog_token, u8 measurement_token, u8 measurement_rep_mode,
++		u8 op_class, u8 channel, u64 start_time, u8 measurement_duration,
++		u8 frame_info, u8 rcpi, u8 rsni, const u8 *bssid, u8 antenna_id,
++		u32 parent_tsf, u8 *ch_width, u8 *ch_center_freq0, u8 *ch_center_freq1,
++		u8 *rep_frame_body, u8 *rep_frame_body_length);
++void hostapd_handle_self_beacon_req(struct hostapd_data *hapd,
++		u16 random_interval, u16 measurement_duration, u8 mode);
+ int hostapd_send_channel_load_req(struct hostapd_data *hapd, const u8 *addr,
+ 		u16 num_of_repetitions, u8 measurement_request_mode, u8 oper_class,
+ 		u8 channel, u16 random_interval, u16 measurement_duration, u8 *rep_cond,
+@@ -70,6 +80,8 @@ int hostapd_send_sta_statistics_report(struct hostapd_data *hapd, const u8 *addr
+ 		u16 measurement_duration, u8 group_identity,
+ 		const u32 *statistics_group_data, u8 statistics_group_data_len,
+ 		u8 *rep_reason);
++void hostapd_handle_self_beacon_report_scan_results(struct hostapd_data *hapd);
++void hostapd_handle_sta_beacon_report_scan_results(struct hostapd_iface *iface);
+ void hostapd_clean_rrm(struct hostapd_data *hapd);
+ 
+ #endif /* RRM_H */
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index fb90727..5cb3d01 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -514,6 +514,16 @@ enum lci_req_subelem {
+ 	LCI_REQ_SUBELEM_MAX_AGE = 4,
+ };
+ 
++/*
++ * IEEE P802.11-REVmc/D5.0 Table 9-86 - Measurement Mode definitions for Beacon
++ * request
++ */
++enum beacon_report_mode {
++	BEACON_REPORT_MODE_PASSIVE,
++	BEACON_REPORT_MODE_ACTIVE,
++	BEACON_REPORT_MODE_TABLE,
++};
++
+ #ifdef _MSC_VER
+ #pragma pack(push, 1)
+ #endif /* _MSC_VER */
+@@ -718,10 +728,26 @@ struct ieee80211_mgmt {
+ 
+ 
+ #define IEEE80211_MAX_MMPDU_SIZE 2304
++#define TLV_MAX_LENGTH 255
++#define SSID_MAX_SIZE 32
+ 
+ /* Rx MCS bitmask is in the first 77 bits of supported_mcs_set */
+ #define IEEE80211_HT_MCS_MASK_LEN 10
+ 
++/* Beacon Measurements */
++struct tlv {
++	u8 type;
++	u8 length;
++	u8 value[];
++};
++
++struct beacon_body {
++	u64 timestamp;
++	le16 beacon_int;
++	le16 capab_info;
++	u8 tlvs[];
++};
++
+ /* HT Capabilities element */
+ struct ieee80211_ht_capabilities {
+ 	le16 ht_capabilities_info;
+@@ -1613,6 +1639,12 @@ struct rrm_link_measurement_report {
+ 	u8 variable[0];
+ } STRUCT_PACKED;
+ 
++struct beacon_request {
++	u8 src_addr[ETH_ALEN];
++	u8 dialog_token;
++	u8 measurement_token;
++} STRUCT_PACKED;
++
+ struct rrm_trig_rep_counters {
+ 	u32 measurement_count;
+ 	u16 trigger_timeout;
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index ccd2d61..1d15908 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -243,7 +243,8 @@ extern "C" {
+ #define RRM_EVENT_NEIGHBOR_REP_FAILED "RRM-NEIGHBOR-REP-REQUEST-FAILED "
+ 
+ #define RRM_EVENT_BEACON_REP_RXED "RRM-BEACON-REP-RECEIVED "
+-#define RRM_EVENT_BEACON_REP_FAILED "RRM-BEACON-REP-REQUEST-FAILED "
++#define RRM_EVENT_BEACON_REQUEST_RXED "RRM-BEACON-REP-REQUEST-RECEIVED "
++#define RRM_EVENT_SELF_BEACON_REP_RXED "RRM-SELF-BEACON-REP-RECEIVED "
+ 
+ #define RRM_EVENT_CHANNEL_LOAD_RXED "RRM-CHANNEL-LOAD-RECEIVED "
+ #define RRM_EVENT_CHANNEL_LOAD_REQUEST_RXED "RRM-CHANNEL-LOAD-REQUEST-RECEIVED "
+-- 
+2.10.1
+

@@ -1,0 +1,229 @@
+From 754b6021220cf1fdae064745a8940415208b2075 Mon Sep 17 00:00:00 2001
+From: Andrei Danaila <andrei.danaila@intel.com>
+Date: Thu, 2 Jun 2016 17:03:56 -0700
+Subject: [PATCH 409/441] mtd: Ported mtd Puma6 driver to Puma7
+
+Ported MTD Puma6 driver to the Puma7 branch.
+
+Change-Id: Ia321d3e8873e25e23adad1cf202576e778f64904
+Signed-off-by: Andrei Danaila <andrei.danaila@intel.com>
+
+mtd: thread_sem needed by puma7
+
+After puma6 puma7 merge thread_sem is used puma7 build as well.
+Removing the ifdef switch for semaphore declaration in header.
+
+Signed-off-by: Pawan Gupta <pawan.kumarx.gupta@intel.com>
+---
+ drivers/mtd/chips/cfi_cmdset_0001.c | 11 ++++++
+ drivers/mtd/devices/Kconfig         |  7 ++++
+ drivers/mtd/devices/Makefile        |  2 +-
+ drivers/mtd/mtd_blkdevs.c           |  3 +-
+ drivers/mtd/mtdblock.c              | 68 +++++++++++++++++++++++++++++++++++++
+ include/linux/mtd/blktrans.h        |  4 +--
+ 6 files changed, 90 insertions(+), 5 deletions(-)
+
+--- a/drivers/mtd/chips/cfi_cmdset_0001.c
++++ b/drivers/mtd/chips/cfi_cmdset_0001.c
+@@ -765,6 +765,13 @@ static int chip_ready (struct map_info *
+ 
+ 	case FL_STATUS:
+ 		for (;;) {
++#ifdef CONFIG_ARCH_GEN3
++			/* Add issuing READ STATUS command before reading
++			 * flash status to guarantee the status read is
++			 * correct.
++			 */
++			map_write(map, CMD(0x70), adr);
++#endif
+ 			status = map_read(map, adr);
+ 			if (map_word_andequal(map, status, status_OK, status_OK))
+ 				break;
+@@ -2092,6 +2099,10 @@ static int __xipram do_xxlock_oneblock(s
+ 	}
+ 
+ 	xip_enable(map, chip, adr);
++#ifdef CONFIG_ARCH_GEN3
++	// Intel specs require this call. Because I don't know how xip works I simply add this call. It shouldn't harm
++	map_write(map, CMD(0xFF), adr);
++#endif
+  out:	DISABLE_VPP(map);
+ 	put_chip(map, chip, adr);
+ 	mutex_unlock(&chip->mutex);
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -127,6 +127,13 @@ config MTD_SST25L
+ 	  Set up your spi devices with the right board-specific platform data,
+ 	  if you want to specify device partitioning.
+ 
++config MTD_NMYX25
++	tristate "Support N25Q256 M25P32 SPI Flash chips"
++	depends on SPI_MASTER && HW_MUTEXES
++	help
++	  This enables access to the N25Q256 AND M25P32 SPI flash chips, used
++	  for program and data storage.
++
+ config MTD_BCM47XXSFLASH
+ 	tristate "R/O support for serial flash on BCMA bus"
+ 	depends on BCMA_SFLASH
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -16,6 +16,6 @@ obj-$(CONFIG_MTD_NAND_OMAP_BCH)	+= elm.o
+ obj-$(CONFIG_MTD_SPEAR_SMI)	+= spear_smi.o
+ obj-$(CONFIG_MTD_SST25L)	+= sst25l.o
+ obj-$(CONFIG_MTD_BCM47XXSFLASH)	+= bcm47xxsflash.o
+-
++obj-$(CONFIG_MTD_NMYX25)	+= nmyx25.o
+ 
+ CFLAGS_docg3.o			+= -I$(src)
+--- a/drivers/mtd/mtd_blkdevs.c
++++ b/drivers/mtd/mtd_blkdevs.c
+@@ -134,7 +134,7 @@ static void mtd_blktrans_work(struct wor
+ 	int background_done = 0;
+ 
+ 	spin_lock_irq(rq->queue_lock);
+-
++        /** FIXME: may be a potential issue **/
+ 	while (1) {
+ 		int res;
+ 
+@@ -425,6 +425,7 @@ int add_mtd_blktrans_dev(struct mtd_blkt
+ 	}
+ 
+ 	gd->queue = new->rq;
++        sema_init(&new->thread_sem, 1);
+ 
+ 	/* Create processing workqueue */
+ 	new->wq = alloc_workqueue("%s%d", 0, 0,
+--- a/drivers/mtd/mtdblock.c
++++ b/drivers/mtd/mtdblock.c
+@@ -29,6 +29,7 @@
+ #include <linux/types.h>
+ #include <linux/vmalloc.h>
+ 
++#include <linux/blkdev.h>
+ #include <linux/mtd/mtd.h>
+ #include <linux/mtd/blktrans.h>
+ #include <linux/mutex.h>
+@@ -36,6 +37,7 @@
+ 
+ struct mtdblk_dev {
+ 	struct mtd_blktrans_dev mbd;
++        struct device dev;
+ 	int count;
+ 	struct mutex cache_mutex;
+ 	unsigned char *cache_data;
+@@ -46,6 +48,56 @@ struct mtdblk_dev {
+ 
+ static DEFINE_MUTEX(mtdblks_lock);
+ 
++#ifdef CONFIG_PM
++static int mtdblock_dev_suspend(struct device *dev);
++static int mtdblock_dev_resume(struct device *dev);
++
++static struct dev_pm_ops mtdblock_dev_pm = {
++        .suspend = mtdblock_dev_suspend,
++        .resume = mtdblock_dev_resume,
++};
++
++static int mtdblock_dev_suspend(struct device *dev)
++{
++        struct mtdblk_dev *mtdblk = container_of(dev, struct mtdblk_dev, dev);
++
++        if (mtdblk) {
++                spin_lock_irq(mtdblk->mbd.rq->queue_lock);
++                blk_stop_queue(mtdblk->mbd.rq);
++                spin_unlock_irq(mtdblk->mbd.rq->queue_lock);
++                down(&mtdblk->mbd.thread_sem);
++        }
++        return 0;
++}
++
++static int mtdblock_dev_resume(struct device *dev)
++{
++        struct mtdblk_dev *mtdblk = container_of(dev, struct mtdblk_dev, dev);
++
++        if (mtdblk){
++                up(&mtdblk->mbd.thread_sem);
++                spin_lock_irq(mtdblk->mbd.rq->queue_lock);
++                blk_start_queue(mtdblk->mbd.rq);
++                spin_unlock_irq(mtdblk->mbd.rq->queue_lock);
++        }
++        return 0;
++}
++
++#endif
++static void mtdblk_release(struct device *dev)
++{
++        return;
++}
++
++static struct class mtdblock_class = {
++        .name = "mtdblock",
++        .owner = THIS_MODULE,
++#ifdef CONFIG_PM
++        .pm = &mtdblock_dev_pm,
++#endif
++        .dev_release = mtdblk_release,
++};
++
+ /*
+  * Cache stuff...
+  *
+@@ -359,6 +411,12 @@ static void mtdblock_add_mtd(struct mtd_
+ 	dev->mbd.size = mtd->size >> 9;
+ 	dev->mbd.tr = tr;
+ 
++        dev->dev.class = &mtdblock_class;
++        dev_set_name(&dev->dev, "mtdblock%d", mtd->index);
++        dev_set_drvdata(&dev->dev, dev);
++        if (device_register(&dev->dev) != 0)
++                return;
++
+ 	if (!(mtd->flags & MTD_WRITEABLE))
+ 		dev->mbd.readonly = 1;
+ 
+@@ -368,7 +426,11 @@ static void mtdblock_add_mtd(struct mtd_
+ 
+ static void mtdblock_remove_dev(struct mtd_blktrans_dev *dev)
+ {
++        struct mtdblk_dev *mtdblk_dev = container_of(dev, struct mtdblk_dev, mbd);
++
+ 	del_mtd_blktrans_dev(dev);
++        device_unregister(&mtdblk_dev->dev);
++        dev_set_drvdata(&mtdblk_dev->dev, NULL);
+ }
+ 
+ static struct mtd_blktrans_ops mtdblock_tr = {
+@@ -388,12 +450,18 @@ static struct mtd_blktrans_ops mtdblock_
+ 
+ static int __init init_mtdblock(void)
+ {
++        int ret = 0;
++        ret = class_register(&mtdblock_class);
++        if (ret)
++                return ret;
++
+ 	return register_mtd_blktrans(&mtdblock_tr);
+ }
+ 
+ static void __exit cleanup_mtdblock(void)
+ {
+ 	deregister_mtd_blktrans(&mtdblock_tr);
++        class_unregister(&mtdblock_class);
+ }
+ 
+ module_init(init_mtdblock);
+--- a/include/linux/mtd/blktrans.h
++++ b/include/linux/mtd/blktrans.h
+@@ -44,9 +44,7 @@ struct mtd_blktrans_dev {
+ 	struct kref ref;
+ 	struct gendisk *disk;
+ 	struct attribute_group *disk_attributes;
+-#ifdef CONFIG_ARCH_GEN3 
+-        struct semaphore        thread_sem;
+-#endif  
++    struct semaphore        thread_sem;
+ 	struct workqueue_struct *wq;
+ 	struct work_struct work;
+ 	struct request_queue *rq;

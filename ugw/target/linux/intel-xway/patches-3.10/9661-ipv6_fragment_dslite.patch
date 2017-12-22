@@ -1,0 +1,61 @@
+Fix to pass cdrouter-2361: Verify DS-Lite packet fragmentation occurs at IPv6 layer and not the IPv4 layer.
+
+Default behaviour : If IPv4 packet_size > dslite tunnel MTU (1500 - 40 (IPv6 header) = 1460) then IPv4 packets are fragmented.
+
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -267,8 +267,14 @@ static int __ipt_optimized ip_finish_out
+ #ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
+ 	skb_mark_priority(skb);
+ #endif
+-	if (skb->len > ip_skb_dst_mtu(skb) && !skb_is_gso(skb))
+-		return ip_fragment(skb, ip_finish_output2);
++
++	if (skb->len > ip_skb_dst_mtu(skb) && !skb_is_gso(skb)){
++		if (skb->dev->type == ARPHRD_TUNNEL6){
++			return ip_finish_output2(skb);
++		}
++		else
++			return ip_fragment(skb, ip_finish_output2);
++	}
+ 	else
+ 	{
+ 		return ip_finish_output2(skb);
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -1011,11 +1011,22 @@ static int ip6_tnl_xmit2(struct sk_buff 
+ 	if (skb_dst(skb))
+ 		skb_dst(skb)->ops->update_pmtu(skb_dst(skb), NULL, skb, mtu);
+ 	if (skb->len > mtu) {
++/*     if in the original IPv4 packet header the Don't Fragment
++ *     the entry-point node discards the packet and returns an ICMP message
++ *     The ICMP message has the type = "unreachable", the code = "packet too big",
++ *     and the recommended MTU size field set to the size of the tunnel MTU - see sections
++ */
++		if ((fl6->flowi6_proto == IPPROTO_IPIP)) {
++			struct iphdr  *ipv4h = ip_hdr(skb);
++			if (!(ipv4h->frag_off & htons(IP_DF)))
++				goto ipv6_frag;
++		}
+ 		*pmtu = mtu;
+ 		err = -EMSGSIZE;
+ 		goto tx_err_dst_release;
+ 	}
+ 
++ipv6_frag:
+ 	/*
+ 	 * Okay, now see if we can stuff it in the buffer as-is.
+ 	 */
+@@ -1055,6 +1066,10 @@ static int ip6_tnl_xmit2(struct sk_buff 
+ 	ipv6h->nexthdr = proto;
+ 	ipv6h->saddr = fl6->saddr;
+ 	ipv6h->daddr = fl6->daddr;
++
++	if (fl6->flowi6_proto == IPPROTO_IPIP && skb->dev->type == ARPHRD_TUNNEL6 && (skb->len > ip6_skb_dst_mtu(skb)))
++		skb->local_df = 1 ;
++
+ 	ip6tunnel_xmit(skb, dev);
+ 	if (ndst)
+ 		ip6_tnl_dst_store(t, ndst);

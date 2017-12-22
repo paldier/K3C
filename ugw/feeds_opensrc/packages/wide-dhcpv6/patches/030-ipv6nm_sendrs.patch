@@ -1,0 +1,382 @@
+diff -Nuar wide-dhcpv6-20080615/Makefile.in wide-dhcpv6-20080615_modif/Makefile.in
+--- wide-dhcpv6-20080615/Makefile.in	2012-08-30 15:56:57.939484000 +0530
++++ wide-dhcpv6-20080615_modif/Makefile.in	2012-08-30 15:56:01.223954000 +0530
+@@ -58,7 +58,7 @@
+ 
+ GENSRCS=cfparse.c cftoken.c
+ CLIENTOBJS=	dhcp6c.o common.o config.o prefixconf.o dhcp6c_ia.o timer.o \
+-	dhcp6c_script.o if.o base64.o auth.o dhcp6_ctl.o addrconf.o lease.o ipv6nm.o \
++	dhcp6c_script.o if.o base64.o auth.o dhcp6_ctl.o addrconf.o lease.o ipv6nm.o raw_icmpv6.o \
+ 	$(GENSRCS:%.c=%.o)
+ SERVOBJS=	dhcp6s.o common.o if.o config.o timer.o lease.o \
+ 	base64.o auth.o dhcp6_ctl.o $(GENSRCS:%.c=%.o)
+diff -Nuar wide-dhcpv6-20080615/config.h wide-dhcpv6-20080615_modif/config.h
+--- wide-dhcpv6-20080615/config.h	2012-08-30 15:56:57.942478000 +0530
++++ wide-dhcpv6-20080615_modif/config.h	2012-08-30 15:56:01.223967000 +0530
+@@ -65,6 +65,9 @@
+ 
+ 	/* timer for the interface */
+ 	struct dhcp6_timer *timer;
++#ifdef ENABLE_IPV6NM
++	struct dhcp6_timer *sendrs_timer;
++#endif
+ 
+ 	/* event queue */
+ 	TAILQ_HEAD(, dhcp6_event) event_list;
+diff -Nuar wide-dhcpv6-20080615/dhcp6c.c wide-dhcpv6-20080615_modif/dhcp6c.c
+--- wide-dhcpv6-20080615/dhcp6c.c	2012-08-30 15:56:57.949475000 +0530
++++ wide-dhcpv6-20080615_modif/dhcp6c.c	2012-08-30 15:58:09.172794000 +0530
+@@ -179,6 +179,77 @@
+          && (((__const uint32_t *) (a))[2] == ((__const uint32_t *) (b))[2])  \
+          && (((__const uint32_t *) (a))[3] == ((__const uint32_t *) (b))[3]))
+ 
++#ifdef ENABLE_IPV6NM
++/* Following functions are called to send periodic RS with interval of 4 sec */
++struct dhcp6_timer *
++sendrs_timo(arg)
++        void *arg;
++{
++	extern int ipv6nm_sendrs(char *intf);
++	extern int get_gw_status(const char *intf);
++	struct dhcp6_if *ifp = (struct dhcp6_if * )arg;
++        struct timeval tm;
++        struct dhcp6_timer *timer = NULL;
++
++	if(ifp == NULL) {
++                return NULL;
++        }
++	timer = ifp->sendrs_timer;
++	if(get_gw_status(ifp->ifname) != 1) { /* valid RA is not yet recved */
++		ipv6nm_sendrs(ifp->ifname);
++		tm.tv_sec = 4; 	/* TODO make this configurable */
++        	tm.tv_usec = 0;
++		dhcp6_set_timer(&tm, timer);
++		return timer;
++	} else {
++		dhcp6_remove_timer(&ifp->sendrs_timer);
++		dprintf(LOG_NOTICE, FNAME, "interface %s got valid RA.. timer is stoped.", ifp->ifname);
++		return NULL;
++	}
++}
++
++int 
++start_sendrs_timer(intf)
++	char *intf;
++{
++	struct dhcp6_if *ifp = find_ifconfbyname(intf);
++	if(ifp == NULL) {
++		return -1;
++	}
++	if(ifp->sendrs_timer == NULL) {
++		ifp->sendrs_timer = dhcp6_add_timer(sendrs_timo, ifp);
++		if(ifp->sendrs_timer == NULL) {
++			dprintf(LOG_ERR, FNAME, "Unable to start Sendrs timer on interface %s.", ifp->ifname);
++		} else {
++ 			struct timeval tm;
++			tm.tv_sec = 0; 	/* TODO make this configurable */
++        		tm.tv_usec = 100;
++			dhcp6_set_timer(&tm, ifp->sendrs_timer);
++
++
++			dprintf(LOG_NOTICE, FNAME, "Sendrs timer is started successfully on interface %s.", ifp->ifname);
++		}
++	} else {
++		dprintf(LOG_NOTICE, FNAME, "Sendrs timer is already running on interface %s.", ifp->ifname);
++	}
++	return 1;
++}
++
++int
++stop_sendrs_timer(intf)
++	char *intf;
++{
++	struct dhcp6_if *ifp = find_ifconfbyname(intf);
++	if(ifp == NULL) {
++		return -1;
++	}
++	if(ifp->sendrs_timer != NULL) {
++		dhcp6_remove_timer(&ifp->sendrs_timer);
++	}
++	return 1;
++
++}
++#endif
+ 
+ int
+ main(argc, argv)
+@@ -487,6 +558,10 @@
+ 		dhcp6_remove_timer(&ifp->timer);
+ 	}
+ 
++#ifdef ENABLE_IPV6NM
++	start_sendrs_timer(ifp->ifname);
++#endif
++
+ 	/* create an event for the initial delay */
+ 	if ((ev = dhcp6_create_event(ifp, DHCP6S_INIT)) == NULL) {
+ 		dprintf(LOG_NOTICE, FNAME, "failed to create an event");
+diff -Nuar wide-dhcpv6-20080615/ipv6nm.c wide-dhcpv6-20080615_modif/ipv6nm.c
+--- wide-dhcpv6-20080615/ipv6nm.c	2012-08-30 15:56:57.951474000 +0530
++++ wide-dhcpv6-20080615_modif/ipv6nm.c	2012-08-30 15:56:01.229956000 +0530
+@@ -132,6 +132,12 @@
+         snprintf(cmd, sizeof(cmd), RADVDUPDATE_SCRIPT " rlife %s %d",
+                  iracvd->name, iracvd->gw_status);
+         printf("calling " RADVDUPDATE_SCRIPT "with %d \n", iracvd->gw_status);
++
++	if(iracvd->gw_status == 0) {
++		extern int start_sendrs_timer(char *intf);
++		start_sendrs_timer(iracvd->name);
++	}
++
+         return system(cmd);
+ }
+ 
+diff -Nuar wide-dhcpv6-20080615/raw_icmpv6.c wide-dhcpv6-20080615_modif/raw_icmpv6.c
+--- wide-dhcpv6-20080615/raw_icmpv6.c	1970-01-01 05:30:00.000000000 +0530
++++ wide-dhcpv6-20080615_modif/raw_icmpv6.c	2012-08-30 15:56:01.230954000 +0530
+@@ -0,0 +1,245 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <netinet/icmp6.h>
++#include <netinet/in.h>
++#include <netinet/ip.h>
++#include <arpa/inet.h>
++#include <netdb.h>
++#include <sys/ioctl.h>
++#include <bits/ioctls.h>
++#include <bits/socket.h>
++#include <net/if.h>
++#define debug_log printf
++
++unsigned short int checksum(unsigned short int *, int);
++
++int ipv6nm_sendrs(char *intf)
++{
++        int RS_HDRLEN = sizeof(struct nd_router_solicit);       /* Length of RS message header */
++        int optlen = 8;        
++		/* Option Type (1 byte) + Length (1 byte) + Length of MAC address (6 bytes) */
++        	/* FIXME: optlen equals to zero for ppp interface */
++
++        int i, sd, status, ifindex, cmsglen, hoplimit, psdhdrlen;
++        struct addrinfo hints;
++        struct addrinfo *res;
++        struct sockaddr_in6 *ipv6, src, dst;
++        struct nd_router_solicit *rs;
++        socklen_t srclen;
++        unsigned char outpack[200], icmpv6_opt[8], psdhdr[200];
++        struct msghdr msghdr;
++        struct ifreq ifr;
++        struct cmsghdr *cmsghdr1, *cmsghdr2;
++        struct in6_pktinfo *pktinfo;
++        struct iovec iov[2];
++        char target[40], source[40]; 
++        char cmsgbuf[200];
++        void *tmp;
++  	int ret = -1;
++
++
++        memset(target, 0, sizeof(target));
++        memset(source, 0, sizeof(source));
++        memset(outpack, 0, sizeof(outpack));
++        memset(icmpv6_opt, 0, sizeof(icmpv6_opt));
++        memset(psdhdr, 0, sizeof(psdhdr));
++
++        strcpy(intf, intf);
++
++        /* Source link-local address */
++        strcpy(source, "fe80::");
++
++        /* Destination */
++        strcpy(target, "ff02::2");
++
++        /* Fill out hints for getaddrinfo(). */
++        memset(&hints, 0, sizeof(struct addrinfo));
++        hints.ai_family = AF_INET6;
++        hints.ai_socktype = SOCK_STREAM;
++        hints.ai_flags = hints.ai_flags | AI_CANONNAME;
++
++        /* Resolve source using getaddrinfo(). */
++        if((status = getaddrinfo(source, NULL, &hints, &res)) != 0) {
++                debug_log("getaddrinfo() failed: %s\n", gai_strerror(status));
++                goto err_ret;
++        }
++        memcpy(&src, res->ai_addr, res->ai_addrlen);
++        srclen = res->ai_addrlen;
++        memcpy(psdhdr, src.sin6_addr.s6_addr, 16);      // Copy to checksum
++                                                        // pseudo-header
++        freeaddrinfo(res);
++
++        /* Resolve target using getaddrinfo(). */
++        if((status = getaddrinfo(target, NULL, &hints, &res)) != 0) {
++                debug_log("getaddrinfo() failed: %s\n", gai_strerror(status));
++                goto err_ret;
++        }
++        memcpy(&dst, res->ai_addr, res->ai_addrlen);
++        memcpy(psdhdr + 16, dst.sin6_addr.s6_addr, 16); /* Copy to checksum
++                                                           pseudo-header */
++
++        /* Report IPv6 "all routers" multicast address. */
++        ipv6 = (struct sockaddr_in6 *)res->ai_addr;
++        tmp = &(ipv6->sin6_addr);
++        memset(target, 0, sizeof(target));
++        inet_ntop(AF_INET6, tmp, target, sizeof(target));
++        printf("Sending to IPv6 \"all routers\" multicast address: %s\n",
++               target);
++        freeaddrinfo(res);
++
++        /* Request a socket descriptor sd. */
++        if((sd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)) < 0) {
++                debug_log
++                    ("unable to open socket (AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)\n");
++                goto err_ret;
++        }
++
++        /* obtain soliciting node (source) MAC address. */
++        memset(&ifr, 0, sizeof(ifr));
++        snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", intf);
++        if(ioctl(sd, SIOCGIFHWADDR, &ifr) < 0) {
++                debug_log
++                    ("ioctl( SIOCGIFHWADDR) failed to get source MAC address ");
++    		optlen = 0;
++        }
++
++  	if(memcmp(ifr.ifr_addr.sa_data, "\0\0\0\0\0\0", 6) == 0) {
++		optlen = 0;
++  	}
++
++	if(optlen > 0) {
++		/* copy source MAC address into icmpv6_opt */
++		icmpv6_opt[0] = 1;      /* Option Type - "source link layer address"
++					   (Section 4.6 of RFC 4861) */
++		icmpv6_opt[1] = optlen / 8;     /* Option Length - units of 8 octets
++						   (RFC 4861) */
++		for(i = 0; i < 6; i++) {
++			icmpv6_opt[i + 2] = (unsigned char)ifr.ifr_addr.sa_data[i];
++		}
++	}
++
++        if(!(psdhdr[0] == 0xfe)) {
++                if(bind(sd, (struct sockaddr *)&src, srclen) < 0) {
++                        debug_log("Unable to bind");
++                        goto err_ret;
++                }
++        }
++
++        /* Retrieve source interface index. */
++        if((ifindex = if_nametoindex(intf)) == 0) {
++                debug_log("if_nametoindex() failed to obtain interface index ");
++                goto err_ret;
++        }
++
++        /* Define first part of buffer outpack to be a router solicit struct. */
++        rs = (struct nd_router_solicit *)outpack;
++        memset(rs, 0, sizeof(*rs));
++
++        rs->nd_rs_hdr.icmp6_type = ND_ROUTER_SOLICIT;   /* 133 (RFC 4861) */
++        rs->nd_rs_hdr.icmp6_code = 0;   /* zero for router solicitation (RFC
++                                           4861) */
++        rs->nd_rs_hdr.icmp6_cksum = htons(0);   /* zero when calculating
++                                                   checksum */
++        rs->nd_rs_reserved = htonl(0);  /* Reserved - must be set to zero (RFC
++                                           4861) */
++
++        /* Append icmpv6_opt to end of router solicit struct. */
++        memcpy(outpack + RS_HDRLEN, icmpv6_opt, optlen);
++
++        /* Need a pseudo-header for checksum calculation. Define length. (RFC
++           2460) * Length = source IP (16 bytes) + destination IP (16 bytes) *
++           + upper layer packet length (4 bytes) + zero (3 bytes) * + next
++           header (1 byte) */
++        psdhdrlen = 16 + 16 + 4 + 3 + 1 + RS_HDRLEN + optlen;
++
++        /* Prepare msghdr for sendmsg(). */
++        memset(&msghdr, 0, sizeof(msghdr));
++        msghdr.msg_name = &dst;
++        msghdr.msg_namelen = sizeof(dst);
++        memset(&iov, 0, sizeof(iov));
++        iov[0].iov_base = (unsigned char *)outpack;
++        iov[0].iov_len = RS_HDRLEN + optlen;
++        msghdr.msg_iov = iov;
++        msghdr.msg_iovlen = 1;
++
++        cmsglen =
++            CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct in6_pktinfo));
++        if(cmsglen < sizeof(cmsgbuf)) {
++                msghdr.msg_control = cmsgbuf;
++        } else {
++                debug_log
++                    ("ERROR: insufficient memory for 'msghdr.msg_control'.\n");
++                goto err_ret;
++        }
++        memset(msghdr.msg_control, 0, cmsglen);
++        msghdr.msg_controllen = cmsglen;
++
++        hoplimit = 255;
++        cmsghdr1 = CMSG_FIRSTHDR(&msghdr);
++        cmsghdr1->cmsg_level = IPPROTO_IPV6;
++        cmsghdr1->cmsg_type = IPV6_HOPLIMIT;
++        cmsghdr1->cmsg_len = CMSG_LEN(sizeof(int));
++        *((int *)CMSG_DATA(cmsghdr1)) = hoplimit;
++
++        cmsghdr2 = CMSG_NXTHDR(&msghdr, cmsghdr1);
++        cmsghdr2->cmsg_level = IPPROTO_IPV6;
++        cmsghdr2->cmsg_type = IPV6_PKTINFO;
++        cmsghdr2->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
++        pktinfo = (struct in6_pktinfo *)CMSG_DATA(cmsghdr2);
++        pktinfo->ipi6_ifindex = ifindex;
++
++        psdhdr[32] = 0;         /* Length should not be greater than 65535
++                                   (i.e., 2 bytes) */
++        psdhdr[33] = 0;         /* Length should not be greater than 65535
++                                   (i.e., 2 bytes) */
++        psdhdr[34] = (RS_HDRLEN + optlen) / 256;        /* Upper layer packet
++                                                           length */
++        psdhdr[35] = (RS_HDRLEN + optlen) % 256;        /* Upper layer packet
++                                                           length */
++        psdhdr[36] = 0;         /* 36-38 must be zero */
++        psdhdr[37] = 0;
++        psdhdr[38] = 0;
++        psdhdr[39] = IPPROTO_ICMPV6;
++        memcpy(psdhdr + 40, outpack, RS_HDRLEN + optlen);
++        rs->nd_rs_hdr.icmp6_cksum =
++            checksum((unsigned short int *)psdhdr, psdhdrlen);
++
++        printf("Checksum: %x\n", ntohs(rs->nd_rs_hdr.icmp6_cksum));
++
++        if(sendmsg(sd, &msghdr, 0) < 0) {
++                debug_log("sendmsg() failed ");
++                goto err_ret;
++        }
++
++  	ret = 1;
++
++err_ret:
++  	close (sd);
++  	return ret;
++}
++
++unsigned short int checksum(unsigned short int *addr, int len)
++{
++        int nleft = len;
++        int sum = 0;
++        unsigned short int *w = addr;
++        unsigned short int ans = 0;
++
++        while(nleft > 1) {
++                sum += *w++;
++                nleft -= sizeof(unsigned short int);
++        }
++
++        if(nleft == 1) {
++                *(unsigned char *)(&ans) = *(unsigned char *)w;
++                sum += ans;
++        }
++
++        sum = (sum >> 16) + (sum & 0xFFFF);
++        sum += (sum >> 16);
++        ans = ~sum;
++
++        return (ans);
++}

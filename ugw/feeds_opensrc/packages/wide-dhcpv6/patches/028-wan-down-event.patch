@@ -1,0 +1,194 @@
+diff -Nuar wide-dhcpv6-20080615_org/common.c wide-dhcpv6-20080615/common.c
+--- wide-dhcpv6-20080615_org/common.c	2012-03-13 13:07:34.985669192 +0530
++++ wide-dhcpv6-20080615/common.c	2012-03-13 15:41:43.868669330 +0530
+@@ -3738,10 +3738,6 @@
+ 		syslog(level, "%s%s%s", fname, printfname ? ": " : "", logbuf);
+ }
+ 
+-#if 1 /* REBIND_REMOVEADDR */
+-char addr_br0[256];
+-char addr_wan[256];
+-#endif
+ int
+ ifaddrconf(cmd, ifname, addr, plen, pltime, vltime)
+ 	ifaddrconf_cmd_t cmd;
+@@ -3846,16 +3842,6 @@
+ 	dprintf(LOG_DEBUG, FNAME, "%s an address %s/%d on %s", cmdstr,
+ 	    addr2str((struct sockaddr *)addr), plen, ifname);
+ 
+-#if 1	/* REBIND_REMOVEADDR */
+-	if(strstr("br0", ifname)) {
+-		snprintf(addr_br0, sizeof(addr_br0), "ip -6 addr %%s %s/%d dev %s", 
+-		 addr2str((struct sockaddr *)addr),  plen,  ifname);
+-	} else {
+-		snprintf(addr_wan,  sizeof(addr_br0), "ip -6 addr %%s %s/%d dev %s", 
+-		 addr2str((struct sockaddr *)addr),  plen,  ifname);
+-	}
+-#endif
+-		
+ 
+ 	close(s);
+ 	return (0);
+diff -Nuar wide-dhcpv6-20080615_org/config.h wide-dhcpv6-20080615/config.h
+--- wide-dhcpv6-20080615_org/config.h	2012-03-13 13:07:34.986669134 +0530
++++ wide-dhcpv6-20080615/config.h	2012-03-14 15:05:50.074528370 +0530
+@@ -210,6 +210,7 @@
+ 	int ifid_len;		/* interface ID length in bits */
+ 	int ifid_type;		/* EUI-64 and manual (unused?) */
+ 	char ifid[16];		/* Interface ID, up to 128bits */
++	char base_ifname[16];	/* Interface on which offer is recved */
+ };
+ #define IFID_LEN_DEFAULT 64
+ #define SLA_LEN_DEFAULT 16
+diff -Nuar wide-dhcpv6-20080615_org/dhcp6c.c wide-dhcpv6-20080615/dhcp6c.c
+--- wide-dhcpv6-20080615_org/dhcp6c.c	2012-03-13 13:07:34.990668146 +0530
++++ wide-dhcpv6-20080615/dhcp6c.c	2012-03-13 15:41:03.308794423 +0530
+@@ -1562,19 +1562,6 @@
+ 				    "failed to add an IAPD");
+ 				goto end;
+ 			}
+-#if 1 /* REBIND_REMOVEADDR */
+-			if(ev->state == DHCP6S_REBIND) {
+-				char cmdbuf[300];
+-				extern addr_br0[256];
+-				extern addr_wan[256];
+-				snprintf(cmdbuf, sizeof(cmdbuf), addr_br0, "del");
+-				dprintf(LOG_NOTICE, FNAME, "executing %s\n", cmdbuf);
+-				system(cmdbuf);
+-				snprintf(cmdbuf, sizeof(cmdbuf), addr_wan, "del");
+-				dprintf(LOG_NOTICE, FNAME, "executing %s\n", cmdbuf);
+-				system(cmdbuf);
+-			}
+-#endif
+ 			break;
+ 		case DHCP6_EVDATA_IANA:
+ 			if (dhcp6_copy_list(&optinfo.iana_list,
+@@ -1583,14 +1570,6 @@
+ 				    "failed to add an IAPD");
+ 				goto end;
+ 			}
+-#if 1 /* REBIND_REMOVEADDR */
+-			if(ev->state == DHCP6S_REBIND) {
+-				char cmdbuf[300];
+-				extern addr_wan[256];
+-				snprintf(cmdbuf, sizeof(cmdbuf), addr_wan, "del");
+-				system(cmdbuf);
+-			}
+-#endif
+ 
+ 			break;
+ #ifdef RECONFIGURE_CLIENT
+diff -Nuar wide-dhcpv6-20080615_org/dhcp6c_ia.c wide-dhcpv6-20080615/dhcp6c_ia.c
+--- wide-dhcpv6-20080615_org/dhcp6c_ia.c	2012-03-13 13:07:34.980669096 +0530
++++ wide-dhcpv6-20080615/dhcp6c_ia.c	2012-03-13 15:41:58.021794507 +0530
+@@ -243,16 +243,6 @@
+ 					    in6addr2str(&siav->val_prefix6.addr, 0),
+ 					    siav->val_prefix6.plen);
+ 				} 
+-#if 1	/* REBIND_REMOVEADDR */
+-				else {
+-					if(ev->state == DHCP6S_REBIND) {
+-						char cmdbuf[300];
+-						extern addr_br0[256];
+-						snprintf(cmdbuf, sizeof(cmdbuf), addr_br0, "add");
+-						system(cmdbuf);
+-					}
+-				}
+-#endif
+ 				break;
+ 			case DHCP6_LISTVAL_STATEFULADDR6:
+ 				ianac = (struct iana_conf *)iac;
+diff -Nuar wide-dhcpv6-20080615_org/prefixconf.c wide-dhcpv6-20080615/prefixconf.c
+--- wide-dhcpv6-20080615_org/prefixconf.c	2012-03-13 13:07:34.981669342 +0530
++++ wide-dhcpv6-20080615/prefixconf.c	2012-03-14 16:29:50.100668970 +0530
+@@ -679,6 +679,8 @@
+ }
+ 
+ #ifdef UPDATE_PD_IN_RADVD
++
++#define RADVD_SCRIPT "/etc/rc.d/update_and_run_radvd.sh"
+ static int	
+ call_user_script_pd(siteprefix, prefix, pconf, dhcpifp, optinfo, a, ifpfx)
+ 	struct siteprefix *siteprefix;
+@@ -689,7 +691,6 @@
+ 	struct in6_addr *a;
+ 	struct dhcp6_ifprefix *ifpfx;
+ {
+-#define RADVD_SCRIPT "/etc/rc.d/update_and_run_radvd.sh"
+ 	int status;
+ 	pid_t pid;
+ 	pid = fork();
+@@ -800,6 +801,53 @@
+ 	}
+ 			
+ }
++static int	
++call_user_script_pd_down(pconf)
++	struct prefix_ifconf *pconf;
++{
++	int status;
++	pid_t pid;
++	pid = fork();
++	if(pid == 0) { 	/* Child */
++		char *env[8];
++		char *argv[3];
++		int	i;
++		char envbuf[sizeof(env)/sizeof(char *)-1][64];
++		int env_max_idx = (sizeof(env)/sizeof(char *)) -1;
++
++		memset(env, 0, sizeof(env));
++		for (i=0; i<sizeof(env)/sizeof(char *)-1 ; i++) {
++			env[i] = envbuf[i];
++		}
++	
++		i = 0;
++		snprintf(env[i++], sizeof(envbuf[0]), "EVENT_SRC=WAN");
++		snprintf(env[i++], sizeof(envbuf[0]), "SRC_INTF=%s", pconf->base_ifname);
++		snprintf(env[i++], sizeof(envbuf[0]), "EVENT_TYPE=DOWN");
++		snprintf(env[i++], sizeof(envbuf[0]), "INTF=%s", pconf->ifname);
++
++		if(i > env_max_idx ) {
++				dprintf(LOG_NOTICE, FNAME, 
++				    "%s: Number of env variable exceeds the max allowed\n", __func__); 
++			env[env_max_idx] = NULL;
++			
++		} else {
++			env[i] = NULL;
++		}
++		argv[0]= RADVD_SCRIPT;
++		argv[1]= "update";
++		argv[2]= NULL;
++		execve(RADVD_SCRIPT, argv, env);
++		dprintf(LOG_ERR, FNAME, "child:%s exec failed: %s", RADVD_SCRIPT, strerror(errno));
++		exit(1); 	/* Exit child  ... no need to free allocated memory */
++	} else if (pid > 0 ) {  /* parent waits child to exit */
++		waitpid(pid, &status, 0);
++		printf("*********" RADVD_SCRIPT " exited with %d*******\n", status);
++	} else { 	/* error */
++		dprintf(LOG_DEBUG, FNAME, "Unable to fork to run %s\n", RADVD_SCRIPT);
++	}
++
++}
+ #endif
+ 
+ 
+@@ -826,6 +874,8 @@
+ 
+ 	ifpfx->ifconf = pconf;
+ 
++	strncpy(pconf->base_ifname, dhcpifp->ifname, sizeof(pconf->base_ifname) -1);
++
+ 	ifpfx->paddr.sin6_family = AF_INET6;
+ #ifdef HAVE_SA_LEN
+ 	ifpfx->paddr.sin6_len = sizeof(struct sockaddr_in6);
+@@ -922,6 +972,9 @@
+ 	ret = ifaddrconf(cmd, pconf->ifname, &ifpfx->ifaddr, ifpfx->plen, 
+ 	    ND6_INFINITE_LIFETIME, ND6_INFINITE_LIFETIME);
+ 	
++	if(cmd == IFADDRCONF_REMOVE) {
++		call_user_script_pd_down(pconf);
++	}
+ 	dprintf(LOG_NOTICE, FNAME, "RET = %d\n", ret);
+ 	
+ 	{
+

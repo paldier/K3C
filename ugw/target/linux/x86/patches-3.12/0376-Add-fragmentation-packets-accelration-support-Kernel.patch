@@ -1,0 +1,149 @@
+From 82971b54821e805f41909af974ce029fa8fdd84e Mon Sep 17 00:00:00 2001
+From: avishalo <avi1.shalom@intel.com>
+Date: Sun, 27 Mar 2016 21:45:33 -0700
+Subject: [PATCH 376/441] Add fragmentation packets accelration support -
+ Kernel changes Signed-off-by: avishalo <avi1.shalom@intel.com> Change-Id:
+ Ia66364cc771c7c24382ad7011079e976c3fdd08b
+
+---
+ net/Kconfig             |  4 ++--
+ net/ipv4/ip_input.c     |  5 +++++
+ net/ipv4/ip_output.c    |  4 ++++
+ net/netfilter/core.c    | 32 ++++++++++++++++----------------
+ net/ti/pp/ti_hil_core.c | 22 +++++++++++++++-------
+ 5 files changed, 42 insertions(+), 25 deletions(-)
+
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -337,8 +337,8 @@ endmenu
+ 
+ #Enable packet processor handling for GW on ATOM
+ config APPCPU_GW_PP_HANDLE
+-       bool "Enable packet processor handling for GW on ATOM"
+-       default n 
++	bool "Enable packet processor handling for GW on ATOM"
++	default n
+ 
+ source "net/ax25/Kconfig"
+ source "net/can/Kconfig"
+--- a/net/ipv4/ip_input.c
++++ b/net/ipv4/ip_input.c
+@@ -366,6 +366,11 @@ static int ip_rcv_finish(struct sk_buff
+ 	return dst_input(skb);
+ 
+ drop:
++
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++    /* Create a NULL PP device, to drop all dropped packets before they reach the host */
++    ti_hil_pp_event (TI_IP_DISCARD_PKT_IPV4, (void *)skb);
++#endif
+ 	kfree_skb(skb);
+ 	return NET_RX_DROP;
+ }
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -427,6 +427,10 @@ static void ip_copy_metadata(struct sk_b
+ #if defined(CONFIG_IP_VS) || defined(CONFIG_IP_VS_MODULE)
+ 	to->ipvs_property = from->ipvs_property;
+ #endif
++
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++    memcpy((void *)SKB_GET_PP_INFO_P(to), (void *)SKB_GET_PP_INFO_P(from), sizeof(*SKB_GET_PP_INFO_P(from)));
++#endif
+ 	skb_copy_secmark(to, from);
+ }
+ 
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -199,25 +199,25 @@ next_hook:
+                                               (~(pa)->hw[4]) | \
+                                               (~(pa)->hw[5]) ))
+ 
+-		int skip_pp_discard=0;
+-		struct ethhdr* ptr_ethhdr = NULL;
+-		ptr_ethhdr = eth_hdr(skb);
++	int skip_pp_discard=0;
++	struct ethhdr* ptr_ethhdr = NULL;
++	ptr_ethhdr = eth_hdr(skb);
+ 
+-		if (  ptr_ethhdr)
++	if (  ptr_ethhdr)
++	{
++		/* Check if the package is the multicast type, but not a broadcast */
++		if (  ( ! (MAC_ISBROADCAST (ptr_ethhdr, h_dest)) )  &&
++			  (   MAC_ISMULTICAST (ptr_ethhdr, h_dest))  )
+ 		{
+-			/* Check if the package is the multicast type, but not a broadcast */
+-			if (  ( ! (MAC_ISBROADCAST (ptr_ethhdr, h_dest)) )  &&
+-				  (   MAC_ISMULTICAST (ptr_ethhdr, h_dest))  )
+-			{
+-				skip_pp_discard=1;
+-				printk(KERN_DEBUG "NF_DROP :Multicast pkg, Do not create PP drop session\n" );
+-			}
++			skip_pp_discard=1;
++			printk(KERN_DEBUG "NF_DROP :Multicast pkg, Do not create PP drop session\n" );
+ 		}
++	}
+ 
+-		if ( likely( ! skip_pp_discard ) )
+-		{
+-			ti_hil_pp_event (TI_CT_NETFILTER_DISCARD_PKT, (void *)skb);
+-		}
++	if ( likely( ! skip_pp_discard ) )
++	{
++	    ti_hil_pp_event (TI_CT_NETFILTER_DISCARD_PKT, (void *)skb);
++	}
+ #endif /* CONFIG_APPCPU_GW_PP_HANDLE */
+                 kfree_skb(skb);
+                 ret = NF_DROP_GETERR(verdict);
+--- a/net/ti/pp/ti_hil_core.c
++++ b/net/ti/pp/ti_hil_core.c
+@@ -138,7 +138,7 @@ int ti_hil_pp_event(unsigned long event,
+             }
+             else
+             {
+-	   	break;  /* Appropriate bit is not set, discard event */
++			break;  /* Appropriate bit is not set, discard event */
+             }
+ #ifdef CONFIG_NETFILTER
+         case TI_CT_NETFILTER_DISCARD_PKT:
+@@ -147,25 +147,33 @@ int ti_hil_pp_event(unsigned long event,
+             struct sk_buff* new_skb  = NULL;
+             skb = (struct sk_buff *)v;
+ 
+-            new_skb  = dev_alloc_skb(2048);
+-            if(0 == skb->len)
++	    if (!skb)
+             {
++		printk(KERN_NOTICE "%s[%u]: Recevied null skb. Failed to create drop session  \n", __FUNCTION__, __LINE__);
+                 break;
+             }
+ 
+-            if(!new_skb)
++	    if (skb->pp_packet_info->input_device_index == 0)
+             {
+-               printk(KERN_NOTICE "%s[%u]: failed to alloc skb \n", __FUNCTION__, __LINE__);
+-               break;
++		break;
+             }
+-            if(new_skb == skb)
++
++	    if(0 == skb->len)
+             {
+                 break;
+             }
+ 
++	    new_skb  = dev_alloc_skb(2048);
++	    if(!new_skb)
++	    {
++		printk(KERN_NOTICE "%s[%u]: failed to alloc skb \n", __FUNCTION__, __LINE__);
++		break;
++	    }
++
+             memcpy(new_skb->pp_packet_info, skb->pp_packet_info, sizeof(PP_PACKET_INFO_t));
+             memcpy(new_skb->data, skb->data, skb->len);
+             skb_put(new_skb, skb->len);
++
+             create_drop_session(new_skb, event);
+             break;
+ 	}

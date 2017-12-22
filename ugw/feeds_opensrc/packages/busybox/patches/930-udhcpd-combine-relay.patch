@@ -1,0 +1,146 @@
+Index: busybox-1.17.1/networking/udhcp/dhcpd.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpd.c	2011-07-10 13:15:47.741798340 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpd.c	2011-07-10 22:13:18.461797422 +0530
+@@ -480,6 +480,11 @@
+ 	int classindex=0;
+ 	int i;
+ #endif
++#if ENABLE_FEATURE_UDHCPD_RELAY
++	/* Socket for relay mode */
++	int relay_socket = -1;
++	int relay_fd = -1;
++#endif
+ 
+ #if ENABLE_FEATURE_UDHCP_PORT
+ 	SERVER_PORT = 67;
+@@ -625,7 +630,32 @@
+ 					server_config.interface);
+ 		}
+ #endif
++#if ENABLE_FEATURE_UDHCPD_RELAY
++		/* If the relay mode is set for this node, then we listen on the relay interface */
++		if (head->server_config_global.dhcpmode == DHCP_MODE_RELAY)
++		{
++			if(relay_socket < 0)
++			{
++				if(relay_fd < 0)
++				{
++#if ENABLE_FEATURE_DHCP_RUN_FROM_INETD
++					relay_fd = 0;
++#else
++					relay_fd = udhcp_listen_socket(SERVER_PORT,server_config.relayif);
++#endif
++				}
++				relay_socket= relay_fd;
++			}
++		}
++#endif
+ 		max_sock = udhcp_sp_fd_set(&rfds, server_socket);
++#if ENABLE_FEATURE_UDHCPD_RELAY
++		/* udhcpd_sp_fd_set does not work for more than one socket so we set manually */
++		if ( relay_socket > 0 ) {
++			FD_SET(relay_socket, &rfds);
++			max_sock = relay_socket;
++		}
++#endif
+ 		if (server_config.auto_time) {
+ 			tv.tv_sec = timeout_end - monotonic_sec();
+ 			tv.tv_usec = 0;
+@@ -680,6 +710,16 @@
+ 			bb_error_msg("MAC length != 6, ignoring packet");
+ 			continue;
+ 		}
++#if ENABLE_FEATURE_UDHCPD_RELAY
++		/* Reply message. This is possible only when reote server replied. Simply forward to client */
++		if (packet.op == BOOTREPLY) {
++			bb_info_msg("Bootreply message\n");
++			if(udhcp_send_raw_packet(&packet, packet.gateway_nip, SERVER_PORT, packet.yiaddr, CLIENT_PORT, packet.chaddr, server_config.ifindex) < 0 ) {
++				bb_info_msg("forwarding to client fail\n");
++			}
++			continue;
++		}
++#endif
+ 		if (packet.op != BOOTREQUEST) {
+ 			bb_error_msg("not a REQUEST, ignoring packet");
+ 			continue;
+@@ -694,6 +734,19 @@
+ 		classindex = 0;
+ 		classindex = find_class( &packet );
+ #endif
++#if ENABLE_FEATURE_UDHCPD_RELAY
++		/* Request message. Forward to server only if relay mode is set for the current node */
++		if (packet.op == BOOTREQUEST) {
++			if (server_config.dhcpmode == DHCP_MODE_RELAY) {
++				bb_info_msg("Bootrequest message\n");
++				packet.gateway_nip = server_config.server_nip;
++				if(udhcp_send_kernel_packet(&packet,server_config.server_nip,SERVER_PORT,server_config.dhcpserverIp, SERVER_PORT)< 0) {
++					bb_info_msg("sending to server fail\n");
++				}
++			continue;
++			}
++		}
++#endif
+ 		/* Look for a static/dynamic lease */
+ 		static_lease_nip = get_static_nip_by_mac(server_config.static_leases, &packet.chaddr);
+ 		if (static_lease_nip) {
+Index: busybox-1.17.1/networking/udhcp/dhcpd.h
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpd.h	2011-07-10 13:15:47.670797851 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpd.h	2011-07-10 22:07:25.268797238 +0530
+@@ -13,6 +13,9 @@
+ #define LEASES_FILE             CONFIG_DHCPD_LEASES_FILE
+ /* Where to find the DHCP server configuration file */
+ #define DHCPD_CONF_FILE         "/etc/udhcpd.conf"
++#if ENABLE_FEATURE_UDHCPD_RELAY
++#define DHCP_MODE_RELAY			1
++#endif
+ 
+ 
+ struct static_lease {
+@@ -30,6 +33,11 @@
+ // update_server_network_data_cache() must re-query data
+ // if more than N seconds have passed after last use.
+ 	int ifindex;
++#if ENABLE_FEATURE_UDHCPD_RELAY
++	char *relayif;					/* interface through which server is available */
++	int dhcpmode;					/* 0 means server and 1 means relay */
++	uint32_t dhcpserverIp;			/* remote server ip in case of relay mode */
++#endif
+ 	uint32_t server_nip;
+ #if ENABLE_FEATURE_UDHCP_PORT
+ 	uint16_t port;
+Index: busybox-1.17.1/networking/udhcp/files.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/files.c	2011-07-10 13:15:47.671797580 +0530
++++ busybox-1.17.1/networking/udhcp/files.c	2011-07-10 22:07:37.130797741 +0530
+@@ -90,6 +90,11 @@
+ 	/* keyword        handler           variable address               default */
+ 	{"start"        , udhcp_str2nip   , &server_config.start_ip     , "192.168.0.20"},
+ 	{"end"          , udhcp_str2nip   , &server_config.end_ip       , "192.168.0.254"},
++#if ENABLE_FEATURE_UDHCPD_RELAY
++	{"dhcpserverIp"	, udhcp_str2nip	  , &server_config.dhcpserverIp , "192.168.2.1"},
++	{"relayif"      , read_str        , &server_config.relayif      , "nas0"},
++	{"dhcpmode"     , read_u32        , &server_config.dhcpmode     , "0"},
++#endif
+ 	{"interface"    , read_str        , &server_config.interface    , "eth0"},
+ 	/* Avoid "max_leases value not sane" warning by setting default
+ 	 * to default_end_ip - default_start_ip + 1: */
+Index: busybox-1.17.1/networking/udhcp/Config.src
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/Config.src	2011-07-10 13:15:47.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/Config.src	2011-07-10 22:09:50.946496711 +0530
+@@ -12,6 +12,13 @@
+ 	  udhcpd is a DHCP server geared primarily toward embedded systems,
+ 	  while striving to be fully functional and RFC compliant.
+ 
++config FEATURE_UDHCPD_RELAY
++	bool "combine relay to server"
++	default n
++	depends on UDHCPD
++	help
++	  This Lantiq enahanement comines relay functionality to server.
++
+ config DHCPRELAY
+ 	bool "dhcprelay"
+ 	default y

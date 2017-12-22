@@ -1,0 +1,1670 @@
+From cb9ea65b42c4486dd9158b22e9d29120721fb7c0 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Thu, 19 Nov 2015 12:52:42 -0700
+Subject: [PATCH 233/441]     Title: Regulator and Puma Platform ACPI driver
+  Issue: <JIRA:CPM-54>     IssueType: <Feature>     Description: <To support
+ CGM power management adding regulator and platform     ACPI driver>
+ Reviewers: <bwelch, ejillela>
+
+---
+ drivers/platform/x86/Kconfig                |   9 +
+ drivers/platform/x86/Makefile               |   1 +
+ drivers/platform/x86/puma_acpi.c            | 978 ++++++++++++++++++++++++++++
+ drivers/regulator/Kconfig                   |   8 +
+ drivers/regulator/Makefile                  |   1 +
+ drivers/regulator/int34d9-regulator.c       | 498 ++++++++++++++
+ include/linux/regulator/int34d9-regulator.h | 116 ++++
+ 7 files changed, 1611 insertions(+)
+ create mode 100644 drivers/platform/x86/puma_acpi.c
+ create mode 100644 drivers/regulator/int34d9-regulator.c
+ create mode 100644 include/linux/regulator/int34d9-regulator.h
+
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -819,4 +819,13 @@ config PVPANIC
+ 	  a paravirtualized device provided by QEMU; it lets a virtual machine
+ 	  (guest) communicate panic events to the host.
+ 
++config PUMA_ACPI
++	tristate "PUMA ACPI Driver"
++	default y
++	depends on ACPI
++	depends on IOSF_MBI
++	depends on REGULATOR
++	---help---
++	  This driver provides support for PUMA platform power management.
++	  
+ endif # X86_PLATFORM_DEVICES
+--- a/drivers/platform/x86/Makefile
++++ b/drivers/platform/x86/Makefile
+@@ -55,3 +55,4 @@ obj-$(CONFIG_INTEL_RST)		+= intel-rst.o
+ obj-$(CONFIG_INTEL_SMARTCONNECT)	+= intel-smartconnect.o
+ 
+ obj-$(CONFIG_PVPANIC)           += pvpanic.o
++obj-$(CONFIG_PUMA_ACPI)    += puma_acpi.o   
+--- /dev/null
++++ b/drivers/platform/x86/puma_acpi.c
+@@ -0,0 +1,978 @@
++/*
++ * PUMA platform ACPI driver
++ *
++ * Copyright (C) 2015 Intel Corp
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
++ */
++ 
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/types.h>
++#include <linux/kfifo.h>
++#include <linux/kthread.h>
++#include <linux/sched.h>
++#include <linux/wait.h>
++#include <linux/timer.h>
++#include <linux/delay.h>
++#include <linux/reboot.h>
++#include <linux/regulator/consumer.h>
++#include <linux/sched/rt.h>
++#include <asm/bitops.h>
++#include <asm/atomic.h>
++#include <asm/iosf_mbi.h>
++#include <acpi/acpi_drivers.h>
++
++/* fifo size in elements (ints) */
++#define PUMA_ACPI_FIFO_SIZE  16
++
++/* Event bits the ACPI thread waits on */
++#define PUMA_ACPI_EVENT    0
++#define PUMA_NETIP_EVENT   1
++#define PUMA_TIMER_EVENT   2
++
++
++/* ACPI power status register bits */
++#define PUMA_ACPI_POWER_LIVE_MASK   0x1
++#define PUMA_ACPI_POWER_LATCH_MASK  0x2
++
++/* PUMA ACPI notifications */
++#define PUMA_ACPI_NOTIFY_ACTIVE_ON_AC           0x80
++#define PUMA_ACPI_NOTIFY_ACTIVE_ON_BATTERY      0x81
++#define PUMA_ACPI_NOTIFY_AC_SPIKE               0x83
++#define PUMA_ACPI_NOTIFY_BATTERY_SPIKE          0x84
++#define PUMA_ACPI_NOTIFY_PWR_BUTTON_PRS         0x85
++#define PUMA_ACPI_NOTIFY_PWR_BUTTON_RLS         0x86
++#define PUMA_ACPI_NOTIFY_FAST_STANBY            0x87
++#define PUMA_ACPI_NOTIFY_DEEP_STANDBY           0x88
++#define PUMA_ACPI_NOTIFY_BATTERY_LOW            0x89
++#define PUMA_ACPI_NOTIFY_PMC2ATOM_IPC           0x8A
++#define PUMA_ACPI_NOTIFY_NETIP_CONNECTED_IDLE   0x8B
++#define PUMA_ACPI_NOTIFY_NETIP_REQUEST_RESET    0x8C
++#define PUMA_ACPI_NOTIFY_PLATFORM_RESOURCES_ON  0x8D
++#define PUMA_ACPI_NOTIFY_PLATFORM_RESOURCES_OFF 0x8E
++#define PUMA_ACPI_NOTIFY_PWR_STAT_CNG_DURING_SB 0x8F
++
++/* PUMA ACPI TIMER durations in ms */
++#define PUMA_ACPI_TIMER_THRS_SB  5000
++#define PUMA_ACPI_TIMER_LED_SB   1000
++#define PUMA_ACPI_TIMER_LED_DSB  500
++
++/* PUMA PMC IPC */
++#define PUMA_PMC_PORT_ID      0x52
++#define PUMA_PMC_READ_OPCODE  0x06
++#define PUMA_PMC_WRITE_OPCODE 0x07
++#define PUMA_ATOM2PMC_CSR     0x8140
++#define PUMA_ATOM2PMC_DB      0x8144
++#define PUMA_ATOM2PMC_DBM     0x815C
++#define PUMA_PMC2ATOM_CSR     0x8150
++#define PUMA_PMC2ATOM_DB      0x8154
++#define PUMA_PMC2ATOM_DBM     0x814C
++
++#define PUMA_ATOM2PMC_DB_VALUE(busy,ipc_transaction_type,format,ipc_cmd_type,ipc_ext_payload,ipc_cmd,ipc_payload) \
++   ((busy << 31) | (ipc_transaction_type << 29) | (format << 28) | (ipc_cmd_type << 24) | (ipc_ext_payload << 23) | \
++   (ipc_cmd << 16) | (ipc_payload))
++   
++#define PUMA_SETPS_ACTIVE     PUMA_ATOM2PMC_DB_VALUE(1, 3, 1, 1, 0, 7, 2)
++#define PUMA_SETPS_LPM        PUMA_ATOM2PMC_DB_VALUE(1, 3, 1, 1, 0, 7, 1)
++#define PUMA_SETPS_NETIP_ON   PUMA_ATOM2PMC_DB_VALUE(1, 3, 1, 1, 0, 7, 4)
++#define PUMA_SETPS_NETIP_OFF  PUMA_ATOM2PMC_DB_VALUE(1, 3, 1, 1, 0, 7, 8)
++
++#define PUMA_ATOM_OVERRIDE_LTR      PUMA_ATOM2PMC_DB_VALUE(1, 3, 1, 1, 0, 5, 7)
++#define PUMA_ATOM_USE_DEVICE_LTR    PUMA_ATOM2PMC_DB_VALUE(1, 3, 1, 1, 0, 5, 0)
++
++#define PUMA_READ_PMC_IPC              0
++#define PUMA_WRITE_PMC_IPC             1
++#define PUMA_PMC_IPC_BUSY_MASK         0x80000000
++#define PUMA_PMC_IPC_OPERATIONAL_MASK  0x80000000
++#define PUMA_PMC_IPC_PAYLOAD_MASK      0xFFFF
++#define PUMA_PMC_IPC_GET_CMD(data)     ((data >> 16) & 0x7F)
++
++#define PUMA_PMC_ABORT_MSG          0x1
++#define PUMA_PMC_ABORT_CONDITION1   0x1
++#define PUMA_PMC_ABORT_CONDITION2   0x2
++#define PUMA_PMC_ABORT_CONDITION3   0x4
++
++#define PUMA_MAX_PMC_IPC_RETRY      1000
++
++#define PUMA_PRINT_STATE(data) \
++   (pr_err("Puma ACPI state %d Netip state %d PMC state %d Platform resource %d notify type %d\n", \
++      data->current_state, data->netip_state, data->pmc_state, data->acpi_resource_indication, data->notify_state_type)) 
++
++
++enum puma_acpi_system_state {
++   PUMA_ACPI_STATE_ACTIVE,
++   PUMA_ACPI_STATE_BBU,
++   PUMA_ACPI_STATE_STANDBY,
++   PUMA_ACPI_STATE_DEEP_STANDBY,
++};
++
++enum puma_acpi_timer_state {
++   PUMA_ACPI_TIMER_NOT_STARTED,
++   PUMA_ACPI_TIMER_STARTED,
++   PUMA_ACPI_TIMER_SB_THRS,
++   PUMA_ACPI_TIMER_SB_LED,
++   PUMA_ACPI_TIMER_DSB_THRS,
++   PUMA_ACPI_TIMER_DSB_LED,
++   PUMA_ACPI_TIMER_STOPPED,
++};
++
++enum puma_acpi_led_state {
++   LED_OFF,
++   LED_ON,
++};
++
++/* New memeber to be added after looking at puma_acpi_free_resources() function.
++ * The index order is important as it is used to free the specific resources. 
++ */
++enum puma_resource_index {
++   PUMA_ACPI_DATA,
++   PUMA_ACPI_NOTIFY_FIFO,   
++   PUMA_ACPI_SYSFS,
++   PUMA_ACPI_TASK,
++};
++
++enum puma_acpi_resource_indication {
++   PUMA_ACPI_RESOURCE_ON,
++   PUMA_ACPI_RESOURCE_OFF,      
++};
++
++enum puma_pcie_port_state {
++   PUMA_PCIE_PORT_ENABLE,
++   PUMA_PCIE_PORT_DISABLE,         
++};
++
++enum puma_acpi_netip_request_reset {
++   PUMA_ACPI_NETIP_REQUEST_RESET_WARM = 1,
++   PUMA_ACPI_NETIP_REQUEST_RESET_COLD = 2,      
++};
++
++enum puma_acpi_pmic_type {
++   PUMA7_ACPI_PMIC_ROHM,
++};
++
++struct puma_acpi_data {
++   char name[20]; //name of the task
++   unsigned char notify_state_type;
++   int current_state;
++   int netip_state;
++   int timer_state;
++   int pmc_state;
++   int led_state;
++   int led_blink_count;
++   int acpi_resource_indication;
++   bool deepstandby2active;
++   bool deepstandby2bbu;
++   bool on_bat_during_standby;
++   unsigned long button_press_time;
++   unsigned long button_release_time;
++   struct acpi_device *acpi_dev;
++   struct task_struct *task;
++   struct timer_list timer;
++   DECLARE_KFIFO_PTR(notify_fifo, unsigned int);
++   struct regulator *regulator;   
++   unsigned int pmic_supported:1;
++   int pmic_type;
++};
++
++static unsigned long puma_events;
++static wait_queue_head_t puma_wait;
++static atomic_t puma_netip_state = ATOMIC_INIT(0);
++
++/* Read operation for the sysfs attributes - system_state, netip_state, pmc_state and platform_resource */
++
++static ssize_t show_system_state(struct device *dev, struct device_attribute *attr, char *buf)
++{
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++
++   return snprintf(buf, PAGE_SIZE, "%d\n", data->current_state);
++}
++
++static ssize_t show_netip_state(struct device *dev, struct device_attribute *attr, char *buf)
++{
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++
++   return snprintf(buf, PAGE_SIZE, "%d\n", data->netip_state);
++}
++
++static ssize_t show_pmc_state(struct device *dev, struct device_attribute *attr, char *buf)
++{
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++
++   return snprintf(buf, PAGE_SIZE, "%d\n", data->pmc_state);
++}
++
++static ssize_t show_platform_resource(struct device *dev, struct device_attribute *attr, char *buf)
++{
++   struct acpi_device *acpi = to_acpi_device(dev);
++   struct puma_acpi_data *data = acpi_driver_data(acpi);
++
++   return snprintf(buf, PAGE_SIZE, "%d\n", data->acpi_resource_indication);
++}
++
++static DEVICE_ATTR(system_state, S_IRUGO, show_system_state, NULL);
++static DEVICE_ATTR(netip_state, S_IRUGO, show_netip_state, NULL);
++static DEVICE_ATTR(pmc_state, S_IRUGO, show_pmc_state, NULL);
++static DEVICE_ATTR(platform_resource, S_IRUGO, show_platform_resource, NULL);
++
++static struct attribute_group *puma_acpi_sysfs_entries[] = {
++   &dev_attr_system_state.attr,
++   &dev_attr_netip_state.attr,
++   &dev_attr_pmc_state.attr,
++   &dev_attr_platform_resource.attr,
++   NULL,
++};
++
++static struct attribute_group puma_acpi_attr_group = {
++   .name = NULL, /* put in device directory */
++   .attrs = puma_acpi_sysfs_entries,     
++};
++
++static inline int puma_check_condition(int *acpi_event, int *netip_event, int *timer_event) 
++{
++   return ((*acpi_event = test_and_clear_bit(PUMA_ACPI_EVENT, &puma_events)) || 
++            (*netip_event = test_and_clear_bit(PUMA_NETIP_EVENT, &puma_events)) || 
++            (*timer_event = test_and_clear_bit(PUMA_TIMER_EVENT, &puma_events)));
++}
++
++static void puma_acpi_notify(struct acpi_device *acpi_dev, unsigned int event)
++{
++   struct puma_acpi_data *data = acpi_driver_data(acpi_dev);
++   
++   if(!(kfifo_put(&data->notify_fifo, &event))) {
++      pr_err("Puma ACPI notify fifo full!\n");
++   } else {
++      set_bit(PUMA_ACPI_EVENT, &puma_events);
++      wake_up_interruptible(&puma_wait);
++   }
++}
++
++static void puma_timer_notify(unsigned long data)
++{
++   set_bit(PUMA_TIMER_EVENT, &puma_events);
++   wake_up_interruptible(&puma_wait);
++}
++
++/**
++ * puma_netip_notify_state() - invoke to update the state of NETIP
++ * @state: state of NETIP, 0 - Active, 1 - BBU, 2 - Standby, 3 - Deep standby
++ */
++int puma_netip_notify_state(int state)
++{
++   int ret = 0;
++   if((state < PUMA_ACPI_STATE_ACTIVE) || (state > PUMA_ACPI_STATE_DEEP_STANDBY)) {
++      pr_err("puma_netip_notify_state %d invalid state\n", state);
++      ret = -EINVAL;
++   } else {    
++      atomic_set(&puma_netip_state, state);
++      set_bit(PUMA_NETIP_EVENT, &puma_events);
++      wake_up_interruptible(&puma_wait);
++   }
++
++   return ret;
++}
++
++EXPORT_SYMBOL(puma_netip_notify_state);
++
++void puma_acpi_free_resources(struct puma_acpi_data *data, int resource_index)
++{
++   switch(resource_index) {
++      case PUMA_ACPI_SYSFS:
++         sysfs_remove_group(&data->acpi_dev->dev.kobj, &puma_acpi_attr_group);
++      case PUMA_ACPI_NOTIFY_FIFO:
++         kfifo_free(&data->notify_fifo);
++      case PUMA_ACPI_DATA:
++         kfree(data);
++         break;
++      default:
++         pr_err("Puma ACPI invalid resource index %d\n", resource_index);
++   }
++}
++
++static int puma_acpi_get_data(struct puma_acpi_data *data, acpi_string pathname, unsigned int *out_data)
++{
++   int ret = 0;
++   struct acpi_buffer buf;
++   union acpi_object out_obj;
++   acpi_status status;
++   
++   buf.pointer = &out_obj;
++   buf.length = sizeof(out_obj);
++
++   status = acpi_evaluate_object(data->acpi_dev->handle, pathname, NULL, &buf);
++   if (ACPI_FAILURE(status) || out_obj.type != ACPI_TYPE_INTEGER) {
++      pr_err("PUMA ACPI %s method execution failed\n", pathname);
++      ret = -EIO;
++   } else {
++      *out_data = out_obj.integer.value;
++   }
++
++   return ret;
++}
++
++static int puma_acpi_power_led(struct puma_acpi_data *data)
++{
++   int ret = 0;
++   struct acpi_object_list input;
++   union acpi_object param;
++   acpi_status status;
++
++   param.type = ACPI_TYPE_INTEGER;
++   param.integer.value = data->led_state;
++
++   input.count = 1;
++   input.pointer = &param;
++   
++   status = acpi_evaluate_object(data->acpi_dev->handle, "PLED", &input, NULL);
++
++   if (!ACPI_SUCCESS(status)) {
++      pr_err("Puma ACPI PLED method execution failed!\n");
++      ret = -EINVAL;
++   }
++
++   return ret;
++}
++
++int puma_acpi_make_pmc_ipc_channel_operational(void)
++{
++   unsigned int reg_value;
++   int ret_value;
++   if(iosf_mbi_available()) {
++      /* check if the IPC channel is operational */
++      if((ret_value = iosf_mbi_read(PUMA_PMC_PORT_ID, PUMA_PMC_READ_OPCODE, PUMA_PMC2ATOM_CSR, &reg_value)) < 0) {
++         pr_err("iosf_mbi_read failed %d at line %d!\n",ret_value, __LINE__);
++      } else if(!(reg_value & PUMA_PMC_IPC_OPERATIONAL_MASK)) {
++         pr_err("Puma PMC IPC not ready\n");
++         ret_value = -EIO;
++      } else if((ret_value = iosf_mbi_read(PUMA_PMC_PORT_ID, PUMA_PMC_READ_OPCODE, PUMA_ATOM2PMC_CSR, &reg_value)) < 0) {
++         pr_err("iosf_mbi_read failed %d at line %d!\n",ret_value, __LINE__);
++      } else if((ret_value = iosf_mbi_write(PUMA_PMC_PORT_ID, PUMA_PMC_WRITE_OPCODE, PUMA_ATOM2PMC_CSR, (reg_value | PUMA_PMC_IPC_OPERATIONAL_MASK))) < 0) {
++         pr_err("iosf_mbi_write failed %d at line %d!\n",ret_value, __LINE__);
++      } 
++   } else {
++      pr_err("Puma ACPI iosf mbi not available\n");
++      ret_value = -ENODEV;
++   }
++
++   return ret_value;
++}
++
++int puma_acpi_pmc_ipc(int operation, unsigned int cmd, unsigned int *data)
++{
++   unsigned int reg_value;
++   int ret_value = 0;
++   unsigned int condition = 1;
++   unsigned int timeout_count = PUMA_MAX_PMC_IPC_RETRY;
++   
++   if(operation == PUMA_WRITE_PMC_IPC) {
++      if((ret_value = iosf_mbi_write(PUMA_PMC_PORT_ID, PUMA_PMC_WRITE_OPCODE, PUMA_ATOM2PMC_DB, cmd)) < 0) {
++         pr_err("iosf_mbi_write failed %d for cmd %u at line %d!\n", ret_value, cmd, __LINE__);
++      } else {
++         do {
++            if((ret_value = iosf_mbi_read(PUMA_PMC_PORT_ID, PUMA_PMC_READ_OPCODE, PUMA_ATOM2PMC_DBM, &reg_value)) < 0) {
++               pr_err("iosf_mbi_read failed %d at line %d!\n", ret_value, __LINE__);
++            } else {
++               condition = reg_value & PUMA_PMC_IPC_BUSY_MASK;
++            }
++            if(condition) {
++               timeout_count--;
++               if(timeout_count == 0) {
++                  pr_err("PMC IPC not responding PUMA_ATOM2PMC_DBM %d!\n", reg_value);
++                  ret_value = -EIO;
++               }
++               msleep(5);
++            }
++         } while(condition && timeout_count);
++      }
++   } else if(operation == PUMA_READ_PMC_IPC) {
++      if((ret_value = iosf_mbi_read(PUMA_PMC_PORT_ID, PUMA_PMC_READ_OPCODE, PUMA_PMC2ATOM_DB, data)) < 0) {
++         pr_err("iosf_mbi_read failed %d at line %d!\n", ret_value, __LINE__);
++      } else if((ret_value = iosf_mbi_write(PUMA_PMC_PORT_ID, PUMA_PMC_WRITE_OPCODE, PUMA_PMC2ATOM_DB, (*data & ~PUMA_PMC_IPC_BUSY_MASK))) < 0) {
++         pr_err("iosf_mbi_write failed %d at line %d!\n", ret_value, __LINE__);
++      } else if((ret_value = iosf_mbi_write(PUMA_PMC_PORT_ID, PUMA_PMC_WRITE_OPCODE, PUMA_PMC2ATOM_DBM, (*data & ~PUMA_PMC_IPC_BUSY_MASK))) < 0) {
++         pr_err("iosf_mbi_write failed %d at line %d!\n", ret_value, __LINE__);
++      } 
++   } else {
++      pr_err("Invalid operation\n");
++   }
++
++   return ret_value;
++}
++
++/* puma_acpi_button_release() - Handle the button release event based on the current state 
++ * and the state of the timer 
++ */
++void puma_acpi_button_release(struct puma_acpi_data *data, unsigned int event)
++{
++   unsigned long button_press_duration;
++
++   data->button_release_time = jiffies;
++   button_press_duration = data->button_release_time - data->button_press_time;
++   pr_debug("Puma ACPI button press duration %u ms\n", jiffies_to_msecs(button_press_duration));
++   if((data->timer_state != PUMA_ACPI_TIMER_STOPPED) && (data->timer_state != PUMA_ACPI_TIMER_NOT_STARTED)) {
++      del_timer(&data->timer);
++   }
++   switch(data->current_state) {
++      case PUMA_ACPI_STATE_ACTIVE:
++      case PUMA_ACPI_STATE_BBU:
++         if((data->timer_state >= PUMA_ACPI_TIMER_SB_THRS) && (data->timer_state <= PUMA_ACPI_TIMER_SB_LED)) {
++            data->current_state = PUMA_ACPI_STATE_STANDBY;
++            data->notify_state_type = PUMA_ACPI_NOTIFY_FAST_STANBY;
++            data->on_bat_during_standby = false;
++         } else if(data->timer_state >= PUMA_ACPI_TIMER_DSB_THRS) {
++            data->current_state = PUMA_ACPI_STATE_DEEP_STANDBY;
++            data->notify_state_type = PUMA_ACPI_NOTIFY_DEEP_STANDBY;
++            data->on_bat_during_standby = false;
++         } 
++         break;
++      case PUMA_ACPI_STATE_STANDBY:
++         if(data->timer_state >= PUMA_ACPI_TIMER_DSB_THRS) {
++            data->current_state = PUMA_ACPI_STATE_DEEP_STANDBY;
++            data->notify_state_type = PUMA_ACPI_NOTIFY_DEEP_STANDBY;
++            data->on_bat_during_standby = false;
++         } else {
++            if(data->on_bat_during_standby) {
++               data->current_state = PUMA_ACPI_STATE_BBU;
++               data->notify_state_type = PUMA_ACPI_NOTIFY_ACTIVE_ON_BATTERY;
++            } else {
++               data->current_state = PUMA_ACPI_STATE_ACTIVE;
++               data->notify_state_type = PUMA_ACPI_NOTIFY_ACTIVE_ON_AC;
++            }
++         }
++         break;
++      case PUMA_ACPI_STATE_DEEP_STANDBY:
++         if(data->on_bat_during_standby) {
++            data->current_state = PUMA_ACPI_STATE_BBU;
++            data->notify_state_type = PUMA_ACPI_NOTIFY_ACTIVE_ON_BATTERY;
++            data->deepstandby2bbu = true;
++         } else {
++            data->current_state = PUMA_ACPI_STATE_ACTIVE;
++            data->notify_state_type = PUMA_ACPI_NOTIFY_ACTIVE_ON_AC;
++            data->deepstandby2active = true;
++         }
++         break;
++      default:                  
++         pr_err("Puma ACPI ERROR invalid state %d for event %d\n", data->current_state, event);
++   }
++   
++   data->timer_state = PUMA_ACPI_TIMER_NOT_STARTED; 
++}
++
++/* puma_acpi_pmc2atom_ipc() - PMC has hit the abort condition, print the indicated error message */
++void puma_acpi_pmc2atom_ipc(struct puma_acpi_data *data, unsigned int event)
++{
++   unsigned int out_value;
++
++   puma_acpi_pmc_ipc(PUMA_READ_PMC_IPC, 0, &out_value);
++   if(PUMA_PMC_IPC_GET_CMD(out_value) == PUMA_PMC_ABORT_MSG) { 
++      switch(out_value & PUMA_PMC_IPC_PAYLOAD_MASK) {
++         case PUMA_PMC_ABORT_CONDITION1:
++            pr_err("Puma ACPI ERROR: PMC exited because ILB interrupt is present and CPU is going to exit C7\n");
++            break;
++         case PUMA_PMC_ABORT_CONDITION2:
++            pr_err("Puma ACPI ERROR: PMC exited because current Cstate < 6\n");
++            break;
++         case PUMA_PMC_ABORT_CONDITION3:
++            pr_err("Puma ACPI ERROR: PMC exited because PLLs are still locked\n");
++            break;
++         default:   
++            pr_err("Puma ACPI ERROR invalid event %d msg\n", event);
++      }
++   } else {
++      pr_err("Puma ACPI ERROR invalid event %d\n", event);
++   }
++}
++
++/* puma_acpi_event_handler() - Handle the ACPI events and change the state of the system if needed */
++void puma_acpi_event_handler(struct puma_acpi_data *data)
++{
++   unsigned int event;
++   unsigned int out_value;
++
++   while(kfifo_get(&data->notify_fifo, &event)) {
++      pr_debug("Puma ACPI state %d notify type %d before event %d handling\n", data->current_state, data->notify_state_type, event);
++      switch(event) {
++         case PUMA_ACPI_NOTIFY_ACTIVE_ON_AC:
++            if(data->current_state == PUMA_ACPI_STATE_BBU) {
++               data->current_state = PUMA_ACPI_STATE_ACTIVE;
++               data->notify_state_type = PUMA_ACPI_NOTIFY_ACTIVE_ON_AC;
++            } else if ((data->current_state == PUMA_ACPI_STATE_STANDBY) || (data->current_state == PUMA_ACPI_STATE_DEEP_STANDBY)) {
++               data->on_bat_during_standby = false;   
++               acpi_bus_generate_netlink_event(data->acpi_dev->pnp.device_class, dev_name(&data->acpi_dev->dev), PUMA_ACPI_NOTIFY_PWR_STAT_CNG_DURING_SB, false);
++            }
++            break;
++         case PUMA_ACPI_NOTIFY_ACTIVE_ON_BATTERY:   
++            if(data->current_state == PUMA_ACPI_STATE_ACTIVE) {
++               data->current_state = PUMA_ACPI_STATE_BBU;
++               data->notify_state_type = PUMA_ACPI_NOTIFY_ACTIVE_ON_BATTERY;
++            } else if ((data->current_state == PUMA_ACPI_STATE_STANDBY) || (data->current_state == PUMA_ACPI_STATE_DEEP_STANDBY)) {
++               data->on_bat_during_standby = true;  
++               acpi_bus_generate_netlink_event(data->acpi_dev->pnp.device_class, dev_name(&data->acpi_dev->dev), PUMA_ACPI_NOTIFY_PWR_STAT_CNG_DURING_SB, true);
++            }
++            break;
++         case PUMA_ACPI_NOTIFY_AC_SPIKE:
++            // check the current status of power
++            if(data->current_state != PUMA_ACPI_STATE_ACTIVE) {
++               pr_err("Puma ACPI invalid state %d for event %d\n", data->current_state, event);
++            }
++            break;
++         case PUMA_ACPI_NOTIFY_BATTERY_SPIKE:     
++            // check the current status of power
++            if(data->current_state != PUMA_ACPI_STATE_BBU) {
++               pr_err("Puma ACPI invalid state %d for event %d\n", data->current_state, event);
++            }
++            break;
++         case PUMA_ACPI_NOTIFY_PWR_BUTTON_PRS:
++            data->button_press_time = jiffies;
++            if((data->current_state != PUMA_ACPI_STATE_DEEP_STANDBY) && (data->timer_state == PUMA_ACPI_TIMER_NOT_STARTED)) {
++               if(data->current_state == PUMA_ACPI_STATE_STANDBY) {
++                  data->timer_state = PUMA_ACPI_TIMER_SB_THRS;
++                  data->led_blink_count = 0;
++               } else {
++                  data->timer_state = PUMA_ACPI_TIMER_STARTED;
++               }
++               data->timer.expires = data->button_press_time + msecs_to_jiffies(PUMA_ACPI_TIMER_THRS_SB);
++               data->timer.data = 0;
++               data->timer.function = puma_timer_notify;
++               add_timer(&data->timer);
++            }
++            break;
++         case PUMA_ACPI_NOTIFY_PWR_BUTTON_RLS:    
++            puma_acpi_button_release(data, event);        
++            break;
++         case PUMA_ACPI_NOTIFY_NETIP_REQUEST_RESET:
++            puma_acpi_get_data(data, "GRST", &out_value);
++            if(out_value == PUMA_ACPI_NETIP_REQUEST_RESET_WARM) {
++               reboot_type = BOOT_CF9;
++               reboot_mode = REBOOT_WARM;
++            } else if (out_value == PUMA_ACPI_NETIP_REQUEST_RESET_COLD) {           
++               reboot_type = BOOT_CF9;
++               reboot_mode = REBOOT_COLD;
++            }
++            acpi_bus_generate_netlink_event(data->acpi_dev->pnp.device_class, dev_name(&data->acpi_dev->dev), event, out_value);
++            break;
++         case PUMA_ACPI_NOTIFY_PLATFORM_RESOURCES_OFF: 
++            data->acpi_resource_indication = PUMA_ACPI_RESOURCE_OFF;
++            break;
++         case PUMA_ACPI_NOTIFY_PLATFORM_RESOURCES_ON: 
++            data->acpi_resource_indication = PUMA_ACPI_RESOURCE_ON;
++            break;
++         case PUMA_ACPI_NOTIFY_BATTERY_LOW:
++            acpi_bus_generate_netlink_event(data->acpi_dev->pnp.device_class, dev_name(&data->acpi_dev->dev), event, 0);
++            break;
++         case PUMA_ACPI_NOTIFY_PMC2ATOM_IPC:
++            puma_acpi_pmc2atom_ipc(data, event);
++            break;
++         case PUMA_ACPI_NOTIFY_NETIP_CONNECTED_IDLE:
++            puma_acpi_get_data(data, "GRCE", &out_value);
++            acpi_bus_generate_netlink_event(data->acpi_dev->pnp.device_class, dev_name(&data->acpi_dev->dev), event, out_value);
++            break;
++         default:
++            pr_err("Puma ACPI invalid event %d\n", event);
++      }
++      pr_debug("Puma ACPI state %d notify type %d after event %d handling\n", data->current_state, data->notify_state_type, event);
++   }
++}
++
++inline void puma_netip_event_handler(struct puma_acpi_data *data)
++{
++   data->netip_state = atomic_read(&puma_netip_state);
++}
++
++/* puma_timer_event_handler() - Manage the timer state based on the time lapsed */
++void puma_timer_event_handler(struct puma_acpi_data *data)
++{
++   pr_debug("Puma ACPI timer state %d before timer event handling, time lapsed from button press %u ms\n", data->timer_state, jiffies_to_msecs(jiffies - data->button_press_time));
++
++   switch(data->timer_state) {
++      case PUMA_ACPI_TIMER_NOT_STARTED:
++         break;
++      case PUMA_ACPI_TIMER_STARTED:
++         data->timer.expires = jiffies + msecs_to_jiffies(PUMA_ACPI_TIMER_LED_SB);
++         data->timer_state = PUMA_ACPI_TIMER_SB_THRS;
++         data->led_state = LED_OFF;
++         data->led_blink_count = 0;
++         puma_acpi_power_led(data);        
++         add_timer(&data->timer);
++         break;
++      case PUMA_ACPI_TIMER_SB_THRS:
++         data->timer.expires = jiffies + msecs_to_jiffies(PUMA_ACPI_TIMER_LED_SB);
++         data->timer_state = PUMA_ACPI_TIMER_SB_LED;
++         data->led_state ^= 1;
++         data->led_blink_count++;
++         puma_acpi_power_led(data);        
++         add_timer(&data->timer);
++         break;
++      case PUMA_ACPI_TIMER_SB_LED:
++         if (data->led_blink_count < 4) {
++            data->led_blink_count++;
++         } else {
++            data->timer_state = PUMA_ACPI_TIMER_DSB_THRS;
++            data->led_blink_count = 0;
++         }
++         data->timer.expires = jiffies + msecs_to_jiffies(PUMA_ACPI_TIMER_LED_SB);
++         data->led_state ^= 1;
++         puma_acpi_power_led(data);        
++         add_timer(&data->timer);
++         break;
++      case PUMA_ACPI_TIMER_DSB_THRS:
++         data->timer.expires = jiffies + msecs_to_jiffies(PUMA_ACPI_TIMER_LED_DSB);
++         data->timer_state = PUMA_ACPI_TIMER_DSB_LED;
++         data->led_state ^= 1;
++         data->led_blink_count++;
++         puma_acpi_power_led(data);        
++         add_timer(&data->timer);
++         break;
++      case PUMA_ACPI_TIMER_DSB_LED:
++         if (data->led_blink_count < 10) {
++            data->led_blink_count++;
++         } else {
++            data->timer_state = PUMA_ACPI_TIMER_STOPPED;
++         }
++         data->timer.expires = jiffies + msecs_to_jiffies(PUMA_ACPI_TIMER_LED_DSB);
++         data->led_state ^= 1;
++         puma_acpi_power_led(data);        
++         add_timer(&data->timer);
++         break;
++      case PUMA_ACPI_TIMER_STOPPED:
++         data->led_blink_count = 0;
++         break;
++      default:        
++         pr_err("Puma ACPI invalid timer state %d\n", data->timer_state);
++   }
++
++   pr_debug("Puma ACPI timer state %d LED state %d after timer event handling\n", data->timer_state, data->led_state);
++}
++
++/* puma_acpi_configure_pmic() - Configure the PMIC LPM mode based on the system state */
++int puma_acpi_configure_pmic(struct puma_acpi_data *data, int state)
++{
++   int ret = 0;
++   if(data->pmic_supported) {
++      if(data->pmic_type == PUMA7_ACPI_PMIC_ROHM) {
++         if((state < PUMA_ACPI_STATE_ACTIVE) || (state > PUMA_ACPI_STATE_DEEP_STANDBY)) {
++            pr_err("puma_acpi_configure_pmic %d invalid state\n", state);
++            ret = -EINVAL;
++         } else if((ret = regulator_set_mode(data->regulator, (1 << state))) != 0) {
++            pr_err("puma regulator_set_mode failed %d in state %d\n", ret, state);
++         }
++      }
++   }
++
++   return ret;
++}
++
++static inline void puma_acpi_update(struct puma_acpi_data *data, int led_state)
++{
++   if(data->notify_state_type) {
++      acpi_bus_generate_netlink_event(data->acpi_dev->pnp.device_class, dev_name(&data->acpi_dev->dev), data->notify_state_type, 0);
++      if((puma_acpi_configure_pmic(data, data->current_state)) != 0) {
++         pr_err("puma_acpi_configure_pmic failed\n");
++         PUMA_PRINT_STATE(data);
++      }
++      data->notify_state_type = 0;
++      data->led_state = led_state;
++      puma_acpi_power_led(data);        
++   }
++}
++
++/* puma_acpi_update_system() - Change the PMC state based on system, netip and resource state. 
++ * Also indicate the ACPID about the current state
++ */
++void puma_acpi_update_system(struct puma_acpi_data *data)
++{
++   unsigned int ipc_data;
++   int ret = 0;
++
++   pr_debug("Puma ACPI state %d Netip state %d PMC state %d Platform resource %d notify type %d before system update\n", 
++      data->current_state, data->netip_state, data->pmc_state, data->acpi_resource_indication, data->notify_state_type);
++   
++   switch(data->current_state) {
++      case PUMA_ACPI_STATE_ACTIVE:
++         if(data->notify_state_type) {
++            if((puma_acpi_configure_pmic(data, data->current_state)) != 0) {
++               pr_err("puma_acpi_configure_pmic failed\n");
++               PUMA_PRINT_STATE(data);
++            } else if ((puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_ATOM_USE_DEVICE_LTR, &ipc_data)) != 0) {
++               pr_err("puma_acpi_pmc_ipc PUMA_ATOM_USE_DEVICE_LTR failed\n");
++               PUMA_PRINT_STATE(data);
++            } else {
++               if(data->deepstandby2active) {
++                  ret = puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_SETPS_NETIP_ON, &ipc_data); 
++               } else {
++                  ret = puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_SETPS_ACTIVE, &ipc_data); 
++               }
++               if(ret == 0) {
++                  data->acpi_resource_indication = PUMA_ACPI_RESOURCE_ON;
++                  data->deepstandby2active = false;
++                  acpi_bus_generate_netlink_event(data->acpi_dev->pnp.device_class, dev_name(&data->acpi_dev->dev), data->notify_state_type, 0);
++                  data->notify_state_type = 0;
++                  data->pmc_state = PUMA_ACPI_STATE_ACTIVE;
++                  data->led_state = LED_ON;
++                  puma_acpi_power_led(data); 
++               } else {
++                  pr_err("puma_acpi_pmc_ipc SETPS ACTIVE failed\n");
++                  PUMA_PRINT_STATE(data);
++               }
++            }
++         }
++         break;
++      case PUMA_ACPI_STATE_BBU:
++      case PUMA_ACPI_STATE_STANDBY:
++         puma_acpi_update(data, LED_ON);
++         if((data->netip_state == data->current_state) && (data->acpi_resource_indication) && (data->pmc_state != data->current_state)) {
++            if(data->deepstandby2bbu) {
++               /* First move the PMC to NETIP ON state */
++               if ((ret = puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_ATOM_USE_DEVICE_LTR, &ipc_data)) != 0) {
++                  pr_err("puma_acpi_pmc_ipc PUMA_ATOM_USE_DEVICE_LTR failed\n");
++                  PUMA_PRINT_STATE(data);
++               } else if((ret = puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_SETPS_NETIP_ON, &ipc_data)) != 0) {
++                  pr_err("puma_acpi_pmc_ipc PUMA_ATOM_USE_DEVICE_LTR failed\n");
++                  PUMA_PRINT_STATE(data);               
++               }
++            }
++            if(ret == 0) {
++               if((puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_ATOM_OVERRIDE_LTR, &ipc_data)) != 0) {
++                  pr_err("puma_acpi_pmc_ipc PUMA_ATOM_OVERRIDE_LTR failed\n");
++                  PUMA_PRINT_STATE(data);
++               } else if ((puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_SETPS_LPM, &ipc_data)) != 0) {
++                  pr_err("puma_acpi_pmc_ipc PUMA_SETPS_LPM failed\n");
++                  PUMA_PRINT_STATE(data);
++               } else {
++                  data->pmc_state = data->current_state;
++                  data->deepstandby2bbu = false;
++               }
++            }
++         }
++         break;
++      case PUMA_ACPI_STATE_DEEP_STANDBY:
++         puma_acpi_update(data, LED_OFF);
++         if((data->netip_state == PUMA_ACPI_STATE_DEEP_STANDBY) && (data->acpi_resource_indication) && (data->pmc_state != data->current_state)) {
++            if((puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_ATOM_OVERRIDE_LTR, &ipc_data)) != 0) {
++               pr_err("puma_acpi_pmc_ipc PUMA_ATOM_OVERRIDE_LTR failed\n");
++               PUMA_PRINT_STATE(data);
++            } else if((puma_acpi_pmc_ipc(PUMA_WRITE_PMC_IPC, PUMA_SETPS_NETIP_OFF, &ipc_data)) != 0) {
++               pr_err("puma_acpi_pmc_ipc PUMA_SETPS_NETIP_OFF failed\n");
++               PUMA_PRINT_STATE(data);
++            } else {
++               data->pmc_state = data->current_state;
++            }
++         }
++         break;
++      default:
++         pr_err("Puma ACPI Invalid state %d\n", data->current_state);
++   }
++   pr_debug("Puma ACPI state %d Netip state %d PMC state %d Platform resource %d notify type %d after system update\n", 
++      data->current_state, data->netip_state, data->pmc_state, data->acpi_resource_indication, data->notify_state_type);
++}
++
++static int puma_acpi_task(void *data)
++{
++   struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
++   struct puma_acpi_data *acpi_data = data;
++   int acpi_event, netip_event, timer_event;
++   int ret;
++   
++   sched_setscheduler(current, SCHED_RR, &param);
++
++   allow_signal(SIGKILL);
++
++   // update the current state 
++   if(acpi_data->current_state == PUMA_ACPI_STATE_BBU) {
++      acpi_bus_generate_netlink_event(acpi_data->acpi_dev->pnp.device_class, dev_name(&acpi_data->acpi_dev->dev), PUMA_ACPI_NOTIFY_ACTIVE_ON_BATTERY, 0);
++   }
++   
++
++   pr_debug("Puma ACPI thread started (%d)\n", current->pid);
++      
++   for(;;) {
++      ret = wait_event_interruptible(puma_wait, puma_check_condition(&acpi_event, &netip_event, &timer_event));
++      if (ret < 0) {
++         pr_err("Wait returned %d, exiting Puma ACPI thread!\n", ret);
++         break;
++      }
++
++      if(timer_event) {
++         puma_timer_event_handler(acpi_data);
++      }
++      
++      if(acpi_event) { 
++         puma_acpi_event_handler(acpi_data);
++      }
++
++      if(netip_event) {
++         puma_netip_event_handler(acpi_data);
++      }
++
++      puma_acpi_update_system(acpi_data);
++   }
++
++   pr_debug("Puma ACPI thread exiting (%d)\n", current->pid);
++
++   module_put_and_exit(0);
++}
++
++static int puma_acpi_add(struct acpi_device *acpi_dev)
++{
++   struct puma_acpi_data *data;
++   struct task_struct *task;
++   int resource_index;
++	int ret;
++   unsigned int power_status;
++
++   data = kzalloc(sizeof(*data), GFP_KERNEL);
++   if (!data)
++      return -ENOMEM;
++
++   data->acpi_dev = acpi_dev;
++
++   ret = kfifo_alloc(&data->notify_fifo, PUMA_ACPI_FIFO_SIZE, GFP_KERNEL);
++   if (ret) {
++      pr_err("error kfifo_alloc %d\n", ret);
++      resource_index = PUMA_ACPI_DATA;
++      goto puma_acpi_add_error;
++   }
++
++   ret = puma_acpi_get_data(data, "GCSR", &power_status);
++   if(ret) {
++      pr_err("puma_acpi_get_data failed!\n");
++      resource_index = PUMA_ACPI_NOTIFY_FIFO;
++      goto puma_acpi_add_error;
++   }
++
++   if(power_status & PUMA_ACPI_POWER_LIVE_MASK) {
++      data->current_state = PUMA_ACPI_STATE_BBU;
++      data->netip_state = PUMA_ACPI_STATE_BBU;
++   } else {
++      data->current_state = PUMA_ACPI_STATE_ACTIVE;
++      data->netip_state = PUMA_ACPI_STATE_ACTIVE;
++   }
++
++   /* create debug attributes */
++   if(ret = sysfs_create_group(&acpi_dev->dev.kobj, &puma_acpi_attr_group)) {
++      pr_err("puma sysfs_create_group failed!\n");
++      resource_index = PUMA_ACPI_NOTIFY_FIFO;
++      goto puma_acpi_add_error;
++   }
++   
++   if((ret = puma_acpi_make_pmc_ipc_channel_operational()) < 0) {
++      pr_err("puma_acpi_make_pmc_ipc_channel_operational failed!\n");
++      resource_index = PUMA_ACPI_SYSFS;
++      goto puma_acpi_add_error;
++   }
++
++   init_waitqueue_head(&puma_wait);
++   init_timer(&data->timer);
++   data->timer_state = PUMA_ACPI_TIMER_NOT_STARTED;
++   data->pmc_state = PUMA_ACPI_STATE_ACTIVE;
++   data->regulator = regulator_get(&data->acpi_dev->dev, "PUMA7_ROHM");
++	if (!IS_ERR(data->regulator)) {  
++      data->pmic_supported = 1;
++      data->pmic_type = PUMA7_ACPI_PMIC_ROHM;
++   }
++   data->acpi_resource_indication = PUMA_ACPI_RESOURCE_ON;
++   data->notify_state_type = 0;
++   data->deepstandby2active = false;
++   data->deepstandby2bbu = false;
++   data->on_bat_during_standby = false;
++   acpi_dev->driver_data = data;
++
++   strcpy(data->name, "Puma_ACPI_Task");
++   task = kthread_run(puma_acpi_task, data, "%s", data->name);
++   if (task == NULL || IS_ERR(task)) {
++      pr_err("error kthread_run\n");
++      resource_index = PUMA_ACPI_SYSFS;
++      ret = -ENOMEM;
++      goto puma_acpi_add_error;
++   }
++
++   data->task = task;
++
++   pr_info("PUMA ACPI platform driver loaded!\n");
++   return 0;
++
++puma_acpi_add_error:
++   puma_acpi_free_resources(data, resource_index);
++
++   pr_err("Failed to load Puma ACPI platform driver!\n");
++   
++   return ret;
++}
++
++static int puma_acpi_remove(struct acpi_device *acpi_dev)
++{
++   struct puma_acpi_data *data = acpi_driver_data(acpi_dev);
++
++   if(&data->timer) {
++      del_timer_sync(&data->timer);
++   }
++   
++   if(data->task) {
++      kthread_stop(data->task);
++   }
++
++   sysfs_remove_group(&acpi_dev->dev.kobj, &puma_acpi_attr_group);
++   kfifo_free(&data->notify_fifo);
++   kfree(data);
++
++   return 0;
++}
++
++static const struct acpi_device_id puma_device_ids[] = {
++   {"INT34DB", 0},
++   {"", 0},
++};
++
++MODULE_DEVICE_TABLE(acpi, puma_device_ids);
++
++
++static struct acpi_driver puma_acpi_driver = {
++   .name    = "Puma ACPI driver",
++   .owner   = THIS_MODULE,
++   .ids     = puma_device_ids,
++   .flags   = ACPI_DRIVER_ALL_NOTIFY_EVENTS,
++   .ops = {
++      .add     = puma_acpi_add,
++      .remove  = puma_acpi_remove,
++      .notify  = puma_acpi_notify,
++   },
++};
++
++static int __init puma_acpi_init(void)
++{
++   int ret;
++
++   ret = acpi_bus_register_driver(&puma_acpi_driver);
++   if (ret) {
++      pr_err("Failed to register ACPI driver: %d\n", ret);
++   }
++
++   return ret;
++}
++
++static void __exit puma_acpi_exit(void)
++{
++   acpi_bus_unregister_driver(&puma_acpi_driver);
++}
++
++module_init(puma_acpi_init);
++module_exit(puma_acpi_exit);
++
++MODULE_AUTHOR("Vinay Patel");
++MODULE_DESCRIPTION("Puma Platform ACPI Driver");
++MODULE_LICENSE("GPL");
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -571,5 +571,13 @@ config REGULATOR_WM8994
+ 	  This driver provides support for the voltage regulators on the
+ 	  WM8994 CODEC.
+ 
++config REGULATOR_INT34D9
++	tristate "Puma7 Rohm PMIC"
++	default y
++	depends on I2C
++	help
++	  This driver controls a Puma7 Rohm voltage output
++	  regulator via I2C bus.
++
+ endif
+ 
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -76,5 +76,6 @@ obj-$(CONFIG_REGULATOR_WM831X) += wm831x
+ obj-$(CONFIG_REGULATOR_WM8350) += wm8350-regulator.o
+ obj-$(CONFIG_REGULATOR_WM8400) += wm8400-regulator.o
+ obj-$(CONFIG_REGULATOR_WM8994) += wm8994-regulator.o
++obj-$(CONFIG_REGULATOR_INT34D9) += int34d9-regulator.o
+ 
+ ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
+--- /dev/null
++++ b/drivers/regulator/int34d9-regulator.c
+@@ -0,0 +1,498 @@
++/*
++ * int34d9-regulator.c - Puma7 Rohm regulator driver
++ *
++ * Copyright (c) 2015, Intel Corporation.
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/i2c.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/mutex.h>
++#include <linux/gpio.h>
++#include <linux/acpi_gpio.h>
++#include <linux/regulator/int34d9-regulator.h>
++
++static DEFINE_MUTEX(puma7_rohm_mutex);
++
++static s32 puma7_rohm_pmic_write(struct puma7_rohm_pmic *pmic, u8 reg, u8 val)
++{
++   s32 ret_val;
++
++   mutex_lock(&puma7_rohm_mutex);
++
++   ret_val = i2c_smbus_write_byte_data(pmic->client, reg, val);
++      
++   mutex_unlock(&puma7_rohm_mutex);
++   
++   return ret_val;
++}
++
++static s32 puma7_rohm_pmic_read(struct puma7_rohm_pmic *pmic, u8 reg)
++{
++   s32 ret_val;
++
++   mutex_lock(&puma7_rohm_mutex);
++   
++   ret_val = i2c_smbus_read_byte_data(pmic->client, reg);
++
++   mutex_unlock(&puma7_rohm_mutex);
++
++   return ret_val;
++}
++
++static int puma7_rohm_regulator_is_enabled(struct regulator_dev *rdev)
++{
++   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
++   u32 mask = rdev->desc->enable_mask;
++   u8 reg = (u8)rdev->desc->enable_reg;
++   s32 reg_val;
++
++   reg_val = puma7_rohm_pmic_read(pmic, reg);
++   if(reg_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
++      return reg_val;
++   } 
++   
++   return ((reg_val & mask)? 0 : 1);
++}
++
++static s32 puma7_rohm_regulator_enable(struct regulator_dev *rdev)
++{
++   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
++   u32 mask = rdev->desc->enable_mask;
++   u8 reg = (u8)rdev->desc->enable_reg;
++   s32 reg_val;
++   s32 ret_val;
++
++   reg_val = puma7_rohm_pmic_read(pmic, reg);
++   if(reg_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
++      return reg_val;
++   } 
++
++   reg_val = reg_val & ~mask;
++
++   ret_val = puma7_rohm_pmic_write(pmic, reg, reg_val);
++   if(ret_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
++   }
++   
++   return ret_val;
++}
++
++static int puma7_rohm_regulator_disable(struct regulator_dev *rdev)
++{
++   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
++   u32 mask = rdev->desc->enable_mask;
++   u8 reg = (u8)rdev->desc->enable_reg;
++   s32 reg_val, ret_val;
++
++   reg_val = puma7_rohm_pmic_read(pmic, reg);
++   if(reg_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
++      return reg_val;
++   } 
++
++   reg_val = reg_val | mask;
++   
++   ret_val = puma7_rohm_pmic_write(pmic, reg, reg_val);
++   if(ret_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
++   }
++
++   return ret_val;
++}
++
++static int puma7_rohm_pmic_set_lpm_mode(struct regulator_dev *rdev, 
++                                          unsigned int mode)
++{
++   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
++   u8 reg_val;
++   s32 ret_val;
++
++	switch (mode) {
++   	case PUMA7_ROHM_PMIC_MODE_ACTIVE:
++   		reg_val = PUMA7_ROHM_LPM_CFG_ACTIVE;
++   		break;
++   	case PUMA7_ROHM_PMIC_MODE_BBU:
++   		reg_val = PUMA7_ROHM_LPM_CFG_BBU;
++   		break;
++   	case PUMA7_ROHM_PMIC_MODE_FAST_STANDBY:
++   		reg_val = PUMA7_ROHM_LPM_CFG_FAST_STANDBY;
++   		break;
++      case PUMA7_ROHM_PMIC_MODE_DEEP_STANDBY:
++         reg_val = PUMA7_ROHM_LPM_CFG_DEEP_STANDBY;
++         break;
++      default:
++         return -EINVAL;
++	}
++   
++   ret_val = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_LPMCTRL_REG, reg_val);
++   if(ret_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
++   }
++   
++   return ret_val;
++}
++
++static unsigned int puma7_rohm_pmic_get_lpm_mode(struct regulator_dev *rdev)
++{
++   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
++   s32 ret_val;
++   unsigned int mode = 0;
++   
++   ret_val = puma7_rohm_pmic_read(pmic, PUMA7_ROHM_PMIC_LPMCTRL_REG);
++   if(ret_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
++   } else {
++   	switch (ret_val) {
++      	case PUMA7_ROHM_LPM_CFG_BBU:
++      		mode = PUMA7_ROHM_PMIC_MODE_BBU;
++      		break;
++      	case PUMA7_ROHM_LPM_CFG_FAST_STANDBY:
++      		mode = PUMA7_ROHM_PMIC_MODE_FAST_STANDBY;
++      		break;
++         case PUMA7_ROHM_LPM_CFG_DEEP_STANDBY:
++            mode = PUMA7_ROHM_PMIC_MODE_DEEP_STANDBY;
++            break;
++         default:
++            mode = PUMA7_ROHM_PMIC_MODE_ACTIVE;
++   	}
++   }
++   
++   return mode;
++}
++
++
++static struct regulator_ops puma7_rohm_regulator_ops = {
++	.is_enabled = puma7_rohm_regulator_is_enabled,
++	.enable = puma7_rohm_regulator_enable,
++	.disable = puma7_rohm_regulator_disable,
++};
++
++static struct regulator_ops puma7_rohm_pmic_ops = {
++	.is_enabled = puma7_rohm_regulator_is_enabled,
++	.enable = puma7_rohm_regulator_enable,
++	.disable = puma7_rohm_regulator_disable,
++   .set_mode = puma7_rohm_pmic_set_lpm_mode,
++   .get_mode = puma7_rohm_pmic_get_lpm_mode,      
++};
++
++static const struct regulator_desc puma7_rohm_reg[] = {
++	{
++		.name = "VPLT_DCDC",
++		.id = PUMA7_ROHM_VPLT,
++		.ops = &puma7_rohm_regulator_ops,
++		.type = REGULATOR_VOLTAGE,
++		.owner = THIS_MODULE,
++		.enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++		.enable_mask = PUMA7_ROHM_VPLT_EN_MASK,
++	},
++	{
++		.name = "VCC0_VID_BUCK",
++		.id = PUMA7_ROHM_VCC0,
++		.ops = &puma7_rohm_regulator_ops,
++		.type = REGULATOR_VOLTAGE,
++		.owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_VCC0_EN_MASK,
++	},
++	{
++		.name = "V3P3_EXT_DCDC",
++		.id = PUMA7_ROHM_V3P3_EXT,
++		.ops = &puma7_rohm_regulator_ops,
++		.type = REGULATOR_VOLTAGE,
++		.owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_V3P3_EXT_EN_MASK,
++	},
++	{
++		.name = "VNN_VID_BUCK",
++		.id = PUMA7_ROHM_VNN,
++		.ops = &puma7_rohm_regulator_ops,
++		.type = REGULATOR_VOLTAGE,
++		.owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_VNN_EN_MASK,
++	},
++	{
++		.name = "V1P15_BUCK",
++		.id = PUMA7_ROHM_V1P15,
++		.ops = &puma7_rohm_regulator_ops,
++		.type = REGULATOR_VOLTAGE,
++		.owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_V1P15_EN_MASK,
++	},
++   {
++      .name = "V1P05A_BUCK",
++      .id = PUMA7_ROHM_V1P05A,
++      .ops = &puma7_rohm_regulator_ops,
++      .type = REGULATOR_VOLTAGE,
++      .owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_V1P05A_EN_MASK,
++   },
++   {
++      .name = "VDDQ_BUCK",
++      .id = PUMA7_ROHM_VDDQ,
++      .ops = &puma7_rohm_regulator_ops,
++      .type = REGULATOR_VOLTAGE,
++      .owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_VDDQ_EN_MASK,
++   },
++   {
++      .name = "V1P8A_BUCK",
++      .id = PUMA7_ROHM_V1P8A,
++      .ops = &puma7_rohm_regulator_ops,
++      .type = REGULATOR_VOLTAGE,
++      .owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_V1P8A_EN_MASK,
++   },
++   {
++      .name = "PUMA7_ROHM",
++      .id = PUMA7_ROHM,
++      .ops = &puma7_rohm_pmic_ops,
++      .type = REGULATOR_VOLTAGE,
++      .owner = THIS_MODULE,
++      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
++      .enable_mask = PUMA7_ROHM_EN_MASK,
++   },
++};
++
++int puma7_rohm_regulator_init(void *driver_data)
++{
++	struct puma7_rohm_pmic *pmic = driver_data;
++   static int num_subdev = 0;
++   struct puma7_rohm_subdev_data *sub = pmic->platform_data.subdevs;
++   int ret = 0;
++
++   sub = sub + num_subdev;
++   if(num_subdev < PUMA7_ROHM_SUPPLY_NUMBER) {
++      printk(KERN_INFO "Puma7 Rohm %s regulator %d initialised\n", sub->name, sub->id);
++      sub->regulator_data.constraints.always_on = 1;
++      if(sub->id == PUMA7_ROHM) {
++         sub->regulator_data.constraints.valid_modes_mask = ( PUMA7_ROHM_PMIC_MODE_ACTIVE |
++                                                              PUMA7_ROHM_PMIC_MODE_BBU |
++                                                              PUMA7_ROHM_PMIC_MODE_FAST_STANDBY |
++                                                              PUMA7_ROHM_PMIC_MODE_DEEP_STANDBY );
++         sub->regulator_data.constraints.valid_ops_mask = REGULATOR_CHANGE_MODE;
++      }
++      num_subdev++;
++   } else {
++      ret = -EINVAL;
++   }
++   
++   return ret;
++}
++
++/* PMIC interrupt handler */
++static irqreturn_t puma7_rohm_pmic_isr(int irq, void *data)
++{
++   struct puma7_rohm_pmic *pmic = data;
++   s32 pwr_src;
++   s32 reg_val;
++
++   reg_val = puma7_rohm_pmic_read(pmic, PUMA7_ROHM_PMIC_IRQLVL1_REG);
++   if(reg_val < 0) {
++      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
++      return IRQ_NONE;
++   } else if ( reg_val & PUMA7_ROHM_PMIC_IRQLVL1_THRM) {
++      acpi_bus_generate_netlink_event(ACPI_PUMA7_ROHM_CLASS, ACPI_PUMA7_ROHM_DEVICE_NAME, PUMA7_ROHM_THERMAL_NOTIFY_CRITICAL, 0);
++   
++      reg_val = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_THRMIRQ_REG, PUMA7_ROHM_PMIC_THRMIRQ_PMICHOT);
++      if (reg_val < 0) {
++         dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
++         return IRQ_NONE;
++      }
++   } else if ( reg_val & PUMA7_ROHM_PMIC_IRQLVL1_PWRSRC) {
++   
++      reg_val = puma7_rohm_pmic_read(pmic, PUMA7_ROHM_PMIC_SPWRSRC_REG);
++      if (reg_val < 0) {
++         dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
++         return IRQ_NONE;
++      }
++      pwr_src = (reg_val & PUMA7_ROHM_PMIC_SPWRSRC_SDCINDET) ? 1 : 0; // 0 = Disconnected   1 = Connected
++      acpi_bus_generate_netlink_event(ACPI_PUMA7_ROHM_CLASS, ACPI_PUMA7_ROHM_DEVICE_NAME, PUMA7_ROHM_BATTERY_NOTIFY_STATUS_CHANGE, pwr_src);
++   
++      reg_val = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_PWRSRCIRQ_REG, PUMA7_ROHM_PMIC_THRMIRQ_DCINDET);
++      if (reg_val < 0) {
++         dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
++         return IRQ_NONE;
++      }
++   }
++
++   return IRQ_HANDLED;
++}
++
++
++static int puma7_rohm_regulator_probe(struct i2c_client *client,
++				   const struct i2c_device_id *i2c_id)
++{
++	struct regulator_dev **rdev;
++	struct device *dev = &client->dev;
++	struct puma7_rohm_platform_data *pdata; 
++   struct puma7_rohm_subdev_data *sub;
++	struct regulator_config config = { };
++	struct puma7_rohm_pmic *pmic;
++	int i, ret = -EINVAL;
++	unsigned long driver_private_data;
++   unsigned int gpio_index;
++   struct acpi_gpio_info info;
++   
++	driver_private_data = i2c_id->driver_data;
++
++	pmic = devm_kzalloc(dev, sizeof(struct puma7_rohm_pmic) +
++			sizeof(struct regulator_dev *) * PUMA7_ROHM_SUPPLY_NUMBER,
++			GFP_KERNEL);
++	if (!pmic)
++		return -ENOMEM;
++
++	pmic->client = client;
++   pmic->handle = ACPI_HANDLE(dev);
++   
++   rdev = pmic->rdev;
++   pdata = &(pmic->platform_data);
++   
++   pdata->num_subdevs = PUMA7_ROHM_SUPPLY_NUMBER;
++   pdata->subdevs = devm_kzalloc(dev, sizeof(struct puma7_rohm_subdev_data) *
++						PUMA7_ROHM_SUPPLY_NUMBER, GFP_KERNEL);
++	if (!pdata->subdevs)
++		return -ENOMEM;
++   sub = pdata->subdevs;
++   for (i = 0; i < PUMA7_ROHM_SUPPLY_NUMBER; i++) {
++      sub->id = puma7_rohm_reg[i].id;
++      strcpy(sub->name, puma7_rohm_reg[i].name);
++      sub->regulator_data.regulator_init = puma7_rohm_regulator_init;
++      sub->regulator_data.driver_data =  sub;    
++      sub++;
++   }
++
++	/* Finally register regulators */
++	for (i = 0; i < pdata->num_subdevs; i++) {
++		config.dev = dev;
++		config.init_data = &(pdata->subdevs[i].regulator_data);
++		config.driver_data = pmic;
++
++		rdev[i] = regulator_register(&puma7_rohm_reg[i], &config);
++		if (IS_ERR(rdev[i])) {
++			ret = PTR_ERR(rdev[i]);
++			dev_err(&client->dev, "failed to register %s\n", puma7_rohm_reg[i].name);
++			goto err_unregister;
++		}
++	}
++
++	i2c_set_clientdata(client, pmic);
++
++   if ((gpio_index = acpi_get_gpio_by_index(&client->dev, 0,  &info)) < 0) {
++		dev_err(dev, "GPIO INT resource not found for PMIC device : %s\n", __func__);
++   } else if((ret = gpio_request(gpio_index, "PMIC")) != 0) {
++		dev_err(dev, "gpio_request failed for %d! : %s\n", gpio_index, __func__);
++   } else if ((ret = gpio_direction_input(gpio_index)) != 0) {
++		dev_err(dev, "gpio_direction_input failed for %d: %s\n", gpio_index, __func__);
++   } else {
++      client->irq = gpio_to_irq(gpio_index);
++   	ret = devm_request_threaded_irq(dev, client->irq, NULL,
++   					puma7_rohm_pmic_isr,
++   					IRQF_TRIGGER_RISING |
++   					IRQF_ONESHOT,
++   					ACPI_PUMA7_ROHM_DEVICE_NAME, pmic);
++   }
++
++   if (ret == 0) {  
++      /* configure the PMIC */
++      if((ret = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_LPMCTRL_REG, PUMA7_ROHM_LPM_CFG_ACTIVE)) < 0) {
++         dev_err(dev, "puma7_rohm_pmic_write failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_LPMCTRL_REG, __func__);
++      } else if((ret = puma7_rohm_pmic_read(pmic, PUMA7_ROHM_PMIC_LPMCTRL_REG)) != PUMA7_ROHM_LPM_CFG_ACTIVE) {
++         dev_err(dev, "puma7_rohm_pmic_read failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_LPMCTRL_REG, __func__);
++      } else if ((ret = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_MIRQLVL1_REG, ~(PUMA7_ROHM_PMIC_IRQLVL1_THRM | PUMA7_ROHM_PMIC_IRQLVL1_PWRSRC))) < 0) {
++         dev_err(dev, "puma7_rohm_pmic_write failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_MIRQLVL1_REG, __func__);
++      } else if ((ret = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_MTHRMIRQ_REG, ~(PUMA7_ROHM_PMIC_THRMIRQ_PMICHOT))) < 0) {
++         dev_err(dev, "puma7_rohm_pmic_write failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_MTHRMIRQ_REG, __func__);
++      } else if ((ret = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_MPWRSRCIRQS0_REG, ~(PUMA7_ROHM_PMIC_THRMIRQ_DCINDET))) < 0) {
++         dev_err(dev, "puma7_rohm_pmic_write failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_MPWRSRCIRQS0_REG, __func__);
++      } else {
++	      return 0;
++      }
++   }
++
++err_unregister:
++	while (--i >= 0)
++		regulator_unregister(rdev[i]);
++   
++return ret;
++   
++}
++
++static int puma7_rohm_regulator_remove(struct i2c_client *client)
++{
++	
++	struct puma7_rohm_pmic *pmic = i2c_get_clientdata(client);
++	int i;
++
++	for (i = 0; i < PUMA7_ROHM_SUPPLY_NUMBER; i++) {
++		regulator_unregister(pmic->rdev[i]);
++   }
++
++   gpio_free(client->irq);
++	return 0;
++}
++
++
++static const struct i2c_device_id puma7_rohm_id[] = {
++	{ .name = ACPI_PUMA7_ROHM_DEVICE_NAME, .driver_data = 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, puma7_rohm_id);
++
++
++static struct acpi_device_id puma7_rohm_acpi_match[] = {
++	{ ACPI_PUMA7_ROHM_DEVICE_NAME, 0},
++	{ },
++};
++MODULE_DEVICE_TABLE(acpi, puma7_rohm_acpi_match);
++
++static struct i2c_driver puma7_rohm_driver = {
++	.probe = puma7_rohm_regulator_probe,
++   .remove = puma7_rohm_regulator_remove,   
++	.driver		= {
++		.name	= ACPI_PUMA7_ROHM_DEVICE_NAME,
++		.owner	= THIS_MODULE,
++      .acpi_match_table = ACPI_PTR(puma7_rohm_acpi_match),
++	},
++	.id_table	= puma7_rohm_id,
++};
++
++static int __init puma7_rohm_init(void)
++{
++	return i2c_add_driver(&puma7_rohm_driver);
++}
++rootfs_initcall(puma7_rohm_init);
++
++static void __exit puma7_rohm_exit(void)
++{
++	i2c_del_driver(&puma7_rohm_driver);
++}
++module_exit(puma7_rohm_exit);
++
++/* Module information */
++MODULE_DESCRIPTION("PUMA7 ROHM voltage regulator driver");
++MODULE_AUTHOR("Vinay Patel");
++MODULE_LICENSE("GPL v2");
++
+--- /dev/null
++++ b/include/linux/regulator/int34d9-regulator.h
+@@ -0,0 +1,116 @@
++/*
++ * int34d9-regulator.h - Puma7 SoC ROHM PMIC Driver
++ *
++ * Copyright (C) 2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version
++ * 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * 
++ */
++
++#ifndef __LINUX_REGULATOR_INT34D9_H__
++#define __LINUX_REGULATOR_INT34D9_H__
++
++#include <linux/regulator/machine.h>
++#include <linux/regulator/driver.h>
++#include <linux/acpi.h>
++
++enum PUMA7_ROHM_REGULATOR_SUPPLIES {
++   PUMA7_ROHM_VPLT,  
++   PUMA7_ROHM_VCC0,  
++   PUMA7_ROHM_V3P3_EXT, 
++   PUMA7_ROHM_VNN,    
++   PUMA7_ROHM_V1P15,  
++   PUMA7_ROHM_V1P05A, 
++   PUMA7_ROHM_VDDQ,   
++   PUMA7_ROHM_V1P8A,  
++   PUMA7_ROHM,
++   PUMA7_ROHM_SUPPLY_NUMBER
++};
++
++#define PUMA7_ROHM_PMIC_MODE_ACTIVE          0x1
++#define PUMA7_ROHM_PMIC_MODE_BBU             0x2
++#define PUMA7_ROHM_PMIC_MODE_FAST_STANDBY    0x4
++#define PUMA7_ROHM_PMIC_MODE_DEEP_STANDBY    0x8
++
++#define PUMA7_ROHM_LPM_CFG_ACTIVE          0x0
++#define PUMA7_ROHM_LPM_CFG_BBU             0x19
++#define PUMA7_ROHM_LPM_CFG_FAST_STANDBY    0x1F
++#define PUMA7_ROHM_LPM_CFG_DEEP_STANDBY    0xFF
++
++#define PUMA7_ROHM_PMIC_LPMCTRL_REG       0x54
++#define PUMA7_ROHM_PMIC_IRQLVL1_REG       0x02
++#define PUMA7_ROHM_PMIC_IRQLVL1_THRM      0x02
++#define PUMA7_ROHM_PMIC_IRQLVL1_PWRSRC    0x01
++#define PUMA7_ROHM_PMIC_THRMIRQ_REG       0x05
++#define PUMA7_ROHM_PMIC_THRMIRQ_PMICHOT   0x01
++#define PUMA7_ROHM_PMIC_PWRSRCIRQ_REG     0x03
++#define PUMA7_ROHM_PMIC_THRMIRQ_DCINDET   0x02
++#define PUMA7_ROHM_PMIC_MIRQLVL1_REG      0x0E
++#define PUMA7_ROHM_PMIC_MTHRMIRQ_REG      0x12
++#define PUMA7_ROHM_PMIC_MPWRSRCIRQS0_REG  0x0F
++#define PUMA7_ROHM_PMIC_SPWRSRC_REG       0x1E
++#define PUMA7_ROHM_PMIC_SPWRSRC_SDCINDET  0x02
++
++
++#define PUMA7_ROHM_VPLT_EN_MASK        0x80  
++#define PUMA7_ROHM_VCC0_EN_MASK        0x40
++#define PUMA7_ROHM_V3P3_EXT_EN_MASK    0x20
++#define PUMA7_ROHM_VNN_EN_MASK         0x10
++#define PUMA7_ROHM_V1P15_EN_MASK       0x08
++#define PUMA7_ROHM_V1P05A_EN_MASK      0x04
++#define PUMA7_ROHM_VDDQ_EN_MASK        0x02
++#define PUMA7_ROHM_V1P8A_EN_MASK       0x01
++#define PUMA7_ROHM_EN_MASK             0xFF
++
++#define PUMA7_ROHM_THERMAL_NOTIFY_CRITICAL      0x90
++#define PUMA7_ROHM_BATTERY_NOTIFY_STATUS_CHANGE 0x82  
++#define ACPI_PUMA7_ROHM_CLASS       "regulator"
++#define ACPI_PUMA7_ROHM_DEVICE_NAME	"INT34D9"
++
++
++/**
++ * struct puma7_rohm_subdev_data - regulator subdev data
++ * @id: regulator id
++ * @name: name of regulator
++ * @regulator_data: regulator initialisation data
++ */
++struct puma7_rohm_subdev_data {
++   int         id;
++   const char name[40];
++   struct regulator_init_data regulator_data;
++};
++
++/**
++ * struct puma7_rohm_platform_data - platform data for PUMA7 ROHM PMIC
++ * @num_subdevs: total number of regulators
++ * @subdevs: pointer to regulatrs used
++ */
++struct puma7_rohm_platform_data {
++   int num_subdevs;
++   struct puma7_rohm_subdev_data *subdevs;
++};
++
++/**
++ * struct puma7_rohm_pmic - Puma7 Rohm PMIC device
++ * @client: points to i2c slave PMIC device
++ * @handle: handle to the ACPI PMIC device
++ * @pathname: name in ACPI namespace
++ * @platform_data: platform data for PUMA7 ROHM PMIC
++ * @rdev: points to regulator device within PMIC
++ */
++struct puma7_rohm_pmic {
++   struct i2c_client *client;
++   acpi_handle handle;
++   struct puma7_rohm_platform_data platform_data;
++   struct regulator_dev *rdev[];
++};
++ 
++#endif /* __LINUX_REGULATOR_INT34D9_H__ */

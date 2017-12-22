@@ -1,0 +1,1788 @@
+From 57fea0c96609685602d9bf8441859c1c71595f4c Mon Sep 17 00:00:00 2001
+From: Gerard Andre <gerard.andre@intel.com>
+Date: Wed, 11 Mar 2015 19:33:13 +0100
+Subject: [PATCH 132/441] Large HECI patchset from IMIN
+
+hid-sensor-hub driver refactored for better coding style compliance
+Added fw_status support
+Added batching/wake sensors support (experimental)
+Added support for flush-complete request
+Fixed HID wait
+PM callbacks moved from legacy way to struct device (fix for suspend/resume ISH lockup)
+Fixed sensor creation with data fields that have internal_index
+Added and exported error and stats counters
+Fixed access to wrong pointers in power-off path for pci-ish and hid-sensor-hub
+
+Change-Id: I526740d6ca6b59ce2a009115723ba23c9c147d64
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-25471
+Signed-off-by: Daniel Drubin <daniel.drubin@intel.com>
+Reviewed-on: https://android.intel.com:443/341102
+(cherry picked from commit 3076b9f05a28a5a1aa46c86fc9753b6c3a770ed9)
+---
+ drivers/hid/hid-sensor-hub.c         | 560 ++++++++++++++++++-----------------
+ drivers/misc/heci/client.c           |  32 +-
+ drivers/misc/heci/client.h           |   4 +
+ drivers/misc/heci/hbm.c              |  95 ++++++
+ drivers/misc/heci/hbm.h              |  35 +++
+ drivers/misc/heci/heci-api.c         |  29 +-
+ drivers/misc/heci/heci-api.h         |   3 +
+ drivers/misc/heci/heci-hid-client.c  |  38 ++-
+ drivers/misc/heci/heci-hid.c         |  17 +-
+ drivers/misc/heci/heci-hid.h         |   8 +
+ drivers/misc/heci/heci_dev.h         |   1 +
+ drivers/misc/heci/hw-ish.c           |  18 +-
+ drivers/misc/heci/hw-ish.h           |   3 +
+ drivers/misc/heci/init.c             |   3 +
+ drivers/misc/heci/pci-ish.c          | 181 ++++++++++-
+ drivers/misc/heci/platform-config.h  |   2 +-
+ drivers/misc/heci/senscol-core.c     | 116 +++++++-
+ include/linux/senscol/senscol-core.h |   8 +
+ 18 files changed, 843 insertions(+), 310 deletions(-)
+
+--- a/drivers/hid/hid-sensor-hub.c
++++ b/drivers/hid/hid-sensor-hub.c
+@@ -683,10 +683,62 @@ static int     hid_get_sample(struct sen
+ 	return	0;
+ }
+ 
++/* Check sensor is activated and in batch mode                  *
++ * property_power_state =       2       hid_usage 0x200319      *
++ * property_reporting_state =   2/5     hid_usage 0x200316      *
++ * property_report_interval !=  0       hid_usage 0x20030e      *
++ * property_report_interval_resolution != 0 hid_usage 0x20530e  *
++ * return value:        0 - sensor is not activated in batch    *
++ *                      1 - sensor is activated in batch        */
++static int      hid_batch_check(struct sensor_def *sensor)
++{
++	unsigned idx;
++	struct sensor_hub_data  *sd;
++	unsigned report_id;
++	struct hid_report *report;
++	int field_idx;
++	__s32 val;
++
++	idx = sensor->id >> 16 & 0xFFFF;
++	sd = get_sensor_hub_by_index(idx);
++	report_id = sensor->id & 0xFFFF;
++	report = sensor_hub_report(report_id, sd->hsdev->hdev,
++		HID_FEATURE_REPORT);
++
++	/* property_power_state */
++	field_idx = get_field_index(sd->hsdev->hdev, report_id, 0x200319,
++		HID_FEATURE_REPORT);
++	if (report->field[field_idx]->value[0] != 2)
++		return 0;
++
++	/* property_reporting_state */
++	field_idx = get_field_index(sd->hsdev->hdev, report_id, 0x200316,
++		HID_FEATURE_REPORT);
++	if (report->field[field_idx]->value[0] != 2 &&
++		report->field[field_idx]->value[0] != 5)
++		return 0;
++
++	/* property_report_interval */
++	field_idx = get_field_index(sd->hsdev->hdev, report_id, 0x20030e,
++		HID_FEATURE_REPORT);
++	if (report->field[field_idx]->value[0] == 0)
++		return 0;
++
++	/* property_report_interval_resolution */
++	field_idx = get_field_index(sd->hsdev->hdev, report_id, 0x20530e,
++		HID_FEATURE_REPORT);
++	if (report->field[field_idx]->value[0] == 0)
++		return 0;
++
++dev_err(NULL, "%s() sensor 0x%x is in batch mode\n", __func__, sensor->id);
++	return 1;
++}
++
+ struct senscol_impl	hid_senscol_impl = {
+ 	.get_sens_property = hid_get_sens_property,
+ 	.set_sens_property = hid_set_sens_property,
+-	.get_sample = hid_get_sample
++	.get_sample = hid_get_sample,
++	.batch_check = hid_batch_check
+ };
+ 
+ static int	is_sens_data_field(unsigned usage)
+@@ -872,6 +924,51 @@ static __u8 *sensor_hub_report_fixup(str
+ 	return rdesc;
+ }
+ 
++
++static int	fill_data_field(struct hid_field *field, unsigned usage,
++	int need_internal_index, int k, struct sensor_def *senscol_sensor)
++{
++	struct data_field	data_field;
++	char	*usage_name;
++	int	rv;
++
++	memset(&data_field, 0, sizeof(struct data_field));
++	usage_name = senscol_usage_to_name(usage & 0xFFFF);
++	if (usage_name)
++		data_field.name = need_internal_index ?
++			kasprintf(GFP_KERNEL, "%s_%d", usage_name, k) :
++			kasprintf(GFP_KERNEL, "%s", usage_name);
++	else {
++		data_field.name =
++			need_internal_index ?
++			kasprintf(GFP_KERNEL, "data-%X_%d", usage, k) :
++			kasprintf(GFP_KERNEL, "data-%X", usage);
++	}
++	if (!data_field.name)
++		return	-ENOMEM;
++
++	data_field.usage_id = usage;
++	data_field.is_numeric = (field->flags & HID_MAIN_ITEM_VARIABLE);
++	if (data_field.is_numeric) {
++		if (field->unit_exponent > 7 ||
++				field->unit_exponent < -8)
++			data_field.exp = 0xFF;
++		else if (field->unit_exponent >= 0)
++			data_field.exp = field->unit_exponent;
++		else
++			data_field.exp = 0x10 - field->unit_exponent;
++		data_field.unit = field->unit;
++	}
++
++	data_field.len = (field->report_size >> 3) * field->report_count;
++	rv = add_data_field(senscol_sensor, &data_field);
++	senscol_sensor->sample_size += (field->report_size >> 3) *
++		field->report_count;
++
++	return	rv;
++}
++
++
+ static int sensor_hub_probe(struct hid_device *hdev,
+ 				const struct hid_device_id *id)
+ {
+@@ -884,6 +981,9 @@ static int sensor_hub_probe(struct hid_d
+ 	struct hid_field *field, *feat_field;
+ 	int dev_cnt;
+ 	int	rv;
++	struct sensor_def	*senscol_sensor;
++	int	j;
++	const char	*usage_name;
+ 
+ 	sd = devm_kzalloc(&hdev->dev, sizeof(*sd), GFP_KERNEL);
+ 	if (!sd) {
+@@ -997,292 +1097,214 @@ static int sensor_hub_probe(struct hid_d
+ 		field = report->field[0];
+ 
+ 		if (report->maxfield && field &&
+-					field->physical) {
+-			if (is_supported(field->physical)) {
+-				name = kasprintf(GFP_KERNEL, "HID-SENSOR-%x",
+-						field->physical);
+-				if (name == NULL) {
+-					hid_err(hdev, "Failed MFD device name\n");
+-						ret = -ENOMEM;
+-						goto err_free_names;
+-				}
+-				sd->hid_sensor_hub_client_devs[
+-					sd->hid_sensor_client_cnt].id = PLATFORM_DEVID_AUTO;
+-				sd->hid_sensor_hub_client_devs[
+-					sd->hid_sensor_client_cnt].name = name;
+-				sd->hid_sensor_hub_client_devs[
+-					sd->hid_sensor_client_cnt].platform_data =
+-						sd->hsdev;
+-				sd->hid_sensor_hub_client_devs[
+-					sd->hid_sensor_client_cnt].pdata_size =
+-						sizeof(*sd->hsdev);
+-				hid_dbg(hdev, "Adding %s:%p\n", name, sd);
+-				sd->hid_sensor_client_cnt++;
++				field->physical &&
++				is_supported(field->physical)) {
++			name = kasprintf(GFP_KERNEL, "HID-SENSOR-%x",
++					field->physical);
++			if (name == NULL) {
++				hid_err(hdev, "Failed MFD device name\n");
++					ret = -ENOMEM;
++					goto err_free_names;
+ 			}
++			sd->hid_sensor_hub_client_devs[
++				sd->hid_sensor_client_cnt].id =
++					PLATFORM_DEVID_AUTO;
++			sd->hid_sensor_hub_client_devs[
++				sd->hid_sensor_client_cnt].name = name;
++			sd->hid_sensor_hub_client_devs[
++				sd->hid_sensor_client_cnt].platform_data =
++					sd->hsdev;
++			sd->hid_sensor_hub_client_devs[
++				sd->hid_sensor_client_cnt].pdata_size =
++					sizeof(*sd->hsdev);
++			hid_dbg(hdev, "Adding %s:%p\n", name, sd);
++			sd->hid_sensor_client_cnt++;
+ 		}
+ #if SENSCOL
+ 		/* Create senscol sensor from each report,
+ 		 * regardles of is_supported() */
+-		do {
+-			struct sensor_def	*senscol_sensor;
+-			int	j;
+-			const char	*usage_name;
+-
+-			senscol_sensor = alloc_senscol_sensor();
+-			if (!senscol_sensor) {
+-				dev_err(&hdev->dev,
+-					"%s(): failed to allocate sensor\n",
+-					__func__);
+-				break;
+-			}
+-			init_senscol_sensor(senscol_sensor);
+-			usage_name = senscol_usage_to_name(field->physical &
+-				0xFFFF);
+-			if (usage_name)
+-				senscol_sensor->name = kasprintf(GFP_KERNEL,
+-					"%s", usage_name);
+-			else
+-				senscol_sensor->name = kasprintf(GFP_KERNEL,
+-					"custom-%X", field->physical);
+-			if (!senscol_sensor->name) {
+-				dev_err(&hdev->dev,
+-					"%s(): failed to allocate name\n",
+-					__func__);
+-				kfree(senscol_sensor);
++		senscol_sensor = alloc_senscol_sensor();
++		if (!senscol_sensor) {
++			dev_err(&hdev->dev,
++				"%s(): failed to allocate sensor\n", __func__);
++			break;
++		}
++		init_senscol_sensor(senscol_sensor);
++		usage_name = senscol_usage_to_name(field->physical & 0xFFFF);
++		if (usage_name)
++			senscol_sensor->name = kasprintf(GFP_KERNEL,
++				"%s", usage_name);
++		else
++			senscol_sensor->name = kasprintf(GFP_KERNEL,
++				"custom-%X", field->physical);
++		if (!senscol_sensor->name) {
++			dev_err(&hdev->dev,
++				"%s(): failed to allocate name\n",
++				__func__);
++			kfree(senscol_sensor);
++			break;
++		}
++		senscol_sensor->usage_id = field->physical;
++		senscol_sensor->id = sd->sensor_hub_index << 16 |
++			report->id & 0xFFFF;
++		senscol_sensor->impl = &hid_senscol_impl;
++		senscol_sensor->sample_size = 0;
++
++		/* Add properties */
++		/* 1. find matching feature report */
++		list_for_each_entry(freport,
++				&feat_report_enum->report_list,
++				list) {
++			feat_field = freport->field[0];
++			if (freport->maxfield && feat_field &&
++					feat_field->physical &&
++					(feat_field->physical ==
++					senscol_sensor->usage_id))
+ 				break;
+-			}
+-			senscol_sensor->usage_id = field->physical;
+-			senscol_sensor->id = sd->sensor_hub_index << 16 |
+-				report->id & 0xFFFF;
+-			senscol_sensor->impl = &hid_senscol_impl;
+-			senscol_sensor->sample_size = 0;
+-
+-			/* Add properties */
+-			/* 1. find matching feature report */
+-			list_for_each_entry(freport,
+-					&feat_report_enum->report_list,
+-					list) {
+-				feat_field = freport->field[0];
+-				if (freport->maxfield && feat_field &&
+-						feat_field->physical &&
+-						(feat_field->physical ==
+-						senscol_sensor->usage_id))
+-					break;
+-			}
++		}
+ 
+-			/*2. dump each prop field */
+-			for (i = 0; i < freport->maxfield; ++i) {
+-				struct sens_property	prop_field;
++		/*2. dump each prop field */
++		for (i = 0; i < freport->maxfield; ++i) {
++			struct sens_property	prop_field;
+ 
+-				dev_dbg(&hdev->dev,
+-					"%d collection_index:%x hid:%x sz:%x ",
+-					i,
+-					freport->field[i]->usage->
+-						collection_index,
+-					freport->field[i]->usage->hid,
+-					freport->field[i]->report_size / 8);
+-
+-				dev_dbg(&hdev->dev, "report count: %u\n",
+-					freport->field[i]->report_count);
+-
+-				memset(&prop_field, 0,
+-					sizeof(struct sens_property));
+-				prop_field.usage_id =
+-					freport->field[i]->usage->hid;
+-				usage_name = senscol_usage_to_name(
+-					prop_field.usage_id & 0xFFFF);
+-				if (usage_name)
+-					prop_field.name = kasprintf(GFP_KERNEL,
++			dev_dbg(&hdev->dev,
++				"%d collection_index:%x hid:%x sz:%x ",
++				i,
++				freport->field[i]->usage->
++					collection_index,
++				freport->field[i]->usage->hid,
++				freport->field[i]->report_size / 8);
++
++			dev_dbg(&hdev->dev, "report count: %u\n",
++				freport->field[i]->report_count);
++
++			memset(&prop_field, 0,
++				sizeof(struct sens_property));
++			prop_field.usage_id =
++				freport->field[i]->usage->hid;
++			usage_name = senscol_usage_to_name(
++				prop_field.usage_id & 0xFFFF);
++			if (usage_name)
++				prop_field.name = kasprintf(GFP_KERNEL,
+ 						"%s", usage_name);
+-				/* there is  a special case when the property
+-				 * is related to specific data field/
+-				 * set of fields */
++			/* there is  a special case when the property
++			 * is related to specific data field/
++			 * set of fields */
++			else {
++				uint32_t modifier =
++					prop_field.usage_id & 0xF000;
++				uint32_t data_hid =
++					prop_field.usage_id & 0x0FFF;
++				usage_name = senscol_usage_to_name(
++					data_hid);
++				dev_dbg(&hdev->dev,
++					"%s(): DATANAME %s\n",
++					__func__, usage_name);
++				if (!usage_name)
++					prop_field.name =
++						kasprintf(GFP_KERNEL,
++						"unknown-%X",
++						prop_field.usage_id);
+ 				else {
+-					uint32_t modifier =
+-						prop_field.usage_id & 0xF000;
+-					uint32_t data_hid =
+-						prop_field.usage_id & 0x0FFF;
+-					usage_name = senscol_usage_to_name(
+-						data_hid);
++					const char *modif_name =
++						senscol_get_modifier(modifier);
+ 					dev_dbg(&hdev->dev,
+-						"%s(): DATANAME %s\n",
+-						__func__, usage_name);
+-					if (!usage_name)
+-						prop_field.name =
+-							kasprintf(GFP_KERNEL,
+-							"unknown-%X",
+-							prop_field.usage_id);
+-					else {
+-						const char *modif_name =
+-							senscol_get_modifier(
+-								modifier);
+-						dev_dbg(&hdev->dev,
+-							"%s(): MODIFNAME %s\n",
+-							__func__, modif_name);
+-						prop_field.name =
+-							kasprintf(GFP_KERNEL,
+-							"%s_%s", usage_name,
+-							modif_name);
+-					}
++						"%s(): MODIFNAME %s\n",
++						__func__, modif_name);
++					prop_field.name =
++						kasprintf(GFP_KERNEL,
++						"%s_%s", usage_name,
++						modif_name);
+ 				}
+-				prop_field.is_numeric =
+-					(freport->field[i]->flags &
+-					HID_MAIN_ITEM_VARIABLE) &&
+-					(!hid_is_string_property(
+-					prop_field.usage_id));
+-
+-				rv = add_sens_property(senscol_sensor,
+-					&prop_field);
+-				dev_dbg(&hdev->dev, "%s(): ", __func__);
+-				dev_dbg(&hdev->dev, "adding prop %s %s %d\n",
+-					prop_field.name, "returned",  rv);
+-
+-
+ 			}
++			prop_field.is_numeric =
++				(freport->field[i]->flags &
++				HID_MAIN_ITEM_VARIABLE) &&
++				(!hid_is_string_property(
++				prop_field.usage_id));
++
++			rv = add_sens_property(senscol_sensor,
++				&prop_field);
++			dev_dbg(&hdev->dev, "%s(): ", __func__);
++			dev_dbg(&hdev->dev, "adding prop %s %s %d\n",
++				prop_field.name, "returned",  rv);
+ 
+-			/* Add data fields; Dump fields in this report.
+-			`maxfield' is upper-bound NON-INCLUSIVE */
+-			for (j = 0; j < report->maxfield; ++j) {
+-				int	k;
+-				bool need_internal_index = false;
+ 
+-				dev_dbg(&hdev->dev, "%s(): ", __func__);
+-				dev_dbg(&hdev->dev,
+-					"%s=%d %s=%08X %s=%08X %s=%u %s=%u ",
+-					"field", j,
+-					"physical",  report->field[j]->physical,
+-					"logical", report->field[j]->logical,
+-					"maxusage", report->field[j]->maxusage,
+-					"report_type",
+-					report->field[j]->report_type);
+-				dev_dbg(&hdev->dev, "%s=%u %s=%d %s=%d %s=%d ",
+-					"report_size",
+-					report->field[j]->report_size >> 3,
+-					"logic_min",
+-					report->field[j]->logical_minimum,
+-					"logic_max",
+-					report->field[j]->logical_maximum,
+-					"phys_min",
+-					report->field[j]->physical_minimum);
+-				dev_dbg(&hdev->dev, "%s=%d %s=%d %s=%u %s=%d\n",
+-					"phys_max",
+-					report->field[j]->physical_maximum,
+-					"exp",
+-					report->field[j]->unit_exponent,
+-					"unit",
+-					report->field[j]->unit,
+-					"report_count",
+-					report->field[j]->report_count);
+-				dev_dbg(&hdev->dev, "%s(): usages --\n",
+-					__func__);
+-
+-				if (report->field[j]->report_count > 1) {
+-					int instancesCnt = 0;
+-for (k = 0; k < report->field[j]->maxusage; ++k)
+-	if (is_sens_data_field(report->field[j]->usage[k].hid & 0xFFFF))
+-							instancesCnt++;
+-
+-					if (instancesCnt > 1)
+-						need_internal_index = true;
+-				}
++		}
+ 
+-				for (k = 0; k < report->field[j]->maxusage;
+-						++k) {
+-					dev_dbg(&hdev->dev,
+-					"	%s(): usage:%d hid=%08X\n",
+-						__func__, k,
+-						report->field[j]->usage[k].hid);
+-
+-					/* Add data fields */
+-					if (is_sens_data_field(report->
+-							field[j]->usage[k].hid &
+-							0xFFFF)) {
+-						struct data_field data_field;
+-
+-						memset(&data_field, 0, sizeof(
+-							struct data_field));
+-
+-						usage_name =
+-							senscol_usage_to_name(
+-							report->field[j]->
+-							usage[k].hid & 0xFFFF);
+-if (usage_name)
+-							data_field.name =
+-							need_internal_index ?
+-							kasprintf(GFP_KERNEL,
+-							"%s_%d", usage_name,
+-							k) : kasprintf(
+-							GFP_KERNEL, "%s",
+-							usage_name);
+-else {
+-							data_field.name =
+-							need_internal_index ?
+-							kasprintf(GFP_KERNEL,
+-							"data-%X_%d",
+-							report->field[j]->
+-							usage[k].hid, k) :
+-							kasprintf(GFP_KERNEL,
+-							"data-%X", report->
+-							field[j]->usage[k].hid);
+-}
+-if (!data_field.name) {
+-							dev_err(&hdev->dev,
+-	"%s(): Failed to allocated data field for usage %08X\n", __func__,
+-							report->field[j]->
+-							usage[k].hid);
+-							continue;
+-}
++		/* Add data fields; Dump fields in this report.
++		`maxfield' is upper-bound NON-INCLUSIVE */
++		for (j = 0; j < report->maxfield; ++j) {
++			int	k;
++			bool need_internal_index = false;
+ 
+-						data_field.usage_id = report->
+-							field[j]->usage[k].hid;
+-						data_field.is_numeric =
+-							(report->field[j]->
+-							flags &
+-							HID_MAIN_ITEM_VARIABLE);
+-if (data_field.is_numeric) {
+-	if (report->field[j]->unit_exponent > 7 || report->
+-								field[j]->
+-								unit_exponent <
+-									-8)
+-								data_field.exp =
+-									0xFF;
+-	else if (report->field[j]->unit_exponent >= 0)
+-								data_field.exp =
+-								report->
+-								field[j]->
+-								unit_exponent;
+-	else
+-								data_field.exp =
+-								0x10 - report->
+-								field[j]->
+-								unit_exponent;
+-							data_field.unit =
+-								report->
+-								field[j]->
+-								unit;
+-}
++			dev_dbg(&hdev->dev, "%s(): ", __func__);
++			dev_dbg(&hdev->dev,
++				"%s=%d %s=%08X %s=%08X %s=%u %s=%u ",
++				"field", j,
++				"physical",  report->field[j]->physical,
++				"logical", report->field[j]->logical,
++				"maxusage", report->field[j]->maxusage,
++				"report_type",
++				report->field[j]->report_type);
++			dev_dbg(&hdev->dev, "%s=%u %s=%d %s=%d %s=%d ",
++				"report_size",
++				report->field[j]->report_size >> 3,
++				"logic_min",
++				report->field[j]->logical_minimum,
++				"logic_max",
++				report->field[j]->logical_maximum,
++				"phys_min",
++				report->field[j]->physical_minimum);
++			dev_dbg(&hdev->dev, "%s=%d %s=%d %s=%u %s=%d\n",
++				"phys_max",
++				report->field[j]->physical_maximum,
++				"exp",
++				report->field[j]->unit_exponent,
++				"unit",
++				report->field[j]->unit,
++				"report_count",
++				report->field[j]->report_count);
++			dev_dbg(&hdev->dev, "%s(): usages --\n",
++				__func__);
++
++			if (report->field[j]->report_count > 1) {
++				int instances_cnt = 0;
++				for (k = 0; k < report->field[j]->maxusage; ++k)
++					if (is_sens_data_field(
++						report->field[j]->usage[k].hid &
++							0xFFFF))
++						instances_cnt++;
+ 
+-						data_field.len =
+-							(report->field[j]->
+-							report_size >> 3) *
+-							report->field[j]->
+-							report_count;
+-						rv = add_data_field(
+-							senscol_sensor,
+-							&data_field);
+-						senscol_sensor->sample_size +=
+-							report->field[j]->
+-							report_size >> 3;
+-					}
+-				}
++				if (instances_cnt > 1)
++					need_internal_index = true;
+ 			}
+ 
+-			/* Add senscol_sensor */
+-			rv = add_senscol_sensor(senscol_sensor);
++			field = report->field[j];
+ 			dev_dbg(&hdev->dev,
+-				"%s(): add_senscol_sensor() returned %d\n",
+-				__func__, rv);
+-		} while (0);
++				"	%s(): usage:%d hid=%08X\n",
++				__func__, k,
++				field->usage[0].hid);
++
++			/* Add data field */
++			if (is_sens_data_field(field->usage[0].hid & 0xFFFF)) {
++				rv = fill_data_field(field,
++					field->usage[0].hid,
++					need_internal_index, 0,
++					senscol_sensor);
++				if (rv == -ENOMEM)
++					dev_err(&hdev->dev,
++			"%s(): Failed to allocated data field for usage %08X\n",
++						__func__,
++						field->usage[0].hid);
++			}
++		}
++
++		/* Add senscol_sensor */
++		rv = add_senscol_sensor(senscol_sensor);
++		dev_dbg(&hdev->dev,
++			"%s(): add_senscol_sensor() returned %d\n",
++			__func__, rv);
+ #endif
+ 	}
+ #if IIO
+@@ -1313,6 +1335,12 @@ static void sensor_hub_remove(struct hid
+ 	unsigned long flags;
+ 	int i;
+ 
++	for (i = 0; i < sensor_hub_count; ++i)
++		if (hid_sensor_hubs[i] == hdev) {
++			hid_sensor_hubs[i] = NULL;
++			break;
++		}
++
+ 	hid_dbg(hdev, " hardware removed\n");
+ 	hid_hw_close(hdev);
+ 	hid_hw_stop(hdev);
+--- a/drivers/misc/heci/client.c
++++ b/drivers/misc/heci/client.c
+@@ -629,7 +629,11 @@ int heci_cl_connect(struct heci_cl *cl)
+ 	if (rets)
+ 		goto	out;
+ 
+-	heci_cl_device_bind(cl);
++	rets = heci_cl_device_bind(cl);
++	if (rets) {
++		heci_cl_disconnect(cl);
++		goto    out;
++	}
+ 
+ 	rets = heci_cl_alloc_rx_ring(cl);
+ 	if (rets) {
+@@ -835,18 +839,24 @@ int heci_cl_send(struct heci_cl *cl, u8
+ 
+ 	dev->print_log(dev, KERN_ALERT "%s(): cl && cl->dev OK\n", __func__);
+ 
+-	if (cl->state != HECI_CL_CONNECTED)
++	if (cl->state != HECI_CL_CONNECTED) {
++		++cl->err_send_msg;
+ 		return -EPIPE;
++	}
+ 	dev->print_log(dev, KERN_ALERT "%s(): cl->state is HECI_CL_CONNECTED\n", __func__);
+ 
+-	if (dev->dev_state != HECI_DEV_ENABLED)
++	if (dev->dev_state != HECI_DEV_ENABLED) {
++		++cl->err_send_msg;
+ 		return -ENODEV;
++	}
+ 	dev->print_log(dev, KERN_ALERT "%s(): dev->dev_state is HECI_DEV_ENABLED\n", __func__);
+ 
+ 	/* Check if we have an ME client device */
+ 	id = heci_me_cl_by_id(dev, cl->me_client_id);
+-	if (id < 0)
++	if (id < 0) {
++		++cl->err_send_msg;
+ 		return -ENOENT;
++	}
+ 	dev->print_log(dev, KERN_ALERT "%s(): have ME client device, id=%d\n", __func__, id);
+ 
+ 	if (length > dev->me_clients[id].props.max_msg_length) {
+@@ -858,12 +868,16 @@ int heci_cl_send(struct heci_cl *cl, u8
+ 			int	preview_len = dev->me_clients[id].props.dma_hdr_len & 0x7F;
+ 
+ 			/* DMA max msg size is 1M */
+-			if (length > host_dma_buf_size)
++			if (length > host_dma_buf_size) {
++				++cl->err_send_msg;
+ 				return	-EMSGSIZE;
++			}
+ 
+ 			/* Client for some reason specified props.dma_hdr_len > 12, mistake? */
+-			if (preview_len > 12)
++			if (preview_len > 12) {
++				++cl->err_send_msg;
+ 				return	-EINVAL;
++			}
+ 
+ 			/* If previous DMA transfer is in progress, go to sleep */
+ 			wait_event(dev->wait_dma_ready, dma_ready);
+@@ -879,11 +893,15 @@ int heci_cl_send(struct heci_cl *cl, u8
+ 			heci_dma_request_msg.reserved2 = 0;
+ 			memcpy(heci_dma_request_msg.msg_preview, buf, preview_len);
+ 			heci_write_message(dev, &hdr, (uint8_t *)&heci_dma_request_msg);
+-		} else
++		} else {
++			++cl->err_send_msg;
+ 			return -EINVAL;		/* -EMSGSIZE? */
++		}
+ 	}
+ 
++	/* No free bufs */
+ 	if (list_empty(&cl->tx_free_list.list)) {
++		++cl->err_send_msg;
+ 		return	-ENOMEM;
+ 	}
+ 	dev->print_log(dev, KERN_ALERT "%s(): have client TX free bufs\n", __func__);
+--- a/drivers/misc/heci/client.h
++++ b/drivers/misc/heci/client.h
+@@ -83,6 +83,10 @@ struct heci_cl {
+ 
+ 	/* wait queue for connect and disconnect response from FW */
+ 	wait_queue_head_t wait_ctrl_res;
++
++	/* Error stats */
++	unsigned	err_send_msg;
++	unsigned	err_send_fc;
+ };
+ 
+ int heci_me_cl_by_uuid(const struct heci_device *dev, const uuid_le *cuuid);
+--- a/drivers/misc/heci/hbm.c
++++ b/drivers/misc/heci/hbm.c
+@@ -331,6 +331,8 @@ dev->print_log(dev, "%s(): send flow_con
+ 	if (!rv) {
+ dev->print_log(dev, "%s(): ++cl->out_flow_ctrl_creds\n", __func__);
+ 		++cl->out_flow_ctrl_creds;
++	} else {
++		++cl->err_send_fc;
+ 	}
+ 	return	rv;
+ }
+@@ -792,3 +794,96 @@ eoi:
+ }
+ EXPORT_SYMBOL(recv_hbm);
+ 
++/* Suspend and resume notification*/
++
++/*
++ *      Receive and process HECI fixed client messages
++ *
++ *      (!) ISR context
++ */
++void recv_fixed_cl_msg(struct heci_device *dev, struct heci_msg_hdr *heci_hdr)
++{
++	uint8_t rd_msg_buf[HECI_RD_MSG_BUF_SIZE];
++
++	dev->print_log(dev,
++		"%s() got fixed client msg. sending client: %d\n",
++		__func__, heci_hdr->me_addr);
++	dev->ops->read(dev, rd_msg_buf, heci_hdr->length);
++	if (heci_hdr->me_addr == HECI_SYSTEM_STATE_CLIENT_ADDR) {
++		struct ish_system_states_header *msg_hdr =
++			(struct ish_system_states_header *)rd_msg_buf;
++		if (msg_hdr->cmd == SYSTEM_STATE_SUBSCRIBE)
++			send_resume(dev);       /* if FW request arrived here,
++						the system is not suspended */
++		else
++			dev_err(&dev->pdev->dev, "unknown fixed client msg\n");
++	}
++}
++EXPORT_SYMBOL(recv_fixed_cl_msg);
++
++static inline void fix_cl_hdr(struct heci_msg_hdr *hdr, size_t length,
++	u8 cl_addr)
++{
++	hdr->host_addr = 0;
++	hdr->me_addr = cl_addr;
++	hdr->length = length;
++	hdr->msg_complete = 1;
++	hdr->reserved = 0;
++}
++
++/*Global var for suspend & resume*/
++u32 current_state = 0;
++u32 supported_states = 0 | SUSPEND_STATE_BIT;
++
++void send_suspend(struct heci_device *dev)
++{
++	struct heci_msg_hdr     heci_hdr;
++	struct ish_system_states_status state_status_msg;
++	const size_t len = sizeof(struct ish_system_states_status);
++
++	fix_cl_hdr(&heci_hdr, len, HECI_SYSTEM_STATE_CLIENT_ADDR);
++
++	memset(&state_status_msg, 0, len);
++	state_status_msg.hdr.cmd = SYSTEM_STATE_STATUS;
++	state_status_msg.supported_states = supported_states;
++	current_state |= SUSPEND_STATE_BIT;
++	dev->print_log(dev, "%s() sends SUSPEND notification\n", __func__);
++	state_status_msg.states_status = current_state;
++
++	heci_write_message(dev, &heci_hdr, &state_status_msg);
++}
++EXPORT_SYMBOL(send_suspend);
++
++void send_resume(struct heci_device *dev)
++{
++	struct heci_msg_hdr     heci_hdr;
++	struct ish_system_states_status state_status_msg;
++	const size_t len = sizeof(struct ish_system_states_status);
++
++	fix_cl_hdr(&heci_hdr, len, HECI_SYSTEM_STATE_CLIENT_ADDR);
++
++	memset(&state_status_msg, 0, len);
++	state_status_msg.hdr.cmd = SYSTEM_STATE_STATUS;
++	state_status_msg.supported_states = supported_states;
++	current_state &= ~SUSPEND_STATE_BIT;
++	dev->print_log(dev, "%s() sends RESUME notification\n", __func__);
++	state_status_msg.states_status = current_state;
++
++	heci_write_message(dev, &heci_hdr, &state_status_msg);
++}
++EXPORT_SYMBOL(send_resume);
++
++void query_subscribers(struct heci_device *dev)
++{
++	struct heci_msg_hdr     heci_hdr;
++	struct ish_system_states_query_subscribers query_subscribers_msg;
++	const size_t len = sizeof(struct ish_system_states_query_subscribers);
++
++	fix_cl_hdr(&heci_hdr, len, HECI_SYSTEM_STATE_CLIENT_ADDR);
++
++	memset(&query_subscribers_msg, 0, len);
++	query_subscribers_msg.hdr.cmd = SYSTEM_STATE_QUERY_SUBSCRIBERS;
++
++	heci_write_message(dev, &heci_hdr, &query_subscribers_msg);
++}
++
+--- a/drivers/misc/heci/hbm.h
++++ b/drivers/misc/heci/hbm.h
+@@ -321,5 +321,40 @@ int heci_hbm_cl_connect_req(struct heci_
+ void heci_hbm_enum_clients_req(struct heci_device *dev);
+ void	recv_hbm(struct heci_device *dev, struct heci_msg_hdr *heci_hdr);
+ 
++/* Suspend and resume notification*/
++#define HECI_SYSTEM_STATE_CLIENT_ADDR 13
++
++#define SYSTEM_STATE_SUBSCRIBE                  0x1
++#define SYSTEM_STATE_STATUS                     0x2
++#define SYSTEM_STATE_QUERY_SUBSCRIBERS          0x3
++
++#define SUSPEND_STATE_BIT       (1<<1) /*indicates suspend and resume states*/
++
++struct ish_system_states_header {
++	u32 cmd;
++	u32 cmd_status;  /*responses will have this set*/
++} __packed;
++
++struct ish_system_states_subscribe {
++	struct ish_system_states_header hdr;
++	u32 states;
++} __packed;
++
++struct ish_system_states_status {
++	struct ish_system_states_header hdr;
++	u32 supported_states;
++	u32 states_status;
++} __packed;
++
++struct ish_system_states_query_subscribers {
++	struct ish_system_states_header hdr;
++} __packed;
++
++void send_suspend(struct heci_device *dev);
++void send_resume(struct heci_device *dev);
++void query_subscribers(struct heci_device *dev);
++
++void recv_fixed_cl_msg(struct heci_device *dev, struct heci_msg_hdr *heci_hdr);
++
+ #endif /* _HECI_HBM_H_ */
+ 
+--- a/drivers/misc/heci/heci-api.c
++++ b/drivers/misc/heci/heci-api.c
+@@ -329,8 +329,20 @@ dev->print_log(dev, "%s(): +++\n", __fun
+ 		goto out;
+ 	}
+ 
++	if (cl->state != HECI_CL_CONNECTED) {
++		dev_err(&dev->pdev->dev, "host client = %d,  is not connected to ME client = %d",
++			cl->host_client_id, cl->me_client_id);
++		rets = -ENODEV;
++		goto out;
++	}
++
++	if (length <= 0) {
++		rets = -EMSGSIZE;
++		goto out;
++	}
++
+ 	/* FIXME: check for DMA size for clients that accept DMA transfers */
+-	if (length > cl->device->fw_client->props.max_msg_length || length <= 0) {
++	if (length > cl->device->fw_client->props.max_msg_length) {
+ 		/* If the client supports DMA, try to use it */
+ 		if (!(host_dma_enabled && cl->device->fw_client->props.dma_hdr_len & HECI_CLIENT_DMA_ENABLED)) {
+ 			rets = -EMSGSIZE;
+@@ -338,13 +350,6 @@ dev->print_log(dev, "%s(): +++\n", __fun
+ 		}
+ 	}
+ 
+-	if (cl->state != HECI_CL_CONNECTED) {
+-		dev_err(&dev->pdev->dev, "host client = %d,  is not connected to ME client = %d",
+-			cl->host_client_id, cl->me_client_id);
+-		rets = -ENODEV;
+-		goto out;
+-	}
+-
+ 	write_buf = kmalloc(length, GFP_KERNEL);
+ 	if (!write_buf) {
+ 		dev_err(&dev->pdev->dev, "write buffer allocation failed\n");
+@@ -462,6 +467,7 @@ static long heci_ioctl(struct file *file
+ 	struct heci_connect_client_data *connect_data = NULL;
+ 	int rets;
+ 	unsigned	ring_size;
++	char fw_stat_buf[20];
+ 
+ 	dev = cl->dev;
+ 	dev_dbg(&dev->pdev->dev, "IOCTL cmd = 0x%x", cmd);
+@@ -526,6 +532,13 @@ err:
+ 		return	0;
+ 	}
+ 
++	if (cmd == IOCTL_GET_FW_STATUS) {
++		sprintf(fw_stat_buf, "%08X\n", dev->ops->get_fw_status(dev));
++		copy_to_user((char __user *)data, fw_stat_buf,
++			strlen(fw_stat_buf));
++		return strlen(fw_stat_buf);
++	}
++
+ 	if (cmd != IOCTL_HECI_CONNECT_CLIENT)
+ 		return -EINVAL;
+ 
+--- a/drivers/misc/heci/heci-api.h
++++ b/drivers/misc/heci/heci-api.h
+@@ -90,6 +90,9 @@
+ #define IOCTL_HECI_SET_RX_FIFO_SIZE	_IOWR('H', 0x02, long)
+ #define IOCTL_HECI_SET_TX_FIFO_SIZE	_IOWR('H', 0x03, long)
+ 
++/* Get FW status */
++#define IOCTL_GET_FW_STATUS             _IO('H', 0x04)
++
+ /*
+  * Intel HECI client information struct
+  */
+--- a/drivers/misc/heci/heci-hid-client.c
++++ b/drivers/misc/heci/heci-hid-client.c
+@@ -58,17 +58,19 @@ int	report_descr_size[MAX_HID_DEVICES];
+ struct hid_device	*hid_sensor_hubs[MAX_HID_DEVICES];
+ 
+ static wait_queue_head_t	init_wait;
++wait_queue_head_t	heci_hid_wait;
+ 
++/*flush notification*/
++void (*flush_cb)(void);
+ 
+ /*********** Locally redirect ISH_DBG_PRINT **************/
+ void g_ish_print_log(char *format, ...);
+ /*********************************************************/
+ 
+-
+ /* HECI client driver structures and API for bus interface */
+ void	process_recv(void *recv_buf, size_t data_len)
+ {
+-	struct hostif_msg	*recv_msg = (struct hostif_msg *)recv_buf;
++	struct hostif_msg	*recv_msg;
+ 	unsigned char	*payload;
+ 	/*size_t	size;*/
+ 	struct device_info	*dev_info;
+@@ -94,6 +96,7 @@ void	process_recv(void *recv_buf, size_t
+ 	may_send = 0;
+ 
+ 	do {
++		recv_msg = (struct hostif_msg *)(recv_buf + cur_pos);
+ 		payload_len = recv_msg->hdr.size;
+ 
+ 		switch (recv_msg->hdr.command & CMD_MASK) {
+@@ -163,7 +166,11 @@ void	process_recv(void *recv_buf, size_t
+ 		case HOSTIF_GET_FEATURE_REPORT:
+ 			report_type = HID_FEATURE_REPORT;
+ 			ISH_DBG_PRINT(KERN_ALERT "[hid-ish]: %s(): received HOSTIF_GET_FEATURE_REPORT\n", __func__);
++			g_ish_print_log(
++				"%s() received HOSTIF_GET_FEATURE_REPORT\n",
++				__func__);
+ 			ISH_DBG_PRINT(KERN_ALERT "[hid-ish]: %s(): dump Get Feature Result\n", __func__);
++			flush_cb(); /*each "GET_FEATURE_REPORT" ends a batch*/
+ 			goto	do_get_report;
+ 
+ 		case HOSTIF_GET_INPUT_REPORT:
+@@ -183,12 +190,22 @@ do_get_report:
+ 						hid_input_report(hid_sensor_hubs[i], report_type, payload, payload_len, 0);
+ 						break;
+ 					}
++			ISH_DBG_PRINT(KERN_ALERT
++				"%s(): received input report, upstreaming\n",
++				__func__);
+ 			get_report_done = 1;
++			if (waitqueue_active(&heci_hid_wait))
++				wake_up(&heci_hid_wait);
+ 			break;
+ 
+ 		case HOSTIF_SET_FEATURE_REPORT:
+ 			ISH_DBG_PRINT(KERN_ALERT "[hid-ish]: %s(): HOSTIF_SET_FEATURE_REPORT returned status=%02X\n", __func__, recv_msg->hdr.status);
++			ISH_DBG_PRINT(KERN_ALERT
++				"%s(): received feature report, upstreaming\n",
++				__func__);
+ 			get_report_done = 1;
++			if (waitqueue_active(&heci_hid_wait))
++				wake_up(&heci_hid_wait);
+ 			break;
+ 
+ 		case HOSTIF_PUBLISH_INPUT_REPORT:
+@@ -224,9 +241,16 @@ do_get_report:
+ 				ISH_DBG_PRINT(KERN_ALERT "\n");
+ 
+ 				for (i = 0; i < num_hid_devices; ++i)
+-					if (recv_msg->hdr.device_id == hid_devices[i].dev_id)
+-						if (hid_sensor_hubs[i] != NULL)
+-							hid_input_report(hid_sensor_hubs[i], report_type, payload, payload_len, 0);
++					if (recv_msg->hdr.device_id ==
++							hid_devices[i].dev_id &&
++							hid_sensor_hubs[i] !=
++							NULL) {
++						hid_input_report(
++							hid_sensor_hubs[i],
++							report_type,
++							payload, payload_len,
++							0);
++					}
+ 
+ 				reports += sizeof(uint16_t) + report_len;
+ 			}
+@@ -286,7 +310,7 @@ void hid_heci_set_feature(struct hid_dev
+ 	msg->hdr.command = HOSTIF_SET_FEATURE_REPORT;
+ 	for (i = 0; i < num_hid_devices; ++i)
+ 		if (hid == hid_sensor_hubs[i]) {
+-			msg->hdr.device_id = hid_devices[i].dev_id; /* FIXME- temporary when single collection exists, then has to be part of hid_device custom fields */
++			msg->hdr.device_id = hid_devices[i].dev_id;
+ 			break;
+ 		}
+ 	if (i == num_hid_devices)
+@@ -483,6 +507,7 @@ g_ish_print_log(KERN_ALERT "[hid-ish]: h
+ 	num_hid_devices = hid_dev_count;
+ 	printk(KERN_ALERT "[hid-ish]: enum_devices_done OK, num_hid_devices=%d\n", num_hid_devices);
+ 
++
+ 	for (i = 0; i < num_hid_devices /*hid_dev_count*/; ++i) {
+ 		cur_hid_dev = i;
+ 
+@@ -565,6 +590,7 @@ static int __init ish_init(void)
+ /*return 0;*/
+ /*----------------------*/
+ 	init_waitqueue_head(&init_wait);
++	init_waitqueue_head(&heci_hid_wait);
+ 
+ 	/* Register HECI client device driver - ISS */
+ 	rv = heci_cl_driver_register(&hid_heci_cl_driver);
+--- a/drivers/misc/heci/heci-hid.c
++++ b/drivers/misc/heci/heci-hid.c
+@@ -128,14 +128,20 @@ static int heci_hid_hidinput_input_event
+ 
+ static int heci_wait_for_response(struct hid_device *hid)
+ {
+-	get_report_done = 0;
++	ISH_DBG_PRINT(KERN_ALERT "%s() +++\n", __func__);
++#ifdef HOST_VIRTUALBOX
+ 	timed_wait_for_timeout(WAIT_FOR_SEND_SLICE, get_report_done, (10 * HZ));
++#else
++	if (!get_report_done)
++		wait_event_timeout(heci_hid_wait, get_report_done, 3 * HZ);
+ 
++#endif
+ 	if (!get_report_done) {
+-		dbg_hid("timeout waiting for heci device\n");
++		hid_err(hid, "timeout waiting for response from HECI device\n");
+ 		return -1;
+ 	}
+ 
++	get_report_done = 0;
+ 	return 0;
+ }
+ 
+@@ -226,3 +232,10 @@ void	heci_hid_remove(void)
+ 	ISH_DBG_PRINT(KERN_ALERT "[hid-heci]: %s():---\n", __func__);
+ }
+ 
++void register_flush_cb(void (*flush_cb_func)(void))
++{
++dev_err(NULL, "%s() +++\n", __func__);
++	flush_cb = flush_cb_func;
++}
++EXPORT_SYMBOL_GPL(register_flush_cb);
++
+--- a/drivers/misc/heci/heci-hid.h
++++ b/drivers/misc/heci/heci-hid.h
+@@ -21,6 +21,11 @@
+ 
+ const static	uuid_le ish_heci_guid = UUID_LE(0x33AECD58, 0xB679, 0x4E54, 0x9B, 0xD9, 0xA0, 0x4D, 0x34, 0xF0, 0xC2, 0x26);
+ 
++extern wait_queue_head_t	heci_hid_wait;
++
++/*flush notification*/
++extern void (*flush_cb)(void);
++
+ struct hostif_msg_hdr {
+ 	uint8_t	command;	/* Bit 7: is_response */
+ #define	CMD_MASK	0x7F
+@@ -97,5 +102,8 @@ struct report_list {
+ 
+ #include "utils.h"
+ 
++/*flush notification*/
++void register_flush_cb(void (*flush_cb_func)(void));
++
+ #endif	/* HECI_HID__H */
+ 
+--- a/drivers/misc/heci/heci_dev.h
++++ b/drivers/misc/heci/heci_dev.h
+@@ -131,6 +131,7 @@ struct heci_hw_ops {
+ 	int (*write)(struct heci_device *dev, struct heci_msg_hdr *hdr, unsigned char *buf);
+ 	int (*write_ex)(struct heci_device *dev, struct heci_msg_hdr *hdr, void *msg, void(*ipc_send_compl)(void *), void *ipc_send_compl_prm);
+ 	int (*read)(struct heci_device *dev, unsigned char *buffer, unsigned long buffer_length);
++	u32 (*get_fw_status)(struct heci_device *dev);
+ };
+ 
+ #define PRINT_BUFFER_SIZE 204800
+--- a/drivers/misc/heci/hw-ish.c
++++ b/drivers/misc/heci/hw-ish.c
+@@ -254,6 +254,7 @@ int write_ipc_from_queue(struct heci_dev
+ 	g_ish_print_log("%s(): +++\n", __func__);
+ 	if (!ish_is_input_ready(dev)) {
+ 		ISH_DBG_PRINT(KERN_ALERT "%s(): --- EBUSY\n", __func__);
++		g_ish_print_log(KERN_ALERT "%s(): --- EBUSY\n", __func__);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -387,6 +388,11 @@ static void	recv_ipc(struct heci_device
+ 
+ 	case MNG_RX_CMPL_INDICATION:
+ 		ISH_DBG_PRINT(KERN_ALERT "%s(): RX_COMPLETE -- IPC_REG_ISH2HOST_MSG[0] = %08X\n", __func__, ish_reg_read(dev, IPC_REG_ISH2HOST_MSG));
++		if (suspend_flag) {
++			suspend_flag = 0;
++			if (waitqueue_active(&suspend_wait))
++				wake_up(&suspend_wait);
++		}
+ 		write_ipc_from_queue(dev);
+ 		break;
+ 
+@@ -476,9 +482,16 @@ irqreturn_t ish_irq_handler(int irq, voi
+ 		recv_hbm(dev, heci_hdr);
+ 		goto	eoi;
+ 
++	/* HECI fixed-client message */
++	} else if (!heci_hdr->host_addr) {
++		g_ish_print_log("%s(): received HECI fixed client message\n",
++			__func__);
++		recv_fixed_cl_msg(dev, heci_hdr);
++		goto	eoi;
+ 	} else {
+ 		/* HECI client message */
+-		g_ish_print_log(KERN_ALERT "%s(): received HECI client message\n", __func__);
++		g_ish_print_log(KERN_ALERT
++			"%s(): received HECI client message\n", __func__);
+ 		recv_heci_cl_msg(dev, heci_hdr);
+ 		goto	eoi;
+ 	}
+@@ -680,7 +693,8 @@ static const struct heci_hw_ops ish_hw_o
+ 	.hw_start = ish_hw_start,
+ 	.read = ish_read,
+ 	.write = ish_write,
+-	.write_ex = ipc_send_heci_msg
++	.write_ex = ipc_send_heci_msg,
++	.get_fw_status = ish_read_fw_sts_reg
+ };
+ 
+ 
+--- a/drivers/misc/heci/hw-ish.h
++++ b/drivers/misc/heci/hw-ish.h
+@@ -20,6 +20,9 @@
+ #include "hw-ish-regs.h"
+ #include "heci_dev.h"
+ 
++extern int	suspend_flag;
++extern wait_queue_head_t	suspend_wait;
++
+ struct ipc_rst_payload_type {
+     u16            reset_id;
+     u16            reserved;
+--- a/drivers/misc/heci/init.c
++++ b/drivers/misc/heci/init.c
+@@ -153,6 +153,9 @@ reset_done:
+ 
+ 	dev_dbg(&dev->pdev->dev, "link layer has been established.\n");
+ 
++	/*suspend & resume notification - send QUERY_SUBSCRIBERS msg*/
++	query_subscribers(dev);
++
+ 	return 0;
+ err:
+ 	dev_err(&dev->pdev->dev, "link layer initialization failed.\n");
+--- a/drivers/misc/heci/pci-ish.c
++++ b/drivers/misc/heci/pci-ish.c
+@@ -34,8 +34,10 @@
+ #include <linux/jiffies.h>
+ #include <linux/interrupt.h>
+ #include <linux/workqueue.h>
++#include "client.h"
+ #include "heci_dev.h"
+ #include "hw-ish.h"
++#include "hbm.h"
+ #include "utils.h"
+ #include <linux/miscdevice.h>
+ 
+@@ -69,6 +71,10 @@ MODULE_DEVICE_TABLE(pci, ish_pci_tbl);
+ static DEFINE_MUTEX(heci_mutex);
+ struct workqueue_struct *workqueue_for_init;
+ 
++/*global variables for suspend*/
++int	suspend_flag = 0;
++wait_queue_head_t	suspend_wait;
++
+ #ifdef TIMER_POLLING
+ /*
+  * DD -- ISS timer-polling workaround for H-FPGA
+@@ -277,8 +283,13 @@ void	g_ish_print_log(char *fmt, ...)
+ {
+ 	char tmp_buf[1024];
+ 	va_list args;
+-	struct heci_device	*dev = pci_get_drvdata(heci_pci_device);
++	struct heci_device	*dev;
++
++	/* Fix for power-off path */
++	if (!heci_pci_device)
++		return;
+ 
++	dev = pci_get_drvdata(heci_pci_device);
+ 	va_start(args, fmt);
+ 	vsprintf(tmp_buf, fmt, args);
+ 	va_end(args);
+@@ -376,6 +387,18 @@ ssize_t show_flush(struct device *dev, s
+ 
+ ssize_t store_flush(struct device *dev, struct device_attribute *dev_attr, const char *buf, size_t count)
+ {
++	struct pci_dev *pdev;
++	struct heci_device *heci_dev;
++	unsigned long   flags;
++
++	pdev = container_of(dev, struct pci_dev, dev);
++	heci_dev = pci_get_drvdata(pdev);
++
++	if (!strncmp(buf, "empty", 5)) {
++		spin_lock_irqsave(&heci_dev->log_spinlock, flags);
++		heci_dev->log_tail = heci_dev->log_head;
++		spin_unlock_irqrestore(&heci_dev->log_spinlock, flags);
++	}
+ 	return count;
+ }
+ 
+@@ -395,6 +418,8 @@ ssize_t show_heci_dev_props(struct devic
+ 	struct pci_dev *pdev;
+ 	struct heci_device *heci_dev;
+ 	ssize_t	ret = -ENOENT;
++	unsigned	count;
++	unsigned long   flags, flags2;
+ 
+ 	pdev = container_of(dev, struct pci_dev, dev);
+ 	heci_dev = pci_get_drvdata(pdev);
+@@ -405,6 +430,94 @@ ssize_t show_heci_dev_props(struct devic
+ 	} else if (!strcmp(dev_attr->attr.name, "hbm_state")) {
+ 		sprintf(buf, "%u\n", (unsigned)heci_dev->hbm_state);
+ 		ret = strlen(buf);
++	} else if (!strcmp(dev_attr->attr.name, "fw_status")) {
++		sprintf(buf, "%08X\n", heci_dev->ops->get_fw_status(heci_dev));
++		ret = strlen(buf);
++	} else if (!strcmp(dev_attr->attr.name, "ipc_buf")) {
++		struct wr_msg_ctl_info *ipc_link, *ipc_link_next;
++
++		count = 0;
++		spin_lock_irqsave(&heci_dev->wr_processing_spinlock, flags);
++		list_for_each_entry_safe(ipc_link, ipc_link_next,
++			&heci_dev->wr_processing_list_head.link, link)
++			++count;
++		spin_unlock_irqrestore(&heci_dev->wr_processing_spinlock,
++			flags);
++		sprintf(buf, "outstanding %u messages\n", count);
++		ret = strlen(buf);
++	} else if (!strcmp(dev_attr->attr.name, "host_clients")) {
++		struct heci_cl *cl, *next;
++		static const char * const cl_states[] = {"initializing",
++			"connecting", "connected", "disconnecting",
++			"disconnected"};
++		struct heci_cl_rb	*rb, *next_rb;
++		struct heci_cl_tx_ring	*tx_rb, *next_tx_rb;
++
++		sprintf(buf, "Host clients:\n"
++				"------------\n");
++		spin_lock_irqsave(&heci_dev->device_lock, flags);
++		list_for_each_entry_safe(cl, next, &heci_dev->cl_list, link) {
++			sprintf(buf + strlen(buf), "id: %d\n",
++				cl->host_client_id);
++			sprintf(buf + strlen(buf), "state: %s\n",
++				cl->state < 0 || cl->state >
++					HECI_CL_DISCONNECTED ?
++					"unknown" : cl_states[cl->state]);
++			if (cl->state == HECI_CL_CONNECTED) {
++				sprintf(buf + strlen(buf),
++					"FW client id: %d\n",
++					cl->me_client_id);
++				sprintf(buf + strlen(buf), "RX ring size: %u\n",
++					cl->rx_ring_size);
++				sprintf(buf + strlen(buf), "TX ring size: %u\n",
++					cl->tx_ring_size);
++
++				count = 0;
++				spin_lock_irqsave(&cl->in_process_spinlock,
++					flags2);
++				list_for_each_entry_safe(rb, next_rb,
++						&cl->in_process_list.list, list)
++					++count;
++				spin_unlock_irqrestore(&cl->in_process_spinlock,
++					flags2);
++				sprintf(buf + strlen(buf), "RX in work: %u\n",
++					count);
++
++				count = 0;
++				spin_lock_irqsave(&cl->in_process_spinlock,
++					flags2);
++				list_for_each_entry_safe(rb, next_rb,
++						&cl->free_rb_list.list, list)
++					++count;
++				spin_unlock_irqrestore(&cl->in_process_spinlock,
++					flags2);
++				sprintf(buf + strlen(buf), "RX free: %u\n",
++					count);
++
++				count = 0;
++				list_for_each_entry_safe(tx_rb, next_tx_rb,
++						&cl->tx_list.list, list)
++					++count;
++				sprintf(buf + strlen(buf), "TX pending: %u\n",
++					count);
++				count = 0;
++				list_for_each_entry_safe(tx_rb, next_tx_rb,
++						&cl->tx_free_list.list, list)
++					++count;
++				sprintf(buf + strlen(buf), "TX free: %u\n",
++					count);
++				sprintf(buf + strlen(buf), "FC: %u\n",
++					(unsigned)cl->heci_flow_ctrl_creds);
++				sprintf(buf + strlen(buf), "out FC: %u\n",
++					(unsigned)cl->out_flow_ctrl_creds);
++				sprintf(buf + strlen(buf), "Err snd msg: %u\n",
++					(unsigned)cl->err_send_msg);
++				sprintf(buf + strlen(buf), "Err snd FC: %u\n",
++					(unsigned)cl->err_send_fc);
++			}
++		}
++		spin_unlock_irqrestore(&heci_dev->device_lock, flags);
++		ret = strlen(buf);
+ 	}
+ 
+ 	return	ret;
+@@ -433,6 +546,33 @@ static struct device_attribute hbm_state
+ 	.store = store_heci_dev_props
+ };
+ 
++static struct device_attribute fw_status_attr = {
++	.attr = {
++		.name = "fw_status",
++		.mode = (S_IWUSR | S_IRUGO)
++	},
++	.show = show_heci_dev_props,
++	.store = store_heci_dev_props
++};
++
++static struct device_attribute host_clients_attr = {
++	.attr = {
++		.name = "host_clients",
++		.mode = (S_IWUSR | S_IRUGO)
++	},
++	.show = show_heci_dev_props,
++	.store = store_heci_dev_props
++};
++
++static struct device_attribute ipc_buf_attr = {
++	.attr = {
++		.name = "ipc_buf",
++		.mode = (S_IWUSR | S_IRUGO)
++	},
++	.show = show_heci_dev_props,
++	.store = store_heci_dev_props
++};
++
+ /**********************************/
+ 
+ typedef struct {
+@@ -452,6 +592,9 @@ void workqueue_init_function(struct work
+ 
+ 	device_create_file(&dev->pdev->dev, &heci_dev_state_attr);
+ 	device_create_file(&dev->pdev->dev, &hbm_state_attr);
++	device_create_file(&dev->pdev->dev, &fw_status_attr);
++	device_create_file(&dev->pdev->dev, &host_clients_attr);
++	device_create_file(&dev->pdev->dev, &ipc_buf_attr);
+ 
+ #if ISH_LOG
+ 
+@@ -476,6 +619,7 @@ void workqueue_init_function(struct work
+ 		dev->pdev->revision);
+ 
+ #endif /*ISH_LOG*/
++	init_waitqueue_head(&suspend_wait);
+ 
+ 	mutex_lock(&heci_mutex);
+ 	if (heci_start(dev)) {
+@@ -691,24 +835,45 @@ static void ish_remove(struct pci_dev *p
+ 	pci_disable_device(pdev);
+ }
+ 
+-#define HECI_ISH_PM_OPS	(&intel_ish_pm)
+-
+-
+-static int intel_ish_suspend(struct device *dev)
++int ish_suspend(struct device *device)
+ {
++	struct pci_dev *pdev = to_pci_dev(device);
++	struct heci_device *dev = pci_get_drvdata(pdev);
++
++	/* If previous suspend hasn't been asnwered then ISH is likely dead,
++	don't attempt nested notification */
++	if (suspend_flag)
++		return	0;
++
++	suspend_flag = 1;
++	send_suspend(dev);
++
++	/* 250 ms should be likely enough for live ISH to flush all IPC buf */
++	if (suspend_flag)
++		wait_event_timeout(suspend_wait, !suspend_flag, HZ / 4);
+ 	return 0;
+ }
+ 
+-static int intel_ish_resume(struct device *dev)
++int ish_resume(struct device *device)
+ {
++	struct pci_dev *pdev = to_pci_dev(device);
++	struct heci_device *dev = pci_get_drvdata(pdev);
++	send_resume(dev);
+ 	return 0;
+ }
+ 
+-static const struct dev_pm_ops intel_ish_pm = {
+-	.suspend = intel_ish_suspend,
+-	.resume = intel_ish_resume,
++#ifdef CONFIG_PM
++static const struct dev_pm_ops ish_pm_ops = {
++	.suspend = ish_suspend,
++	.resume = ish_resume,
+ };
+ 
++#define HECI_ISH_PM_OPS	(&ish_pm_ops)
++#else
++#define HECI_ISH_PM_OPS	NULL
++#endif /* CONFIG_PM */
++
++
+ /*
+  *  PCI driver structure
+  */
+--- a/drivers/misc/heci/platform-config.h
++++ b/drivers/misc/heci/platform-config.h
+@@ -17,7 +17,7 @@
+ #define PLATFORM_CONFIG__H
+ 
+ /* Build ID string */
+-#define	BUILD_ID	"imin-0127-fixes-c0"
++#define	BUILD_ID	"imin-0133-fixes-batch-wake-hid-dbg"
+ 
+ #define	ISH_DEBUG	0
+ #if ISH_DEBUG
+--- a/drivers/misc/heci/senscol-core.c
++++ b/drivers/misc/heci/senscol-core.c
+@@ -25,7 +25,7 @@
+ #include <linux/poll.h>
+ #include <linux/sched.h>
+ #include <linux/wait.h>
+-
++#include "heci-hid.h"
+ 
+ /***** DEBUG *****/
+ void g_ish_print_log(char *format, ...);
+@@ -38,6 +38,8 @@ spinlock_t	senscol_lock;
+ spinlock_t	senscol_data_lock;
+ uint8_t	*senscol_data_buf;
+ unsigned	senscol_data_head, senscol_data_tail;
++int	flush_asked = 0;
++
+ 
+ static ssize_t	sc_data_show(struct kobject *kobj, struct attribute *attr, char *buf);
+ static ssize_t	sc_data_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t size);
+@@ -169,12 +171,18 @@ static struct attribute sc_sensdef_defat
+ 	.mode = (S_IRUGO)
+ };
+ 
++static struct attribute sc_sensdef_defattr_flush = {
++	.name = "flush",
++	.mode = (S_IRUGO)
++};
++
+ struct attribute	*sc_sensdef_defattrs[] = {
+ 	&sc_sensdef_defattr_name,
+ 	&sc_sensdef_defattr_type,
+ 	&sc_sensdef_defattr_id,
+ 	&sc_sensdef_defattr_usage_id,
+ 	&sc_sensdef_defattr_sample_size,
++	&sc_sensdef_defattr_flush,
+ 	NULL
+ };
+ 
+@@ -187,6 +195,8 @@ static ssize_t	sc_sensdef_show(struct ko
+ {
+ 	ssize_t	rv;
+ 	struct sensor_def	*sensdef;
++	char    tmp_buf[0x1000];
++	unsigned long flags;
+ 
+ 	ISH_DBG_PRINT(KERN_ALERT "[senscol]: %s(): +++ attr='%s'\n", __func__, attr->name);
+ 	sensdef = container_of(kobj, struct sensor_def, kobj);
+@@ -199,6 +209,27 @@ static ssize_t	sc_sensdef_show(struct ko
+ 		sprintf(buf, "%08X\n", sensdef->usage_id);
+ 	else if (!strcmp(attr->name, "name"))
+ 		sprintf(buf, "%s\n", sensdef->name);
++	else if (!strcmp(attr->name, "flush"))
++		/*if "sensdef" is activated in batch mode,
++		mark it as asking flush*/
++		if (sensdef->impl->batch_check(sensdef)) {
++			spin_lock_irqsave(&senscol_lock, flags);
++			flush_asked = 1;
++			sensdef->flush_req = 1;
++			spin_unlock_irqrestore(&senscol_lock, flags);
++			g_ish_print_log("%s() sensor 0x%x asked for flush\n",
++				 __func__, sensdef->id);
++			sensdef->impl->get_sens_property(sensdef,
++				sensdef->properties, tmp_buf, 0x1000);
++			sprintf(buf, "1\n");
++		} else {
++			uint32_t pseudo_event_id =
++				sensdef->id | PSEUSO_EVENT_BIT;
++			uint32_t pseudo_event_content = 0;
++			pseudo_event_content |= FLUSH_CMPL_BIT;
++			push_sample(pseudo_event_id, &pseudo_event_content);
++			sprintf(buf, "0\n");
++		}
+ 
+ 	rv = strlen(buf) + 1;
+ 	return	rv;
+@@ -376,13 +407,16 @@ static ssize_t	sc_sensprop_show(struct k
+ {
+ 	struct sens_property	*pfield;
+ 	struct sensor_def	*sensor;
++	int	rv;
+ 
+ 	/* We need "property_power_state" (=2), "property_reporting_state" (=2) and "property_report_interval" (in ms?) */
+ 	ISH_DBG_PRINT(KERN_ALERT "[senscol]: %s(): +++ attr='%s'\n", __func__, attr->name);
+ 	pfield = container_of(kobj, struct sens_property, kobj);
+ 	sensor = pfield->sensor;
+-	sensor->impl->get_sens_property(sensor, pfield, buf, 0x1000);
+ 
++	rv = sensor->impl->get_sens_property(sensor, pfield, buf, 0x1000);
++	if (rv)
++		return	rv;
+ 	return	strlen(buf);
+ }
+ 
+@@ -390,13 +424,16 @@ static ssize_t	sc_sensprop_store(struct
+ {
+ 	struct sens_property	*pfield;
+ 	struct sensor_def	*sensor;
++	int	rv;
+ 
+ 	/* TODO: stream down set property request and return size upon successful completion or error code */
+ 	ISH_DBG_PRINT(KERN_ALERT "[senscol]: %s(): +++ attr='%s' buf='%s' size=%u\n", __func__, attr->name, buf, (unsigned)size);
+ 	pfield = container_of(kobj, struct sens_property, kobj);
+ 	sensor = pfield->sensor;
+-	sensor->impl->set_sens_property(sensor, pfield, buf);
++	rv = sensor->impl->set_sens_property(sensor, pfield, buf);
+ 
++	if (rv)
++		return	rv;
+ 	return	size;
+ }
+ 
+@@ -519,6 +556,7 @@ int	add_senscol_sensor(struct sensor_def
+ 	char	sensor_name[256];	/* Enough for name "sensor_<NN>_def", if convention changes array size should be reviewed */
+ 	int	i;
+ 	int	rv;
++	int	j;
+ 
+ 	if (!sensor->name || !sensor->impl || !sensor->usage_id || !sensor->id)
+ 		return	-EINVAL;
+@@ -566,6 +604,7 @@ err_ret2:
+ 	rv = kobject_init_and_add(&sensor->props_kobj, &sc_subdir_kobj_type, &sensor->kobj, "properties");
+ 	if (rv) {
+ 		rv = -EFAULT;
++err_ret3:
+ 		kobject_put(&sensor->props_kobj);
+ 		kobject_del(&sensor->props_kobj);
+ 		goto	err_ret2;
+@@ -574,11 +613,27 @@ err_ret2:
+ 	/*
+ 	 * Create kobjects for data_fields
+ 	 */
+-
+ 	for (i = 0; i < sensor->num_data_fields; ++i) {
+ 		if (sensor->data_fields[i].name) {
+ 			/* Mark index */
+ 			sensor->data_fields[i].index = i;
++
++			/* If the name already appeared, append '#<index>' */
++			for (j = 0; j < i; ++j)
++				if (!strcmp(sensor->data_fields[i].name,
++						sensor->data_fields[j].name)) {
++					char *p = sensor->data_fields[i].name;
++					p = kasprintf(GFP_KERNEL,
++						"%s#%d", p, i);
++					if (!p) {
++						rv = -ENOMEM;
++						goto	err_ret3;
++					}
++					kfree(sensor->data_fields[i].name);
++					sensor->data_fields[i].name = p;
++					break;
++				}
++
+ 			rv = kobject_init_and_add(&sensor->data_fields[i].kobj, &sc_datafield_kobj_type, &sensor->data_fields_kobj, sensor->data_fields[i].name);
+ 			ISH_DBG_PRINT(KERN_ALERT "%s(): kobject_init_and_add() for data_field '%s' returned %d\n", __func__, sensor->data_fields[i].name, rv);
+ 		}
+@@ -684,15 +739,23 @@ int	push_sample(uint32_t id, void *sampl
+ 	unsigned long flags;
+ 	unsigned char	sample_buf[1024];
+ 	struct senscol_sample	*p_sample = (struct senscol_sample *)sample_buf;
++	struct sensor_def pseudo_event_sensor;
+ 
+ 	ISH_DBG_PRINT(KERN_ALERT "[senscol]: %s():+++\n", __func__);
++	g_ish_print_log("%s() DATA from sensor #%x\n", __func__, id);
+ 
+ 	if (!senscol_data_buf)
+ 		return	-ENOMEM;
+ 
+ 	ISH_DBG_PRINT(KERN_ALERT "[senscol]: %s(): senscol_data_buf=%p\n", __func__, senscol_data_buf);
+ 
+-	sensor = get_senscol_sensor_by_id(id);
++	if (id & PSEUSO_EVENT_BIT) {
++		pseudo_event_sensor.sample_size = sizeof(uint32_t) +
++			offsetof(struct senscol_sample, data);
++		sensor = &pseudo_event_sensor;
++	} else
++		sensor = get_senscol_sensor_by_id(id);
++
+ 	if (!sensor)
+ 		return	-ENODEV;
+ 
+@@ -736,10 +799,7 @@ int	push_sample(uint32_t id, void *sampl
+ 
+ 	/* Fire event through "data/event" */
+ 	ISH_DBG_PRINT(KERN_ALERT "[senscol] %s(): firing data-ready event senscol_data_head=%u senscol_data_tail=%u id=%08X sample_size=%u\n", __func__, senscol_data_head, senscol_data_tail, p_sample->id, sensor->sample_size);
+-	/***** DEBUG *****/
+-	g_ish_print_log(KERN_ALERT "[senscol] %s(): firing data-ready event senscol_data_head=%u senscol_data_tail=%u id=%08X sample_size=%u\n", __func__, senscol_data_head, senscol_data_tail, p_sample->id, sensor->sample_size);
+-	/*****************/
+-	/*sysfs_notify(&sc_data_kobj, NULL, "event");*/
++
+ 	if (waitqueue_active(&senscol_read_wait))
+ 		wake_up_interruptible(&senscol_read_wait);
+ 
+@@ -794,6 +854,39 @@ static unsigned int senscol_poll(struct
+ 	return	mask;
+ }
+ 
++/* flush callback */
++void senscol_flush_cb(void)
++{
++	struct sensor_def	*sens, *next;
++	unsigned long   flags;
++	uint32_t pseudo_event_id;
++	uint32_t pseudo_event_content = 0;
++
++	spin_lock_irqsave(&senscol_lock, flags);
++	if (!flush_asked) {
++		spin_unlock_irqrestore(&senscol_lock, flags);
++		return;
++	}
++
++	list_for_each_entry_safe(sens, next, &senscol_sensors_list, link) {
++		if (sens->flush_req) {
++			g_ish_print_log("%s() sensor 0x%x gets flush event\n",
++				__func__, sens->id);
++			sens->flush_req = 0;
++			pseudo_event_id = sens->id | PSEUSO_EVENT_BIT;
++			pseudo_event_content |= FLUSH_CMPL_BIT;
++
++			spin_unlock_irqrestore(&senscol_lock, flags);
++			push_sample(pseudo_event_id, &pseudo_event_content);
++			spin_lock_irqsave(&senscol_lock, flags);
++		}
++	}
++	flush_asked = 0;
++	spin_unlock_irqrestore(&senscol_lock, flags);
++	return;
++}
++
++
+ /*
+  * file operations structure will be used for heci char device.
+  */
+@@ -857,7 +950,10 @@ static int __init senscol_init(void)
+ 
+ 	rv = sysfs_create_bin_file(&sc_data_kobj, &sensors_data_binattr);
+ 	if (rv)
+-		ISH_DBG_PRINT(KERN_ERR "%s(): sysfs_create_bin_file() for 'sensors_data' returned %d\n", __func__, rv);
++		ISH_DBG_PRINT(KERN_ERR
++"%s(): sysfs_create_bin_file() for 'sensors_data' returned %d\n", __func__, rv);
++
++	register_flush_cb(senscol_flush_cb);
+ 
+ 	return	0;
+ }
+--- a/include/linux/senscol/senscol-core.h
++++ b/include/linux/senscol/senscol-core.h
+@@ -19,6 +19,9 @@
+ #include <linux/types.h>
+ #include <linux/kobject.h>
+ 
++#define	PSEUSO_EVENT_BIT	(1<<31)
++#define	FLUSH_CMPL_BIT		(1<<0)
++
+ struct data_field;
+ struct sens_property;
+ struct senscol_impl;
+@@ -38,6 +41,7 @@ struct sensor_def {
+ 	struct kobject	kobj;
+ 	struct kobject	data_fields_kobj;
+ 	struct kobject	props_kobj;
++	int     flush_req;
+ };
+ 
+ struct data_field {
+@@ -126,6 +130,10 @@ struct senscol_impl {
+ 
+ 	/* Get sample */
+ 	int	(*get_sample)(struct sensor_def *sensor, void *sample_buf, size_t sample_buf_size);
++
++	/* Check if sensor is activated in batch mode */
++	int	(*batch_check)(struct sensor_def *sensor);
++
+ 	struct list_head link;
+ };
+ 

@@ -1,0 +1,210 @@
+From 7196dcf5fcff321e0fb3642dd6868628d97ec43d Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Mon, 1 Aug 2016 12:40:55 +0300
+Subject: [PATCH 05/69] hostapd ltq bssm
+
+---
+ src/ap/ap_drv_ops.c          |  5 ++++-
+ src/ap/ap_drv_ops.h          |  4 +++-
+ src/ap/ieee802_11.c          | 31 ++++++++++++++++++++++++++-----
+ src/ap/sta_info.c            |  3 ++-
+ src/ap/sta_info.h            |  4 ++++
+ src/drivers/driver.h         |  2 ++
+ src/drivers/driver_nl80211.c |  7 +++++++
+ 7 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index 532b72f..c42a17d 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -364,7 +364,8 @@ int hostapd_sta_add(struct hostapd_data *hapd,
+ 		    const struct ieee80211_ht_capabilities *ht_capab,
+ 		    const struct ieee80211_vht_capabilities *vht_capab,
+ 		    u32 flags, u8 qosinfo, u8 vht_opmode, int supp_p2p_ps,
+-		    int set)
++		    int set, struct ieee80211_mgmt *last_assoc_req, 
++		    size_t last_assoc_req_len)
+ {
+ 	struct hostapd_sta_add_params params;
+ 
+@@ -388,6 +389,8 @@ int hostapd_sta_add(struct hostapd_data *hapd,
+ 	params.qosinfo = qosinfo;
+ 	params.support_p2p_ps = supp_p2p_ps;
+ 	params.set = set;
++	params.last_assoc_req = last_assoc_req;
++	params.last_assoc_req_len = last_assoc_req_len;
+ 	return hapd->driver->sta_add(hapd->drv_priv, &params);
+ }
+ 
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 6406d13..3cea827 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -15,6 +15,7 @@ struct wpa_driver_scan_params;
+ struct ieee80211_ht_capabilities;
+ struct ieee80211_vht_capabilities;
+ struct hostapd_freq_params;
++struct ieee80211_mgmt;
+ 
+ u32 hostapd_sta_flags_to_drv(u32 flags);
+ int hostapd_build_ap_extra_ies(struct hostapd_data *hapd,
+@@ -42,7 +43,8 @@ int hostapd_sta_add(struct hostapd_data *hapd,
+ 		    const struct ieee80211_ht_capabilities *ht_capab,
+ 		    const struct ieee80211_vht_capabilities *vht_capab,
+ 		    u32 flags, u8 qosinfo, u8 vht_opmode, int supp_p2p_ps,
+-		    int set);
++		    int set, struct ieee80211_mgmt *last_assoc_req,
++		    size_t last_assoc_req_len);
+ int hostapd_set_privacy(struct hostapd_data *hapd, int enabled);
+ int hostapd_set_generic_elem(struct hostapd_data *hapd, const u8 *elem,
+ 			     size_t elem_len);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 11f12f9..eb1818e 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -1278,7 +1278,7 @@ static void handle_auth(struct hostapd_data *hapd,
+ 				WLAN_STA_AUTHORIZED);
+ 
+ 		if (hostapd_sta_add(hapd, sta->addr, 0, 0, NULL, 0, 0,
+-				    NULL, NULL, sta->flags, 0, 0, 0, 0)) {
++				    NULL, NULL, sta->flags, 0, 0, 0, 0, NULL, 0)) {
+ 			hostapd_logger(hapd, sta->addr,
+ 				       HOSTAPD_MODULE_IEEE80211,
+ 				       HOSTAPD_LEVEL_NOTICE,
+@@ -1872,7 +1872,8 @@ static int add_associated_sta(struct hostapd_data *hapd,
+ 			    sta->flags & WLAN_STA_VHT ? &vht_cap : NULL,
+ 			    sta->flags | WLAN_STA_ASSOC, sta->qosinfo,
+ 			    sta->vht_opmode, sta->p2p_ie ? 1 : 0,
+-			    sta->added_unassoc)) {
++			    sta->added_unassoc, sta->last_assoc_req, 
++			    sta->last_assoc_req_len)) {
+ 		hostapd_logger(hapd, sta->addr,
+ 			       HOSTAPD_MODULE_IEEE80211, HOSTAPD_LEVEL_NOTICE,
+ 			       "Could not %s STA to kernel driver",
+@@ -1883,6 +1884,12 @@ static int add_associated_sta(struct hostapd_data *hapd,
+ 			sta->added_unassoc = 0;
+ 		}
+ 
++		/* Copy of the association request is not needed anymore */
++		if (sta->last_assoc_req) {
++			os_free(sta->last_assoc_req);
++			sta->last_assoc_req = NULL;
++		}
++		
+ 		return -1;
+ 	}
+ 
+@@ -2246,6 +2253,13 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	}
+ #endif /* CONFIG_IEEE80211W */
+ 
++	if (sta->last_assoc_req)
++		os_free(sta->last_assoc_req);
++	sta->last_assoc_req_len = len;
++	sta->last_assoc_req = os_malloc(len);
++	if (sta->last_assoc_req)
++		os_memcpy(sta->last_assoc_req, mgmt, len);
++
+ 	/* Make sure that the previously registered inactivity timer will not
+ 	 * remove the STA immediately. */
+ 	sta->timeout_next = STA_NULLFUNC;
+@@ -2814,7 +2828,7 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
+ 	}
+ 
+ 	if (status != WLAN_STATUS_SUCCESS)
+-		return;
++		goto fail;
+ 
+ 	/* Stop previous accounting session, if one is started, and allocate
+ 	 * new session id for the new session. */
+@@ -2864,11 +2878,11 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
+ 		 * interface selection is not going to change anymore.
+ 		 */
+ 		if (ap_sta_bind_vlan(hapd, sta) < 0)
+-			return;
++			goto fail;
+ 	} else if (sta->vlan_id) {
+ 		/* VLAN ID already set (e.g., by PMKSA caching), so bind STA */
+ 		if (ap_sta_bind_vlan(hapd, sta) < 0)
+-			return;
++			goto fail;
+ 	}
+ 
+ 	hostapd_set_sta_flags(hapd, sta);
+@@ -2898,6 +2912,13 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
+ 		os_free(sta->pending_eapol_rx);
+ 		sta->pending_eapol_rx = NULL;
+ 	}
++	
++fail:
++	/* Copy of the association request is not needed anymore */
++	if (sta->last_assoc_req) {
++		os_free(sta->last_assoc_req);
++		sta->last_assoc_req = NULL;
++	}
+ }
+ 
+ 
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index c36842b..c99e79e 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -286,7 +286,8 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	}
+ #endif /* CONFIG_NO_VLAN */
+ 
+-	os_free(sta->challenge);
++  os_free(sta->last_assoc_req);
++  os_free(sta->challenge);
+ 
+ #ifdef CONFIG_IEEE80211W
+ 	os_free(sta->sa_query_trans_id);
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index cf3fbb1..736d45b 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -129,6 +129,10 @@ struct sta_info {
+ 	struct eapol_state_machine *eapol_sm;
+ 
+ 	struct pending_eapol_rx *pending_eapol_rx;
++	
++	/* IEEE 802.11f (IAPP) related data */
++	struct ieee80211_mgmt *last_assoc_req;
++	size_t last_assoc_req_len;
+ 
+ 	u64 acct_session_id;
+ 	struct os_reltime acct_session_start;
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index a85ed32..d53aea7 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1437,6 +1437,8 @@ struct hostapd_sta_add_params {
+ 	const u8 *supp_oper_classes;
+ 	size_t supp_oper_classes_len;
+ 	int support_p2p_ps;
++	struct ieee80211_mgmt *last_assoc_req;
++	size_t last_assoc_req_len;
+ };
+ 
+ struct mac_address {
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index ae40f42..716ccf4 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -4086,6 +4086,13 @@ static int wpa_driver_nl80211_sta_add(void *priv,
+ 		nla_nest_end(msg, wme);
+ 	}
+ 
++	if (params->last_assoc_req && (params->last_assoc_req_len)) {
++		if (nla_put(msg, NL80211_ATTR_FRAME,
++				params->last_assoc_req_len,
++				params->last_assoc_req))
++			goto fail;
++	}
++
+ 	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+ 	msg = NULL;
+ 	if (ret)
+-- 
+1.8.3.4
+

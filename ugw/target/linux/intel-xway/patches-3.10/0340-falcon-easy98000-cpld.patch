@@ -1,0 +1,432 @@
+--- /dev/null
++++ b/arch/mips/lantiq/falcon/addon-easy98000.c
+@@ -0,0 +1,247 @@
++/*
++ *  EASY98000 CPLD Addon driver
++ *
++ *  Copyright (C) 2011 Thomas Langer <thomas.langer@lantiq.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License version 2  as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/platform_device.h>
++#include <linux/of_platform.h>
++#include <linux/errno.h>
++#include <linux/slab.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++
++struct easy98000_reg_cpld {
++	u16 cmdreg1;		/* 0x1 */
++	u16 cmdreg0;		/* 0x0 */
++	u16 idreg0;		/* 0x3 */
++	u16 resreg;		/* 0x2 */
++	u16 intreg;		/* 0x5 */
++	u16 idreg1;		/* 0x4 */
++	u16 ledreg;		/* 0x7 */
++	u16 pcmconconfig;	/* 0x6 */
++	u16 res0;		/* 0x9 */
++	u16 ethledreg;		/* 0x8 */
++	u16 res1[4];		/* 0xa-0xd */
++	u16 cpld1v;		/* 0xf */
++	u16 cpld2v;		/* 0xe */
++};
++static struct easy98000_reg_cpld * const cpld =
++	(struct easy98000_reg_cpld *)(KSEG1 | 0x17c00000);
++#define cpld_r8(reg) (__raw_readw(&cpld->reg) & 0xFF)
++#define cpld_w8(val, reg) __raw_writew((val) & 0xFF, &cpld->reg)
++
++int easy98000_addon_has_dm9000(void)
++{
++	if ((cpld_r8(idreg0) & 0xF) == 1)
++		return 1;
++	return 0;
++}
++
++#if defined(CONFIG_PROC_FS)
++typedef void (*cpld_dump) (struct seq_file *s);
++struct proc_entry {
++	char *name;
++	void *callback;
++};
++
++static int cpld_proc_show ( struct seq_file *s, void *p )
++{
++	cpld_dump dump = s->private;
++
++	if ( dump != NULL )
++		dump(s);
++
++	return 0;
++}
++
++static int cpld_proc_open ( struct inode *inode, struct file *file )
++{
++	return single_open ( file, cpld_proc_show, PDE_DATA(inode) );
++}
++
++static void cpld_versions_get ( struct seq_file *s )
++{
++	seq_printf(s, "CPLD1: V%d\n", cpld_r8(cpld1v));
++	seq_printf(s, "CPLD2: V%d\n", cpld_r8(cpld2v));
++}
++
++static void cpld_ebu_module_get ( struct seq_file *s )
++{
++	u8 addon_id;
++
++	addon_id = cpld_r8(idreg0) & 0xF;
++	switch (addon_id) {
++	case 0xF: /* nothing connected */
++		break;
++	case 1:
++		seq_printf(s, "Ethernet Controller module (dm9000)\n");
++		break;
++	default:
++		seq_printf(s, "Unknown EBU module (EBU_ID=0x%02X)\n", addon_id);
++		break;
++	}
++}
++
++static void cpld_xmii_module_get ( struct seq_file *s )
++{
++	u8 addon_id;
++	char *mod = NULL;
++
++	addon_id = cpld_r8(idreg1) & 0xF;
++	switch (addon_id) {
++	case 0xF:
++		mod = "no module";
++		break;
++	case 0x1:
++		mod = "RGMII module";
++		break;
++	case 0x4:
++		mod = "GMII MAC Mode (XWAY TANTOS-3G)";
++		break;
++	case 0x5:
++		mod = "MII MAC Mode (XWAY TANTOS-3G)";
++		break;
++	case 0x6:
++		mod = "TMII MAC Mode (XWAY TANTOS-3G)";
++		break;
++	case 0x8:
++		mod = "GMII PHY module";
++		break;
++	case 0x9:
++		mod = "MII PHY module";
++		break;
++	case 0xA:
++		mod = "RMII PHY module";
++		break;
++	default:
++		break;
++	}
++	if (mod)
++		seq_printf(s, "%s\n", mod);
++	else
++		seq_printf(s, "unknown xMII module (xMII_ID=0x%02X)\n", addon_id);
++}
++
++static void cpld_sgmii_module_get ( struct seq_file *s )
++{
++	u8 addon_id;
++	char *mod = NULL;
++
++	addon_id = cpld_r8(idreg1)>>4 & 0xF;
++	switch (addon_id) {
++	case 0xF:
++		mod = "no module";
++		break;
++	case 0x1:
++		mod = "SGMII module";
++		break;
++	default:
++		mod = NULL;
++		break;
++	}
++	if (mod)
++		seq_printf(s, "%s\n", mod);
++	else
++		seq_printf(s, "unknown module (SGMII_ID=0x%02X) found\n", addon_id);
++}
++
++static struct proc_entry proc_entries[] = {
++	{"versions",	cpld_versions_get},
++	{"ebu",		cpld_ebu_module_get},
++	{"xmii",	cpld_xmii_module_get},
++	{"sgmii",	cpld_sgmii_module_get},
++};
++
++static struct file_operations ops = {
++	.owner   = THIS_MODULE,
++	.open    = cpld_proc_open,
++	.read    = seq_read,
++	.llseek  = seq_lseek,
++	.release = single_release,
++};
++
++static void cpld_proc_entry_create(struct proc_dir_entry *parent_node,
++				   struct proc_entry *proc_entry)
++{
++	proc_create_data ( proc_entry->name, (S_IFREG | S_IRUGO), parent_node,
++			   &ops, proc_entry->callback);
++}
++
++static int cpld_proc_install(void)
++{
++	struct proc_dir_entry *driver_proc_node;
++
++	driver_proc_node = proc_mkdir("cpld", NULL);
++	if (driver_proc_node != NULL) {
++		int i;
++		for (i = 0; i < ARRAY_SIZE(proc_entries); i++)
++			cpld_proc_entry_create(driver_proc_node,
++					      &proc_entries[i]);
++	} else {
++		printk("cannot create proc entry");
++		return -1;
++	}
++	return 0;
++}
++#else
++static inline int cpld_proc_install(void) {}
++#endif
++
++static int easy98000_addon_probe(struct platform_device *pdev)
++{
++	return cpld_proc_install();
++}
++
++static int easy98000_addon_remove(struct platform_device *pdev)
++{
++#if defined(CONFIG_PROC_FS)
++	char buf[64];
++	int i;
++
++	for (i = 0; i < sizeof(proc_entries) / sizeof(proc_entries[0]); i++) {
++		sprintf(buf, "cpld/%s", proc_entries[i].name);
++		remove_proc_entry(buf, 0);
++	}
++	remove_proc_entry("cpld", 0);
++#endif
++	return 0;
++}
++
++static const struct of_device_id easy98000_addon_match[] = {
++	{.compatible = "lantiq,easy98000_addon" },
++	{},
++};
++
++static struct platform_driver easy98000_addon_driver = {
++	.probe = easy98000_addon_probe,
++	.remove = easy98000_addon_remove,
++	.driver = {
++		.name = "easy98000_addon",
++		.owner = THIS_MODULE,
++		.of_match_table = easy98000_addon_match,
++	},
++};
++
++int __init easy98000_addon_init(void)
++{
++	return platform_driver_register(&easy98000_addon_driver);
++}
++
++void __exit easy98000_addon_exit(void)
++{
++	platform_driver_unregister(&easy98000_addon_driver);
++}
++
++module_init(easy98000_addon_init);
++module_exit(easy98000_addon_exit);
+--- /dev/null
++++ b/arch/mips/lantiq/falcon/dev-leds-easy98000-cpld.c
+@@ -0,0 +1,174 @@
++/*
++ *  EASY98000 CPLD LED driver
++ *
++ *  Copyright (C) 2013 Ralph Hempel <ralph.hempel@lantiq.com>
++ *
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License version 2  as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/platform_device.h>
++#include <linux/of_platform.h>
++#include <linux/errno.h>
++#include <linux/leds.h>
++#include <linux/slab.h>
++
++#ifdef CONFIG_LEDS_CLASS
++
++#define LED_NAME	"easy98000_cpld_led"
++#define LED_DESC	"EASY98000 LED driver"
++#define LED_VERSION	"1.0.1"
++
++#define MAX_LED		16
++
++const char *led_name[8] = {
++	"ge0_act",
++	"ge0_link",
++	"ge1_act",
++	"ge1_link",
++	"fe2_act",
++	"fe2_link",
++	"fe3_act",
++	"fe3_link"
++};
++
++#define cpld_base7			((u16 *)(KSEG1 | 0x17c0000c))
++#define cpld_base8			((u16 *)(KSEG1 | 0x17c00012))
++
++#define ltq_r16(reg)			__raw_readw(reg)
++#define ltq_w16(val, reg)		__raw_writew(val, reg)
++
++struct cpld_led_dev {
++	struct led_classdev	cdev;
++	u8			mask;
++	u16			*base;
++};
++
++struct cpld_led_drvdata {
++	struct cpld_led_dev	*led_devs;
++	int			num_leds;
++};
++
++void led_set(u8 mask, u16 *base)
++{
++	ltq_w16(ltq_r16(base) | mask, base);
++}
++
++void led_clear(u8 mask, u16 *base)
++{
++	ltq_w16(ltq_r16(base) & (~mask), base);
++}
++
++void led_blink_clear(u8 mask, u16 *base)
++{
++	led_clear(mask, base);
++}
++
++static void led_brightness(struct led_classdev *led_cdev,
++			       enum led_brightness value)
++{
++	struct cpld_led_dev *led_dev =
++	    container_of(led_cdev, struct cpld_led_dev, cdev);
++
++	if (value)
++		led_set(led_dev->mask, led_dev->base);
++	else
++		led_clear(led_dev->mask, led_dev->base);
++}
++
++static int led_probe(struct platform_device *pdev)
++{
++	int i;
++	char name[32];
++	struct cpld_led_drvdata *drvdata;
++	int ret = 0;
++
++	drvdata = kzalloc(sizeof(struct cpld_led_drvdata) +
++			  sizeof(struct cpld_led_dev) * MAX_LED,
++			  GFP_KERNEL);
++	if (!drvdata)
++		return -ENOMEM;
++
++	drvdata->led_devs = (struct cpld_led_dev *) &drvdata[1];
++
++	for (i = 0; i < MAX_LED; i++) {
++		struct cpld_led_dev *led_dev = &drvdata->led_devs[i];
++		led_dev->cdev.brightness_set = led_brightness;
++		led_dev->cdev.default_trigger = NULL;
++		led_dev->mask = 1 << (i % 8);
++		if(i < 8) {
++			sprintf(name, "easy98000-cpld:%s", led_name[i]);
++			led_dev->base = cpld_base8;
++		} else {
++			sprintf(name, "easy98000-cpld:red:%d", i-8);
++			led_dev->base = cpld_base7;
++		}
++		led_dev->cdev.name = name;
++		ret = led_classdev_register(&pdev->dev, &led_dev->cdev);
++		if (ret)
++			goto err;
++	}
++	platform_set_drvdata(pdev, drvdata);
++	return 0;
++
++err:
++	for (i = i - 1; i >= 0; i--)
++		led_classdev_unregister(&drvdata->led_devs[i].cdev);
++
++	kfree(drvdata);
++	return ret;
++}
++
++static int led_remove(struct platform_device *pdev)
++{
++	int i;
++	struct cpld_led_drvdata *drvdata = platform_get_drvdata(pdev);
++	for (i = 0; i < MAX_LED; i++)
++		led_classdev_unregister(&drvdata->led_devs[i].cdev);
++	kfree(drvdata);
++	return 0;
++}
++
++static const struct of_device_id led_driver_match[] = {
++	{.compatible = "lantiq," LED_NAME },
++	{},
++};
++
++static struct platform_driver led_driver = {
++	.probe = led_probe,
++	.remove = led_remove,
++	.driver = {
++		.name = LED_NAME,
++		.owner = THIS_MODULE,
++		.of_match_table = led_driver_match,
++		},
++};
++
++int __init easy98000_cpld_led_init(void)
++{
++	pr_info(LED_DESC ", Version " LED_VERSION
++		" (c) Copyright 2013, Lantiq Deutschland GmbH\n");
++	return platform_driver_register(&led_driver);
++}
++
++void __exit easy98000_cpld_led_exit(void)
++{
++	platform_driver_unregister(&led_driver);
++}
++
++module_init(easy98000_cpld_led_init);
++module_exit(easy98000_cpld_led_exit);
++
++MODULE_DESCRIPTION(LED_NAME);
++MODULE_DESCRIPTION(LED_DESC);
++MODULE_AUTHOR("Ralph Hempel <ralph.hempel@lantiq.com>");
++MODULE_LICENSE("GPL v2");
++
++#endif /* CONFIG_LEDS_CLASS */
+--- a/arch/mips/lantiq/falcon/Makefile
++++ b/arch/mips/lantiq/falcon/Makefile
+@@ -1 +1,2 @@
+ obj-y := prom.o reset.o sysctrl.o
++obj-y += addon-easy98000.o dev-leds-easy98000-cpld.o

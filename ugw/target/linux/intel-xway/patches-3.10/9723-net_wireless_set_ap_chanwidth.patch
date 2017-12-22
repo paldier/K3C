@@ -1,0 +1,125 @@
+Index: linux-3.10.12/include/net/cfg80211.h
+===================================================================
+--- linux-3.10.12.orig/include/net/cfg80211.h	2015-01-22 18:33:21.000000000 +0200
++++ linux-3.10.12/include/net/cfg80211.h	2015-01-23 12:56:51.000000000 +0200
+@@ -2248,6 +2248,10 @@
+ 				    u16 duration);
+ 	void	(*crit_proto_stop)(struct wiphy *wiphy,
+ 				   struct wireless_dev *wdev);
++
++	int	(*set_ap_chanwidth)(struct wiphy *wiphy, struct net_device *dev,
++					struct cfg80211_chan_def *chandef);
++
+ };
+ 
+ /*
+Index: linux-3.10.12/include/uapi/linux/nl80211.h
+===================================================================
+--- linux-3.10.12.orig/include/uapi/linux/nl80211.h	2015-01-23 13:10:44.000000000 +0200
++++ linux-3.10.12/include/uapi/linux/nl80211.h	2015-01-23 13:11:18.000000000 +0200
+@@ -3841,6 +3841,9 @@
+  *	interface. An active monitor interface behaves like a normal monitor
+  *	interface, but gets added to the driver. It ensures that incoming
+  *	unicast packets directed at the configured interface address get ACKed.
++ * @NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE: This driver supports dynamic
++ *	channel bandwidth change (e.g., HT 20 <-> 40 MHz channel) during the
++ *	lifetime of a BSS.
+  */
+ enum nl80211_feature_flags {
+ 	NL80211_FEATURE_SK_TX_STATUS			= 1 << 0,
+@@ -3861,6 +3864,7 @@
+ 	NL80211_FEATURE_FULL_AP_CLIENT_STATE		= 1 << 15,
+ 	NL80211_FEATURE_USERSPACE_MPM			= 1 << 16,
+ 	NL80211_FEATURE_ACTIVE_MONITOR			= 1 << 17,
++	NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE	= 1 << 18,
+ };
+ 
+ /**
+Index: linux-3.10.12/net/wireless/nl80211.c
+===================================================================
+--- linux-3.10.12.orig/net/wireless/nl80211.c	2015-01-23 12:32:05.000000000 +0200
++++ linux-3.10.12/net/wireless/nl80211.c	2015-01-23 13:27:25.000000000 +0200
+@@ -1846,14 +1846,28 @@
+ 	switch (iftype) {
+ 	case NL80211_IFTYPE_AP:
+ 	case NL80211_IFTYPE_P2P_GO:
+-		if (wdev->beacon_interval) {
+-			result = -EBUSY;
+-			break;
+-		}
+ 		if (!cfg80211_reg_can_beacon(&rdev->wiphy, &chandef)) {
+ 			result = -EINVAL;
+ 			break;
+ 		}
++		if (wdev->beacon_interval) {
++			/* This functionality is backported from Linux 3.18 -- DI */
++			if (!wdev->netdev || !rdev->ops->set_ap_chanwidth ||
++			    !(rdev->wiphy.features &
++			      NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE)) {
++				result = -EBUSY;
++				break;
++			}
++
++			/* Only allow dynamic channel width changes */
++			if (chandef.chan != wdev->preset_chandef.chan) {
++				result = -EBUSY;
++				break;
++			}
++			result = rdev_set_ap_chanwidth(rdev, wdev->netdev, &chandef);
++			if (result)
++				break;
++		}
+ 		wdev->preset_chandef = chandef;
+ 		result = 0;
+ 		break;
+Index: linux-3.10.12/net/wireless/rdev-ops.h
+===================================================================
+--- linux-3.10.12.orig/net/wireless/rdev-ops.h	2013-09-14 16:55:12.000000000 +0300
++++ linux-3.10.12/net/wireless/rdev-ops.h	2015-01-23 13:15:26.000000000 +0200
+@@ -923,4 +923,17 @@
+ 	trace_rdev_return_void(&rdev->wiphy);
+ }
+ 
++static inline int
++rdev_set_ap_chanwidth(struct cfg80211_registered_device *rdev,
++		      struct net_device *dev, struct cfg80211_chan_def *chandef)
++{
++	int ret;
++
++	trace_rdev_set_ap_chanwidth(&rdev->wiphy, dev, chandef);
++	ret = rdev->ops->set_ap_chanwidth(&rdev->wiphy, dev, chandef);
++	trace_rdev_return_int(&rdev->wiphy, ret);
++
++	return ret;
++}
++
+ #endif /* __CFG80211_RDEV_OPS */
+Index: linux-3.10.12/net/wireless/trace.h
+===================================================================
+--- linux-3.10.12.orig/net/wireless/trace.h	2013-09-14 16:55:12.000000000 +0300
++++ linux-3.10.12/net/wireless/trace.h	2015-01-23 13:22:08.000000000 +0200
+@@ -1841,6 +1841,24 @@
+ 		  WIPHY_PR_ARG, WDEV_PR_ARG)
+ );
+ 
++TRACE_EVENT(rdev_set_ap_chanwidth,
++	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
++		 struct cfg80211_chan_def *chandef),
++	TP_ARGS(wiphy, netdev, chandef),
++	TP_STRUCT__entry(
++		WIPHY_ENTRY
++		NETDEV_ENTRY
++		CHAN_DEF_ENTRY
++	),
++	TP_fast_assign(
++		WIPHY_ASSIGN;
++		NETDEV_ASSIGN;
++		CHAN_DEF_ASSIGN(chandef);
++	),
++	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", " CHAN_DEF_PR_FMT,
++		  WIPHY_PR_ARG, NETDEV_PR_ARG, CHAN_DEF_PR_ARG)
++);
++
+ /*************************************************************
+  *	     cfg80211 exported functions traces		     *
+  *************************************************************/

@@ -1,0 +1,69 @@
+#!/bin/sh /etc/rc.common
+
+samba_opt_ena()
+{
+	if [ ${samba_opt_flag} = 1 ]; then
+		# play safe : disable first
+		samba_opt_dis
+
+		# it is assumed that dependant kernel configuration
+		# is taken care of at compile time
+		# for eg. raw table, CT target etc
+		KERNEL_VER="`uname -r`"
+		IPT_RAW_MOD="iptable_raw"
+		SAMBA_PORT=445
+
+		if [ -f /lib/modules/${KERNEL_VER}/${IPT_RAW_MOD}.ko -a -z "`grep ${IPT_RAW_MOD} /proc/modules`" ]; then
+			/sbin/insmod /lib/modules/${KERNEL_VER}/${IPT_RAW_MOD}.ko
+		fi
+		
+		if [ -n "`echo ${KERNEL_VER} | grep "^2.6."`" ]; then
+			NOTRACK_MOD="xt_NOTRACK"
+			NOTRACK_TARGET="-j NOTRACK"
+		else
+			NOTRACK_MOD="xt_CT"
+			NOTRACK_TARGET="-j CT --notrack"
+		fi
+
+		if [ -f /lib/modules/${KERNEL_VER}/${NOTRACK_MOD}.ko -a -z "`grep ${NOTRACK_MOD} /proc/modules`" ]; then
+			/sbin/insmod /lib/modules/${KERNEL_VER}/${NOTRACK_MOD}.ko
+		fi
+
+		/usr/sbin/iptables -t raw -I PREROUTING -p tcp --dport ${SAMBA_PORT} ${NOTRACK_TARGET}
+		/usr/sbin/iptables -t raw -I PREROUTING -p tcp --sport ${SAMBA_PORT} ${NOTRACK_TARGET}
+		/usr/sbin/iptables -t raw -I OUTPUT -p tcp --sport ${SAMBA_PORT} ${NOTRACK_TARGET}
+		/usr/sbin/iptables -t raw -I OUTPUT -p tcp --dport ${SAMBA_PORT} ${NOTRACK_TARGET}
+	fi
+	# take care to restart samba process if required
+}
+
+samba_opt_dis()
+{
+	# it is assumed that dependant kernel configuration
+	# is taken care of at compile time
+	# for eg. raw table, CT target etc
+	KERNEL_VER="`uname -r`"
+	IPT_RAW_MOD="iptable_raw"
+	SAMBA_PORT=445
+
+	if [ -n "`echo ${KERNEL_VER} | grep "^2.6."`" ]; then
+		NOTRACK_MOD="xt_NOTRACK"
+		NOTRACK_TARGET="-j NOTRACK"
+	else
+		NOTRACK_MOD="xt_CT"
+		NOTRACK_TARGET="-j CT --notrack"
+	fi
+
+	/usr/sbin/iptables -t raw -D OUTPUT -p tcp --dport ${SAMBA_PORT} ${NOTRACK_TARGET} 2> /dev/null
+	/usr/sbin/iptables -t raw -D OUTPUT -p tcp --sport ${SAMBA_PORT} ${NOTRACK_TARGET} 2> /dev/null
+	/usr/sbin/iptables -t raw -D PREROUTING -p tcp --sport ${SAMBA_PORT} ${NOTRACK_TARGET} 2> /dev/null
+	/usr/sbin/iptables -t raw -D PREROUTING -p tcp --dport ${SAMBA_PORT} ${NOTRACK_TARGET} 2> /dev/null
+
+	if [ -n "`grep ${NOTRACK_MOD} /proc/modules`" ]; then
+		/sbin/rmmod ${NOTRACK_MOD} 2> /dev/null
+	fi
+
+	if [ -n "`grep ${IPT_RAW_MOD} /proc/modules`" ]; then
+		/sbin/rmmod ${IPT_RAW_MOD} 2> /dev/null
+	fi
+}

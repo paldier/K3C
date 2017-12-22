@@ -1,0 +1,120 @@
+#!/bin/sh
+# Copyright (C) 2013 Lantiq Deutschland GmbH
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+#/bin/mount -a
+
+[ -z "$PREINIT" ] && exec /sbin/init
+mount -t debugfs -o defaults debugfs /sys/kernel/debug
+mount -t tmpfs tmpfs /dev/shm
+
+#tmp workaround to find the binaries from /opt/lantiq. this has to be removed once the actual fix is identified
+#export LD_LIBRARY_PATH=/opt/lantiq/lib:/opt/lantiq/usr/lib:${LD_LIBRARY_PATH}
+#export PATH=$PATH:/opt/lantiq/sbin:/opt/lantiq/usr/sbin:/opt/lantiq/bin
+
+setup_tty ()
+{
+	local idev;
+	for idev in `ls /sys/class/tty/ttyLTQ* -d`; do
+		mknod $(echo /dev/${idev:15} c `sed 's/:/ /' $idev/dev`);
+	done
+}
+
+mount_default ()
+{
+	mount -t ramfs -o nr_inodes=1k,mode=770 /dev/ram /ramdisk
+	cp -ar /ramdisk_copy/* /ramdisk
+	#/bin/mount -t ramfs /dev/ram /dev
+	#[ -e /etc/device_table.txt ] && /sbin/makedevs -d /etc/device_table.txt /
+	#/bin/mount -t devpts /dev/pts
+	#setup_tty
+}
+
+do_preinit_work()
+{
+	sleep 10;
+}
+
+mount_ubi_overlay ()
+{
+	#/bin/mount -t ramfs /dev/ram /dev
+	#[ -e /etc/device_table.txt ] && /sbin/makedevs -d /etc/device_table.txt /
+	#setup_tty
+	/usr/sbin/vol_mgmt create_ubi_nodes >&- 2>&-
+	/usr/sbin/vol_mgmt mount_ubi_data_vol /overlay && {
+		if grep -q overlay /proc/filesystems; then
+			mount -t overlayfs -o lowerdir=/,upperdir=/overlay "overlayfs:/overlay" /mnt && root=/mnt
+		else
+			mount -t mini_fo -o base=/,sto=/overlay "mini_fo:/overlay" /mnt 2>&- && root=/mnt
+		fi
+		mount -o move /proc /mnt/proc && \
+			pivot_root /mnt /mnt/rom && {
+			mount -o move /rom/dev /dev
+			mount -o move /rom/sys /sys 2>&-
+			mount -o move /rom/overlay /overlay 2>&-
+		}
+	}
+	#/bin/mount -t devpts /dev/pts
+	mount -t ramfs -o nr_inodes=1k,mode=770 /dev/ram /ramdisk
+	cp -ar /ramdisk_copy/* /ramdisk
+	do_preinit_work &
+}
+
+setup_jffs2 ()
+{
+	grep -q -w data /proc/mtd && {
+		mount -t jffs2 mtd:data $1 || {
+			flash_erase -q -j /dev/`grep -w data /proc/mtd|cut -d: -f1` 0 0 || true
+			mount -t jffs2 mtd:data $1
+		}
+	}
+}
+
+mount_jffs2_overlay ()
+{
+	#/bin/mount -t ramfs /dev/ram /dev
+	#[ -e /etc/device_table.txt ] && /sbin/makedevs -d /etc/device_table.txt /
+	#setup_tty
+	setup_jffs2 /overlay && {
+		if grep -q overlay /proc/filesystems; then
+			mount -t overlayfs -o lowerdir=/,upperdir=/overlay "overlayfs:/overlay" /mnt && root=/mnt
+		else
+			mount -t mini_fo -o base=/,sto=/overlay "mini_fo:/overlay" /mnt 2>&- && root=/mnt
+		fi
+		mount -o move /proc /mnt/proc && \
+			pivot_root /mnt /mnt/rom && {
+			mount -o move /rom/dev /dev
+			mount -o move /rom/sys /sys 2>&-
+			mount -o move /rom/overlay /overlay 2>&-
+		}
+	}
+	#/bin/mount -t devpts /dev/pts
+	mount -t ramfs -o nr_inodes=1k,mode=770 /dev/ram /ramdisk
+	cp -ar /ramdisk_copy/* /ramdisk
+	#do_preinit_work &
+}
+
+grep "ubi.mtd" /proc/cmdline >&- 2>&-
+if [ $? -eq 0 ]; then
+	if grep -w -q do_overlay /proc/cmdline; then
+		mount_ubi_overlay
+	else
+		mount_default
+		/usr/sbin/vol_mgmt create_ubi_nodes >&- 2>&-
+		/usr/sbin/vol_mgmt mount_ubi_data_vol /mnt/data || echo "Failed to mount data_vol"
+	fi
+else
+	if grep -w -q do_overlay /proc/cmdline; then
+		mount_jffs2_overlay
+	else
+		mount_default
+	fi
+fi
+
+ls /etc/preinit.d/* >/dev/null 2>/dev/null && {
+	for pi_source_file in /etc/preinit.d/*; do
+		. $pi_source_file
+	done
+}
+

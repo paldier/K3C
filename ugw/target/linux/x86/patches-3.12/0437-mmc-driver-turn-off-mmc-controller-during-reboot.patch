@@ -1,0 +1,62 @@
+From 7c1f84eaadaeffe0a9bc0d93fac3da49f27cc9a7 Mon Sep 17 00:00:00 2001
+From: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+Date: Mon, 20 Jun 2016 18:30:43 -0700
+Subject: [PATCH 437/441] mmc: driver turn off mmc controller during reboot
+
+When typing 'reboot' on Atom shell, Atom begins its reboot sequence
+(and turns off eMMC) At the end it notifies the PMC of the reboot request,
+PMC notifies ARM, with RSWARN message and ARM starts its reboot process,
+In the meantime every ARM eMMC access will fail since Atom took
+eMMC down as part of its shutdown.
+
+Change-Id: I3c719989256b8bc91a1b760a1cf613b7ce88a7dc
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/mmc/core/bus.c        | 12 ++++++++++++
+ drivers/mmc/host/sdhci-acpi.c |  2 +-
+ include/linux/mmc/host.h      |  2 ++
+ 3 files changed, 15 insertions(+), 1 deletion(-)
+
+--- a/drivers/mmc/core/bus.c
++++ b/drivers/mmc/core/bus.c
+@@ -148,6 +148,18 @@ static void mmc_bus_shutdown(struct devi
+ 	struct mmc_host *host = card->host;
+ 	int ret;
+ 
++#ifdef CONFIG_X86_PUMA7
++	/*
++	 * When typing 'reboot' on Atom shell, Atom is going down (and turn off
++	 * the eMMC) At the end it notify to the PMC on the reboot request,
++	 * then the PMC notify to the ARM, with RSWARN message,
++	 * then the ARM start the reboot process, but every access
++	 * to eMMC is failing. This work around will not turn off the eMMC
++	 * if the capability is set
++	 */
++	if (host->caps2 & MMC_CAP2_NO_SHUTDOWN_BUS)
++		return;
++#endif
+ 	if (dev->driver && drv->shutdown)
+ 		drv->shutdown(card);
+ 
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@ -244,7 +244,7 @@ static const struct sdhci_acpi_slot sdhc
+ 		| MMC_CAP_1_8V_DDR,
+ 	.caps2   = MMC_CAP2_HC_ERASE_SZ | MMC_CAP2_POLL_R1B_BUSY |
+ 		MMC_CAP2_CACHE_CTRL | MMC_CAP2_HS200_1_8V_SDR |
+-		MMC_CAP2_CAN_DO_CMDQ,
++		MMC_CAP2_CAN_DO_CMDQ | MMC_CAP2_NO_SHUTDOWN_BUS,
+ #endif
+ 	.flags   = SDHCI_ACPI_RUNTIME_PM,
+ #ifdef CONFIG_X86_PUMA7
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -316,6 +316,8 @@ struct mmc_host {
+ #define MMC_CAP2_HS400		(MMC_CAP2_HS400_1_8V | \
+ 				 MMC_CAP2_HS400_1_2V)
+ #define MMC_CAP2_CAN_DO_CMDQ	(1 << 19)
++#define MMC_CAP2_NO_SHUTDOWN_BUS (1 << 20)      /* Don't allow shutdown callback
++						   for shared mmc.*/
+ #endif
+ 
+ 	mmc_pm_flag_t		pm_caps;	/* supported pm features */

@@ -1,0 +1,228 @@
+From cb1c2cff34a8a51249d70a37530d57e3057f9b19 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Fri, 30 Oct 2015 18:54:08 -0700
+Subject: [PATCH 199/441] Dualboot NetIP handshake changes.
+
+---
+ arch/x86/NetIP_SubSystem/netip_subsystem_defs.h | 11 +++--
+ arch/x86/NetIP_SubSystem/netip_subsystem_pm.c   | 59 ++++++++++++++++---------
+ 2 files changed, 46 insertions(+), 24 deletions(-)
+
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
+@@ -71,9 +71,14 @@ typedef struct netss_service_status {
+    uint8_t id;
+    uint8_t state;
+ }netss_service_status_t;
++
++typedef union netss_msg_header {
++   uint8_t  opcode;
++   uint32_t header;
++} netss_msg_header_t;
+  
+ typedef struct netss_configure_msg {
+-   uint32_t opcode;          /**Opcode of the message */
++   netss_msg_header_t hdr;       /**header of the message */
+    //uint32_t num_ds_chan;     /**Number of QAM DS channels */
+    uint8_t  docsis_chan[32]; /** each byte if 1, indicates that it is a docsis channel */
+    uint32_t cm_mode;         /**Cable modem operational mode  */
+@@ -82,13 +87,13 @@ typedef struct netss_configure_msg {
+ } netss_configure_msg_t;
+ 
+ typedef struct netss_service_status_msg {
+-   uint32_t opcode;          /**Opcode of the message */
++   netss_msg_header_t hdr;       /**header of the message */
+    uint32_t  netip_level;     /** ARM11 power state 0==Active, 2==low power, 3==disable */
+    netss_service_status_t service[0];
+ }netss_service_status_msg_t;
+ 
+ typedef struct netss_service_request_msg {
+-   uint32_t opcode;          /**Opcode of the message */
++   netss_msg_header_t hdr;       /**header of the message */
+    uint32_t onBattery;       /**1 == system is on battery or 0 system is on AC power  */
+    uint32_t  netip_level;     /** ARM11 power state 0==Active, 2==low power, 3==disable */
+    netss_service_status_t service[0];
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_pm.c
+@@ -86,10 +86,11 @@ static int  netss_receive_netip_msg(hw_m
+                               Uint8 *dataBuf, Uint32 dataLen,
+                               Uint32 *token)
+ {
++   int i=0;
+    mutex_lock(&pnetss_drv_data->netip_msg.lock);
+    memcpy(pnetss_drv_data->netip_msg.payload, dataBuf, dataLen);
+    pnetss_drv_data->netip_msg.len = dataLen;
+-   pnetss_drv_data->netip_msg.type = be32_to_cpu(*((uint32_t *)&dataBuf[0])); 
++   pnetss_drv_data->netip_msg.type = dataBuf[0]; 
+    /*Wake up thread, cleanup sysfs attributes */ 
+    if(pnetss_drv_data->netip_msg.type == NETSS_OPCODE_NETIP_PROPERTIES) 
+    {
+@@ -99,6 +100,13 @@ static int  netss_receive_netip_msg(hw_m
+    {
+       g_netip_msg = 2;
+    }
++   printk("NetIP Msg recvd:");
++   for(i=0; i<dataLen; i++)
++   {
++      if(i%4 == 0) (printk("\n"));
++      printk("%2X\t", dataBuf[i]);
++   }
++   printk("===========================\n");
+    mutex_unlock(&pnetss_drv_data->netip_msg.lock);
+    wake_up_all(&waitForNetIPMsgWQ);
+    return 0;
+@@ -158,7 +166,7 @@ static void ness_process_netip_props_msg
+    NETSS_DBG_PRINT("services that are available = %x\n", g_netip_services_available);
+   
+    /*Remove the sysfs attribute files of the services that are not available */
+-   netss_sysfs_clean_up(g_netip_services_available);
++   //netss_sysfs_clean_up(g_netip_services_available);
+    return;
+ }
+ /** NetIP configure message format
+@@ -194,7 +202,7 @@ static void netss_send_configure_msg (vo
+    /*clear the message */
+     memset(&cfg_msg, 0, sizeof(netss_configure_msg_t));
+    
+-   cfg_msg.opcode = cpu_to_be32(NETSS_OPCODE_CONFIGURE);
++   cfg_msg.hdr.opcode = NETSS_OPCODE_CONFIGURE;
+    /*These values should be read from platfom config files
+     *for now writing some default values  */
+    for(i=0; i < sizeof(uint32_t); i++)
+@@ -208,7 +216,7 @@ static void netss_send_configure_msg (vo
+    cfg_msg.docsis_chan[j] = 0;
+   
+    cfg_msg.cm_mode = 0; 
+-   cfg_msg.RCE_floor = cpu_to_be32(1);
++   cfg_msg.RCE_floor = 1;
+    cfg_msg.RCF_filter = 0;
+    ret = hwMbox_sendOpcode(HW_MBOX_MASTER_NP_CPU, 0, (uint8_t*)&cfg_msg, sizeof(netss_configure_msg_t), sizeof(netss_configure_msg_t), &reply_len);
+    if(ret)
+@@ -243,13 +251,13 @@ static void netss_send_configure_msg (vo
+ static void ness_process_service_status_msg(void) 
+ {
+    int i=0;
+-   netss_service_request_msg_t *service_msg =(netss_service_status_msg_t*) &pnetss_drv_data->netip_msg.payload[0];
++   netss_service_status_msg_t *service_msg =(netss_service_status_msg_t*) &pnetss_drv_data->netip_msg.payload[0];
+    netss_sysfs_attributes_info_t *syfs_info = &g_netss_sysfs_attributes_info;
+    netss_service_status_t *service_status = (netss_service_status_t *)&pnetss_drv_data->netip_msg.payload[SERVICE_OFFSET];
+    
+    //mutex_lock(&syfs_info->lock);
+-   NETSS_DBG_PRINT("processing service status message opcode %d\n", service_msg->opcode);
+-   syfs_info->runtime_state[0] = be32_to_cpu(service_msg->netip_level);
++   NETSS_DBG_PRINT("processing service status message opcode %d\n", service_msg->hdr.opcode);
++   syfs_info->runtime_state[0] = service_msg->netip_level;
+    while(service_status[i].id != 0) 
+    {
+       syfs_info->runtime_state[service_status[i].id] = service_status[i].state;
+@@ -270,7 +278,7 @@ static void ness_process_service_status_
+ static void netss_update_sysfs_attributes(netss_sysfs_attributes_info_t *syfs_info, netss_service_request_msg_t *service_msg)
+ {
+    int i=0;
+-   uint32_t netip_level = be32_to_cpu(service_msg->netip_level);
++   uint32_t netip_level = service_msg->netip_level;
+    /*Upon successful reply process the reply and update sysfs attributes */
+    syfs_info->runtime_state[0] = service_msg->netip_level;
+ 
+@@ -280,7 +288,7 @@ static void netss_update_sysfs_attribute
+      i++;
+    }
+    if(netip_level == NETIP_ACTIVE_ON_AC) {
+-      /*Ideally need to convert to litte endian format, but it can be ok as we are just checking true or not */
++      /* just checking true or not */
+       if(service_msg->onBattery) { 
+          syfs_info->runtime_state[0] = NETIP_ACTIVE_ON_BATTERY;
+          g_current_netip_power_state = NETIP_ACTIVE_ON_BATTERY;
+@@ -367,7 +375,7 @@ static int ness_send_service_request_msg
+    else 
+    {
+       //mutex_lock(&syfs_info->lock);
+-      service_msg->opcode = cpu_to_be32(NETSS_OPCODE_SERVICE_REQUEST);
++      service_msg->hdr.opcode = NETSS_OPCODE_SERVICE_REQUEST;
+       if(0 == service_level) 
+       {
+          /*PMP has not set the service level, 
+@@ -393,18 +401,19 @@ static int ness_send_service_request_msg
+             service_msg->netip_level = 0;
+          } else if(1 == (service_level & 3)) {
+             /*On Battery mode, put voice in low power mode and disable all services */
+-            service_msg->onBattery = cpu_to_be32(1);
++            service_msg->onBattery = 1;
+             service_msg->netip_level = 0;
+          } else if ( 2 == (service_level & 3)) {
+             /*standby mode, put ARM11 in low power mode and disable all services */
+-            service_msg->netip_level = cpu_to_be32(2);
++            service_msg->netip_level = 2;
+          } else if ( 3 == (service_level & 3)) {
+             /*deep standby mode, ARM11 and all netip services are off, PCI device should go to PCI_D3hot state */
+-            service_msg->netip_level = cpu_to_be32(3);
++            service_msg->netip_level = 3;
+          }
+          for(i=2; i<24; ) 
+          {
+             uint32_t id = i/2;
++            uint8_t service_level = 0;
+             /*if that service is ready to be requested 
+              * BIT 0 represents SERVICE ID 1
+              * BIT 1 represents SERVICE ID 2 ... and so on
+@@ -419,15 +428,21 @@ static int ness_send_service_request_msg
+                    *PMP wont request its status, it is always on */
+                   service_msg->service[j].id = id+1;
+                }
+-               service_msg->service[j].state = syfs_info->service_level & (3 << i);
++               service_level = ((syfs_info->service_level >> i ) & 3 );
++               service_msg->service[j].state = (service_level < 2 )? service_level : service_level+1;
+                j++;
+             } else {
+-               NETSS_DBG_PRINT("Service id %d is not initialized, not including in the service request msg \n", 
++               printk("Service id %d is not initialized, not including in the service request msg \n", 
+                        (id < 6)? id : id+1);
+             }
+             i += 2;
+          }
+       }
++      if(3 == (service_level & 3)) {
++         /*BBU should be off if NetIP going to deep standby*/
++         service_msg->service[j].id = 6;
++         service_msg->service[j].state = 3;
++      }
+       /*Null termination of the list */
+       service_msg->service[j].id = 0;
+       service_msg->service[j].state = 0;
+@@ -463,20 +478,20 @@ static int ness_send_single_service_requ
+    }
+    else
+    {
+-      service_msg->opcode = cpu_to_be32(NETSS_OPCODE_SERVICE_REQUEST);
++      service_msg->hdr.opcode = NETSS_OPCODE_SERVICE_REQUEST;
+      
+       if(g_current_netip_power_state == NETIP_ACTIVE_ON_AC) {
+          service_msg->netip_level = 0;
+       } else if (g_current_netip_power_state == NETIP_ACTIVE_ON_BATTERY) {
+          service_msg->netip_level = 0;
+-         service_msg->onBattery = cpu_to_be32(1);
++         service_msg->onBattery = 1;
+       } else if (g_current_netip_power_state == NETIP_STANDBY) {
+-         service_msg->netip_level = cpu_to_be32(2);
++         service_msg->netip_level = 2;
+       } else if (g_current_netip_power_state == NETIP_DEEP_STANDBY) {
+-         service_msg->netip_level = cpu_to_be32(3);
++         service_msg->netip_level = 3;
+       }
+       service_msg->service[0].id = service_id;
+-      service_msg->service[0].state = state;
++      service_msg->service[0].state = (state < 2)? state : 3;
+       
+       service_msg->service[1].id = 0;
+       service_msg->service[1].state = 0;
+@@ -545,7 +560,9 @@ static int netss_configure_and_setup_net
+       } else if (g_netip_msg == 5) {
+          NETSS_DBG_PRINT("EJ test wake up received %d\n", count++);
+       } else {
+-         NETSS_DBG_PRINT("Unknown message received Opcode type %d\n", pnetss_drv_data->netip_msg.type);
++         printk("Unknown message received Opcode type %d\n", pnetss_drv_data->netip_msg.type);
++         /*send reply*/
++         netss_send_reply_ack();
+       }
+ 
+       /*We will get multiple service status message, one message per one subsystem

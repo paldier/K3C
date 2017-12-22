@@ -1,0 +1,70 @@
+Index: busybox-1.17.1/networking/udhcp/packet.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/packet.c	2012-02-13 17:57:30.284181000 +0530
++++ busybox-1.17.1/networking/udhcp/packet.c	2012-02-14 12:43:08.619013000 +0530
+@@ -188,6 +188,7 @@
+ 	int fd;
+ 	int result = -1;
+ 	const char *msg;
++	unsigned padding;
+ 	int p_len = udhcp_get_payload_len(dhcp_pkt);
+ 
+ 	fd = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
+@@ -211,24 +212,35 @@
+ 		goto ret_close;
+ 	}
+ 
++	/* We were sending full-sized DHCP packets (zero padded),
++	 * but some badly configured servers were seen dropping them.
++	 * Apparently they drop all DHCP packets >576 *ethernet* octets big,
++	 * whereas they may only drop packets >576 *IP* octets big
++	 * (which for typical Ethernet II means 590 octets: 6+6+2 + 576).
++	 *
++	 * In order to work with those buggy servers,
++	 * we truncate packets after end option byte.
++	 */
++	padding = DHCP_OPTIONS_BUFSIZE - 1 - udhcp_end_option(packet.data.options);
++
+ 	packet.ip.protocol = IPPROTO_UDP;
+ 	packet.ip.saddr = source_nip;
+ 	packet.ip.daddr = dest_nip;
+ 	packet.udp.source = htons(source_port);
+ 	packet.udp.dest = htons(dest_port);
+ 	p_len += sizeof(packet.udp);
+-	packet.udp.len = htons(p_len);
++	packet.udp.len = htons(UPD_DHCP_SIZE - padding);
+ 	packet.ip.tot_len = packet.udp.len;
+ 	p_len += sizeof(packet.ip);
+-	packet.udp.check = udhcp_checksum(&packet, p_len);
+-	packet.ip.tot_len = htons(p_len);
++	packet.udp.check = udhcp_checksum(&packet, IP_UPD_DHCP_SIZE - padding);
++	packet.ip.tot_len = htons(IP_UPD_DHCP_SIZE - padding);
+ 	packet.ip.ihl = sizeof(packet.ip) >> 2;
+ 	packet.ip.version = IPVERSION;
+ 	packet.ip.ttl = IPDEFTTL;
+ 	packet.ip.check = udhcp_checksum(&packet.ip, sizeof(packet.ip));
+ 
+ 	udhcp_dump_packet(dhcp_pkt);
+-	result = sendto(fd, &packet, p_len, /*flags:*/ 0,
++	result = sendto(fd, &packet, IP_UPD_DHCP_SIZE- padding, /*flags:*/ 0,
+ 			(struct sockaddr *) &dest_sll, sizeof(dest_sll));
+ 	msg = "sendto";
+  ret_close:
+@@ -249,6 +261,7 @@
+ 	int fd;
+ 	int result = -1;
+ 	const char *msg;
++	unsigned padding;
+ 
+ 	fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+ 	if (fd < 0) {
+@@ -276,7 +289,8 @@
+ 	}
+ 
+ 	udhcp_dump_packet(dhcp_pkt);
+-	result = safe_write(fd, dhcp_pkt, udhcp_get_payload_len(dhcp_pkt));
++	padding = DHCP_OPTIONS_BUFSIZE - 1 - udhcp_end_option(dhcp_pkt->options);
++	result = safe_write(fd, dhcp_pkt, DHCP_SIZE - padding);
+ 	msg = "write";
+  ret_close:
+ 	close(fd);

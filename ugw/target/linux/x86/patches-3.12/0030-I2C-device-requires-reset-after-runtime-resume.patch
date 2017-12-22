@@ -1,0 +1,59 @@
+From 1fe138d59ee95f8038f21741906bc7029387f954 Mon Sep 17 00:00:00 2001
+From: Aubrey Li <aubrey.li@intel.com>
+Date: Tue, 8 Jul 2014 00:37:10 -0500
+Subject: [PATCH 030/441] I2C device requires reset after runtime resume
+
+I2C device is runtime power managed per transaction. After I2C device
+is runtime resume from D3 to D0, it could be in an inaccessible state.
+So, the device reset is required after runtime resume
+
+Change-Id: I53a9ba2f78efa2cffa48703b19ced454aef3b9f7
+Signed-off-by: Aubrey Li <aubrey.li@intel.com>
+(cherry picked from commit b1bb3dd4543b30e07f539a5991ca198a648517ca)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/i2c/busses/i2c-designware-core.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+--- a/drivers/i2c/busses/i2c-designware-core.c
++++ b/drivers/i2c/busses/i2c-designware-core.c
+@@ -88,6 +88,10 @@
+ #define DW_IC_INTR_STOP_DET	0x200
+ #define DW_IC_INTR_START_DET	0x400
+ #define DW_IC_INTR_GEN_CALL	0x800
++#define	DW_IC_RESETS		0x804
++# define	DW_IC_RESETS_FUNC	BIT(0)
++# define	DW_IC_RESETS_APB	BIT(1)
++#define	DW_IC_GENERAL		0x808
+ 
+ #define DW_IC_INTR_DEFAULT_MASK		(DW_IC_INTR_RX_FULL | \
+ 					 DW_IC_INTR_TX_EMPTY | \
+@@ -288,6 +292,27 @@ int i2c_dw_init(struct dw_i2c_dev *dev)
+ 	u32 input_clock_khz;
+ 	u32 hcnt, lcnt;
+ 	u32 reg;
++	int timeout = TIMEOUT;
++
++	do {
++		/*
++		 * We need to reset the controller if it's not accessible
++		 */
++		if (dw_readl(dev, DW_IC_COMP_TYPE) == DW_IC_COMP_TYPE_VALUE)
++			break;
++		/*
++		 * reset apb and clock domain
++		 */
++		dw_writel(dev, 0, DW_IC_RESETS);
++		dw_writel(dev, 0, DW_IC_GENERAL);
++		usleep_range(10, 100);
++		dw_writel(dev, DW_IC_RESETS_APB | DW_IC_RESETS_FUNC,
++				DW_IC_RESETS);
++		usleep_range(10, 100);
++	} while (timeout--);
++
++	if (unlikely(timeout == 0))
++		dev_err(dev->dev, "controller time out\n");
+ 
+ 	input_clock_khz = dev->get_clk_rate_khz(dev);
+ 

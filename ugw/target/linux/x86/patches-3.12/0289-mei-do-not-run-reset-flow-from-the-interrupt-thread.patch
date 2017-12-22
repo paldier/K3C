@@ -1,0 +1,662 @@
+From ead8cd5e59bdbd2204799e91f60031a74e72efb4 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Wed, 8 Jan 2014 20:19:21 +0200
+Subject: [PATCH 289/441] mei: do not run reset flow from the interrupt thread
+
+This fixes a potential deadlock in case of a firmware
+initiated reset
+
+mei_reset has a dialog with the interrupt thread hence
+it has to be run from an another work item
+
+Most of the mei_resets were called from mei_hbm_dispatch
+which is called in interrupt thread context so this
+function underwent major revamp. The error code is
+propagated to the interrupt thread and if needed
+the reset is scheduled from there.
+
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 544f94601409653f07ae6e22d4a39e3a90dceead)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/hbm.c       | 200 +++++++++++++++++++++++++++----------------
+ drivers/misc/mei/hbm.h       |   6 +-
+ drivers/misc/mei/hw-me.c     |  25 +++---
+ drivers/misc/mei/init.c      | 100 +++++++++++++---------
+ drivers/misc/mei/interrupt.c |   9 +-
+ drivers/misc/mei/mei_dev.h   |   1 +
+ 6 files changed, 208 insertions(+), 133 deletions(-)
+
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -28,9 +28,9 @@
+  *
+  * @dev: the device structure
+  *
+- * returns none.
++ * returns 0 on success -ENOMEM on allocation failure
+  */
+-static void mei_hbm_me_cl_allocate(struct mei_device *dev)
++static int mei_hbm_me_cl_allocate(struct mei_device *dev)
+ {
+ 	struct mei_me_client *clients;
+ 	int b;
+@@ -44,7 +44,7 @@ static void mei_hbm_me_cl_allocate(struc
+ 		dev->me_clients_num++;
+ 
+ 	if (dev->me_clients_num == 0)
+-		return;
++		return 0;
+ 
+ 	kfree(dev->me_clients);
+ 	dev->me_clients = NULL;
+@@ -56,12 +56,10 @@ static void mei_hbm_me_cl_allocate(struc
+ 			sizeof(struct mei_me_client), GFP_KERNEL);
+ 	if (!clients) {
+ 		dev_err(&dev->pdev->dev, "memory allocation for ME clients failed.\n");
+-		dev->dev_state = MEI_DEV_RESETTING;
+-		mei_reset(dev, 1);
+-		return;
++		return -ENOMEM;
+ 	}
+ 	dev->me_clients = clients;
+-	return;
++	return 0;
+ }
+ 
+ /**
+@@ -148,7 +146,7 @@ int mei_hbm_start_wait(struct mei_device
+ 	mutex_unlock(&dev->device_lock);
+ 	ret = wait_event_interruptible_timeout(dev->wait_recvd_msg,
+ 			dev->hbm_state == MEI_HBM_IDLE ||
+-			dev->hbm_state > MEI_HBM_START,
++			dev->hbm_state >= MEI_HBM_STARTED,
+ 			mei_secs_to_jiffies(MEI_INTEROP_TIMEOUT));
+ 	mutex_lock(&dev->device_lock);
+ 
+@@ -164,12 +162,15 @@ int mei_hbm_start_wait(struct mei_device
+  * mei_hbm_start_req - sends start request message.
+  *
+  * @dev: the device structure
++ *
++ * returns 0 on success and < 0 on failure
+  */
+ int mei_hbm_start_req(struct mei_device *dev)
+ {
+ 	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
+ 	struct hbm_host_version_request *start_req;
+ 	const size_t len = sizeof(struct hbm_host_version_request);
++	int ret;
+ 
+ 	mei_hbm_hdr(mei_hdr, len);
+ 
+@@ -181,12 +182,13 @@ int mei_hbm_start_req(struct mei_device
+ 	start_req->host_version.minor_version = HBM_MINOR_VERSION;
+ 
+ 	dev->hbm_state = MEI_HBM_IDLE;
+-	if (mei_write_message(dev, mei_hdr, dev->wr_msg.data)) {
+-		dev_err(&dev->pdev->dev, "version message write failed\n");
+-		dev->dev_state = MEI_DEV_RESETTING;
+-		mei_reset(dev, 1);
+-		return -EIO;
++	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
++	if (ret) {
++		dev_err(&dev->pdev->dev, "version message write failed: ret = %d\n",
++			ret);
++		return ret;
+ 	}
++
+ 	dev->hbm_state = MEI_HBM_START;
+ 	dev->init_clients_timer = MEI_CLIENTS_INIT_TIMEOUT;
+ 	return 0;
+@@ -197,13 +199,15 @@ int mei_hbm_start_req(struct mei_device
+  *
+  * @dev: the device structure
+  *
+- * returns none.
++ * returns 0 on success and < 0 on failure
+  */
+-static void mei_hbm_enum_clients_req(struct mei_device *dev)
++static int mei_hbm_enum_clients_req(struct mei_device *dev)
+ {
+ 	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
+ 	struct hbm_host_enum_request *enum_req;
+ 	const size_t len = sizeof(struct hbm_host_enum_request);
++	int ret;
++
+ 	/* enumerate clients */
+ 	mei_hbm_hdr(mei_hdr, len);
+ 
+@@ -211,14 +215,15 @@ static void mei_hbm_enum_clients_req(str
+ 	memset(enum_req, 0, len);
+ 	enum_req->hbm_cmd = HOST_ENUM_REQ_CMD;
+ 
+-	if (mei_write_message(dev, mei_hdr, dev->wr_msg.data)) {
+-		dev->dev_state = MEI_DEV_RESETTING;
+-		dev_err(&dev->pdev->dev, "enumeration request write failed.\n");
+-		mei_reset(dev, 1);
++	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
++	if (ret) {
++		dev_err(&dev->pdev->dev, "enumeration request write failed: ret = %d.\n",
++			ret);
++		return ret;
+ 	}
+ 	dev->hbm_state = MEI_HBM_ENUM_CLIENTS;
+ 	dev->init_clients_timer = MEI_CLIENTS_INIT_TIMEOUT;
+-	return;
++	return 0;
+ }
+ 
+ /**
+@@ -226,7 +231,7 @@ static void mei_hbm_enum_clients_req(str
+  *
+  * @dev: the device structure
+  *
+- * returns none.
++ * returns 0 on success and < 0 on failure
+  */
+ 
+ static int mei_hbm_prop_req(struct mei_device *dev)
+@@ -237,7 +242,7 @@ static int mei_hbm_prop_req(struct mei_d
+ 	const size_t len = sizeof(struct hbm_props_request);
+ 	unsigned long next_client_index;
+ 	unsigned long client_num;
+-
++	int ret;
+ 
+ 	client_num = dev->me_client_presentation_num;
+ 
+@@ -264,12 +269,11 @@ static int mei_hbm_prop_req(struct mei_d
+ 	prop_req->hbm_cmd = HOST_CLIENT_PROPERTIES_REQ_CMD;
+ 	prop_req->address = next_client_index;
+ 
+-	if (mei_write_message(dev, mei_hdr, dev->wr_msg.data)) {
+-		dev->dev_state = MEI_DEV_RESETTING;
+-		dev_err(&dev->pdev->dev, "properties request write failed\n");
+-		mei_reset(dev, 1);
+-
+-		return -EIO;
++	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
++	if (ret) {
++		dev_err(&dev->pdev->dev, "properties request write failed: ret = %d\n",
++			ret);
++		return ret;
+ 	}
+ 
+ 	dev->init_clients_timer = MEI_CLIENTS_INIT_TIMEOUT;
+@@ -570,8 +574,10 @@ bool mei_hbm_version_is_supported(struct
+  *
+  * @dev: the device structure
+  * @mei_hdr: header of bus message
++ *
++ * returns 0 on success and < 0 on failure
+  */
+-void mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr)
++int mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr)
+ {
+ 	struct mei_bus_message *mei_msg;
+ 	struct mei_me_client *me_client;
+@@ -598,6 +604,10 @@ void mei_hbm_dispatch(struct mei_device
+ 
+ 	switch (mei_msg->hbm_cmd) {
+ 	case HOST_START_RES_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: start: response message received.\n");
++
++		dev->init_clients_timer = 0;
++
+ 		version_res = (struct hbm_host_version_response *)mei_msg;
+ 
+ 		dev_dbg(&dev->pdev->dev, "HBM VERSION: DRIVER=%02d:%02d DEVICE=%02d:%02d\n",
+@@ -616,73 +626,89 @@ void mei_hbm_dispatch(struct mei_device
+ 		}
+ 
+ 		if (!mei_hbm_version_is_supported(dev)) {
+-			dev_warn(&dev->pdev->dev, "hbm version mismatch: stopping the driver.\n");
++			dev_warn(&dev->pdev->dev, "hbm: start: version mismatch - stopping the driver.\n");
+ 
+-			dev->hbm_state = MEI_HBM_STOP;
++			dev->hbm_state = MEI_HBM_STOPPED;
+ 			mei_hbm_stop_req_prepare(dev, &dev->wr_msg.hdr,
+ 						dev->wr_msg.data);
+-			mei_write_message(dev, &dev->wr_msg.hdr,
+-					dev->wr_msg.data);
++			if (mei_write_message(dev, &dev->wr_msg.hdr,
++					dev->wr_msg.data)) {
++				dev_err(&dev->pdev->dev, "hbm: start: failed to send stop request\n");
++				return -EIO;
++			}
++			break;
++		}
+ 
+-			return;
++		if (dev->dev_state != MEI_DEV_INIT_CLIENTS ||
++		    dev->hbm_state != MEI_HBM_START) {
++			dev_err(&dev->pdev->dev, "hbm: start: state mismatch, [%d, %d]\n",
++				dev->dev_state, dev->hbm_state);
++			return -EPROTO;
+ 		}
+ 
+-		if (dev->dev_state == MEI_DEV_INIT_CLIENTS &&
+-		    dev->hbm_state == MEI_HBM_START) {
+-			dev->init_clients_timer = 0;
+-			mei_hbm_enum_clients_req(dev);
+-		} else {
+-			dev_err(&dev->pdev->dev, "reset: wrong host start response\n");
+-			mei_reset(dev, 1);
+-			return;
++		dev->hbm_state = MEI_HBM_STARTED;
++
++		if (mei_hbm_enum_clients_req(dev)) {
++			dev_err(&dev->pdev->dev, "hbm: start: failed to send enumeration request\n");
++			return -EIO;
+ 		}
+ 
+ 		wake_up_interruptible(&dev->wait_recvd_msg);
+-		dev_dbg(&dev->pdev->dev, "host start response message received.\n");
+ 		break;
+ 
+ 	case CLIENT_CONNECT_RES_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: client connect response: message received.\n");
++
+ 		connect_res = (struct hbm_client_connect_response *) mei_msg;
+ 		mei_hbm_cl_connect_res(dev, connect_res);
+-		dev_dbg(&dev->pdev->dev, "client connect response message received.\n");
+ 		wake_up(&dev->wait_recvd_msg);
+ 		break;
+ 
+ 	case CLIENT_DISCONNECT_RES_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: client disconnect response: message received.\n");
++
+ 		disconnect_res = (struct hbm_client_connect_response *) mei_msg;
+ 		mei_hbm_cl_disconnect_res(dev, disconnect_res);
+-		dev_dbg(&dev->pdev->dev, "client disconnect response message received.\n");
+ 		wake_up(&dev->wait_recvd_msg);
+ 		break;
+ 
+ 	case MEI_FLOW_CONTROL_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: client flow control response: message received.\n");
++
+ 		flow_control = (struct hbm_flow_control *) mei_msg;
+ 		mei_hbm_cl_flow_control_res(dev, flow_control);
+-		dev_dbg(&dev->pdev->dev, "client flow control response message received.\n");
+ 		break;
+ 
+ 	case HOST_CLIENT_PROPERTIES_RES_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: properties response: message received.\n");
++
++		dev->init_clients_timer = 0;
++
++		if (dev->me_clients == NULL) {
++			dev_err(&dev->pdev->dev, "hbm: properties response: mei_clients not allocated\n");
++			return -EPROTO;
++		}
++
+ 		props_res = (struct hbm_props_response *)mei_msg;
+ 		me_client = &dev->me_clients[dev->me_client_presentation_num];
+ 
+-		if (props_res->status || !dev->me_clients) {
+-			dev_err(&dev->pdev->dev, "reset: properties response hbm wrong status.\n");
+-			mei_reset(dev, 1);
+-			return;
++		if (props_res->status) {
++			dev_err(&dev->pdev->dev, "hbm: properties response: wrong status = %d\n",
++				props_res->status);
++			return -EPROTO;
+ 		}
+ 
+ 		if (me_client->client_id != props_res->address) {
+-			dev_err(&dev->pdev->dev, "reset: host properties response address mismatch\n");
+-			mei_reset(dev, 1);
+-			return;
++			dev_err(&dev->pdev->dev, "hbm: properties response: address mismatch %d ?= %d\n",
++				me_client->client_id, props_res->address);
++			return -EPROTO;
+ 		}
+ 
+ 		if (dev->dev_state != MEI_DEV_INIT_CLIENTS ||
+ 		    dev->hbm_state != MEI_HBM_CLIENT_PROPERTIES) {
+-			dev_err(&dev->pdev->dev, "reset: unexpected properties response\n");
+-			mei_reset(dev, 1);
+-
+-			return;
++			dev_err(&dev->pdev->dev, "hbm: properties response: state mismatch, [%d, %d]\n",
++				dev->dev_state, dev->hbm_state);
++			return -EPROTO;
+ 		}
+ 
+ 		me_client->props = props_res->client_properties;
+@@ -690,49 +716,70 @@ void mei_hbm_dispatch(struct mei_device
+ 		dev->me_client_presentation_num++;
+ 
+ 		/* request property for the next client */
+-		mei_hbm_prop_req(dev);
++		if (mei_hbm_prop_req(dev))
++			return -EIO;
+ 
+ 		break;
+ 
+ 	case HOST_ENUM_RES_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: enumeration response: message received\n");
++
++		dev->init_clients_timer = 0;
++
+ 		enum_res = (struct hbm_host_enum_response *) mei_msg;
+ 		BUILD_BUG_ON(sizeof(dev->me_clients_map)
+ 				< sizeof(enum_res->valid_addresses));
+ 		memcpy(dev->me_clients_map, enum_res->valid_addresses,
+ 			sizeof(enum_res->valid_addresses));
+-		if (dev->dev_state == MEI_DEV_INIT_CLIENTS &&
+-		    dev->hbm_state == MEI_HBM_ENUM_CLIENTS) {
+-				dev->init_clients_timer = 0;
+-				mei_hbm_me_cl_allocate(dev);
+-				dev->hbm_state = MEI_HBM_CLIENT_PROPERTIES;
+ 
+-				/* first property reqeust */
+-				mei_hbm_prop_req(dev);
+-		} else {
+-			dev_err(&dev->pdev->dev, "reset: unexpected enumeration response hbm.\n");
+-			mei_reset(dev, 1);
+-			return;
++		if (dev->dev_state != MEI_DEV_INIT_CLIENTS ||
++		    dev->hbm_state != MEI_HBM_ENUM_CLIENTS) {
++			dev_err(&dev->pdev->dev, "hbm: enumeration response: state mismatch, [%d, %d]\n",
++				dev->dev_state, dev->hbm_state);
++			return -EPROTO;
++		}
++
++		if (mei_hbm_me_cl_allocate(dev)) {
++			dev_err(&dev->pdev->dev, "hbm: enumeration response: cannot allocate clients array\n");
++			return -ENOMEM;
+ 		}
++
++		dev->hbm_state = MEI_HBM_CLIENT_PROPERTIES;
++
++		/* first property request */
++		if (mei_hbm_prop_req(dev))
++			return -EIO;
++
+ 		break;
+ 
+ 	case HOST_STOP_RES_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: stop response: message received\n");
++
++		dev->init_clients_timer = 0;
++
++		if (dev->hbm_state != MEI_HBM_STOPPED) {
++			dev_err(&dev->pdev->dev, "hbm: stop response: state mismatch, [%d, %d]\n",
++				dev->dev_state, dev->hbm_state);
++			return -EPROTO;
++		}
+ 
+-		if (dev->hbm_state != MEI_HBM_STOP)
+-			dev_err(&dev->pdev->dev, "unexpected stop response hbm.\n");
+ 		dev->dev_state = MEI_DEV_DISABLED;
+-		dev_info(&dev->pdev->dev, "reset: FW stop response.\n");
+-		mei_reset(dev, 1);
++		dev_info(&dev->pdev->dev, "hbm: stop response: resetting.\n");
++		/* force the reset */
++		return -EPROTO;
+ 		break;
+ 
+ 	case CLIENT_DISCONNECT_REQ_CMD:
+-		/* search for client */
++		dev_dbg(&dev->pdev->dev, "hbm: disconnect request: message received\n");
++
+ 		disconnect_req = (struct hbm_client_connect_request *)mei_msg;
+ 		mei_hbm_fw_disconnect_req(dev, disconnect_req);
+ 		break;
+ 
+ 	case ME_STOP_REQ_CMD:
++		dev_dbg(&dev->pdev->dev, "hbm: stop request: message received\n");
+ 
+-		dev->hbm_state = MEI_HBM_STOP;
++		dev->hbm_state = MEI_HBM_STOPPED;
+ 		mei_hbm_stop_req_prepare(dev, &dev->wr_ext_msg.hdr,
+ 					dev->wr_ext_msg.data);
+ 		break;
+@@ -741,5 +788,6 @@ void mei_hbm_dispatch(struct mei_device
+ 		break;
+ 
+ 	}
++	return 0;
+ }
+ 
+--- a/drivers/misc/mei/hbm.h
++++ b/drivers/misc/mei/hbm.h
+@@ -32,13 +32,13 @@ struct mei_cl;
+ enum mei_hbm_state {
+ 	MEI_HBM_IDLE = 0,
+ 	MEI_HBM_START,
++	MEI_HBM_STARTED,
+ 	MEI_HBM_ENUM_CLIENTS,
+ 	MEI_HBM_CLIENT_PROPERTIES,
+-	MEI_HBM_STARTED,
+-	MEI_HBM_STOP,
++	MEI_HBM_STOPPED,
+ };
+ 
+-void mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr);
++int mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr);
+ 
+ static inline void mei_hbm_hdr(struct mei_msg_hdr *hdr, size_t length)
+ {
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -483,7 +483,7 @@ irqreturn_t mei_me_irq_thread_handler(in
+ 	struct mei_device *dev = (struct mei_device *) dev_id;
+ 	struct mei_cl_cb complete_list;
+ 	s32 slots;
+-	int rets;
++	int rets = 0;
+ 
+ 	dev_dbg(&dev->pdev->dev, "function called after ISR to handle the interrupt processing.\n");
+ 	/* initialize our complete list */
+@@ -501,10 +501,9 @@ irqreturn_t mei_me_irq_thread_handler(in
+ 	    dev->dev_state != MEI_DEV_INITIALIZING &&
+ 	    dev->dev_state != MEI_DEV_POWER_DOWN &&
+ 	    dev->dev_state != MEI_DEV_POWER_UP) {
+-		dev_dbg(&dev->pdev->dev, "FW not ready.\n");
+-		mei_reset(dev, 1);
+-		mutex_unlock(&dev->device_lock);
+-		return IRQ_HANDLED;
++		dev_warn(&dev->pdev->dev, "FW not ready: resetting.\n");
++		schedule_work(&dev->reset_work);
++		goto end;
+ 	}
+ 
+ 	/*  check if we need to start the dev */
+@@ -526,21 +525,23 @@ irqreturn_t mei_me_irq_thread_handler(in
+ 		/* we have urgent data to send so break the read */
+ 		if (dev->wr_ext_msg.hdr.length)
+ 			break;
+-		dev_dbg(&dev->pdev->dev, "slots =%08x\n", slots);
+-		dev_dbg(&dev->pdev->dev, "call mei_irq_read_handler.\n");
++		dev_dbg(&dev->pdev->dev, "slots to read = %08x\n", slots);
+ 		rets = mei_irq_read_handler(dev, &complete_list, &slots);
+-		if (rets)
++		if (rets) {
++			schedule_work(&dev->reset_work);
+ 			goto end;
++		}
+ 	}
++
+ 	rets = mei_irq_write_handler(dev, &complete_list);
+-end:
+-	dev_dbg(&dev->pdev->dev, "end of bottom half function.\n");
+-	dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
+ 
+-	mutex_unlock(&dev->device_lock);
++	dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
+ 
+ 	mei_irq_compl_handler(dev, &complete_list);
+ 
++end:
++	dev_dbg(&dev->pdev->dev, "interrupt thread end ret = %d\n", rets);
++	mutex_unlock(&dev->device_lock);
+ 	return IRQ_HANDLED;
+ }
+ static const struct mei_hw_ops mei_me_hw_ops = {
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -43,42 +43,6 @@ const char *mei_dev_state_str(int state)
+ #undef MEI_DEV_STATE
+ }
+ 
+-void mei_device_init(struct mei_device *dev)
+-{
+-	/* setup our list array */
+-	INIT_LIST_HEAD(&dev->file_list);
+-	INIT_LIST_HEAD(&dev->device_list);
+-	mutex_init(&dev->device_lock);
+-	init_waitqueue_head(&dev->wait_hw_ready);
+-	init_waitqueue_head(&dev->wait_recvd_msg);
+-	init_waitqueue_head(&dev->wait_stop_wd);
+-	dev->dev_state = MEI_DEV_INITIALIZING;
+-
+-	mei_io_list_init(&dev->read_list);
+-	mei_io_list_init(&dev->write_list);
+-	mei_io_list_init(&dev->write_waiting_list);
+-	mei_io_list_init(&dev->ctrl_wr_list);
+-	mei_io_list_init(&dev->ctrl_rd_list);
+-
+-	INIT_DELAYED_WORK(&dev->timer_work, mei_timer);
+-	INIT_WORK(&dev->init_work, mei_host_client_init);
+-
+-	INIT_LIST_HEAD(&dev->wd_cl.link);
+-	INIT_LIST_HEAD(&dev->iamthif_cl.link);
+-	mei_io_list_init(&dev->amthif_cmd_list);
+-	mei_io_list_init(&dev->amthif_rd_complete_list);
+-
+-	bitmap_zero(dev->host_clients_map, MEI_CLIENTS_MAX);
+-	dev->open_handle_count = 0;
+-
+-	/*
+-	 * Reserving the first client ID
+-	 * 0: Reserved for MEI Bus Message communications
+-	 */
+-	bitmap_set(dev->host_clients_map, 0, 1);
+-}
+-EXPORT_SYMBOL_GPL(mei_device_init);
+-
+ /**
+  * mei_start - initializes host and fw to start work.
+  *
+@@ -131,10 +95,15 @@ err:
+ }
+ EXPORT_SYMBOL_GPL(mei_start);
+ 
+-
++/**
++ * mei_cancel_work. Cancel mei background jobs
++ *
++ * @dev: the device structure
++ */
+ void mei_cancel_work(struct mei_device *dev)
+ {
+ 	cancel_work_sync(&dev->init_work);
++	cancel_work_sync(&dev->reset_work);
+ 
+ 	cancel_delayed_work(&dev->timer_work);
+ }
+@@ -222,11 +191,27 @@ void mei_reset(struct mei_device *dev, i
+ 
+ 	dev->dev_state = MEI_DEV_INIT_CLIENTS;
+ 
+-	mei_hbm_start_req(dev);
+-
++	ret = mei_hbm_start_req(dev);
++	if (ret) {
++		dev_err(&dev->pdev->dev, "hbm_start failed disabling the device\n");
++		dev->dev_state = MEI_DEV_DISABLED;
++		return;
++	}
+ }
+ EXPORT_SYMBOL_GPL(mei_reset);
+ 
++static void mei_reset_work(struct work_struct *work)
++{
++	struct mei_device *dev =
++		container_of(work, struct mei_device,  reset_work);
++
++	mutex_lock(&dev->device_lock);
++
++	mei_reset(dev, true);
++
++	mutex_unlock(&dev->device_lock);
++}
++
+ void mei_stop(struct mei_device *dev)
+ {
+ 	dev_dbg(&dev->pdev->dev, "stopping the device.\n");
+@@ -252,3 +237,40 @@ EXPORT_SYMBOL_GPL(mei_stop);
+ 
+ 
+ 
++void mei_device_init(struct mei_device *dev)
++{
++	/* setup our list array */
++	INIT_LIST_HEAD(&dev->file_list);
++	INIT_LIST_HEAD(&dev->device_list);
++	mutex_init(&dev->device_lock);
++	init_waitqueue_head(&dev->wait_hw_ready);
++	init_waitqueue_head(&dev->wait_recvd_msg);
++	init_waitqueue_head(&dev->wait_stop_wd);
++	dev->dev_state = MEI_DEV_INITIALIZING;
++
++	mei_io_list_init(&dev->read_list);
++	mei_io_list_init(&dev->write_list);
++	mei_io_list_init(&dev->write_waiting_list);
++	mei_io_list_init(&dev->ctrl_wr_list);
++	mei_io_list_init(&dev->ctrl_rd_list);
++
++	INIT_DELAYED_WORK(&dev->timer_work, mei_timer);
++	INIT_WORK(&dev->init_work, mei_host_client_init);
++	INIT_WORK(&dev->reset_work, mei_reset_work);
++
++	INIT_LIST_HEAD(&dev->wd_cl.link);
++	INIT_LIST_HEAD(&dev->iamthif_cl.link);
++	mei_io_list_init(&dev->amthif_cmd_list);
++	mei_io_list_init(&dev->amthif_rd_complete_list);
++
++	bitmap_zero(dev->host_clients_map, MEI_CLIENTS_MAX);
++	dev->open_handle_count = 0;
++
++	/*
++	 * Reserving the first client ID
++	 * 0: Reserved for MEI Bus Message communications
++	 */
++	bitmap_set(dev->host_clients_map, 0, 1);
++}
++EXPORT_SYMBOL_GPL(mei_device_init);
++
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -329,9 +329,12 @@ int mei_irq_read_handler(struct mei_devi
+ 
+ 	/*  HBM message */
+ 	if (mei_hdr->host_addr == 0 && mei_hdr->me_addr == 0) {
+-		mei_hbm_dispatch(dev, mei_hdr);
+-		ret = 0;
+-		dev_dbg(&dev->pdev->dev, "mei_hbm_dispatch.\n");
++		ret = mei_hbm_dispatch(dev, mei_hdr);
++		if (ret) {
++			dev_dbg(&dev->pdev->dev, "mei_hbm_dispatch failed ret = %d\n",
++					ret);
++			goto end;
++		}
+ 		goto reset_slots;
+ 	}
+ 
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -428,6 +428,7 @@ struct mei_device {
+ 	bool iamthif_canceled;
+ 
+ 	struct work_struct init_work;
++	struct work_struct reset_work;
+ 
+ 	/* List of bus devices */
+ 	struct list_head device_list;

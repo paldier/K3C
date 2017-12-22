@@ -1,0 +1,86 @@
+Binary files hostapd-2.6-orig/hostapd/hostapd_debug and hostapd-2.6/hostapd/hostapd_debug differ
+diff -Npur hostapd-2.6-orig/src/ap/gas_serv.c hostapd-2.6/src/ap/gas_serv.c
+--- hostapd-2.6-orig/src/ap/gas_serv.c	2017-03-09 12:56:48.000000000 +0200
++++ hostapd-2.6/src/ap/gas_serv.c	2017-03-09 14:51:00.000000000 +0200
+@@ -27,7 +27,7 @@ static void convert_to_protected_dual(st
+ 
+ 
+ static struct gas_dialog_info *
+-gas_dialog_create(struct hostapd_data *hapd, const u8 *addr, u8 dialog_token)
++gas_dialog_create(struct hostapd_data *hapd, const u8 *addr, u8 dialog_token, u16 comeback_delay)
+ {
+ 	struct sta_info *sta;
+ 	struct gas_dialog_info *dia = NULL;
+@@ -52,9 +52,9 @@ gas_dialog_create(struct hostapd_data *h
+ 		 * The default inactivity is 300 seconds. We don't need
+ 		 * it to be that long.
+ 		 */
+-		ap_sta_session_timeout(hapd, sta, 5);
++		ap_sta_session_timeout(hapd, sta, 5 + ((comeback_delay * 1024) / 1000000));
+ 	} else {
+-		ap_sta_replenish_timeout(hapd, sta, 5);
++		ap_sta_replenish_timeout(hapd, sta, 5 + ((comeback_delay * 1024) / 1000000));
+ 	}
+ 
+ 	if (sta->gas_dialog == NULL) {
+@@ -86,7 +86,7 @@ gas_dialog_create(struct hostapd_data *h
+ 
+ struct gas_dialog_info *
+ gas_serv_dialog_find(struct hostapd_data *hapd, const u8 *addr,
+-		     u8 dialog_token)
++		     u8 dialog_token, u16 comeback_delay)
+ {
+ 	struct sta_info *sta;
+ 	int i;
+@@ -101,7 +101,7 @@ gas_serv_dialog_find(struct hostapd_data
+ 		if (sta->gas_dialog[i].dialog_token != dialog_token ||
+ 		    !sta->gas_dialog[i].valid)
+ 			continue;
+-		ap_sta_replenish_timeout(hapd, sta, 5);
++		ap_sta_replenish_timeout(hapd, sta, 5 +  ((comeback_delay * 1024) / 1000000));
+ 		return &sta->gas_dialog[i];
+ 	}
+ 	wpa_printf(MSG_DEBUG, "ANQP: Could not find dialog for "
+@@ -1315,7 +1315,7 @@ static void gas_serv_req_local_processin
+ 
+ 		wpa_printf(MSG_DEBUG, "ANQP: Too long response to fit in "
+ 			   "initial response - use GAS comeback");
+-		di = gas_dialog_create(hapd, sa, dialog_token);
++		di = gas_dialog_create(hapd, sa, dialog_token, comeback_delay);
+ 		if (!di) {
+ 			wpa_printf(MSG_INFO, "ANQP: Could not create dialog "
+ 				   "for " MACSTR " (dialog token %u)",
+@@ -1482,6 +1482,7 @@ static void gas_serv_rx_gas_comeback_req
+ 	u8 dialog_token;
+ 	size_t frag_len;
+ 	int more = 0;
++	u16 comeback_delay = 1;
+ 
+ 	wpa_hexdump(MSG_DEBUG, "GAS: RX GAS Comeback Request", data, len);
+ 	if (len < 1)
+@@ -1490,7 +1491,12 @@ static void gas_serv_rx_gas_comeback_req
+ 	wpa_msg(hapd->msg_ctx, MSG_DEBUG, "GAS: Dialog Token: %u",
+ 		dialog_token);
+ 
+-	dialog = gas_serv_dialog_find(hapd, sa, dialog_token);
++	if (hapd->conf->gas_comeback_delay) {
++		/* Testing - allow overriding of the delay value */
++		comeback_delay = hapd->conf->gas_comeback_delay;
++	}
++
++	dialog = gas_serv_dialog_find(hapd, sa, dialog_token, comeback_delay);
+ 	if (!dialog) {
+ 		wpa_msg(hapd->msg_ctx, MSG_DEBUG, "GAS: No pending SD "
+ 			"response fragment for " MACSTR " dialog token %u",
+diff -Npur hostapd-2.6-orig/src/ap/gas_serv.h hostapd-2.6/src/ap/gas_serv.h
+--- hostapd-2.6-orig/src/ap/gas_serv.h	2017-03-09 12:56:48.000000000 +0200
++++ hostapd-2.6/src/ap/gas_serv.h	2017-03-09 14:49:42.000000000 +0200
+@@ -79,7 +79,7 @@ struct hostapd_data;
+ 
+ struct gas_dialog_info *
+ gas_serv_dialog_find(struct hostapd_data *hapd, const u8 *addr,
+-		     u8 dialog_token);
++		     u8 dialog_token, u16 comeback_delay);
+ void gas_serv_dialog_clear(struct gas_dialog_info *dialog);
+ 
+ int gas_serv_init(struct hostapd_data *hapd);

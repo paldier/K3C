@@ -1,0 +1,480 @@
+diff -Npur hostapd-2.6-B-orig/src/ap/drv_callbacks.c hostapd-2.6-B/src/ap/drv_callbacks.c
+--- hostapd-2.6-B-orig/src/ap/drv_callbacks.c	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/ap/drv_callbacks.c	2016-11-30 16:36:18.000000000 +0200
+@@ -36,8 +36,25 @@
+ #include "beacon.h"
+ #include "mbo_ap.h"
+ #include "acs.h"
++#include "wmm.h"
+ 
+ 
++/* Must be aligned with drivers wv_wds_sta_info structure */
++struct wv_wds_sta_info
++{
++  u32         max_rssi;
++  u32         sta_flags_mask;
++  u32         sta_flags_set;
++  size_t      assoc_req_ies_len;
++  u16         beacon_interval;
++  const u8    mac_addr[ETH_ALEN];
++  u8          dtim_period;
++  u8          protection;
++  u8          short_preamble;
++  u8          short_slot_time;
++  const u8    assoc_req_ies[0];
++};
++
+ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 			const u8 *req_ies, size_t req_ies_len, int reassoc)
+ {
+@@ -1088,6 +1105,248 @@ static void hostapd_event_ltq_unconnecte
+     unc_sta->rssi[0], unc_sta->rssi[1], unc_sta->rssi[2], unc_sta->rssi[3]);
+ }
+ 
++static u16 check_wmm_wds(struct hostapd_data *hapd, struct sta_info *sta,
++		     const u8 *wmm_ie, size_t wmm_ie_len)
++{
++	sta->flags &= ~WLAN_STA_WMM;
++	sta->qosinfo = 0;
++	if (wmm_ie && hapd->conf->wmm_enabled) {
++		struct wmm_information_element *wmm;
++
++		if (!hostapd_eid_wmm_valid_wds(hapd, wmm_ie, wmm_ie_len)) {
++			hostapd_logger(hapd, sta->addr,
++				       HOSTAPD_MODULE_WPA,
++				       HOSTAPD_LEVEL_DEBUG,
++				       "invalid WMM element in association "
++				       "request");
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++		}
++
++		sta->flags |= WLAN_STA_WMM;
++		wmm = (struct wmm_information_element *) wmm_ie;
++		sta->qosinfo = wmm->qos_info;
++	}
++	return WLAN_STATUS_SUCCESS;
++}
++
++static u16 check_assoc_ies_wds(struct hostapd_data *hapd, struct sta_info *sta,
++			   const u8 *ies, size_t ies_len, int reassoc)
++{
++	struct ieee802_11_elems elems;
++	u16 resp;
++
++	if (ieee802_11_parse_elems(ies, ies_len, &elems, 1) == ParseFailed) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_INFO, "Station sent an invalid "
++			       "association request");
++		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++#if 1 /*FIXME: open question if wmm parameters should be kept */
++	resp = check_wmm_wds(hapd, sta, elems.wmm, elems.wmm_len);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++#endif
++	resp = copy_supp_rates(hapd, sta, &elems);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++#ifdef CONFIG_IEEE80211N
++	resp = copy_sta_ht_capab(hapd, sta, elems.ht_capabilities);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++	if (hapd->iconf->ieee80211n && hapd->iconf->require_ht &&
++	    !(sta->flags & WLAN_STA_HT)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_INFO, "Station does not support "
++			       "mandatory HT PHY - reject association");
++		return WLAN_STATUS_ASSOC_DENIED_NO_HT;
++	}
++#endif /* CONFIG_IEEE80211N */
++
++#ifdef CONFIG_IEEE80211AC
++	if (hapd->iconf->channel > 14) {
++		resp = copy_sta_vht_capab(hapd, sta, elems.vht_capabilities);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++		resp = set_sta_vht_opmode(hapd, sta, elems.vht_opmode_notif);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++		if (hapd->iconf->ieee80211ac && hapd->iconf->require_vht &&
++		    !(sta->flags & WLAN_STA_VHT)) {
++			hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				       HOSTAPD_LEVEL_INFO, "Station does not support "
++				       "mandatory VHT PHY - reject association");
++			return WLAN_STATUS_ASSOC_DENIED_NO_VHT;
++		}
++	}
++#endif /* CONFIG_IEEE80211AC */
++
++	wpa_auth_sta_no_wpa(sta->wpa_sm);
++
++	return WLAN_STATUS_SUCCESS;
++}
++
++static void hostapd_event_ltq_wds_connect_rx(struct hostapd_data *hapd,
++				     const u8 *data, size_t data_len)
++{
++	struct sta_info *sta;
++	struct wv_wds_sta_info *wds_sta = (struct wv_wds_sta_info *)data;
++	struct ieee80211_ht_capabilities ht_cap;
++	struct ieee80211_vht_capabilities vht_cap;
++	u16 resp, i, capab_info = 0;
++	int new_assoc = 1;
++
++	if (data_len != sizeof(*wds_sta) + wds_sta->assoc_req_ies_len) {
++		wpa_printf(MSG_ERROR, "Wrong hostapd_wds_sta_connect data length");
++		return;
++	}
++
++	wpa_printf(MSG_DEBUG, "hostapd_wds_sta_connect " MACSTR, MAC2STR(wds_sta->mac_addr));
++
++	sta = ap_sta_add(hapd, wds_sta->mac_addr);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Unable to handle new sta");
++		hostapd_drv_sta_remove(hapd, wds_sta->mac_addr);
++		return;
++	}
++	sta->flags |= WLAN_STA_AUTH;
++	wpa_printf(MSG_INFO, "RX max_rssi 0x%08x(%d)", wds_sta->max_rssi, wds_sta->max_rssi);
++	sta->ssi_signal = wds_sta->max_rssi;
++
++	resp = check_assoc_ies_wds(hapd, sta, wds_sta->assoc_req_ies, wds_sta->assoc_req_ies_len, 0);
++	if (resp != WLAN_STATUS_SUCCESS) {
++		wpa_printf(MSG_ERROR, "check_assoc_ies_wds() failed");
++		hostapd_drv_sta_remove(hapd, sta->addr);
++		return;
++	}
++
++	if (hostapd_get_aid(hapd, sta) < 0) {
++		hostapd_logger(hapd, wds_sta->mac_addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_INFO, "No room for more AIDs");
++		hostapd_drv_sta_remove(hapd, sta->addr);
++		return;
++	}
++
++	if (wds_sta->short_preamble)
++		capab_info |= WLAN_CAPABILITY_SHORT_PREAMBLE;
++	if (wds_sta->short_slot_time)
++		capab_info |= WLAN_CAPABILITY_SHORT_SLOT_TIME;
++	sta->capability = capab_info;
++
++	if (hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G)
++		sta->flags |= WLAN_STA_NONERP;
++	for (i = 0; i < sta->supported_rates_len; i++) {
++		if ((sta->supported_rates[i] & 0x7f) > 22) {
++			sta->flags &= ~WLAN_STA_NONERP;
++			break;
++		}
++	}
++	if (sta->flags & WLAN_STA_NONERP && !sta->nonerp_set) {
++		sta->nonerp_set = 1;
++		hapd->iface->num_sta_non_erp++;
++		if (hapd->iface->num_sta_non_erp == 1)
++			ieee802_11_set_beacons(hapd->iface);
++	}
++
++	if (!(sta->capability & WLAN_CAPABILITY_SHORT_SLOT_TIME) &&
++	    !sta->no_short_slot_time_set) {
++		sta->no_short_slot_time_set = 1;
++		hapd->iface->num_sta_no_short_slot_time++;
++		if (hapd->iface->current_mode->mode ==
++		    HOSTAPD_MODE_IEEE80211G &&
++		    hapd->iface->num_sta_no_short_slot_time == 1)
++			ieee802_11_set_beacons(hapd->iface);
++	}
++
++	if (sta->capability & WLAN_CAPABILITY_SHORT_PREAMBLE)
++		sta->flags |= WLAN_STA_SHORT_PREAMBLE;
++	else
++		sta->flags &= ~WLAN_STA_SHORT_PREAMBLE;
++
++	if (!(sta->capability & WLAN_CAPABILITY_SHORT_PREAMBLE) &&
++	    !sta->no_short_preamble_set) {
++		sta->no_short_preamble_set = 1;
++		hapd->iface->num_sta_no_short_preamble++;
++		if (hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G
++		    && hapd->iface->num_sta_no_short_preamble == 1)
++			ieee802_11_set_beacons(hapd->iface);
++	}
++
++#ifdef CONFIG_IEEE80211N
++	update_ht_state(hapd, sta);
++#endif /* CONFIG_IEEE80211N */
++
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++		       HOSTAPD_LEVEL_DEBUG,
++		       "association OK (aid %d)", sta->aid);
++
++	/* Stop previous accounting session, if one is started, and allocate
++	 * new session id for the new session. */
++	accounting_sta_stop(hapd, sta);
++
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++		       HOSTAPD_LEVEL_INFO,
++		       "associated (aid %d)",
++		       sta->aid);
++
++	sta->flags |= WLAN_STA_ASSOC_REQ_OK;
++	if (sta->flags & WLAN_STA_ASSOC)
++		new_assoc = 0;
++	sta->flags |= WLAN_STA_ASSOC;
++	sta->flags &= ~WLAN_STA_WNM_SLEEP_MODE;
++
++#if 0
++	/*
++	 * Remove the STA entry in order to make sure the STA PS state gets
++	 * cleared and configuration gets updated in case of reassociation back
++	 * to the same AP.
++	 */
++	hostapd_drv_sta_remove(hapd, sta->addr);
++#endif
++#ifdef CONFIG_IEEE80211N
++	if (sta->flags & WLAN_STA_HT)
++		hostapd_get_ht_capab(hapd, sta->ht_capabilities, &ht_cap);
++#endif /* CONFIG_IEEE80211N */
++#ifdef CONFIG_IEEE80211AC
++	if (sta->flags & WLAN_STA_VHT)
++		hostapd_get_vht_capab(hapd, sta->vht_capabilities, &vht_cap);
++#endif /* CONFIG_IEEE80211AC */
++
++	if (hostapd_sta_add(hapd, sta->addr, sta->aid, sta->capability,
++			    sta->supported_rates, sta->supported_rates_len,
++			    sta->listen_interval,
++			    sta->flags & WLAN_STA_HT ? &ht_cap : NULL,
++			    sta->flags & WLAN_STA_VHT ? &vht_cap : NULL,
++			    sta->flags | WLAN_STA_AUTHORIZED, sta->qosinfo, sta->vht_opmode, 
++			    sta->p2p_ie ? 1 : 0, sta->added_unassoc, sta->last_assoc_req, 
++			    sta->last_assoc_req_len, sta->ssi_signal)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_NOTICE,
++			       "Could not add STA to kernel driver");
++		ap_free_sta(hapd, sta);
++		return;
++	}
++
++	hostapd_set_sta_flags(hapd, sta);
++	hapd->new_assoc_sta_cb(hapd, sta, !new_assoc);
++	ieee802_1x_notify_port_enabled(sta->eapol_sm, 1);
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++		       HOSTAPD_LEVEL_INFO,
++		       "hostapd_wds_sta_connect: WDS STA connected");
++
++}
++
++static void hostapd_event_ltq_wds_disconnect_rx(struct hostapd_data *hapd,
++				     const u8 *data, size_t data_len)
++{
++	struct wv_wds_sta_info *wds_sta = (struct wv_wds_sta_info *)data;
++
++	if (data_len != sizeof(*wds_sta) + wds_sta->assoc_req_ies_len) {
++		wpa_printf(MSG_ERROR, "Wrong hostapd_wds_sta_disconnect data length");
++		return;
++	}
++
++	hostapd_notif_disassoc(hapd, wds_sta->mac_addr);
++}
+ 
+ struct hostapd_channel_data * hostapd_get_mode_channel(
+ 	struct hostapd_iface *iface, unsigned int freq)
+@@ -1378,6 +1637,16 @@ void wpa_supplicant_event(void *ctx, enu
+ 		hostapd_event_ltq_unconnected_sta_rx(hapd,
+ 			&data->ltq_unconnected_sta);
+ 		break;
++	case EVENT_LTQ_WDS_CONNECT:
++		hostapd_event_ltq_wds_connect_rx(hapd,
++			data->ltq_wds_sta_info_data.data,
++			data->ltq_wds_sta_info_data.data_len);
++		break;
++	case EVENT_LTQ_WDS_DISCONNECT:
++		hostapd_event_ltq_wds_disconnect_rx(hapd,
++			data->ltq_wds_sta_info_data.data,
++			data->ltq_wds_sta_info_data.data_len);
++		break;
+ 	case EVENT_ASSOC:
+ 		if (!data)
+ 			return;
+diff -Npur hostapd-2.6-B-orig/src/ap/ieee802_11.c hostapd-2.6-B/src/ap/ieee802_11.c
+--- hostapd-2.6-B-orig/src/ap/ieee802_11.c	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/ap/ieee802_11.c	2016-11-30 13:55:28.000000000 +0200
+@@ -1501,7 +1501,7 @@ static u16 check_wmm(struct hostapd_data
+ }
+ 
+ 
+-static u16 copy_supp_rates(struct hostapd_data *hapd, struct sta_info *sta,
++u16 copy_supp_rates(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   struct ieee802_11_elems *elems)
+ {
+ 	if (!elems->supp_rates) {
+diff -Npur hostapd-2.6-B-orig/src/ap/ieee802_11.h hostapd-2.6-B/src/ap/ieee802_11.h
+--- hostapd-2.6-B-orig/src/ap/ieee802_11.h	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/ap/ieee802_11.h	2016-11-30 13:56:14.000000000 +0200
+@@ -77,6 +77,8 @@ u16 copy_sta_ht_capab(struct hostapd_dat
+ 		      const u8 *ht_capab);
+ u16 copy_sta_vendor_vht(struct hostapd_data *hapd, struct sta_info *sta,
+ 			const u8 *ie, size_t len);
++u16 copy_supp_rates(struct hostapd_data *hapd, struct sta_info *sta,
++			   struct ieee802_11_elems *elems);
+ 
+ void update_ht_state(struct hostapd_data *hapd, struct sta_info *sta);
+ void ht40_intolerant_add(struct hostapd_iface *iface, struct sta_info *sta);
+diff -Npur hostapd-2.6-B-orig/src/ap/wmm.c hostapd-2.6-B/src/ap/wmm.c
+--- hostapd-2.6-B-orig/src/ap/wmm.c	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/ap/wmm.c	2016-11-30 13:24:22.000000000 +0200
+@@ -123,6 +123,31 @@ int hostapd_eid_wmm_valid(struct hostapd
+ 	return 1;
+ }
+ 
++int hostapd_eid_wmm_valid_wds(struct hostapd_data *hapd, const u8 *eid, size_t len)
++{
++	struct wmm_information_element *wmm;
++
++	wpa_hexdump(MSG_MSGDUMP, "WMM IE", eid, len);
++
++	if (len < sizeof(struct wmm_information_element)) {
++		wpa_printf(MSG_DEBUG, "Too short WMM IE (len=%lu)",
++			   (unsigned long) len);
++		return 0;
++	}
++
++	wmm = (struct wmm_information_element *) eid;
++	wpa_printf(MSG_DEBUG, "Validating WMM IE: OUI %02x:%02x:%02x  "
++		   "OUI type %d  OUI sub-type %d  version %d  QoS info 0x%x",
++		   wmm->oui[0], wmm->oui[1], wmm->oui[2], wmm->oui_type,
++		   wmm->oui_subtype, wmm->version, wmm->qos_info);
++	if (wmm->oui_subtype != WMM_OUI_SUBTYPE_PARAMETER_ELEMENT ||
++	    wmm->version != WMM_VERSION) {
++		wpa_printf(MSG_DEBUG, "Unsupported WMM IE Subtype/Version");
++		return 0;
++	}
++
++	return 1;
++}
+ 
+ static void wmm_send_action(struct hostapd_data *hapd, const u8 *addr,
+ 			    const struct wmm_tspec_element *tspec,
+diff -Npur hostapd-2.6-B-orig/src/ap/wmm.h hostapd-2.6-B/src/ap/wmm.h
+--- hostapd-2.6-B-orig/src/ap/wmm.h	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/ap/wmm.h	2016-11-30 13:24:43.000000000 +0200
+@@ -16,6 +16,8 @@ struct wmm_tspec_element;
+ u8 * hostapd_eid_wmm(struct hostapd_data *hapd, u8 *eid);
+ int hostapd_eid_wmm_valid(struct hostapd_data *hapd, const u8 *eid,
+ 			  size_t len);
++int hostapd_eid_wmm_valid_wds(struct hostapd_data *hapd, const u8 *eid,
++			  size_t len);
+ void hostapd_wmm_action(struct hostapd_data *hapd,
+ 			const struct ieee80211_mgmt *mgmt, size_t len);
+ int wmm_process_tspec(struct wmm_tspec_element *tspec);
+diff -Npur hostapd-2.6-B-orig/src/common/ltq-vendor.h hostapd-2.6-B/src/common/ltq-vendor.h
+--- hostapd-2.6-B-orig/src/common/ltq-vendor.h	2016-11-29 16:31:05.000000000 +0200
++++ hostapd-2.6-B/src/common/ltq-vendor.h	2016-11-30 10:23:33.000000000 +0200
+@@ -51,6 +51,8 @@ enum ltq_nl80211_vendor_events {
+   LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS = 1,
+   LTQ_NL80211_VENDOR_EVENT_CHAN_DATA = 2,
+ 	LTQ_NL80211_VENDOR_EVENT_UNCONNECTED_STA = 3,
++	LTQ_NL80211_VENDOR_EVENT_WDS_CONNECT = 4,
++	LTQ_NL80211_VENDOR_EVENT_WDS_DISCONNECT = 5,
+ };
+ 
+ #endif /* LTQ_VENDOR_H */
+diff -Npur hostapd-2.6-B-orig/src/drivers/driver.h hostapd-2.6-B/src/drivers/driver.h
+--- hostapd-2.6-B-orig/src/drivers/driver.h	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/drivers/driver.h	2016-11-30 14:32:32.000000000 +0200
+@@ -4343,6 +4343,8 @@ enum wpa_event_type {
+ 	EVENT_LTQ_FLUSH_STATIONS_RX,
+   EVENT_LTQ_CHAN_DATA,
+ 	EVENT_LTQ_UNCONNECTED_STA_RX,
++	EVENT_LTQ_WDS_CONNECT,
++	EVENT_LTQ_WDS_DISCONNECT,
+ 
+ 	/**
+ 	 * EVENT_SIGNAL_CHANGE - Indicate change in signal strength
+@@ -5137,6 +5139,15 @@ union wpa_event_data {
+ 	} ltq_unconnected_sta;
+ 
+ 	/**
++	   * struct ltq_wds_sta_info_data - Data for
++	   * LTQ_WDS_CONNECT and LTQ_WDS_DISCONNECT
++	   */
++	struct ltq_wds_sta_info_data {
++		const u8 *data;
++		size_t data_len;
++	} ltq_wds_sta_info_data;
++
++	/**
+ 	 * signal_change - Data for EVENT_SIGNAL_CHANGE events
+ 	 */
+ 	struct wpa_signal_info signal_change;
+@@ -5434,6 +5445,23 @@ static inline void drv_event_ltq_unconne
+    wpa_supplicant_event(ctx, EVENT_LTQ_UNCONNECTED_STA_RX, &event);
+ }
+ 
++static inline void drv_event_ltq_wds_connect (void *ctx, const u8 *data, size_t data_len)
++{
++	union wpa_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	event.ltq_wds_sta_info_data.data = data;
++	event.ltq_wds_sta_info_data.data_len = data_len;
++	wpa_supplicant_event(ctx, EVENT_LTQ_WDS_CONNECT, &event);
++}
++
++static inline void drv_event_ltq_wds_disconnect (void *ctx, const u8 *data, size_t data_len)
++{
++	union wpa_event_data event;
++	event.ltq_wds_sta_info_data.data = data;
++	event.ltq_wds_sta_info_data.data_len = data_len;
++	wpa_supplicant_event(ctx, EVENT_LTQ_WDS_DISCONNECT, &event);
++}
++
+ /* driver_common.c */
+ void wpa_scan_results_free(struct wpa_scan_results *res);
+ 
+diff -Npur hostapd-2.6-B-orig/src/drivers/driver_common.c hostapd-2.6-B/src/drivers/driver_common.c
+--- hostapd-2.6-B-orig/src/drivers/driver_common.c	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/drivers/driver_common.c	2016-11-30 15:28:29.000000000 +0200
+@@ -56,6 +56,8 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(LTQ_FLUSH_STATIONS_RX);
+   E2S(LTQ_CHAN_DATA);
+ 	E2S(LTQ_UNCONNECTED_STA_RX);
++	E2S(LTQ_WDS_CONNECT);
++	E2S(LTQ_WDS_DISCONNECT);
+ 	E2S(SIGNAL_CHANGE);
+ 	E2S(INTERFACE_ENABLED);
+ 	E2S(INTERFACE_DISABLED);
+diff -Npur hostapd-2.6-B-orig/src/drivers/driver_nl80211_event.c hostapd-2.6-B/src/drivers/driver_nl80211_event.c
+--- hostapd-2.6-B-orig/src/drivers/driver_nl80211_event.c	2016-11-29 16:31:04.000000000 +0200
++++ hostapd-2.6-B/src/drivers/driver_nl80211_event.c	2016-11-30 12:42:30.000000000 +0200
+@@ -1983,6 +1983,21 @@ static void ltq_nl80211_handle_unconnect
+   	drv_event_ltq_unconnected_sta(drv->ctx, data, len);
+ }
+ 
++static void ltq_nl80211_handle_wds_connect (struct wpa_driver_nl80211_data *drv,
++                           const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive LTQ vendor event: WDS connect, ctx=%p", drv->ctx);
++
++	drv_event_ltq_wds_connect(drv->ctx, data, len);
++}
++
++static void ltq_nl80211_handle_wds_disconnect (struct wpa_driver_nl80211_data *drv,
++                           const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive LTQ vendor event: WDS disconnect, ctx=%p", drv->ctx);
++
++	drv_event_ltq_wds_disconnect(drv->ctx, data, len);
++}
+ 
+ static void nl80211_vendor_event_ltq(struct wpa_driver_nl80211_data *drv,
+ 										u32 subcmd, u8 *data, size_t len)
+@@ -2000,6 +2015,12 @@ static void nl80211_vendor_event_ltq(str
+ 		case LTQ_NL80211_VENDOR_EVENT_UNCONNECTED_STA:
+ 			ltq_nl80211_handle_unconnected_sta(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_WDS_CONNECT:
++			ltq_nl80211_handle_wds_connect(drv, data, len);
++			break;
++		case LTQ_NL80211_VENDOR_EVENT_WDS_DISCONNECT:
++			ltq_nl80211_handle_wds_disconnect(drv, data, len);
++			break;
+        default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported LTQ vendor event %u", subcmd);
+ 			break;

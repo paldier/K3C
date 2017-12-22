@@ -1,0 +1,48 @@
+#!/bin/sh
+
+mount_gw_fs()
+{
+	local MMCBLK="/dev/mmcblk0p6"
+	local target
+
+	if grep -w -q do_overlay /proc/cmdline; then
+		target="/overlay"
+	else
+		target="/mnt/data"
+	fi
+
+	mount -t ext4 $MMCBLK "$target" || {
+		## If the MMCBLK filesystem is not valid then create filesystem
+		mkfs.ext4 -F $MMCBLK
+		mount -t ext4 $MMCBLK "$target"
+		return $?
+	}
+	return 0
+}
+
+do_overlay()
+{
+	if grep -w -q do_overlay /proc/cmdline; then
+		if grep -q overlay /proc/filesystems; then
+			mount -t overlayfs -o lowerdir=/,upperdir=/overlay "overlayfs:/overlay" /mnt && root=/mnt
+		else
+			mount -t mini_fo -o base=/,sto=/overlay "mini_fo:/overlay" /mnt 2>&- && root=/mnt
+		fi
+		mount -o move /proc /mnt/proc && pivot_root /mnt /mnt/rom && {
+			mount -o move /rom/dev /dev
+			mount -o move /rom/sys /sys
+			mount -o move /rom/overlay /overlay
+			mount -o move /rom/tmp /tmp
+		}
+	else
+		echo "Overlay is disabled"
+	fi
+	mount -t ramfs -o nr_inodes=1k,mode=770 /dev/ram /ramdisk && cp -ar /ramdisk_copy/* /ramdisk
+}
+
+set_overlay()
+{
+	mount_gw_fs && do_overlay
+}
+
+boot_hook_add preinit_essential set_overlay

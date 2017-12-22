@@ -1,0 +1,109 @@
+From e5c22f59e574246c23962338f78ddae0391173f2 Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Thu, 12 Sep 2013 10:48:40 -0500
+Subject: [PATCH 068/105] MIPS: bugfix of stack trace dump.
+
+NMI from YAMON doesn't clear BEV and deliver PC in ErrorPC instead of EPC.
+And it can interrupt a kernel itself and that differs for EVA.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Signed-off-by: Steven Hill <Steven.Hill@imgtec.com>
+---
+ arch/mips/kernel/cpu-probe.c |    4 ++--
+ arch/mips/kernel/genex.S     |   16 ++++++++++++++++
+ arch/mips/kernel/traps.c     |   14 ++++++++++++--
+ 3 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+index b0d04a2..42e82c2 100644
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -1056,8 +1056,8 @@ __cpuinit void cpu_report(void)
+ {
+ 	struct cpuinfo_mips *c = &current_cpu_data;
+ 
+-	printk(KERN_INFO "CPU revision is: %08x (%s)\n",
+-	       c->processor_id, cpu_name_string());
++	printk(KERN_INFO "CPU%d revision is: %08x (%s)\n",
++	       smp_processor_id(), c->processor_id, cpu_name_string());
+ 	if (c->options & MIPS_CPU_FPU)
+ 		printk(KERN_INFO "FPU revision is: %08x\n", c->fpu_id);
+ }
+diff --git a/arch/mips/kernel/genex.S b/arch/mips/kernel/genex.S
+index 31fa856..adac3bb 100644
+--- a/arch/mips/kernel/genex.S
++++ b/arch/mips/kernel/genex.S
+@@ -374,10 +374,26 @@ NESTED(except_vec_nmi, 0, sp)
+ NESTED(nmi_handler, PT_SIZE, sp)
+ 	.set	push
+ 	.set	noat
++		/* Clear ERL - restore segment mapping */
++		mfc0	k0, CP0_STATUS
++		ori     k0, k0, ST0_EXL
++		lui     k1, 0xffff & ~(ST0_BEV>>16)
++		ori     k1, k1, 0xffff & ~(ST0_ERL)
++		and     k0, k0, k1
++		mtc0    k0, CP0_STATUS
++		ehb
+ 	SAVE_ALL
+ 	move	a0, sp
+ 	jal	nmi_exception_handler
+ 	RESTORE_ALL
++		/* Set ERL and clear EXL|NMI */
++		mfc0	k0, CP0_STATUS
++		ori     k0, k0, ST0_ERL
++		lui     k1, 0xffff & ~(ST0_NMI>>16)
++		ori     k1, k1, 0xffff & ~(ST0_EXL)
++		and     k0, k0, k1
++		mtc0    k0, CP0_STATUS
++		ehb
+ 	.set	mips3
+ 	eret
+ 	.set	pop
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index 6c00937..62f1fad 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -328,6 +328,7 @@ void show_regs(struct pt_regs *regs)
+ void show_registers(struct pt_regs *regs)
+ {
+ 	const int field = 2 * sizeof(unsigned long);
++	mm_segment_t old_fs = get_fs();
+ 
+ 	__show_regs(regs);
+ 	print_modules();
+@@ -342,9 +343,12 @@ void show_registers(struct pt_regs *regs)
+ 			printk("*HwTLS: %0*lx\n", field, tls);
+ 	}
+ 
++	if (!user_mode(regs))
++		set_fs(KERNEL_DS);
+ 	show_stacktrace(current, regs);
+ 	show_code((unsigned int __user *) regs->cp0_epc);
+ 	printk("\n");
++	set_fs(old_fs);
+ }
+ 
+ static int regs_to_trapnr(struct pt_regs *regs)
+@@ -1447,10 +1451,16 @@ int register_nmi_notifier(struct notifier_block *nb)
+ 
+ void __noreturn nmi_exception_handler(struct pt_regs *regs)
+ {
++	unsigned long epc;
++	char str[100];
++
+ 	raw_notifier_call_chain(&nmi_chain, 0, regs);
+ 	bust_spinlocks(1);
+-	printk("NMI taken!!!!\n");
+-	die("NMI", regs);
++	epc = regs->cp0_epc;
++	snprintf(str, 100, "CPU%d NMI taken, CP0_EPC=%lx (before replacement by CP0_ERROREPC)\n",smp_processor_id(),regs->cp0_epc);
++	regs->cp0_epc = read_c0_errorepc();
++	die(str, regs);
++	regs->cp0_epc = epc;
+ }
+ 
+ #define VECTORSPACING 0x100	/* for EI/VI mode */
+-- 
+1.7.1
+

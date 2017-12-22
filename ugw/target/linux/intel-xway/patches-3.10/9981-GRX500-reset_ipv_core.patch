@@ -1,0 +1,120 @@
+# HG changeset patch
+# Parent 98b2da1ab5ca0ee959905fd7620ac119beef6781
+
+diff --git a/arch/mips/lantiq/grx500_bootcore/Makefile b/arch/mips/lantiq/grx500_bootcore/Makefile
+--- a/arch/mips/lantiq/grx500_bootcore/Makefile
++++ b/arch/mips/lantiq/grx500_bootcore/Makefile
+@@ -1,1 +1,5 @@
+-obj-y := prom.o clk.o irq.o sysctrl.o early_printk.o
++obj-y := prom.o clk.o irq.o sysctrl.o early_printk.o 
++
++ifdef CONFIG_RESET_IAP
++obj-y += interaptiv_reset.o
++endif
+diff --git a/arch/mips/lantiq/grx500_bootcore/interaptiv_reset.c b/arch/mips/lantiq/grx500_bootcore/interaptiv_reset.c
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/lantiq/grx500_bootcore/interaptiv_reset.c
+@@ -0,0 +1,102 @@
++/*
++ *  This program is free software; you can redistribute it and/or modify it
++ *  under the terms of the GNU General Public License version 2 as published
++ *  by the Free Software Foundation.
++ *
++ *  Copyright (C) 2010 John Crispin <blogic@openwrt.org>
++ *  Copyright (C) 2013 Lei Chuanhua <chuanhua.lei@lantiq.com>
++ */
++
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/ioport.h>
++#include <linux/pm.h>
++#include <linux/export.h>
++#include <linux/delay.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
++#include <linux/reset-controller.h>
++#include <asm/reboot.h>
++
++#include <lantiq_soc.h>
++
++#include "prom.h"
++
++/* reset request register */
++#define RCU_RST_REQ		0x0010
++/* reset status register */
++#define RCU_RST_STAT		0x0014
++#define RESET_ADDR CONFIG_IAP_RESET_ADDR
++#define CHIPTOP_SI		0x80000
++#define RCU_IPT_ENDIAN		0x004C
++#define RCU_NGI_ENDIAN		0x005C
++
++#define RCU_MEMBASE		0xb6000000
++
++#define CPU_CLUSTER_RST		0x4
++#define CPU_CLUSTER_RLSE	0x8
++#define APTV_CORE_END		0x1
++#define NGI_ENDIAN_IA_DEF	0xdfffff 
++
++void *ltq_rcu_membase = (void *)RCU_MEMBASE;
++
++/* reset a io domain by hardware control instead of software control */
++void ltq_hw_reset(unsigned int module)
++{
++	ltq_rcu_w32(module, RCU_RST_REQ);
++	while (!(ltq_rcu_r32(RCU_RST_STAT) & module))
++		;
++}
++EXPORT_SYMBOL_GPL(ltq_hw_reset);
++
++void ltq_rcu_w32(uint32_t val, uint32_t reg_off)
++{
++	ltq_w32(val, ltq_rcu_membase + reg_off);
++}
++EXPORT_SYMBOL_GPL(ltq_rcu_w32);
++
++uint32_t ltq_rcu_r32(uint32_t reg_off)
++{
++	return ltq_r32(ltq_rcu_membase + reg_off);
++}
++EXPORT_SYMBOL_GPL(ltq_rcu_r32);
++
++static int32_t __init reset_InterAptiv_cluster(void)
++{
++	uint32_t temp=0;
++
++	if ((ltq_rcu_r32(RCU_RST_STAT) & CPU_CLUSTER_RST)  == 0) { 	// check CPU_CLUSTER_RST
++			ltq_rcu_w32(CPU_CLUSTER_RST,RCU_RST_REQ);  	// set CPU_CLUSTER_RST
++		while ((ltq_rcu_r32(RCU_RST_STAT) & CPU_CLUSTER_RST) == CPU_CLUSTER_RST);  // check CPU_CLUSTER to confirm of reset
++	}
++
++#ifdef CONFIG_CPU_BIG_ENDIAN
++	printk ("Boot InterAptiv Cluster in Big Endian \n");
++	temp = ltq_rcu_r32(CHIPTOP_SI + RCU_IPT_ENDIAN);
++	mips_ihb();
++	ltq_rcu_w32((temp | APTV_CORE_END), (CHIPTOP_SI + RCU_IPT_ENDIAN));
++	
++	temp = ltq_rcu_r32(CHIPTOP_SI + RCU_NGI_ENDIAN);
++	mips_ihb();
++	ltq_rcu_w32((temp | NGI_ENDIAN_IA_DEF),(CHIPTOP_SI + RCU_NGI_ENDIAN));	
++#else
++	printk ("Boot InterAptiv Cluster in Little Endian \n");
++	temp = ltq_rcu_r32(CHIPTOP_SI + RCU_IPT_ENDIAN);
++	mips_ihb();
++	ltq_rcu_w32((temp & ~(APTV_CORE_END)), (CHIPTOP_SI + RCU_IPT_ENDIAN));
++	
++	temp = ltq_rcu_r32(CHIPTOP_SI + RCU_NGI_ENDIAN);
++	mips_ihb();
++	ltq_rcu_w32((temp & ~(NGI_ENDIAN_IA_DEF)), (CHIPTOP_SI + RCU_NGI_ENDIAN));	
++#endif	
++   ltq_w32(RESET_ADDR,(u32 *)0xbf2001e0); // pointer to interaptiv normal entry program
++   ltq_w32(0x56701dcb,(u32 *)0xbf2001f4); // RVEC_INSTALLED
++   ltq_w32(RESET_ADDR,(u32 *)0xbf2001e4); // pointer to interaptiv nmi handling program
++   ltq_w32(0x45601CBA,(u32 *)0xbf2001f8); // NVEC_INSTALLED
++	ltq_rcu_w32(CPU_CLUSTER_RLSE, RCU_RST_REQ); // set CPU_CLUSTER_RLSE
++	printk("After releasing reset\n");
++	//while ((ltq_rcu_r32(RCU_RST_STAT) & 0x8) == 0x8); // Optional :check CPU_CLUSTER_RC for reset complete
++	return 0;
++}
++
++module_init (reset_InterAptiv_cluster);

@@ -1,0 +1,73 @@
+From fbd1ce0f5a523ec33852f1c88f9ac0ca8bf791a3 Mon Sep 17 00:00:00 2001
+From: avelayux <arunkumar.velayutham@intel.com>
+Date: Tue, 5 Apr 2016 18:27:00 -0700
+Subject: [PATCH 380/441] Extend client MRPC call timeout from 200ms to 10000ms
+ to avoid timeout related ATOM crash Owner: Arunkumar Velayutham Extend client
+ MRPC call timeout from 200ms to 10000ms to avoid timeout related ATOM crash.
+
+---
+ drivers/mrpc/core/conntrack_client.c | 13 ++++++++++---
+ drivers/mrpc/core/pp_client.c        |  2 +-
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+--- a/drivers/mrpc/core/conntrack_client.c
++++ b/drivers/mrpc/core/conntrack_client.c
+@@ -108,6 +108,9 @@ struct ct_client_private {
+     struct mrpc_client *mrpc;
+     struct notifier_block ct_event_notifier;
+     struct workqueue_struct *workQ;
++    unsigned int call_success_count;/* number of successful MRPC calls made */
++    unsigned int call_failure_count;/* number of failure  MRPC calls made */
++
+ };
+ 
+ static struct ct_client_private *this;
+@@ -152,15 +155,16 @@ static inline int ct_mrpc_call(__u8 proc
+    }
+ 
+    ret = mrpc_call(priv->mrpc, procid, ct_tuple_info, sizeof(*ct_tuple_info),
+-		   reply, sizeof(*reply), 0, &errcode);
++		   reply, sizeof(*reply), 10000, &errcode);
+ 
+    if (ret || errcode) {
+       pr_err("CONNTRACK_MRPC_CLIENT: ERROR: ret=%d, errcode=%d",ret, errcode);
++      priv->call_failure_count++;
+       return -1;
+    }
+ 
+    DBG("CONNTRACK_MRPC_CLIENT: SUCCESS: reply : %d",ntohl(reply->extend_timeout));
+-
++   priv->call_success_count++;
+    return 0;
+ }
+ 
+@@ -370,7 +374,8 @@ static ssize_t status_show(struct device
+    if(!priv)
+      return -EINVAL;
+ 
+-   return scnprintf(buf, PAGE_SIZE, "status OK\n");
++   return scnprintf(buf, PAGE_SIZE, "status ok.\nMRPC Success : %d\nMRPC Failure : %d\n",
++                                     priv->call_success_count,priv->call_failure_count);
+ 
+ }
+ 
+@@ -427,6 +432,8 @@ static int ct_client_driver_probe(struct
+ 
+   /* register notifier here */
+   atomic_notifier_chain_register(&ct_chain, &ct_info_notifier_block);
++  priv->call_success_count = 0;
++  priv->call_failure_count = 0;
+   this = priv;
+   return 0;
+ 
+--- a/drivers/mrpc/core/pp_client.c
++++ b/drivers/mrpc/core/pp_client.c
+@@ -96,7 +96,7 @@ static inline int pp_mrpc_call(__u8 proc
+         return PP_RC_FAILURE;
+     }
+ 
+-    ret = mrpc_call(priv->mrpc, procid, args, sizeof(*args), NULL, 0, 5000, &errcode);
++    ret = mrpc_call(priv->mrpc, procid, args, sizeof(*args), NULL, 0, 60000, &errcode);
+ 
+     if (ret || errcode) {
+         pr_err("ERROR: ret=%d, errcode=%d", ret, errcode);

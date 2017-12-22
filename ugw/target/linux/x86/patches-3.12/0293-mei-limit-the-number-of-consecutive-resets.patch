@@ -1,0 +1,337 @@
+From 71e2452bb0c9aea93f6c187e083df4f4a4b33899 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Sun, 12 Jan 2014 00:36:10 +0200
+Subject: [PATCH 293/441] mei: limit the number of consecutive resets
+
+give up reseting after 3 unsuccessful tries
+
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 6adb8efb024a7e413b93b22848fc13395b1a438a)
+
+Conflicts:
+
+	drivers/misc/mei/init.c
+
+Change-Id: Iecd6b1ecc3eb92a4f29e3102ca5f164d2d32258a
+---
+ drivers/misc/mei/client.c  |   1 +
+ drivers/misc/mei/init.c    | 194 ++++++++++++++++++++++++++++-----------------
+ drivers/misc/mei/mei_dev.h |   7 ++
+ 3 files changed, 130 insertions(+), 72 deletions(-)
+
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -416,6 +416,7 @@ void mei_host_client_init(struct work_st
+ 	}
+ 
+ 	dev->dev_state = MEI_DEV_ENABLED;
++	dev->reset_count = 0;
+ 
+ 	mutex_unlock(&dev->device_lock);
+ }
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -43,62 +43,13 @@ const char *mei_dev_state_str(int state)
+ #undef MEI_DEV_STATE
+ }
+ 
+-/**
+- * mei_start - initializes host and fw to start work.
+- *
+- * @dev: the device structure
+- *
+- * returns 0 on success, <0 on failure.
+- */
+-int mei_start(struct mei_device *dev)
+-{
+-	mutex_lock(&dev->device_lock);
+-
+-	/* acknowledge interrupt and stop interupts */
+-	mei_clear_interrupts(dev);
+-
+-	mei_hw_config(dev);
+-
+-	dev_dbg(&dev->pdev->dev, "reset in start the mei device.\n");
+-
+-	mei_reset(dev, 1);
+-
+-	if (mei_hbm_start_wait(dev)) {
+-		dev_err(&dev->pdev->dev, "HBM haven't started");
+-		goto err;
+-	}
+-
+-	if (!mei_host_is_ready(dev)) {
+-		dev_err(&dev->pdev->dev, "host is not ready.\n");
+-		goto err;
+-	}
+-
+-	if (!mei_hw_is_ready(dev)) {
+-		dev_err(&dev->pdev->dev, "ME is not ready.\n");
+-		goto err;
+-	}
+-
+-	if (!mei_hbm_version_is_supported(dev)) {
+-		dev_dbg(&dev->pdev->dev, "MEI start failed.\n");
+-		goto err;
+-	}
+-
+-	dev_dbg(&dev->pdev->dev, "link layer has been established.\n");
+-
+-	mutex_unlock(&dev->device_lock);
+-	return 0;
+-err:
+-	dev_err(&dev->pdev->dev, "link layer initialization failed.\n");
+-	dev->dev_state = MEI_DEV_DISABLED;
+-	mutex_unlock(&dev->device_lock);
+-	return -ENODEV;
+-}
+-EXPORT_SYMBOL_GPL(mei_start);
+ 
+ /**
+  * mei_cancel_work. Cancel mei background jobs
+  *
+  * @dev: the device structure
++ *
++ * returns 0 on success or < 0 if the reset hasn't succeeded
+  */
+ void mei_cancel_work(struct mei_device *dev)
+ {
+@@ -113,11 +64,11 @@ EXPORT_SYMBOL_GPL(mei_cancel_work);
+  * mei_reset - resets host and fw.
+  *
+  * @dev: the device structure
+- * @interrupts_enabled: if interrupt should be enabled after reset.
+  */
+-void mei_reset(struct mei_device *dev, int interrupts_enabled)
++int mei_reset(struct mei_device *dev)
+ {
+-	bool unexpected;
++	enum mei_dev_state state = dev->dev_state;
++	bool interrupts_enabled;
+ 	int ret;
+ 
+ 	if (state != MEI_DEV_INITIALIZING &&
+@@ -134,22 +85,23 @@ void mei_reset(struct mei_device *dev, i
+ 	 */
+ 	mei_hbm_idle(dev);
+ 
++	/* enter reset flow */
++	interrupts_enabled = state != MEI_DEV_POWER_DOWN;
++	dev->dev_state = MEI_DEV_RESETTING;
++
+ 	ret = mei_hw_reset(dev, interrupts_enabled);
+ 	/* fall through and remove the sw state even if hw reset has failed */
+ 
+-
+-	if (dev->dev_state != MEI_DEV_INITIALIZING &&
+-	    dev->dev_state != MEI_DEV_POWER_UP) {
+-		if (dev->dev_state != MEI_DEV_DISABLED &&
+-		    dev->dev_state != MEI_DEV_POWER_DOWN)
+-			dev->dev_state = MEI_DEV_RESETTING;
++	/* no need to clean up software state in case of power up */
++	if (state != MEI_DEV_INITIALIZING &&
++	    state != MEI_DEV_POWER_UP) {
+ 
+ 		/* remove all waiting requests */
+ 		mei_cl_all_write_clear(dev);
+ 
+ 		mei_cl_all_disconnect(dev);
+ 
+-		/* wake up all readings so they can be interrupted */
++		/* wake up all readers and writers so they can be interrupted */
+ 		mei_cl_all_wakeup(dev);
+ 
+ 		/* remove entry if already in list */
+@@ -165,33 +117,128 @@ void mei_reset(struct mei_device *dev, i
+ 	dev->rd_msg_hdr = 0;
+ 	dev->wd_pending = false;
+ 
+-	if (!interrupts_enabled) {
+-		dev_dbg(&dev->pdev->dev, "intr not enabled end of reset\n");
++	if (ret) {
++		dev_err(&dev->pdev->dev, "hw_reset failed ret = %d\n", ret);
++		dev->dev_state = MEI_DEV_DISABLED;
++		return ret;
++	}
++
++	if (state == MEI_DEV_POWER_DOWN) {
++		dev_dbg(&dev->pdev->dev, "powering down: end of reset\n");
+ 		dev->dev_state = MEI_DEV_DISABLED;
+-		return;
++		return 0;
+ 	}
+ 
+ 	ret = mei_hw_start(dev);
+ 	if (ret) {
+-		dev_err(&dev->pdev->dev, "hw_start failed disabling the device\n");
++		dev_err(&dev->pdev->dev, "hw_start failed ret = %d\n", ret);
+ 		dev->dev_state = MEI_DEV_DISABLED;
+-		return;
++		return ret;
+ 	}
+ 
+ 	dev_dbg(&dev->pdev->dev, "link is established start sending messages.\n");
+-	/* link is established * start sending messages.  */
+ 
+ 	dev->dev_state = MEI_DEV_INIT_CLIENTS;
+-
+ 	ret = mei_hbm_start_req(dev);
+ 	if (ret) {
+-		dev_err(&dev->pdev->dev, "hbm_start failed disabling the device\n");
++		dev_err(&dev->pdev->dev, "hbm_start failed ret = %d\n", ret);
+ 		dev->dev_state = MEI_DEV_DISABLED;
+-		return;
++		return ret;
+ 	}
++
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(mei_reset);
+ 
++/**
++ * mei_start - initializes host and fw to start work.
++ *
++ * @dev: the device structure
++ *
++ * returns 0 on success, <0 on failure.
++ */
++int mei_start(struct mei_device *dev)
++{
++	mutex_lock(&dev->device_lock);
++
++	/* acknowledge interrupt and stop interrupts */
++	mei_clear_interrupts(dev);
++
++	mei_hw_config(dev);
++
++	dev_dbg(&dev->pdev->dev, "reset in start the mei device.\n");
++
++	dev->dev_state = MEI_DEV_INITIALIZING;
++	dev->reset_count = 0;
++	mei_reset(dev);
++
++	if (dev->dev_state == MEI_DEV_DISABLED) {
++		dev_err(&dev->pdev->dev, "reset failed");
++		goto err;
++	}
++
++	if (mei_hbm_start_wait(dev)) {
++		dev_err(&dev->pdev->dev, "HBM haven't started");
++		goto err;
++	}
++
++	if (!mei_host_is_ready(dev)) {
++		dev_err(&dev->pdev->dev, "host is not ready.\n");
++		goto err;
++	}
++
++	if (!mei_hw_is_ready(dev)) {
++		dev_err(&dev->pdev->dev, "ME is not ready.\n");
++		goto err;
++	}
++
++	if (!mei_hbm_version_is_supported(dev)) {
++		dev_dbg(&dev->pdev->dev, "MEI start failed.\n");
++		goto err;
++	}
++
++	dev_dbg(&dev->pdev->dev, "link layer has been established.\n");
++
++	mutex_unlock(&dev->device_lock);
++	return 0;
++err:
++	dev_err(&dev->pdev->dev, "link layer initialization failed.\n");
++	dev->dev_state = MEI_DEV_DISABLED;
++	mutex_unlock(&dev->device_lock);
++	return -ENODEV;
++}
++EXPORT_SYMBOL_GPL(mei_start);
++
++/**
++ * mei_restart - restart device after suspend
++ *
++ * @dev: the device structure
++ *
++ * returns 0 on success or -ENODEV if the restart hasn't succeeded
++ */
++int mei_restart(struct mei_device *dev)
++{
++	int err;
++
++	mutex_lock(&dev->device_lock);
++
++	mei_clear_interrupts(dev);
++
++	dev->dev_state = MEI_DEV_POWER_UP;
++	dev->reset_count = 0;
++
++	err = mei_reset(dev);
++
++	mutex_unlock(&dev->device_lock);
++
++	if (err || dev->dev_state == MEI_DEV_DISABLED)
++		return -ENODEV;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mei_restart);
++
++
+ static void mei_reset_work(struct work_struct *work)
+ {
+ 	struct mei_device *dev =
+@@ -199,9 +246,12 @@ static void mei_reset_work(struct work_s
+ 
+ 	mutex_lock(&dev->device_lock);
+ 
+-	mei_reset(dev, true);
++	mei_reset(dev);
+ 
+ 	mutex_unlock(&dev->device_lock);
++
++	if (dev->dev_state == MEI_DEV_DISABLED)
++		dev_err(&dev->pdev->dev, "reset failed");
+ }
+ 
+ void mei_stop(struct mei_device *dev)
+@@ -217,7 +267,7 @@ void mei_stop(struct mei_device *dev)
+ 	mei_wd_stop(dev);
+ 
+ 	dev->dev_state = MEI_DEV_POWER_DOWN;
+-	mei_reset(dev, 0);
++	mei_reset(dev);
+ 	/* move device to disabled state unconditionally */
+ 	dev->dev_state = MEI_DEV_DISABLED;
+ 
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -61,6 +61,11 @@ extern const uuid_le mei_wd_guid;
+ #define MEI_CLIENTS_MAX 256
+ 
+ /*
++ * maximum number of consecutive resets
++ */
++#define MEI_MAX_CONSEC_RESET  3
++
++/*
+  * Number of File descriptors/handles
+  * that can be opened to the driver.
+  *
+@@ -327,6 +332,7 @@ struct mei_cl_device {
+ /**
+  * struct mei_device -  MEI private device struct
+ 
++ * @reset_count - limits the number of consecutive resets
+  * @hbm_state - state of host bus message protocol
+  * @mem_addr - mem mapped base register address
+ 
+@@ -370,6 +376,7 @@ struct mei_device {
+ 	/*
+ 	 * mei device  states
+ 	 */
++	unsigned long reset_count;
+ 	enum mei_dev_state dev_state;
+ 	enum mei_hbm_state hbm_state;
+ 	u16 init_clients_timer;

@@ -1,0 +1,406 @@
+--- mini_httpd-1.19/mini_httpd.c	2011-02-07 18:51:49.126498920 -0500
++++ mini_httpd.c	2011-02-07 18:50:36.831374688 -0500
+@@ -81,6 +81,16 @@
+ 
+ #define MAX_MEMORY_BUFF 8192    /* IO buffer */
+ 
++#ifdef CONFIG_PACKAGE_LTQ_CLI //000004:tc.chen
++#define CONFIG_FEATURE_CLI_REQUEST
++#endif //000004:tc.chen
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++#include <sys/un.h>
++#define SOCK_BE_PATH	"/tmp/cli_be_socket"
++int cli_server;
++int ifx_clireq;
++#endif
++
+ typedef struct
+ {
+   char buf[MAX_MEMORY_BUFF];
+@@ -200,6 +210,7 @@
+ static unsigned short port;
+ static char* dir;
+ static char* data_dir;
++static char* cli_dir;
+ static int do_chroot;
+ static int vhost;
+ static char* user;
+@@ -263,24 +274,24 @@
+ static void value_required( char* name, char* value );
+ static void no_value_required( char* name, char* value );
+ static int initialize_listen_socket( usockaddr* usaP );
+-static void handle_request( void );
++static int handle_request( void );
+ static void de_dotdot( char* file );
+ static int get_pathinfo( void );
+-static void do_file( void );
+-static void do_dir( void );
++static int do_file( void );
++static int do_dir( void );
+ #ifdef HAVE_SCANDIR
+ static char* file_details( const char* dir, const char* name );
+ static void strencode( char* to, size_t tosize, const char* from );
+ #endif /* HAVE_SCANDIR */
+-static void do_cgi( void );
++static int do_cgi( void );
+ static void cgi_interpose_input( int wfd );
+ static void post_post_garbage_hack( void );
+ static void cgi_interpose_output( int rfd, int parse_headers );
+ static char** make_argp( void );
+ static char** make_envp( void );
+ static char* build_env( char* fmt, char* arg );
+-static void auth_check( char* dirname );
+-static void send_authenticate( char* realm );
++static int auth_check( char* dirname );
++static int send_authenticate( char* realm );
+ static char* virtual_file( char* file );
+ static int send_error( int s, char* title, char* extra_header, char* text );
+ static void send_error_body( int s, char* title, char* text );
+@@ -329,6 +340,43 @@
+ #endif /* NO_SNPRINTF */
+ 
+ 
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++/****************************************************************************
++ *
++ > $Function: openCLIServer()
++ *
++ * $Description: create a listen server socket on the designated file.
++ *
++ * $Return: (int)  . . . A connection socket. -1 for errors.
++ *
++ * $Errors: None
++ *
++ ****************************************************************************/
++static int openCLIServer(void)
++{
++  int len;
++  int fd;
++  struct sockaddr_un local;
++
++  local.sun_family = PF_UNIX;
++  strcpy(local.sun_path, SOCK_BE_PATH);
++  unlink(local.sun_path);
++  len = strlen(local.sun_path) + sizeof(local.sun_family);
++
++  if ((fd = socket(PF_UNIX, SOCK_STREAM, 0)) >= 0) {
++  if (bind(fd, (struct sockaddr *)&local, len) == 0) {
++      listen(fd, 9);
++      signal(SIGCHLD, SIG_IGN);   /* prevent zombie (defunct) processes */
++    } else {
++	syslog( LOG_CRIT, "cli bind");
++    }
++  } else {
++	syslog( LOG_CRIT, "cli create socket");
++  }
++
++  return fd;
++}
++#endif /* CONFIG_FEATURE_CLI_REQUEST */
+ 
+ /****************************************************************************
+  *
+@@ -402,6 +450,7 @@
+     port = 0;
+     dir = (char*) 0;
+     data_dir = (char*) 0;
++    cli_dir = (char*) 0;
+     do_chroot = 0;
+     vhost = 0;
+     cgi_pattern = (char*) 0;
+@@ -509,6 +558,11 @@
+ 	    ++argn;
+ 	    max_age = atoi( argv[argn] );
+ 	    }
++	else if ( strcmp(argv[argn], "-H" ) == 0 && argn + 1 < argc )
++            {
++            ++argn;
++	    cli_dir = argv[argn];
++	    }
+ 	else
+ 	    usage();
+ 	++argn;
+@@ -613,6 +667,10 @@
+ 	}
+     else
+ 	listen4_fd = -1;
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++       cli_server = openCLIServer();
++     //  set_cloexec_flag (cli_server,1);
++#endif
+     /* If we didn't get any valid sockets, fail. */
+     if ( listen4_fd == -1 && listen6_fd == -1 )
+ 	{
+@@ -828,7 +886,7 @@
+ 	}
+ 
+     /* Switch directories again if requested. */
+-    if ( data_dir != (char*) 0 )
++    /* if ( data_dir != (char*) 0 )
+ 	{
+ 	if ( chdir( data_dir ) < 0 )
+ 	    {
+@@ -836,8 +894,7 @@
+ 	    perror( "data_dir chdir" );
+ 	    exit( 1 );
+ 	    }
+-	}
+-
++	}*/
+     /* If we're root, become someone else. */
+     if ( getuid() == 0 )
+ 	{
+@@ -920,6 +977,18 @@
+ 	    if ( listen6_fd > maxfd )
+ 		maxfd = listen6_fd;
+ 	    }
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++        FD_SET(cli_server, &lfdset );
++	ifx_clireq = 0;
++        if ( select((maxfd > cli_server ? maxfd : cli_server) + 1, &lfdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0) < 0)
++	    {
++	    if ( errno == EINTR || errno == EAGAIN )
++		continue;	/* try again */
++	    syslog( LOG_CRIT, "select - %m" );
++	    perror( "select" );
++	    exit( 1 );
++	    }
++#else
+ 	if ( select( maxfd + 1, &lfdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0 ) < 0 )
+ 	    {
+ 	    if ( errno == EINTR || errno == EAGAIN )
+@@ -928,13 +997,66 @@
+ 	    perror( "select" );
+ 	    exit( 1 );
+ 	    }
+-
++#endif
+ 	/* Accept the new connection. */
+ 	sz = sizeof(usa);
+ 	if ( listen4_fd != -1 && FD_ISSET( listen4_fd, &lfdset ) )
++            {
++            /* Switch directories again if requested. */
++            if ( data_dir != (char*) 0 )
++	    {
++	       if ( chdir( data_dir ) < 0 )
++	       {
++	         syslog( LOG_CRIT, "data_dir chdir - %m" );
++	         perror( "data_dir chdir" );
++	         exit( 1 );
++	       }
++	    }
+ 	    conn_fd = accept( listen4_fd, &usa.sa, &sz );
++            }
+ 	else if ( listen6_fd != -1 && FD_ISSET( listen6_fd, &lfdset ) )
++            {
++            /* Switch directories again if requested. */
++            if ( data_dir != (char*) 0 )
++	    {
++	      if ( chdir( data_dir ) < 0 )
++	      {
++	        syslog( LOG_CRIT, "data_dir chdir - %m" );
++	        perror( "data_dir chdir" );
++	        exit( 1 );
++	      }
++	    }
+ 	    conn_fd = accept( listen6_fd, &usa.sa, &sz );
++            }
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++	else if ( cli_server != -1 && FD_ISSET( cli_server, &lfdset ) )
++	    {
++            int t;
++	    int on;
++            struct sockaddr_un remote;		   
++	    t = sizeof(remote);
++            
++            /* Switch directories again if requested. */
++            if ( cli_dir != (char*) 0 )
++	    {
++	      if ( chdir( cli_dir ) < 0 )
++	      {
++	      syslog( LOG_CRIT, "cli_dir chdir - %m" );
++	      perror( "cli_dir chdir" );
++	      exit( 1 );
++	      }
++	    }
++            conn_fd = accept( cli_server, (struct sockaddr *)&remote, &t );
++            if (conn_fd < 0) 
++            {
++               continue;
++            }
++            ifx_clireq = 1;
++           /*  set the KEEPALIVE option to cull dead connections */
++            on = 1;
++            setsockopt(conn_fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&on, sizeof (on));
++	    }
++#endif
+ 	else
+ 	    {
+ 	    syslog( LOG_CRIT, "select failure" );
+@@ -973,6 +1095,14 @@
+         	(void) close( listen6_fd );*/
+ 	    set_cloexec_flag (conn_fd,1);
+ 	    handle_request();
++	   
++            /* Always chdir to / after a chroot. */
++	    if ( chdir( cwd ) < 0 )
++	    {
++	    syslog( LOG_CRIT, "chroot chdir - %m" );
++	    perror( "chroot chdir" );
++	    exit( 1 );
++	    }
+ 	    /*exit( 0 );*/
+ 	    }
+ 	(void) close( conn_fd );
+@@ -981,6 +1111,9 @@
+             dlclose(dlHandle);
+             syslog( LOG_INFO, "Dlclose completed");
+ 	}
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++        close(cli_server);
++#endif
+     }
+ 
+ 
+@@ -988,9 +1121,9 @@
+ usage( void )
+     {
+ #ifdef USE_SSL
+-    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-S] [-E certfile] [-Y cipher] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
++    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-S] [-E certfile] [-Y cipher] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage] [-H cli_dir]\n", argv0 );
+ #else /* USE_SSL */
+-    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage]\n", argv0 );
++    (void) fprintf( stderr, "usage:  %s [-C configfile] [-D] [-p port] [-d dir] [-dd data_dir] [-c cgipat] [-u user] [-h hostname] [-r] [-v] [-l logfile] [-i pidfile] [-T charset] [-P P3P] [-M maxage] [-H cli_dir]\n", argv0 );
+ #endif /* USE_SSL */
+     exit( 1 );
+     }
+@@ -1058,6 +1191,11 @@
+ 		value_required( name, value );
+ 		data_dir = e_strdup( value );
+ 		}
++            else if ( strcasecmp( name, "cli_dir" ) == 0 )
++                {
++                value_required( name, value );
++                cli_dir = e_strdup( value );
++                }  
+ 	    else if ( strcasecmp( name, "chroot" ) == 0 )
+ 		{
+ 		no_value_required( name, value );
+@@ -1253,7 +1391,7 @@
+ /* This runs in a child process, and exits when done, so cleanup is
+ ** not needed.
+ */
+-static void
++static int
+ handle_request( void )
+     {
+     char* method_str;
+@@ -1342,6 +1480,7 @@
+ 	return send_error( 400, "Bad Request", "", "Can't parse request." );
+     *path++ = '\0';
+     path += strspn( path, " \t\012\015" );
++    de_dotdot( path );
+     protocol = strpbrk( path, " \t\012\015" );
+     if ( protocol == (char*) 0 )
+ 	return send_error( 400, "Bad Request", "", "Can't parse request." );
+@@ -1578,7 +1717,7 @@
+     }
+ 
+ 
+-static void
++static int
+ do_file( void )
+     {
+     /*char buf[10000];*/
+@@ -1675,9 +1814,11 @@
+ 	    memset(buf,0x00,MAX_MEMORY_BUFF);
+ 	    while ((count = my_read(fd, buf,MAX_MEMORY_BUFF-1)) > 0) {
+ 		    if ((strstr(fixed_mime_type,"html") != NULL ) || (strstr(file,"asp") != NULL)
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++			  || (strstr(file,"cli") != NULL)
++#endif
+ 		       ){
+ 			    writtenCount = (*ifx_psendDHTMLFile)(buf,host,count,conn_fd,&bNewFile);
+-			    fsync(conn_fd);
+ 			    if (writtenCount != count && writtenCount >= 0)  {
+ 				    if(lseek(fd,writtenCount - count,SEEK_CUR) == -1){
+ 					    fprintf(stderr,"lseek failed ERROR\n");
+@@ -1696,7 +1837,7 @@
+     }
+ 
+ 
+-static void
++static int
+ do_dir( void )
+     {
+     char *buf = config->buf;
+@@ -1840,7 +1981,7 @@
+ #endif /* HAVE_SCANDIR */
+ 
+ 
+-static void
++static int
+ do_cgi( void )
+     {
+     char** argp;
+@@ -1902,10 +2043,16 @@
+ 	    }
+ 	(void) close( p[1] );
+ 
+-    /*if(ifx_AuthHandler_ptr){
+-          if((*ifx_AuthHandler_ptr)(file,p[0],p[1]) == 1)  
++        if(ifx_AuthHandler_ptr){
++#ifdef CONFIG_FEATURE_CLI_REQUEST
++	  if(ifx_clireq == 0)
++#endif
++          if((*ifx_AuthHandler_ptr)(file,p[0],p[1]) == 1)
++          {  
+             syslog( LOG_INFO, "ifx_AuthHandler_ptr failed"); 
+-      }*/	  
++	    return;
++          } 
++        }
+ 	if (strncmp(file, "goform", 6) == 0){
+ 		if(ifx_psendGoform)
+ 			(*ifx_psendGoform)(file,get_method_str(method),query,content_length,cookie, content_type,host,p[0],p[1]);
+@@ -2373,7 +2520,7 @@
+     }
+ 
+ 
+-static void
++static int
+ auth_check( char* dirname )
+     {
+     char authpath[10000];
+@@ -2468,7 +2615,7 @@
+     }
+ 
+ 
+-static void
++static int
+ send_authenticate( char* realm )
+     {
+     char header[10000];
+@@ -3114,6 +3261,13 @@
+ 	}
+     }
+ 
++static const char * ltq_config_backup_fix(char *name,const char *type)
++{
++    if(!strcmp(name,"rc.conf.gz"))
++        return "binary/octet-stream";	 
++    else 
++	return type;
++}
+ 
+ /* Figure out MIME encodings and type based on the filename.  Multiple
+ ** encodings are separated by commas, and are listed in the order in
+@@ -3211,7 +3365,7 @@
+ 	    me_len += enc_tab[me_indexes[i]].val_len;
+ 	    }
+ 	}
+-
++    type = ltq_config_backup_fix(file,type);
+     return type;
+     }
+ 

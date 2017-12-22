@@ -1,0 +1,58 @@
+From e16797aac1d43069a7679a241f7cd7dcff472ef4 Mon Sep 17 00:00:00 2001
+From: Jiebing Li <jiebing.li@intel.com>
+Date: Wed, 10 Dec 2014 16:45:12 +0800
+Subject: [PATCH 217/441] usb/dwc3-device: release device driver's spin lock
+ during gadget resume
+
+gadget resume callback should be called out of dwc3 device driver's
+spin lock protection, or device driver's notifier API may try to
+call spin_lock() again in its critical section.
+
+Without the patch there's a chance of kernel panic like below:
+
+[  357.697839] RIP: 0010:[<ffffffff81b71764>]  [<ffffffff81b71764>] _raw_spin_lock_irqsave+0x44/0x50
+[  357.804100] Call Trace:
+[  357.806834]  [<ffffffff817934c6>] dwc3_handle_otg_notification+0x36/0xf0
+[  357.814318]  [<ffffffff810a5f63>] notifier_call_chain+0x53/0xa0
+[  357.820933]  [<ffffffff810a6073>] atomic_notifier_call_chain+0x33/0x50
+[  357.828231]  [<ffffffff81818926>] cht_otg_set_power+0x76/0xc0
+[  357.834654]  [<ffffffff81794ef4>] dwc3_vbus_draw+0x54/0x90
+[  357.840784]  [<ffffffff8181af0e>] composite_resume+0xae/0xe0
+[  357.847108]  [<ffffffff81796cd6>] dwc3_thread_interrupt+0x166/0x790
+[  357.854114]  [<ffffffff810cfab0>] ? irq_finalize_oneshot.part.29+0xd0/0xd0
+[  357.861797]  [<ffffffff810cfad0>] irq_thread_fn+0x20/0x50
+[  357.867829]  [<ffffffff810cfab0>] ? irq_finalize_oneshot.part.29+0xd0/0xd0
+[  357.875513]  [<ffffffff810d001f>] irq_thread+0x11f/0x150
+[  357.881449]  [<ffffffff810cfb90>] ? wake_threads_waitq+0x30/0x30
+[  357.888163]  [<ffffffff810cff00>] ? irq_thread_check_affinity+0x70/0x70
+[  357.895556]  [<ffffffff810a1802>] kthread+0xd2/0xf0
+[  357.901007]  [<ffffffff810a1730>] ? kthread_create_on_node+0x170/0x170
+[  357.908304]  [<ffffffff81b7266c>] ret_from_fork+0x7c/0xb0
+[  357.914337]  [<ffffffff810a1730>] ? kthread_create_on_node+0x170/0x170
+
+Signed-off-by: Jiebing Li <jiebing.li@intel.com>
+
+Change-Id: Ia3d5682b6bdd0f1c50c82b2b7248fdac03ef9b8b
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-8602
+(cherry picked from commit a4dc7f46c1714b7fe2c5cedd221e6db6fb4893fb)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/usb/dwc3/gadget.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -2431,7 +2431,11 @@ static void dwc3_gadget_wakeup_interrupt
+ 	 * implemented.
+ 	 */
+ 
+-	dwc->gadget_driver->resume(&dwc->gadget);
++	if (dwc->gadget_driver && dwc->gadget_driver->resume) {
++		spin_unlock(&dwc->lock);
++		dwc->gadget_driver->resume(&dwc->gadget);
++		spin_lock(&dwc->lock);
++	}
+ }
+ 
+ static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,

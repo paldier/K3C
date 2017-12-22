@@ -1,0 +1,1039 @@
+From 23b660da7323dfcb821e89a3e08f9c73c1889256 Mon Sep 17 00:00:00 2001
+From: "Sukerkar, Amol N" <amol.n.sukerkar@intel.com>
+Date: Wed, 15 Jun 2016 15:19:20 -0700
+Subject: [PATCH 428/441] net: litepath: Partial Offload for WiFi Device
+
+This feature exposes the LitePath API to be used by WiFi
+Devices to use Partial Offload feature that enables the
+acceleration of network packets while reducing the CPU
+consumption.
+
+Signed-off-by: Sukerkar, Amol N <amol.n.sukerkar@intel.com>
+---
+ arch/x86/Kconfig                       |  32 +++
+ drivers/net/Kconfig                    |   6 +
+ drivers/net/Makefile                   |   1 +
+ drivers/net/lpal_api/Makefile          |  35 +++
+ drivers/net/lpal_api/lpal_api.c        | 161 +++++++++++++
+ drivers/net/lpal_api/lpal_directpath.c | 412 +++++++++++++++++++++++++++++++++
+ include/linux/netdevice.h              |   8 +
+ include/linux/skbuff.h                 |  17 ++
+ include/net/lpal_api.h                 | 157 +++++++++++++
+ include/net/ppa_api_cable.h                  |  32 +++
+ include/net/ppa_hook_cable.h                 |  13 ++
+ net/core/skbuff.c                      |  40 ++++
+ 12 files changed, 914 insertions(+)
+ create mode 100644 drivers/net/lpal_api/Makefile
+ create mode 100644 drivers/net/lpal_api/lpal_api.c
+ create mode 100644 drivers/net/lpal_api/lpal_directpath.c
+ create mode 100644 include/net/lpal_api.h
+ create mode 100644 include/net/ppa_api_cable.h
+ create mode 100644 include/net/ppa_hook_cable.h
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -457,6 +457,38 @@ config NET_SUBSYSTEM_SYSFS
+         ---help---
+           Exposes sysfs interface to get and set NET-IP subsystem attributes.
+ 
++menu "Intel Puma7 LitePath Support"
++    config PPA_PUMA7
++       bool "Configures Partial Offload feature in LitePath"
++       depends on X86_PUMA7
++       default n
++       ---help---
++          Configures the Partial Offload features in the LitePath.
++          This feature turns on the LitePath support logic for
++          WiFi Access Point driver that wishes to use Partial
++          Offload feature.
++
++    config LTQ_PPA_API_DIRECTPATH
++        bool "Enables Litepath API in Wave500"
++        depends on PPA_PUMA7
++        default n
++        ---help---
++           Configures Litepath feature for Wave500. This symbol
++           enables the WiFi Access Point driver to make use of
++           the Directpath API exposed by LitePath for Partial
++           Offload.
++
++    config LTQ_PPA_API_DIRECTPATH_HAS_NEW_API
++        bool "Enables Litepath New API in Wave500"
++        depends on PPA_PUMA7
++        default n
++        ---help---
++           Configures Litepath feature New API for Wave500. This
++           symbol enabled the WiFi Access Point driver to make use
++           of the Directpath extended API exposed by LitePath for
++           Partial Offload.
++endmenu
++
+ menu  "Intel PUMA7 AVALANCHE support"
+     config ARM_AVALANCHE_PDSP_PP
+         bool "TI Packet processor support for net-infra structure"
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -389,6 +389,12 @@ config VMXNET3
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called vmxnet3.
+ 
++config LPAL_DIRECTPATH
++   tristate "LitePath DirectPath Interface"
++   default y
++   help
++     Partial Offload SUpport for WiFi.
++
+ source "drivers/net/hyperv/Kconfig"
+ 
+ endif # NETDEVICES
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -74,3 +74,4 @@ obj-$(CONFIG_USB_CDC_PHONET)   += usb/
+ 
+ obj-$(CONFIG_HYPERV_NET) += hyperv/
+ obj-$(CONFIG_NTB_NETDEV) += ntb_netdev.o
++obj-$(CONFIG_LPAL_DIRECTPATH) += lpal_api/
+--- /dev/null
++++ b/drivers/net/lpal_api/Makefile
+@@ -0,0 +1,35 @@
++################################################################################
++#
++# Linux driver for VMware's vmxnet3 ethernet NIC.
++#
++# Copyright (C) 2007-2009, VMware, Inc. All Rights Reserved.
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms of the GNU General Public License as published by the
++# Free Software Foundation; version 2 of the License and no later version.
++#
++# This program is distributed in the hope that it will be useful, but
++# WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, GOOD TITLE or
++# NON INFRINGEMENT.  See the GNU General Public License for more
++# details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++#
++# The full GNU General Public License is included in this distribution in
++# the file called "COPYING".
++#
++# Maintained by: Shreyas Bhatewara <pv-drivers@vmware.com>
++#
++#
++################################################################################
++
++#
++# Makefile for the LitePath Directpath driver
++#
++
++obj-$(CONFIG_LPAL_DIRECTPATH) += lpal_dp.o
++
++lpal_dp-objs := lpal_api.o lpal_directpath.o
+--- /dev/null
++++ b/drivers/net/lpal_api/lpal_api.c
+@@ -0,0 +1,161 @@
++/* lpal_api.c
++ * Description: LitePath Callback Wrapper implementation
++ *
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++#include <net/lpal_api.h>
++
++static struct ppa_lpal_cb g_lpal_cb;
++
++int32_t ppa_litepath_ll_register(struct ppa_lpal_cb *lpcb, int flags)
++{
++	if (!lpcb) {
++		/* LOG_ERROR("lpcb NULL !!\n"); */
++		return PPA_FAILURE;
++	} else if (flags == PPA_LPAL_F_REGISTER) {
++		memcpy(&g_lpal_cb, lpcb, sizeof(g_lpal_cb));
++	} else if (flags == PPA_LPAL_F_DEREGISTER) {
++		memset(&g_lpal_cb, 0, sizeof(g_lpal_cb));
++	} else {
++		/*( LOG_ERROR("Invalid flags: 0x%X\n", flags); */
++		return PPA_FAILURE;
++	}
++
++	return PPA_SUCCESS;
++}
++EXPORT_SYMBOL_GPL(ppa_litepath_ll_register);
++
++/**
++ * API for WiFi Driver to register/deregister with Puma Litepath
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Network Device
++ *
++ * @param Pointer to Callback functions of the Network interface registered
++ *
++ * @param Flags associated with the network interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++int32_t
++ppa_drv_lpal_directpath_register(PPA_SUBIF *subif, PPA_NETIF *netif,
++				 PPA_DIRECTPATH_CB *pDirectpathCb,
++				 int32_t *index, uint32_t flags)
++{
++	if (g_lpal_cb.cb_register == NULL)
++		return PPA_INVALID;
++
++	return g_lpal_cb.cb_register(subif, netif, pDirectpathCb, index, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_drv_lpal_directpath_register);
++
++/**
++ * API for WiFI Driver to send skb
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Pointer to skb
++ *
++ * @param Length of skb
++ *
++ * @param Flags associated with the interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++int32_t
++ppa_drv_lpal_directpath_send(PPA_SUBIF *subif, struct sk_buff *skb,
++			     int32_t len, uint32_t flags)
++{
++	if (g_lpal_cb.cb_send == NULL)
++		return PPA_INVALID;
++
++	return g_lpal_cb.cb_send(subif, skb, len, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_drv_lpal_directpath_send);
++
++/**
++ * API for network interface flow control
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Flags associated with the interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++int32_t ppa_drv_lpal_directpath_flowctrl(PPA_SUBIF *subif, uint32_t flags)
++{
++	if (g_lpal_cb.cb_flowctrl == NULL)
++		return PPA_INVALID;
++
++	return g_lpal_cb.cb_flowctrl(subif, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_drv_lpal_directpath_flowctrl);
++
++/**
++ * API for WiFI Driver to send skb
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Length of skb
++ *
++ * @param Flags associated with the interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++PPA_BUF *ppa_drv_lpal_directpath_alloc_skb(PPA_SUBIF *subif, int32_t len,
++					   uint32_t flags)
++{
++	if (g_lpal_cb.cb_alloc_skb == NULL)
++		return (PPA_BUF *) PPA_INVALID;
++
++	return g_lpal_cb.cb_alloc_skb(subif, len, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_drv_lpal_directpath_alloc_skb);
++
++/**
++ * API to recycle skb
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Pointer to skb
++ *
++ * @param Flags associated with the interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++int32_t
++ppa_drv_lpal_directpath_recycle_skb(PPA_SUBIF *subif, PPA_BUF *skb,
++				    uint32_t flags)
++{
++	if (g_lpal_cb.cb_recycle_skb == NULL)
++		return PPA_INVALID;
++
++	return g_lpal_cb.cb_recycle_skb(subif, skb, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_drv_lpal_directpath_recycle_skb);
+--- /dev/null
++++ b/drivers/net/lpal_api/lpal_directpath.c
+@@ -0,0 +1,412 @@
++/* lpal_directpath.c
++ * Description: LitePath Directpath device driver implementation
++ *
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++/* Common Head File */
++#include <linux/version.h>
++#include <generated/autoconf.h>
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/types.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
++#include <linux/spinlock.h>
++
++#include <net/ppa_api_cable.h>
++
++#ifdef LPAL_DEBUG
++#define LPAL_PRINT_RX(msg, arg...) \
++	pr_info("[LP-DP-DEBUG][%s:%d] "msg, __func__, __LINE__, ##arg)
++#else
++#define LPAL_PRINT_RX(msg, arg...)
++#endif
++
++#define LPAL_PRINT(msg, arg...) \
++	pr_info("[LP-DP-DEBUG][%s:%d] "msg, __func__, __LINE__, ##arg);
++
++/* This API are according to new lpal structure */
++#define MAX_SUBIF       MAX_VPID
++#define DRV_REGISTER    ppa_drv_lpal_directpath_register
++#define DRV_SEND        ppa_drv_lpal_directpath_send
++#define DRV_ALLOC_SKB   ppa_drv_lpal_directpath_alloc_skb
++
++/*!
++ * \brief  PPA synchronization primitive for exclusion and/or synchronization
++ */
++static spinlock_t g_lpal_dp_lock;
++static uint32_t g_start_ifid = 0, g_end_ifid = MAX_PID * MAX_VPID;
++struct ppe_directpath_data *ppa_drv_g_ppe_directpath_data;
++EXPORT_SYMBOL(ppa_drv_g_ppe_directpath_data);
++
++int32_t(*ppa_hook_directpath_ex_register_dev_fn) (PPA_SUBIF *subif,
++						  PPA_NETIF *dev,
++						  PPA_DIRECTPATH_CB *
++						  pDirectpathCb,
++						  uint32_t flags) = NULL;
++
++int32_t(*ppa_hook_directpath_ex_send_fn) (PPA_SUBIF *subif, PPA_BUF *buf,
++					  int32_t len, uint32_t flags) = NULL;
++
++PPA_BUF *(*ppa_hook_directpath_alloc_skb_fn) (PPA_SUBIF *psubif, int32_t len,
++					      uint32_t flags) = NULL;
++
++/**
++ * Cleanup the device attributes
++ *
++ * @param Interface ID of the device
++ *
++ * @return NULL
++ */
++static PPA_BUF *__remove_directpath_dev_from_datapath(int if_id)
++{
++	if ((ppa_drv_g_ppe_directpath_data[if_id].flags &
++	     PPE_DIRECTPATH_DATA_ENTRY_VALID)) {
++		memset(&ppa_drv_g_ppe_directpath_data[if_id], 0,
++		       sizeof(ppa_drv_g_ppe_directpath_data[if_id]));
++	}
++
++	return NULL;
++}
++
++/**
++ * Wrapper to Register/Deregister Network Device using Litepath
++ *
++ * @param Network Device ID of Sub-Interface
++ *
++ * @param Network Device ID of Physical Interface
++ *
++ * @param Callback Interface to Sub-Interface
++ *
++ * @param flags
++ *
++ * @return zero in Success, non-zero on failure
++ */
++int32_t ppa_directpath_register_dev_ex(PPA_SUBIF *subif, PPA_NETIF *netif,
++				       PPA_DIRECTPATH_CB *pDirectpathCb,
++				       uint32_t flags)
++{
++	int32_t ret;
++	int32_t if_id;
++	uint32_t tmp_flags;
++	PPA_BUF *skb_list = NULL;
++
++	if ((subif == NULL) || !ppa_drv_g_ppe_directpath_data)
++		return PPA_INVALID;
++
++	LPAL_PRINT("Entry Port Id :%d\n", subif->port_id);
++	if ((flags & PPA_F_DIRECTPATH_REGISTER)) {
++		if (!netif || !pDirectpathCb || !pDirectpathCb->rx_fn)
++			return PPA_INVALID;
++
++		if (netif->name == NULL)
++			return PPA_INVALID;
++
++		spin_lock_bh(&g_lpal_dp_lock);
++
++#ifndef USBNET_DEV_TEST
++		/* first check whether the interface already added
++		 * into PPA directpath or not
++		 */
++		for (if_id = 0; if_id < g_end_ifid; if_id++) {
++			if (ppa_drv_g_ppe_directpath_data[if_id].netif &&
++			    (ppa_drv_g_ppe_directpath_data[if_id].netif ==
++			     netif)) {
++				if (subif) {
++#if defined(CONFIG_PPA_PUMA7) && CONFIG_PPA_PUMA7
++					subif->port_id = DP_PORT_ID(if_id);
++					subif->subif = DP_SUBIF(if_id);
++#endif
++				}
++
++				spin_unlock_bh(&g_lpal_dp_lock);
++				return PPA_SUCCESS;
++			}
++		}
++#endif /* USBNET_DEV_TEST */
++		ret = DRV_REGISTER(subif, netif, pDirectpathCb, &if_id, flags);
++		if (ret == PPA_SUCCESS) {
++			LPAL_PRINT("Reg. PortId:[%d] subif:[%d] if_id:[%d]\n",
++				   subif->port_id, subif->subif, if_id);
++			/* Required only for physical port */
++			if (subif->subif == -1) {
++				tmp_flags =
++				    ppa_drv_g_ppe_directpath_data[if_id].
++				    flags | PPE_DIRECTPATH_DATA_ENTRY_VALID |
++				    PPE_DIRECTPATH_DATA_RX_ENABLE;
++				ppa_drv_g_ppe_directpath_data[if_id].flags =
++				    tmp_flags;
++			} else {
++				LPAL_PRINT("Registered subif :[%d]\n",
++					   subif->subif);
++				tmp_flags =
++				    ppa_drv_g_ppe_directpath_data[if_id].
++				    flags | PPE_DIRECTPATH_DATA_ENTRY_VALID |
++				    PPE_DIRECTPATH_DATA_RX_ENABLE;
++				ppa_drv_g_ppe_directpath_data[if_id].flags =
++				    tmp_flags;
++			}
++		}
++		spin_unlock_bh(&g_lpal_dp_lock);
++
++		LPAL_PRINT("Exit - DP Register\n");
++		return ret;
++	} else {
++		if (subif->port_id < 0 || subif->port_id >= g_end_ifid) {
++			LPAL_PRINT("directp unregister wrong id: %d\n",
++				   subif->port_id);
++			return PPA_INVALID;
++		}
++
++		LPAL_PRINT("Entry - DP UnRegister\n");
++		ret = DRV_REGISTER(subif, netif, pDirectpathCb, &if_id, flags);
++		spin_lock_bh(&g_lpal_dp_lock);
++		LPAL_PRINT("Remove directpath device index :%d\n", if_id);
++		skb_list = __remove_directpath_dev_from_datapath(if_id);
++		spin_unlock_bh(&g_lpal_dp_lock);
++
++		LPAL_PRINT("Unregiter Directpath ok\n");
++		return PPA_SUCCESS;
++	}
++}
++
++/**
++ * Wrapper to send skb from Network Device to Puma LitePath
++ *
++ * @param Network Device ID for Sub-Interface
++ *
++ * @param skb pointer
++ *
++ * @param Length of skb
++ *
++ * @param flags associated with the network sub-interface
++ *
++ * @return zero in Success, non-zero on failure
++ */
++int32_t ppa_directpath_send_ex(PPA_SUBIF *subif,
++			       PPA_BUF *skb, int32_t len, uint32_t flags)
++{
++	int32_t ret = PPA_SUCCESS;
++
++	if (skb == NULL) {
++		LPAL_PRINT_RX("Null skb\n");
++		return PPA_INVALID;
++	}
++
++	if (!ppa_drv_g_ppe_directpath_data) {
++		LPAL_PRINT_RX("Invalid WiFi Device table.\n");
++		dev_kfree_skb_any(skb);
++		return PPA_INVALID;
++	}
++
++	spin_lock_bh(&g_lpal_dp_lock);
++
++	if (subif->port_id < g_start_ifid || subif->port_id >= g_end_ifid) {
++		ret = PPA_INVALID;
++		goto __DIRETPATH_TX_EXIT;
++	}
++
++	if (!(ppa_drv_g_ppe_directpath_data[subif->port_id * MAX_SUBIF].flags &
++	      PPE_DIRECTPATH_DATA_ENTRY_VALID)) {
++		LPAL_PRINT_RX("Invalid index for pid %d.\n", subif->port_id);
++		ret = PPA_EPERM;
++		goto __DIRETPATH_TX_EXIT;
++	}
++
++	LPAL_PRINT_RX("Send skb to puma_lpal...\n");
++	ret = DRV_SEND(subif, skb, len, flags);
++	spin_unlock_bh(&g_lpal_dp_lock);
++
++	return ret;
++
++__DIRETPATH_TX_EXIT:
++	if (ret != PPA_SUCCESS && skb)
++		dev_kfree_skb_any(skb);
++
++	spin_unlock_bh(&g_lpal_dp_lock);
++	return ret;
++}
++
++/**
++ * Wrapper to send skb from Network Device to Puma LitePath
++ *
++ * @param Network Interface ID
++ *
++ * @param skb pointer
++ *
++ * @param Length of skb
++ *
++ * @param flags associated with the network sub-interface
++ *
++ * @return zero in Success, non-zero on failure
++ */
++int32_t ppa_directpath_send(uint32_t rx_if_id, PPA_BUF *skb,
++			    int32_t len, uint32_t flags)
++{
++	int32_t ret;
++	PPA_SUBIF sub_if;
++
++	sub_if.port_id = rx_if_id;
++	sub_if.subif = -1;
++
++	ret = ppa_directpath_send_ex(&sub_if, skb, len, flags);
++
++	return ret;
++}
++
++/**
++ * Wrapper for Network Device to allocate a skb
++ *
++ * @param Network Device Sub-Interface
++ *
++ * @param Length of skb
++ *
++ * @param Flags associated with the interface
++ *
++ * @return Pointer to Netowkr Device sub-interface
++ */
++PPA_BUF *ppa_directpath_alloc_skb(PPA_SUBIF *subif, int32_t len,
++				  uint32_t flags)
++{
++	PPA_BUF *ret = (void *)PPA_INVALID;
++
++#if defined(CONFIG_PPA_PUMA7) && CONFIG_PPA_PUMA7
++	spin_lock_bh(&g_lpal_dp_lock);
++
++	/* TODO: subif validation */
++	if (ppa_drv_g_ppe_directpath_data[DP_DATA_INDEX(subif)].
++	    flags & PPE_DIRECTPATH_DATA_ENTRY_VALID) {
++		ret = DRV_ALLOC_SKB(subif, len, flags);
++	}
++
++	spin_unlock_bh(&g_lpal_dp_lock);
++#else
++	LPAL_PRINT("ppa_directpath_alloc_skb not defined!!\n");
++#endif
++
++	return ret;
++}
++
++/**
++ * API for WiFi Driver to register/deregister with Puma Litepath
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Network Device
++ *
++ * @param Pointer to Callback functions of the Network interface registered
++ *
++ * @param Flags associated with the network interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++int32_t __ppa_hook_directpath_ex_register_dev_fn(PPA_SUBIF *subif,
++						 PPA_NETIF *dev,
++						 PPA_DIRECTPATH_CB *
++						 pDirectpathCb,
++						 uint32_t flags)
++{
++	return ppa_directpath_register_dev_ex(subif, dev, pDirectpathCb, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_hook_directpath_ex_register_dev_fn);
++
++/**
++ * API for WiFI Driver to send skb
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Pointer to skb
++ *
++ * @param Length of skb
++ *
++ * @param Flags associated with the interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++int32_t __ppa_hook_directpath_ex_send_fn(PPA_SUBIF *subif, PPA_BUF *buf,
++					 int32_t len, uint32_t flags)
++{
++	return ppa_directpath_send_ex(subif, buf, len, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_hook_directpath_ex_send_fn);
++
++/**
++ * API for WiFI Driver to send skb
++ *
++ * @param Network Device sub-interface
++ *
++ * @param Length of skb
++ *
++ * @param Flags associated with the interface
++ *
++ * @return zero for success, non-zero for failure
++ */
++PPA_BUF *__ppa_hook_directpath_alloc_skb_fn(PPA_SUBIF *psubif,
++					    int32_t len, uint32_t flags)
++{
++	return ppa_directpath_alloc_skb(psubif, len, flags);
++}
++EXPORT_SYMBOL_GPL(ppa_hook_directpath_alloc_skb_fn);
++
++/**
++ * Driver Init
++ *
++ * @return zero for success, non-zero for failure
++ */
++static int __init lpal_dp_init(void)
++{
++	spin_lock_init(&g_lpal_dp_lock);
++
++	ppa_hook_directpath_ex_register_dev_fn =
++	    __ppa_hook_directpath_ex_register_dev_fn;
++	ppa_hook_directpath_ex_send_fn = __ppa_hook_directpath_ex_send_fn;
++	ppa_hook_directpath_alloc_skb_fn = __ppa_hook_directpath_alloc_skb_fn;
++
++	LPAL_PRINT("litepath AL Wrapper module loaded\n");
++
++	return 0;
++}
++
++/**
++ * Driver Exit
++ */
++static void __exit lpal_dp_exit(void)
++{
++	LPAL_PRINT("litepath AL Wrapper module unloaded.\n");
++}
++
++module_init(lpal_dp_init);
++module_exit(lpal_dp_exit);
++
++MODULE_DESCRIPTION("LITEPATH ADAPTATION WRAPPER MODULE");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("1.0.0");
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1420,6 +1420,14 @@ struct net_device {
+ 	int group;
+ 
+ 	struct pm_qos_request	pm_qos_req;
++#ifdef CONFIG_PPA_PUMA7
++	/* pid handle for network device */
++	unsigned int pid_handle;
++
++	/* virtual pid handle for network device */
++	unsigned int vpid_handle;
++#endif /* CONFIG_PPA_PUMA7 */
++
+ };
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -331,6 +331,11 @@ struct skb_shared_info {
+ 	struct skb_shared_hwtstamps hwtstamps;
+ 	__be32          ip6_frag_id;
+ 
++#ifdef CONFIG_PPA_PUMA7
++	__u8 pid:6,
++	     dir:1,
++	pool_skb:1;
++#endif
+ 	/*
+ 	 * Warning : all fields before dataref are cleared in __alloc_skb()
+ 	 */
+@@ -2958,5 +2963,17 @@ static inline unsigned int skb_gso_netwo
+ 			       skb_network_header(skb);
+ 	return hdr_len + skb_gso_transport_seglen(skb);
+ }
++
++#ifdef CONFIG_PPA_PUMA7
++struct skb_buf_manager_cb {
++	bool (*is_bm_skb)(struct sk_buff *skb);
++	int  (*bm_free_skb)(struct sk_buff *skb);
++	void  (*bm_clear_skb)(struct sk_buff *skb);
++};
++
++int skb_register_buf_manager(struct skb_buf_manager_cb *cb);
++int skb_unregister_buf_manager(void);
++#endif
++
+ #endif	/* __KERNEL__ */
+ #endif	/* _LINUX_SKBUFF_H */
+--- /dev/null
++++ b/include/net/lpal_api.h
+@@ -0,0 +1,157 @@
++#ifndef __PPA_LPAL_API_H__
++#define __PPA_LPAL_API_H__
++
++#include <linux/skbuff.h>
++
++#define LOG_PRINT(msg, arg...) \
++	pr_crit("[%s:%d] "msg, __func__, __LINE__, ##arg)
++#define LOG_ERROR              err
++#define LOG_INFO(msg, arg...) \
++	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, msg, ##arg)
++#define LOG_DEBUG(msg, arg...) \
++	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, msg, ##arg)
++#define LOG_TRACE(msg, arg...) \
++	ppa_debug(DBG_ENABLE_MASK_DEBUG_PRINT, msg, ##arg)
++
++enum {
++	PPA_LPAL_F_REGISTER = 0x1,
++	PPA_LPAL_F_DEREGISTER = 0x2,
++	/* = 0x4 */
++};
++
++#define	MAX_PID  (32)
++#define	MAX_VPID (50)
++
++#define DP_DATA_INDEX(__p) \
++	((__p)->port_id * MAX_VPID + ((__p)->subif > 0 ? (__p)->subif : 0))
++#define DP_PORT_ID(_idx)	((_idx) ? ((_idx) / MAX_VPID) : 0)
++#define DP_SUBIF(_idx)		((_idx) ? ((_idx) % MAX_VPID) : 0)
++
++#define PPA_SUCCESS    0
++#define PPA_FAILURE   -1
++#define PPA_EPERM     -2
++#define PPA_INVALID   -3
++
++#define PPA_F_DIRECTPATH_REGISTER        0x00100000 /*!< Directpath
++							 register flag */
++#define PPE_DIRECTPATH_DATA_ENTRY_VALID  (1 << 31)  /*!< define flag */
++#define PPE_DIRECTPATH_DATA_RX_ENABLE    (1 << 0)   /*!< define flag */
++
++struct ppa_lpal_ifstats {
++	uint64_t rx_pkts;
++	uint64_t tx_pkts;
++	uint64_t rx_bytes;
++	uint64_t tx_bytes;
++	uint64_t droped_pkts;
++	/* ... */
++};
++
++#define PPA_NETIF struct net_device
++#define PPA_BUF   struct sk_buff
++
++struct ppa_subif_t {
++	int32_t port_id;   /*!< Datapath Port Id corresponds to PMAC Port Id */
++	int32_t subif:15;  /*!< Sub-interface Id info. In GRX500,
++				this is 15 bits, only 13 bits in PAE
++				are handled [14, 11:0].\n
++				DMA subif format is
++				mc_flag[14:14] Res[13:12] VAP[11:8]
++				GRP[7:7] Index/StationID[6:0] \n
++				*/
++};
++
++#define PPA_SUBIF struct ppa_subif_t
++
++typedef int32_t(*PPA_FP_RX_FN) (PPA_NETIF *rxif, PPA_NETIF *txif,
++				PPA_BUF *skb, int32_t len);
++typedef int32_t(*PPA_FP_RESTART_TX_FN) (PPA_NETIF *dev);
++typedef int32_t(*PPA_FP_STOP_TX_FN) (PPA_NETIF *dev);
++
++struct ppa_directpath_cb_t {
++	PPA_FP_STOP_TX_FN stop_tx_fn;	/*!< Pointer to the Driver
++					     Stop Tx function callback.
++					     Providing a NULL pointer disables
++					     the callback functionality. */
++	PPA_FP_RESTART_TX_FN start_tx_fn;   /*!< Pointer to the Driver
++						Restart Tx function callback.
++						Providing a NULL pointer
++						disables the callback
++						functionality. */
++	PPA_FP_RX_FN rx_fn;	/*!< Device Receive Function callback
++					for packets. Setting a value of
++					NULL pointer disables Receive callback
++					for the device */
++};
++
++#define PPA_DIRECTPATH_CB struct ppa_directpath_cb_t
++
++struct ppe_directpath_data {
++	PPA_DIRECTPATH_CB callback;	/*!< Callback Pointer to
++					     PPA_DIRECTPATH_CB */
++	PPA_NETIF *netif;	/*!< pointer to  PPA_NETIF */
++	uint32_t ifid;		/*!< directpath interface id */
++	uint32_t rx_fn_rxif_pkt;	/*!< received packet counter */
++	uint32_t rx_fn_txif_pkt;	/*!< transmitted packet coutner */
++	uint32_t tx_pkt;	/*!< transmitted packet counter */
++	uint32_t tx_pkt_dropped;	/*!< dropped packet counter */
++	uint32_t tx_pkt_queued;	/*!< queued packet counter */
++	uint32_t flags;		/*!<  bit 0 - directpath send valid,
++				      31 - entry valid  */
++};
++
++typedef int32_t(*ppa_lpal_regsiter_cb) (PPA_SUBIF *psubif, PPA_NETIF *netif,
++					PPA_DIRECTPATH_CB *cb,
++					uint32_t *index, uint32_t flags);
++
++typedef int32_t(*ppa_lpal_send_cb) (PPA_SUBIF *p_subif, struct sk_buff *skb,
++				    int32_t len, uint32_t flags);
++
++typedef struct sk_buff *(*ppa_lpal_allocskb_cb) (PPA_SUBIF *p_subif,
++						 int32_t len, uint32_t flags);
++
++typedef int32_t(*ppa_lpal_recycleskb_cb) (PPA_SUBIF *p_subif,
++					  struct sk_buff *skb, uint32_t flags);
++
++typedef int32_t(*ppa_lpal_flowctrl_cb) (PPA_SUBIF *p_subif, uint32_t flags);
++
++typedef int32_t(*ppa_lpal_stats_cb) (PPA_SUBIF *p_subif,
++				     struct ppa_lpal_ifstats *stats);
++
++struct ppa_lpal_cb {
++	ppa_lpal_regsiter_cb cb_register;
++	ppa_lpal_send_cb cb_send;
++	ppa_lpal_allocskb_cb cb_alloc_skb;
++	ppa_lpal_recycleskb_cb cb_recycle_skb;
++	ppa_lpal_flowctrl_cb cb_flowctrl;
++	ppa_lpal_stats_cb cb_stats;
++};
++
++extern int32_t ppa_litepath_ll_register(struct ppa_lpal_cb *lpcb, int flags);
++extern int32_t ppa_drv_lpal_directpath_register(PPA_SUBIF *subif,
++						PPA_NETIF *netif,
++						PPA_DIRECTPATH_CB *
++						pDirectpathCb,
++						int32_t *index,
++						uint32_t flags);
++extern int32_t ppa_drv_lpal_directpath_send(PPA_SUBIF *p_subif,
++					    struct sk_buff *skb, int32_t len,
++					    uint32_t flags);
++extern int32_t ppa_drv_lpal_directpath_flowctrl(PPA_SUBIF *psubif,
++						uint32_t flags);
++extern PPA_BUF *ppa_drv_lpal_directpath_alloc_skb(PPA_SUBIF *subif,
++						  int32_t len, uint32_t flags);
++extern int32_t ppa_drv_lpal_directpath_recycle_skb(PPA_SUBIF *subif,
++						   PPA_BUF *skb,
++						   uint32_t flags);
++
++#if 0
++/* Exposed API to get lpal callback reference */
++extern ppa_lpal_regsiter_cb LPAL_REGISTER_CB(void);
++extern ppa_lpal_send_cb LPAL_SEND_CB(void);
++extern ppa_lpal_allocskb_cb LPAL_ALLOC_SKB_CB(void);
++extern ppa_lpal_recycleskb_cb LPAL_RECYCLE_SKB_CB(void);
++extern ppa_lpal_flowctrl_cb LPAL_FLOWCTRL_CB(void);
++extern ppa_lpal_stats_cb LPAL_STATS_CB(void);
++#endif
++
++#endif
+--- /dev/null
++++ b/include/net/ppa_api_cable.h
+@@ -0,0 +1,32 @@
++#ifndef __LPAL_DIRECTPATH
++#define __LPAL_DIRECTPATH
++
++#include <net/lpal_api.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif				/* __cplusplus */
++
++	extern int32_t(*ppa_hook_directpath_ex_register_dev_fn) (PPA_SUBIF *
++								 subif,
++								 PPA_NETIF *
++								 dev,
++							PPA_DIRECTPATH_CB
++								 *
++								 pDirectpathCb,
++								 uint32_t
++								 flags);
++
++	extern int32_t(*ppa_hook_directpath_ex_send_fn) (PPA_SUBIF *subif,
++							 PPA_BUF *buf,
++							 int32_t len,
++							 uint32_t flags);
++
++	extern PPA_BUF *(*ppa_hook_directpath_alloc_skb_fn) (PPA_SUBIF *psubif,
++							     int32_t len,
++							     uint32_t flags);
++
++#ifdef __cplusplus
++}
++#endif				/* __cplusplus */
++#endif				/* __LPAL_DIRECTPATH */
+--- /dev/null
++++ b/include/net/ppa_hook_cable.h
+@@ -0,0 +1,13 @@
++#ifndef __PPA_HOOK_H
++#define __PPA_HOOK_H
++
++/* PPA Defines for PPA Compatiblity */
++#define PPA_HOOK_SUCCESS 1
++#define PPA_HOOK_FAILURE 0
++
++#define PPA_F_DIRECTPATH_ETH_IF	0x00400000 /*!< Directpath flag:
++						Ethernet type */
++#define PPE_DIRECTPATH_LEGACY	(1 << 12)  /*!< define flag */
++#define PPA_EINVAL		-22	   /*!< invalid argument */
++
++#endif /* __PPA_HOOK_H */
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -98,6 +98,10 @@ struct kmem_cache *skbuff_pp_info_cache
+ #endif
+ #endif
+ 
++#ifdef CONFIG_PPA_PUMA7
++static struct skb_buf_manager_cb bm_cb;
++#endif
++
+ /**
+  *	skb_panic - private function for out-of-line support
+  *	@skb:	buffer
+@@ -630,6 +634,13 @@ static void skb_clone_fraglist(struct sk
+ 
+ static void skb_free_head(struct sk_buff *skb)
+ {
++
++#ifdef CONFIG_PPA_PUMA7
++	if (bm_cb.is_bm_skb && bm_cb.is_bm_skb(skb)) {
++		bm_cb.bm_free_skb(skb);
++		return;
++	}
++#endif
+ 	if (skb->head_frag)
+ 		put_page(virt_to_head_page(skb->head));
+ 	else
+@@ -1301,6 +1312,12 @@ int pskb_expand_head(struct sk_buff *skb
+ 	skb->hdr_len  = 0;
+ 	skb->nohdr    = 0;
+ 	atomic_set(&skb_shinfo(skb)->dataref, 1);
++
++#if defined(CONFIG_PPA_PUMA7) && !defined(CONFIG_ARM_AVALANCHE_SOC)
++	if (bm_cb.is_bm_skb && bm_cb.is_bm_skb(skb))
++		bm_cb.bm_clear_skb(skb);
++#endif
++
+ 	return 0;
+ 
+ nofrags:
+@@ -3836,3 +3853,26 @@ err_free:
+ 	return NULL;
+ }
+ EXPORT_SYMBOL(skb_vlan_untag);
++
++#ifdef CONFIG_PPA_PUMA7
++int skb_register_buf_manager(struct skb_buf_manager_cb *cb)
++{
++	if (bm_cb.is_bm_skb) {
++		pr_err("buffer manager already registered\n");
++		return 1;
++	}
++
++	pr_info("skb buffer manager registered\n");
++	memcpy(&bm_cb, cb, sizeof(bm_cb));
++	return 0;
++}
++EXPORT_SYMBOL_GPL(skb_register_buf_manager);
++
++int skb_unregister_buf_manager(void)
++{
++	pr_info("skb buffer manager unregistered\n");
++	memset(&bm_cb, 0, sizeof(bm_cb));
++}
++EXPORT_SYMBOL_GPL(skb_unregister_buf_manager);
++
++#endif

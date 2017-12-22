@@ -1,0 +1,312 @@
+Support for IMQ target in ebtables
+
+diff --git a/drivers/net/imq.c b/drivers/net/imq.c
+--- a/drivers/net/imq.c
++++ b/drivers/net/imq.c
+@@ -454,6 +454,16 @@ static netdev_tx_t imq_dev_xmit(struct s
+ 	dev->stats.tx_packets++;
+ 
+ 	if (unlikely(entry == NULL)) {
++
++		#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++		if (skb->imq_flags == IMQ_F_EBT) {
++			skb->imq_flags = 0;
++			skb->destructor = NULL;
++			dev_hard_start_xmit(skb,skb->dev,NULL);
++			return 0;
++		}
++		#endif
++
+ 		/* We don't know what is going on here.. packet is queued for
+ 		 * imq device, but (probably) not by us.
+ 		 *
+@@ -585,6 +595,78 @@ static int __imq_nf_queue_gso(struct nf_
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++
++static int  imq_ebt_queue(struct sk_buff *skb, unsigned queue_num)
++{
++	struct net_device *dev;
++	struct Qdisc *q;
++	struct netdev_queue *txq;
++	int    index;
++	int retval = -EINVAL;
++
++	index = skb->imq_flags & IMQ_F_IFMASK;
++	if (unlikely(index > numdevs - 1)) {
++		if (net_ratelimit())
++			printk(KERN_WARNING
++			       "IMQ: invalid device specified, highest is %u\n",
++			       numdevs - 1);
++		retval = -EINVAL;
++		goto out;
++	}
++
++	/* check for imq device by index from cache */
++	dev = imq_devs_cache[index];
++	if (unlikely(!dev)) {
++		char buf[8];
++
++		/* get device by name and cache result */
++		snprintf(buf, sizeof(buf), "imq%d", index);
++		dev = dev_get_by_name(&init_net, buf);
++		if (!dev) {
++			/* not found ?!*/
++			BUG();
++			retval = -ENODEV;
++			goto out;
++		}
++
++		imq_devs_cache[index] = dev;
++		dev_put(dev);
++	}
++
++	if (unlikely(!(dev->flags & IFF_UP))) {
++		skb->imq_flags = 0;
++		retval = -1;
++		goto out;
++	}
++	dev->last_rx = jiffies;
++
++
++	dev->stats.rx_bytes += skb->len;
++	dev->stats.rx_packets++;
++
++	txq = netdev_pick_tx(dev, skb);
++
++	q = rcu_dereference(txq->qdisc);
++
++	spin_lock_bh(qdisc_lock(q));
++
++	qdisc_enqueue_root(skb, q); /* might kfree_skb */
++	skb->imq_flags = IMQ_F_EBT;
++
++	spin_unlock_bh(qdisc_lock(q));
++
++	/* schedule qdisc dequeue */
++	__netif_schedule(q);
++
++	retval = 0;
++
++out:
++	return retval;
++}
++
++#endif
++
+ static int imq_nf_queue(struct nf_queue_entry *entry, unsigned queue_num)
+ {
+ 	struct sk_buff *skb, *segs;
+@@ -855,6 +937,9 @@ static struct rtnl_link_ops imq_link_ops
+ 
+ static const struct nf_queue_handler imq_nfqh = {
+ 	.outfn = imq_nf_queue,
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++	.ebt_imq = imq_ebt_queue,
++#endif
+ };
+ 
+ static int __init imq_init_hooks(void)
+diff --git a/include/linux/imq.h b/include/linux/imq.h
+--- a/include/linux/imq.h
++++ b/include/linux/imq.h
+@@ -7,6 +7,10 @@
+ #define IMQ_F_IFMASK	0x0f
+ #define IMQ_F_ENQUEUE	0x10
+ 
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++#define IMQ_F_EBT	0x11
++#endif
++
+ #define IMQ_MAX_DEVS	(IMQ_F_IFMASK + 1)
+ 
+ #endif /* _IMQ_H */
+diff --git a/include/linux/netfilter_bridge/ebt_imq.h b/include/linux/netfilter_bridge/ebt_imq.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/netfilter_bridge/ebt_imq.h
+@@ -0,0 +1,8 @@
++#ifndef __LINUX_BRIDGE_EBT_IMQ_H
++#define __LINUX_BRIDGE_EBT_IMQ_H
++struct ebt_imq_info
++{
++	unsigned int todev;
++};
++#endif
++
+diff --git a/include/net/netfilter/nf_queue.h b/include/net/netfilter/nf_queue.h
+--- a/include/net/netfilter/nf_queue.h
++++ b/include/net/netfilter/nf_queue.h
+@@ -24,6 +24,9 @@ struct nf_queue_entry {
+ struct nf_queue_handler {
+ 	int			(*outfn)(struct nf_queue_entry *entry,
+ 					 unsigned int queuenum);
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++	int			(*ebt_imq)(struct sk_buff *skb);
++#endif
+ };
+ 
+ void nf_register_queue_handler(const struct nf_queue_handler *qh);
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -19,6 +19,12 @@
+ #include <linux/skbuff.h>
+ #include <linux/if_vlan.h>
+ #include <linux/netfilter_bridge.h>
++
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++#include <linux/netfilter_bridge/ebt_imq.h>
++extern int nf_ebt_queue(struct sk_buff *skb);
++#endif
++
+ #include "br_private.h"
+ 
+ #if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
+@@ -46,6 +52,9 @@ static inline unsigned int packet_length
+ 
+ int __ebt_optimized br_dev_queue_push_xmit(struct sk_buff *skb)
+ {
++	#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++	int retval = -1;
++	#endif
+ 	/* ip_fragment doesn't copy the MAC header */
+ 	if (nf_bridge_maybe_copy_header(skb) ||
+ 	    (packet_length(skb) > skb->dev->mtu && !skb_is_gso(skb))) {
+@@ -62,8 +71,17 @@ int __ebt_optimized br_dev_queue_push_xm
+ 					PPA_F_BRIDGED_SESSION);
+ 		}
+ #endif
++		#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++			if (skb->imq_flags & IMQ_F_ENQUEUE) {
++				retval = nf_ebt_queue(skb);
++			}
++			if (retval < 0) {
+ 		dev_queue_xmit(skb);
+ 	}
++		#else
++			dev_queue_xmit(skb);
++		#endif
++	}
+ 
+ 	return 0;
+ }
+diff --git a/net/bridge/netfilter/Kconfig b/net/bridge/netfilter/Kconfig
+--- a/net/bridge/netfilter/Kconfig
++++ b/net/bridge/netfilter/Kconfig
+@@ -75,6 +75,14 @@ config BRIDGE_EBT_802_3
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
++config LTQ_IPQOS_BRIDGE_EBT_IMQ
++	depends on NETFILTER_XT_TARGET_IMQ
++	bool "ebt: IMQ support"
++	help
++	  This option adds IMQ target for bridged target.
++
++	  To compile it as a module, choose M here.  If unsure, say N.
++
+ config BRIDGE_EBT_AMONG
+ 	tristate "ebt: among filter support"
+ 	help
+diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2608,7 +2608,11 @@ int dev_hard_start_xmit(struct sk_buff *
+ 		} else {
+ 			rc = NETDEV_TX_OK;
+ 		}
++		#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++		if (txq && (rc == NETDEV_TX_OK))
++		#else
+ 		if (rc == NETDEV_TX_OK)
++		#endif
+ 			txq_trans_update(txq);
+ 		return rc;
+ 	}
+@@ -2643,6 +2647,9 @@ gso:
+ 			skb->next = nskb;
+ 			return rc;
+ 		}
++		#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++		if (txq)
++		#endif
+ 		txq_trans_update(txq);
+ 		if (unlikely(netif_xmit_stopped(txq) && skb->next))
+ 			return NETDEV_TX_BUSY;
+diff --git a/net/netfilter/nf_queue.c b/net/netfilter/nf_queue.c
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@ -112,6 +112,19 @@ bool nf_queue_entry_get_refs(struct nf_q
+ }
+ EXPORT_SYMBOL_GPL(nf_queue_entry_get_refs);
+ 
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++int  nf_ebt_queue(struct sk_buff *skb)
++{
++	int retval = -1;
++	const struct nf_queue_handler *qih = rcu_dereference(queue_imq_handler);
++	if(qih) {
++		retval = qih->ebt_imq(skb);
++	}
++	return retval;
++}
++EXPORT_SYMBOL(nf_ebt_queue);
++#endif
++
+ /*
+  * Any packet that leaves via this function must come back
+  * through nf_reinject().
+diff --git a/net/netfilter/xt_IMQ.c b/net/netfilter/xt_IMQ.c
+--- a/net/netfilter/xt_IMQ.c
++++ b/net/netfilter/xt_IMQ.c
+@@ -7,6 +7,10 @@
+ #include <linux/netfilter/xt_IMQ.h>
+ #include <linux/imq.h>
+ 
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++#include <linux/netfilter_bridge/ebtables.h>
++#endif
++
+ static unsigned int imq_target(struct sk_buff *pskb,
+ 				const struct xt_action_param *par)
+ {
+@@ -17,6 +21,18 @@ static unsigned int imq_target(struct sk
+ 	return XT_CONTINUE;
+ }
+ 
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++static unsigned int imq_ebt_target(struct sk_buff *pskb,
++				const struct xt_action_param *par)
++{
++	const struct xt_imq_info *mr = par->targinfo;
++
++	pskb->imq_flags = (mr->todev & IMQ_F_IFMASK) | IMQ_F_ENQUEUE;
++
++	return EBT_CONTINUE;
++}
++#endif
++
+ static int imq_checkentry(const struct xt_tgchk_param *par)
+ {
+ 	struct xt_imq_info *mr = par->targinfo;
+@@ -49,6 +65,17 @@ static struct xt_target xt_imq_reg[] __r
+ 		.table		= "mangle",
+ 		.me             = THIS_MODULE
+ 	},
++#ifdef CONFIG_LTQ_IPQOS_BRIDGE_EBT_IMQ
++	{
++		.name           = "IMQ",
++		.revision       = 0,
++		.family		= NFPROTO_BRIDGE,
++		.checkentry     = imq_checkentry,
++		.target         = imq_ebt_target,
++		.targetsize	= sizeof(struct xt_imq_info),
++		.me             = THIS_MODULE
++	},
++#endif
+ };
+ 
+ static int __init imq_init(void)

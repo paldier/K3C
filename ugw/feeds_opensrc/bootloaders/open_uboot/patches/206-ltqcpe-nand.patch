@@ -1,0 +1,6265 @@
+# HG changeset patch
+# Parent 0333155b00f8f10b59a43bb212e588995ead9d0d
+nand flash feature enhancement
+including:
+onfi support
+large nand flash support(>=4GB)
+nand flash parital write
+* * *
+Add NAND driver
+* * *
+hsnand bugfix
+
+diff --git a/arch/mips/include/asm/types.h b/arch/mips/include/asm/types.h
+--- a/arch/mips/include/asm/types.h
++++ b/arch/mips/include/asm/types.h
+@@ -27,6 +27,13 @@ typedef unsigned short __u16;
+ typedef __signed__ int __s32;
+ typedef unsigned int __u32;
+ 
++
++#ifdef BUILD_FROM_LTQ_APPS
++typedef unsigned long long u64;
++typedef unsigned char u8;
++#endif
++
++
+ #if (_MIPS_SZLONG == 64)
+ 
+ typedef __signed__ long __s64;
+@@ -61,6 +68,8 @@ typedef unsigned short u16;
+ typedef __signed int s32;
+ typedef unsigned int u32;
+ 
++
++
+ #if (_MIPS_SZLONG == 64)
+ 
+ typedef __signed__ long s64;
+diff --git a/common/cmd_nand.c b/common/cmd_nand.c
+--- a/common/cmd_nand.c
++++ b/common/cmd_nand.c
+@@ -7,7 +7,7 @@
+  * Added 16-bit nand support
+  * (C) 2004 Texas Instruments
+  */
+-
++  
+ #include <common.h>
+ #include <linux/mtd/mtd.h>
+ #include <command.h>
+@@ -79,6 +79,98 @@ static int nand_dump(nand_info_t *nand, 
+ 	return 0;
+ }
+ 
++#define NAND_RW_RAW_READ 0
++#define NAND_RW_RAW_WRITE 1
++
++static int nand_rdwr_raw(int rdwr, nand_info_t *nand, ulong off, u_char *buf,
++				size_t size)
++{
++	struct mtd_oob_ops ops = {
++		.len = nand->writesize,
++		.ooblen = nand->oobsize,
++		.mode = MTD_OOB_RAW,
++	};
++	int i;
++	int nrblocks = size / nand->writesize;
++	loff_t addr = (loff_t)(off & ~(nand->writesize - 1));
++
++	while (nrblocks--) {
++		ops.datbuf = buf;
++		/*
++		 * for read oobbuf must be set, but oob data
++		 * will be appended to ops.datbuf
++		 * for write oobbuf is actually used
++		 */
++		ops.oobbuf = buf + nand->writesize;
++		if (rdwr == NAND_RW_RAW_READ)
++			i = nand->read_oob(nand, addr, &ops);
++		else
++			i = nand->write_oob(nand, addr, &ops);
++		if (i < 0) {
++			printf("Error (%d) %s page %08lx\n", i,
++					rdwr == NAND_RW_RAW_READ ?
++						"reading" : "writing",
++					(unsigned long)addr);
++			return 1;
++		}
++
++		addr += nand->writesize;
++		buf += (nand->writesize + nand->oobsize);
++	}
++	return 0;
++}
++
++static int nand_read_raw(nand_info_t *nand, ulong off, u_char *buf,
++			 size_t size)
++{
++	return nand_rdwr_raw(NAND_RW_RAW_READ, nand, off, buf, size);
++}
++
++static int nand_write_raw(nand_info_t *nand, ulong off, u_char *buf,
++			  size_t size)
++{
++	return nand_rdwr_raw(NAND_RW_RAW_WRITE, nand, off, buf, size);
++}
++
++static int nand_biterr(nand_info_t *nand, ulong off, int bit, 
++			uint64_t size)
++{
++	int ret = 0;
++	u_char *buf;
++	ulong blockoff = off & ~(nand->erasesize - 1);
++	u32 byteoff = off & (nand->erasesize - 1);
++	nand_erase_options_t opts = {
++		.offset = blockoff,
++		.length = nand->erasesize,
++	};
++
++	buf = malloc(size +
++			nand->oobsize * (nand->erasesize / nand->writesize));
++	if (!buf) {
++		puts("No memory for page buffer\n");
++		return 1;
++	}
++
++	nand_read_raw(nand, blockoff, buf, size);
++
++	ret = nand_erase_opts(nand, &opts);
++	if (ret) {
++		puts("Failed to erase block at %x\n");
++		return ret;
++	}
++
++	printf("toggling bit %x in byte 0x%x in block %x %02x ->",
++		bit, byteoff, blockoff, buf[byteoff]);
++
++	buf[byteoff] ^= (1 << bit);
++	printf("%02x\n", buf[byteoff]);
++	
++	nand_write_raw(nand, blockoff, buf, size);
++	free(buf);
++	return 0;
++}
++
++
+ /* ------------------------------------------------------------------------- */
+ 
+ static inline int str2long(char *p, ulong *num)
+@@ -89,8 +181,15 @@ static inline int str2long(char *p, ulon
+ 	return (*p != '\0' && *endptr == '\0') ? 1 : 0;
+ }
+ 
++static inline int str2longlong(char *p, uint64_t *num)
++{
++   char *endptr;
++   *num = simple_strtoull(p, &endptr, 16);
++   return (*p != '\0' && *endptr == '\0') ? 1 : 0;
++}   
++
+ static int
+-arg_off_size(int argc, char *argv[], nand_info_t *nand, ulong *off, size_t *size)
++arg_off_size(int argc, char *argv[], nand_info_t *nand, uint64_t *off, uint64_t *size)
+ {
+ 	int idx = nand_curr_device;
+ #if defined(CONFIG_CMD_MTDPARTS)
+@@ -124,7 +223,7 @@ arg_off_size(int argc, char *argv[], nan
+ #endif
+ 
+ 	if (argc >= 1) {
+-		if (!(str2long(argv[0], off))) {
++		if (!(str2longlong(argv[0], off))) {
+ 			printf("'%s' is not a number\n", argv[0]);
+ 			return -1;
+ 		}
+@@ -133,7 +232,7 @@ arg_off_size(int argc, char *argv[], nan
+ 	}
+ 
+ 	if (argc >= 2) {
+-		if (!(str2long(argv[1], (ulong *)size))) {
++		if (!(str2longlong(argv[1], size))) {
+ 			printf("'%s' is not a number\n", argv[1]);
+ 			return -1;
+ 		}
+@@ -148,7 +247,7 @@ out:
+ 	if (*size == nand->size)
+ 		puts("whole chip\n");
+ 	else
+-		printf("offset 0x%lx, size 0x%zx\n", *off, *size);
++		printf("offset 0x%llx, size 0x%llx\n", *off, *size);
+ 	return 0;
+ }
+ 
+@@ -207,8 +306,8 @@ static void nand_print_info(int idx)
+ int do_nand(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
+ {
+ 	int i, dev, ret = 0;
+-	ulong addr, off;
+-	size_t size;
++	uint64_t addr, off;
++	uint64_t size;
+ 	char *cmd, *s;
+ 	nand_info_t *nand;
+ #ifdef CONFIG_SYS_NAND_QUIET
+@@ -287,7 +386,7 @@ int do_nand(cmd_tbl_t * cmdtp, int flag,
+ 		printf("\nDevice %d bad blocks:\n", nand_curr_device);
+ 		for (off = 0; off < nand->size; off += nand->erasesize)
+ 			if (nand_block_isbad(nand, off))
+-				printf("  %08lx\n", off);
++				printf(" 0x%llx\n", off);
+ 		return 0;
+ 	}
+ 
+@@ -374,26 +473,28 @@ int do_nand(cmd_tbl_t * cmdtp, int flag,
+ 		printf("\nNAND %s: ", read ? "read" : "write");
+ 		if (arg_off_size(argc - 3, argv + 3, nand, &off, &size) != 0)
+ 			return 1;
+-
+ 		s = strchr(cmd, '.');
+ 		if (!s || !strcmp(s, ".jffs2") ||
+ 		    !strcmp(s, ".e") || !strcmp(s, ".i")) {
+ 			if (read)
+-				ret = nand_read_skip_bad(nand, off, &size,
+-							 (u_char *)addr);
++				ret = nand_read_skip_bad(nand, off, &size,(u_char *)addr);
+ 			else
+ 				ret = nand_write_skip_bad(nand, off, &size,
+ 							  (u_char *)addr);
+-		} else if (!strcmp(s, ".oob")) {
++		}else if(s != NULL && !strcmp(s, ".partial")){
++            ret = nand_write_partial(nand, off, &size, (u_char *)addr);
++            printf(" 0x%llx bytes %s: %s\n", size,
++               read ? "read" : "written", ret ? "ERROR" : "OK");
++          return ret == 0 ? 0 : 1;
++    }else if (!strcmp(s, ".oob")) {
+ 			/* out-of-band data */
+ 			mtd_oob_ops_t ops = {
+ 				.oobbuf = (u8 *)addr,
+ 				.ooblen = size,
+ 				.mode = MTD_OOB_RAW
+ 			};
+-
+ 			if (read)
+-				ret = nand->read_oob(nand, off, &ops);
++			    ret = nand->read_oob(nand, off, &ops);
+ 			else
+ 				ret = nand->write_oob(nand, off, &ops);
+ 		} else {
+@@ -401,9 +502,10 @@ int do_nand(cmd_tbl_t * cmdtp, int flag,
+ 			return 1;
+ 		}
+ 
+-		printf(" %zu bytes %s: %s\n", size,
++		
++		printf(" 0x%llx bytes %s: %s\n", size,
+ 		       read ? "read" : "written", ret ? "ERROR" : "OK");
+-
++        
+ 		return ret == 0 ? 0 : 1;
+ 	}
+ 
+@@ -435,6 +537,49 @@ int do_nand(cmd_tbl_t * cmdtp, int flag,
+ 
+ 	if (strcmp(cmd, "biterr") == 0) {
+ 		/* todo */
++		if (argc < 3)
++			goto usage;
++
++#if defined(CONFIG_NAND_ECC_HW_REED_SOLOMON)
++		puts("This function is not supported in HW ecc mode\n");
++		return -1;
++#endif
++
++		off = (ulong)simple_strtoul(argv[2], NULL, 16);
++
++		if (off < nand->erasesize) {
++			puts("Warning: You are trying to mess with"
++				 " with the first block. Only do this"
++				 " if you know what you are doing.\n"
++				 "Continue (Y/N): ");
++			if (getc() == 'y') {
++				if (getc() != "\r") {
++					puts("Aborting biterr test\n");	
++					return -1;
++				}
++			} else {
++				puts("Aborting biterr test\n");
++				return -1;
++			}
++		}	
++		
++		i = (int)simple_strtoul(argv[3], NULL, 16);
++		if (i >= 8 || i < 0) {
++			puts("Wrong bit offset value, bit offset in a byte [0 -> 7]\n");
++			goto usage;
++		}
++
++		ret = nand_biterr(nand, off, i, nand->erasesize);
++		if (ret == 0) {
++			printf("byte offset 0x%08lx toggled bit %d\n",
++			       (ulong) off, i);
++			return 0;
++		} else {
++			printf("byte offset 0x%08lx toggled bit %d\n",
++			       (ulong) off, i);
++			return 0;
++		}
++		
+ 		return 1;
+ 	}
+ 
+@@ -495,7 +640,7 @@ U_BOOT_CMD(nand, CONFIG_SYS_MAXARGS, 1, 
+ 	"nand dump[.oob] off - dump page\n"
+ 	"nand scrub - really clean NAND erasing bad blocks (UNSAFE)\n"
+ 	"nand markbad off [...] - mark bad block(s) at offset (UNSAFE)\n"
+-	"nand biterr off - make a bit error at offset (UNSAFE)"
++	"nand biterr byteoff bitoff - make a bit error at offset (UNSAFE)"
+ #ifdef CONFIG_CMD_NAND_LOCK_UNLOCK
+ 	"\n"
+ 	"nand lock [tight] [status]\n"
+diff --git a/common/env_nand.c b/common/env_nand.c
+--- a/common/env_nand.c
++++ b/common/env_nand.c
+@@ -163,14 +163,14 @@ int env_init(void)
+  */
+ int writeenv(size_t offset, u_char *buf)
+ {
+-	size_t end = offset + CONFIG_ENV_RANGE;
+-	size_t amount_saved = 0;
+-	size_t blocksize, len;
++	u64 end = offset + CONFIG_ENV_RANGE;
++	u64 amount_saved = 0;
++	u64 blocksize, len;
+ 
+ 	u_char *char_ptr;
+ 
+ 	blocksize = nand_info[0].erasesize;
+-	len = min(blocksize, CONFIG_ENV_SIZE);
++	len = (u64)min(blocksize, CONFIG_ENV_SIZE);
+ 
+ 	while (amount_saved < CONFIG_ENV_SIZE && offset < end) {
+ 		if (nand_block_isbad(&nand_info[0], offset)) {
+@@ -262,21 +262,22 @@ int saveenv(void)
+ 
+ int readenv (size_t offset, u_char * buf)
+ {
+-	size_t end = offset + CONFIG_ENV_RANGE;
+-	size_t amount_loaded = 0;
+-	size_t blocksize, len;
++	u64 end = offset + CONFIG_ENV_RANGE;
++	u64 amount_loaded = 0;
++	u64 blocksize, len;
+ 
+ 	u_char *char_ptr;
+ 
+ 	blocksize = nand_info[0].erasesize;
+-	len = min(blocksize, CONFIG_ENV_SIZE);
++	len = (u64)min(blocksize, CONFIG_ENV_SIZE);
+ 
+ 	while (amount_loaded < CONFIG_ENV_SIZE && offset < end) {
+ 		if (nand_block_isbad(&nand_info[0], offset)) {
+ 			offset += blocksize;
+ 		} else {
+ 			char_ptr = &buf[amount_loaded];
+-			if (nand_read(&nand_info[0], offset, &len, char_ptr))
++			if (nand_read_skip_bad(&nand_info[0], 
++			            	offset, &len, char_ptr))
+ 				return 1;
+ 			offset += blocksize;
+ 			amount_loaded += len;
+diff --git a/drivers/mtd/nand/Makefile b/drivers/mtd/nand/Makefile
+--- a/drivers/mtd/nand/Makefile
++++ b/drivers/mtd/nand/Makefile
+@@ -32,6 +32,7 @@ COBJS-y += nand_bbt.o
+ COBJS-y += nand_ecc.o
+ COBJS-y += nand_ids.o
+ COBJS-y += nand_util.o
++COBJS-$(CONFIG_NAND_ECC_BCH) += nand_bch.o
+ 
+ COBJS-$(CONFIG_NAND_ATMEL) += atmel_nand.o
+ COBJS-$(CONFIG_DRIVER_NAND_BFIN) += bfin_nand.o
+@@ -50,6 +51,8 @@ COBJS-$(CONFIG_NAND_S3C64XX) += s3c64xx.
+ COBJS-$(CONFIG_NAND_SPEAR) += spr_nand.o
+ COBJS-$(CONFIG_NAND_OMAP_GPMC) += omap_gpmc.o
+ COBJS-$(CONFIG_NAND_PLAT) += nand_plat.o
++COBJS-$(CONFIG_NAND_LANTIQ) += lq_nand.o
++COBJS-$(CONFIG_SPINAND_LANTIQ) += lq_spinand.o
+ endif
+ 
+ COBJS	:= $(COBJS-y)
+diff --git a/drivers/mtd/nand/lq_nand.c b/drivers/mtd/nand/lq_nand.c
+new file mode 100755
+--- /dev/null
++++ b/drivers/mtd/nand/lq_nand.c
+@@ -0,0 +1,1378 @@
++/******************************************************************************
++ * **
++ * ** FILE NAME    : lq_nand.c
++ * ** PROJECT      : Latiq UEIP
++ * ** MODULES      : NAND Flash
++ * **
++ * ** DATE         : 23 Apr 2005
++ * ** AUTHOR       : Wu Qi Ming
++ * ** DESCRIPTION  : NAND Flash MTD Driver
++ * ** COPYRIGHT    :       Copyright (c) 2010
++ * **                      Lantiq Technologies 
++ * **                      
++ * **
++ * **    This program is free software; you can redistribute it and/or modify
++ * **    it under the terms of the GNU General Public License as published by
++ * **    the Free Software Foundation; either version 2 of the License, or
++ * **    (at your option) any later version.
++ * **
++ * ** HISTORY
++ * ** $Date        $Author      $Version   $Comment
++ * ** 23 Apr 2008  Wu Qi Ming   1.0        initial version
++ * ** 27 Jul 2010  Wu Qi Ming   2.0        modified for u-boot-2010.06
++ * *******************************************************************************/
++
++#include <common.h>
++
++
++#include <nand.h>
++#include <asm/errno.h>
++#include <asm/addrspace.h>
++#ifdef CONFIG_NAND_ECC_HW_REED_SOLOMON 
++#include <asm/lq_dma.h>
++#define NUM_RX_DESC 2
++#define NUM_TX_DESC 2
++
++#ifdef CONFIG_DRIVER_GRX500
++#define DMA_HSNAND_PORT_NUM 2
++#define TX_CHAN_NO   5
++#define RX_CHAN_NO   4
++#define DMA_BYTE_OFFSET_MASK 0x3
++#define EMPTY_PG_CHK	1
++#define ECC_OFFSET		1
++#define CUST_MSG_OFFSET	1
++#define BBT_VERSION_OFFSET	7
++#define BBT_TABLE_OFFSET	3
++  #ifdef CPHYSADDR
++     #undef CPHYSADDR
++     #define PHYS_ADDR(a) (unsigned long)a<0xb0000000?((((unsigned long)a) & 0x1fffffff) | 0x20000000):(((unsigned long)a) & 0x1fffffff)
++     #define CPHYSADDR(a) cpu_is_cps()?(PHYS_ADDR(a)+0xa0000000):(PHYS_ADDR(a))
++     #undef KSEG1ADDR 
++     #define KSEG1ADDR(a) ((unsigned long)a & 0x1fffffff)|KSEG1;
++ #endif
++#else
++#define DMA_BYTE_OFFSET_MASK 0x1f
++#define DMA_HSNAND_PORT_NUM 3
++#define TX_CHAN_NO   15
++#define RX_CHAN_NO   14
++#define EMPTY_PG_CHK	0
++#define ECC_OFFSET		0
++#define CUST_MSG_OFFSET	0
++#endif
++
++#define MAX_PACKET_SIZE 	8192
++
++extern void flush_dcache_range(unsigned long start, unsigned long stop);
++extern void clean_dcache_range(unsigned long start, unsigned long stop);
++extern void invalidate_dcache_range(unsigned long start, unsigned long stop);
++extern void flush_dcache(void);
++extern void invalidate_dcache(void);
++extern void invalidate_icache(void);
++
++#ifdef CONFIG_DRIVER_GRX500
++extern void invalidate_scache_range(unsigned long start, unsigned long stop);
++extern void flush_scache_range(unsigned long start, unsigned long stop);
++#else
++static inline void flush_scache_range(unsigned long start, unsigned long stop) {};
++static inline void invalidate_scache_range(unsigned long start, unsigned long stop) {};
++#endif
++
++static int hsnand_tx_num, hsnand_rx_num;
++static dma_rx_descriptor_t hsnand_rx_des_ring[NUM_RX_DESC] __attribute__ ((aligned(16)));
++static dma_tx_descriptor_t hsnand_tx_des_ring[NUM_TX_DESC] __attribute__ ((aligned(16)));
++static int current_cmd =  NAND_CMD_NONE;
++static int addr_cnt;
++
++u8 g_num2alpha[256] = {0,0,1,99,2,198,100,106,3,205,199,188,101,126,107,42,4,141,206,
++             78,200,212,189,225,102,221,127,49,108,32,43,243,5,87,142,232,207,
++             172,79,131,201,217,213,65,190,148,226,180,103,39,222,240,128,177,
++             50,53,109,69,33,18,44,13,244,56,6,155,88,26,143,121,233,112,208,
++             194,173,168,80,117,132,72,202,252,218,138,214,84,66,36,191,152,149,
++             249,227,94,181,21,104,97,40,186,223,76,241,47,129,230,178,63,51,
++             238,54,16,110,24,70,166,34,136,19,247,45,184,14,61,245,164,57,59,7,
++             158,156,157,89,159,27,8,144,9,122,28,234,160,113,90,209,29,195,123,
++             174,10,169,145,81,91,118,114,133,161,73,235,203,124,253,196,219,30,
++             139,210,215,146,85,170,67,11,37,175,192,115,153,119,150,92,250,82,
++             228,236,95,74,182,162,22,134,105,197,98,254,41,125,187,204,224,211,
++             77,140,242,31,48,220,130,171,231,86,179,147,64,216,52,176,239,38,
++             55,12,17,68,111,120,25,154,71,116,167,193,35,83,137,251,20,93,248,
++             151,46,75,185,96,15,237,62,229,246,135,165,23,58,163,60,183};
++
++u8 g_alpha2num[256] = {1,2,4,8,16,32,64,128,135,137,149,173,221,61,122,244,111,222,59,118,
++             236,95,190,251,113,226,67,134,139,145,165,205,29,58,116,232,87,174,
++             219,49,98,196,15,30,60,120,240,103,206,27,54,108,216,55,110,220,63,
++             126,252,127,254,123,246,107,214,43,86,172,223,57,114,228,79,158,187,
++             241,101,202,19,38,76,152,183,233,85,170,211,33,66,132,143,153,181,
++             237,93,186,243,97,194,3,6,12,24,48,96,192,7,14,28,56,112,224,71,142,
++             155,177,229,77,154,179,225,69,138,147,161,197,13,26,52,104,208,39,
++             78,156,191,249,117,234,83,166,203,17,34,68,136,151,169,213,45,90,
++             180,239,89,178,227,65,130,131,129,133,141,157,189,253,125,250,115,
++             230,75,150,171,209,37,74,148,175,217,53,106,212,47,94,188,255,121,
++             242,99,198,11,22,44,88,176,231,73,146,163,193,5,10,20,40,80,160,
++             199,9,18,36,72,144,167,201,21,42,84,168,215,41,82,164,207,25,50,
++             100,200,23,46,92,184,247,105,210,35,70,140,159,185,245,109,218,51,
++             102,204,31,62,124,248,119,238,91,182,235,81,162,195,1};
++
++
++static uint8_t scan_ff_pattern[] = { 0xff, 0xff };
++
++static struct nand_bbt_descr smallpage_memorybased = {
++    .options = NAND_BBT_SCAN2NDPAGE,
++    .offs = 5,
++    .len = 1,
++    .pattern = scan_ff_pattern
++};
++
++static struct nand_bbt_descr largepage_memorybased = {
++    .options = 0,
++    .offs = 0,
++    .len = 2,
++    .pattern = scan_ff_pattern
++};
++
++static struct nand_bbt_descr smallpage_flashbased = {
++    .options = NAND_BBT_SCAN2NDPAGE,
++    .offs = 5,
++    .len = 1,
++    .pattern = scan_ff_pattern
++};
++
++static struct nand_bbt_descr largepage_flashbased = {
++    .options = NAND_BBT_SCAN2NDPAGE,
++    .offs = 0,
++    .len = 2,
++    .pattern = scan_ff_pattern
++};
++
++#endif
++
++#if defined(CONFIG_BCH_8BITS) || defined(CONFIG_NAND_ECC_HW_REED_SOLOMON)
++
++static uint8_t bbt_pattern[] = {'B', 'b', 't', '0' };
++static uint8_t mirror_pattern[] = {'1', 't', 'b', 'B' };
++
++#ifdef CONFIG_NAND_ECC_BCH 
++#define BBT_OFFS 	3
++#define VER_OFFS	7
++#else
++#define BBT_OFFS 	8
++#define VER_OFFS	12
++#endif
++
++static struct nand_bbt_descr bbt_main_descr = {
++    .options = NAND_BBT_LASTBLOCK | NAND_BBT_CREATE | NAND_BBT_WRITE
++        | NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_PERCHIP,
++    .offs = BBT_OFFS,
++    .len = 4,
++    .veroffs = VER_OFFS,
++    .maxblocks = 4,
++    .pattern = bbt_pattern
++};
++
++static struct nand_bbt_descr bbt_mirror_descr = {
++    .options = NAND_BBT_LASTBLOCK | NAND_BBT_CREATE | NAND_BBT_WRITE
++        | NAND_BBT_2BIT | NAND_BBT_VERSION | NAND_BBT_PERCHIP,
++    .offs = BBT_OFFS,
++    .len = 4,
++    .veroffs = VER_OFFS,
++    .maxblocks = 4,
++    .pattern = mirror_pattern
++};
++
++#endif /* CONFIG_BCH_8BITS || CONFIG_NAND_ECC_HW_REED_SOLOMON */
++
++static u32 latchcmd=0;
++
++static void ifx_nand_write_byte(struct mtd_info *mtd, u_char byte);
++extern void nand_gpio_init(void);
++
++#ifdef CONFIG_NAND_SPL
++#if defined (CONFIG_NAND_ECC_BCH) && defined (CONFIG_DRIVER_GRX500)
++extern int nand_bch_calculate_ecc(struct mtd_info *mtd, const unsigned char *buf,
++               unsigned char *code);
++int nand_bch_correct_data(struct mtd_info *mtd, unsigned char *buf,
++			  unsigned char *read_ecc, unsigned char *calc_ecc);
++#else
++extern int nand_calculate_ecc(struct mtd_info *mtd, const u_char *dat, u_char *ecc_code);
++extern int nand_correct_data(struct mtd_info *mtd, u_char *dat, u_char *read_ecc, u_char *calc_ecc);
++#endif
++static void lq_enable_hwecc(struct mtd_info *mtd, int mode)
++{
++    return;
++}
++	
++#endif
++static void ifx_nand_cmd_ctrl(struct mtd_info *mtd, int cmd, unsigned int ctrl)
++{
++     struct nand_chip *chip = mtd->priv;
++	 unsigned int oob_features = 0;
++
++     if(ctrl & NAND_CTRL_CHANGE){
++        if( ctrl & NAND_ALE ){
++				 NAND_CLRCLE;
++        	     NAND_SETALE;
++		         latchcmd = WRITE_ADDR;
++		        }
++		    else if( ctrl & NAND_CLE ){
++		    	   NAND_CLRALE;
++		    	   NAND_SETCLE;
++		         latchcmd = WRITE_CMD;
++		        }
++           else{
++		       NAND_CLRALE;
++			     NAND_CLRCLE;
++			     latchcmd = WRITE_DATA;
++		       }
++	   }
++	   if(cmd!=NAND_CMD_NONE){
++#ifdef  CONFIG_NAND_ECC_HW_REED_SOLOMON
++         u32 PiB, page;
++		 oob_features = (CUST_MSG_OFFSET << 17) | (EMPTY_PG_CHK << 16) | (ECC_OFFSET << 11);
++
++		 /*if it is a readpage or writepage command, store it in current_cmd*/
++		 if((cmd == NAND_CMD_SEQIN || cmd == NAND_CMD_READ0) && (ctrl & NAND_CLE)){
++	       current_cmd = cmd;
++	       addr_cnt=0;
++			   /*decide number of pages in one block, as required by ND_PARA0*/
++			   switch(mtd->erasesize/mtd->writesize){
++                   case 32:
++				      PiB = 0;
++					  break;
++				   case 64:
++				      PiB = 1;
++					  break;
++				   case	128:
++				      PiB = 2;
++					  break;
++				   case 256:
++				      PiB = 3;
++					  break;
++				   default:
++				      PiB = 0; /*should not happen*/
++					  break;
++
++			   }
++         switch(mtd->writesize){
++                   case 512:
++				      page = 0;
++				      break;
++				   case 2048:
++				      page = 1;
++					  break;
++				   case 4096:
++				      page = 2;
++					  break;
++				   case 8192:
++				      page=3;
++					  break;
++			   }
++			   
++			   *BSP_NDAC_CTL1 = (u32)(cmd & 0xff); /*write command to the LSB, set other fields to be 0*/              
++			   //*BSP_NDAC_CTL2 = 0x04000000;
++			   *BSP_NDAC_CTL2 = 0;
++			   /*works on single plane, single operation, ECC in spare area, 4 byte ecc modes
++			     User should change the setting according to their own needs*/  
++#ifdef CONFIG_NAND_ECC_HW_4BYTES			  
++			  *BSP_ND_PARA0  = ((chip->onfi_version?1:0) & 0x1)<<18 | 1<<8 | 1<<6 | (PiB & 0x3)<<4 | (page & 0xf);
++#else /*3 bytes ECC*/
++              *BSP_ND_PARA0  = ((chip->onfi_version?1:0) & 0x1)<<18 | 1<<6 | (PiB & 0x3)<<4 | (page & 0xf);  
++#endif
++
++#ifdef CONFIG_DRIVER_GRX500
++              *BSP_ND_CMSG_0 = 0xffffffff;
++              *BSP_ND_CMSG_1 = 0xffffffff;
++#endif
++
++#ifdef  CONFIG_NAND_CS0
++			   *BSP_MD_CTL= 0x00000009 | oob_features | ((cmd == NAND_CMD_SEQIN)?0x400:0);  /*Write operation, DMA enable mode, chip select 0 */
++#else
++			   *BSP_MD_CTL= 0x00000011 | oob_features | ((cmd == NAND_CMD_SEQIN)?0x400:0);  /*write operation, DMA enable mode, chip select 1 */
++#endif
++			} /*current_cmd=read or write*/
++		   else if( (cmd==NAND_CMD_READSTART) && (ctrl & NAND_CLE) ){
++			  current_cmd = NAND_CMD_NONE;
++			  *BSP_NDAC_CTL2 |=((addr_cnt==5)?2:1)<<16;	  
++		   }
++		   else if((cmd == NAND_CMD_PAGEPROG) && (ctrl & NAND_CLE) && (addr_cnt != 0)) {
++                /*skip program command if the operation is done by dma*/
++                /*addr_cnt will be cleared after raw write to the page*/ 
++                addr_cnt = 0;
++				current_cmd = NAND_CMD_NONE;
++		   }
++		   else{
++              if( current_cmd != NAND_CMD_NONE ){
++                  /*It is an address byte, record it in the register*/  
++				  switch(addr_cnt){
++                       case 0:
++                           *BSP_NDAC_CTL1 |= (cmd & 0xff) <<8;
++						   addr_cnt++;
++						   break;
++					   case 1:
++					       *BSP_NDAC_CTL1 |= (cmd & 0xff) <<16;
++					       addr_cnt++;
++						   break;
++					   case 2:
++					       *BSP_NDAC_CTL1 |= (cmd & 0xff) <<24;
++					       addr_cnt++;
++						   break;
++                       case 3:
++					       *BSP_NDAC_CTL2 |= cmd & 0xff;
++						   addr_cnt++;
++                           break;
++					   case 4:
++					       *BSP_NDAC_CTL2 |= (cmd & 0xff)<<8;
++						   addr_cnt++;
++					       break;
++				  }
++			  }else{
++			    /*normal command or address byte, just write to the nand controller*/   
++                ifx_nand_write_byte(mtd, cmd);
++			  }
++		   }
++
++#else /*!CONFIG_NAND_ECC_HW_REED_SOLOMON*/	   	
++         ifx_nand_write_byte(mtd, cmd);
++     
++#endif      
++      }
++     return;
++}
++
++
++
++static int NanD_WaitReady(struct mtd_info *mtd)
++{
++      struct nand_chip *nand = mtd->priv;
++	  NAND_WAIT_READY(nand);
++	  return 1;
++}
++
++
++/**
++ * nand_block_bad - [DEFAULT] Read bad block marker from the chip
++ * @mtd:        MTD device structure
++ * @ofs:        offset from device start
++ * @getchip:    0, if the chip is already selected
++ *
++ * Check, if the block is bad.
++ */
++static int ifx_nand_block_bad(struct mtd_info *mtd, loff_t ofs, int getchip)
++{
++      return 0;
++}
++
++
++/**
++ * amazon_s_nand_read_byte -  read one byte from the chip
++ * @mtd:        MTD device structure
++ *
++ *  read function for 8bit buswith
++ */
++static u_char ifx_nand_read_byte(struct mtd_info *mtd)
++{
++      struct nand_chip *nand = mtd->priv;
++      u_char ret;
++      asm("sync");
++      NAND_READ(READ_DATA, ret); 
++      asm("sync");
++      //printf("read_byte: %02x\n",ret);
++      return ret;
++}
++
++/**
++ * amazon_s_nand_read_buf - [DEFAULT] read chip data into buffer
++ * @mtd:        MTD device structure
++ * @buf:        buffer to store date
++ * @len:        number of bytes to read
++ *
++ * Default read function for 8bit buswith
++ */
++static void ifx_nand_read_buf(struct mtd_info *mtd, uint8_t *buf, int len)
++{
++        int i;
++        struct nand_chip *chip = mtd->priv;
++
++        for (i = 0; i < len; i++){
++		         NAND_READ(READ_DATA, buf[i]);
++				}
++
++}
++
++
++/**
++ * nand_write_byte - [DEFAULT] write one byte to the chip
++ * @mtd:        MTD device structure
++ * @byte:       pointer to data byte to write
++ *
++ * Default write function for 8it buswith
++ */
++static void ifx_nand_write_byte(struct mtd_info *mtd, u_char byte)
++{
++      struct nand_chip *this = mtd->priv;
++      *(volatile u8*)((u32)this->IO_ADDR_W | latchcmd)=byte;
++      while((*EBU_NAND_WAIT & 0x08) == 0);
++}
++								
++#ifdef CONFIG_NAND_BENAND
++int nand_read_page_benand(struct mtd_info *mtd, struct nand_chip *chip,
++					uint8_t *buf, int oob_required, int page)
++{
++	uint8_t status;
++	unsigned int max_bitflips = 0;
++
++	chip->read_buf(mtd, buf, mtd->writesize);
++	chip->read_buf(mtd, chip->oob_poi, mtd->oobsize);
++	/* Check Read Status */
++#ifndef CONFIG_NAND_SPL
++	chip->cmdfunc(mtd, NAND_CMD_STATUS, -1, -1);
++	status = chip->read_byte(mtd);
++
++	if (status & NAND_STATUS_FAIL)
++		/* uncorrectable error */
++		mtd->ecc_stats.failed++;
++	else if (status & NAND_STATUS_RECOM_REWRT) {
++		mtd->ecc_stats.corrected += 8;
++		max_bitflips = 8;
++	}
++#endif
++	return max_bitflips;
++}
++
++int nand_read_subpage_benand(struct mtd_info *mtd, struct nand_chip *chip,
++			uint32_t data_offs, uint32_t readlen, uint8_t *buf,
++			int page)
++{
++	uint8_t status;
++	uint8_t *p;
++	unsigned int max_bitflips = 0;
++
++	if (data_offs != 0)
++		chip->cmdfunc(mtd, NAND_CMD_RNDOUT, data_offs, -1);
++
++	p = buf + data_offs;
++	chip->read_buf(mtd, p, readlen);
++
++#ifndef CONFIG_NAND_SPL
++	chip->cmdfunc(mtd, NAND_CMD_STATUS, -1, -1);
++	status = chip->read_byte(mtd);
++	
++	if (status & NAND_STATUS_FAIL)
++		/* uncorrectable error */
++		mtd->ecc_stats.failed++;
++	else if (status & NAND_STATUS_RECOM_REWRT) {
++		mtd->ecc_stats.corrected += 8;
++		max_bitflips += 8;
++	}
++#endif
++	return max_bitflips;	
++}
++
++#endif /* CONFIG_NAND_BENAND */
++
++#ifndef CONFIG_NAND_SPL
++/**
++ * amazon_s_nand_write_buf - [DEFAULT] write buffer to chip
++ * @mtd:        MTD device structure
++ * @buf:        data buffer
++ * @len:        number of bytes to write
++ *
++ * Default write function for 8bit buswith
++ */
++static void ifx_nand_write_buf(struct mtd_info *mtd, const uint8_t *buf, int len)
++{
++        int i;
++        struct nand_chip *chip = mtd->priv;
++
++        for (i = 0; i < len; i++){
++                  //printf("x%02x", buf[i]);                 
++ 				  WRITE_NAND(buf[i],chip->IO_ADDR_W); 
++			   }
++             // writeb(buf[i], chip->IO_ADDR_W);
++}
++
++
++
++/**
++ * amazon_s_nand_verify_buf - [DEFAULT] Verify chip data against buffer
++ * @mtd:        MTD device structure
++ * @buf:        buffer containing the data to compare
++ * @len:        number of bytes to compare
++ *
++ * Default verify function for 8bit buswith
++ */
++static int ifx_nand_verify_buf(struct mtd_info *mtd, const uint8_t *buf, int len)
++{
++        int i;
++		uint8_t tmp;
++        struct nand_chip *chip = mtd->priv;
++
++        for (i = 0; i < len; i++){
++		        NAND_READ(READ_DATA, tmp);
++                if ( buf[i] != tmp ) return -EFAULT;
++			}
++        return 0;
++}
++
++#endif
++/**
++ * amazon_s_nand_select_chip - control -CE line
++ *      Forbid driving -CE manually permitting the NAND controller to do this.
++ *      Keeping -CE asserted during the whole sector reads interferes with the
++ *      NOR flash and PCMCIA drivers as it causes contention on the static bus.
++ *      We only have to hold -CE low for the NAND read commands since the flash
++ *      chip needs it to be asserted during chip not ready time but the NAND
++ *      controller keeps it released.
++ *
++ * @mtd:        MTD device structure
++ * @chip:       chipnumber to select, -1 for deselect
++ */
++static void ifx_nand_select_chip(struct mtd_info *mtd, int chip)
++{
++      struct nand_chip *nand = mtd->priv;
++
++        switch (chip) {
++        case -1:
++                NAND_CE_CLEAR;
++				*EBU_NAND_CON &=~(0x1);
++			    break;
++        case 0:
++		        *EBU_NAND_CON |=(0x1);
++				NAND_CE_SET;
++				break;
++        default:
++               break;
++        }
++ 
++
++}
++
++#ifdef CONFIG_NAND_ECC_HW
++
++u8 g_mul(u8 arg1,u8 arg2) {
++   u8 s=0;
++   if ((arg1== 0) || (arg2==0)) {
++                return 0;
++          };
++         s = (s + g_num2alpha[arg1]) % 255;
++         s = (s + g_num2alpha[arg2]) % 255;
++    return g_alpha2num[s];
++};
++
++
++u8 g_add(u8 arg3,u8 arg4) {
++       u8 s=0;
++       s = s ^ arg3;
++       s = s ^ arg4;
++       return s;    //add in G math is XOR
++};
++
++u8 *reed_solomn_128bytes_ecc(u8 *data_bytes_partial) {
++   u8 g[4];
++   u8 temp[4];
++   u8 degree;
++   u8 bytes;
++   u8 y;
++   u8 i;
++   u8 s[4] = {0,0,0,0};
++   u8 t[3];
++#ifdef CONFIG_NAND_ECC_HW_4BYTES 
++   g[3] = 205;
++   g[2] =  63;
++   g[1] =  92;
++   g[0] =  32;
++   degree = 4;
++   bytes = 128; 
++   for (i=0;i<=bytes-1;i++) {
++               y     = g_add( s[3], data_bytes_partial[i] );
++               temp[1]  = g_mul( y, g[3] );
++               temp[2]  = g_mul( y, g[2]);
++               temp[3]  = g_mul( y, g[1] );
++               s[3]  = g_add( s[2], temp[1] );
++               s[2]  = g_add( s[1], temp[2] );
++               s[1]  = g_add( s[0], temp[3] );
++               s[0]  = g_mul( y, g[0] );
++        };
++#else /*3 bytes mode*/
++   g[3] = 0;
++   g[2] = g_add(g_add(2,4), 8);
++   g[1] = g_add(g_mul(2,4), g_add(g_mul(4,8), g_mul(2,8)));
++   g[0] = g_mul(g_mul(2,4),8);
++   bytes = 128;
++   for (i=0;i<=bytes-1;i++) {
++   y   = g_add( s[2], data_bytes_partial[i] );
++   temp[2]  = g_mul( y, g[2]);
++   temp[3]  = g_mul( y, g[1] );
++   s[2]  = g_add( s[1], temp[2] );
++   s[1]  = g_add( s[0], temp[3] );
++   s[0]  = g_mul( y, g[0] );
++  };
++#endif
++    return s;  
++};
++
++
++#ifndef CONFIG_NAND_SPL
++/**
++ * nand_default_bbt - [NAND Interface] Select a default bad block table for the device
++ * @mtd:    MTD device structure
++ *
++ * This function selects the default bad block table
++ * support for the device and calls the nand_scan_bbt function
++ *
++*/
++int lq_rs_nand_default_bbt(struct mtd_info *mtd)
++{
++       int ecc_length;
++	   struct nand_chip *this = mtd->priv;
++#ifdef CONFIG_NAND_ECC_HW_4BYTES
++       ecc_length=4;
++#else
++       ecc_length=3;
++#endif
++    /* Is a flash based bad block table requested ? */
++    if (this->options & NAND_USE_FLASH_BBT) {
++        /* Use the default pattern descriptors */
++        if (!this->bbt_td) {
++            this->bbt_td = &bbt_main_descr;
++            this->bbt_md = &bbt_mirror_descr;
++        }
++        if (!this->badblock_pattern) {
++            this->badblock_pattern = (mtd->writesize > 512) ? &largepage_flashbased : &smallpage_flashbased;
++        }
++#ifndef CONFIG_DRIVER_GRX500
++        this->bbt_td->offs =8 + (mtd->writesize/128)*ecc_length;
++	    this->bbt_td->veroffs =12 + (mtd->writesize/128)*ecc_length;
++	    this->bbt_md->offs =8 + (mtd->writesize/128)*ecc_length;
++	    this->bbt_md->veroffs =12 + (mtd->writesize/128)*ecc_length;
++#else
++		this->bbt_td->offs = BBT_TABLE_OFFSET;
++		this->bbt_td->veroffs = BBT_VERSION_OFFSET;
++		this->bbt_md->offs = BBT_TABLE_OFFSET;
++		this->bbt_md->veroffs = BBT_VERSION_OFFSET;
++#endif
++    } else {
++        this->bbt_td = NULL;
++        this->bbt_md = NULL;
++        if (!this->badblock_pattern) {
++            this->badblock_pattern = (mtd->writesize > 512) ?
++                &largepage_memorybased : &smallpage_memorybased;
++        }
++    }
++	
++	return nand_scan_bbt(mtd, this->badblock_pattern);
++
++}
++#endif
++
++
++static void hsnand_dma_setup(void)
++{
++         int i;     
++		 /*configure DMA*/
++         //*AR10_PMU_CLKGCR1_A |= (1<<5)|(1<<10); /*enable EBU and DMA clocks in PMU*/
++         *BSP_CLKGCR1_A |= (1<<5)|(1<<10); /*enable EBU and DMA clocks in PMU*/
++         //*BSP_DMA_PS = 0x3;                    /*port3 for HSNAND*/ 
++         *BSP_DMA_PS = DMA_HSNAND_PORT_NUM;
++	
++	 *BSP_DMA_PCTRL = 0xf3c;                /*burst size to 8 words*/ 
++   
++         *BSP_DMA_CS    = RX_CHAN_NO;
++         *BSP_DMA_CCTRL=  0x2;
++         *BSP_DMA_CCTRL = 0x30000;  /* Channel is off , we will enable it once des are set*/
++         *BSP_DMA_CDBA  = CPHYSADDR((u32)hsnand_rx_des_ring);   
++	 *BSP_DMA_CDLEN = NUM_RX_DESC; 
++         *BSP_DMA_CIE   = 0x0;
++         *BSP_DMA_CPOLL = 0x80000080;
++         
++         *BSP_DMA_CS    = TX_CHAN_NO;
++         *BSP_DMA_CCTRL=  0x2;
++         *BSP_DMA_CCTRL = 0x30100;  /* Channel is off , we will enable it once des are set*/
++         *BSP_DMA_CDBA  = CPHYSADDR((u32)hsnand_tx_des_ring);   
++	 *BSP_DMA_CDLEN = NUM_TX_DESC; 
++         *BSP_DMA_CIE   = 0x0;
++         *BSP_DMA_CPOLL = 0x80000080;
++			   
++	  hsnand_tx_num = 0; 
++          hsnand_rx_num = 0;
++          
++          for(i=0;i < NUM_RX_DESC; i++)
++	      {
++	          dma_rx_descriptor_t * rx_desc = KSEG1ADDR(&hsnand_rx_des_ring[i]);
++                  rx_desc->status.word=0;
++                  rx_desc->status.field.OWN = 0;
++	          rx_desc->status.field.DataLen = 0;   /* 1536  */
++	          rx_desc->DataPtr = 0;
++	      }
++		  
++			  
++}
++
++int check_empty_page(u8 *buf, unsigned int len)
++{
++	int i, j = 0;
++	int ecc_size = 128;
++	int err_cnt = 0;
++	int err_flag = 0;
++	
++	for (i = 0; i < len; i++, j++) {
++		if (buf[i] != 0xff)
++			err_cnt++;
++
++        /* if err is larger than threshold, we return bad */
++        if (err_cnt > 3)
++            return -1;
++
++        /* Keep track of bitflips for 
++         * every ecc quantum which is in this
++         * case 128-byte in RS hardware module
++         */
++        if ((j >= ecc_size - 1)) {
++            if (err_cnt) 
++                err_flag = 1;
++                
++            err_cnt = 0;
++            j = 0;
++        }
++    }
++
++    /* If bitflip found on a page read, we set the empty 
++     * page to all 0xff 
++     */
++    if (err_flag)
++        memset(buf, 0xff, len);
++
++    return 0;
++}
++
++/**
++ * lq_nand_read_page_hwecc - [REPLACABLE] hardware ecc based page read function
++ * @mtd:    mtd info structure
++ * @chip:   nand chip info structure
++ * @buf:    buffer to store read data
++ * @page:   page number to read
++ *
++ * Not for syndrome calculating ecc controllers which need a special oob layout
++ */
++static int lq_nand_read_page_hwecc(struct mtd_info *mtd, struct nand_chip *chip,
++                uint8_t *buf, int page)
++{
++     int ret=0;
++	 dma_rx_descriptor_t * rx_desc;
++     u8* tmp_buf;
++	 int flag=0;
++	 int i;
++	
++	 rx_desc = KSEG1ADDR(&hsnand_rx_des_ring[hsnand_rx_num]); 
++     while(rx_desc->status.field.OWN);
++     rx_desc->status.field.Sop=0;
++     rx_desc->status.field.Eop=0;
++     rx_desc->status.field.C=0;
++     rx_desc->status.field.DataLen=mtd->writesize;
++#ifdef CONFIG_NAND_SPL    
++     rx_desc->DataPtr =  CPHYSADDR((u32)buf);
++#else
++     if((u32)buf & 0x1f ){
++		//tmp_buf = (u8*)0x80200000; /*fix me, need to allocate 32byte aligned buffer in kernel*/
++		tmp_buf = (uchar *)memalign(32, mtd->writesize);
++		rx_desc->DataPtr = CPHYSADDR((u32)tmp_buf);
++		flag=1;
++	 }else{
++	    rx_desc->DataPtr = CPHYSADDR((u32)buf);
++	 }
++#endif
++	 
++	 rx_desc->status.field.OWN=1;
++	 
++	 	 
++     *BSP_DMA_CS=RX_CHAN_NO;
++
++	 if(!(*BSP_DMA_CCTRL & 1))
++	 *BSP_DMA_CCTRL|=1;
++			 
++	 NAND_SETALE;
++     *BSP_INT_Msk_CTL |=1<<((page%2)?6:5);	/*even page address is odd page, odd is even*/ 
++	 *BSP_MD_CTL &=~(1<<10);
++	 *BSP_NDAC_CTL2 |=((addr_cnt==5)?2:1)<<16;
++	 *BSP_MD_CTL |= 1<<2;
++   
++	 while(rx_desc->status.field.OWN || !rx_desc->status.field.C);
++     /*invalidate cache here*/
++#ifdef CONFIG_NAND_SPL     
++	 invalidate_scache_range(buf, buf+mtd->writesize);
++     invalidate_dcache_range(buf, buf+mtd->writesize);
++#else	 
++	 if(flag){
++	 	 invalidate_scache_range(tmp_buf, tmp_buf+mtd->writesize);
++	     invalidate_dcache_range(tmp_buf, tmp_buf+mtd->writesize);
++         memcpy(buf, tmp_buf, mtd->writesize);
++		 free(tmp_buf);
++	 }else{
++	     invalidate_scache_range(buf, buf+mtd->writesize);
++         invalidate_dcache_range(buf, buf+mtd->writesize);
++	 }
++#endif	 
++	 
++     hsnand_rx_num++;
++     if(hsnand_rx_num==NUM_RX_DESC) hsnand_rx_num=0;
++	 NAND_CLRALE;
++
++     if(*BSP_INT_Sta){
++       //printf("page %d read error!\n",page);
++       if (EMPTY_PG_CHK == 0) {
++			ret = check_empty_page(buf, mtd->writesize);
++		} else
++			ret = -1;
++	 }
++
++	 *BSP_INT_Sta |=((page%2)?6:5);/*clear interrupts status*/
++	 return ret;
++}
++
++
++/**
++ * lq_nand_write_page_hwecc - [REPLACABLE] hardware ecc based page write function
++ * @mtd:    mtd info structure
++ * @chip:   nand chip info structure
++ * @buf:    data buffer
++ */
++static void lq_nand_write_page_hwecc(struct mtd_info *mtd, struct nand_chip *chip,
++                  const uint8_t *buf)
++{
++    dma_tx_descriptor_t * tx_desc= KSEG1ADDR(&hsnand_tx_des_ring[hsnand_tx_num]);  
++    u8* tmp_buf;
++	
++	while(tx_desc->status.field.OWN);/*descriptor not available, wait here*/
++    tx_desc->status.field.Sop=1;
++    tx_desc->status.field.Eop=1;
++    tx_desc->status.field.C=0;
++    tx_desc->status.field.DataLen = mtd->writesize;
++    tx_desc->status.field.Byteoffset = (u32)buf & DMA_BYTE_OFFSET_MASK; 
++    tx_desc->DataPtr = CPHYSADDR((u32)(buf-tx_desc->status.field.Byteoffset));
++    flush_dcache_range(buf,buf+mtd->writesize);
++	flush_scache_range(buf,buf+mtd->writesize);
++    tx_desc->status.field.OWN=1;	
++    hsnand_tx_num++;
++	if(hsnand_tx_num==NUM_TX_DESC) hsnand_tx_num=0;
++		
++			
++	*BSP_DMA_CS=TX_CHAN_NO;
++
++	if(!(*BSP_DMA_CCTRL & 1))
++	*BSP_DMA_CCTRL|=1;
++
++    NAND_SETALE;    
++    *BSP_INT_Msk_CTL |=1<<4;
++	*BSP_NDAC_CTL2 |=((addr_cnt==5)?2:1)<<16;						
++    *BSP_MD_CTL |= 1<<2;
++  
++	while(!(*BSP_INT_Sta & (1<<4)));
++	*BSP_INT_Sta |=(1<<4);
++	NAND_CLRALE;
++
++} 
++
++/**
++ * lq_nand_read_page_raw - [Intern] read raw page data without ecc
++ * @mtd:	mtd info structure
++ * @chip:	nand chip info structure
++ * @buf:	buffer to store read data
++ * @page:	page number to read
++ *
++ * Not for syndrome calculating ecc controllers, which use a special oob layout
++ */
++static int lq_nand_read_page_raw(struct mtd_info *mtd, struct nand_chip *chip,
++			      uint8_t *buf, int page)
++{
++    int i, cmd;
++	NAND_SETCLE;
++    latchcmd = WRITE_CMD;
++	cmd = NAND_CMD_READ0;
++	ifx_nand_write_byte(mtd, cmd);
++	NAND_CLRCLE;
++	NAND_SETALE;
++	latchcmd = WRITE_ADDR;
++	for(i=0;i<addr_cnt;i++){
++       switch(i){
++           case 0:
++		      cmd = (*BSP_NDAC_CTL1 >>8) & 0xff;  
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	       case 1:
++		      cmd = (*BSP_NDAC_CTL1 >>16) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 2:
++		      cmd = (*BSP_NDAC_CTL1 >>24) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 3:
++		      cmd = *BSP_NDAC_CTL2 & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 4:
++		      cmd = (*BSP_NDAC_CTL2 >>8)  & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	   }
++	}
++	NAND_CLRALE;
++	NAND_SETCLE;
++    if(mtd->writesize > 512){
++       latchcmd = WRITE_CMD;
++	   cmd = NAND_CMD_READSTART;
++       ifx_nand_write_byte(mtd, cmd);
++	}
++	NAND_CLRCLE;
++	while(!NAND_READY);
++	chip->read_buf(mtd, buf, mtd->writesize);
++	chip->read_buf(mtd, chip->oob_poi, mtd->oobsize);
++	addr_cnt = 0;
++	return 0;
++}
++
++
++/**
++ * lq_nand_write_page_raw - [Intern] raw page write function
++ * @mtd:	mtd info structure
++ * @chip:	nand chip info structure
++ * @buf:	data buffer
++ *
++ * Not for syndrome calculating ecc controllers, which use a special oob layout
++ */
++static void lq_nand_write_page_raw(struct mtd_info *mtd, struct nand_chip *chip,
++				const uint8_t *buf)
++{
++	 int i, j, cmd;
++	 u8* s;
++
++#ifdef CONFIG_DRIVER_GRX500
++     *BSP_ND_CMSG_0 = (chip->oob_poi[3] << 24) | (chip->oob_poi[2] << 16) | 
++						(chip->oob_poi[1] << 8) | chip->oob_poi[0];
++     *BSP_ND_CMSG_1 = (chip->oob_poi[7] << 24) | (chip->oob_poi[6] << 16) | 
++						(chip->oob_poi[5] << 8) | chip->oob_poi[4];
++     chip->ecc.write_page(mtd, chip, buf); 
++#else
++#ifdef CONFIG_NAND_ECC_HW_4BYTES
++     for(i=0;i<mtd->writesize/128;i++){
++         s = reed_solomn_128bytes_ecc(buf+i*128);
++         chip->oob_poi[i*4]=s[3];
++         chip->oob_poi[i*4+1]=s[2];
++         chip->oob_poi[i*4+2]=s[1];
++         chip->oob_poi[i*4+3]=s[0];
++	     }
++#else
++      for(i=0;i<mtd->writesize/128;i++){
++	     s = reed_solomn_128bytes_ecc(buf+i*128);
++	     chip->oob_poi[i*3]=s[2];
++	     chip->oob_poi[i*3+1]=s[1];
++	     chip->oob_poi[i*3+2]=s[0];
++         }
++#endif
++
++	 NAND_SETCLE;
++     latchcmd = WRITE_CMD;
++	 cmd = NAND_CMD_SEQIN;
++	 ifx_nand_write_byte(mtd, cmd);
++	 NAND_CLRCLE;
++	 NAND_SETALE;
++     latchcmd = WRITE_ADDR;
++	 for(i=0;i<addr_cnt;i++){
++       switch(i){
++           case 0:
++		      cmd = (*BSP_NDAC_CTL1 >>8) & 0xff;  
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	       case 1:
++		      cmd = (*BSP_NDAC_CTL1 >>16) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 2:
++		      cmd = (*BSP_NDAC_CTL1 >>24) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 3:
++		      cmd = *BSP_NDAC_CTL2 & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 4:
++		      cmd = (*BSP_NDAC_CTL2 >>8)  & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	   }
++	}
++	 NAND_CLRALE;
++     while(!NAND_READY);	
++	 chip->write_buf(mtd, buf, mtd->writesize);
++	 chip->write_buf(mtd, chip->oob_poi, mtd->oobsize);
++	 NAND_SETCLE;
++     latchcmd = WRITE_CMD;
++	 cmd = NAND_CMD_PAGEPROG;
++	 ifx_nand_write_byte(mtd, cmd);
++	 NAND_CLRCLE;
++     addr_cnt = 0;
++	 while(!NAND_READY);
++
++	 /* Send a fake command to program the OOB data */
++	 chip->cmdfunc(mtd, NAND_CMD_PAGEPROG, -1, -1);
++
++#endif /* CONFIG_DRIVER_GRX500 */
++}
++
++
++/**
++ * lq_nand_write_oob - [REPLACABLE] the most common OOB data write function
++ * @mtd:    mtd info structure
++ * @chip:   nand chip info structure
++ * @page:   page number to write
++ */
++static int lq_nand_write_oob(struct mtd_info *mtd, struct nand_chip *chip,
++                  int page)
++{
++    int i, cmd;
++    int status = 0;
++    const uint8_t *buf = chip->oob_poi;
++    int length = mtd->oobsize;
++
++    chip->cmdfunc(mtd, NAND_CMD_SEQIN, mtd->writesize, page);
++    
++    NAND_SETCLE;
++     latchcmd = WRITE_CMD;
++	 cmd = NAND_CMD_SEQIN;
++	 ifx_nand_write_byte(mtd, cmd);
++	 NAND_CLRCLE;
++	 NAND_SETALE;
++     latchcmd = WRITE_ADDR;
++	 for(i=0;i<addr_cnt;i++){
++       switch(i){
++           case 0:
++		      cmd = (*BSP_NDAC_CTL1 >>8) & 0xff;  
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	       case 1:
++		      cmd = (*BSP_NDAC_CTL1 >>16) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 2:
++		      cmd = (*BSP_NDAC_CTL1 >>24) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 3:
++		      cmd = *BSP_NDAC_CTL2 & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 4:
++		      cmd = (*BSP_NDAC_CTL2 >>8)  & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	   }
++	}
++	NAND_CLRALE;
++     while(!NAND_READY);	
++    
++    
++    chip->write_buf(mtd, buf, length);
++
++    NAND_SETCLE;
++    latchcmd = WRITE_CMD;
++	  cmd = NAND_CMD_PAGEPROG;
++	  ifx_nand_write_byte(mtd, cmd);
++	  NAND_CLRCLE;
++    addr_cnt = 0;
++     
++    while(!NAND_READY); 
++    
++     /* Send a fake command to program the OOB data */
++    chip->cmdfunc(mtd, NAND_CMD_PAGEPROG, -1, -1);
++
++
++    return 0;
++}
++
++
++/**
++ * lq_nand_read_oob - [REPLACABLE] the most common OOB data read function
++ * @mtd:    mtd info structure
++ * @chip:   nand chip info structure
++ * @page:   page number to read
++ * @sndcmd: flag whether to issue read command or not
++ */
++static int lq_nand_read_oob(struct mtd_info *mtd, struct nand_chip *chip,
++	                   int page, int sndcmd)
++{
++	
++	  int i, cmd;
++    if (sndcmd) {
++          chip->cmdfunc(mtd, NAND_CMD_READOOB, 0, page);
++          sndcmd = 0;
++        }
++	NAND_SETCLE;
++  latchcmd = WRITE_CMD;
++	cmd = NAND_CMD_READ0;
++	ifx_nand_write_byte(mtd, cmd);
++	NAND_CLRCLE;
++	NAND_SETALE;
++	latchcmd = WRITE_ADDR;
++	for(i=0;i<addr_cnt;i++){
++       switch(i){
++           case 0:
++		      cmd = (*BSP_NDAC_CTL1 >>8) & 0xff;  
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	       case 1:
++		      cmd = (*BSP_NDAC_CTL1 >>16) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 2:
++		      cmd = (*BSP_NDAC_CTL1 >>24) & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 3:
++		      cmd = *BSP_NDAC_CTL2 & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++		   case 4:
++		      cmd = (*BSP_NDAC_CTL2 >>8)  & 0xff;
++			  ifx_nand_write_byte(mtd, cmd);
++		      break;
++	   }
++	}
++	NAND_CLRALE;
++	NAND_SETCLE;
++    if(mtd->writesize > 512){
++       latchcmd = WRITE_CMD;
++	   cmd = NAND_CMD_READSTART;
++       ifx_nand_write_byte(mtd, cmd);
++	}
++	NAND_CLRCLE;
++	while(!NAND_READY);
++	chip->read_buf(mtd, chip->oob_poi, mtd->oobsize);
++	addr_cnt = 0;
++  return sndcmd;
++}
++													   
++
++#endif
++static void ifx_nand_chip_init(void)
++{
++         volatile unsigned char tmpc[5];
++         volatile unsigned char buf;
++         int i;
++
++		 nand_gpio_init();
++
++#ifdef CONFIG_NAND_CS0
++         *EBU_CON_0    = 0x40c7fe;
++         *EBU_NAND_CON = 0x000000F2; 
++#else
++		 *EBU_ADDR_SEL_1 = (NAND_BASE_ADDRESS&0x1fffff00)|0x31;
++		 /* byte swap;minimum
++          * delay*/
++		 *EBU_CON_1	= 0x40F295;
++	     *EBU_NAND_CON = 0x000005F2;
++#endif
++#ifdef CONFIG_NAND_ECC_HW_REED_SOLOMON 
++       hsnand_dma_setup();
++#endif
++#if 0
++
++    ifx_nand_select_chip(NULL, 0);
++    NAND_WRITE(WRITE_CMD, 0xff);
++    while(!NAND_READY){}
++    ifx_nand_select_chip(NULL, -1);
++    
++	ifx_nand_select_chip(NULL, 0);
++    NAND_WRITE(WRITE_CMD, 0x60);
++    NAND_SETALE;
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_CLRALE;
++    NAND_WRITE(WRITE_CMD, 0xd0);
++    while(!NAND_READY){}
++	ifx_nand_select_chip(NULL, -1);
++    
++    ifx_nand_select_chip(NULL, 0);
++    printf("delay\n");    
++	NAND_SETCLE;
++	NAND_WRITE(WRITE_CMD, 0x0);
++    NAND_CLRCLE;
++	NAND_SETALE;
++	NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_CLRALE;
++	NAND_SETCLE;
++    NAND_WRITE(WRITE_CMD, 0x30);
++    NAND_CLRCLE;
++	for(i=0;i<4096;i++){
++    	NAND_READ(READ_DATA, buf);
++    	printf("%02x ",buf);
++    	//if(buf!=0xff) printf("erase error!\n");
++    }
++    while(!NAND_READY){}
++    ifx_nand_select_chip(NULL, -1);
++#endif
++
++#if 0
++    ifx_nand_select_chip(NULL, 0);
++    NAND_WRITE(WRITE_CMD, 0xff);
++    while(!NAND_READY){}
++    ifx_nand_select_chip(NULL, -1);
++    
++    ifx_nand_select_chip(NULL, 0);
++    NAND_WRITE(WRITE_CMD, 0x80);
++    NAND_SETALE;
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_CLRALE;
++    for(i=0;i<8192;i++){
++    	WRITE_NAND(i%5,0xb4000000); 
++    }
++	for(i=0;i<352;i++){
++        WRITE_NAND(0xff,0xb4000000);
++	}
++	for(i=0;i<96;i++){
++        WRITE_NAND(0x55,0xb4000000);
++	}
++    NAND_WRITE(WRITE_CMD, 0x10);
++    while(!NAND_READY){}
++    ifx_nand_select_chip(NULL, -1);
++
++    ifx_nand_select_chip(NULL, 0);
++    NAND_WRITE(WRITE_CMD, 0xff);
++    while(!NAND_READY){}
++    ifx_nand_select_chip(NULL, -1);
++
++
++    ifx_nand_select_chip(NULL, 0);
++    NAND_WRITE(WRITE_CMD, 0x0);
++    NAND_SETALE;
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_WRITE(WRITE_ADDR,0);
++    NAND_CLRALE;
++    NAND_WRITE(WRITE_CMD, 0x30);
++    for(i=0;i<4096;i++){
++    	NAND_READ(READ_DATA, buf);
++    	printf("%02x ",buf);
++    	//if(buf!=i%5) printf("read error!\n");
++    	if((i+1)%16==0) printf("\n");
++    }
++	for(i=0;i<224;i++){
++	    NAND_READ(READ_DATA, buf);
++	    printf("%02x ",buf);
++	    if((i+1)%16==0) printf("\n");
++	  }
++										
++    while(!NAND_READY){}
++    ifx_nand_select_chip(NULL, -1);
++#endif    
++        
++    
++}
++ 
++
++
++
++/*
++ * Board-specific NAND initialization. The following members of the
++ * argument are board-specific (per include/linux/mtd/nand.h):
++ * - IO_ADDR_R?: address to read the 8 I/O lines of the flash device
++ * - IO_ADDR_W?: address to write the 8 I/O lines of the flash device
++ * - hwcontrol: hardwarespecific function for accesing control-lines
++ * - dev_ready: hardwarespecific function for  accesing device ready/busy line
++ * - enable_hwecc?: function to enable (reset)  hardware ecc generator. Must
++ *   only be provided if a hardware ECC is available
++ * - eccmode: mode of ecc, see defines
++ * - chip_delay: chip dependent delay for transfering data from array to
++ *   read regs (tR)
++ * - options: various chip options. They can partly be set to inform
++ *   nand_scan about special functionality. See the defines for further
++ *   explanation
++ * Members with a "?" were not set in the merged testing-NAND branch,
++ * so they are not set here either.
++ */
++int board_nand_init(struct nand_chip *nand)
++{
++	 ifx_nand_chip_init();
++	 /* insert callbacks */
++   nand->IO_ADDR_R = NAND_BASE_ADDRESS;
++   nand->IO_ADDR_W = NAND_BASE_ADDRESS;
++	 
++   nand->read_byte=ifx_nand_read_byte;
++   nand->read_buf=ifx_nand_read_buf;
++   //nand->write_byte=ifx_nand_write_byte;
++#ifndef CONFIG_NAND_SPL   
++   nand->write_buf=ifx_nand_write_buf;
++   nand->verify_buf=ifx_nand_verify_buf;
++#endif   
++   //nand->hwcontrol=ifx_nand_hwcontrol;
++   //nand->block_bad = ifx_nand_block_bad;
++   nand->cmd_ctrl=ifx_nand_cmd_ctrl;
++   nand->dev_ready=NanD_WaitReady;
++   nand->select_chip=ifx_nand_select_chip;
++#ifdef CONFIG_NAND_ECC_HW_REED_SOLOMON
++   nand->ecc.mode = NAND_ECC_HW;
++   nand->options |= NAND_NO_SUBPAGE_WRITE;
++#ifndef CONFIG_NAND_SPL   
++   nand->scan_bbt = lq_rs_nand_default_bbt;
++#endif   
++   nand->ecc.read_page  = lq_nand_read_page_hwecc;
++   nand->ecc.write_page = lq_nand_write_page_hwecc;
++   nand->ecc.read_page_raw = lq_nand_read_page_raw;
++   nand->ecc.write_page_raw = lq_nand_write_page_raw;
++   nand->ecc.read_oob = lq_nand_read_oob;
++   nand->ecc.write_oob = lq_nand_write_oob;
++   nand->ecc.size = 128;
++   nand->ops.mode = MTD_OOB_AUTO;
++#elif defined(CONFIG_NAND_ECC_BCH)
++   nand->ecc.mode = NAND_ECC_SOFT_BCH; 
++   nand->options |= NAND_NO_SUBPAGE_WRITE;
++
++   /* Limit BCH strength options to GRX500 */
++#if defined (CONFIG_DRIVER_GRX500)
++   nand->ecc.size = CONFIG_SYS_NAND_ECCSIZE;
++   nand->ecc.bytes = CONFIG_SYS_NAND_ECCBYTES;
++#endif /* CONFIG_DRIVER_GRX500 */
++
++   /* BCH 8 bytes on 2k page NAND, ECC will 
++    * overlap with default bbt table 
++    */
++#if defined(CONFIG_BCH_8BITS) && (CONFIG_NAND_PAGE_SIZE == 0x800)
++   nand->bbt_td = &bbt_main_descr;
++   nand->bbt_md = &bbt_mirror_descr;
++#endif
++
++#elif defined(CONFIG_NAND_BENAND)
++	nand->ecc.mode = NAND_ECC_BENAND;
++	nand->ecc.read_page = nand_read_page_benand;		
++	nand->ecc.read_subpage = nand_read_subpage_benand;
++#else
++   nand->ecc.mode=NAND_ECC_SOFT;
++#endif
++   //nand->ecc.mode=NAND_ECC_NONE;
++   nand->options|=NAND_USE_FLASH_BBT;
++   //nand->options|=NAND_SKIP_BBTSCAN;
++#ifdef CONFIG_NAND_SPL
++   nand->ecc.hwctl = lq_enable_hwecc;
++#if defined (CONFIG_NAND_ECC_BCH) && defined(CONFIG_DRIVER_GRX500)
++   nand->ecc.calculate = nand_bch_calculate_ecc;
++   nand->ecc.correct = nand_bch_correct_data;
++#elif defined(CONFIG_NAND_ECC_SOFT)
++   nand->ecc.calculate = nand_calculate_ecc;
++   nand->ecc.correct = nand_correct_data;
++#endif
++#endif
++	return 0;
++}
++
++
++
++
+diff --git a/drivers/mtd/nand/lq_spinand.c b/drivers/mtd/nand/lq_spinand.c
+new file mode 100755
+--- /dev/null
++++ b/drivers/mtd/nand/lq_spinand.c
+@@ -0,0 +1,572 @@
++/******************************************************************************
++ * **
++ * ** FILE NAME    : lq_spinand.c
++ * ** PROJECT      : GRX500
++ * ** MODULES      : SPI NAND Flash
++ * **
++ * ** DATE         : 22 Oct 2015
++ * ** AUTHOR       : Wu Qi Ming
++ * ** DESCRIPTION  : SPI NAND Flash MTD Driver
++ * ** COPYRIGHT    :       Copyright (c) 2015
++ * **                      Lantiq Technologies 
++ * **                      
++ * **
++ * **    This program is free software; you can redistribute it and/or modify
++ * **    it under the terms of the GNU General Public License as published by
++ * **    the Free Software Foundation; either version 2 of the License, or
++ * **    (at your option) any later version.
++ * **
++ * ** HISTORY
++ * ** $Date        $Author      $Version   $Comment
++ * ** 22 Oct 2015  Wu Qi Ming   1.0        initial version
++ * *******************************************************************************/
++
++#include <common.h>
++
++
++#include <nand.h>
++#include <asm/errno.h>
++#include <asm/addrspace.h>
++#include <spi.h>
++#include <spinand.h>
++
++
++struct spinand_info spinand_info={NULL, NULL, NULL};
++struct spinand_state spinand_state={0, 0, 0, NULL};
++/*fix me, hardcoded to 4K page+256 oob, might need to adjust for bigger spi nand flashes*/
++unsigned char spinand_buf[4096+256]; 
++
++static void spinand_write_byte(struct spi_slave *spi, u_char byte);
++
++static inline struct spinand_state *mtd_to_state(struct mtd_info *mtd)
++{
++        struct nand_chip *chip = (struct nand_chip *)mtd->priv;
++        struct spinand_info *info = (struct spinand_info *)chip->priv;
++        struct spinand_state *state = (struct spinand_state *)info->priv;
++
++        return state;
++}
++
++
++
++static void spinand_chip_init(void)
++{
++    
++}
++
++
++static void spinand_write_byte(struct spi_slave *spi, u_char byte)
++{
++      unsigned long flags = SPI_XFER_BEGIN|SPI_XFER_END;
++      spi_xfer(spi, 8, &byte, NULL, flags);
++}
++
++
++static uint8_t spinand_read_byte(struct mtd_info *mtd)
++{
++       struct spinand_state *state = mtd_to_state(mtd);
++       u8 data;
++
++       data = state->buf[state->buf_ptr];
++       state->buf_ptr++;
++       return data;
++
++}
++
++
++
++static void spinand_read_buf(struct mtd_info *mtd, uint8_t *buf, int len)
++{
++        struct nand_chip *chip = (struct nand_chip *)mtd->priv;
++        struct spi_slave *spi = (struct spi_slave *)chip->priv;
++        spi_xfer(spi, len * 8, NULL, buf, SPI_XFER_BEGIN|SPI_XFER_END);        
++}
++
++static void spinand_write_buf(struct mtd_info *mtd, const uint8_t *buf, int len)
++{
++        struct nand_chip *chip = (struct nand_chip *)mtd->priv;
++        struct spi_slave *spi = (struct spi_slave *)chip->priv;
++        spi_xfer(spi, len * 8, buf, NULL, SPI_XFER_BEGIN|SPI_XFER_END); 
++}
++
++
++/*
++ * spinand_cmd - to process a command to send to the SPI Nand
++ * Description:
++ *    Set up the command buffer to send to the SPI controller.
++ *    The command buffer has to initialized to 0.
++ */
++
++static int spinand_cmd(struct spi_slave *spi, struct spinand_cmd *cmd)
++{
++       int retval=0;
++       spi_xfer(spi, 8, &(cmd->cmd), NULL, SPI_XFER_BEGIN);
++       /* send addr if any */
++       spi_xfer(spi, 8*(cmd->n_addr), cmd->addr, NULL, 0);
++       /*send tx dummy bytes if any*/
++       spi_xfer(spi, 8*(cmd->n_tx), cmd->tx_buf, NULL, 0);  
++       spi_xfer(spi, 8*(cmd->n_rx), NULL,cmd->rx_buf, SPI_XFER_END);  
++       return retval;
++}
++
++
++
++/*
++ * spinand_read_id- Read SPI Nand ID
++ * Description:
++ *    Read ID: read two ID bytes from the SPI Nand device
++ */
++static int spinand_read_id(struct spinand_info *spi_nand, u8 *id)
++{
++        int retval;
++        u8 nand_id[3];
++        struct spinand_cmd cmd = {0};
++        struct spi_slave *spi=spi_nand->spi;
++
++        cmd.cmd = CMD_READ_ID;
++        cmd.n_rx = 3;
++        cmd.rx_buf = &nand_id[0];
++
++        retval = spinand_cmd(spi, &cmd);
++        if (retval < 0) {
++                return retval;
++        }
++        id[0] = nand_id[0];
++        id[1] = nand_id[1];
++        id[2] = nand_id[2];
++        if(id[0]==0 || id[0]==0xff){
++           id[0]=id[1];
++           id[1]=id[2];
++        }
++        
++        if(id[0]==0xc8){
++           spi_nand->options|=GIGADEVICE_DUMMY_TYPE;
++        }
++        return retval;
++}
++
++
++/*
++ * spinand_get_feature- get spi nand feature
++ * Description: get spi nand feature
++ */
++static u8 spinand_get_feature(struct spi_slave *spi, u8 addr)
++{       
++        u8 feature=0;
++        struct spinand_cmd cmd = {0};
++
++        cmd.cmd = CMD_GET_FEATURE;
++        cmd.n_addr = 1;
++        cmd.addr[0] = addr;
++        cmd.n_rx = 1;
++        cmd.rx_buf = &feature;
++        spinand_cmd(spi, &cmd);
++        return feature;
++}
++
++
++/*
++ * spinand_set_feature- set spi nand feature
++ * Description: set spi nand feature
++ */
++static int spinand_set_feature(struct spi_slave *spi, u8 addr, u8 feature)
++{
++        int retval;
++        struct spinand_cmd cmd = {0};
++
++        cmd.cmd = CMD_SET_FEATURE;
++        cmd.n_addr = 1;
++        cmd.addr[0] = addr;
++        cmd.n_tx = 1;
++        cmd.tx_buf = &feature;
++        retval = spinand_cmd(spi, &cmd);
++        return retval;
++}
++
++
++static int spinand_ready(struct mtd_info *mtd)
++{
++      struct nand_chip *chip = (struct nand_chip *)mtd->priv;
++      struct spinand_info *info = (struct spinand_info *)chip->priv;
++
++       /*check OIP status bit*/
++      while(spinand_get_feature(info->spi, REG_STATUS) & 0x1);
++      return 1;
++}
++
++
++
++
++/*
++ * spinand_reset -reset spi nand 
++ * Description: reset spi nand flash
++ */
++static int spinand_reset(struct spi_slave *spi)
++{
++        int retval;
++        struct spinand_cmd cmd = {0};
++        cmd.cmd = CMD_RESET;
++        retval = spinand_cmd(spi, &cmd);
++        /*check OIP status bit*/
++        while(spinand_get_feature(spi, REG_STATUS) & 0x1);
++        /*unlock the whole spi nand flash*/
++        spinand_set_feature(spi, REG_BLOCK_LOCK, 0);
++        /*unlock the whole spi nand flash*/
++        while(spinand_get_feature(spi, REG_STATUS) & 0x1);
++
++        return retval;        
++}
++
++
++
++/**
++ * spi_nand_write_enable- send command 0x06 to enable write or erase the
++ * Nand cells
++ * Description:
++ *   Before write and erase the Nand cells, the write enable has to be set.
++ *   After the write or erase, the write enable bit is automatically
++ *   cleared (status register bit 2)
++ *   Set the bit 2 of the status register has the same effect
++ */
++static int spi_nand_write_enable(struct spi_slave *spi)
++{
++    struct spinand_cmd cmd = {0};
++
++    cmd.cmd = CMD_WR_ENABLE;
++    return spinand_cmd(spi, &cmd);
++}
++
++
++
++/**
++ * spi_nand_write_disable- send command 0x04 to disable write or erase the nand flash
++ */
++static int spi_nand_write_disable(struct spi_slave *spi)
++{
++    struct spinand_cmd cmd = {0};
++
++    cmd.cmd = CMD_WR_DISABLE;
++    return spinand_cmd(spi, &cmd);
++}
++
++
++/*
++ * spinand_erase_block -erase an spi nand block
++ * Description: erase an spi nand block
++ */
++
++static int spinand_erase_block(struct spi_slave *spi, int page_addr)
++{
++      struct spinand_cmd cmd = {0};
++      int retval;
++      spi_nand_write_enable(spi);
++
++      cmd.cmd = CMD_ERASE_BLK;
++      cmd.n_addr = 3;
++      cmd.addr[0] = (u8)(page_addr >> 16);
++      cmd.addr[1] = (u8)(page_addr >> 8);
++      cmd.addr[2] = (u8)page_addr;
++
++      retval=spinand_cmd(spi, &cmd);
++
++      /*check OIP status bit*/
++      while(spinand_get_feature(spi, REG_STATUS) & 0x1);
++
++      spi_nand_write_disable(spi);
++
++      return retval;
++}
++
++
++/*
++ *Build a "fake" nand flash status to make the nand flash driver happy
++ *
++*/
++static int spinand_read_status(struct spinand_info *spi_nand)
++{
++     struct spinand_state *state = spi_nand->priv;
++     u8 status;
++     status=0x80;
++     state->buf[0]=status;
++     state->buf_ptr=0;
++     return 1;
++}
++
++static void spinand_cmdfunc(struct mtd_info *mtd, unsigned int command,
++                int column, int page)
++{
++      struct nand_chip *chip = (struct nand_chip *)mtd->priv;
++      struct spinand_info *info = (struct spinand_info *)chip->priv;
++      struct spinand_state *state = (struct spinand_state *)info->priv;
++      u8 cmd;
++      u8 id[2];
++      switch (command) {
++          case NAND_CMD_READ1:
++          case NAND_CMD_READ0:
++          case NAND_CMD_ERASE2:
++                break;
++          case NAND_CMD_SEQIN:
++                *((u32*)state->buf)=page; /*record the page information*/
++                state->buf_ptr=0;
++                break;
++          case NAND_CMD_STATUS:
++                spinand_read_status(info); 
++                break;
++          case NAND_CMD_ERASE1: 
++                spinand_erase_block(info->spi, page); 
++                break;
++          case NAND_CMD_READID:
++                state->buf_ptr = 0;
++                spinand_read_id(info, (u8 *)state->buf);
++                break;
++          case NAND_CMD_RESET:
++                spinand_reset(info->spi); 
++                break;
++          default:
++                break;
++      }
++}
++
++
++
++
++
++static void spinand_select_chip(struct mtd_info *mtd, int dev)
++{
++}
++
++
++int spinand_read_from_cache(struct nand_chip *chip, u32 column, size_t len, u8 *rbuf)
++{
++    struct spinand_info *info = (struct spinand_info *)chip->priv;
++    struct spinand_cmd cmd = {0};
++    cmd.cmd = CMD_READ_FROM_CACHE;
++    cmd.n_addr = 3;
++    if(info->options & GIGADEVICE_DUMMY_TYPE){
++      cmd.addr[0] = 0; 
++      cmd.addr[1] = (u8)(column >> 8);
++      cmd.addr[2] = (u8)column;
++    } else {
++      cmd.addr[0] = (u8)(column >> 8);
++      cmd.addr[1] = (u8)column;
++      cmd.addr[2] = 0;
++    }
++    cmd.n_rx = len;
++    cmd.rx_buf = rbuf;
++    spinand_cmd(info->spi, &cmd);
++    return 1;
++}
++
++
++int spinand_read_page_to_cache(struct nand_chip *chip, int page)
++{
++    int retval=0;
++    struct spinand_info *info = (struct spinand_info *)chip->priv;
++    struct spinand_cmd cmd = {0};
++    u8 status=0x1;
++    cmd.cmd = CMD_READ_PAGE_TO_CACHE;
++    cmd.n_addr = 3;
++    cmd.addr[0] = (u8)(page >> 16);
++    cmd.addr[1] = (u8)(page >> 8);
++    cmd.addr[2] = (u8)page;
++    cmd.n_tx=0;
++    cmd.n_rx=0;
++    retval = spinand_cmd(info->spi, &cmd);
++    while(status & 0x1){
++      status = spinand_get_feature(info->spi, REG_STATUS);
++    }
++    if((status>>4)==0x7) retval=-1;
++    return retval; 
++}
++
++
++static int spinand_read_page(struct mtd_info *mtd, struct nand_chip *chip,
++                uint8_t *rbuf, int page)
++{
++ 
++    int retval = spinand_read_page_to_cache(chip, page);
++    spinand_read_from_cache(chip, 0, mtd->writesize, rbuf);
++    return retval;
++}
++
++
++static int spinand_read_page_raw(struct mtd_info *mtd, struct nand_chip *chip,
++                uint8_t *rbuf, int page)
++{
++     int retval = spinand_read_page(mtd, chip, rbuf, page);
++     spinand_read_from_cache(chip, mtd->writesize, mtd->oobsize, chip->oob_poi);
++     return retval;
++}
++
++
++
++static int spinand_read_oob(struct mtd_info *mtd, struct nand_chip *chip,
++                           int page, int sndcmd)
++{
++       int retval = spinand_read_page_to_cache(chip, page);
++       spinand_read_from_cache(chip, mtd->writesize, mtd->oobsize, chip->oob_poi);
++       return retval;
++}
++
++
++static int spi_nand_program_data_to_cache(struct nand_chip *chip, u32 column, size_t len, u8 *wbuf)
++{
++    struct spinand_cmd cmd = {0};
++    struct spinand_info *info = (struct spinand_info *)chip->priv;
++    cmd.cmd = CMD_PROG_LOAD_TO_CACHE;
++    cmd.n_addr = 2;
++    cmd.addr[0] = (u8)(column >> 8);
++    cmd.addr[1] = (u8)column;
++    cmd.n_tx = len;
++    cmd.tx_buf = wbuf;
++    return spinand_cmd(info->spi, &cmd);
++}
++
++
++static int spi_nand_program_data_to_cache_random(struct nand_chip *chip, u32 column, size_t len, u8 *wbuf)
++{
++    struct spinand_cmd cmd = {0};
++    struct spinand_info *info = (struct spinand_info *)chip->priv;
++    cmd.cmd = CMD_PROG_LOAD_TO_CACHE_RANDOM;
++    cmd.n_addr = 2;
++    cmd.addr[0] = (u8)(column >> 8);
++    cmd.addr[1] = (u8)column;
++    cmd.n_tx = len;
++    cmd.tx_buf = wbuf;
++    return spinand_cmd(info->spi, &cmd);
++}
++
++
++
++static int spi_nand_program_execute(struct nand_chip *chip, u32 page_addr)
++{
++    struct spinand_cmd cmd = {0};
++    struct spinand_info *info = (struct spinand_info *)chip->priv;
++    cmd.cmd = CMD_PROG_PAGE_EXC;
++    cmd.n_addr = 3;
++    cmd.addr[0] = (u8)(page_addr >> 16);
++    cmd.addr[1] = (u8)(page_addr >> 8);
++    cmd.addr[2] = (u8)page_addr;
++    spinand_cmd(info->spi, &cmd);
++
++    /*check OIP status bit*/
++    while(spinand_get_feature(info->spi, REG_STATUS) & 0x1);
++}
++
++
++static int spinand_write_page(struct mtd_info *mtd,
++                struct nand_chip *chip, const uint8_t *buf)
++{
++        struct spinand_info *info = (struct spinand_info *)chip->priv;
++        struct spinand_state *state = (struct spinand_state *)info->priv;
++        int i;
++        //spinand_read_page_to_cache(chip, *((u32*)state->buf));
++        //spi_nand_program_data_to_cache_random(chip, 0, mtd->writesize, buf);
++        //spi_nand_program_data_to_cache_random(chip, mtd->writesize, mtd->oobsize, chip->oob_poi);
++        spi_nand_write_enable(info->spi);
++        //spi_nand_program_data_to_cache(chip, 0, mtd->writesize, buf);    
++        spi_nand_program_data_to_cache_random(chip, 0, mtd->writesize, buf);
++        spi_nand_program_data_to_cache_random(chip, mtd->writesize, mtd->oobsize, chip->oob_poi);
++        spi_nand_program_execute(chip, *((u32*)state->buf));
++        spinand_ready(mtd);
++        spi_nand_write_disable(info->spi);
++        return 0;
++}
++
++
++
++static int spinand_write_oob(struct mtd_info *mtd, struct nand_chip *chip,
++                  int page)
++{
++    struct spinand_info *info = (struct spinand_info *)chip->priv;
++    spinand_read_page_to_cache(chip, page);
++    spinand_ready(mtd);
++    spi_nand_program_data_to_cache_random(chip, mtd->writesize, mtd->oobsize, chip->oob_poi);
++    spi_nand_write_enable(info->spi);
++    spi_nand_program_execute(chip, page);
++    spinand_ready(mtd);
++    spi_nand_write_disable(info->spi);
++    return 0;
++}
++
++
++
++static int spinand_wait(struct mtd_info *mtd, struct nand_chip *chip)
++{
++
++       return 0;
++}
++
++
++static int spinand_block_bad(struct mtd_info *mtd, loff_t ofs, int getchip)
++{
++       int page;
++       int retval=0;
++       struct nand_chip *chip = mtd->priv;
++       page = (int)(ofs >> chip->page_shift) & chip->pagemask;
++       chip->ecc.read_oob(mtd, chip, page, 0);
++       if(*(chip->oob_poi+CONFIG_SYS_NAND_BAD_BLOCK_POS)!=0xff) {
++          retval=1;
++       }
++       return retval;
++}
++
++
++
++int board_nand_init(struct nand_chip *chip)
++{
++        unsigned int bus = 0;
++        unsigned int cs=CONFIG_ENV_SPI_CS;
++        unsigned int speed = CONFIG_SF_DEFAULT_SPEED;
++        unsigned int mode = CONFIG_SF_DEFAULT_MODE;
++        struct spi_slave *spi;
++        struct spinand_info *info;
++        struct spinand_state *state;
++        int ret;
++
++        spinand_chip_init();
++        spi = spi_setup_slave(bus, cs, speed, mode);
++        if (!spi) {
++                debug("SF: Failed to set up slave\n");
++                goto error;
++        }
++
++        ret = spi_claim_bus(spi);
++        if (ret) {
++                debug("SF: Failed to claim SPI bus: %d\n", ret);
++                goto error;
++        }
++
++        /*init spinand info structure*/
++        info = &spinand_info;
++        info->options=0;
++        info->spi = spi;
++        state = &spinand_state;
++        info->priv      = state;
++        state->buf_ptr  = 0;
++        state->buf      = &spinand_buf;
++
++        chip->priv = info;
++        chip->ecc.mode  = NAND_ECC_HW;
++        chip->ecc.read_page = spinand_read_page;
++        chip->ecc.read_page_raw = spinand_read_page_raw;
++        chip->ecc.write_page = spinand_write_page;
++        chip->ecc.read_oob = spinand_read_oob;
++        chip->ecc.write_oob = spinand_write_oob;
++        chip->read_buf  = spinand_read_buf;
++        chip->write_buf = spinand_write_buf;
++        chip->read_byte = spinand_read_byte;
++        chip->cmdfunc   = spinand_cmdfunc;
++	chip->block_bad = spinand_block_bad;
++        chip->dev_ready = spinand_ready;
++        chip->waitfunc  = spinand_wait;
++        chip->select_chip = spinand_select_chip;
++        chip->options|=NAND_USE_FLASH_BBT|NAND_NO_SUBPAGE_WRITE;; 
++
++error:
++        return 0;
++}
++
++
++
++
+diff --git a/drivers/mtd/nand/nand.c b/drivers/mtd/nand/nand.c
+--- a/drivers/mtd/nand/nand.c
++++ b/drivers/mtd/nand/nand.c
+@@ -55,10 +55,9 @@ static void nand_init_chip(struct mtd_in
+ 			if (!mtd->name)
+ 				mtd->name = (char *)default_nand_name;
+ #ifndef CONFIG_RELOC_FIXUP_WORKS
+-			else
++			else if(!nand->onfi_version)
+ 				mtd->name += gd->reloc_off;
+ #endif
+-
+ #ifdef CONFIG_MTD_DEVICE
+ 			/*
+ 			 * Add MTD device so that we can reference it later
+diff --git a/drivers/mtd/nand/nand_base.c b/drivers/mtd/nand/nand_base.c
+old mode 100644
+new mode 100755
+--- a/drivers/mtd/nand/nand_base.c
++++ b/drivers/mtd/nand/nand_base.c
+@@ -67,7 +67,7 @@
+ #include <linux/mtd/mtd.h>
+ #include <linux/mtd/nand.h>
+ #include <linux/mtd/nand_ecc.h>
+-
++#include <linux/mtd/nand_bch.h>
+ #ifdef CONFIG_MTD_PARTITIONS
+ #include <linux/mtd/partitions.h>
+ #endif
+@@ -133,6 +133,262 @@ static struct nand_ecclayout nand_oob_12
+ 		{.offset = 2,
+ 		 .length = 78}}
+ };
++/*
++static struct nand_ecclayout nand_oob_224 = {
++        .eccbytes = 48,
++	    .eccpos = {
++		          176, 177, 178, 179, 180, 181, 182, 183,
++				  184, 185, 186, 187, 188, 189, 190, 191,
++				  192, 193, 194, 195, 196, 197, 198, 199,
++				  200, 201, 202, 203, 204, 205, 206, 207,
++				  208, 209, 210, 211, 212, 213, 214, 215,
++				  216, 217, 218, 219, 220, 221, 222, 223,
++		          },
++		.oobfree = {
++		        {.offset = 2,
++			     .length = 174}}
++};
++*/
++
++
++static struct nand_ecclayout nand_oob_224 = {
++        .eccbytes = 96,
++		.eccpos = {
++                    128, 129, 130, 131, 132, 133, 134, 135,
++					136, 137, 138, 139, 140, 141, 142, 143,
++					144, 145, 146, 147, 148, 149, 150, 151,
++					152, 153, 154, 155, 156, 157, 158, 159,
++					160, 161, 162, 163, 164, 165, 166, 167,
++					168, 169, 170, 171, 172, 173, 174, 175,
++					176, 177, 178, 179, 180, 181, 182, 183,
++					184, 185, 186, 187, 188, 189, 190, 191,
++					192, 193, 194, 195, 196, 197, 198, 199,
++					200, 201, 202, 203, 204, 205, 206, 207,
++					208, 209, 210, 211, 212, 213, 214, 215,
++					216, 217, 218, 219, 220, 221, 222, 223,
++		           },
++	     .oobfree = {
++		         {.offset = 2,
++		          .length = 126}}
++};
++													
++				
++static struct nand_ecclayout nand_oob_436 = {
++	.eccbytes = 96,
++	.eccpos = {
++		    340, 341, 342, 343, 344, 345, 346, 347,
++        348, 349, 350, 351, 352, 353, 354, 355,
++        356, 357, 358, 359, 360, 361, 362, 363,
++        364, 365, 366, 367, 368, 369, 370, 371,
++        372, 373, 374, 375, 376, 377, 378, 379,
++        380, 381, 382, 383, 384, 385, 386, 387,
++        388, 389, 390, 391, 392, 393, 394, 395,
++        396, 397, 398, 399, 400, 401, 402, 403,
++        404, 405, 406, 407, 408, 409, 410, 411,
++        412, 413, 414, 415, 416, 417, 418, 419,
++        420, 421, 422, 423, 424, 425, 426, 427,
++        428, 429, 430, 431, 432, 433, 434, 435,},
++	.oobfree = {
++		{.offset = 2,
++		 .length = 338}}
++};
++
++static struct nand_ecclayout nand_oob_448 = {
++	.eccbytes = 96,
++	.eccpos = {
++		    352, 353, 354, 355, 356, 357, 358, 359,
++        360, 361, 362, 363, 364, 365, 366, 367,
++        368, 369, 370, 371, 372, 373, 374, 375,
++        376, 377, 378, 379, 380, 381, 382, 383,
++        384, 385, 386, 387, 388, 389, 390, 391,
++        392, 393, 394, 395, 396, 397, 398, 399,
++        400, 401, 402, 403, 404, 405, 406, 407,
++        408, 409, 410, 411, 412, 413, 414, 415,
++        416, 417, 418, 419, 420, 421, 422, 423,
++        424, 425, 426, 427, 428, 429, 430, 431,
++        432, 433, 434, 435, 436, 437, 438, 439,
++        440, 441, 442, 443, 444, 445, 446, 447,},
++	.oobfree = {
++		{.offset = 2,
++		 .length = 350}}
++};
++
++static struct nand_ecclayout nand_oob_744 = {
++	.eccbytes = 560,
++	.eccpos = {
++		212, 213, 214, 215, 216, 217, 218, 219,
++		219, 220, 221, 222, 223, 224, 225, 226,
++		226, 227, 228, 229, 230, 231, 232, 233,
++		233, 234, 235, 236, 237, 238, 239, 240,
++		240, 241, 242, 243, 244, 245, 246, 247,
++		247, 248, 249, 250, 251, 252, 253,
++		254, 255, 256, 257, 258, 259, 260, 261,
++		261, 262, 263, 264, 265, 266, 267, 268,
++		268, 269, 270, 271, 272, 273, 274, 275,
++		275, 276, 277, 278, 279, 280, 281, 282,
++		282, 283, 284, 285, 286, 287, 288, 289,
++		289, 290, 291, 292, 293, 294, 295, 296,
++		296, 297, 298, 299, 300, 301, 302, 303,
++		303, 304, 305, 306, 307, 308, 309, 310,
++		310, 311, 312, 313, 314, 315, 316, 317,
++		317, 318, 319, 320, 321, 322, 323, 324,
++		324, 325, 326, 327, 328, 329, 330, 331,
++		331, 332, 333, 334, 335, 336, 337, 338,
++		338, 339, 340, 341, 342, 343, 344, 345,
++		345, 346, 347, 348, 349, 350, 351, 352,
++		352, 353, 354, 355, 356, 357, 358, 359,
++		359, 360, 361, 362, 363, 364, 365, 366,
++		366, 367, 368, 369, 370, 371, 372, 373,
++		373, 374, 375, 376, 377, 378, 379, 380,
++		380, 381, 382, 383, 384, 385, 386, 387,
++		387, 388, 389, 390, 391, 392, 393, 394,
++		394, 395, 396, 397, 398, 399, 400, 401,
++		401, 402, 403, 404, 405, 406, 407, 408,
++		408, 409, 410, 411, 412, 413, 414, 415,
++		415, 416, 417, 418, 419, 420, 421, 422,
++		422, 423, 424, 425, 426, 427, 428, 429,
++		429, 430, 431, 432, 433, 434, 435, 436,
++		436, 437, 438, 439, 440, 441, 442, 443,
++		443, 444, 445, 446, 447, 448, 449, 450,
++		450, 451, 452, 453, 454, 455, 456, 457,
++		457, 458, 459, 460, 461, 462, 463, 464,
++		464, 465, 466, 467, 468, 469, 470, 471,
++		471, 472, 473, 474, 475, 476, 477, 478,
++		478, 479, 480, 481, 482, 483, 484, 485,
++		485, 486, 487, 488, 489, 490, 491, 492,
++		492, 493, 494, 495, 496, 497, 498, 499,
++		499, 500, 501, 502, 503, 504, 505, 506,
++		506, 507, 508, 509, 510, 511, 512, 513,
++		513, 514, 515, 516, 517,
++		518, 519, 520, 521, 522, 523, 524, 525,
++		525, 526, 527, 528, 529, 530, 531, 532,
++		532, 533, 534, 535, 536, 537, 538, 539,
++		539, 540, 541, 542, 543, 544, 545, 546,
++		546, 547, 548, 549, 550, 551, 552, 553,
++		553, 554, 555, 556, 557, 558, 559, 560,
++		560, 561, 562, 563, 564, 565, 566, 567,
++		567, 568, 569, 570, 571, 572, 573, 574,
++		574, 575, 576, 577, 578, 579, 580, 581,
++		581, 582, 583, 584, 585, 586, 587, 588,
++		588, 589, 590, 591, 592, 593, 594, 595,
++		595, 596, 597, 598, 599, 600, 601, 602,
++		602, 603, 604, 605, 606, 607, 608, 609,
++		609, 610, 611, 612, 613, 614, 615, 616,
++		616, 617, 618, 619, 620, 621, 622, 623,
++		623, 624, 625, 626, 627, 628, 629, 630,
++		630, 631, 632, 633, 634, 635, 636, 637,
++		637, 638, 639, 640, 641, 642, 643, 644,
++		644, 645, 646, 647, 648, 649, 650, 651,
++		651, 652, 653, 654, 655, 656, 657, 658,
++		658, 659, 660, 661, 662, 663, 664, 665,
++		665, 666, 667, 668, 669, 670, 671, 672,
++		672, 673, 674, 675, 676, 677, 678, 679,
++		679, 680, 681, 682, 683, 684, 685, 686,
++		686, 687, 688, 689, 690, 691, 692, 693,
++		693, 694, 695, 696, 697, 698, 699, 700,
++		700, 701, 702, 703, 704, 705, 706, 707,
++		707, 708, 709, 710, 711, 712, 713, 714,
++		714, 715, 716, 717, 718, 719, 720, 721,
++		721, 722, 723, 724, 725, 726, 727, 728,
++		728, 729, 730, 731, 732, 733, 734, 735,
++		735, 736, 737, 738, 739, 740, 741, 742,
++		742, 743, 744, 745, 746, 747, 748, 749,
++		749, 750, 751, 752, 753, 754, 755, 756,
++		756, 757, 758, 759, 760, 761, 762, 763,
++		763, 764, 765, 766, 767, 768, 769, 770,
++		770, 771, 772, 773},
++	.oobfree = {
++		{.offset = 2,
++		 .length = 212}}
++};
++
++static struct nand_ecclayout nand_oob_1280 = {
++    .eccbytes = 560,
++    .eccpos = {
++		720, 721, 722, 723, 724, 725, 726, 727,
++		727, 728, 729, 730, 731, 732, 733, 734,
++		734, 735, 736, 737, 738, 739, 740, 741,
++		741, 742, 743, 744, 745, 746, 747, 748,
++		748, 749, 750, 751, 752, 753, 754, 755,
++		755, 756, 757, 758, 759, 760, 761, 762,
++		762, 763, 764, 765, 766, 767, 768, 769,
++		769, 770, 771, 772, 773, 774, 775, 776,
++		776, 777, 778, 779, 780, 781, 782, 783,
++		783, 784, 785, 786, 787, 788, 789, 790,
++		790, 791, 792, 793, 794, 795, 796, 797,
++		797, 798, 799, 800, 801, 802, 803, 804,
++		804, 805, 806, 807, 808, 809, 810, 811,
++		811, 812, 813, 814, 815, 816, 817, 818,
++		818, 819, 820, 821, 822, 823, 824, 825,
++		825, 826, 827, 828, 829, 830, 831, 832,
++		832, 833, 834, 835, 836, 837, 838, 839,
++		839, 840, 841, 842, 843, 844, 845, 846,
++		846, 847, 848, 849, 850, 851, 852, 853,
++		853, 854, 855, 856, 857, 858, 859, 860,
++		860, 861, 862, 863, 864, 865, 866, 867,
++		867, 868, 869, 870, 871, 872, 873, 874,
++		874, 875, 876, 877, 878, 879, 880, 881,
++		881, 882, 883, 884, 885, 886, 887, 888,
++		888, 889, 890, 891, 892, 893, 894, 895,
++		895, 896, 897, 898, 899, 900, 901, 902,
++		902, 903, 904, 905, 906, 907, 908, 909,
++		909, 910, 911, 912, 913, 914, 915, 916,
++		916, 917, 918, 919, 920, 921, 922, 923,
++		923, 924, 925, 926, 927, 928, 929, 930,
++		930, 931, 932, 933, 934, 935, 936, 937,
++		937, 938, 939, 940, 941, 942, 943, 944,
++		944, 945, 946, 947, 948, 949, 950, 951,
++		951, 952, 953, 954, 955, 956, 957, 958,
++		958, 959, 960, 961, 962, 963, 964, 965,
++		965, 966, 967, 968, 969, 970, 971, 972,
++		972, 973, 974, 975, 976, 977, 978, 979,
++		979, 980, 981, 982, 983, 984, 985, 986,
++		986, 987, 988, 989, 990, 991, 992, 993,
++		993, 994, 995, 996, 997, 998, 999, 1000,
++		1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007,
++		1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014,
++		1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021,
++		1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028,
++		1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035,
++		1035, 1036, 1037, 1038, 1039, 1040, 1041, 1042,
++		1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049,
++		1049, 1050, 1051, 1052, 1053, 1054, 1055, 1056,
++		1056, 1057, 1058, 1059, 1060, 1061, 1062, 1063,
++		1063, 1064, 1065, 1066, 1067, 1068, 1069, 1070,
++		1070, 1071, 1072, 1073, 1074, 1075, 1076, 1077,
++		1077, 1078, 1079, 1080, 1081, 1082, 1083, 1084,
++		1084, 1085, 1086, 1087, 1088, 1089, 1090, 1091,
++		1091, 1092, 1093, 1094, 1095, 1096, 1097, 1098,
++		1098, 1099, 1100, 1101, 1102, 1103, 1104, 1105,
++		1105, 1106, 1107, 1108, 1109, 1110, 1111, 1112,
++		1112, 1113, 1114, 1115, 1116, 1117, 1118, 1119,
++		1119, 1120, 1121, 1122, 1123, 1124, 1125, 1126,
++		1126, 1127, 1128, 1129, 1130, 1131, 1132, 1133,
++		1133, 1134, 1135, 1136, 1137, 1138, 1139, 1140,
++		1140, 1141, 1142, 1143, 1144, 1145, 1146, 1147,
++		1147, 1148, 1149, 1150, 1151, 1152, 1153, 1154,
++		1154, 1155, 1156, 1157, 1158, 1159, 1160, 1161,
++		1161, 1162, 1163, 1164, 1165, 1166, 1167, 1168,
++		1168, 1169, 1170, 1171, 1172, 1173, 1174, 1175,
++		1175, 1176, 1177, 1178, 1179, 1180, 1181, 1182,
++		1182, 1183, 1184, 1185, 1186, 1187, 1188, 1189,
++		1189, 1190, 1191, 1192, 1193, 1194, 1195, 1196,
++		1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203,
++		1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210,
++		1210, 1211, 1212, 1213, 1214, 1215, 1216, 1217,
++		1217, 1218, 1219, 1220, 1221, 1222, 1223, 1224,
++		1224, 1225, 1226, 1227, 1228, 1229, 1230, 1231,
++		1231, 1232, 1233, 1234, 1235, 1236, 1237, 1238,
++		1238, 1239, 1240, 1241, 1242, 1243, 1244, 1245,
++		1245, 1246, 1247, 1248, 1249, 1250, 1251, 1252,
++		1252, 1253, 1254, 1255, 1256, 1257, 1258, 1259,
++		1259, 1260, 1261, 1262, 1263, 1264, 1265, 1266,
++		1266, 1267, 1268, 1269, 1270, 1271, 1272, 1273,
++		1273, 1274, 1275, 1276, 1277, 1278, 1279},
++    .oobfree = {
++        {.offset = 2,
++         .length = 718}}
++};
+ 
+ 
+ static int nand_get_device(struct nand_chip *chip, struct mtd_info *mtd,
+@@ -751,103 +1007,12 @@ static void nand_command_lp(struct mtd_i
+ 	nand_wait_ready(mtd);
+ }
+ 
+-/**
+- * nand_get_device - [GENERIC] Get chip for selected access
+- * @chip:	the nand chip descriptor
+- * @mtd:	MTD device structure
+- * @new_state:	the state which is requested
+- *
+- * Get the device and lock it for exclusive access
+- */
+-/* XXX U-BOOT XXX */
+-#if 0
+-static int
+-nand_get_device(struct nand_chip *chip, struct mtd_info *mtd, int new_state)
+-{
+-	spinlock_t *lock = &chip->controller->lock;
+-	wait_queue_head_t *wq = &chip->controller->wq;
+-	DECLARE_WAITQUEUE(wait, current);
+- retry:
+-	spin_lock(lock);
+-
+-	/* Hardware controller shared among independend devices */
+-	/* Hardware controller shared among independend devices */
+-	if (!chip->controller->active)
+-		chip->controller->active = chip;
+-
+-	if (chip->controller->active == chip && chip->state == FL_READY) {
+-		chip->state = new_state;
+-		spin_unlock(lock);
+-		return 0;
+-	}
+-	if (new_state == FL_PM_SUSPENDED) {
+-		spin_unlock(lock);
+-		return (chip->state == FL_PM_SUSPENDED) ? 0 : -EAGAIN;
+-	}
+-	set_current_state(TASK_UNINTERRUPTIBLE);
+-	add_wait_queue(wq, &wait);
+-	spin_unlock(lock);
+-	schedule();
+-	remove_wait_queue(wq, &wait);
+-	goto retry;
+-}
+-#else
+ static int nand_get_device (struct nand_chip *this, struct mtd_info *mtd, int new_state)
+ {
+ 	this->state = new_state;
+ 	return 0;
+ }
+-#endif
+-
+-/**
+- * nand_wait - [DEFAULT]  wait until the command is done
+- * @mtd:	MTD device structure
+- * @chip:	NAND chip structure
+- *
+- * Wait for command done. This applies to erase and program only
+- * Erase can take up to 400ms and program up to 20ms according to
+- * general NAND and SmartMedia specs
+- */
+-/* XXX U-BOOT XXX */
+-#if 0
+-static int nand_wait(struct mtd_info *mtd, struct nand_chip *chip)
+-{
+-
+-	unsigned long timeo = jiffies;
+-	int status, state = chip->state;
+-
+-	if (state == FL_ERASING)
+-		timeo += (HZ * 400) / 1000;
+-	else
+-		timeo += (HZ * 20) / 1000;
+-
+-	led_trigger_event(nand_led_trigger, LED_FULL);
+-
+-	/* Apply this short delay always to ensure that we do wait tWB in
+-	 * any case on any machine. */
+-	ndelay(100);
+-
+-	if ((state == FL_ERASING) && (chip->options & NAND_IS_AND))
+-		chip->cmdfunc(mtd, NAND_CMD_STATUS_MULTI, -1, -1);
+-	else
+-		chip->cmdfunc(mtd, NAND_CMD_STATUS, -1, -1);
+-
+-	while (time_before(jiffies, timeo)) {
+-		if (chip->dev_ready) {
+-			if (chip->dev_ready(mtd))
+-				break;
+-		} else {
+-			if (chip->read_byte(mtd) & NAND_STATUS_READY)
+-				break;
+-		}
+-		cond_resched();
+-	}
+-	led_trigger_event(nand_led_trigger, LED_OFF);
+-
+-	status = (int)chip->read_byte(mtd);
+-	return status;
+-}
+-#else
++
+ static int nand_wait(struct mtd_info *mtd, struct nand_chip *this)
+ {
+ 	unsigned long	timeo;
+@@ -886,7 +1051,6 @@ static int nand_wait(struct mtd_info *mt
+ 
+ 	return this->read_byte(mtd);
+ }
+-#endif
+ 
+ /**
+  * nand_read_page_raw - [Intern] read raw page data without ecc
+@@ -980,10 +1144,12 @@ static int nand_read_page_swecc(struct m
+ 		int stat;
+ 
+ 		stat = chip->ecc.correct(mtd, p, &ecc_code[i], &ecc_calc[i]);
+-		if (stat < 0)
++		if (stat < 0){
+ 			mtd->ecc_stats.failed++;
+-		else
++			}
++		else{
+ 			mtd->ecc_stats.corrected += stat;
++			}
+ 	}
+ 	return 0;
+ }
+@@ -1416,8 +1582,8 @@ static int nand_do_read_ops(struct mtd_i
+  *
+  * Get hold of the chip and call nand_do_read
+  */
+-static int nand_read(struct mtd_info *mtd, loff_t from, size_t len,
+-		     size_t *retlen, uint8_t *buf)
++static int nand_read(struct mtd_info *mtd, loff_t from, u64 len,
++		     u64 *retlen, uint8_t *buf)
+ {
+ 	struct nand_chip *chip = mtd->priv;
+ 	int ret;
+@@ -1512,14 +1678,14 @@ static int nand_write_oob_std(struct mtd
+ 	int status = 0;
+ 	const uint8_t *buf = chip->oob_poi;
+ 	int length = mtd->oobsize;
+-
++	
+ 	chip->cmdfunc(mtd, NAND_CMD_SEQIN, mtd->writesize, page);
+ 	chip->write_buf(mtd, buf, length);
++	
+ 	/* Send command to program the OOB data */
+ 	chip->cmdfunc(mtd, NAND_CMD_PAGEPROG, -1, -1);
+ 
+ 	status = chip->waitfunc(mtd, chip);
+-
+ 	return status & NAND_STATUS_FAIL ? -EIO : 0;
+ }
+ 
+@@ -2053,16 +2219,19 @@ static int nand_do_write_ops(struct mtd_
+ 
+ 		if (unlikely(oob))
+ 			oob = nand_fill_oob(chip, oob, ops);
+-
++#ifdef CONFIG_NAND_ECC_HW_REED_SOLOMON
++        ret = chip->write_page(mtd, chip, wbuf, page, cached, (ops->mode == MTD_OOB_RAW) || (oob && (ops->mode == MTD_OOB_PLACE)));
++#else
+ 		ret = chip->write_page(mtd, chip, wbuf, page, cached,
+ 				       (ops->mode == MTD_OOB_RAW));
+-		if (ret)
++#endif
++        if (ret)
+ 			break;
+ 
+ 		writelen -= bytes;
+-		if (!writelen)
+-			break;
+-
++		if (!writelen){
++			  break;
++            }
+ 		column = 0;
+ 		buf += bytes;
+ 		realpage++;
+@@ -2075,7 +2244,7 @@ static int nand_do_write_ops(struct mtd_
+ 			chip->select_chip(mtd, chipnr);
+ 		}
+ 	}
+-
++	asm("sync");
+ 	ops->retlen = ops->len - writelen;
+ 	if (unlikely(oob))
+ 		ops->oobretlen = ops->ooblen;
+@@ -2092,8 +2261,8 @@ static int nand_do_write_ops(struct mtd_
+  *
+  * NAND write with ECC
+  */
+-static int nand_write(struct mtd_info *mtd, loff_t to, size_t len,
+-			  size_t *retlen, const uint8_t *buf)
++static int nand_write(struct mtd_info *mtd, loff_t to, u64 len,
++			  u64 *retlen, const uint8_t *buf)
+ {
+ 	struct nand_chip *chip = mtd->priv;
+ 	int ret;
+@@ -2119,6 +2288,72 @@ static int nand_write(struct mtd_info *m
+ 	return ret;
+ }
+ 
++static int nand_write_partial (struct mtd_info *mtd, loff_t offset, u64 len, u64 * retlen, const u_char * buf)
++{
++      size_t chunk_len;
++    size_t actual;
++    int ret;
++    unsigned long sect_addr;
++    unsigned long sector_size;
++    unsigned char *sect_buf = NULL;
++    int f_start_partial=0;
++    int f_end_partial=0;
++    int f_malloc=0;
++    int total_sect_num=0;
++    struct erase_info erase;
++    int i;
++    sector_size = mtd->erasesize;
++    
++	if( (offset % sector_size)!=0 ) f_start_partial = 1;
++    if( ( (offset + len ) % sector_size)!=0 ) f_end_partial = 1;
++
++    total_sect_num = (offset + len -1) / sector_size - offset / sector_size + 1;
++    sect_addr = offset / sector_size;
++    sect_buf = buf;
++    for(i=0; i<total_sect_num; i++){
++             if((f_start_partial && i==0) || (f_end_partial && total_sect_num ==1)) {
++				 sect_buf=(uchar *)memalign(32, sector_size);
++				 asm("sync");
++				 nand_read(mtd, (sect_addr + i) * sector_size, (u64)sector_size, retlen, sect_buf);
++				 asm("sync");
++				 memcpy(sect_buf + (offset % (u32)sector_size), buf, \
++                        min((sector_size-(offset % sector_size)),len));
++                 f_malloc = 1;
++              }
++              else if(f_end_partial && i == total_sect_num -1 && i!=0){
++                 sect_buf=(uchar *)memalign(32, sector_size);;
++                 nand_read(mtd, (sect_addr + i) * sector_size, (u64)sector_size, retlen, sect_buf);
++                 memcpy(sect_buf,buf+i*sector_size-(offset % sector_size), (offset+len) % sector_size);
++                 f_malloc=1;
++              }
++
++											   
++             memset(&erase, 0, sizeof(erase));
++             erase.mtd  = mtd;
++             erase.addr = (sect_addr + i) * sector_size;
++             erase.len  = sector_size;
++             erase.state = 0;
++             if (nand_block_checkbad( mtd, erase.addr, 1, 1)){
++                   printf("block bad, partial write failed..\n");
++				   *retlen = 0;
++				   return 0;
++			 }
++			 
++			 nand_erase_nand (mtd, &erase,0);
++
++             nand_write(mtd, (sect_addr + i) * sector_size, (u64)sector_size, retlen, sect_buf);
++             if(f_malloc) {
++                 free(sect_buf);
++				 f_malloc=0;
++               }
++             sect_buf = buf + (i+1)*sector_size - (offset % sector_size);
++        }
++      *retlen = (u64)len;		
++	  return 0;
++}
++
++
++
+ /**
+  * nand_do_write_oob - [MTD Interface] NAND write out-of-band
+  * @mtd:	MTD device structure
+@@ -2598,16 +2833,278 @@ static void nand_set_defaults(struct nan
+ }
+ 
+ /*
++ * sanitize ONFI strings so we can safely print them
++ */
++static void sanitize_string(uint8_t *s, size_t len)
++{
++	ssize_t i;
++
++	/* null terminate */
++	s[len - 1] = 0;
++
++	/* remove non printable chars */
++	for (i = 0; i < len - 1; i++) {
++		if (s[i] < ' ' || s[i] > 127)
++			s[i] = '?';
++	}
++
++	/* remove trailing spaces */
++	strim(s);
++}
++
++static u16 onfi_crc16(u16 crc, u8 const *p, size_t len)
++{
++	int i;
++	while (len--) {
++		crc ^= *p++ << 8;
++		for (i = 0; i < 8; i++)
++			crc = (crc << 1) ^ ((crc & 0x8000) ? 0x8005 : 0);
++	}
++
++	return crc;
++}
++
++/*
++ * Check if the NAND chip is ONFI compliant, returns 1 if it is, 0 otherwise
++ */
++static int nand_flash_detect_onfi(struct mtd_info *mtd, struct nand_chip *chip,
++					int busw)
++{
++	struct nand_onfi_params *p = &chip->onfi_params;
++	int i,j;
++	int val;
++
++	/* try ONFI for unknow chip or LP */
++	chip->cmdfunc(mtd, NAND_CMD_READID, 0x20, -1);
++	if (chip->read_byte(mtd) != 'O' || chip->read_byte(mtd) != 'N' ||
++		chip->read_byte(mtd) != 'F' || chip->read_byte(mtd) != 'I')
++		return 0;
++
++	printk(KERN_INFO "ONFI flash detected\n");
++	chip->cmdfunc(mtd, NAND_CMD_PARAM, 0, -1);
++	for (i = 0; i < 3; i++) {
++		chip->read_buf(mtd, (uint8_t *)p, sizeof(*p));
++		if (onfi_crc16(ONFI_CRC_BASE, (uint8_t *)p, 254) ==
++				le16_to_cpu(p->crc)) {
++			printk(KERN_INFO "ONFI param page %d valid\n", i);
++			break;
++		}
++	}
++    /* 
++    for(j=0;j<sizeof(*p);j++){
++        printf("%02x ",*((uint8_t *)p+j));
++        if((j+1)%16==0) printf("\n");
++	}
++    */
++	if (i == 3)
++		return 0;
++
++	/* check version */
++	val = le16_to_cpu(p->revision) & 0xf;
++	if (val == 1 || val > (1 << 4)) {
++		printk(KERN_INFO "%s: unsupported ONFI version: %d\n",
++								__func__, val);
++		return 0;
++	}
++
++	if (val & (1 << 4))
++		chip->onfi_version = 22;
++	else if (val & (1 << 3))
++		chip->onfi_version = 21;
++	else if (val & (1 << 2))
++		chip->onfi_version = 20;
++	else
++		chip->onfi_version = 10;
++
++	sanitize_string(p->manufacturer, sizeof(p->manufacturer));
++	sanitize_string(p->model, sizeof(p->model));
++	if (!mtd->name)
++		mtd->name = p->model;
++	mtd->writesize = le32_to_cpu(p->byte_per_page);
++	mtd->erasesize = le32_to_cpu(p->pages_per_block) * mtd->writesize;
++	mtd->oobsize = le16_to_cpu(p->spare_bytes_per_page);
++	chip->chipsize = (u64)le32_to_cpu(p->blocks_per_lun)*(u64)(p->lun_count)*(u64)(mtd->erasesize);
++	/*fix me, seems no way to differenciate between Micron MLC 64,128,256,512G based on the above calculation*/
++	if (strcmp(mtd->name,"MT29F128G08CFAAAWP")==0){
++		chip->chipsize *= 2; 
++	}else if(strcmp(mtd->name,"MT29F256G08CJAAAWP")==0){	
++	    chip->chipsize *= 2;
++	}
++	
++	busw = 0;
++	if (le16_to_cpu(p->features) & 1)
++		busw = NAND_BUSWIDTH_16;
++
++	chip->options &= ~NAND_CHIPOPTIONS_MSK;
++	chip->options |= (NAND_NO_READRDY |
++			NAND_NO_AUTOINCR) & NAND_CHIPOPTIONS_MSK;
++
++	return 1;
++}
++
++/* return the supported JEDEC features. */
++static inline int jedec_feature(struct nand_chip *chip)
++{
++    return chip->jedec_version ? le16_to_cpu(chip->jedec_params.features)
++        : 0;
++}
++
++/*
++ * Check if the NAND chip is JEDEC compliant, returns 1 if it is, 0 otherwise.
++ */
++static int nand_flash_detect_jedec(struct mtd_info *mtd, struct nand_chip *chip,
++                    int *busw)
++{
++    struct nand_jedec_params *p = &chip->jedec_params;
++    struct jedec_ecc_info *ecc;
++    int val;
++    int i, j;
++
++    /* Try JEDEC for unknown chip or LP */
++    chip->cmdfunc(mtd, NAND_CMD_READID, 0x40, -1);
++    if (chip->read_byte(mtd) != 'J' || chip->read_byte(mtd) != 'E' ||
++        chip->read_byte(mtd) != 'D' || chip->read_byte(mtd) != 'E' ||
++        chip->read_byte(mtd) != 'C')
++        return 0;
++
++    chip->cmdfunc(mtd, NAND_CMD_PARAM, 0x40, -1);
++    for (i = 0; i < 3; i++) {
++        for (j = 0; j < sizeof(*p); j++)
++            ((uint8_t *)p)[j] = chip->read_byte(mtd);
++
++        if (onfi_crc16(ONFI_CRC_BASE, (uint8_t *)p, 510) ==
++                le16_to_cpu(p->crc))
++            break;
++    }
++
++    if (i == 3) {
++        printk(KERN_ERR "Could not find valid JEDEC parameter page; aborting\n");
++        return 0;
++    }
++
++    /* Check version */
++    val = le16_to_cpu(p->revision);
++    if (val & (1 << 2))
++        chip->jedec_version = 10;
++    else if (val & (1 << 1))
++        chip->jedec_version = 1; /* vendor specific version */
++    if (!chip->jedec_version) {
++        printk(KERN_INFO "unsupported JEDEC version: %d\n", val);
++        return 0;
++    }
++
++    sanitize_string(p->manufacturer, sizeof(p->manufacturer));
++    sanitize_string(p->model, sizeof(p->model));
++    if (!mtd->name)
++        mtd->name = p->model;
++
++    mtd->writesize = le32_to_cpu(p->byte_per_page);
++
++    /* Please reference to the comment for nand_flash_detect_onfi. */
++    mtd->erasesize = 1 << (fls(le32_to_cpu(p->pages_per_block)) - 1);
++    mtd->erasesize *= mtd->writesize;
++
++    mtd->oobsize = le16_to_cpu(p->spare_bytes_per_page);
++
++    /* Please reference to the comment for nand_flash_detect_onfi. */
++    chip->chipsize = 1 << (fls(le32_to_cpu(p->blocks_per_lun)) - 1);
++    chip->chipsize *= (uint64_t)mtd->erasesize * p->lun_count;
++    //chip->bits_per_cell = p->bits_per_cell;
++
++    if (jedec_feature(chip) & JEDEC_FEATURE_16_BIT_BUS)
++        *busw = NAND_BUSWIDTH_16;
++    else
++        *busw = 0;
++
++    /* ECC info */
++    ecc = &p->ecc_info[0];
++
++	/* 
++	* TODO:
++	* do we need to know the ecc density now? 
++	* or should we just enforce HW/SW correctibility meets spec?
++    if (ecc->codeword_size >= 9) {
++        chip->ecc_strength_ds = ecc->ecc_bits;
++        chip->ecc_step_ds = 1 << ecc->codeword_size;
++    } else {
++        printk(KERN_WARNING, "Invalid codeword size\n");
++    }
++	*/
++
++    return 1;
++}
++
++/*
++ * Check if the NAND chip is SPI NAND flash, returns 1 if it is, 0 otherwise.
++ */
++static int spinand_flash_detect(struct mtd_info *mtd,struct nand_chip *chip)
++{
++       int retval=0;
++       u8 id_data[8];
++       int i;
++       struct spinand_flash_dev *type = NULL;
++       
++       chip->cmdfunc(mtd, NAND_CMD_READID, 0x00, -1);
++       for (i = 0; i < 3; i++)
++                id_data[i] = chip->read_byte(mtd);
++
++        if (!type)
++                type = spinand_flash_ids;
++
++        for (; type->name != NULL; type++)
++                if ((id_data[0] == type->mf_id) && (id_data[1] == type->dev_id))
++                        break;
++
++        if (!type->name)
++                goto probe_done;
++
++        mtd->name = type->name;
++
++        mtd->erasesize = type->erasesize;
++        mtd->writesize = type->pagesize;
++        mtd->oobsize = type->oobsize;
++
++        chip->chipsize = (type->chipsize)<<20;
++
++        if (mtd->oobsize == 128) {
++                        chip->ecc.bytes = 9;            /* 9B * (4096B/512B) */
++                        chip->ecc.size = 512;   /* 4b * (4096B/512B) */
++                } else if (mtd->oobsize == 64) { /* 64B oob */
++                        chip->ecc.bytes = 9;
++                        chip->ecc.size = 512;
++                } else {
++                        printk(KERN_WARNING "%d unsupported oobsize\n",
++                                        mtd->oobsize);
++                        return -EINVAL;
++                }
++
++
++        chip->options &= ~NAND_CHIPOPTIONS_MSK;
++
++        retval = 1;
++probe_done:
++        return retval;
++
++}
++
++
++/*
+  * Get the flash and manufacturer id and lookup if the type is supported
+  */
+ static struct nand_flash_dev *nand_get_flash_type(struct mtd_info *mtd,
+ 						  struct nand_chip *chip,
+ 						  int busw, int *maf_id)
+ {
+-	struct nand_flash_dev *type = NULL;
+-	int i, dev_id, maf_idx;
+-	int tmp_id, tmp_manf;
+-
++	int i, maf_idx,dev_id_value; 
++	int *dev_id;
++	u8 id_data[8];
++	int ret;
++  struct nand_flash_dev *type = NULL;
++
++
++  dev_id = &dev_id_value;
++	
++	
+ 	/* Select the device */
+ 	chip->select_chip(mtd, 0);
+ 
+@@ -2622,8 +3119,10 @@ static struct nand_flash_dev *nand_get_f
+ 
+ 	/* Read manufacturer and device IDs */
+ 	*maf_id = chip->read_byte(mtd);
+-	dev_id = chip->read_byte(mtd);
+-
++	*dev_id = chip->read_byte(mtd);
++
++
++    //printf("%02x, %02x\n",*maf_id,*dev_id);
+ 	/* Try again to make sure, as some systems the bus-hold or other
+ 	 * interface concerns can cause random data which looks like a
+ 	 * possibly credible NAND flash to appear. If the two results do
+@@ -2632,27 +3131,46 @@ static struct nand_flash_dev *nand_get_f
+ 
+ 	chip->cmdfunc(mtd, NAND_CMD_READID, 0x00, -1);
+ 
+-	/* Read manufacturer and device IDs */
+-
+-	tmp_manf = chip->read_byte(mtd);
+-	tmp_id = chip->read_byte(mtd);
+-
+-	if (tmp_manf != *maf_id || tmp_id != dev_id) {
++	for (i = 0; i < 2; i++)
++		id_data[i] = chip->read_byte(mtd);
++
++	if (id_data[0] != *maf_id || id_data[1] != *dev_id) {
+ 		printk(KERN_INFO "%s: second ID read did not match "
+ 		       "%02x,%02x against %02x,%02x\n", __func__,
+-		       *maf_id, dev_id, tmp_manf, tmp_id);
++		       *maf_id, *dev_id, id_data[0], id_data[1]);
+ 		return ERR_PTR(-ENODEV);
+ 	}
+ 
+-	/* Lookup the flash id */
+-	for (i = 0; nand_flash_ids[i].name != NULL; i++) {
+-		if (dev_id == nand_flash_ids[i].id) {
+-			type =  &nand_flash_ids[i];
++	if (!type)
++		type = nand_flash_ids;
++
++	for (; type->name != NULL; type++)
++		if (*dev_id == type->id)
+ 			break;
+-		}
++
++	chip->onfi_version = 0;
++	if (!type->name || !type->pagesize) {
++		/* Check is chip is ONFI compliant */
++		ret = nand_flash_detect_onfi(mtd, chip, busw);
++		if (ret)
++			goto ident_done;
++		ret = nand_flash_detect_jedec(mtd, chip, &busw);
++		if (ret)
++			goto ident_done;
++                ret = spinand_flash_detect(mtd, chip);
++                if (ret)
++                        goto ident_done;
+ 	}
+-
+-	if (!type)
++	
++
++	chip->cmdfunc(mtd, NAND_CMD_READID, 0x00, -1);
++
++	/* Read entire ID string */
++
++	for (i = 0; i < 8; i++)
++		id_data[i] = chip->read_byte(mtd);
++
++	if (!type->name)
+ 		return ERR_PTR(-ENODEV);
+ 
+ 	if (!mtd->name)
+@@ -2660,25 +3178,91 @@ static struct nand_flash_dev *nand_get_f
+ 
+ 	chip->chipsize = (uint64_t)type->chipsize << 20;
+ 
+-	/* Newer devices have all the information in additional id bytes */
+-	if (!type->pagesize) {
++	if (!type->pagesize && chip->init_size) {
++		/* set the pagesize, oobsize, erasesize by the driver*/
++		busw = chip->init_size(mtd, chip, id_data);
++	} else if (!type->pagesize) {
+ 		int extid;
+ 		/* The 3rd id byte holds MLC / multichip data */
+-		chip->cellinfo = chip->read_byte(mtd);
++		chip->cellinfo = id_data[2];
+ 		/* The 4th id byte is the important one */
+-		extid = chip->read_byte(mtd);
+-		/* Calc pagesize */
+-		mtd->writesize = 1024 << (extid & 0x3);
+-		extid >>= 2;
+-		/* Calc oobsize */
+-		mtd->oobsize = (8 << (extid & 0x01)) * (mtd->writesize >> 9);
+-		extid >>= 2;
+-		/* Calc blocksize. Blocksize is multiples of 64KiB */
+-		mtd->erasesize = (64 * 1024) << (extid & 0x03);
+-		extid >>= 2;
+-		/* Get buswidth information */
+-		busw = (extid & 0x01) ? NAND_BUSWIDTH_16 : 0;
+-
++		extid = id_data[3];
++
++		/*
++		 * Field definitions are in the following datasheets:
++		 * Old style (4,5 byte ID): Samsung K9GAG08U0M (p.32)
++		 * New style   (6 byte ID): Samsung K9GBG08U0M (p.40)
++		 *
++		 * Check for wraparound + Samsung ID + nonzero 6th byte
++		 * to decide what to do.
++		 */
++		if (id_data[0] == id_data[6] && id_data[1] == id_data[7] &&
++				id_data[0] == NAND_MFR_SAMSUNG &&
++				(chip->cellinfo & NAND_CI_CELLTYPE_MSK) &&
++				id_data[5] != 0x00) {
++			/* Calc pagesize */
++			mtd->writesize = 2048 << (extid & 0x03);
++			extid >>= 2;
++			/* Calc oobsize */
++			switch (extid & 0x03) {
++			case 1:
++				mtd->oobsize = 128;
++				break;
++			case 2:
++				mtd->oobsize = 218;
++				break;
++			case 3:
++				mtd->oobsize = 400;
++				break;
++			default:
++				mtd->oobsize = 436;
++				break;
++			}
++			extid >>= 2;
++			/* Calc blocksize */
++			mtd->erasesize = (128 * 1024) <<
++				(((extid >> 1) & 0x04) | (extid & 0x03));
++			busw = 0;
++		} 
++		else if (id_data[0] == id_data[6] && id_data[1] == id_data[7] &&
++				id_data[0] == NAND_MFR_HYNIX &&
++				(chip->cellinfo & NAND_CI_CELLTYPE_MSK) &&
++				id_data[5] != 0x00) {
++			/* Calc pagesize */
++			mtd->writesize = 2048 << (extid & 0x03);
++			extid >>= 2;
++			/* Calc oobsize */
++			switch (extid & 0x03) {
++			case 0:
++				mtd->oobsize = 128;
++				break;
++			case 1:
++				mtd->oobsize = 224;
++				break;
++			case 2:
++				mtd->oobsize = 448;
++				break;
++			}
++			extid >>= 2;
++			/* Calc blocksize */
++			mtd->erasesize = (extid & 0x8) ? (1024 * 1024)<< ( extid & 0x1 ) :(128 * 1024) * (extid & 0x03)* 2;
++			busw = 0;
++		} 
++	
++		else {
++			/* Calc pagesize */
++			mtd->writesize = 1024 << (extid & 0x03);
++			extid >>= 2;
++			/* Calc oobsize */
++			mtd->oobsize = (8 << (extid & 0x01)) *
++				(mtd->writesize >> 9);
++			extid >>= 2;
++			/* Calc blocksize. Blocksize is multiples of 64KiB */
++			mtd->erasesize = (64 * 1024) << (extid & 0x03);
++			extid >>= 2;
++			/* Get buswidth information */
++			busw = (extid & 0x01) ? NAND_BUSWIDTH_16 : 0;
++		}
+ 	} else {
+ 		/*
+ 		 * Old devices have chip data hardcoded in the device id table
+@@ -2687,7 +3271,35 @@ static struct nand_flash_dev *nand_get_f
+ 		mtd->writesize = type->pagesize;
+ 		mtd->oobsize = mtd->writesize / 32;
+ 		busw = type->options & NAND_BUSWIDTH_16;
++
++		/*
++		 * Check for Spansion/AMD ID + repeating 5th, 6th byte since
++		 * some Spansion chips have erasesize that conflicts with size
++		 * listed in nand_ids table
++		 * Data sheet (5 byte ID): Spansion S30ML-P ORNAND (p.39)
++		 */
++		if (*maf_id == NAND_MFR_AMD && id_data[4] != 0x00 &&
++				id_data[5] == 0x00 && id_data[6] == 0x00 &&
++				id_data[7] == 0x00 && mtd->writesize == 512) {
++			mtd->erasesize = 128 * 1024;
++			mtd->erasesize <<= ((id_data[3] & 0x03) << 1);
++		}
+ 	}
++	/* Get chip options, preserve non chip based options */
++	chip->options &= ~NAND_CHIPOPTIONS_MSK;
++	chip->options |= type->options & NAND_CHIPOPTIONS_MSK;
++
++	/* Check if chip is a not a samsung device. Do not clear the
++	 * options for chips which are not having an extended id.
++	 */
++	if (*maf_id != NAND_MFR_SAMSUNG && !type->pagesize)
++		chip->options &= ~NAND_SAMSUNG_LP_OPTIONS;
++ident_done:
++
++	/*
++	 * Set chip as a default. Board drivers can override it, if necessary
++	 */
++	chip->options |= NAND_NO_AUTOINCR;
+ 
+ 	/* Try to identify manufacturer */
+ 	for (maf_idx = 0; nand_manuf_ids[maf_idx].id != 0x0; maf_idx++) {
+@@ -2702,7 +3314,7 @@ static struct nand_flash_dev *nand_get_f
+ 	if (busw != (chip->options & NAND_BUSWIDTH_16)) {
+ 		printk(KERN_INFO "NAND device: Manufacturer ID:"
+ 		       " 0x%02x, Chip ID: 0x%02x (%s %s)\n", *maf_id,
+-		       dev_id, nand_manuf_ids[maf_idx].name, mtd->name);
++		       *dev_id, nand_manuf_ids[maf_idx].name, mtd->name);
+ 		printk(KERN_WARNING "NAND bus width %d instead %d bit\n",
+ 		       (chip->options & NAND_BUSWIDTH_16) ? 16 : 8,
+ 		       busw ? 16 : 8);
+@@ -2718,27 +3330,56 @@ static struct nand_flash_dev *nand_get_f
+ 		ffs(mtd->erasesize) - 1;
+ 	if (chip->chipsize & 0xffffffff)
+ 		chip->chip_shift = ffs((unsigned)chip->chipsize) - 1;
++	else {
++		chip->chip_shift = ffs((unsigned)(chip->chipsize >> 32));
++		chip->chip_shift += 32 - 1;
++	}
++
++	/* Set the bad block position */
++	if (mtd->writesize > 512 || (busw & NAND_BUSWIDTH_16))
++		chip->badblockpos = NAND_LARGE_BADBLOCK_POS;
+ 	else
+-		chip->chip_shift = ffs((unsigned)(chip->chipsize >> 32)) + 31;
+-
+-	/* Set the bad block position */
+-	chip->badblockpos = mtd->writesize > 512 ?
+-		NAND_LARGE_BADBLOCK_POS : NAND_SMALL_BADBLOCK_POS;
+-
+-	/* Get chip options, preserve non chip based options */
+-	chip->options &= ~NAND_CHIPOPTIONS_MSK;
+-	chip->options |= type->options & NAND_CHIPOPTIONS_MSK;
++		chip->badblockpos = NAND_SMALL_BADBLOCK_POS;
+ 
+ 	/*
+-	 * Set chip as a default. Board drivers can override it, if necessary
++	 * Bad block marker is stored in the last page of each block
++	 * on Samsung and Hynix MLC devices; stored in first two pages
++	 * of each block on Micron devices with 2KiB pages and on
++	 * SLC Samsung, Hynix, Toshiba and AMD/Spansion. All others scan
++	 * only the first page.
+ 	 */
+-	chip->options |= NAND_NO_AUTOINCR;
+-
+-	/* Check if chip is a not a samsung device. Do not clear the
+-	 * options for chips which are not having an extended id.
++	if ((chip->cellinfo & NAND_CI_CELLTYPE_MSK) &&
++			(*maf_id == NAND_MFR_SAMSUNG ||
++			 *maf_id == NAND_MFR_HYNIX))
++		chip->options |= NAND_BBT_SCANLASTPAGE;
++	else if ((!(chip->cellinfo & NAND_CI_CELLTYPE_MSK) &&
++				(*maf_id == NAND_MFR_SAMSUNG ||
++				 *maf_id == NAND_MFR_HYNIX ||
++				 *maf_id == NAND_MFR_TOSHIBA ||
++				 *maf_id == NAND_MFR_AMD)) ||
++			(mtd->writesize == 2048 &&
++			 *maf_id == NAND_MFR_MICRON))
++		chip->options |= NAND_BBT_SCAN2NDPAGE;
++
++	if (id_data[0] == NAND_MFR_TOSHIBA &&
++			!(chip->cellinfo & NAND_CI_CELLTYPE_MSK) &&
++			(id_data[5] & 0x7) == 0x6) {
++
++		if (id_data[4] & 0x80) /* BENAND */
++			chip->ecc.mode = NAND_ECC_BENAND;
++		else
++			mtd->oobsize = 32 * mtd->writesize >> 9; /* !BENAND */
++	}
++
++	/*
++	 * Numonyx/ST 2K pages, x8 bus use BOTH byte 1 and 6
+ 	 */
+-	if (*maf_id != NAND_MFR_SAMSUNG && !type->pagesize)
+-		chip->options &= ~NAND_SAMSUNG_LP_OPTIONS;
++	if (!(busw & NAND_BUSWIDTH_16) &&
++			*maf_id == NAND_MFR_STMICRO &&
++			mtd->writesize == 2048) {
++		chip->options |= NAND_BBT_SCANBYTE1AND6;
++		chip->badblockpos = 0;
++	}
+ 
+ 	/* Check for AND chips with 4 page planes */
+ 	if (chip->options & NAND_4PAGE_ARRAY)
+@@ -2750,11 +3391,18 @@ static struct nand_flash_dev *nand_get_f
+ 	if (mtd->writesize > 512 && chip->cmdfunc == nand_command)
+ 		chip->cmdfunc = nand_command_lp;
+ 
+-	MTDDEBUG (MTD_DEBUG_LEVEL0, "NAND device: Manufacturer ID:"
+-	          " 0x%02x, Chip ID: 0x%02x (%s %s)\n", *maf_id, dev_id,
+-	          nand_manuf_ids[maf_idx].name, type->name);
+-
+-	return type;
++	/* TODO onfi flash name */
++    printk(KERN_INFO "NAND device: Manufacturer ID:"
++        " 0x%02x, Chip ID: 0x%02x ", *maf_id, *dev_id);	
++	if (chip->onfi_version)
++		printk("(%s %s)\n", nand_manuf_ids[maf_idx].name, chip->onfi_params.model);
++	else if (chip->jedec_version)
++		printk("(%s %s)\n", nand_manuf_ids[maf_idx].name, chip->jedec_params.model);
++	else
++		printk("(%s %s)\n", nand_manuf_ids[maf_idx].name, mtd->name);
++		
++		return type;
++
+ }
+ 
+ /**
+@@ -2838,7 +3486,7 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 	/*
+ 	 * If no default placement scheme is given, select an appropriate one
+ 	 */
+-	if (!chip->ecc.layout) {
++	if (!chip->ecc.layout && (chip->ecc.mode != NAND_ECC_SOFT_BCH)) {
+ 		switch (mtd->oobsize) {
+ 		case 8:
+ 			chip->ecc.layout = &nand_oob_8;
+@@ -2852,6 +3500,21 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 		case 128:
+ 			chip->ecc.layout = &nand_oob_128;
+ 			break;
++		case 224:
++		  chip->ecc.layout = &nand_oob_224;
++			break;
++		case 436:
++			chip->ecc.layout = &nand_oob_436;
++			break;	
++		case 448:
++			chip->ecc.layout = &nand_oob_448;
++			break;
++		case 744:
++			chip->ecc.layout = &nand_oob_744;
++			break;
++		case 1280:
++			chip->ecc.layout = &nand_oob_1280;
++			break;
+ 		default:
+ 			printk(KERN_WARNING "No oob scheme defined for "
+ 			       "oobsize %d\n", mtd->oobsize);
+@@ -2877,7 +3540,7 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 		}
+ 		if (!chip->ecc.read_page)
+ 			chip->ecc.read_page = nand_read_page_hwecc_oob_first;
+-
++	
+ 	case NAND_ECC_HW:
+ 		/* Use standard hwecc read page function ? */
+ 		if (!chip->ecc.read_page)
+@@ -2892,7 +3555,7 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 			chip->ecc.read_oob = nand_read_oob_std;
+ 		if (!chip->ecc.write_oob)
+ 			chip->ecc.write_oob = nand_write_oob_std;
+-
++	
+ 	case NAND_ECC_HW_SYNDROME:
+ 		if ((!chip->ecc.calculate || !chip->ecc.correct ||
+ 		     !chip->ecc.hwctl) &&
+@@ -2924,10 +3587,10 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 		       "%d byte page size, fallback to SW ECC\n",
+ 		       chip->ecc.size, mtd->writesize);
+ 		chip->ecc.mode = NAND_ECC_SOFT;
+-
++	
+ 	case NAND_ECC_SOFT:
+-		chip->ecc.calculate = nand_calculate_ecc;
+-		chip->ecc.correct = nand_correct_data;
++		if(!chip->ecc.calculate) chip->ecc.calculate = nand_calculate_ecc;
++		if(!chip->ecc.correct) chip->ecc.correct = nand_correct_data;
+ 		chip->ecc.read_page = nand_read_page_swecc;
+ 		chip->ecc.read_subpage = nand_read_subpage;
+ 		chip->ecc.write_page = nand_write_page_swecc;
+@@ -2935,8 +3598,67 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 		chip->ecc.write_page_raw = nand_write_page_raw;
+ 		chip->ecc.read_oob = nand_read_oob_std;
+ 		chip->ecc.write_oob = nand_write_oob_std;
+-		chip->ecc.size = 256;
+-		chip->ecc.bytes = 3;
++		if(!chip->ecc.size) chip->ecc.size = 256;
++		if(!chip->ecc.bytes) chip->ecc.bytes = 3;
++		break;
++
++   case NAND_ECC_SOFT_BCH:
++       if (!mtd_nand_has_bch()) {
++           printk(KERN_WARNING "CONFIG_MTD_ECC_BCH not enabled\n");
++           return -EINVAL;
++       }
++       chip->ecc.calculate = nand_bch_calculate_ecc;
++       chip->ecc.correct = nand_bch_correct_data;
++       chip->ecc.read_page = nand_read_page_swecc;
++       chip->ecc.read_subpage = nand_read_subpage;
++       chip->ecc.write_page = nand_write_page_swecc;
++       chip->ecc.read_page_raw = nand_read_page_raw;
++       chip->ecc.write_page_raw = nand_write_page_raw;
++       chip->ecc.read_oob = nand_read_oob_std;
++       chip->ecc.write_oob = nand_write_oob_std;
++       /*
++        * Board driver should supply ecc.size and ecc.bytes values to
++        * select how many bits are correctable; see nand_bch_init()
++        * for details.
++        * Otherwise, default to 4 bits for large page devices
++        */
++       if (!chip->ecc.size && (mtd->oobsize >= 64)) {
++           chip->ecc.size = 512;
++           chip->ecc.bytes = 7;
++       }
++       chip->ecc.priv = nand_bch_init(mtd,
++                          chip->ecc.size,
++                          chip->ecc.bytes,
++                          &chip->ecc.layout);
++       if (!chip->ecc.priv)
++           printk(KERN_WARNING "BCH ECC initialization failed!\n");
++
++       break;
++	
++	case NAND_ECC_BENAND:
++		chip->ecc.calculate = NULL;
++		chip->ecc.correct = NULL;
++		if (!chip->ecc.read_page)
++			chip->ecc.read_page = nand_read_page_raw;
++		chip->ecc.write_page = nand_write_page_raw;
++		chip->ecc.read_page_raw = nand_read_page_raw;
++		chip->ecc.write_page_raw = nand_write_page_raw;
++		chip->ecc.read_oob = nand_read_oob_std;
++		chip->ecc.write_oob = nand_write_oob_std;
++		chip->ecc.size = mtd->writesize;
++
++		if (mtd->oobsize == 128) {
++			chip->ecc.bytes = 9;		/* 9B * (4096B/512B) */
++			chip->ecc.size = 512;	/* 4b * (4096B/512B) */
++		} else if (mtd->oobsize == 64) { /* 64B oob */
++			chip->ecc.bytes = 9;		
++			chip->ecc.size = 512;
++		} else {
++			printk(KERN_WARNING "%d unsupported oobsize in benand_init\n",
++					mtd->oobsize);
++			return -EINVAL;
++		}
++
+ 		break;
+ 
+ 	case NAND_ECC_NONE:
+@@ -3016,6 +3738,7 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 	mtd->unpoint = NULL;
+ 	mtd->read = nand_read;
+ 	mtd->write = nand_write;
++	mtd->write_partial = nand_write_partial;
+ 	mtd->read_oob = nand_read_oob;
+ 	mtd->write_oob = nand_write_oob;
+ 	mtd->sync = nand_sync;
+@@ -3085,6 +3808,9 @@ void nand_release(struct mtd_info *mtd)
+ {
+ 	struct nand_chip *chip = mtd->priv;
+ 
++    if (chip->ecc.mode == NAND_ECC_SOFT_BCH)
++	       nand_bch_free((struct nand_bch_control *)chip->ecc.priv);
++
+ #ifdef CONFIG_MTD_PARTITIONS
+ 	/* Deregister partitions */
+ 	del_mtd_partitions(mtd);
+diff --git a/drivers/mtd/nand/nand_bch.c b/drivers/mtd/nand/nand_bch.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/mtd/nand/nand_bch.c
+@@ -0,0 +1,226 @@
++/*
++ * This file provides ECC correction for more than 1 bit per block of data,
++ * using binary BCH codes. It relies on the generic BCH library lib/bch.c.
++ *
++ * Copyright © 2011 Ivan Djelic <ivan.djelic@parrot.com>
++ *
++  * SPDX-License-Identifier:	GPL-2.0+
++ */
++
++#include <common.h>
++/*#include <asm/io.h>*/
++#include <linux/types.h>
++#include <linux/mtd/nand.h>
++#include <linux/bch.h>
++#include <malloc.h>
++
++
++/**
++ * struct nand_bch_control - private NAND BCH control structure
++ * @bch:       BCH control structure
++ * @ecclayout: private ecc layout for this BCH configuration
++ * @errloc:    error location array
++ * @eccmask:   XOR ecc mask, allows erased pages to be decoded as valid
++ */
++struct nand_bch_control {
++	struct bch_control   *bch;
++	struct nand_ecclayout ecclayout;
++	unsigned int         *errloc;
++	unsigned char        *eccmask;
++};
++
++/**
++ * nand_bch_calculate_ecc - [NAND Interface] Calculate ECC for data block
++ * @mtd:	MTD block structure
++ * @buf:	input buffer with raw data
++ * @code:	output buffer with ECC
++ */
++int nand_bch_calculate_ecc(struct mtd_info *mtd, const unsigned char *buf,
++			   unsigned char *code)
++{
++	const struct nand_chip *chip = mtd->priv;
++	struct nand_bch_control *nbc = chip->ecc.priv;
++	unsigned int i;
++
++	memset(code, 0, chip->ecc.bytes);
++	encode_bch(nbc->bch, buf, chip->ecc.size, code);
++
++	/* apply mask so that an erased page is a valid codeword */
++	for (i = 0; i < chip->ecc.bytes; i++)
++		code[i] ^= nbc->eccmask[i];
++
++	return 0;
++}
++
++/**
++ * nand_bch_correct_data - [NAND Interface] Detect and correct bit error(s)
++ * @mtd:	MTD block structure
++ * @buf:	raw data read from the chip
++ * @read_ecc:	ECC from the chip
++ * @calc_ecc:	the ECC calculated from raw data
++ *
++ * Detect and correct bit errors for a data byte block
++ */
++int nand_bch_correct_data(struct mtd_info *mtd, unsigned char *buf,
++			  unsigned char *read_ecc, unsigned char *calc_ecc)
++{
++	const struct nand_chip *chip = mtd->priv;
++	struct nand_bch_control *nbc = chip->ecc.priv;
++	unsigned int *errloc = nbc->errloc;
++	int i, count;
++
++	count = decode_bch(nbc->bch, NULL, chip->ecc.size, read_ecc, calc_ecc,
++			   NULL, errloc);
++	if (count > 0) {
++		for (i = 0; i < count; i++) {
++			if (errloc[i] < (chip->ecc.size*8))
++				/* error is located in data, correct it */
++				buf[errloc[i] >> 3] ^= (1 << (errloc[i] & 7));
++			/* else error in ecc, no action needed */
++
++			//MTDDEBUG(MTD_DEBUG_LEVEL0, "%s: corrected bitflip %u\n",
++			//      __func__, errloc[i]);
++		}
++	} else if (count < 0) {
++		//printk(KERN_ERR "ecc unrecoverable error\n");
++		count = -1;
++	}
++	return count;
++}
++
++/**
++ * nand_bch_init - [NAND Interface] Initialize NAND BCH error correction
++ * @mtd:	MTD block structure
++ * @eccsize:	ecc block size in bytes
++ * @eccbytes:	ecc length in bytes
++ * @ecclayout:	output default layout
++ *
++ * Returns:
++ *  a pointer to a new NAND BCH control structure, or NULL upon failure
++ *
++ * Initialize NAND BCH error correction. Parameters @eccsize and @eccbytes
++ * are used to compute BCH parameters m (Galois field order) and t (error
++ * correction capability). @eccbytes should be equal to the number of bytes
++ * required to store m*t bits, where m is such that 2^m-1 > @eccsize*8.
++ *
++ * Example: to configure 4 bit correction per 512 bytes, you should pass
++ * @eccsize = 512  (thus, m=13 is the smallest integer such that 2^m-1 > 512*8)
++ * @eccbytes = 7   (7 bytes are required to store m*t = 13*4 = 52 bits)
++ */
++struct nand_bch_control *
++nand_bch_init(struct mtd_info *mtd, unsigned int eccsize, unsigned int eccbytes,
++	      struct nand_ecclayout **ecclayout)
++{
++	unsigned int m, t, eccsteps, i;
++	struct nand_ecclayout *layout;
++	struct nand_bch_control *nbc = NULL;
++	unsigned char *erased_page;
++
++	if (!eccsize || !eccbytes) {
++		//printk(KERN_WARNING "ecc parameters not supplied\n");
++		goto fail;
++	}
++
++	m = fls(1+8*eccsize);
++	t = (eccbytes*8)/m;
++
++#ifdef CONFIG_NAND_SPL
++	nbc = kmalloc(sizeof(*nbc), GFP_KERNEL);
++	memset(nbc, 0, sizeof(*nbc));
++#else
++	nbc = kzalloc(sizeof(*nbc), GFP_KERNEL);
++#endif
++	if (!nbc)
++		goto fail;
++
++	nbc->bch = init_bch(m, t, 0);
++	if (!nbc->bch)
++		goto fail;
++
++	/* verify that eccbytes has the expected value */
++	if (nbc->bch->ecc_bytes != eccbytes) {
++		//printk(KERN_WARNING "invalid eccbytes %u, should be %u\n",
++		//       eccbytes, nbc->bch->ecc_bytes);
++		goto fail;
++	}
++
++	eccsteps = mtd->writesize/eccsize;
++
++	/* if no ecc placement scheme was provided, build one */
++	if (!*ecclayout) {
++
++		/* handle large page devices only */
++		if (mtd->oobsize < 64) {
++			//printk(KERN_WARNING "must provide an oob scheme for "
++			//       "oobsize %d\n", mtd->oobsize);
++			goto fail;
++		}
++
++		layout = &nbc->ecclayout;
++		layout->eccbytes = eccsteps*eccbytes;
++
++		/* reserve 2 bytes for bad block marker */
++		if (layout->eccbytes+2 > mtd->oobsize) {
++			//printk(KERN_WARNING "no suitable oob scheme available "
++			 //      "for oobsize %d eccbytes %u\n", mtd->oobsize,
++			 //      eccbytes);
++			goto fail;
++		}
++		/* put ecc bytes at oob tail */
++		for (i = 0; i < layout->eccbytes; i++)
++			layout->eccpos[i] = mtd->oobsize-layout->eccbytes+i;
++
++		layout->oobfree[0].offset = 2;
++		layout->oobfree[0].length = mtd->oobsize-2-layout->eccbytes;
++
++		*ecclayout = layout;
++	}
++
++	/* sanity checks */
++	if (8*(eccsize+eccbytes) >= (1 << m)) {
++		//printk(KERN_WARNING "eccsize %u is too large\n", eccsize);
++		goto fail;
++	}
++	if ((*ecclayout)->eccbytes != (eccsteps*eccbytes)) {
++		//printk(KERN_WARNING "invalid ecc layout\n");
++		goto fail;
++	}
++
++	nbc->eccmask = kmalloc(eccbytes, GFP_KERNEL);
++	nbc->errloc = kmalloc(t*sizeof(*nbc->errloc), GFP_KERNEL);
++	if (!nbc->eccmask || !nbc->errloc)
++		goto fail;
++	/*
++	 * compute and store the inverted ecc of an erased ecc block
++	 */
++	erased_page = kmalloc(eccsize, GFP_KERNEL);
++	if (!erased_page)
++		goto fail;
++
++	memset(erased_page, 0xff, eccsize);
++	memset(nbc->eccmask, 0, eccbytes);
++	encode_bch(nbc->bch, erased_page, eccsize, nbc->eccmask);
++	kfree(erased_page);
++
++	for (i = 0; i < eccbytes; i++)
++		nbc->eccmask[i] ^= 0xff;
++
++	return nbc;
++fail:
++	nand_bch_free(nbc);
++	return NULL;
++}
++
++/**
++ * nand_bch_free - [NAND Interface] Release NAND BCH ECC resources
++ * @nbc:	NAND BCH control structure
++ */
++void nand_bch_free(struct nand_bch_control *nbc)
++{
++	if (nbc) {
++		free_bch(nbc->bch);
++		kfree(nbc->errloc);
++		kfree(nbc->eccmask);
++		kfree(nbc);
++	}
++}
+diff --git a/drivers/mtd/nand/nand_ecc.c b/drivers/mtd/nand/nand_ecc.c
+--- a/drivers/mtd/nand/nand_ecc.c
++++ b/drivers/mtd/nand/nand_ecc.c
+@@ -58,7 +58,7 @@
+  * only nand_correct_data() is needed
+  */
+ 
+-#ifndef CONFIG_NAND_SPL
++//#ifndef CONFIG_NAND_SPL
+ /*
+  * Pre-calculated 256-way 1 byte column parity
+  */
+@@ -144,7 +144,7 @@ int nand_calculate_ecc(struct mtd_info *
+ #if 0
+ EXPORT_SYMBOL(nand_calculate_ecc);
+ #endif
+-#endif /* CONFIG_NAND_SPL */
++//#endif /* CONFIG_NAND_SPL */
+ 
+ static inline int countbits(uint32_t byte)
+ {
+diff --git a/drivers/mtd/nand/nand_ids.c b/drivers/mtd/nand/nand_ids.c
+--- a/drivers/mtd/nand/nand_ids.c
++++ b/drivers/mtd/nand/nand_ids.c
+@@ -85,6 +85,7 @@ struct nand_flash_dev nand_flash_ids[] =
+ 	{"NAND 128MiB 3,3V 8-bit",	0xF1, 0, 128, 0, LP_OPTIONS},
+ 	{"NAND 128MiB 1,8V 16-bit",	0xB1, 0, 128, 0, LP_OPTIONS16},
+ 	{"NAND 128MiB 3,3V 16-bit",	0xC1, 0, 128, 0, LP_OPTIONS16},
++	{"NAND 128MiB 3,3V 8-bit",  0xD1, 0, 128, 0, LP_OPTIONS},
+ 
+ 	/* 2 Gigabit */
+ 	{"NAND 256MiB 1,8V 8-bit",	0xAA, 0, 256, 0, LP_OPTIONS},
+@@ -110,6 +111,37 @@ struct nand_flash_dev nand_flash_ids[] =
+ 	{"NAND 2GiB 1,8V 16-bit",	0xB5, 0, 2048, 0, LP_OPTIONS16},
+ 	{"NAND 2GiB 3,3V 16-bit",	0xC5, 0, 2048, 0, LP_OPTIONS16},
+ 
++   /* 32 Gigabit */
++  {"NAND 4GiB 1,8V 8-bit",        0xA7, 0, 4096, 0, LP_OPTIONS},
++  {"NAND 4GiB 3,3V 8-bit",        0xD7, 0, 4096, 0, LP_OPTIONS},
++  {"NAND 4GiB 1,8V 16-bit",       0xB7, 0, 4096, 0, LP_OPTIONS16},
++  {"NAND 4GiB 3,3V 16-bit",       0xC7, 0, 4096, 0, LP_OPTIONS16},
++
++  /* 64 Gigabit */
++  {"NAND 8GiB 1,8V 8-bit",        0xAE, 0, 8192, 0, LP_OPTIONS},
++  {"NAND 8GiB 3,3V 8-bit",        0xDE, 0, 8192, 0, LP_OPTIONS},
++  {"NAND 8GiB 1,8V 16-bit",       0xBE, 0, 8192, 0, LP_OPTIONS16},
++  {"NAND 8GiB 3,3V 16-bit",       0xCE, 0, 8192, 0, LP_OPTIONS16},
++
++   /* 128 Gigabit */
++  {"NAND 16GiB 1,8V 8-bit",       0x1A, 0, 16384, 0, LP_OPTIONS},
++  {"NAND 16GiB 3,3V 8-bit",       0x3A, 0, 16384, 0, LP_OPTIONS},
++  {"NAND 16GiB 1,8V 16-bit",      0x2A, 0, 16384, 0, LP_OPTIONS16},
++  {"NAND 16GiB 3,3V 16-bit",      0x4A, 0, 16384, 0, LP_OPTIONS16},
++
++  /* 256 Gigabit */
++  {"NAND 32GiB 1,8V 8-bit",       0x1C, 0, 32768, 0, LP_OPTIONS},
++  {"NAND 32GiB 3,3V 8-bit",       0x3C, 0, 32768, 0, LP_OPTIONS},
++  {"NAND 32GiB 1,8V 16-bit",      0x2C, 0, 32768, 0, LP_OPTIONS16},
++  {"NAND 32GiB 3,3V 16-bit",      0x4C, 0, 32768, 0, LP_OPTIONS16},
++
++  /* 512 Gigabit */
++  {"NAND 64GiB 1,8V 8-bit",       0x1E, 0, 65536, 0, LP_OPTIONS},
++  {"NAND 64GiB 3,3V 8-bit",       0x3E, 0, 65536, 0, LP_OPTIONS},
++  {"NAND 64GiB 1,8V 16-bit",      0x2E, 0, 65536, 0, LP_OPTIONS16},
++  {"NAND 64GiB 3,3V 16-bit",      0x4E, 0, 65536, 0, LP_OPTIONS16},
++
++
+ 	/*
+ 	 * Renesas AND 1 Gigabit. Those chips do not support extended id and
+ 	 * have a strange page/block layout !  The chosen minimum erasesize is
+@@ -128,11 +160,35 @@ struct nand_flash_dev nand_flash_ids[] =
+ 	{NULL,}
+ };
+ 
++
++/*
++*       Chip ID list
++*
++*       Name. ID code, pagesize, chipsize in MegaByte, eraseblock size,
++*       options
++*
++*       Pagesize; 0, 256, 512
++*       0       get this information from the extended chip ID
+++       256     256 Byte page size
++*       512     512 Byte page size
++*/
++struct spinand_flash_dev spinand_flash_ids[]={
++       {"SPI NAND 1Gbit 3.3v", 0xC8, 0xb1, 2048, 128, 0x20000, 64, 0},
++       {"SPI NAND 2Gbit 3.3v", 0xC8, 0xb2, 2048, 256, 0x20000, 64, 0},
++       {"SPI NAND TC58CVG0S3 1Gbit", 0x98, 0xc2, 2048, 128, 0x20000, 64, 0},
++       {"SPI NAND TC58CVG1S3 2Gbit", 0x98, 0xcb, 2048, 256, 0x20000, 64, 0},
++       {"SPI NAND TC58CVG2S0 4Gbit", 0x98, 0xcd, 4096, 512, 0x40000, 128, 0},
++       {"SPI NAND MX35LFE4AB 1Gbit", 0xC2, 0x12, 2048, 128, 0x20000, 64, 0}
++};
++
++
++
+ /*
+ *	Manufacturer ID list
+ */
+ struct nand_manufacturers nand_manuf_ids[] = {
+-	{NAND_MFR_TOSHIBA, "Toshiba"},
++	{NAND_MFR_GIGADEVICE, "Gigadevice"},
++        {NAND_MFR_TOSHIBA, "Toshiba"},
+ 	{NAND_MFR_SAMSUNG, "Samsung"},
+ 	{NAND_MFR_FUJITSU, "Fujitsu"},
+ 	{NAND_MFR_NATIONAL, "National"},
+@@ -141,5 +197,6 @@ struct nand_manufacturers nand_manuf_ids
+ 	{NAND_MFR_HYNIX, "Hynix"},
+ 	{NAND_MFR_MICRON, "Micron"},
+ 	{NAND_MFR_AMD, "AMD"},
++        {NAND_MFR_MXIC, "MXIC"},
+ 	{0x0, "Unknown"}
+ };
+diff --git a/drivers/mtd/nand/nand_util.c b/drivers/mtd/nand/nand_util.c
+--- a/drivers/mtd/nand/nand_util.c
++++ b/drivers/mtd/nand/nand_util.c
+@@ -69,7 +69,7 @@ int nand_erase_opts(nand_info_t *meminfo
+ {
+ 	struct jffs2_unknown_node cleanmarker;
+ 	erase_info_t erase;
+-	ulong erase_length;
++	uint64_t erase_length;
+ 	int bbtest = 1;
+ 	int result;
+ 	int percent_complete = -1;
+@@ -109,7 +109,7 @@ int nand_erase_opts(nand_info_t *meminfo
+ 	}
+ 
+ 	if (erase_length < meminfo->erasesize) {
+-		printf("Warning: Erase size 0x%08lx smaller than one "	\
++		printf("Warning: Erase size 0x%llx smaller than one "	\
+ 		       "erase block 0x%08x\n",erase_length, meminfo->erasesize);
+ 		printf("         Erasing 0x%08x instead\n", meminfo->erasesize);
+ 		erase_length = meminfo->erasesize;
+@@ -118,7 +118,6 @@ int nand_erase_opts(nand_info_t *meminfo
+ 	for (;
+ 	     erase.addr < opts->offset + erase_length;
+ 	     erase.addr += meminfo->erasesize) {
+-
+ 		WATCHDOG_RESET ();
+ 
+ 		if (!opts->scrub && bbtest) {
+@@ -165,12 +164,13 @@ int nand_erase_opts(nand_info_t *meminfo
+ 		}
+ 
+ 		if (!opts->quiet) {
+-			unsigned long long n =(unsigned long long)
+-				(erase.addr + meminfo->erasesize - opts->offset)
+-				* 100;
++		    unsigned long long n =(unsigned long long)
++				(erase.addr + meminfo->erasesize - opts->offset) / 0x4000 * 100;
+ 			int percent;
+-
+-			do_div(n, erase_length);
++		    unsigned long long shrinked_erase_length = erase_length / 0x4000;	
++			
++			do_div(n, shrinked_erase_length);
++			
+ 			percent = (int)n;
+ 
+ 			/* output progress message only at whole percent
+@@ -433,7 +433,7 @@ int nand_unlock(struct mtd_info *mtd, ul
+  * @return image length including bad blocks
+  */
+ static size_t get_len_incl_bad (nand_info_t *nand, loff_t offset,
+-				const size_t length)
++				const u64 length)
+ {
+ 	size_t len_incl_bad = 0;
+ 	size_t len_excl_bad = 0;
+@@ -469,12 +469,12 @@ static size_t get_len_incl_bad (nand_inf
+  * @param buf           buffer to read from
+  * @return		0 in case of success
+  */
+-int nand_write_skip_bad(nand_info_t *nand, loff_t offset, size_t *length,
++int nand_write_skip_bad(nand_info_t *nand, loff_t offset, u64 *length,
+ 			u_char *buffer)
+ {
+ 	int rval;
+-	size_t left_to_write = *length;
+-	size_t len_incl_bad;
++	u64 left_to_write = *length;
++	u64 len_incl_bad;
+ 	u_char *p_buffer = buffer;
+ 
+ 	/* Reject writes, which are not page aligned */
+@@ -502,7 +502,7 @@ int nand_write_skip_bad(nand_info_t *nan
+ 
+ 	while (left_to_write > 0) {
+ 		size_t block_offset = offset & (nand->erasesize - 1);
+-		size_t write_size;
++		u64 write_size;
+ 
+ 		WATCHDOG_RESET ();
+ 
+@@ -548,12 +548,12 @@ int nand_write_skip_bad(nand_info_t *nan
+  * @param buffer buffer to write to
+  * @return 0 in case of success
+  */
+-int nand_read_skip_bad(nand_info_t *nand, loff_t offset, size_t *length,
++int nand_read_skip_bad(nand_info_t *nand, loff_t offset, u64 *length,
+ 		       u_char *buffer)
+ {
+ 	int rval;
+-	size_t left_to_read = *length;
+-	size_t len_incl_bad;
++	u64 left_to_read = *length;
++	u64 len_incl_bad;
+ 	u_char *p_buffer = buffer;
+ 
+ 	len_incl_bad = get_len_incl_bad (nand, offset, *length);
+@@ -574,7 +574,7 @@ int nand_read_skip_bad(nand_info_t *nand
+ 
+ 	while (left_to_read > 0) {
+ 		size_t block_offset = offset & (nand->erasesize - 1);
+-		size_t read_length;
++		u64 read_length;
+ 
+ 		WATCHDOG_RESET ();
+ 
+diff --git a/include/linux/bch.h b/include/linux/bch.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/bch.h
+@@ -0,0 +1,79 @@
++/*
++ * Generic binary BCH encoding/decoding library
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 51
++ * Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Copyright © 2011 Parrot S.A.
++ *
++ * Author: Ivan Djelic <ivan.djelic@parrot.com>
++ *
++ * Description:
++ *
++ * This library provides runtime configurable encoding/decoding of binary
++ * Bose-Chaudhuri-Hocquenghem (BCH) codes.
++*/
++#ifndef _BCH_H
++#define _BCH_H
++
++#include <linux/types.h>
++
++/**
++ * struct bch_control - BCH control structure
++ * @m:          Galois field order
++ * @n:          maximum codeword size in bits (= 2^m-1)
++ * @t:          error correction capability in bits
++ * @ecc_bits:   ecc exact size in bits, i.e. generator polynomial degree (<=m*t)
++ * @ecc_bytes:  ecc max size (m*t bits) in bytes
++ * @a_pow_tab:  Galois field GF(2^m) exponentiation lookup table
++ * @a_log_tab:  Galois field GF(2^m) log lookup table
++ * @mod8_tab:   remainder generator polynomial lookup tables
++ * @ecc_buf:    ecc parity words buffer
++ * @ecc_buf2:   ecc parity words buffer
++ * @xi_tab:     GF(2^m) base for solving degree 2 polynomial roots
++ * @syn:        syndrome buffer
++ * @cache:      log-based polynomial representation buffer
++ * @elp:        error locator polynomial
++ * @poly_2t:    temporary polynomials of degree 2t
++ */
++struct bch_control {
++	unsigned int    m;
++	unsigned int    n;
++	unsigned int    t;
++	unsigned int    ecc_bits;
++	unsigned int    ecc_bytes;
++/* private: */
++	uint16_t       *a_pow_tab;
++	uint16_t       *a_log_tab;
++	uint32_t       *mod8_tab;
++	uint32_t       *ecc_buf;
++	uint32_t       *ecc_buf2;
++	unsigned int   *xi_tab;
++	unsigned int   *syn;
++	int            *cache;
++	struct gf_poly *elp;
++	struct gf_poly *poly_2t[4];
++};
++
++struct bch_control *init_bch(int m, int t, unsigned int prim_poly);
++
++void free_bch(struct bch_control *bch);
++
++void encode_bch(struct bch_control *bch, const uint8_t *data,
++		unsigned int len, uint8_t *ecc);
++
++int decode_bch(struct bch_control *bch, const uint8_t *data, unsigned int len,
++	       const uint8_t *recv_ecc, const uint8_t *calc_ecc,
++	       const unsigned int *syn, unsigned int *errloc);
++
++#endif /* _BCH_H */
+diff --git a/include/linux/ctype.h b/include/linux/ctype.h
+--- a/include/linux/ctype.h
++++ b/include/linux/ctype.h
+@@ -15,7 +15,7 @@
+ #define _X	0x40	/* hex digit */
+ #define _SP	0x80	/* hard space (0x20) */
+ 
+-extern unsigned char _ctype[];
++unsigned char _ctype[];
+ 
+ #define __ismask(x) (_ctype[(int)(unsigned char)(x)])
+ 
+diff --git a/include/linux/mtd/bbm.h b/include/linux/mtd/bbm.h
+--- a/include/linux/mtd/bbm.h
++++ b/include/linux/mtd/bbm.h
+@@ -88,6 +88,13 @@ struct nand_bbt_descr {
+ #define NAND_BBT_SAVECONTENT	0x00002000
+ /* Search good / bad pattern on the first and the second page */
+ #define NAND_BBT_SCAN2NDPAGE	0x00004000
++#define NAND_BBT_SCANLASTPAGE   0x00008000
++/* Chip stores bad block marker on BOTH 1st and 6th bytes of OOB */
++#define NAND_BBT_SCANBYTE1AND6 0x00100000
++/* The nand_bbt_descr was created dynamicaly and must be freed */
++#define NAND_BBT_DYNAMICSTRUCT 0x00200000
++/* The bad block table does not OOB for marker */
++#define NAND_BBT_NO_OOB         0x00400000
+ 
+ /* The maximum number of blocks to scan for a bbt */
+ #define NAND_BBT_SCAN_MAXBLOCKS	4
+diff --git a/include/linux/mtd/mtd-abi.h b/include/linux/mtd/mtd-abi.h
+--- a/include/linux/mtd/mtd-abi.h
++++ b/include/linux/mtd/mtd-abi.h
+@@ -116,14 +116,14 @@ struct nand_oobfree {
+ 	uint32_t length;
+ };
+ 
+-#define MTD_MAX_OOBFREE_ENTRIES	8
++#define MTD_MAX_OOBFREE_ENTRIES	512
+ /*
+  * ECC layout control structure. Exported to userspace for
+  * diagnosis and to allow creation of raw images
+  */
+ struct nand_ecclayout {
+ 	uint32_t eccbytes;
+-	uint32_t eccpos[128];
++	uint32_t eccpos[1280];
+ 	uint32_t oobavail;
+ 	struct nand_oobfree oobfree[MTD_MAX_OOBFREE_ENTRIES];
+ };
+diff --git a/include/linux/mtd/mtd.h b/include/linux/mtd/mtd.h
+--- a/include/linux/mtd/mtd.h
++++ b/include/linux/mtd/mtd.h
+@@ -163,9 +163,9 @@ struct mtd_info {
+ 	void (*unpoint) (struct mtd_info *mtd, loff_t from, size_t len);
+ 
+ 
+-	int (*read) (struct mtd_info *mtd, loff_t from, size_t len, size_t *retlen, u_char *buf);
+-	int (*write) (struct mtd_info *mtd, loff_t to, size_t len, size_t *retlen, const u_char *buf);
+-
++	int (*read) (struct mtd_info *mtd, loff_t from, u64 len, u64 *retlen, u_char *buf);
++	int (*write) (struct mtd_info *mtd, loff_t to, u64 len, u64 *retlen, const u_char *buf);
++  int (*write_partial) (struct mtd_info *mtd, loff_t to, u64 len, u64 *retlen, const u_char *buf);
+ 	/* In blackbox flight recorder like scenarios we want to make successful
+ 	   writes in interrupt context. panic_write() is only intended to be
+ 	   called when its known the kernel is about to panic and we need the
+diff --git a/include/linux/mtd/nand.h b/include/linux/mtd/nand.h
+--- a/include/linux/mtd/nand.h
++++ b/include/linux/mtd/nand.h
+@@ -50,8 +50,8 @@ extern void nand_wait_ready(struct mtd_i
+  * is supported now. If you add a chip with bigger oobsize/page
+  * adjust this accordingly.
+  */
+-#define NAND_MAX_OOBSIZE	218
+-#define NAND_MAX_PAGESIZE	4096
++#define NAND_MAX_OOBSIZE	1280
++#define NAND_MAX_PAGESIZE	16384
+ 
+ /*
+  * Constants for hardware specific CLE/ALE/NCE function
+@@ -85,6 +85,7 @@ extern void nand_wait_ready(struct mtd_i
+ #define NAND_CMD_RNDIN		0x85
+ #define NAND_CMD_READID		0x90
+ #define NAND_CMD_ERASE2		0xd0
++#define NAND_CMD_PARAM    0xec
+ #define NAND_CMD_RESET		0xff
+ 
+ /* Extended commands for large page devices */
+@@ -116,6 +117,8 @@ extern void nand_wait_ready(struct mtd_i
+ /* Status bits */
+ #define NAND_STATUS_FAIL	0x01
+ #define NAND_STATUS_FAIL_N1	0x02
++/* Recommended to rewrite for BENAND */
++#define NAND_STATUS_RECOM_REWRT	0x08
+ #define NAND_STATUS_TRUE_READY	0x20
+ #define NAND_STATUS_READY	0x40
+ #define NAND_STATUS_WP		0x80
+@@ -129,6 +132,8 @@ typedef enum {
+ 	NAND_ECC_HW,
+ 	NAND_ECC_HW_SYNDROME,
+ 	NAND_ECC_HW_OOB_FIRST,
++    NAND_ECC_SOFT_BCH,
++	NAND_ECC_BENAND,
+ } nand_ecc_modes_t;
+ 
+ /*
+@@ -190,7 +195,7 @@ typedef enum {
+ 					&& (chip->page_shift > 9))
+ 
+ /* Mask to zero out the chip options, which come from the id table */
+-#define NAND_CHIPOPTIONS_MSK	(0x0000ffff & ~NAND_NO_AUTOINCR)
++#define NAND_CHIPOPTIONS_MSK	(0x0000ffff & ~NAND_NO_AUTOINCR & ~NAND_NO_SUBPAGE_WRITE)
+ 
+ /* Non chip related options */
+ /* Use a flash based bad block table. This option is passed to the
+@@ -214,6 +219,149 @@ typedef enum {
+ /* Keep gcc happy */
+ struct nand_chip;
+ 
++
++struct nand_onfi_params {
++	/* rev info and features block */
++	/* 'O' 'N' 'F' 'I'  */
++	u8 sig[4];
++	__le16 revision;
++	__le16 features;
++	__le16 opt_cmd;
++	u8 reserved[22];
++
++	/* manufacturer information block */
++	char manufacturer[12];
++	char model[20];
++	u8 jedec_id;
++	__le16 date_code;
++	u8 reserved2[13];
++
++	/* memory organization block */
++	__le32 byte_per_page;
++	__le16 spare_bytes_per_page;
++	__le32 data_bytes_per_ppage;
++	__le16 spare_bytes_per_ppage;
++	__le32 pages_per_block;
++	__le32 blocks_per_lun;
++	u8 lun_count;
++	u8 addr_cycles;
++	u8 bits_per_cell;
++	__le16 bb_per_lun;
++	__le16 block_endurance;
++	u8 guaranteed_good_blocks;
++	__le16 guaranteed_block_endurance;
++	u8 programs_per_page;
++	u8 ppage_attr;
++	u8 ecc_bits;
++	u8 interleaved_bits;
++	u8 interleaved_ops;
++	u8 reserved3[13];
++
++	/* electrical parameter block */
++	u8 io_pin_capacitance_max;
++	__le16 async_timing_mode;
++	__le16 program_cache_timing_mode;
++	__le16 t_prog;
++	__le16 t_bers;
++	__le16 t_r;
++	__le16 t_ccs;
++	__le16 src_sync_timing_mode;
++	__le16 src_ssync_features;
++	__le16 clk_pin_capacitance_typ;
++	__le16 io_pin_capacitance_typ;
++	__le16 input_pin_capacitance_typ;
++	u8 input_pin_capacitance_max;
++	u8 driver_strenght_support;
++	__le16 t_int_r;
++	__le16 t_ald;
++	u8 reserved4[7];
++
++	/* vendor */
++	u8 reserved5[90];
++
++	__le16 crc;
++} __attribute__((packed));
++
++#define ONFI_CRC_BASE   0x4F4E
++
++struct jedec_ecc_info {
++    u8 ecc_bits;
++    u8 codeword_size;
++    __le16 bb_per_lun; 
++    __le16 block_endurance;
++    u8 reserved[2];
++} __attribute__((packed));
++        
++/* JEDEC features */
++#define JEDEC_FEATURE_16_BIT_BUS    (1 << 0) 
++struct nand_jedec_params {
++    /* rev info and features block */
++    /* 'J' 'E' 'S' 'D'  */
++    u8 sig[4];
++    __le16 revision;
++    __le16 features;
++    u8 opt_cmd[3];
++    __le16 sec_cmd;
++    u8 num_of_param_pages;
++    u8 reserved0[18];
++
++    /* manufacturer information block */
++    char manufacturer[12];
++    char model[20];
++    u8 jedec_id[6];
++    u8 reserved1[10];
++
++    /* memory organization block */
++    __le32 byte_per_page;
++    __le16 spare_bytes_per_page;
++    u8 reserved2[6];
++    __le32 pages_per_block;
++    __le32 blocks_per_lun;
++    u8 lun_count;
++    u8 addr_cycles;
++    u8 bits_per_cell;
++    u8 programs_per_page;
++    u8 multi_plane_addr;
++    u8 multi_plane_op_attr;
++    u8 reserved3[38];
++
++    /* electrical parameter block */
++    __le16 async_sdr_speed_grade;
++    __le16 toggle_ddr_speed_grade;
++    __le16 sync_ddr_speed_grade;
++    u8 async_sdr_features;
++    u8 toggle_ddr_features;
++    u8 sync_ddr_features;
++    __le16 t_prog;
++    __le16 t_bers;
++    __le16 t_r;
++    __le16 t_r_multi_plane;
++    __le16 t_ccs;
++    __le16 io_pin_capacitance_typ;
++    __le16 input_pin_capacitance_typ;
++    __le16 clk_pin_capacitance_typ;
++    u8 driver_strength_support;
++    __le16 t_ald;
++    u8 reserved4[36];
++
++    /* ECC and endurance block */
++    u8 guaranteed_good_blocks;
++    __le16 guaranteed_block_endurance;
++    struct jedec_ecc_info ecc_info[4];
++    u8 reserved5[29];
++
++    /* reserved */
++    u8 reserved6[148];
++
++    /* vendor */
++    __le16 vendor_rev_num;
++    u8 reserved7[88];
++
++    /* CRC for Parameter Page */
++    __le16 crc;
++} __attribute__((packed));
++
++
+ /**
+  * struct nand_hw_control - Control structure for hardware controller (e.g ECC generator) shared among independent devices
+  * @lock:               protection lock
+@@ -260,6 +408,7 @@ struct nand_ecc_ctrl {
+ 	int			prepad;
+ 	int			postpad;
+ 	struct nand_ecclayout	*layout;
++	void        *priv;
+ 	void			(*hwctl)(struct mtd_info *mtd, int mode);
+ 	int			(*calculate)(struct mtd_info *mtd,
+ 					     const uint8_t *dat,
+@@ -380,6 +529,8 @@ struct nand_chip {
+ 	int		(*block_markbad)(struct mtd_info *mtd, loff_t ofs);
+ 	void		(*cmd_ctrl)(struct mtd_info *mtd, int dat,
+ 				    unsigned int ctrl);
++	int (*init_size)(struct mtd_info *mtd, struct nand_chip *this,
++                        u8 *id_data);
+ 	int		(*dev_ready)(struct mtd_info *mtd);
+ 	void		(*cmdfunc)(struct mtd_info *mtd, unsigned command, int column, int page_addr);
+ 	int		(*waitfunc)(struct mtd_info *mtd, struct nand_chip *this);
+@@ -404,6 +555,13 @@ struct nand_chip {
+ 	uint8_t		cellinfo;
+ 	int		badblockpos;
+ 
++	int onfi_version;
++	int jedec_version;
++    union {
++        struct nand_onfi_params onfi_params;
++        struct nand_jedec_params jedec_params;
++    };
++
+ 	int 		state;
+ 
+ 	uint8_t		*oob_poi;
+@@ -429,6 +587,7 @@ struct nand_chip {
+ /*
+  * NAND Flash Manufacturer ID Codes
+  */
++#define NAND_MFR_GIGADEVICE     0xC8
+ #define NAND_MFR_TOSHIBA	0x98
+ #define NAND_MFR_SAMSUNG	0xec
+ #define NAND_MFR_FUJITSU	0x04
+@@ -438,6 +597,7 @@ struct nand_chip {
+ #define NAND_MFR_HYNIX		0xad
+ #define NAND_MFR_MICRON		0x2c
+ #define NAND_MFR_AMD		0x01
++#define NAND_MFR_MXIC           0xC2
+ 
+ /**
+  * struct nand_flash_dev - NAND Flash Device ID Structure
+@@ -461,6 +621,31 @@ struct nand_flash_dev {
+ };
+ 
+ /**
++ * struct spinand_flash_dev - NAND Flash Device ID Structure
++ * @name:       Identify the device type
++ * @id:         device ID code
++ * @pagesize:   Pagesize in bytes. Either 256 or 512 or 0
++ *              If the pagesize is 0, then the real pagesize
++ *              and the eraseize are determined from the
++ *              extended id bytes in the chip
++ * @erasesize:  Size of an erase block in the flash device.
++ * @chipsize:   Total chipsize in Mega Bytes
++ * @options:    Bitfield to store chip relevant options
++ */
++struct spinand_flash_dev {
++        char *name;
++        int mf_id;
++        int dev_id;
++        unsigned long pagesize;
++        unsigned long chipsize;
++        unsigned long erasesize;
++        unsigned long oobsize;
++        unsigned long options;
++};
++
++
++
++/**
+  * struct nand_manufacturers - NAND Flash Manufacturer ID Structure
+  * @name:	Manufacturer name
+  * @id:		manufacturer ID code of device.
+@@ -471,6 +656,7 @@ struct nand_manufacturers {
+ };
+ 
+ extern struct nand_flash_dev nand_flash_ids[];
++extern struct spinand_flash_dev spinand_flash_ids[];
+ extern struct nand_manufacturers nand_manuf_ids[];
+ 
+ extern int nand_scan_bbt(struct mtd_info *mtd, struct nand_bbt_descr *bd);
+diff --git a/include/linux/mtd/nand_bch.h b/include/linux/mtd/nand_bch.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/mtd/nand_bch.h
+@@ -0,0 +1,72 @@
++/*
++ * Copyright © 2011 Ivan Djelic <ivan.djelic@parrot.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This file is the header for the NAND BCH ECC implementation.
++ */
++
++#ifndef __MTD_NAND_BCH_H__
++#define __MTD_NAND_BCH_H__
++
++struct mtd_info;
++struct nand_bch_control;
++
++#if defined(CONFIG_NAND_ECC_BCH)
++
++static inline int mtd_nand_has_bch(void) { return 1; }
++
++/*
++ * Calculate BCH ecc code
++ */
++int nand_bch_calculate_ecc(struct mtd_info *mtd, const u_char *dat,
++			   u_char *ecc_code);
++
++/*
++ * Detect and correct bit errors
++ */
++int nand_bch_correct_data(struct mtd_info *mtd, u_char *dat, u_char *read_ecc,
++			  u_char *calc_ecc);
++/*
++ * Initialize BCH encoder/decoder
++ */
++struct nand_bch_control *
++nand_bch_init(struct mtd_info *mtd, unsigned int eccsize,
++	      unsigned int eccbytes, struct nand_ecclayout **ecclayout);
++/*
++ * Release BCH encoder/decoder resources
++ */
++void nand_bch_free(struct nand_bch_control *nbc);
++
++#else /* !CONFIG_NAND_ECC_BCH */
++
++static inline int mtd_nand_has_bch(void) { return 0; }
++
++static inline int
++nand_bch_calculate_ecc(struct mtd_info *mtd, const u_char *dat,
++		       u_char *ecc_code)
++{
++	return -1;
++}
++
++static inline int
++nand_bch_correct_data(struct mtd_info *mtd, unsigned char *buf,
++		      unsigned char *read_ecc, unsigned char *calc_ecc)
++{
++	return -1;
++}
++
++static inline struct nand_bch_control *
++nand_bch_init(struct mtd_info *mtd, unsigned int eccsize,
++	      unsigned int eccbytes, struct nand_ecclayout **ecclayout)
++{
++	return NULL;
++}
++
++static inline void nand_bch_free(struct nand_bch_control *nbc) {}
++
++#endif /* CONFIG_NAND_ECC_BCH */
++
++#endif /* __MTD_NAND_BCH_H__ */
+diff --git a/include/linux/types.h b/include/linux/types.h
+--- a/include/linux/types.h
++++ b/include/linux/types.h
+@@ -131,7 +131,9 @@ typedef		__s64		int64_t;
+ #endif
+ 
+ typedef __u16 __bitwise __le16;
+-typedef __u16 __bitwise __be16;
++#ifndef BUILD_FROM_LTQ_APPS
++  typedef __u16 __bitwise __be16;
++#endif
+ typedef __u32 __bitwise __le32;
+ typedef __u32 __bitwise __be32;
+ #if defined(__GNUC__)
+diff --git a/include/nand.h b/include/nand.h
+--- a/include/nand.h
++++ b/include/nand.h
+@@ -37,16 +37,22 @@ typedef struct mtd_info nand_info_t;
+ extern int nand_curr_device;
+ extern nand_info_t nand_info[];
+ 
+-static inline int nand_read(nand_info_t *info, loff_t ofs, size_t *len, u_char *buf)
++static inline int nand_read(nand_info_t *info, loff_t ofs, u64 *len, u_char *buf)
+ {
+-	return info->read(info, ofs, *len, (size_t *)len, buf);
++	return info->read(info, ofs, *len, (u64 *)len, buf);
+ }
+ 
+-static inline int nand_write(nand_info_t *info, loff_t ofs, size_t *len, u_char *buf)
++static inline int nand_write(nand_info_t *info, loff_t ofs, u64 *len, u_char *buf)
+ {
+-	return info->write(info, ofs, *len, (size_t *)len, buf);
++	return info->write(info, ofs, *len, (u64 *)len, buf);
+ }
+ 
++static inline int nand_write_partial(nand_info_t *info, ulong ofs, u64 *len, u_char *buf)
++{
++    return info->write_partial(info, ofs, *len, (u64 *)len, buf);
++}
++	
++
+ static inline int nand_block_isbad(nand_info_t *info, loff_t ofs)
+ {
+ 	return info->block_isbad(info, ofs);
+@@ -98,8 +104,8 @@ struct nand_read_options {
+ typedef struct nand_read_options nand_read_options_t;
+ 
+ struct nand_erase_options {
+-	ulong length;		/* number of bytes to erase */
+-	ulong offset;		/* first address in NAND to erase */
++	uint64_t length;		/* number of bytes to erase */
++	uint64_t offset;		/* first address in NAND to erase */
+ 	int quiet;		/* don't display progress messages */
+ 	int jffs2;		/* if true: format for jffs2 usage
+ 				 * (write appropriate cleanmarker blocks) */
+@@ -109,9 +115,9 @@ struct nand_erase_options {
+ 
+ typedef struct nand_erase_options nand_erase_options_t;
+ 
+-int nand_read_skip_bad(nand_info_t *nand, loff_t offset, size_t *length,
++int nand_read_skip_bad(nand_info_t *nand, loff_t offset, u64 *length,
+ 		       u_char *buffer);
+-int nand_write_skip_bad(nand_info_t *nand, loff_t offset, size_t *length,
++int nand_write_skip_bad(nand_info_t *nand, loff_t offset, u64 *length,
+ 			u_char *buffer);
+ int nand_erase_opts(nand_info_t *meminfo, const nand_erase_options_t *opts);
+ 
+diff --git a/include/spinand.h b/include/spinand.h
+new file mode 100644
+--- /dev/null
++++ b/include/spinand.h
+@@ -0,0 +1,107 @@
++/*-
++ * Copyright 2013 Broadcom Corporation
++ *
++ * Copyright (c) 2009-2010 Micron Technology, Inc.
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Henry Pan <hspan@micron.com>
++ *
++ * based on nand.h
++ */
++#ifndef __LINUX_MTD_SPI_NAND_H
++#define __LINUX_MTD_SPI_NAND_H
++#include <common.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++/* cmd */
++#define CMD_READ_PAGE_TO_CACHE   	0x13
++#define CMD_READ_FROM_CACHE		0x03
++#define CMD_PROG_LOAD_TO_CACHE 		0x02
++#define CMD_PROG_LOAD_TO_CACHE_RANDOM 	0x84
++#define CMD_PROG_PAGE_EXC		0x10
++#define CMD_ERASE_BLK			0xd8
++#define CMD_WR_ENABLE			0x06
++#define CMD_WR_DISABLE			0x04
++#define CMD_READ_ID			0x9f
++#define CMD_RESET			0xff
++#define CMD_GET_FEATURE			0x0f
++#define CMD_SET_FEATURE			0x1f
++
++/* feature/ status reg */
++#define REG_BLOCK_LOCK			0xa0
++#define REG_OTP				0xb0
++#define REG_STATUS			0xc0/* timing */
++
++/* status */
++#define STATUS_OIP_MASK			0x01
++#define STATUS_READY			(0 << 0)
++#define STATUS_BUSY			(1 << 0)
++
++#define STATUS_E_FAIL_MASK		0x04
++#define STATUS_E_FAIL			(1 << 2)
++
++#define STATUS_P_FAIL_MASK		0x08
++#define STATUS_P_FAIL			(1 << 3)
++
++#define STATUS_ECC_MASK			0x30
++#define STATUS_ECC_1BIT_CORRECTED	(1 << 4)
++#define STATUS_ECC_ERROR		(2 << 4)
++#define STATUS_ECC_RESERVED		(3 << 4)
++
++/*ECC enable defines*/
++#define OTP_ECC_MASK			0x10
++#define OTP_ECC_OFF			0
++#define OTP_ECC_ON			1
++
++#define ECC_DISABLED
++#define ECC_IN_NAND
++#define ECC_SOFT
++
++/* block lock */
++#define BL_ALL_LOCKED      0x38
++#define BL_1_2_LOCKED      0x30
++#define BL_1_4_LOCKED      0x28
++#define BL_1_8_LOCKED      0x20
++#define BL_1_16_LOCKED     0x18
++#define BL_1_32_LOCKED     0x10
++#define BL_1_64_LOCKED     0x08
++#define BL_ALL_UNLOCKED    0
++
++#define GIGADEVICE_DUMMY_TYPE 0x1
++
++struct spinand_info {
++	struct nand_ecclayout *ecclayout;
++	struct spi_slave *spi;
++	int options;
++        void *priv;
++};
++
++struct spinand_state {
++	uint32_t	col;
++	uint32_t	row;
++	int		buf_ptr;
++	u8		*buf;
++};
++
++struct spinand_cmd {
++	u8		cmd;
++	u32		n_addr;		/* Number of address */
++	u8		addr[3];	/* Reg Offset */
++	u32		n_dummy;	/* Dummy use */
++	u32		n_tx;		/* Number of tx bytes */
++	u8		*tx_buf;	/* Tx buf */
++	u32		n_rx;		/* Number of rx bytes */
++	u8		*rx_buf;	/* Rx buf */
++};
++
++
++
++#endif /* __LINUX_MTD_SPI_NAND_H */
+diff --git a/lib/Kconfig b/lib/Kconfig
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -6,6 +6,9 @@ config ADDR_MAP
+ config BZIP2
+    bool "bzip2"
+ 
++config BCH
++   bool "BCH"
++
+ config USB_TTY
+    bool "usb tty"
+ 
+diff --git a/lib/Makefile b/lib/Makefile
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -26,6 +26,7 @@ include $(TOPDIR)/config.mk
+ LIB	= $(obj)libgeneric.a
+ 
+ COBJS-$(CONFIG_ADDR_MAP) += addr_map.o
++COBJS-$(CONFIG_BCH) += bch.o
+ COBJS-$(CONFIG_BZIP2) += bzlib.o
+ COBJS-$(CONFIG_BZIP2) += bzlib_crctable.o
+ COBJS-$(CONFIG_BZIP2) += bzlib_decompress.o
+diff --git a/lib/bch.c b/lib/bch.c
+new file mode 100644
+--- /dev/null
++++ b/lib/bch.c
+@@ -0,0 +1,1364 @@
++/*
++ * Generic binary BCH encoding/decoding library
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 51
++ * Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Copyright © 2011 Parrot S.A.
++ *
++ * Author: Ivan Djelic <ivan.djelic@parrot.com>
++ *
++ * Description:
++ *
++ * This library provides runtime configurable encoding/decoding of binary
++ * Bose-Chaudhuri-Hocquenghem (BCH) codes.
++ *
++ * Call init_bch to get a pointer to a newly allocated bch_control structure for
++ * the given m (Galois field order), t (error correction capability) and
++ * (optional) primitive polynomial parameters.
++ *
++ * Call encode_bch to compute and store ecc parity bytes to a given buffer.
++ * Call decode_bch to detect and locate errors in received data.
++ *
++ * On systems supporting hw BCH features, intermediate results may be provided
++ * to decode_bch in order to skip certain steps. See decode_bch() documentation
++ * for details.
++ *
++ * Option CONFIG_BCH_CONST_PARAMS can be used to force fixed values of
++ * parameters m and t; thus allowing extra compiler optimizations and providing
++ * better (up to 2x) encoding performance. Using this option makes sense when
++ * (m,t) are fixed and known in advance, e.g. when using BCH error correction
++ * on a particular NAND flash device.
++ *
++ * Algorithmic details:
++ *
++ * Encoding is performed by processing 32 input bits in parallel, using 4
++ * remainder lookup tables.
++ *
++ * The final stage of decoding involves the following internal steps:
++ * a. Syndrome computation
++ * b. Error locator polynomial computation using Berlekamp-Massey algorithm
++ * c. Error locator root finding (by far the most expensive step)
++ *
++ * In this implementation, step c is not performed using the usual Chien search.
++ * Instead, an alternative approach described in [1] is used. It consists in
++ * factoring the error locator polynomial using the Berlekamp Trace algorithm
++ * (BTA) down to a certain degree (4), after which ad hoc low-degree polynomial
++ * solving techniques [2] are used. The resulting algorithm, called BTZ, yields
++ * much better performance than Chien search for usual (m,t) values (typically
++ * m >= 13, t < 32, see [1]).
++ *
++ * [1] B. Biswas, V. Herbert. Efficient root finding of polynomials over fields
++ * of characteristic 2, in: Western European Workshop on Research in Cryptology
++ * - WEWoRC 2009, Graz, Austria, LNCS, Springer, July 2009, to appear.
++ * [2] [Zin96] V.A. Zinoviev. On the solution of equations of degree 10 over
++ * finite fields GF(2^q). In Rapport de recherche INRIA no 2829, 1996.
++ */
++
++#include <common.h>
++#include <ubi_uboot.h>
++
++#include <linux/bitops.h>
++#include <asm/byteorder.h>
++#include <linux/bch.h>
++
++#if defined(CONFIG_BCH_CONST_PARAMS)
++#define GF_M(_p)               (CONFIG_BCH_CONST_M)
++#define GF_T(_p)               (CONFIG_BCH_CONST_T)
++#define GF_N(_p)               ((1 << (CONFIG_BCH_CONST_M))-1)
++#else
++#define GF_M(_p)               ((_p)->m)
++#define GF_T(_p)               ((_p)->t)
++#define GF_N(_p)               ((_p)->n)
++#endif
++
++#define BCH_ECC_WORDS(_p)      DIV_ROUND_UP(GF_M(_p)*GF_T(_p), 32)
++#define BCH_ECC_BYTES(_p)      DIV_ROUND_UP(GF_M(_p)*GF_T(_p), 8)
++
++#ifndef dbg
++//#define dbg(_fmt, args...)     do {} while (0)
++#define dbg(_fmt, args...) 
++#endif
++
++/*
++ * represent a polynomial over GF(2^m)
++ */
++struct gf_poly {
++	unsigned int deg;    /* polynomial degree */
++	unsigned int c[0];   /* polynomial terms */
++};
++
++/* given its degree, compute a polynomial size in bytes */
++#define GF_POLY_SZ(_d) (sizeof(struct gf_poly)+((_d)+1)*sizeof(unsigned int))
++
++/* polynomial of degree 1 */
++struct gf_poly_deg1 {
++	struct gf_poly poly;
++	unsigned int   c[2];
++};
++
++/*
++ * same as encode_bch(), but process input data one byte at a time
++ */
++static void encode_bch_unaligned(struct bch_control *bch,
++				 const unsigned char *data, unsigned int len,
++				 uint32_t *ecc)
++{
++	int i;
++	const uint32_t *p;
++	const int l = BCH_ECC_WORDS(bch)-1;
++
++	while (len--) {
++		p = bch->mod8_tab + (l+1)*(((ecc[0] >> 24)^(*data++)) & 0xff);
++
++		for (i = 0; i < l; i++)
++			ecc[i] = ((ecc[i] << 8)|(ecc[i+1] >> 24))^(*p++);
++
++		ecc[l] = (ecc[l] << 8)^(*p);
++	}
++}
++
++/*
++ * convert ecc bytes to aligned, zero-padded 32-bit ecc words
++ */
++static void load_ecc8(struct bch_control *bch, uint32_t *dst,
++		      const uint8_t *src)
++{
++	uint8_t pad[4] = {0, 0, 0, 0};
++	unsigned int i, nwords = BCH_ECC_WORDS(bch)-1;
++
++	for (i = 0; i < nwords; i++, src += 4)
++		dst[i] = (src[0] << 24)|(src[1] << 16)|(src[2] << 8)|src[3];
++
++	memcpy(pad, src, BCH_ECC_BYTES(bch)-4*nwords);
++	dst[nwords] = (pad[0] << 24)|(pad[1] << 16)|(pad[2] << 8)|pad[3];
++}
++
++/*
++ * convert 32-bit ecc words to ecc bytes
++ */
++static void store_ecc8(struct bch_control *bch, uint8_t *dst,
++		       const uint32_t *src)
++{
++	uint8_t pad[4];
++	unsigned int i, nwords = BCH_ECC_WORDS(bch)-1;
++
++	for (i = 0; i < nwords; i++) {
++		*dst++ = (src[i] >> 24);
++		*dst++ = (src[i] >> 16) & 0xff;
++		*dst++ = (src[i] >>  8) & 0xff;
++		*dst++ = (src[i] >>  0) & 0xff;
++	}
++	pad[0] = (src[nwords] >> 24);
++	pad[1] = (src[nwords] >> 16) & 0xff;
++	pad[2] = (src[nwords] >>  8) & 0xff;
++	pad[3] = (src[nwords] >>  0) & 0xff;
++	memcpy(dst, pad, BCH_ECC_BYTES(bch)-4*nwords);
++}
++
++/**
++ * encode_bch - calculate BCH ecc parity of data
++ * @bch:   BCH control structure
++ * @data:  data to encode
++ * @len:   data length in bytes
++ * @ecc:   ecc parity data, must be initialized by caller
++ *
++ * The @ecc parity array is used both as input and output parameter, in order to
++ * allow incremental computations. It should be of the size indicated by member
++ * @ecc_bytes of @bch, and should be initialized to 0 before the first call.
++ *
++ * The exact number of computed ecc parity bits is given by member @ecc_bits of
++ * @bch; it may be less than m*t for large values of t.
++ */
++void encode_bch(struct bch_control *bch, const uint8_t *data,
++		unsigned int len, uint8_t *ecc)
++{
++	const unsigned int l = BCH_ECC_WORDS(bch)-1;
++	unsigned int i, mlen;
++	unsigned long m;
++	uint32_t w, r[l+1];
++	const uint32_t * const tab0 = bch->mod8_tab;
++	const uint32_t * const tab1 = tab0 + 256*(l+1);
++	const uint32_t * const tab2 = tab1 + 256*(l+1);
++	const uint32_t * const tab3 = tab2 + 256*(l+1);
++	const uint32_t *pdata, *p0, *p1, *p2, *p3;
++
++	if (ecc) {
++		/* load ecc parity bytes into internal 32-bit buffer */
++		load_ecc8(bch, bch->ecc_buf, ecc);
++	} else {
++		memset(bch->ecc_buf, 0, sizeof(r));
++	}
++
++	/* process first unaligned data bytes */
++	m = ((unsigned long)data) & 3;
++	if (m) {
++		mlen = (len < (4-m)) ? len : 4-m;
++		encode_bch_unaligned(bch, data, mlen, bch->ecc_buf);
++		data += mlen;
++		len  -= mlen;
++	}
++
++	/* process 32-bit aligned data words */
++	pdata = (uint32_t *)data;
++	mlen  = len/4;
++	data += 4*mlen;
++	len  -= 4*mlen;
++	memcpy(r, bch->ecc_buf, sizeof(r));
++
++	/*
++	 * split each 32-bit word into 4 polynomials of weight 8 as follows:
++	 *
++	 * 31 ...24  23 ...16  15 ... 8  7 ... 0
++	 * xxxxxxxx  yyyyyyyy  zzzzzzzz  tttttttt
++	 *                               tttttttt  mod g = r0 (precomputed)
++	 *                     zzzzzzzz  00000000  mod g = r1 (precomputed)
++	 *           yyyyyyyy  00000000  00000000  mod g = r2 (precomputed)
++	 * xxxxxxxx  00000000  00000000  00000000  mod g = r3 (precomputed)
++	 * xxxxxxxx  yyyyyyyy  zzzzzzzz  tttttttt  mod g = r0^r1^r2^r3
++	 */
++	while (mlen--) {
++		/* input data is read in big-endian format */
++		w = r[0]^cpu_to_be32(*pdata++);
++		p0 = tab0 + (l+1)*((w >>  0) & 0xff);
++		p1 = tab1 + (l+1)*((w >>  8) & 0xff);
++		p2 = tab2 + (l+1)*((w >> 16) & 0xff);
++		p3 = tab3 + (l+1)*((w >> 24) & 0xff);
++
++		for (i = 0; i < l; i++)
++			r[i] = r[i+1]^p0[i]^p1[i]^p2[i]^p3[i];
++
++		r[l] = p0[l]^p1[l]^p2[l]^p3[l];
++	}
++	memcpy(bch->ecc_buf, r, sizeof(r));
++
++	/* process last unaligned bytes */
++	if (len)
++		encode_bch_unaligned(bch, data, len, bch->ecc_buf);
++
++	/* store ecc parity bytes into original parity buffer */
++	if (ecc)
++		store_ecc8(bch, ecc, bch->ecc_buf);
++}
++
++static inline int modulo(struct bch_control *bch, unsigned int v)
++{
++	const unsigned int n = GF_N(bch);
++	while (v >= n) {
++		v -= n;
++		v = (v & n) + (v >> GF_M(bch));
++	}
++	return v;
++}
++
++/*
++ * shorter and faster modulo function, only works when v < 2N.
++ */
++static inline int mod_s(struct bch_control *bch, unsigned int v)
++{
++	const unsigned int n = GF_N(bch);
++	return (v < n) ? v : v-n;
++}
++
++static inline int deg(unsigned int poly)
++{
++	/* polynomial degree is the most-significant bit index */
++	return fls(poly)-1;
++}
++
++static inline int parity(unsigned int x)
++{
++	/*
++	 * public domain code snippet, lifted from
++	 * http://www-graphics.stanford.edu/~seander/bithacks.html
++	 */
++	x ^= x >> 1;
++	x ^= x >> 2;
++	x = (x & 0x11111111U) * 0x11111111U;
++	return (x >> 28) & 1;
++}
++
++/* Galois field basic operations: multiply, divide, inverse, etc. */
++
++static inline unsigned int gf_mul(struct bch_control *bch, unsigned int a,
++				  unsigned int b)
++{
++	return (a && b) ? bch->a_pow_tab[mod_s(bch, bch->a_log_tab[a]+
++					       bch->a_log_tab[b])] : 0;
++}
++
++static inline unsigned int gf_sqr(struct bch_control *bch, unsigned int a)
++{
++	return a ? bch->a_pow_tab[mod_s(bch, 2*bch->a_log_tab[a])] : 0;
++}
++
++static inline unsigned int gf_div(struct bch_control *bch, unsigned int a,
++				  unsigned int b)
++{
++	return a ? bch->a_pow_tab[mod_s(bch, bch->a_log_tab[a]+
++					GF_N(bch)-bch->a_log_tab[b])] : 0;
++}
++
++static inline unsigned int gf_inv(struct bch_control *bch, unsigned int a)
++{
++	return bch->a_pow_tab[GF_N(bch)-bch->a_log_tab[a]];
++}
++
++static inline unsigned int a_pow(struct bch_control *bch, int i)
++{
++	return bch->a_pow_tab[modulo(bch, i)];
++}
++
++static inline int a_log(struct bch_control *bch, unsigned int x)
++{
++	return bch->a_log_tab[x];
++}
++
++static inline int a_ilog(struct bch_control *bch, unsigned int x)
++{
++	return mod_s(bch, GF_N(bch)-bch->a_log_tab[x]);
++}
++
++/*
++ * compute 2t syndromes of ecc polynomial, i.e. ecc(a^j) for j=1..2t
++ */
++static void compute_syndromes(struct bch_control *bch, uint32_t *ecc,
++			      unsigned int *syn)
++{
++	int i, j, s;
++	unsigned int m;
++	uint32_t poly;
++	const int t = GF_T(bch);
++
++	s = bch->ecc_bits;
++
++	/* make sure extra bits in last ecc word are cleared */
++	m = ((unsigned int)s) & 31;
++	if (m)
++		ecc[s/32] &= ~((1u << (32-m))-1);
++	memset(syn, 0, 2*t*sizeof(*syn));
++
++	/* compute v(a^j) for j=1 .. 2t-1 */
++	do {
++		poly = *ecc++;
++		s -= 32;
++		while (poly) {
++			i = deg(poly);
++			for (j = 0; j < 2*t; j += 2)
++				syn[j] ^= a_pow(bch, (j+1)*(i+s));
++
++			poly ^= (1 << i);
++		}
++	} while (s > 0);
++
++	/* v(a^(2j)) = v(a^j)^2 */
++	for (j = 0; j < t; j++)
++		syn[2*j+1] = gf_sqr(bch, syn[j]);
++}
++
++static void gf_poly_copy(struct gf_poly *dst, struct gf_poly *src)
++{
++	memcpy(dst, src, GF_POLY_SZ(src->deg));
++}
++
++static int compute_error_locator_polynomial(struct bch_control *bch,
++					    const unsigned int *syn)
++{
++	const unsigned int t = GF_T(bch);
++	const unsigned int n = GF_N(bch);
++	unsigned int i, j, tmp, l, pd = 1, d = syn[0];
++	struct gf_poly *elp = bch->elp;
++	struct gf_poly *pelp = bch->poly_2t[0];
++	struct gf_poly *elp_copy = bch->poly_2t[1];
++	int k, pp = -1;
++
++	memset(pelp, 0, GF_POLY_SZ(2*t));
++	memset(elp, 0, GF_POLY_SZ(2*t));
++
++	pelp->deg = 0;
++	pelp->c[0] = 1;
++	elp->deg = 0;
++	elp->c[0] = 1;
++
++	/* use simplified binary Berlekamp-Massey algorithm */
++	for (i = 0; (i < t) && (elp->deg <= t); i++) {
++		if (d) {
++			k = 2*i-pp;
++			gf_poly_copy(elp_copy, elp);
++			/* e[i+1](X) = e[i](X)+di*dp^-1*X^2(i-p)*e[p](X) */
++			tmp = a_log(bch, d)+n-a_log(bch, pd);
++			for (j = 0; j <= pelp->deg; j++) {
++				if (pelp->c[j]) {
++					l = a_log(bch, pelp->c[j]);
++					elp->c[j+k] ^= a_pow(bch, tmp+l);
++				}
++			}
++			/* compute l[i+1] = max(l[i]->c[l[p]+2*(i-p]) */
++			tmp = pelp->deg+k;
++			if (tmp > elp->deg) {
++				elp->deg = tmp;
++				gf_poly_copy(pelp, elp_copy);
++				pd = d;
++				pp = 2*i;
++			}
++		}
++		/* di+1 = S(2i+3)+elp[i+1].1*S(2i+2)+...+elp[i+1].lS(2i+3-l) */
++		if (i < t-1) {
++			d = syn[2*i+2];
++			for (j = 1; j <= elp->deg; j++)
++				d ^= gf_mul(bch, elp->c[j], syn[2*i+2-j]);
++		}
++	}
++	dbg("elp=%s\n", gf_poly_str(elp));
++	return (elp->deg > t) ? -1 : (int)elp->deg;
++}
++
++/*
++ * solve a m x m linear system in GF(2) with an expected number of solutions,
++ * and return the number of found solutions
++ */
++static int solve_linear_system(struct bch_control *bch, unsigned int *rows,
++			       unsigned int *sol, int nsol)
++{
++	const int m = GF_M(bch);
++	unsigned int tmp, mask;
++	int rem, c, r, p, k, param[m];
++
++	k = 0;
++	mask = 1 << m;
++
++	/* Gaussian elimination */
++	for (c = 0; c < m; c++) {
++		rem = 0;
++		p = c-k;
++		/* find suitable row for elimination */
++		for (r = p; r < m; r++) {
++			if (rows[r] & mask) {
++				if (r != p) {
++					tmp = rows[r];
++					rows[r] = rows[p];
++					rows[p] = tmp;
++				}
++				rem = r+1;
++				break;
++			}
++		}
++		if (rem) {
++			/* perform elimination on remaining rows */
++			tmp = rows[p];
++			for (r = rem; r < m; r++) {
++				if (rows[r] & mask)
++					rows[r] ^= tmp;
++			}
++		} else {
++			/* elimination not needed, store defective row index */
++			param[k++] = c;
++		}
++		mask >>= 1;
++	}
++	/* rewrite system, inserting fake parameter rows */
++	if (k > 0) {
++		p = k;
++		for (r = m-1; r >= 0; r--) {
++			if ((r > m-1-k) && rows[r])
++				/* system has no solution */
++				return 0;
++
++			rows[r] = (p && (r == param[p-1])) ?
++				p--, 1u << (m-r) : rows[r-p];
++		}
++	}
++
++	if (nsol != (1 << k))
++		/* unexpected number of solutions */
++		return 0;
++
++	for (p = 0; p < nsol; p++) {
++		/* set parameters for p-th solution */
++		for (c = 0; c < k; c++)
++			rows[param[c]] = (rows[param[c]] & ~1)|((p >> c) & 1);
++
++		/* compute unique solution */
++		tmp = 0;
++		for (r = m-1; r >= 0; r--) {
++			mask = rows[r] & (tmp|1);
++			tmp |= parity(mask) << (m-r);
++		}
++		sol[p] = tmp >> 1;
++	}
++	return nsol;
++}
++
++/*
++ * this function builds and solves a linear system for finding roots of a degree
++ * 4 affine monic polynomial X^4+aX^2+bX+c over GF(2^m).
++ */
++static int find_affine4_roots(struct bch_control *bch, unsigned int a,
++			      unsigned int b, unsigned int c,
++			      unsigned int *roots)
++{
++	int i, j, k;
++	const int m = GF_M(bch);
++	unsigned int mask = 0xff, t, rows[16] = {0,};
++
++	j = a_log(bch, b);
++	k = a_log(bch, a);
++	rows[0] = c;
++
++	/* buid linear system to solve X^4+aX^2+bX+c = 0 */
++	for (i = 0; i < m; i++) {
++		rows[i+1] = bch->a_pow_tab[4*i]^
++			(a ? bch->a_pow_tab[mod_s(bch, k)] : 0)^
++			(b ? bch->a_pow_tab[mod_s(bch, j)] : 0);
++		j++;
++		k += 2;
++	}
++	/*
++	 * transpose 16x16 matrix before passing it to linear solver
++	 * warning: this code assumes m < 16
++	 */
++	for (j = 8; j != 0; j >>= 1, mask ^= (mask << j)) {
++		for (k = 0; k < 16; k = (k+j+1) & ~j) {
++			t = ((rows[k] >> j)^rows[k+j]) & mask;
++			rows[k] ^= (t << j);
++			rows[k+j] ^= t;
++		}
++	}
++	return solve_linear_system(bch, rows, roots, 4);
++}
++
++/*
++ * compute root r of a degree 1 polynomial over GF(2^m) (returned as log(1/r))
++ */
++static int find_poly_deg1_roots(struct bch_control *bch, struct gf_poly *poly,
++				unsigned int *roots)
++{
++	int n = 0;
++
++	if (poly->c[0])
++		/* poly[X] = bX+c with c!=0, root=c/b */
++		roots[n++] = mod_s(bch, GF_N(bch)-bch->a_log_tab[poly->c[0]]+
++				   bch->a_log_tab[poly->c[1]]);
++	return n;
++}
++
++/*
++ * compute roots of a degree 2 polynomial over GF(2^m)
++ */
++static int find_poly_deg2_roots(struct bch_control *bch, struct gf_poly *poly,
++				unsigned int *roots)
++{
++	int n = 0, i, l0, l1, l2;
++	unsigned int u, v, r;
++
++	if (poly->c[0] && poly->c[1]) {
++
++		l0 = bch->a_log_tab[poly->c[0]];
++		l1 = bch->a_log_tab[poly->c[1]];
++		l2 = bch->a_log_tab[poly->c[2]];
++
++		/* using z=a/bX, transform aX^2+bX+c into z^2+z+u (u=ac/b^2) */
++		u = a_pow(bch, l0+l2+2*(GF_N(bch)-l1));
++		/*
++		 * let u = sum(li.a^i) i=0..m-1; then compute r = sum(li.xi):
++		 * r^2+r = sum(li.(xi^2+xi)) = sum(li.(a^i+Tr(a^i).a^k)) =
++		 * u + sum(li.Tr(a^i).a^k) = u+a^k.Tr(sum(li.a^i)) = u+a^k.Tr(u)
++		 * i.e. r and r+1 are roots iff Tr(u)=0
++		 */
++		r = 0;
++		v = u;
++		while (v) {
++			i = deg(v);
++			r ^= bch->xi_tab[i];
++			v ^= (1 << i);
++		}
++		/* verify root */
++		if ((gf_sqr(bch, r)^r) == u) {
++			/* reverse z=a/bX transformation and compute log(1/r) */
++			roots[n++] = modulo(bch, 2*GF_N(bch)-l1-
++					    bch->a_log_tab[r]+l2);
++			roots[n++] = modulo(bch, 2*GF_N(bch)-l1-
++					    bch->a_log_tab[r^1]+l2);
++		}
++	}
++	return n;
++}
++
++/*
++ * compute roots of a degree 3 polynomial over GF(2^m)
++ */
++static int find_poly_deg3_roots(struct bch_control *bch, struct gf_poly *poly,
++				unsigned int *roots)
++{
++	int i, n = 0;
++	unsigned int a, b, c, a2, b2, c2, e3, tmp[4];
++
++	if (poly->c[0]) {
++		/* transform polynomial into monic X^3 + a2X^2 + b2X + c2 */
++		e3 = poly->c[3];
++		c2 = gf_div(bch, poly->c[0], e3);
++		b2 = gf_div(bch, poly->c[1], e3);
++		a2 = gf_div(bch, poly->c[2], e3);
++
++		/* (X+a2)(X^3+a2X^2+b2X+c2) = X^4+aX^2+bX+c (affine) */
++		c = gf_mul(bch, a2, c2);           /* c = a2c2      */
++		b = gf_mul(bch, a2, b2)^c2;        /* b = a2b2 + c2 */
++		a = gf_sqr(bch, a2)^b2;            /* a = a2^2 + b2 */
++
++		/* find the 4 roots of this affine polynomial */
++		if (find_affine4_roots(bch, a, b, c, tmp) == 4) {
++			/* remove a2 from final list of roots */
++			for (i = 0; i < 4; i++) {
++				if (tmp[i] != a2)
++					roots[n++] = a_ilog(bch, tmp[i]);
++			}
++		}
++	}
++	return n;
++}
++
++/*
++ * compute roots of a degree 4 polynomial over GF(2^m)
++ */
++static int find_poly_deg4_roots(struct bch_control *bch, struct gf_poly *poly,
++				unsigned int *roots)
++{
++	int i, l, n = 0;
++	unsigned int a, b, c, d, e = 0, f, a2, b2, c2, e4;
++
++	if (poly->c[0] == 0)
++		return 0;
++
++	/* transform polynomial into monic X^4 + aX^3 + bX^2 + cX + d */
++	e4 = poly->c[4];
++	d = gf_div(bch, poly->c[0], e4);
++	c = gf_div(bch, poly->c[1], e4);
++	b = gf_div(bch, poly->c[2], e4);
++	a = gf_div(bch, poly->c[3], e4);
++
++	/* use Y=1/X transformation to get an affine polynomial */
++	if (a) {
++		/* first, eliminate cX by using z=X+e with ae^2+c=0 */
++		if (c) {
++			/* compute e such that e^2 = c/a */
++			f = gf_div(bch, c, a);
++			l = a_log(bch, f);
++			l += (l & 1) ? GF_N(bch) : 0;
++			e = a_pow(bch, l/2);
++			/*
++			 * use transformation z=X+e:
++			 * z^4+e^4 + a(z^3+ez^2+e^2z+e^3) + b(z^2+e^2) +cz+ce+d
++			 * z^4 + az^3 + (ae+b)z^2 + (ae^2+c)z+e^4+be^2+ae^3+ce+d
++			 * z^4 + az^3 + (ae+b)z^2 + e^4+be^2+d
++			 * z^4 + az^3 +     b'z^2 + d'
++			 */
++			d = a_pow(bch, 2*l)^gf_mul(bch, b, f)^d;
++			b = gf_mul(bch, a, e)^b;
++		}
++		/* now, use Y=1/X to get Y^4 + b/dY^2 + a/dY + 1/d */
++		if (d == 0)
++			/* assume all roots have multiplicity 1 */
++			return 0;
++
++		c2 = gf_inv(bch, d);
++		b2 = gf_div(bch, a, d);
++		a2 = gf_div(bch, b, d);
++	} else {
++		/* polynomial is already affine */
++		c2 = d;
++		b2 = c;
++		a2 = b;
++	}
++	/* find the 4 roots of this affine polynomial */
++	if (find_affine4_roots(bch, a2, b2, c2, roots) == 4) {
++		for (i = 0; i < 4; i++) {
++			/* post-process roots (reverse transformations) */
++			f = a ? gf_inv(bch, roots[i]) : roots[i];
++			roots[i] = a_ilog(bch, f^e);
++		}
++		n = 4;
++	}
++	return n;
++}
++
++/*
++ * build monic, log-based representation of a polynomial
++ */
++static void gf_poly_logrep(struct bch_control *bch,
++			   const struct gf_poly *a, int *rep)
++{
++	int i, d = a->deg, l = GF_N(bch)-a_log(bch, a->c[a->deg]);
++
++	/* represent 0 values with -1; warning, rep[d] is not set to 1 */
++	for (i = 0; i < d; i++)
++		rep[i] = a->c[i] ? mod_s(bch, a_log(bch, a->c[i])+l) : -1;
++}
++
++/*
++ * compute polynomial Euclidean division remainder in GF(2^m)[X]
++ */
++static void gf_poly_mod(struct bch_control *bch, struct gf_poly *a,
++			const struct gf_poly *b, int *rep)
++{
++	int la, p, m;
++	unsigned int i, j, *c = a->c;
++	const unsigned int d = b->deg;
++
++	if (a->deg < d)
++		return;
++
++	/* reuse or compute log representation of denominator */
++	if (!rep) {
++		rep = bch->cache;
++		gf_poly_logrep(bch, b, rep);
++	}
++
++	for (j = a->deg; j >= d; j--) {
++		if (c[j]) {
++			la = a_log(bch, c[j]);
++			p = j-d;
++			for (i = 0; i < d; i++, p++) {
++				m = rep[i];
++				if (m >= 0)
++					c[p] ^= bch->a_pow_tab[mod_s(bch,
++								     m+la)];
++			}
++		}
++	}
++	a->deg = d-1;
++	while (!c[a->deg] && a->deg)
++		a->deg--;
++}
++
++/*
++ * compute polynomial Euclidean division quotient in GF(2^m)[X]
++ */
++static void gf_poly_div(struct bch_control *bch, struct gf_poly *a,
++			const struct gf_poly *b, struct gf_poly *q)
++{
++	if (a->deg >= b->deg) {
++		q->deg = a->deg-b->deg;
++		/* compute a mod b (modifies a) */
++		gf_poly_mod(bch, a, b, NULL);
++		/* quotient is stored in upper part of polynomial a */
++		memcpy(q->c, &a->c[b->deg], (1+q->deg)*sizeof(unsigned int));
++	} else {
++		q->deg = 0;
++		q->c[0] = 0;
++	}
++}
++
++/*
++ * compute polynomial GCD (Greatest Common Divisor) in GF(2^m)[X]
++ */
++static struct gf_poly *gf_poly_gcd(struct bch_control *bch, struct gf_poly *a,
++				   struct gf_poly *b)
++{
++	struct gf_poly *tmp;
++
++	dbg("gcd(%s,%s)=", gf_poly_str(a), gf_poly_str(b));
++
++	if (a->deg < b->deg) {
++		tmp = b;
++		b = a;
++		a = tmp;
++	}
++
++	while (b->deg > 0) {
++		gf_poly_mod(bch, a, b, NULL);
++		tmp = b;
++		b = a;
++		a = tmp;
++	}
++
++	dbg("%s\n", gf_poly_str(a));
++
++	return a;
++}
++
++/*
++ * Given a polynomial f and an integer k, compute Tr(a^kX) mod f
++ * This is used in Berlekamp Trace algorithm for splitting polynomials
++ */
++static void compute_trace_bk_mod(struct bch_control *bch, int k,
++				 const struct gf_poly *f, struct gf_poly *z,
++				 struct gf_poly *out)
++{
++	const int m = GF_M(bch);
++	int i, j;
++
++	/* z contains z^2j mod f */
++	z->deg = 1;
++	z->c[0] = 0;
++	z->c[1] = bch->a_pow_tab[k];
++
++	out->deg = 0;
++	memset(out, 0, GF_POLY_SZ(f->deg));
++
++	/* compute f log representation only once */
++	gf_poly_logrep(bch, f, bch->cache);
++
++	for (i = 0; i < m; i++) {
++		/* add a^(k*2^i)(z^(2^i) mod f) and compute (z^(2^i) mod f)^2 */
++		for (j = z->deg; j >= 0; j--) {
++			out->c[j] ^= z->c[j];
++			z->c[2*j] = gf_sqr(bch, z->c[j]);
++			z->c[2*j+1] = 0;
++		}
++		if (z->deg > out->deg)
++			out->deg = z->deg;
++
++		if (i < m-1) {
++			z->deg *= 2;
++			/* z^(2(i+1)) mod f = (z^(2^i) mod f)^2 mod f */
++			gf_poly_mod(bch, z, f, bch->cache);
++		}
++	}
++	while (!out->c[out->deg] && out->deg)
++		out->deg--;
++
++	dbg("Tr(a^%d.X) mod f = %s\n", k, gf_poly_str(out));
++}
++
++/*
++ * factor a polynomial using Berlekamp Trace algorithm (BTA)
++ */
++static void factor_polynomial(struct bch_control *bch, int k, struct gf_poly *f,
++			      struct gf_poly **g, struct gf_poly **h)
++{
++	struct gf_poly *f2 = bch->poly_2t[0];
++	struct gf_poly *q  = bch->poly_2t[1];
++	struct gf_poly *tk = bch->poly_2t[2];
++	struct gf_poly *z  = bch->poly_2t[3];
++	struct gf_poly *gcd;
++
++	dbg("factoring %s...\n", gf_poly_str(f));
++
++	*g = f;
++	*h = NULL;
++
++	/* tk = Tr(a^k.X) mod f */
++	compute_trace_bk_mod(bch, k, f, z, tk);
++
++	if (tk->deg > 0) {
++		/* compute g = gcd(f, tk) (destructive operation) */
++		gf_poly_copy(f2, f);
++		gcd = gf_poly_gcd(bch, f2, tk);
++		if (gcd->deg < f->deg) {
++			/* compute h=f/gcd(f,tk); this will modify f and q */
++			gf_poly_div(bch, f, gcd, q);
++			/* store g and h in-place (clobbering f) */
++			*h = &((struct gf_poly_deg1 *)f)[gcd->deg].poly;
++			gf_poly_copy(*g, gcd);
++			gf_poly_copy(*h, q);
++		}
++	}
++}
++
++/*
++ * find roots of a polynomial, using BTZ algorithm; see the beginning of this
++ * file for details
++ */
++static int find_poly_roots(struct bch_control *bch, unsigned int k,
++			   struct gf_poly *poly, unsigned int *roots)
++{
++	int cnt;
++	struct gf_poly *f1, *f2;
++
++	switch (poly->deg) {
++		/* handle low degree polynomials with ad hoc techniques */
++	case 1:
++		cnt = find_poly_deg1_roots(bch, poly, roots);
++		break;
++	case 2:
++		cnt = find_poly_deg2_roots(bch, poly, roots);
++		break;
++	case 3:
++		cnt = find_poly_deg3_roots(bch, poly, roots);
++		break;
++	case 4:
++		cnt = find_poly_deg4_roots(bch, poly, roots);
++		break;
++	default:
++		/* factor polynomial using Berlekamp Trace Algorithm (BTA) */
++		cnt = 0;
++		if (poly->deg && (k <= GF_M(bch))) {
++			factor_polynomial(bch, k, poly, &f1, &f2);
++			if (f1)
++				cnt += find_poly_roots(bch, k+1, f1, roots);
++			if (f2)
++				cnt += find_poly_roots(bch, k+1, f2, roots+cnt);
++		}
++		break;
++	}
++	return cnt;
++}
++
++#if defined(USE_CHIEN_SEARCH)
++/*
++ * exhaustive root search (Chien) implementation - not used, included only for
++ * reference/comparison tests
++ */
++static int chien_search(struct bch_control *bch, unsigned int len,
++			struct gf_poly *p, unsigned int *roots)
++{
++	int m;
++	unsigned int i, j, syn, syn0, count = 0;
++	const unsigned int k = 8*len+bch->ecc_bits;
++
++	/* use a log-based representation of polynomial */
++	gf_poly_logrep(bch, p, bch->cache);
++	bch->cache[p->deg] = 0;
++	syn0 = gf_div(bch, p->c[0], p->c[p->deg]);
++
++	for (i = GF_N(bch)-k+1; i <= GF_N(bch); i++) {
++		/* compute elp(a^i) */
++		for (j = 1, syn = syn0; j <= p->deg; j++) {
++			m = bch->cache[j];
++			if (m >= 0)
++				syn ^= a_pow(bch, m+j*i);
++		}
++		if (syn == 0) {
++			roots[count++] = GF_N(bch)-i;
++			if (count == p->deg)
++				break;
++		}
++	}
++	return (count == p->deg) ? count : 0;
++}
++#define find_poly_roots(_p, _k, _elp, _loc) chien_search(_p, len, _elp, _loc)
++#endif /* USE_CHIEN_SEARCH */
++
++/**
++ * decode_bch - decode received codeword and find bit error locations
++ * @bch:      BCH control structure
++ * @data:     received data, ignored if @calc_ecc is provided
++ * @len:      data length in bytes, must always be provided
++ * @recv_ecc: received ecc, if NULL then assume it was XORed in @calc_ecc
++ * @calc_ecc: calculated ecc, if NULL then calc_ecc is computed from @data
++ * @syn:      hw computed syndrome data (if NULL, syndrome is calculated)
++ * @errloc:   output array of error locations
++ *
++ * Returns:
++ *  The number of errors found, or -EBADMSG if decoding failed, or -EINVAL if
++ *  invalid parameters were provided
++ *
++ * Depending on the available hw BCH support and the need to compute @calc_ecc
++ * separately (using encode_bch()), this function should be called with one of
++ * the following parameter configurations -
++ *
++ * by providing @data and @recv_ecc only:
++ *   decode_bch(@bch, @data, @len, @recv_ecc, NULL, NULL, @errloc)
++ *
++ * by providing @recv_ecc and @calc_ecc:
++ *   decode_bch(@bch, NULL, @len, @recv_ecc, @calc_ecc, NULL, @errloc)
++ *
++ * by providing ecc = recv_ecc XOR calc_ecc:
++ *   decode_bch(@bch, NULL, @len, NULL, ecc, NULL, @errloc)
++ *
++ * by providing syndrome results @syn:
++ *   decode_bch(@bch, NULL, @len, NULL, NULL, @syn, @errloc)
++ *
++ * Once decode_bch() has successfully returned with a positive value, error
++ * locations returned in array @errloc should be interpreted as follows -
++ *
++ * if (errloc[n] >= 8*len), then n-th error is located in ecc (no need for
++ * data correction)
++ *
++ * if (errloc[n] < 8*len), then n-th error is located in data and can be
++ * corrected with statement data[errloc[n]/8] ^= 1 << (errloc[n] % 8);
++ *
++ * Note that this function does not perform any data correction by itself, it
++ * merely indicates error locations.
++ */
++int decode_bch(struct bch_control *bch, const uint8_t *data, unsigned int len,
++	       const uint8_t *recv_ecc, const uint8_t *calc_ecc,
++	       const unsigned int *syn, unsigned int *errloc)
++{
++	const unsigned int ecc_words = BCH_ECC_WORDS(bch);
++	unsigned int nbits;
++	int i, err, nroots;
++	uint32_t sum;
++
++	/* sanity check: make sure data length can be handled */
++	if (8*len > (bch->n-bch->ecc_bits))
++		return -EINVAL;
++
++	/* if caller does not provide syndromes, compute them */
++	if (!syn) {
++		if (!calc_ecc) {
++			/* compute received data ecc into an internal buffer */
++			if (!data || !recv_ecc)
++				return -EINVAL;
++			encode_bch(bch, data, len, NULL);
++		} else {
++			/* load provided calculated ecc */
++			load_ecc8(bch, bch->ecc_buf, calc_ecc);
++		}
++		/* load received ecc or assume it was XORed in calc_ecc */
++		if (recv_ecc) {
++			load_ecc8(bch, bch->ecc_buf2, recv_ecc);
++			/* XOR received and calculated ecc */
++			for (i = 0, sum = 0; i < (int)ecc_words; i++) {
++				bch->ecc_buf[i] ^= bch->ecc_buf2[i];
++				sum |= bch->ecc_buf[i];
++			}
++			if (!sum)
++				/* no error found */
++				return 0;
++		}
++		compute_syndromes(bch, bch->ecc_buf, bch->syn);
++		syn = bch->syn;
++	}
++
++	err = compute_error_locator_polynomial(bch, syn);
++	if (err > 0) {
++		nroots = find_poly_roots(bch, 1, bch->elp, errloc);
++		if (err != nroots)
++			err = -1;
++	}
++	if (err > 0) {
++		/* post-process raw error locations for easier correction */
++		nbits = (len*8)+bch->ecc_bits;
++		for (i = 0; i < err; i++) {
++			if (errloc[i] >= nbits) {
++				err = -1;
++				break;
++			}
++			errloc[i] = nbits-1-errloc[i];
++			errloc[i] = (errloc[i] & ~7)|(7-(errloc[i] & 7));
++		}
++	}
++	return (err >= 0) ? err : -EBADMSG;
++}
++
++/*
++ * generate Galois field lookup tables
++ */
++static int build_gf_tables(struct bch_control *bch, unsigned int poly)
++{
++	unsigned int i, x = 1;
++	const unsigned int k = 1 << deg(poly);
++
++	/* primitive polynomial must be of degree m */
++	if (k != (1u << GF_M(bch)))
++		return -1;
++
++	for (i = 0; i < GF_N(bch); i++) {
++		bch->a_pow_tab[i] = x;
++		bch->a_log_tab[x] = i;
++		if (i && (x == 1))
++			/* polynomial is not primitive (a^i=1 with 0<i<2^m-1) */
++			return -1;
++		x <<= 1;
++		if (x & k)
++			x ^= poly;
++	}
++	bch->a_pow_tab[GF_N(bch)] = 1;
++	bch->a_log_tab[0] = 0;
++
++	return 0;
++}
++
++/*
++ * compute generator polynomial remainder tables for fast encoding
++ */
++static void build_mod8_tables(struct bch_control *bch, const uint32_t *g)
++{
++	int i, j, b, d;
++	uint32_t data, hi, lo, *tab;
++	const int l = BCH_ECC_WORDS(bch);
++	const int plen = DIV_ROUND_UP(bch->ecc_bits+1, 32);
++	const int ecclen = DIV_ROUND_UP(bch->ecc_bits, 32);
++
++	memset(bch->mod8_tab, 0, 4*256*l*sizeof(*bch->mod8_tab));
++
++	for (i = 0; i < 256; i++) {
++		/* p(X)=i is a small polynomial of weight <= 8 */
++		for (b = 0; b < 4; b++) {
++			/* we want to compute (p(X).X^(8*b+deg(g))) mod g(X) */
++			tab = bch->mod8_tab + (b*256+i)*l;
++			data = i << (8*b);
++			while (data) {
++				d = deg(data);
++				/* subtract X^d.g(X) from p(X).X^(8*b+deg(g)) */
++				data ^= g[0] >> (31-d);
++				for (j = 0; j < ecclen; j++) {
++					hi = (d < 31) ? g[j] << (d+1) : 0;
++					lo = (j+1 < plen) ?
++						g[j+1] >> (31-d) : 0;
++					tab[j] ^= hi|lo;
++				}
++			}
++		}
++	}
++}
++
++/*
++ * build a base for factoring degree 2 polynomials
++ */
++static int build_deg2_base(struct bch_control *bch)
++{
++	const int m = GF_M(bch);
++	int i, j, r;
++	unsigned int sum, x, y, remaining, ak = 0, xi[m];
++
++	/* find k s.t. Tr(a^k) = 1 and 0 <= k < m */
++	for (i = 0; i < m; i++) {
++		for (j = 0, sum = 0; j < m; j++)
++			sum ^= a_pow(bch, i*(1 << j));
++
++		if (sum) {
++			ak = bch->a_pow_tab[i];
++			break;
++		}
++	}
++	/* find xi, i=0..m-1 such that xi^2+xi = a^i+Tr(a^i).a^k */
++	remaining = m;
++	memset(xi, 0, sizeof(xi));
++
++	for (x = 0; (x <= GF_N(bch)) && remaining; x++) {
++		y = gf_sqr(bch, x)^x;
++		for (i = 0; i < 2; i++) {
++			r = a_log(bch, y);
++			if (y && (r < m) && !xi[r]) {
++				bch->xi_tab[r] = x;
++				xi[r] = 1;
++				remaining--;
++				dbg("x%d = %x\n", r, x);
++				break;
++			}
++			y ^= ak;
++		}
++	}
++	/* should not happen but check anyway */
++	return remaining ? -1 : 0;
++}
++
++static void *bch_alloc(size_t size, int *err)
++{
++	void *ptr;
++
++	ptr = kmalloc(size, GFP_KERNEL);
++	if (ptr == NULL)
++		*err = 1;
++	return ptr;
++}
++
++/*
++ * compute generator polynomial for given (m,t) parameters.
++ */
++static uint32_t *compute_generator_polynomial(struct bch_control *bch)
++{
++	const unsigned int m = GF_M(bch);
++	const unsigned int t = GF_T(bch);
++	int n, err = 0;
++	unsigned int i, j, nbits, r, word, *roots;
++	struct gf_poly *g;
++	uint32_t *genpoly;
++
++	g = bch_alloc(GF_POLY_SZ(m*t), &err);
++	roots = bch_alloc((bch->n+1)*sizeof(*roots), &err);
++	genpoly = bch_alloc(DIV_ROUND_UP(m*t+1, 32)*sizeof(*genpoly), &err);
++
++	if (err) {
++		kfree(genpoly);
++		genpoly = NULL;
++		goto finish;
++	}
++
++	/* enumerate all roots of g(X) */
++	memset(roots , 0, (bch->n+1)*sizeof(*roots));
++	for (i = 0; i < t; i++) {
++		for (j = 0, r = 2*i+1; j < m; j++) {
++			roots[r] = 1;
++			r = mod_s(bch, 2*r);
++		}
++	}
++	/* build generator polynomial g(X) */
++	g->deg = 0;
++	g->c[0] = 1;
++	for (i = 0; i < GF_N(bch); i++) {
++		if (roots[i]) {
++			/* multiply g(X) by (X+root) */
++			r = bch->a_pow_tab[i];
++			g->c[g->deg+1] = 1;
++			for (j = g->deg; j > 0; j--)
++				g->c[j] = gf_mul(bch, g->c[j], r)^g->c[j-1];
++
++			g->c[0] = gf_mul(bch, g->c[0], r);
++			g->deg++;
++		}
++	}
++	/* store left-justified binary representation of g(X) */
++	n = g->deg+1;
++	i = 0;
++
++	while (n > 0) {
++		nbits = (n > 32) ? 32 : n;
++		for (j = 0, word = 0; j < nbits; j++) {
++			if (g->c[n-1-j])
++				word |= 1u << (31-j);
++		}
++		genpoly[i++] = word;
++		n -= nbits;
++	}
++	bch->ecc_bits = g->deg;
++
++finish:
++	kfree(g);
++	kfree(roots);
++
++	return genpoly;
++}
++
++/**
++ * init_bch - initialize a BCH encoder/decoder
++ * @m:          Galois field order, should be in the range 5-15
++ * @t:          maximum error correction capability, in bits
++ * @prim_poly:  user-provided primitive polynomial (or 0 to use default)
++ *
++ * Returns:
++ *  a newly allocated BCH control structure if successful, NULL otherwise
++ *
++ * This initialization can take some time, as lookup tables are built for fast
++ * encoding/decoding; make sure not to call this function from a time critical
++ * path. Usually, init_bch() should be called on module/driver init and
++ * free_bch() should be called to release memory on exit.
++ *
++ * You may provide your own primitive polynomial of degree @m in argument
++ * @prim_poly, or let init_bch() use its default polynomial.
++ *
++ * Once init_bch() has successfully returned a pointer to a newly allocated
++ * BCH control structure, ecc length in bytes is given by member @ecc_bytes of
++ * the structure.
++ */
++struct bch_control *init_bch(int m, int t, unsigned int prim_poly)
++{
++	int err = 0;
++	unsigned int i, words;
++	uint32_t *genpoly;
++	struct bch_control *bch = NULL;
++
++	const int min_m = 5;
++	const int max_m = 15;
++
++	/* default primitive polynomials */
++	static const unsigned int prim_poly_tab[] = {
++		0x25, 0x43, 0x83, 0x11d, 0x211, 0x409, 0x805, 0x1053, 0x201b,
++		0x402b, 0x8003,
++	};
++
++#if defined(CONFIG_BCH_CONST_PARAMS)
++	if ((m != (CONFIG_BCH_CONST_M)) || (t != (CONFIG_BCH_CONST_T))) {
++	//	printk(KERN_ERR "bch encoder/decoder was configured to support "
++	//	       "parameters m=%d, t=%d only!\n",
++	//	       CONFIG_BCH_CONST_M, CONFIG_BCH_CONST_T);
++		goto fail;
++	}
++#endif
++	if ((m < min_m) || (m > max_m))
++		/*
++		 * values of m greater than 15 are not currently supported;
++		 * supporting m > 15 would require changing table base type
++		 * (uint16_t) and a small patch in matrix transposition
++		 */
++		goto fail;
++
++	/* sanity checks */
++	if ((t < 1) || (m*t >= ((1 << m)-1)))
++		/* invalid t value */
++		goto fail;
++
++	/* select a primitive polynomial for generating GF(2^m) */
++	if (prim_poly == 0)
++		prim_poly = prim_poly_tab[m-min_m];
++
++#ifdef CONFIG_NAND_SPL
++	bch = kmalloc(sizeof(*bch), GFP_KERNEL);
++	memset(bch, 0, sizeof(*bch));
++#else
++	bch = kzalloc(sizeof(*bch), GFP_KERNEL);
++#endif
++	if (bch == NULL)
++		goto fail;
++
++	bch->m = m;
++	bch->t = t;
++	bch->n = (1 << m)-1;
++	words  = DIV_ROUND_UP(m*t, 32);
++	bch->ecc_bytes = DIV_ROUND_UP(m*t, 8);
++	bch->a_pow_tab = bch_alloc((1+bch->n)*sizeof(*bch->a_pow_tab), &err);
++	bch->a_log_tab = bch_alloc((1+bch->n)*sizeof(*bch->a_log_tab), &err);
++	bch->mod8_tab  = bch_alloc(words*1024*sizeof(*bch->mod8_tab), &err);
++	bch->ecc_buf   = bch_alloc(words*sizeof(*bch->ecc_buf), &err);
++	bch->ecc_buf2  = bch_alloc(words*sizeof(*bch->ecc_buf2), &err);
++	bch->xi_tab    = bch_alloc(m*sizeof(*bch->xi_tab), &err);
++	bch->syn       = bch_alloc(2*t*sizeof(*bch->syn), &err);
++	bch->cache     = bch_alloc(2*t*sizeof(*bch->cache), &err);
++	bch->elp       = bch_alloc((t+1)*sizeof(struct gf_poly_deg1), &err);
++
++	for (i = 0; i < ARRAY_SIZE(bch->poly_2t); i++)
++		bch->poly_2t[i] = bch_alloc(GF_POLY_SZ(2*t), &err);
++
++	if (err)
++		goto fail;
++
++	err = build_gf_tables(bch, prim_poly);
++	if (err)
++		goto fail;
++
++	/* use generator polynomial for computing encoding tables */
++	genpoly = compute_generator_polynomial(bch);
++	if (genpoly == NULL)
++		goto fail;
++
++	build_mod8_tables(bch, genpoly);
++	kfree(genpoly);
++
++	err = build_deg2_base(bch);
++	if (err)
++		goto fail;
++
++	return bch;
++
++fail:
++	free_bch(bch);
++	return NULL;
++}
++
++/**
++ *  free_bch - free the BCH control structure
++ *  @bch:    BCH control structure to release
++ */
++void free_bch(struct bch_control *bch)
++{
++	unsigned int i;
++
++	if (bch) {
++		kfree(bch->a_pow_tab);
++		kfree(bch->a_log_tab);
++		kfree(bch->mod8_tab);
++		kfree(bch->ecc_buf);
++		kfree(bch->ecc_buf2);
++		kfree(bch->xi_tab);
++		kfree(bch->syn);
++		kfree(bch->cache);
++		kfree(bch->elp);
++
++		for (i = 0; i < ARRAY_SIZE(bch->poly_2t); i++)
++			kfree(bch->poly_2t[i]);
++
++		kfree(bch);
++	}
++}
+diff --git a/lib/string.c b/lib/string.c
+--- a/lib/string.c
++++ b/lib/string.c
+@@ -214,6 +214,51 @@ char * strrchr(const char * s, int c)
+ }
+ #endif
+ 
++
++
++/**
++ * skip_spaces - Removes leading whitespace from @str.
++ * @str: The string to be stripped.
++ *
++ * Returns a pointer to the first non-whitespace character in @str.
++ */
++char *skip_spaces(const char *str)
++{
++        
++        while (isspace(*str))
++                ++str;
++        
++        return (char *)str;
++}
++
++
++/**
++ * strim - Removes leading and trailing whitespace from @s.
++ * @s: The string to be stripped.
++ *
++ * Note that the first trailing whitespace is replaced with a %NUL-terminator
++ * in the given string @s. Returns a pointer to the first non-whitespace
++ * character in @s.
++ */
++char *strim(char *s)
++{
++        size_t size;
++        char *end;
++
++        s = skip_spaces(s);
++        size = strlen(s);
++        if (!size)
++                return s;
++
++        end = s + size - 1;
++        while (end >= s && isspace(*end))
++                end--;
++        *(end + 1) = '\0';
++
++        return s;
++}
++
++
+ #ifndef __HAVE_ARCH_STRLEN
+ /**
+  * strlen - Find the length of a string

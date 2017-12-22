@@ -1,0 +1,69 @@
+From 9bebea6d8385414d27e2f674b3d24e33b8d42cba Mon Sep 17 00:00:00 2001
+From: Samuel Ortiz <sameo@linux.intel.com>
+Date: Mon, 8 Sep 2014 11:10:16 +0200
+Subject: [PATCH 167/441] i2c: designware: Fix suspend/resume hooks
+
+The suspend/resume hooks are NOP for shared hosts.
+In that case the master clock is not disable for example.
+This patch fixes that by trying to grab ownership when we're shared
+and then doing the suspend/resume calls unconditionally.
+
+Issue: IRDA-710
+Change-Id: I66c17a44077cdecc49c08c757ccff907123c9f65
+Signed-off-by: Samuel Ortiz <sameo@linux.intel.com>
+(cherry picked from commit cf558637c8d6d770064c2e5d95fba27ba552ca16)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/i2c/busses/i2c-designware-platdrv.c | 30 ++++++++++++++++++++++-------
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@ -429,11 +429,19 @@ static int dw_i2c_suspend(struct device
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct dw_i2c_dev *i_dev = platform_get_drvdata(pdev);
+ 
+-	if (!i_dev->shared_host) {
+-		i2c_dw_disable(i_dev);
+-		clk_disable_unprepare(i_dev->clk);
++	if (i_dev->shared_host && i_dev->acquire_ownership) {
++		if (i_dev->acquire_ownership() < 0) {
++			dev_WARN(i_dev->dev, "Couldn't acquire ownership\n");
++			return 0;
++		}
+ 	}
+ 
++	i2c_dw_disable(i_dev);
++	clk_disable_unprepare(i_dev->clk);
++
++	if (i_dev->shared_host && i_dev->release_ownership)
++		i_dev->release_ownership();
++
+ 	return 0;
+ }
+ 
+@@ -442,11 +450,19 @@ static int dw_i2c_resume(struct device *
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct dw_i2c_dev *i_dev = platform_get_drvdata(pdev);
+ 
+-
+-	if (!i_dev->shared_host) {
+-		clk_prepare_enable(i_dev->clk);
+-		i2c_dw_init(i_dev);
++	if (i_dev->shared_host && i_dev->acquire_ownership) {
++		if (i_dev->acquire_ownership() < 0) {
++			dev_WARN(i_dev->dev, "Couldn't acquire ownership\n");
++			return 0;
++		}
+ 	}
++
++	clk_prepare_enable(i_dev->clk);
++	i2c_dw_init(i_dev);
++
++	if (i_dev->shared_host && i_dev->release_ownership)
++		i_dev->release_ownership();
++
+ 	return 0;
+ }
+ #endif

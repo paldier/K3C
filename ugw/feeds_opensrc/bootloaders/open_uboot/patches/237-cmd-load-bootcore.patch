@@ -1,0 +1,157 @@
+# HG changeset patch
+# Parent 201fd3de6300417633b4f26b5212ef687393aae2
+
+diff --git a/common/Kconfig b/common/Kconfig
+--- a/common/Kconfig
++++ b/common/Kconfig
+@@ -14,6 +14,11 @@ config CMD_BEDBUG
+ config CMD_BMP
+      bool "bmp"
+ 
++config CMD_BOOT_TOS
++	bool "boot tos"
++	default n
++	depends on DRIVER_GRX500
++
+ config CMD_CACHE
+      bool "cache"
+ 
+@@ -244,4 +249,3 @@ config SYS_PROMPT_HUSH_PS2
+     string "Hush PS2 Prompt"
+        default "> "
+        depends on SYS_HUSH_PARSER
+-
+diff --git a/common/Makefile b/common/Makefile
+--- a/common/Makefile
++++ b/common/Makefile
+@@ -168,6 +168,7 @@ COBJS-$(CONFIG_USB_KEYBOARD) += usb_kbd.
+ COBJS-$(CONFIG_CMD_UPGRADE) += upgrade.o cmd_upgrade.o
+ COBJS-$(CONFIG_CMD_WDT) += cmd_wdt.o
+ COBJS-$(CONFIG_CMD_AUTH) += cmd_auth.o
++COBJS-$(CONFIG_CMD_BOOT_TOS) += cmd_secboot.o
+ 
+ COBJS	:= $(sort $(COBJS-y))
+ SRCS	:= $(AOBJS:.o=.S) $(COBJS:.o=.c)
+diff --git a/common/cmd_secboot.c b/common/cmd_secboot.c
+new file mode 100644
+--- /dev/null
++++ b/common/cmd_secboot.c
+@@ -0,0 +1,82 @@
++/************************************************************************
++*
++*	Copyright: Lantiq Asia Pacific Pte Ltd
++*	Author:	   Mohammad Firdaus B Alias Thani
++*	
++*	Additional U-boot command to allow booting of the TOS from
++*	the U-boot commandline.
++*
++*	Revision:  1.0
++*
++************************************************************************/
++
++#include <common.h>
++#include <command.h>
++#include <asm/boot.h>
++#include <asm/addrspace.h>
++
++int run_tos(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
++{
++	unsigned long ddr_addr, size, load_addr;
++	unsigned long phy_ddr_addr;
++
++	if (argc != 5) {
++		printf("Wrong Number of arguements given!\n");
++		cmd_usage(cmdtp);
++		return -1;
++	}
++	
++	load_addr = (ulong) simple_strtoul(argv[2], NULL, 16);
++	ddr_addr = (ulong) simple_strtoul(argv[3], NULL, 16);
++	size = (ulong) simple_strtoul(argv[4], NULL, 16);
++
++	phy_ddr_addr = CPHYSADDR((u32)ddr_addr) | 0x20000000;
++	
++	asm("sync");	
++    invalidate_scache_range((u32)phy_ddr_addr, (u32)(phy_ddr_addr + size));
++    invalidate_dcache_range((u32)phy_ddr_addr, (u32)(phy_ddr_addr + size));
++
++	/* Write the location we want 4Kec to load to */
++	REG32(MPS_LOAD_ADDR) = load_addr;
++	/* Write DDR location to mailbox */
++	REG32(MPS_DDR_LOC) = ddr_addr;
++	/* Write image size to mailbox */
++	REG32(MPS_SIZE_LOC) = size;
++	/* Trigger 4Kec to run */
++	REG32(SRAMFLAG) = IPCMAGIC;
++
++	return 0;
++}
++
++int wait_tos(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
++{
++	if (argc != 2) {
++		printf("Wrong Number of arguements given!\n");
++		cmd_usage(cmdtp);
++		return -1;
++	}
++
++	/* wait till 4kec kernel notify us with bootcore up icc msg  */
++	while(REG32(0xbf2013f8)!=0x00000100);
++
++	return 0;
++}
++
++int boot_tos(cmd_tbl_t * cmdtp, int flag, int argc, char *argv[])
++{
++	if (strcmp(argv[1], "load_os") == 0)
++		return run_tos(cmdtp, flag, argc, argv);
++	else if (strcmp(argv[1], "wait_os") == 0)
++		return wait_tos(cmdtp, flag, argc, argv);
++
++	cmd_usage(cmdtp);
++
++	return 0;
++}
++
++U_BOOT_CMD(secboot, 5, 1, boot_tos, 
++	"Command to Boot TOS",
++	"secboot load_os [4Kec high mem addr] [ddr load address] [image size]\n"
++	"secboot wait_os\n"
++);
++
+diff --git a/common/cmd_upgrade.c b/common/cmd_upgrade.c
+--- a/common/cmd_upgrade.c
++++ b/common/cmd_upgrade.c
+@@ -98,7 +98,7 @@ int do_upgrade( cmd_tbl_t *cmdtp, int fl
+ 	ulong srcHeader=0;
+ 	int curParSize=0, dir, pad;
+ 	image_header_t *pimg_header = NULL;
+-	char name[16], strimg_crc[32], buf[32];;
++	char name[16], strimg_crc[32], buf[32];
+ #ifdef CONFIG_CMD_UBI
+     int ubi = 0;
+ #endif
+@@ -148,7 +148,10 @@ int do_upgrade( cmd_tbl_t *cmdtp, int fl
+ 			#ifdef CONFIG_CMD_UBI
+ 			    if(strncmp(pimg_header->ih_name, "LTQCPE UBI_Kernel", sizeof(pimg_header->ih_name)) == 0) ubi=1;
+ 			#endif	
+-				sprintf(name, "kernel");
++				if (strncmp(pimg_header->ih_name, "MIPS 4Kec Bootcore", sizeof(pimg_header->ih_name)) == 0)
++					sprintf(name, "bootcore");
++				else
++					sprintf(name, "kernel");
+ 				dir = 1;
+ 				break;
+ 			case IH_TYPE_FIRMWARE:
+@@ -375,7 +378,10 @@
+ 				dir = 0;
+ 				break;
+ 			case IH_TYPE_KERNEL:
+-				sprintf(name, "kernel");
++				if (strncmp(xImgHeader.ih_name, "MIPS 4Kec Bootcore", sizeof(xImgHeader.ih_name)) == 0)
++          sprintf(name, "bootcore");
++				else
++					sprintf(name, "kernel");
+ 				dir = 1;
+ 				break;
+ 			case IH_TYPE_FIRMWARE:

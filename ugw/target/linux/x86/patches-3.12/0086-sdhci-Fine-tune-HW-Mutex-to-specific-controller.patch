@@ -1,0 +1,78 @@
+From 8a9dd910f5934f8418b4211ebd7f6c55ea7f1ef1 Mon Sep 17 00:00:00 2001
+From: "Brett T. Warden" <brett.t.warden@intel.com>
+Date: Fri, 22 May 2015 13:27:26 -0700
+Subject: [PATCH 086/441] sdhci: Fine-tune HW Mutex to specific controller
+
+Add specific probe function for first eMMC controller in Cougar Mountain
+to set the HW Mutex support flag only for that controller.
+Remove logic that applies the HW Mutex flag to all controllers when a
+specific device exists.
+---
+ drivers/mmc/host/sdhci-pci.c | 28 +++++++++++++++++++---------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+--- a/drivers/mmc/host/sdhci-pci.c
++++ b/drivers/mmc/host/sdhci-pci.c
+@@ -283,6 +283,19 @@ static int byt_sdio_probe_slot(struct sd
+ 	return 0;
+ }
+ 
++static int cgm_emmc_probe_shared_slot(struct sdhci_pci_slot *slot)
++{
++	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
++				 MMC_CAP_HW_RESET;
++	slot->host->mmc->caps2 |= MMC_CAP2_HC_ERASE_SZ;
++	slot->hw_reset = sdhci_pci_int_hw_reset;
++#ifdef CONFIG_HW_MUTEXES
++    /* First eMMC controller is shared with NetIP subsystem */
++    slot->host->flags |= SDHCI_SUPPORT_HW_MUTEX;
++#endif
++	return 0;
++}
++
+ static const struct sdhci_pci_fixes sdhci_intel_byt_emmc = {
+ 	.allow_runtime_pm = true,
+ 	.probe_slot	= byt_emmc_probe_slot,
+@@ -301,6 +314,11 @@ static const struct sdhci_pci_fixes sdhc
+ 	.own_cd_for_runtime_pm = true,
+ };
+ 
++static const struct sdhci_pci_fixes sdhci_intel_cgm_shared_emmc = {
++	.allow_runtime_pm = true,
++	.probe_slot	= cgm_emmc_probe_shared_slot,
++};
++
+ /* Define Host controllers for Intel Merrifield platform */
+ #define INTEL_MRFL_EMMC_0	0
+ #define INTEL_MRFL_EMMC_1	1
+@@ -1036,7 +1054,7 @@ static const struct pci_device_id pci_id
+ 		.device		= PCI_DEVICE_ID_INTEL_CGM_EMMC,
+ 		.subvendor	= PCI_ANY_ID,
+ 		.subdevice	= PCI_ANY_ID,
+-		.driver_data	= (kernel_ulong_t)&sdhci_intel_byt_emmc,
++		.driver_data	= (kernel_ulong_t)&sdhci_intel_cgm_shared_emmc,
+ 	},
+ 
+ 	{
+@@ -1399,9 +1417,6 @@ static struct sdhci_pci_slot *sdhci_pci_
+ 	struct sdhci_pci_slot *slot;
+ 	struct sdhci_host *host;
+ 	int ret, bar = first_bar + slotno;
+-#ifdef CONFIG_HW_MUTEXES
+-	struct pci_dev *tmp_dev = NULL;
+-#endif
+ 
+ 	if (!(pci_resource_flags(pdev, bar) & IORESOURCE_MEM)) {
+ 		dev_err(&pdev->dev, "BAR %d is not iomem. Aborting.\n", bar);
+@@ -1497,11 +1512,6 @@ static struct sdhci_pci_slot *sdhci_pci_
+ #ifdef CONFIG_HW_MUTEXES
+ 	/* If there's a HW Mutex controller that exists, then we'll need to use a HW Mutex
+ 	 * to make sure and use exclusive controller access from different processors */
+-	tmp_dev = pci_get_device(0x8086, HW_MUTEX_DEV_ID, NULL);
+-	if (tmp_dev) {
+-	  host->flags |= SDHCI_SUPPORT_HW_MUTEX;
+-	  pci_dev_put(tmp_dev);
+-	}
+ 
+ 	//Lock the HW Mutex (Gain Control)
+ 	LOCK_EMMC_HW_MUTEX(host->mmc);

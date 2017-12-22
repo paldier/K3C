@@ -1,0 +1,115 @@
+# HG changeset patch
+# Parent bf240e582fa80307fd06da3628bfd411c733b9af
+
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -84,6 +84,7 @@ EXPORT_SYMBOL_GPL(nf_conntrack_max);
+ DEFINE_PER_CPU(struct nf_conn, nf_conntrack_untracked);
+ EXPORT_PER_CPU_SYMBOL(nf_conntrack_untracked);
+ 
++#define LTQ_IP_CONNTRACK_REPLACEMENT
+ unsigned int nf_conntrack_hash_rnd __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_conntrack_hash_rnd);
+ 
+@@ -670,23 +671,41 @@ static noinline int early_drop(struct ne
+ 	struct hlist_nulls_node *n;
+ 	unsigned int i, cnt = 0;
+ 	int dropped = 0;
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
++	int recheck  = 1;
++redo:
++#endif
+ 
+ 	rcu_read_lock();
+ 	for (i = 0; i < net->ct.htable_size; i++) {
+ 		hlist_nulls_for_each_entry_rcu(h, n, &net->ct.hash[hash],
+ 					 hnnode) {
+ 			tmp = nf_ct_tuplehash_to_ctrack(h);
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
++			if (recheck) {
++				if (!test_bit(IPS_CONFIRMED_BIT, &tmp->status))
++					ct = tmp;
++			} else {
++				ct = tmp;
++			}
++#else
+ 			if (!test_bit(IPS_ASSURED_BIT, &tmp->status))
+ 				ct = tmp;
++#endif
+ 			cnt++;
+ 		}
+-
+ 		if (ct != NULL) {
+-			if (likely(!nf_ct_is_dying(ct) &&
+-				   atomic_inc_not_zero(&ct->ct_general.use)))
++                        if (likely(!nf_ct_is_dying(ct) && atomic_inc_not_zero(&ct->ct_general.use))
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++                                  && (ppa_hook_session_add_fn == NULL || ppa_hook_session_prio_fn(ct, PPA_F_SESSION_ORG_DIR | PPA_F_SESSION_REPLY_DIR) <= nf_conntrack_default_prio_thresh)
++#endif
++#endif
++                        ){
+ 				break;
+-			else
++			} else {
+ 				ct = NULL;
++			}
+ 		}
+ 
+ 		if (cnt >= NF_CT_EVICTION_RANGE)
+@@ -696,8 +715,18 @@ static noinline int early_drop(struct ne
+ 	}
+ 	rcu_read_unlock();
+ 
+-	if (!ct)
++#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
++	if (!ct) {
++		if ( recheck ) {
++			recheck = 0;
++			goto redo;
++		}
+ 		return dropped;
++	}
++#else
++	if (!ct) 
++		return dropped;
++#endif
+ 
+ 	if (del_timer(&ct->timeout)) {
+ #if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
+@@ -733,8 +762,6 @@ void init_nf_conntrack_hash_rnd(void)
+ 	cmpxchg(&nf_conntrack_hash_rnd, 0, rand);
+ }
+ 
+-//#define LTQ_IP_CONNTRACK_REPLACEMENT
+-
+ #undef LTQ_IP_CONNTRACK_REPLACEMENT_DEBUG
+ 
+ #ifdef LTQ_IP_CONNTRACK_REPLACEMENT
+@@ -831,24 +858,12 @@ static struct nf_conn *
+ 	if (nf_conntrack_max &&
+ 	    unlikely(atomic_read(&net->ct.count) > nf_conntrack_max)) {
+ 		if (!early_drop(net, hash_bucket(hash, net))) {
+-#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
+-               if( FindReplacement(net) )
+-               {
+-#ifdef LTQ_IP_CONNTRACK_REPLACEMENT_DEBUG
+-                       printk(KERN_WARNING "inside nf_conntrack_alloc ok\n");
+-#endif
+-                       goto SUCCESS_REPLACEMENT;
+-               }
+-#endif
+ 			atomic_dec(&net->ct.count);
+-			net_warn_ratelimited("nf_conntrack: table full, dropping packet\n");
++//			net_warn_ratelimited("nf_conntrack: table full, dropping packet\n");
+ 			return ERR_PTR(-ENOMEM);
+ 		}
+ 	}
+ 
+-#ifdef LTQ_IP_CONNTRACK_REPLACEMENT
+-SUCCESS_REPLACEMENT:
+-#endif
+ 	/*
+ 	 * Do not use kmem_cache_zalloc(), as this cache uses
+ 	 * SLAB_DESTROY_BY_RCU.

@@ -1,0 +1,511 @@
+From 1fb99fb5af84934b23eb6bdbe80caa7a3bef1c1a Mon Sep 17 00:00:00 2001
+From: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@intel.com>
+Date: Tue, 10 Jun 2014 15:21:09 -0700
+Subject: [PATCH 164/441] i2c: dw_i2c: Ported punit locking patch from MCG
+ kernel
+
+  commit bbf94b35e02b522ef4232c872a27c78e9acac234
+  Author: Sundar Iyer <sundar.iyer@intel.com>
+  Date:   Wed Dec 11 16:45:34 2013 +0530
+
+  i2c/dw_i2c: implement arbitration for shared host controller
+
+  BZ: 162832
+
+  For platforms where an i2c host is shared between multiple
+  entities like a CPU, and a u-controller, we need some
+  synchronization mechanism for i2c access. The actual synchronization
+  is platform dependent.
+
+  This patch adds the support to introduce sync for such hosts.
+  Also, we disable the power management (also runtime) for such
+  hosts to avoid lockup issues. We currently use the flag "shared_host"
+  to signify a shared host and implement the synchronization.
+
+  TODO: Update the driver for UEFI changes
+
+Change-Id: I7e010925e2811a5a8fd54f046a5f62bff93fa486
+Signed-off-by: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@intel.com>
+(cherry picked from commit a7899115d3e9ce33782187db1a880ed05495910e)
+
+Also adds:
+	arch/x86/include/asm/intel_mid_pcihelpers.h
+	arch/x86/platform/intel-mid/intel_mid_pcihelpers.c
+---
+ arch/x86/include/asm/intel_mid_pcihelpers.h        |  37 +++
+ arch/x86/platform/intel-mid/intel_mid_pcihelpers.c | 267 +++++++++++++++++++++
+ drivers/i2c/busses/i2c-designware-core.c           |  14 +-
+ drivers/i2c/busses/i2c-designware-core.h           |   4 +
+ drivers/i2c/busses/i2c-designware-platdrv.c        |  50 +++-
+ 5 files changed, 365 insertions(+), 7 deletions(-)
+ create mode 100644 arch/x86/include/asm/intel_mid_pcihelpers.h
+ create mode 100644 arch/x86/platform/intel-mid/intel_mid_pcihelpers.c
+
+--- /dev/null
++++ b/arch/x86/include/asm/intel_mid_pcihelpers.h
+@@ -0,0 +1,37 @@
++/*
++ * Access to message bus through three registers
++ * in CUNIT(0:0:0) PCI configuration space.
++ * MSGBUS_CTRL_REG(0xD0):
++ *   31:24      = message bus opcode
++ *   23:16      = message bus port
++ *   15:8       = message bus address, low 8 bits.
++ *   7:4        = message bus byte enables
++ * MSGBUS_CTRL_EXT_REG(0xD8):
++ *   31:8       = message bus address, high 24 bits.
++ * MSGBUS_DATA_REG(0xD4):
++ *   hold the data for write or read
++ */
++#define PCI_ROOT_MSGBUS_CTRL_REG        0xD0
++#define PCI_ROOT_MSGBUS_DATA_REG        0xD4
++#define PCI_ROOT_MSGBUS_CTRL_EXT_REG    0xD8
++#define PCI_ROOT_MSGBUS_READ            0x10
++#define PCI_ROOT_MSGBUS_WRITE           0x11
++#define PCI_ROOT_MSGBUS_DWORD_ENABLE    0xf0
++
++/* In BYT platform for all internal PCI devices d3 delay
++ * of 3 ms is sufficient. Default value of 10 ms is overkill.
++ */
++#define INTERNAL_PCI_PM_D3_WAIT		3
++
++#define ISP_SUB_CLASS			0x80
++#define SUB_CLASS_MASK			0xFF00
++
++u32 intel_mid_msgbus_read32_raw(u32 cmd);
++u32 intel_mid_msgbus_read32(u8 port, u32 addr);
++void intel_mid_msgbus_write32_raw(u32 cmd, u32 data);
++void intel_mid_msgbus_write32(u8 port, u32 addr, u32 data);
++u32 intel_mid_msgbus_read32_raw_ext(u32 cmd, u32 cmd_ext);
++void intel_mid_msgbus_write32_raw_ext(u32 cmd, u32 cmd_ext, u32 data);
++u32 intel_mid_soc_stepping(void);
++int intel_mid_dw_i2c_acquire_ownership(void);
++int intel_mid_dw_i2c_release_ownership(void);
+--- /dev/null
++++ b/arch/x86/platform/intel-mid/intel_mid_pcihelpers.c
+@@ -0,0 +1,267 @@
++#include <linux/export.h>
++#include <linux/pci.h>
++#include <linux/pm_qos.h>
++#include <linux/delay.h>
++
++/* G-Min addition: "platform_is()" lives in intel_mid_pm.h in the MCG
++ * tree, but it's just platform ID info and we don't want to pull in
++ * the whole SFI-based PM architecture. */
++#define INTEL_ATOM_MRST 0x26
++#define INTEL_ATOM_MFLD 0x27
++#define INTEL_ATOM_CLV 0x35
++#define INTEL_ATOM_MRFLD 0x4a
++#define INTEL_ATOM_BYT 0x37
++#define INTEL_ATOM_MOORFLD 0x5a
++#define INTEL_ATOM_CHT 0x4c
++/* synchronization for sharing the I2C controller */
++#define PUNIT_PORT	0x04
++#define PUNIT_DOORBELL_OPCODE	(0xE0)
++#define PUNIT_DOORBELL_REG	(0x0)
++#ifndef CSTATE_EXIT_LATENCY
++#define CSTATE_EXIT_LATENCY_C1 1
++#endif
++static inline int platform_is(u8 model)
++{
++        return (boot_cpu_data.x86_model == model);
++}
++
++#include <asm/intel_mid_pcihelpers.h>
++
++/* Unified message bus read/write operation */
++static DEFINE_SPINLOCK(msgbus_lock);
++
++static struct pci_dev *pci_root;
++static struct pm_qos_request pm_qos;
++int qos;
++
++static int intel_mid_msgbus_init(void)
++{
++	pci_root = pci_get_bus_and_slot(0, PCI_DEVFN(0, 0));
++	if (!pci_root) {
++		pr_err("%s: Error: msgbus PCI handle NULL\n", __func__);
++		return -ENODEV;
++	}
++
++	pm_qos_add_request(&pm_qos, PM_QOS_CPU_DMA_LATENCY,
++			PM_QOS_DEFAULT_VALUE);
++	return 0;
++}
++fs_initcall(intel_mid_msgbus_init);
++
++u32 intel_mid_msgbus_read32_raw(u32 cmd)
++{
++	unsigned long irq_flags;
++	u32 data;
++
++	spin_lock_irqsave(&msgbus_lock, irq_flags);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_REG, cmd);
++	pci_read_config_dword(pci_root, PCI_ROOT_MSGBUS_DATA_REG, &data);
++	spin_unlock_irqrestore(&msgbus_lock, irq_flags);
++
++	return data;
++}
++EXPORT_SYMBOL(intel_mid_msgbus_read32_raw);
++
++/*
++ * GU: this function is only used by the VISA and 'VXD' drivers.
++ */
++u32 intel_mid_msgbus_read32_raw_ext(u32 cmd, u32 cmd_ext)
++{
++	unsigned long irq_flags;
++	u32 data;
++
++	spin_lock_irqsave(&msgbus_lock, irq_flags);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_EXT_REG, cmd_ext);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_REG, cmd);
++	pci_read_config_dword(pci_root, PCI_ROOT_MSGBUS_DATA_REG, &data);
++	spin_unlock_irqrestore(&msgbus_lock, irq_flags);
++
++	return data;
++}
++EXPORT_SYMBOL(intel_mid_msgbus_read32_raw_ext);
++
++void intel_mid_msgbus_write32_raw(u32 cmd, u32 data)
++{
++	unsigned long irq_flags;
++
++	spin_lock_irqsave(&msgbus_lock, irq_flags);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_DATA_REG, data);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_REG, cmd);
++	spin_unlock_irqrestore(&msgbus_lock, irq_flags);
++}
++EXPORT_SYMBOL(intel_mid_msgbus_write32_raw);
++
++/*
++ * GU: this function is only used by the VISA and 'VXD' drivers.
++ */
++void intel_mid_msgbus_write32_raw_ext(u32 cmd, u32 cmd_ext, u32 data)
++{
++	unsigned long irq_flags;
++
++	spin_lock_irqsave(&msgbus_lock, irq_flags);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_DATA_REG, data);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_EXT_REG, cmd_ext);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_REG, cmd);
++	spin_unlock_irqrestore(&msgbus_lock, irq_flags);
++}
++EXPORT_SYMBOL(intel_mid_msgbus_write32_raw_ext);
++
++u32 intel_mid_msgbus_read32(u8 port, u32 addr)
++{
++	unsigned long irq_flags;
++	u32 data;
++	u32 cmd;
++	u32 cmdext;
++
++	cmd = (PCI_ROOT_MSGBUS_READ << 24) | (port << 16) |
++		((addr & 0xff) << 8) | PCI_ROOT_MSGBUS_DWORD_ENABLE;
++	cmdext = addr & 0xffffff00;
++
++	spin_lock_irqsave(&msgbus_lock, irq_flags);
++
++	if (cmdext) {
++		/* This resets to 0 automatically, no need to write 0 */
++		pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_EXT_REG,
++					cmdext);
++	}
++
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_REG, cmd);
++	pci_read_config_dword(pci_root, PCI_ROOT_MSGBUS_DATA_REG, &data);
++	spin_unlock_irqrestore(&msgbus_lock, irq_flags);
++
++	return data;
++}
++
++EXPORT_SYMBOL(intel_mid_msgbus_read32);
++void intel_mid_msgbus_write32(u8 port, u32 addr, u32 data)
++{
++	unsigned long irq_flags;
++	u32 cmd;
++	u32 cmdext;
++
++	cmd = (PCI_ROOT_MSGBUS_WRITE << 24) | (port << 16) |
++		((addr & 0xFF) << 8) | PCI_ROOT_MSGBUS_DWORD_ENABLE;
++	cmdext = addr & 0xffffff00;
++
++	spin_lock_irqsave(&msgbus_lock, irq_flags);
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_DATA_REG, data);
++
++	if (cmdext) {
++		/* This resets to 0 automatically, no need to write 0 */
++		pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_EXT_REG,
++					cmdext);
++	}
++
++	pci_write_config_dword(pci_root, PCI_ROOT_MSGBUS_CTRL_REG, cmd);
++	spin_unlock_irqrestore(&msgbus_lock, irq_flags);
++}
++EXPORT_SYMBOL(intel_mid_msgbus_write32);
++
++/* called only from where is later then fs_initcall */
++u32 intel_mid_soc_stepping(void)
++{
++	return pci_root->revision;
++}
++EXPORT_SYMBOL(intel_mid_soc_stepping);
++
++static bool is_south_complex_device(struct pci_dev *dev)
++{
++	unsigned base_class = dev->class >> 16;
++	unsigned sub_class  = (dev->class & SUB_CLASS_MASK) >> 8;
++
++	/* other than camera, pci bridges and display,
++	 * everything else are south complex devices.
++	 */
++	if (((base_class == PCI_BASE_CLASS_MULTIMEDIA) &&
++	     (sub_class == ISP_SUB_CLASS)) ||
++	    (base_class == PCI_BASE_CLASS_BRIDGE) ||
++	    ((base_class == PCI_BASE_CLASS_DISPLAY) && !sub_class))
++		return false;
++	else
++		return true;
++}
++
++/* In BYT platform, d3_delay for internal south complex devices,
++ * they are not subject to 10 ms d3 to d0 delay required by pci spec.
++ */
++static void pci_d3_delay_fixup(struct pci_dev *dev)
++{
++	if (platform_is(INTEL_ATOM_BYT)) {
++		/* All internal devices are in bus 0. */
++		if (dev->bus->number == 0 && is_south_complex_device(dev)) {
++			dev->d3_delay = INTERNAL_PCI_PM_D3_WAIT;
++			dev->d3cold_delay = INTERNAL_PCI_PM_D3_WAIT;
++		}
++	}
++}
++DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, PCI_ANY_ID, pci_d3_delay_fixup);
++
++#define PUNIT_SEMAPHORE	(platform_is(INTEL_ATOM_BYT) ? 0x7 : 0x10E)
++#define GET_SEM() (intel_mid_msgbus_read32(PUNIT_PORT, PUNIT_SEMAPHORE) & 0x1)
++
++static void reset_semaphore(void)
++{
++	u32 data;
++
++	data = intel_mid_msgbus_read32(PUNIT_PORT, PUNIT_SEMAPHORE);
++	smp_mb();
++	data = data & 0xfffffffe;
++	intel_mid_msgbus_write32(PUNIT_PORT, PUNIT_SEMAPHORE, data);
++	smp_mb();
++
++	pm_qos_update_request(&pm_qos, PM_QOS_DEFAULT_VALUE);
++
++}
++
++int intel_mid_dw_i2c_acquire_ownership(void)
++{
++	u32 ret = 0;
++	u32 data = 0; /* data sent to PUNIT */
++	u32 cmd;
++	u32 cmdext;
++	int timeout = 100;
++
++	pm_qos_update_request(&pm_qos, CSTATE_EXIT_LATENCY_C1 - 1);
++
++	/* host driver writes 0x2 to side band register 0x7 */
++	intel_mid_msgbus_write32(PUNIT_PORT, PUNIT_SEMAPHORE, 0x2);
++	smp_mb();
++
++	/* host driver sends 0xE0 opcode to PUNIT and writes 0 register */
++	cmd = (PUNIT_DOORBELL_OPCODE << 24) | (PUNIT_PORT << 16) |
++	((PUNIT_DOORBELL_REG & 0xFF) << 8) | PCI_ROOT_MSGBUS_DWORD_ENABLE;
++	cmdext = PUNIT_DOORBELL_REG & 0xffffff00;
++
++	if (cmdext)
++		intel_mid_msgbus_write32_raw_ext(cmd, cmdext, data);
++	else
++		intel_mid_msgbus_write32_raw(cmd, data);
++
++	/* host driver waits for bit 0 to be set in side band 0x7 */
++	while (GET_SEM() != 0x1) {
++		usleep_range(1000, 2000);
++		timeout--;
++		if (timeout <= 0) {
++			pr_err("Timeout: semaphore timed out, reset sem\n");
++			ret = -ETIMEDOUT;
++			reset_semaphore();
++			pr_err("PUNIT SEM: %d\n",
++					intel_mid_msgbus_read32(PUNIT_PORT,
++						PUNIT_SEMAPHORE));
++			WARN_ON(1);
++			return ret;
++		}
++	}
++	smp_mb();
++
++	return ret;
++}
++EXPORT_SYMBOL(intel_mid_dw_i2c_acquire_ownership);
++
++int intel_mid_dw_i2c_release_ownership(void)
++{
++	reset_semaphore();
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_mid_dw_i2c_release_ownership);
+--- a/drivers/i2c/busses/i2c-designware-core.c
++++ b/drivers/i2c/busses/i2c-designware-core.c
+@@ -652,6 +652,15 @@ i2c_dw_xfer(struct i2c_adapter *adap, st
+ 	dev->abort_source = 0;
+ 	dev->rx_outstanding = 0;
+ 
++	/* if the host is shared between other units on the SoC */
++	if (dev->shared_host && dev->acquire_ownership) {
++		ret = dev->acquire_ownership();
++		if (ret < 0) {
++			dev_WARN(dev->dev, "couldnt acquire ownership\n");
++			goto done;
++		}
++	}
++
+ 	ret = i2c_dw_wait_bus_not_busy(dev);
+ 	if (ret < 0)
+ 		goto done;
+@@ -660,7 +669,7 @@ i2c_dw_xfer(struct i2c_adapter *adap, st
+ 	i2c_dw_xfer_init(dev);
+ 
+ 	/* wait for tx to complete */
+-	ret = wait_for_completion_timeout(&dev->cmd_complete, HZ);
++	ret = wait_for_completion_timeout(&dev->cmd_complete, 3 * HZ);
+ 	if (ret == 0) {
+ 		dev_err(dev->dev, "controller timed out\n");
+ 		/* i2c_dw_init implicitly disables the adapter */
+@@ -697,6 +706,9 @@ i2c_dw_xfer(struct i2c_adapter *adap, st
+ 	ret = -EIO;
+ 
+ done:
++	if (dev->shared_host && dev->release_ownership)
++		dev->release_ownership();
++
+ 	pm_runtime_mark_last_busy(dev->dev);
+ 	pm_runtime_put_autosuspend(dev->dev);
+ 	mutex_unlock(&dev->lock);
+--- a/drivers/i2c/busses/i2c-designware-core.h
++++ b/drivers/i2c/busses/i2c-designware-core.h
+@@ -65,6 +65,7 @@
+  * @ss_lcnt: standard speed LCNT value
+  * @fs_hcnt: fast speed HCNT value
+  * @fs_lcnt: fast speed LCNT value
++ * @shared_host: if this host is shared by other units on the SoC
+  *
+  * HCNT and LCNT parameters can be used if the platform knows more accurate
+  * values than the one computed based only on the input clock frequency.
+@@ -103,6 +104,9 @@ struct dw_i2c_dev {
+ 	u16			ss_lcnt;
+ 	u16			fs_hcnt;
+ 	u16			fs_lcnt;
++	int			shared_host;
++	int			(*acquire_ownership) (void);
++	int			(*release_ownership) (void);
+ };
+ 
+ #define ACCESS_SWAP		0x00000001
+--- a/drivers/i2c/busses/i2c-designware-platdrv.c
++++ b/drivers/i2c/busses/i2c-designware-platdrv.c
+@@ -46,6 +46,8 @@
+ #include <acpi/actypes.h>
+ #include "i2c-designware-core.h"
+ 
++#include <asm/intel_mid_pcihelpers.h>
++
+ static struct i2c_algorithm i2c_dw_algo = {
+ 	.master_xfer	= i2c_dw_xfer,
+ 	.functionality	= i2c_dw_func,
+@@ -77,6 +79,21 @@ struct dw_i2c_acpi_handler_data {
+ 	struct platform_device *pdev;
+ };
+ 
++
++int dw_i2c_acquire_ownership(void)
++{
++#ifdef CONFIG_GMIN_INTEL_MID
++	return intel_mid_dw_i2c_acquire_ownership();
++#endif
++	return 0;
++}
++int dw_i2c_release_ownership(void)
++{
++#ifdef CONFIG_GMIN_INTEL_MID
++	return intel_mid_dw_i2c_release_ownership();
++#endif
++	return 0;
++}
+ static acpi_status
+ dw_i2c_acpi_space_handler(u32 function, acpi_physical_address address,
+ 			u32 bits, u64 *value64,
+@@ -217,6 +234,9 @@ static int dw_i2c_acpi_configure(struct
+ {
+ 	struct dw_i2c_dev *dev = platform_get_drvdata(pdev);
+ 	bool fs_mode = dev->master_cfg & DW_IC_CON_SPEED_FAST;
++	acpi_status status;
++	acpi_handle handle = ACPI_HANDLE(&pdev->dev);
++	unsigned long long shared_host = 0;
+ 
+ 	if (!ACPI_HANDLE(&pdev->dev))
+ 		return -ENODEV;
+@@ -234,6 +254,18 @@ static int dw_i2c_acpi_configure(struct
+ 	dw_i2c_acpi_params(pdev, "FMCN", &dev->fs_hcnt, &dev->fs_lcnt,
+ 			   fs_mode ? &dev->sda_hold_time : NULL);
+ 
++	status = acpi_evaluate_integer(handle, "_SEM", NULL, &shared_host);
++
++	if (ACPI_SUCCESS(status))
++		dev_info(&pdev->dev, "_SEM=%ld\n", shared_host);
++
++	if (shared_host != 0) {
++		dev_info(&pdev->dev, "Share controller with PUNIT\n");
++		dev->shared_host = 1;
++		dev->acquire_ownership = dw_i2c_acquire_ownership;
++		dev->release_ownership = dw_i2c_release_ownership;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -347,10 +379,14 @@ static int dw_i2c_probe(struct platform_
+ 		return r;
+ 	}
+ 
+-	pm_runtime_set_autosuspend_delay(&pdev->dev, 1000);
+-	pm_runtime_use_autosuspend(&pdev->dev);
+-	pm_runtime_set_active(&pdev->dev);
+-	pm_runtime_enable(&pdev->dev);
++	if (dev->shared_host) {
++		pm_runtime_forbid(&pdev->dev);
++	} else {
++		pm_runtime_set_autosuspend_delay(&pdev->dev, 1000);
++		pm_runtime_use_autosuspend(&pdev->dev);
++		pm_runtime_set_active(&pdev->dev);
++		pm_runtime_enable(&pdev->dev);
++	}
+ 
+ 	dw_i2c_acpi_install_space_handler(pdev);
+ 	acpi_walk_dep_device_list();
+@@ -399,7 +435,9 @@ static int dw_i2c_resume(struct device *
+ 	struct dw_i2c_dev *i_dev = platform_get_drvdata(pdev);
+ 
+ 	clk_prepare_enable(i_dev->clk);
+-	i2c_dw_init(i_dev);
++
++	if (!i_dev->shared_host)
++		i2c_dw_init(i_dev);
+ 
+ 	return 0;
+ }
+@@ -427,7 +465,7 @@ static int __init dw_i2c_init_driver(voi
+ {
+ 	return platform_driver_register(&dw_i2c_driver);
+ }
+-subsys_initcall(dw_i2c_init_driver);
++fs_initcall_sync(dw_i2c_init_driver);
+ 
+ static void __exit dw_i2c_exit_driver(void)
+ {

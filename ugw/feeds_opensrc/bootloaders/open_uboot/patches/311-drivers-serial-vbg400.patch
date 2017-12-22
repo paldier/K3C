@@ -1,0 +1,541 @@
+# HG changeset patch
+# Parent 20ee3847558596c8dbe1e6af0eaa76f2ee37b05d
+
+diff --git a/drivers/serial/Makefile b/drivers/serial/Makefile
+--- a/drivers/serial/Makefile
++++ b/drivers/serial/Makefile
+@@ -31,6 +31,7 @@ COBJS-$(CONFIG_ARM_DCC) += arm_dcc.o
+ COBJS-$(CONFIG_AT91RM9200_USART) += at91rm9200_usart.o
+ COBJS-$(CONFIG_ATMEL_USART) += atmel_usart.o
+ COBJS-$(CONFIG_LANTIQ_UART) += lq_asc.o
++COBJS-$(CONFIG_DRIVER_VBG400) += lq_vbg400_asc.o
+ COBJS-$(CONFIG_MCFUART) += mcfuart.o
+ COBJS-$(CONFIG_NS9750_UART) += ns9750_serial.o
+ COBJS-$(CONFIG_OPENCORES_YANU) += opencores_yanu.o
+diff --git a/drivers/serial/lq_vbg400_asc.c b/drivers/serial/lq_vbg400_asc.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/serial/lq_vbg400_asc.c
+@@ -0,0 +1,237 @@
++
++#include <config.h>
++
++#if defined(CONFIG_PURPLE) || defined(CONFIG_DRIVER_VBG400)
++
++#ifdef CONFIG_PURPLE
++#define	serial_init	asc_serial_init
++#define	serial_putc	asc_serial_putc
++#define	serial_puts	asc_serial_puts
++#define	serial_getc	asc_serial_getc
++#define	serial_tstc	asc_serial_tstc
++#define	serial_setbrg	asc_serial_setbrg
++#endif
++
++#include <common.h>
++#include "lq_vbg400_asc.h"
++
++#ifdef CONFIG_PURPLE
++
++#undef ASC_FIFO_PRESENT
++#define TOUT_LOOP	100000
++
++/* Set base address for second FPI interrupt control register bank */
++#define SFPI_INTCON_BASEADDR	0xBF0F0000
++
++/* Register offset from base address */
++#define FBS_ISR		0x00000000	/* Interrupt status register */
++#define FBS_IMR		0x00000008	/* Interrupt mask register */
++#define FBS_IDIS	0x00000010	/* Interrupt disable register */
++
++/* Interrupt status register bits */
++#define FBS_ISR_AT	0x00000040	/* ASC transmit interrupt */
++#define FBS_ISR_AR 	0x00000020	/* ASC receive interrupt */
++#define FBS_ISR_AE	0x00000010	/* ASC error interrupt */
++#define FBS_ISR_AB	0x00000008	/* ASC transmit buffer interrupt */
++#define FBS_ISR_AS      0x00000004 	/* ASC start of autobaud detection interrupt */
++#define FBS_ISR_AF	0x00000002	/* ASC end of autobaud detection interrupt */
++
++#else
++
++#define ASC_FIFO_PRESENT
++
++#endif
++
++
++#define SET_BIT(reg, mask)                  reg |= (mask)
++#define CLEAR_BIT(reg, mask)                reg &= (~mask)
++#define CLEAR_BITS(reg, mask)               CLEAR_BIT(reg, mask)
++#define SET_BITS(reg, mask)                 SET_BIT(reg, mask)
++#define SET_BITFIELD(reg, mask, off, val)   {reg &= (~mask); reg |= (val << off);}
++
++static int serial_setopt (void);
++void MT_UARTConfig(unsigned long,MT_UART_CNFG *);
++
++extern void ReadModWriteReg(unsigned long , unsigned long , unsigned long, unsigned long );
++extern void WriteReg(unsigned long , unsigned long , unsigned long ) ;
++extern unsigned long ReadReg (unsigned long , unsigned long );
++
++/* pointer to ASC register base address */
++static UART_CONTROL asUartControl ;
++
++void serial_setbrg (void) {}
++#endif
++unsigned long UART_Clk_Rate[] = 
++{
++	115200,
++	38400,
++	19200,
++	9600 
++};
++
++
++/******************************************************************************
++*
++* serial_init - initialize a tty channel
++*
++* This routine initializes the number of data bits, parity
++* and set the selected baud rate. Interrupts are disabled.
++* Set the modem control signals if the option is selected.
++*
++* RETURNS: N/A
++*/
++int serial_init (void)
++{
++	MT_UART_CNFG UartConfig;
++
++  	/* Set water level for RX and TX */
++  	UartConfig.UartTxWaterLevel=0;
++  	UartConfig.UartRxWaterLevel=7; /* 4 is default on the register*/
++
++  	/* Set parity Rx and TX */
++  	UartConfig.UartTxParity=UART_PARITY_NONE;
++  	UartConfig.UartRxParity=UART_PARITY_NONE;
++
++  	/* Set stop bits Rx and TX */
++  	UartConfig.UartTxStopBits=UART_STOP_ONEBIT;
++  	UartConfig.UartRxStopBits=UART_STOP_ONEBIT;
++
++  	/* Set ouput logic */
++  	UartConfig.UartRxLogic =UART_SIGNAL_NO_INVERT;
++  	UartConfig.UartTxLogic =UART_SIGNAL_NO_INVERT;
++
++  	/* Set the baud rate */
++  	UartConfig.UartRate= (SYS_CLOCK_RATE/(UART_BAUD_RATIO_DIV*UART_Clk_Rate[UART_BAUD115200/*UART_BAUD38400*/])) - 1;        
++
++
++  	UartConfig.UartTxOutEnable=UART_TX_OUT_ENABLE_YES;
++
++  	/* Set idle duration to 10 times of one byte duration */
++  	UartConfig.UartRxIdle=(8+1)*10 ;//10*(8+1+2+1);
++
++
++  	/* On fisrt time reset Uart */
++  	UartConfig.UartReset=UART_RESET_YES;
++
++  	/* Enable clock to the UART */
++  	UartConfig.UartClockOnOff=UART_CLOCK_ON;
++
++  	UartConfig.UartLoopBack=UART_LOOPBACK_OFF;
++
++  	/* Enable Uart interrupt to the v186 */
++  //	UartConfig.UartEnableHostIntrpt= UART_HOST_INTRPT_ENABLE;
++
++  	/* Select Uart events to cause interrupt to the host*/
++  	UartConfig.Status.UartOverRunIntrpt 		= UART_DISABLE_INTRPT; 
++  	UartConfig.Status.UartFramingIntrpt 		= UART_DISABLE_INTRPT; //UART_DISABLE_INTRPT;
++  	UartConfig.Status.UartParityIntrpt  		= UART_DISABLE_INTRPT; 
++  	UartConfig.Status.UartRXFIFOCollapseIntrpt 	= UART_DISABLE_INTRPT; //UART_DISABLE_INTRPT;
++  	UartConfig.Status.UartTxFIFOCollapseIntrpt 	= UART_DISABLE_INTRPT; //UART_DISABLE_INTRPT;
++  	UartConfig.Status.UartRxWaterLevelIntrpt   	= UART_DISABLE_INTRPT;
++  	UartConfig.Status.UartTxWaterLevelIntrpt   	= UART_DISABLE_INTRPT;
++  	UartConfig.Status.UartIdleIntrpt           	= UART_DISABLE_INTRPT;
++
++	MT_UARTConfig(0 , &UartConfig);
++
++	UART_CONTROL *psUart = &asUartControl;
++
++
++    	psUart->pu8TxHead = psUart->pu8TxTail = &psUart->au8TxBuffer[0];
++    	psUart->boTxBusy = 0;    /* FALSE */
++
++    	/* OK, we're ready to go */
++serial_puts("serial_init finished :-)\n");
++
++    	return 0;
++}
++
++/**************************************************************
++  *
++  * Function Name:  MT_UARTConfig 
++  * Description:   config  parameter of UART
++  * Input Parameters:  none
++  * Return Values: none
++  *
++  *************************************************************/
++
++void MT_UARTConfig(unsigned long u32Port, MT_UART_CNFG *UartCnfg)
++{
++
++	unsigned long temp;
++
++  	/*============ Set Baud rate ======================================== */	
++	temp = (SYS_CLOCK_RATE/(UART_BAUD_RATIO_DIV*UART_Clk_Rate[UART_BAUD115200/*UART_BAUD38400*/])) - 1; //app 13
++	WriteReg(UART_BASE,REG_UART_CLOCK_DIVISION_RATIO, temp);
++
++	/* Write to REG_UART_CONTROL  output enable and configure Serial to be connected to MPU  (Mux) */  	
++	temp = REG_UART_CONTROL_ENABLE_BIT | REG_UART_CONTROL_MUX_MPU_BIT;
++  	WriteReg(UART_BASE ,REG_UART_CONTROL,temp);	
++
++  	 /*============ Set TX AND RX WATER_ to 0x21 rec= 1 tx = 1 ================ */
++	temp = 0x21;
++	WriteReg(UART_BASE,REG_UART_RX_FIFO_WATER_LEVEL,temp);	
++
++	/* Enable clocks: 0-rx, 1-rx fifo, 2-tx, 3-tx fifo, 4-cdiv */
++	temp = UART_CLK_ENABLE_REG_VAL;
++	ReadModWriteReg(UART_BASE, 0/*?*/, temp, UART_CLK_ENABLE_REG_MASK);
++	/*============ Enable interrupts ==================================== */
++	temp=0x60;
++	WriteReg(UART_BASE ,REG_UART_INT,temp);	
++  	
++  	
++  	/*============ Set RX Idle ==================================== */
++  	temp=0;
++   	WriteReg(UART_BASE ,REG_UART_RX_IDLE_COUNTER,temp);
++}
++
++void serial_putc (const char c)
++{
++	if (c == '\n') serial_putc ('\r');
++
++	while (ReadReg(UART_BASE , 0x2c) & MCOR_UART_TX_NUM_MASK)
++		__udelay (10) ;
++
++	WriteReg(UART_BASE ,WR_ADDR, (volatile unsigned long ) c);
++}
++		
++	
++void serial_puts (const char *s)
++{
++    while (*s)
++    {
++	serial_putc (*s++);
++    }
++}
++
++/* Fifo for console: use exactly 256 bytes so that unsigned char data type will handle the wraparounds automatically */
++char ascFifo[0xFF];
++unsigned char inFifo = 0;
++unsigned char outFifo = 0;
++
++int serial_getc (void)
++{
++    while ((!serial_tstc()) && (inFifo==outFifo));
++    /*there is data in hw bufer*/
++    while (serial_tstc()) { /*do as long as data in buffer*/
++        ascFifo[inFifo] = ReadReg(UART_BASE , 0x10) & 0x000000ff;
++        inFifo++;
++    }
++    /*read data from buffer*/
++    return ascFifo[outFifo++];
++
++}
++
++inline int  serial_tstc (void)
++{
++/* TODO ? 
++   if interrupts enabled, need to test also the SW buffer (diff prev to current).
++   because, for new chars comming in there may be interrpt (crossing the level)
++   and RX fifo would be 0 on test.
++*/
++#define OK_FOR_READ	1
++#define LOOP		0
++#define UART_MCOR_RD_RX_BYTES ((unsigned char )((ReadReg (UART_BASE , REG_UART_BYTES_IN_RX_FIFO) & MCOR_UART_RX_NUM_MASK)))
++
++	return UART_MCOR_RD_RX_BYTES;
++}
++
+diff --git a/drivers/serial/lq_vbg400_asc.h b/drivers/serial/lq_vbg400_asc.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/serial/lq_vbg400_asc.h
+@@ -0,0 +1,280 @@
++
++#ifndef __VBG400UART
++#define __VBG400UART
++
++typedef struct {
++
++           unsigned UartOverRunIntrpt:1;
++           unsigned UartFramingIntrpt:1;
++           unsigned UartParityIntrpt:1;
++           unsigned UartRXFIFOCollapseIntrpt:1;
++           unsigned UartTxFIFOCollapseIntrpt:1;
++           unsigned UartRxWaterLevelIntrpt:1;
++           unsigned UartTxWaterLevelIntrpt:1;
++           unsigned UartIdleIntrpt:1;
++
++}MT_UART_STATUS;
++
++typedef struct {
++           unsigned UartTxOutEnable:1;
++           unsigned UartRxParity:2;
++           unsigned UartTxParity:2;
++           unsigned UartTxStopBits:1;
++           unsigned UartRxStopBits:1;
++           unsigned UartTxLogic:1;
++           unsigned UartRxLogic:1;
++           unsigned UartLoopBack: 1;
++
++           unsigned char UartRxIdle;
++
++           unsigned UartTxWaterLevel:4;
++           unsigned UartRxWaterLevel:4;
++
++
++           MT_UART_STATUS Status;
++
++           unsigned long UartRate;
++
++           unsigned UartReset:1;
++           unsigned UartClockOnOff:1;
++           unsigned UartEnableHostIntrpt:1;
++
++           unsigned reserve1:5;
++
++           unsigned reserve2:8;        /* Align to word boundry */
++} MT_UART_CNFG;
++
++
++
++/*=============== Parity =======================*/
++#define UART_PARITY_NONE           0           
++#define UART_PARITY_ODD            1
++#define UART_PARITY_EVEN		   3
++#define UART_PARITY_DEFAULT        UART_PARITY_NONE
++#define UART_PARITY_RX_SHIFT	   1 
++#define UART_PARITY_TX_SHIFT	   3
++	   
++/*=============== Num of stop bits ==============*/
++#define UART_STOP_ONEBIT           0
++#define UART_STOP_TWOBIT           1
++#define UART_STOP_DEFAULT          UART_STOP_ONEBIT
++#define	UART_STOP_BIT_RX_SHIFT	   9
++#define	UART_STOP_BIT_TX_SHIFT	   10
++/*=============== Invert output siganl============*/
++#define UART_SIGNAL_NO_INVERT      0
++#define UART_SIGNAL_INVERT         1
++#define UART_SIGNAL_DEFAULT        UART_SIGNAL_NO_INVERT
++
++/*=============== Loop back on off ============*/
++#define UART_LOOPBACK_ON           1
++#define UART_LOOPBACK_OFF          0
++#define UART_LOOPBACK_SHIFT		   11
++/*=============== Reset uart ==================*/
++#define UART_RESET_YES             1
++#define UART_RESET_NO              0
++
++/*=============== Enable disable uart cloocking */
++#define UART_CLOCK_ON              1
++#define UART_CLOCK_OFF             0
++
++/*=============== Enable/Disable host interrupts from uart */
++#define UART_HOST_INTRPT_ENABLE    0
++#define UART_HOST_INTRPT_DISABLE   1
++
++/* channel operating modes */
++#define	ASCOPT_CSIZE	0x00000003
++#define	ASCOPT_CS7	0x00000001
++#define UART_TX_OUT_ENABLE_NO      0
++#define UART_TX_OUT_ENABLE_YES     1
++#define UART_TX_OUT_ENABLE_SHIFT   0
++
++/*=============== Baud rate ====================*/
++#define UART_RATE_9600             9600UL
++#define UART_RATE_19200            19200UL
++#define UART_RATE_38400            38400UL
++#define UART_RATE_57600            57600UL
++#define UART_RATE_115200           115200UL
++#define UART_RATE_MAX              UART_RATE_115200
++#define UART_RATE_DEFAULT          UART_RATE_9600
++
++/* The ratio between the trunk clock after the UART divider
++   and the uart baud rate */
++/*#define UART_SYS_CLK            240000000 */    /* Clock rate is set according to platform type (FPGA or chip) */
++#define UART_BAUD_RATIO_DIV     16
++
++typedef enum  _UART_BAUD{
++   UART_BAUD115200,
++   UART_BAUD38400,
++   UART_BAUD19200,
++   UART_BAUD9600
++} _UART_BAUD;
++
++#define MT_UARTRXIDLE ()
++
++#define UART_ENABLE_INTRPT   1
++#define UART_DISABLE_INTRPT  0
++
++#define UART_BASE	 			0xa7000000
++
++#define REG_UART_CONTROL  			0x20
++#define REG_UART_CLOCK_DIVISION_RATIO 		0x14
++#define REG_UART_RX_FIFO_WATER_LEVEL 		0x18
++#define REG_UART_INT 				0x1c
++#define REG_UART_RX_IDLE_COUNTER 		0x28
++#define ENET_UART_WAITING_MASK 			0
++#define WR_ADDR					0x0c
++
++#define REG_UART_CONTROL_ENABLE_BIT  		0x1
++#define REG_UART_CONTROL_MUX_MPU_BIT  		0x100
++
++
++/* If debug output is defined, it uses the USART port 1 */
++#define UART_TX_BUFFER_SIZE    /*512*/ /*1536*/ 4096
++
++typedef struct UART_CONTROL
++{
++    unsigned char       *pu8TxHead, *pu8TxTail;
++    unsigned char       au8TxBuffer[ UART_TX_BUFFER_SIZE];
++    char       		au8RxBuff[ENET_UART_WAITING_MASK+1];
++    int        		boTxBusy;
++    unsigned char       u8PaddUnusedByte1;
++    unsigned short      u16Stream; /* Stream this port is used for */
++} UART_CONTROL;
++
++
++#define MT_UART_MCOR_RX_DATA_READY \
++        ( (ReadReg (UART_BASE , 0x1c) & UART_INT_MCOR_IDLE) | \
++          (ReadReg (UART_BASE , 0x1c) & MT_UART_MCOR_RX_WATER_LEVEL) )
++
++
++#define REG_UART_WRITE_FIFO_WATER_LEVEL_IRQ                     0x1c
++#define UART_INT_MCOR_IDLE                                      0x00008000
++#define MT_UART_MCOR_RX_WATER_LEVEL                             0x00002000
++#define REG_UART_BYTES_IN_RX_FIFO                               0x2c
++#define MCOR_UART_RX_NUM_MASK                                   0x1F
++
++#define MCOR_UART_TX_NUM_MASK                                   0x000003e0
++
++#define UART_CLK_ENABLE_REG_VAL                                 0x0000001f
++#define UART_CLK_ENABLE_REG_MASK                                0x0000001f
++
++
++
++
++#define	ASCOPT_CS8	0x00000002
++#define	ASCOPT_PARENB	0x00000004
++#define	ASCOPT_STOPB	0x00000008
++#define	ASCOPT_PARODD	0x00000010
++#define	ASCOPT_CREAD	0x00000020
++
++
++
++#define ASC_OPTIONS		(ASCOPT_CREAD | ASCOPT_CS8)
++
++/* ASC input select (0 or 1) */
++#define CONSOLE_TTY	0
++
++/* use fractional divider for baudrate settings */
++
++/* interrupt lines masks for the ASC device interrupts*/
++/* change these macroses if it's necessary */
++
++/* CLC register's bits and bitfields */
++#define ASCCLC_DISR        0x00000001
++#define ASCCLC_DISS        0x00000002
++#define ASCCLC_RMCMASK     0x0000FF00
++#define ASCCLC_RMCOFFSET   8
++
++/* CON register's bits and bitfields */
++#define ASCCON_MODEMASK 0x0007
++    #define ASCCON_M_8SYNC          0x0
++    #define ASCCON_M_8ASYNC         0x1
++    #define ASCCON_M_8IRDAASYNC     0x2
++    #define ASCCON_M_7ASYNCPAR      0x3
++    #define ASCCON_M_9ASYNC         0x4
++    #define ASCCON_M_8WAKEUPASYNC   0x5
++    #define ASCCON_M_8ASYNCPAR      0x7
++#define ASCCON_STP      0x0008
++#define ASCCON_REN      0x0010
++#define ASCCON_PEN      0x0020
++#define ASCCON_FEN      0x0040
++#define ASCCON_OEN      0x0080
++#define ASCCON_PE       0x0100
++#define ASCCON_FE       0x0200
++#define ASCCON_OE       0x0400
++#define ASCCON_FDE      0x0800
++#define ASCCON_ODD      0x1000
++#define ASCCON_BRS      0x2000
++#define ASCCON_LB       0x4000
++#define ASCCON_R        0x8000
++
++/* WHBCON register's bits and bitfields */
++#define ASCWHBCON_CLRREN    0x0010
++#define ASCWHBCON_SETREN    0x0020
++#define ASCWHBCON_CLRPE     0x0100
++#define ASCWHBCON_CLRFE     0x0200
++#define ASCWHBCON_CLROE     0x0400
++#define ASCWHBCON_SETPE     0x0800
++#define ASCWHBCON_SETFE     0x1000
++#define ASCWHBCON_SETOE     0x2000
++
++/* ABCON register's bits and bitfields */
++#define ASCABCON_ABEN       0x0001
++#define ASCABCON_AUREN      0x0002
++#define ASCABCON_ABSTEN     0x0004
++#define ASCABCON_ABDETEN    0x0008
++#define ASCABCON_FCDETEN    0x0010
++#define ASCABCON_EMMASK     0x0300
++    #define ASCABCON_EMOFF          8
++	#define ASCABCON_EM_DISAB       0x0
++	#define ASCABCON_EM_DURAB       0x1
++	#define ASCABCON_EM_ALWAYS      0x2
++#define ASCABCON_TXINV      0x0400
++#define ASCABCON_RXINV      0x0800
++
++/* FDV register mask, offset and bitfields*/
++#define ASCFDV_VALUE_MASK     0x000001FF
++
++/* WHBABCON register's bits and bitfields */
++#define ASCWHBABCON_SETABEN     0x0001
++#define ASCWHBABCON_CLRABEN     0x0002
++
++/* ABSTAT register's bits and bitfields */
++#define ASCABSTAT_FCSDET    0x0001
++#define ASCABSTAT_FCCDET    0x0002
++#define ASCABSTAT_SCSDET    0x0004
++#define ASCABSTAT_SCCDET    0x0008
++#define ASCABSTAT_DETWAIT   0x0010
++
++/* WHBABSTAT register's bits and bitfields */
++#define ASCWHBABSTAT_CLRFCSDET  0x0001
++#define ASCWHBABSTAT_SETFCSDET  0x0002
++#define ASCWHBABSTAT_CLRFCCDET  0x0004
++#define ASCWHBABSTAT_SETFCCDET  0x0008
++#define ASCWHBABSTAT_CLRSCSDET  0x0010
++#define ASCWHBABSTAT_SETSCSDET  0x0020
++#define ASCWHBABSTAT_SETSCCDET  0x0040
++#define ASCWHBABSTAT_CLRSCCDET  0x0080
++#define ASCWHBABSTAT_CLRDETWAIT 0x0100
++#define ASCWHBABSTAT_SETDETWAIT 0x0200
++
++/* TXFCON register's bits and bitfields */
++#define ASCTXFCON_TXFEN         0x0001
++#define ASCTXFCON_TXFFLU        0x0002
++#define ASCTXFCON_TXTMEN        0x0004
++#define ASCTXFCON_TXFITLMASK    0x3F00
++#define ASCTXFCON_TXFITLOFF     8
++
++/* RXFCON register's bits and bitfields */
++#define ASCRXFCON_RXFEN         0x0001
++#define ASCRXFCON_RXFFLU        0x0002
++#define ASCRXFCON_RXTMEN        0x0004
++#define ASCRXFCON_RXFITLMASK    0x3F00
++#define ASCRXFCON_RXFITLOFF     8
++
++/* FSTAT register's bits and bitfields */
++#define ASCFSTAT_RXFFLMASK      0x003F
++#define ASCFSTAT_TXFFLMASK      0x3F00
++#define ASCFSTAT_TXFFLOFF       8
++
++#endif /* __VBG400UART */

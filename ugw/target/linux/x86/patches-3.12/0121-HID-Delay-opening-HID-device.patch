@@ -1,0 +1,139 @@
+From b0ee7edca42b748e1594e5a79f8a6a6bb2f957c3 Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Wed, 18 Sep 2013 18:13:00 +0100
+Subject: [PATCH 121/441] HID: Delay opening HID device
+
+Don't call hid_open_device till there is actually an user. This saves
+power by not opening underlying transport for HID. Also close device
+if there are no active mfd client using HID sensor hub.
+
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 1df3a401154add23826d714c808204633b3b1c31)
+---
+ drivers/hid/hid-sensor-hub.c   | 45 ++++++++++++++++++++++++++++++++----------
+ include/linux/hid-sensor-hub.h | 18 +++++++++++++++++
+ 2 files changed, 53 insertions(+), 10 deletions(-)
+
+--- a/drivers/hid/hid-sensor-hub.c
++++ b/drivers/hid/hid-sensor-hub.c
+@@ -467,6 +467,39 @@ static int sensor_hub_raw_event(struct h
+ 	return 1;
+ }
+ 
++int sensor_hub_device_open(struct hid_sensor_hub_device *hsdev)
++{
++	int ret = 0;
++	struct sensor_hub_data *data =  hid_get_drvdata(hsdev->hdev);
++
++	mutex_lock(&data->mutex);
++	if (!hsdev->ref_cnt) {
++		ret = hid_hw_open(hsdev->hdev);
++		if (ret) {
++			hid_err(hsdev->hdev, "failed to open hid device\n");
++			mutex_unlock(&data->mutex);
++			return ret;
++		}
++	}
++	hsdev->ref_cnt++;
++	mutex_unlock(&data->mutex);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sensor_hub_device_open);
++
++void sensor_hub_device_close(struct hid_sensor_hub_device *hsdev)
++{
++	struct sensor_hub_data *data =  hid_get_drvdata(hsdev->hdev);
++
++	mutex_lock(&data->mutex);
++	hsdev->ref_cnt--;
++	if (!hsdev->ref_cnt)
++		hid_hw_close(hsdev->hdev);
++	mutex_unlock(&data->mutex);
++}
++EXPORT_SYMBOL_GPL(sensor_hub_device_close);
++
+ static int sensor_hub_probe(struct hid_device *hdev,
+ 				const struct hid_device_id *id)
+ {
+@@ -508,12 +541,6 @@ static int sensor_hub_probe(struct hid_d
+ 		hid_err(hdev, "hw start failed\n");
+ 		return ret;
+ 	}
+-	ret = hid_hw_open(hdev);
+-	if (ret) {
+-		hid_err(hdev, "failed to open input interrupt pipe\n");
+-		goto err_stop_hw;
+-	}
+-
+ 	INIT_LIST_HEAD(&sd->dyn_callback_list);
+ 	sd->hid_sensor_client_cnt = 0;
+ 	report_enum = &hdev->report_enum[HID_INPUT_REPORT];
+@@ -522,7 +549,7 @@ static int sensor_hub_probe(struct hid_d
+ 	if (dev_cnt > HID_MAX_PHY_DEVICES) {
+ 		hid_err(hdev, "Invalid Physical device count\n");
+ 		ret = -EINVAL;
+-		goto err_close;
++		goto err_stop_hw;
+ 	}
+ 	sd->hid_sensor_hub_client_devs = kzalloc(dev_cnt *
+ 						sizeof(struct mfd_cell),
+@@ -530,7 +557,7 @@ static int sensor_hub_probe(struct hid_d
+ 	if (sd->hid_sensor_hub_client_devs == NULL) {
+ 		hid_err(hdev, "Failed to allocate memory for mfd cells\n");
+ 			ret = -ENOMEM;
+-			goto err_close;
++			goto err_stop_hw;
+ 	}
+ 	list_for_each_entry(report, &report_enum->report_list, list) {
+ 		hid_dbg(hdev, "Report id:%x\n", report->id);
+@@ -567,8 +594,6 @@ err_free_names:
+ 	for (i = 0; i < sd->hid_sensor_client_cnt ; ++i)
+ 		kfree(sd->hid_sensor_hub_client_devs[i].name);
+ 	kfree(sd->hid_sensor_hub_client_devs);
+-err_close:
+-	hid_hw_close(hdev);
+ err_stop_hw:
+ 	hid_hw_stop(hdev);
+ 
+--- a/include/linux/hid-sensor-hub.h
++++ b/include/linux/hid-sensor-hub.h
+@@ -49,11 +49,13 @@ struct hid_sensor_hub_attribute_info {
+  * @hdev:		Stores the hid instance.
+  * @vendor_id:		Vendor id of hub device.
+  * @product_id:		Product id of hub device.
++ * @ref_cnt:		Number of MFD clients have opened this device
+  */
+ struct hid_sensor_hub_device {
+ 	struct hid_device *hdev;
+ 	u32 vendor_id;
+ 	u32 product_id;
++	int ref_cnt;
+ };
+ 
+ /**
+@@ -76,6 +78,22 @@ struct hid_sensor_hub_callbacks {
+ 			 void *priv);
+ };
+ 
++/**
++* sensor_hub_device_open() - Open hub device
++* @hsdev:	Hub device instance.
++*
++* Used to open hid device for sensor hub.
++*/
++int sensor_hub_device_open(struct hid_sensor_hub_device *hsdev);
++
++/**
++* sensor_hub_device_clode() - Close hub device
++* @hsdev:	Hub device instance.
++*
++* Used to clode hid device for sensor hub.
++*/
++void sensor_hub_device_close(struct hid_sensor_hub_device *hsdev);
++
+ /* Registration functions */
+ 
+ /**

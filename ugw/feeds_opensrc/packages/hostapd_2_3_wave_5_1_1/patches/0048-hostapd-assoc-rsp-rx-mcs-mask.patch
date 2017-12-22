@@ -1,0 +1,168 @@
+From 347c084c6d21dbe8ccca364e03b21b88e6c3f6dc Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Wed, 26 Oct 2016 15:54:39 +0300
+Subject: [PATCH 48/69] hostapd: assoc rsp rx mcs mask
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ hostapd/config_file.c  |  2 ++
+ src/ap/ap_config.c     |  1 +
+ src/ap/ap_config.h     |  1 +
+ src/ap/ieee802_11.c    |  7 ++++-
+ src/ap/ieee802_11.h    |  2 ++
+ src/ap/ieee802_11_ht.c | 71 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 7e8d745..57dc5a2 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3118,6 +3118,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		conf->require_ht = atoi(pos);
+ 	} else if (os_strcmp(buf, "obss_interval") == 0) {
+ 		conf->obss_interval = atoi(pos);
++	} else if (os_strcmp(buf, "assoc_rsp_rx_mcs_mask") == 0) {
++		conf->assoc_rsp_rx_mcs_mask = atoi(pos);
+ 	} else if  (os_strcmp(buf, "scan_passive_dwell") == 0) {
+ 		conf->scan_passive_dwell = atoi(pos);
+ 	} else if  (os_strcmp(buf, "scan_active_dwell") == 0) {
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 12a6158..31183d1 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -191,6 +191,7 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->ap_table_max_size = 255;
+ 	conf->ap_table_expiration_time = 60;
+ 	conf->track_sta_max_age = 180;
++	conf->assoc_rsp_rx_mcs_mask = 1;
+ 
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	conf->ignore_probe_probability = 0.0;
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 376bb45..8bfd084 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -689,6 +689,7 @@ struct hostapd_config {
+ 	u8 vht_oper_chwidth;
+ 	u8 vht_oper_centr_freq_seg0_idx;
+ 	u8 vht_oper_centr_freq_seg1_idx;
++	int assoc_rsp_rx_mcs_mask;
+ 
+ 	/* Use driver-generated interface addresses when adding multiple BSSs */
+ 	u8 use_driver_iface_addr;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 59460ca..fbbfe32 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -1988,7 +1988,12 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ #endif /* CONFIG_IEEE80211W */
+ 
+ #ifdef CONFIG_IEEE80211N
+-	p = hostapd_eid_ht_capabilities(hapd, p);
++	/* IOP: mask out or not RX MCS bits in HT caps for ASSOC RSP */
++	if (hapd->iconf->assoc_rsp_rx_mcs_mask) {
++		p = hostapd_eid_ht_capabilities_assoc_resp(hapd, p, sta);
++	} else {
++		p = hostapd_eid_ht_capabilities(hapd, p);
++	}
+ 	p = hostapd_eid_ht_operation(hapd, p);
+ #endif /* CONFIG_IEEE80211N */
+ 
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 6f43818..b50a902 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -51,6 +51,8 @@ u8 * hostapd_eid_qos_map_set(struct hostapd_data *hapd, u8 *eid);
+ u8 * hostapd_eid_supp_rates(struct hostapd_data *hapd, u8 *eid);
+ u8 * hostapd_eid_ext_supp_rates(struct hostapd_data *hapd, u8 *eid);
+ u8 * hostapd_eid_ht_capabilities(struct hostapd_data *hapd, u8 *eid);
++u8 * hostapd_eid_ht_capabilities_assoc_resp(struct hostapd_data *hapd, u8 *eid,
++     struct sta_info *sta);
+ u8 * hostapd_eid_ht_operation(struct hostapd_data *hapd, u8 *eid);
+ u8 * hostapd_eid_secondary_channel(struct hostapd_data *hapd, u8 *eid);
+ u8 * hostapd_eid_vht_capabilities(struct hostapd_data *hapd, u8 *eid, u32 nsts);
+diff --git a/src/ap/ieee802_11_ht.c b/src/ap/ieee802_11_ht.c
+index 0a852ee..3df8a18 100644
+--- a/src/ap/ieee802_11_ht.c
++++ b/src/ap/ieee802_11_ht.c
+@@ -21,6 +21,77 @@
+ #include "ap_drv_ops.h"
+ 
+ 
++/*    special case for ASSOC RESP:
++      mask out RX MCS Set as a workoaround for some STA vendors*/
++u8 * hostapd_eid_ht_capabilities_assoc_resp(struct hostapd_data *hapd, u8 *eid,
++     struct sta_info *sta)
++{
++  struct ieee80211_ht_capabilities *cap;
++  int i;
++  u8 *pos = eid;
++
++  if (!hapd->iconf->ieee80211n || !hapd->iface->current_mode ||
++    hapd->conf->disable_11n)
++    return eid;
++
++  *pos++ = WLAN_EID_HT_CAP;
++  *pos++ = sizeof(*cap);
++
++  cap = (struct ieee80211_ht_capabilities *) pos;
++  os_memset(cap, 0, sizeof(*cap));
++  cap->ht_capabilities_info = host_to_le16(hapd->iconf->ht_capab);
++  cap->a_mpdu_params = hapd->iface->current_mode->a_mpdu_params;
++
++  if (sta->ht_capabilities) {
++    for (i = 0; i < sizeof(cap->supported_mcs_set); i++) {
++        cap->supported_mcs_set[i] =
++          hapd->iface->current_mode->mcs_set[i] & sta->ht_capabilities->supported_mcs_set[i];
++    }
++  }
++  else {
++      os_memcpy(cap->supported_mcs_set, hapd->iface->current_mode->mcs_set, 16);
++  }
++
++  /* tx_bf_capability_info */
++  cap->tx_bf_capability_info = host_to_le32(hapd->iconf->ht_tx_bf_capab);
++
++  /* TODO: ht_extended_capabilities (now fully disabled) */
++  /* TODO: asel_capabilities (now fully disabled) */
++
++  pos += sizeof(*cap);
++
++  if (hapd->iconf->obss_interval) {
++    struct ieee80211_obss_scan_parameters *scan_params;
++
++    *pos++ = WLAN_EID_OVERLAPPING_BSS_SCAN_PARAMS;
++    *pos++ = sizeof(*scan_params);
++
++    scan_params = (struct ieee80211_obss_scan_parameters *) pos;
++    os_memset(scan_params, 0, sizeof(*scan_params));
++    scan_params->width_trigger_scan_interval =
++      host_to_le16(hapd->iconf->obss_interval);
++
++    /* Fill in default values for remaining parameters
++    * (IEEE Std 802.11-2012, 8.4.2.61 and MIB defval) */
++    scan_params->scan_passive_dwell =
++      host_to_le16(hapd->iconf->scan_passive_dwell);
++    scan_params->scan_active_dwell =
++      host_to_le16(hapd->iconf->scan_active_dwell);
++    scan_params->scan_passive_total_per_channel =
++      host_to_le16(hapd->iconf->scan_passive_total_per_channel);
++    scan_params->scan_active_total_per_channel =
++      host_to_le16(hapd->iconf->scan_active_total_per_channel);
++    scan_params->channel_transition_delay_factor =
++      host_to_le16(hapd->iconf->channel_transition_delay_factor);
++    scan_params->scan_activity_threshold =
++      host_to_le16(hapd->iconf->scan_activity_threshold);
++
++    pos += sizeof(*scan_params);
++  }
++
++  return pos;
++}
++
+ u8 * hostapd_eid_ht_capabilities(struct hostapd_data *hapd, u8 *eid)
+ {
+ 	struct ieee80211_ht_capabilities *cap;
+-- 
+2.7.4
+

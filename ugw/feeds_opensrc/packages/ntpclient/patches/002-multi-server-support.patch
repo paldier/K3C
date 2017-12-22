@@ -1,0 +1,173 @@
+--- ntpclient-2007.orig/ntpclient.c	2015-04-10 15:38:04.240409000 +0530
++++ ntpclient-2007/ntpclient.c	2015-04-10 15:35:59.959218000 +0530
+@@ -82,12 +82,14 @@
+ typedef uint32_t u32;  /* universal for C99 */
+ /* typedef u_int32_t u32;   older Linux installs? */
+ 
++
+ /* XXX fixme - non-automatic build configuration */
+ #ifdef __linux__
+ #include <sys/utsname.h>
+ #include <sys/time.h>
+ #include <sys/timex.h>
+ #else
++#define main ntpclient
+ extern struct hostent *gethostbyname(const char *name);
+ extern int h_errno;
+ #define herror(hostname) \
+@@ -117,7 +119,7 @@
+  * Should somehow be the same as 1000000 * x / 65536
+  */
+ #define sec2u(x) ( (x) * 15.2587890625 )
+-
++static int success = 0;
+ struct ntptime {
+ 	unsigned int coarse;
+ 	unsigned int fine;
+@@ -439,20 +441,24 @@
+ 	return 1;
+ }
+ 
+-static void stuff_net_addr(struct in_addr *p, char *hostname)
++//static void stuff_net_addr(struct in_addr *p, char *hostname)
++static int stuff_net_addr(struct in_addr *p, char *hostname)
+ {
+ 	struct hostent *ntpserver;
+ 	ntpserver=gethostbyname(hostname);
+ 	if (ntpserver == NULL) {
+ 		herror(hostname);
+-		exit(1);
++		//exit(1);
++		return -1;
+ 	}
+ 	if (ntpserver->h_length != 4) {
+ 		/* IPv4 only, until I get a chance to test IPv6 */
+ 		fprintf(stderr,"oops %d\n",ntpserver->h_length);
+-		exit(1);
++		//exit(1);
++		return -1;
+ 	}
+ 	memcpy(&(p->s_addr),ntpserver->h_addr_list[0],4);
++	return 0;
+ }
+ 
+ static void setup_receive(int usd, unsigned int interface, short port)
+@@ -470,18 +476,21 @@
+ 	/* listen(usd,3); this isn't TCP; thanks Alexander! */
+ }
+ 
+-static void setup_transmit(int usd, char *host, short port, struct ntp_control *ntpc)
++//static void setup_transmit(int usd, char *host, short port, struct ntp_control *ntpc)
++static int setup_transmit(int usd, char *host, short port, struct ntp_control *ntpc)
+ {
+ 	struct sockaddr_in sa_dest;
+ 	memset(&sa_dest,0,sizeof sa_dest);
+ 	sa_dest.sin_family=AF_INET;
+-	stuff_net_addr(&(sa_dest.sin_addr),host);
++	//stuff_net_addr(&(sa_dest.sin_addr),host);
++	if (stuff_net_addr(&(sa_dest.sin_addr),host)) return -1;
+ 	memcpy(ntpc->serv_addr,&(sa_dest.sin_addr),4); /* XXX asumes IPv4 */
+ 	sa_dest.sin_port=htons(port);
+ 	if (connect(usd,(struct sockaddr *)&sa_dest,sizeof sa_dest)==-1)
+-		{perror("connect");exit(1);}
++		//{perror("connect");exit(1);}
++		{perror("connect"); return -1;}
++        return 0;
+ }
+-
+ static void primary_loop(int usd, struct ntp_control *ntpc)
+ {
+ 	fd_set fds;
+@@ -509,7 +518,7 @@
+ 				if (errno != EINTR) perror("select");
+ 				continue;
+ 			}
+-			if (to.tv_sec == 0) {
++			if ((to.tv_sec == 0)|| (to.tv_sec == ntpc->cycle_time)) {
+ 				if (probes_sent >= ntpc->probe_count &&
+ 					ntpc->probe_count != 0) break;
+ 				send_packet(usd,ntpc->time_of_send);
+@@ -528,6 +537,7 @@
+ 			get_packet_timestamp(usd, &udp_arrival_ntp);
+ 			if (check_source(pack_len, &sa_xmit, sa_xmit_len, ntpc)!=0) continue;
+ 			if (rfc1305print(incoming_word, &udp_arrival_ntp, ntpc, &error)!=0) continue;
++			success++;
+ 			/* udp_handle(usd,incoming,pack_len,&sa_xmit,sa_xmit_len); */
+ 		} else {
+ 			printf("Ooops.  pack_len=%d\n",pack_len);
+@@ -603,18 +613,22 @@
+ 	/* These parameters are settable from the command line
+ 	   the initializations here provide default behavior */
+ 	short int udp_local_port=0;   /* default of 0 means kernel chooses */
+-	char *hostname=NULL;          /* must be set */
++	//char *hostname=NULL;          /* must be set */
++	char *hostname[10];          /* must be set */
++	int i=0;
+ 	int initial_freq;             /* initial freq value to use */
+ 	struct ntp_control ntpc;
+ 	ntpc.live=0;
+ 	ntpc.set_clock=0;
+ 	ntpc.probe_count=0;           /* default of 0 means loop forever */
+-	ntpc.cycle_time=600;          /* seconds */
++	//ntpc.cycle_time=600;          /* seconds */
++	ntpc.cycle_time=30;          /* seconds */
+ 	ntpc.goodness=0;
+ 	ntpc.cross_check=1;
+ 
++	memset(hostname,0,sizeof(hostname));
+ 	for (;;) {
+-		c = getopt( argc, argv, "c:" DEBUG_OPTION "f:g:h:i:lp:q:" REPLAY_OPTION "stD");
++		c = getopt( argc, argv, "c:" DEBUG_OPTION "f:g:h:i:lp:q:" REPLAY_OPTION "st");
+ 		if (c == EOF) break;
+ 		switch (c) {
+ 			case 'c':
+@@ -635,7 +649,7 @@
+ 				ntpc.goodness = atoi(optarg);
+ 				break;
+ 			case 'h':
+-				hostname = optarg;
++				hostname[i++] = optarg;
+ 				break;
+ 			case 'i':
+ 				ntpc.cycle_time = atoi(optarg);
+@@ -663,10 +677,6 @@
+ 				(ntpc.cross_check)=0;
+ 				break;
+ 
+-			case 'D':
+-				daemon();
+-				break;
+-
+ 			default:
+ 				usage(argv[0]);
+ 				exit(1);
+@@ -702,17 +712,22 @@
+ 		hostname, ntpc.cycle_time, ntpc.live, udp_local_port, min_delay,
+ 		ntpc.set_clock, ntpc.cross_check );
+ 	}
+-
+-	/* Startup sequence */
+-	if ((usd=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP))==-1)
++	i=0;
++	while(hostname[i] && !success)
++	{
++		/* Startup sequence */
++		if ((usd=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP))==-1)
+ 		{perror ("socket");exit(1);}
+ 
+-	setup_receive(usd, INADDR_ANY, udp_local_port);
++		setup_receive(usd, INADDR_ANY, udp_local_port);
+ 
+-	setup_transmit(usd, hostname, NTP_PORT, &ntpc);
++		if (setup_transmit(usd, hostname[i], NTP_PORT, &ntpc)) goto cleanup;
+ 
+-	primary_loop(usd, &ntpc);
++		primary_loop(usd, &ntpc);
++cleanup:
++		close(usd);
++		i++;
++	}
+ 
+-	close(usd);
+ 	return 0;
+ }

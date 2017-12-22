@@ -1,0 +1,638 @@
+--- mini_httpd-1.19/mini_httpd.c	2011-02-10 09:51:32.204374543 -0500
++++ mini_httpd.c	2011-02-10 09:50:48.694374374 -0500
+@@ -339,7 +339,6 @@
+ static int snprintf( char* str, size_t size, const char* format, ... );
+ #endif /* NO_SNPRINTF */
+ 
+-
+ #ifdef CONFIG_FEATURE_CLI_REQUEST
+ /****************************************************************************
+  *
+@@ -354,27 +353,27 @@
+  ****************************************************************************/
+ static int openCLIServer(void)
+ {
+-  int len;
+-  int fd;
+-  struct sockaddr_un local;
+-
+-  local.sun_family = PF_UNIX;
+-  strcpy(local.sun_path, SOCK_BE_PATH);
+-  unlink(local.sun_path);
+-  len = strlen(local.sun_path) + sizeof(local.sun_family);
+-
+-  if ((fd = socket(PF_UNIX, SOCK_STREAM, 0)) >= 0) {
+-  if (bind(fd, (struct sockaddr *)&local, len) == 0) {
+-      listen(fd, 9);
+-      signal(SIGCHLD, SIG_IGN);   /* prevent zombie (defunct) processes */
+-    } else {
+-	syslog( LOG_CRIT, "cli bind");
+-    }
+-  } else {
+-	syslog( LOG_CRIT, "cli create socket");
+-  }
++	int len;
++	int fd;
++	struct sockaddr_un local;
++
++	local.sun_family = PF_UNIX;
++	strcpy(local.sun_path, SOCK_BE_PATH);
++	unlink(local.sun_path);
++	len = strlen(local.sun_path) + sizeof(local.sun_family);
++
++	if ((fd = socket(PF_UNIX, SOCK_STREAM, 0)) >= 0) {
++		if (bind(fd, (struct sockaddr *)&local, len) == 0) {
++			listen(fd, 9);
++			signal(SIGCHLD, SIG_IGN);   /* prevent zombie (defunct) processes */
++		} else {
++			syslog( LOG_CRIT, "cli bind");
++		}
++	} else {
++		syslog( LOG_CRIT, "cli create socket");
++	}
+ 
+-  return fd;
++	return fd;
+ }
+ #endif /* CONFIG_FEATURE_CLI_REQUEST */
+ 
+@@ -413,19 +412,95 @@
+  *            or clear the flag if value is 0.           Return 0 on success, or
+  *            -1 on error with errno  set. */ 
+ int set_cloexec_flag (int desc, int value)        
+-   {
+-	    int oldflags = fcntl (desc, F_GETFD, 0);
+-	    /* If reading the flags failed, return error indication now.*/
+-	    if (oldflags < 0)            
+-		    return oldflags;
+-	    /* Set just the flag we want to set. */
+-	    if (value != 0)  
+-		    oldflags |= FD_CLOEXEC;   
+-	    else
+-		    oldflags &= ~FD_CLOEXEC;
+-	    /* Store modified flag word in the descriptor. */      
+-	    return fcntl (desc, F_SETFD, oldflags);
+-   }	    
++{
++	int oldflags = fcntl (desc, F_GETFD, 0);
++	/* If reading the flags failed, return error indication now.*/
++	if (oldflags < 0)            
++		return oldflags;
++	/* Set just the flag we want to set. */
++	if (value != 0)  
++		oldflags |= FD_CLOEXEC;   
++	else
++		oldflags &= ~FD_CLOEXEC;
++	/* Store modified flag word in the descriptor. */      
++	return fcntl (desc, F_SETFD, oldflags);
++}	    
++
++static void sendHeaders(int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod,char *redirectURL)
++{
++	add_headers(s,title,extra_header,me, mt,b,mod,redirectURL );     
++	send_response(); 
++}
++	
++static const char * ltq_config_backup_fix(char *name,const char *type)
++{
++	if(!strcmp(name,"rc.conf.gz"))
++		return "binary/octet-stream";	 
++	else 
++		return type;
++}
++
++static void ltq_switch_dir( char* dir)
++{
++	/* Switch directories again if requested. */
++	if ( dir != (char*) 0 )
++	{
++		if ( chdir( dir ) < 0 )
++		{
++			syslog( LOG_CRIT, "%s chdir - %m",dir );
++			perror( "data_cir/cli_dir chdir" );
++			exit( 1 );
++		}
++	}
++}
++
++static void ltq_dynamic_handling(void)
++{
++	char *error;
++        int i;
++  	dlHandle = dlopen (IFX_LIB, RTLD_LAZY);
++	if (!dlHandle)
++	{
++		fprintf (stderr, "%s\n", dlerror());
++		fprintf(stderr,"\n  Error : dlopen fails.\n");
++		exit(0);
++	}
++
++	ifx_function_ptr = dlsym(dlHandle,"ifx_RegisterFunc");
++	if ((error = dlerror()) != NULL)
++	{
++		fprintf (stderr, "%s\n", error);
++		fprintf(stderr,"Error : dlsym fails. Cannot find ifx_RegisterFunc\n");
++	}else
++	{
++		ifx_exportedFunc.ifx_sendHeaders = (IFX_SENDHEADERS)sendHeaders;
++		ifx_exportedFunc.ifx_read = (IFX_READ)my_read;
++		ifx_exportedFunc.ifx_write = (IFX_WRITE)my_write;
++		ifx_exportedFunc.ifx_getHeaderData = (IFX_GETHEADERDATA)getHeaderData;
++		ifx_exportedFunc.dlHandle = dlHandle;
++		syslog( LOG_INFO, "Try to call ifx_RegisterFunc");
++		i = (*ifx_function_ptr)(&ifx_exportedFunc);
++		if(i < 0){
++			syslog( LOG_INFO, "###ifx_RegisterFunc returned error %d",i);
++			dlclose(dlHandle);
++			dlHandle = NULL;
++		}else{
++			ifx_psendGoform = dlsym(dlHandle,"ifx_sendGoform");
++			if ((error = dlerror()) != NULL){
++				syslog( LOG_INFO, "dlsym fails. Cannot find ifx_sendGoform");
++			}
++			ifx_psendDHTMLFile = dlsym(dlHandle,"ifx_sendDHTMLFile");
++			if ((error = dlerror()) != NULL){
++				syslog( LOG_INFO, "dlsym fails. Cannot find ifx_sendDHTMLFile");
++			}
++			ifx_AuthHandler_ptr = dlsym(dlHandle,"ifx_AuthHandler");
++			if ((error = dlerror()) != NULL)
++			{
++				syslog( LOG_INFO, "dlsym fails. Cannot find ifx_AuthHandler");
++			}
++		}
++	}
++}
+ 
+ int
+ main( int argc, char** argv )
+@@ -440,9 +515,8 @@
+     fd_set lfdset;
+     int maxfd;
+     usockaddr usa;
+-    int sz, r,i;
++    int sz, r;
+     char* cp;
+-    char *error;
+ 
+     /* Parse args. */
+     argv0 = argv[0];
+@@ -704,48 +778,7 @@
+ 	}
+ #endif /* USE_SSL */
+ 
+-  dlHandle = dlopen (IFX_LIB, RTLD_LAZY);
+-  if (!dlHandle)
+-  {
+-    fprintf (stderr, "%s\n", dlerror());
+-    fprintf(stderr,"\n  Error : dlopen fails.\n");
+-    exit(0);
+-  }
+-
+-  ifx_function_ptr = dlsym(dlHandle,"ifx_RegisterFunc");
+-  if ((error = dlerror()) != NULL)
+-  {
+-    fprintf (stderr, "%s\n", error);
+-    fprintf(stderr,"Error : dlsym fails. Cannot find ifx_RegisterFunc\n");
+-  }else
+-  {
+-    ifx_exportedFunc.ifx_sendHeaders = (IFX_SENDHEADERS)sendHeaders;
+-    ifx_exportedFunc.ifx_read = (IFX_READ)my_read;
+-    ifx_exportedFunc.ifx_write = (IFX_WRITE)my_write;
+-    ifx_exportedFunc.ifx_getHeaderData = (IFX_GETHEADERDATA)getHeaderData;
+-    ifx_exportedFunc.dlHandle = dlHandle;
+-    syslog( LOG_INFO, "Try to call ifx_RegisterFunc");
+-    i = (*ifx_function_ptr)(&ifx_exportedFunc);
+-    if(i < 0){
+-       syslog( LOG_INFO, "###ifx_RegisterFunc returned error %d",i);
+-       dlclose(dlHandle);
+-       dlHandle = NULL;
+-    }else{
+-      ifx_psendGoform = dlsym(dlHandle,"ifx_sendGoform");
+-      if ((error = dlerror()) != NULL){
+-       syslog( LOG_INFO, "dlsym fails. Cannot find ifx_sendGoform");
+-      }
+-      ifx_psendDHTMLFile = dlsym(dlHandle,"ifx_sendDHTMLFile");
+-      if ((error = dlerror()) != NULL){
+-       syslog( LOG_INFO, "dlsym fails. Cannot find ifx_sendDHTMLFile");
+-      }
+-      ifx_AuthHandler_ptr = dlsym(dlHandle,"ifx_AuthHandler");
+-      if ((error = dlerror()) != NULL)
+-      {
+-       syslog( LOG_INFO, "dlsym fails. Cannot find ifx_AuthHandler");
+-      }
+-    }
+-  }
++    ltq_dynamic_handling();
+ 
+     if ( ! debug )
+ 	{
+@@ -885,8 +918,9 @@
+ 
+ 	}
+ 
++#if 0
+     /* Switch directories again if requested. */
+-    /* if ( data_dir != (char*) 0 )
++     if ( data_dir != (char*) 0 )
+ 	{
+ 	if ( chdir( data_dir ) < 0 )
+ 	    {
+@@ -894,7 +928,9 @@
+ 	    perror( "data_dir chdir" );
+ 	    exit( 1 );
+ 	    }
+-	}*/
++	}
++#endif
++
+     /* If we're root, become someone else. */
+     if ( getuid() == 0 )
+ 	{
+@@ -977,18 +1013,13 @@
+ 	    if ( listen6_fd > maxfd )
+ 		maxfd = listen6_fd;
+ 	    }
++
+ #ifdef CONFIG_FEATURE_CLI_REQUEST
+         FD_SET(cli_server, &lfdset );
+ 	ifx_clireq = 0;
+-        if ( select((maxfd > cli_server ? maxfd : cli_server) + 1, &lfdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0) < 0)
+-	    {
+-	    if ( errno == EINTR || errno == EAGAIN )
+-		continue;	/* try again */
+-	    syslog( LOG_CRIT, "select - %m" );
+-	    perror( "select" );
+-	    exit( 1 );
+-	    }
+-#else
++        maxfd = maxfd > cli_server ? maxfd : cli_server;
++#endif
++
+ 	if ( select( maxfd + 1, &lfdset, (fd_set*) 0, (fd_set*) 0, (struct timeval*) 0 ) < 0 )
+ 	    {
+ 	    if ( errno == EINTR || errno == EAGAIN )
+@@ -997,64 +1028,27 @@
+ 	    perror( "select" );
+ 	    exit( 1 );
+ 	    }
+-#endif
+ 	/* Accept the new connection. */
+ 	sz = sizeof(usa);
+ 	if ( listen4_fd != -1 && FD_ISSET( listen4_fd, &lfdset ) )
+             {
+-            /* Switch directories again if requested. */
+-            if ( data_dir != (char*) 0 )
+-	    {
+-	       if ( chdir( data_dir ) < 0 )
+-	       {
+-	         syslog( LOG_CRIT, "data_dir chdir - %m" );
+-	         perror( "data_dir chdir" );
+-	         exit( 1 );
+-	       }
+-	    }
++            ltq_switch_dir(data_dir);
+ 	    conn_fd = accept( listen4_fd, &usa.sa, &sz );
+             }
+ 	else if ( listen6_fd != -1 && FD_ISSET( listen6_fd, &lfdset ) )
+             {
+-            /* Switch directories again if requested. */
+-            if ( data_dir != (char*) 0 )
+-	    {
+-	      if ( chdir( data_dir ) < 0 )
+-	      {
+-	        syslog( LOG_CRIT, "data_dir chdir - %m" );
+-	        perror( "data_dir chdir" );
+-	        exit( 1 );
+-	      }
+-	    }
++            ltq_switch_dir(data_dir);
+ 	    conn_fd = accept( listen6_fd, &usa.sa, &sz );
+             }
+ #ifdef CONFIG_FEATURE_CLI_REQUEST
+ 	else if ( cli_server != -1 && FD_ISSET( cli_server, &lfdset ) )
+ 	    {
+             int t;
+-	    int on;
+             struct sockaddr_un remote;		   
+ 	    t = sizeof(remote);
+-            
+-            /* Switch directories again if requested. */
+-            if ( cli_dir != (char*) 0 )
+-	    {
+-	      if ( chdir( cli_dir ) < 0 )
+-	      {
+-	      syslog( LOG_CRIT, "cli_dir chdir - %m" );
+-	      perror( "cli_dir chdir" );
+-	      exit( 1 );
+-	      }
+-	    }
++            ltq_switch_dir(cli_dir); 
+             conn_fd = accept( cli_server, (struct sockaddr *)&remote, &t );
+-            if (conn_fd < 0) 
+-            {
+-               continue;
+-            }
+             ifx_clireq = 1;
+-           /*  set the KEEPALIVE option to cull dead connections */
+-            on = 1;
+-            setsockopt(conn_fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&on, sizeof (on));
+ 	    }
+ #endif
+ 	else
+@@ -1075,9 +1069,18 @@
+ 	    perror( "accept" );
+ 	    exit( 1 );
+ 	    }
++        
++        /*Httpd macro should be put here*/ 
++        /*  set the KEEPALIVE option to cull dead connections */
++	int on = 1;
++        setsockopt(conn_fd, SOL_SOCKET, SO_KEEPALIVE, (void *)&on, sizeof (on));
+ 
+ 	/* Fork a sub-process to handle the connection. */
+-	/*r = fork();*/
++
++#if 0
++	r = fork();
++#endif
++
+         r =0;
+ 	if ( r < 0 )
+ 	    {
+@@ -1089,21 +1092,25 @@
+ 	    {
+ 	    /* Child process. */
+ 	    client_addr = usa;
+-	    /*if ( listen4_fd != -1 )
++#if 0
++	    if ( listen4_fd != -1 )
+ 		(void) close( listen4_fd );
+ 	    if ( listen6_fd != -1 )
+-        	(void) close( listen6_fd );*/
++        	(void) close( listen6_fd );
++#endif
+ 	    set_cloexec_flag (conn_fd,1);
+ 	    handle_request();
+ 	   
+             /* Always chdir to / after a chroot. */
+ 	    if ( chdir( cwd ) < 0 )
+ 	    {
+-	    syslog( LOG_CRIT, "chroot chdir - %m" );
+-	    perror( "chroot chdir" );
++	    syslog( LOG_CRIT, "cwd chdir - %m" );
++	    perror( "cwd chdir" );
+ 	    exit( 1 );
+ 	    }
+-	    /*exit( 0 );*/
++#if 0
++	    exit( 0 );
++#endif
+ 	    }
+ 	(void) close( conn_fd );
+ 	}
+@@ -1458,13 +1465,17 @@
+     for (;;)
+ 	{
+         char *buf = config->buf;
+-	/*char buf[10000];*/
++#if 0
++	char buf[10000];
++#endif
+ 	int r = my_read(conn_fd,buf,MAX_MEMORY_BUFF );
+ 	if ( r < 0 && ( errno == EINTR || errno == EAGAIN ) )
+ 	    continue;
+ 	if ( r <= 0 )
+ 	    break;
+-	/*(void) alarm( READ_TIMEOUT );*/
++#if 0
++	(void) alarm( READ_TIMEOUT );
++#endif
+ 	add_to_request( buf, r );
+ 	if ( strstr( request, "\015\012\015\012" ) != (char*) 0 ||
+ 	     strstr( request, "\012\012" ) != (char*) 0 )
+@@ -1578,7 +1589,9 @@
+ #else /* HAVE_SIGSET */
+     (void) signal( SIGALRM, handle_write_timeout );
+ #endif /* HAVE_SIGSET */
+-    /*(void) alarm( WRITE_TIMEOUT );*/
++#if 0
++    (void) alarm( WRITE_TIMEOUT );
++#endif
+ 
+     r = stat( file, &sb );
+     if ( r < 0 )
+@@ -1720,7 +1733,9 @@
+ static int
+ do_file( void )
+     {
+-    /*char buf[10000];*/
++#if 0
++    char buf[10000];
++#endif
+     char mime_encodings[500];
+     const char* mime_type;
+     char fixed_mime_type[500];
+@@ -1786,10 +1801,9 @@
+     send_response();
+     if ( method == METHOD_HEAD)
+ 	return;
+-/*  if ( sb.st_size > 0 )
++#if 0
++    if ( sb.st_size > 0 )
+ 	{
+-
+-
+ #ifdef HAVE_SENDFILE
+ 
+ #ifndef USE_SSL
+@@ -1806,7 +1820,9 @@
+    	send_via_write( fd, sb.st_size );
+ 
+ #endif
+-	}*/
++	}
++#endif
++/*Httpd macro*/
+     if ( sb.st_size > 0 )
+     {
+ 	    int count;
+@@ -1841,7 +1857,9 @@
+ do_dir( void )
+     {
+     char *buf = config->buf;
+-    /*char buf[10000];*/
++#if 0
++    char buf[10000];
++#endif
+     size_t buflen;
+     char* contents;
+     size_t contents_size, contents_len;
+@@ -1940,7 +1958,10 @@
+     char f_time[20];
+     static char encname[1000];
+     char *buf = config->buf;
+-    /*static char buf[2000];*/
++
++#if 0
++    static char buf[2000];
++#endif
+ 
+     (void) snprintf( buf, MAX_MEMORY_BUFF, "%s/%s", dir, name );
+     if ( lstat( buf, &sb ) < 0 )
+@@ -2047,7 +2068,7 @@
+ #ifdef CONFIG_FEATURE_CLI_REQUEST
+ 	  if(ifx_clireq == 0)
+ #endif
+-          if((*ifx_AuthHandler_ptr)(file,p[0],p[1]) == 1)
++          if((*ifx_AuthHandler_ptr)(file,p[0],p[0]) == 1)
+           {  
+             syslog( LOG_INFO, "ifx_AuthHandler_ptr failed"); 
+ 	    return;
+@@ -2055,7 +2076,7 @@
+         }
+ 	if (strncmp(file, "goform", 6) == 0){
+ 		if(ifx_psendGoform)
+-			(*ifx_psendGoform)(file,get_method_str(method),query,content_length,cookie, content_type,host,p[0],p[1]);
++			(*ifx_psendGoform)(file,get_method_str(method),query,content_length,cookie, content_type,host,p[0],conn_fd);
+ 		else
+ 			return send_error( 403, "Forbidden", "", "You must supply a local referer." );
+ 	}
+@@ -2182,7 +2203,10 @@
+     size_t c;
+     ssize_t r, r2;
+     char *buf = config->buf;
+-    /*char buf[1024];*/
++
++#if 0
++    char buf[1024];
++#endif
+ 
+     c = request_len - request_idx;
+     if ( c > 0 )
+@@ -2249,7 +2273,9 @@
+ cgi_interpose_output( int rfd, int parse_headers )
+     {
+     ssize_t r, r2;
+-    /*char buf[1024];*/
++#if 0
++    char buf[1024];
++#endif
+     char *buf = config->buf;
+     if ( ! parse_headers )
+ 	{
+@@ -2678,7 +2704,9 @@
+     {
+     char filename[1000];
+     char *buf = config->buf;
++#if 0
+     /*char buf[10000];*/
++#endif
+     int buflen;
+ 
+     if ( vhost && req_hostname != (char*) 0 )
+@@ -2716,7 +2744,9 @@
+     {
+     FILE* fp;
+     char *buf = config->buf;
+-    /*char buf[1000];*/
++#if 0
++    char buf[1000];
++#endif
+     size_t r;
+ 
+     fp = fopen( filename, "r" );
+@@ -2738,7 +2768,9 @@
+ send_error_tail( void )
+     {
+     char *buf = config->buf;
+-    /*char buf[500];*/
++#if 0
++    char buf[500];
++#endif
+     int buflen;
+ 
+     if ( match( "**MSIE**", useragent ) )
+@@ -2771,7 +2803,9 @@
+     time_t now, expires;
+     char timebuf[100];
+     char *buf = config->buf;
+-    /*char buf[10000];*/
++#if 0
++    char buf[10000];
++#endif
+     int buflen;
+     int s100;
+     const char* rfc1123_fmt = "%a, %d %b %Y %H:%M:%S GMT";
+@@ -2814,7 +2848,8 @@
+ 	buflen = snprintf( buf, MAX_MEMORY_BUFF, "Content-Type: %s\015\012", mt );
+ 	add_to_response( buf, buflen );
+ 	}
+-    /*if ( bytes >= 0 )
++#if 0
++    if ( bytes >= 0 )
+ 	{
+ 	buflen = snprintf(
+ 	    buf, MAX_MEMORY_BUFF, "Content-Length: %lld\015\012", (int64_t) bytes );
+@@ -2824,7 +2859,8 @@
+ 	{
+ 	buflen = snprintf( buf, MAX_MEMORY_BUFF, "P3P: %s\015\012", p3p );
+ 	add_to_response( buf, buflen );
+-	}*/
++	}
++#endif
+     if ( max_age >= 0 )
+ 	{
+ 	expires = now + max_age;
+@@ -2834,14 +2870,16 @@
+ 	    "Cache-Control: max-age=%d\015\012Expires: %s\015\012", max_age, timebuf );
+ 	add_to_response( buf, buflen );
+ 	}
+-    /*if ( mod != (time_t) -1 )
++#if 0
++    if ( mod != (time_t) -1 )
+ 	{
+ 	(void) strftime(
+ 	    timebuf, sizeof(timebuf), rfc1123_fmt, gmtime( &mod ) );
+ 	buflen = snprintf( buf, MAX_MEMORY_BUFF, "Last-Modified: %s\015\012", timebuf );
+ 	add_to_response( buf, buflen );
+ 	}
+-      buflen = snprintf( buf, MAX_MEMORY_BUFF, "Connection: close\015\012\015\012" );*/
++      buflen = snprintf( buf, MAX_MEMORY_BUFF, "Connection: close\015\012\015\012" );
++#endif
+       buflen = snprintf( buf, MAX_MEMORY_BUFF, "Connection: keep-alive\015\012" );
+       add_to_response( buf, buflen );
+       buflen = snprintf( buf, MAX_MEMORY_BUFF, "Keep-Alive: 115\015\012\015\012" );
+@@ -2933,7 +2971,9 @@
+ 	{
+ 	/* mmap can't deal with files larger than 2GB. */
+ 	char *buf = config->buf;
+-        /*char buf[30000];*/
++#if 0
++        char buf[30000];
++#endif
+ 	ssize_t r, r2;
+ 
+ 	for (;;)
+@@ -3261,13 +3301,6 @@
+ 	}
+     }
+ 
+-static const char * ltq_config_backup_fix(char *name,const char *type)
+-{
+-    if(!strcmp(name,"rc.conf.gz"))
+-        return "binary/octet-stream";	 
+-    else 
+-	return type;
+-}
+ 
+ /* Figure out MIME encodings and type based on the filename.  Multiple
+ ** encodings are separated by commas, and are listed in the order in
+@@ -3895,8 +3928,3 @@
+     }
+ #endif /* NO_SNPRINTF */
+ 
+-static void sendHeaders(int s, char* title, char* extra_header, char* me, char* mt, off_t b, time_t mod,char *redirectURL)
+-{
+-  add_headers(s,title,extra_header,me, mt,b,mod,redirectURL );     
+-  send_response(); 
+-}	

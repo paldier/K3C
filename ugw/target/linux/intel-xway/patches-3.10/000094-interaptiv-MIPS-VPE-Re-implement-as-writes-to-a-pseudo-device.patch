@@ -1,0 +1,202 @@
+From 0d6f34364a6e486a07ba1aa52c18da755dcbf8ab Mon Sep 17 00:00:00 2001
+From: Chris Dearman <Chris.Dearman@imgtec.com>
+Date: Wed, 25 Sep 2013 14:59:31 -0500
+Subject: [PATCH 094/105] MIPS: VPE: Re-implement as writes to a pseudo-device.
+
+Load-time linking of relocatable binaries has same functionality and
+restrictions as before. For pre-linked ELF binaries:
+
+   * Program size restrictions due to intermediate copy in
+     vmalloc buffer are eliminated. Program segments are
+     copied directly from input stream to target memory.
+
+   * Programs no longer need to be linked to exactly the
+     top of memory known to the kernel. They need only be
+     linked to an address that is no less than the kernel's
+     memory size limit (max_low_pfn).
+
+   * Programs may be stripped of the __start symbol, as the
+     ELF header entry point is used if __start is unavailable.
+     "vpe_shared" symbol must be retained if the rtlx I/O
+     services are to be used.
+
+   * Protection added against binaries linked to addresses
+     that overlay kernel or user addresses.
+
+   * Migration of some functions from rtlx.c to vpe.c in order
+     to support multiple Linux services for AP support, e.g.
+     M3P network driver.
+
+Signed-off-by: Chris Dearman <Chris.Dearman@imgtec.com>
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+---
+ arch/mips/Kconfig           |   34 +-
+ arch/mips/include/asm/vpe.h |   30 ++-
+ arch/mips/kernel/rtlx.c     |   28 +--
+ 3 files changed, 826 insertions(+), 101 deletions(-)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 5b04c19..521e787 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -1947,14 +1947,14 @@ config MIPS_MT_SMP
+ 	select SMP_UP
+ 	select MIPS_PERF_SHARED_TC_COUNTERS
+ 	help
+-	  This is a kernel model which is known a VSMP but lately has been
+-	  marketesed into SMVP.
+-	  Virtual SMP uses the processor's VPEs  to implement virtual
+-	  processors. In currently available configuration of the 34K processor
+-	  this allows for a dual processor. Both processors will share the same
+-	  primary caches; each will obtain the half of the TLB for it's own
+-	  exclusive use. For a layman this model can be described as similar to
+-	  what Intel calls Hyperthreading.
++	  Virtual SMP uses the processor's VPEs to implement virtual
++	  processors. In currently available configurations of the 34K
++	  processor this allows for a dual processor. Both processors will
++	  share the same primary caches and each will obtain the half of
++	  the TLB for its own exclusive use. For a layman this model can
++	  be described as similar to what Intel calls Hyperthreading. At
++	  some point MIPS marketing decided to renamed to SMVP but the
++	  renaming hasn't caught on as of yet. 
+ 
+ 	  For further information see http://www.linux-mips.org/wiki/34K#VSMP
+ 
+@@ -1971,14 +1971,16 @@ config MIPS_MT_SMTC
+ 	select SYS_SUPPORTS_SMP
+ 	select SMP_UP
+ 	help
+-	  This is a kernel model which is known a SMTC or lately has been
+-	  marketesed into SMVP.
+-	  is presenting the available TC's of the core as processors to Linux.
+-	  On currently available 34K processors this means a Linux system will
+-	  see up to 5 processors. The implementation of the SMTC kernel differs
+-	  significantly from VSMP and cannot efficiently coexist in the same
+-	  kernel binary so the choice between VSMP and SMTC is a compile time
+-	  decision.
++	  SMTC is presenting the available TCs of the core as processors to
++	  Linux. On currently available 34K processors this means a Linux
++	  system will see up to 5 processors. The implementation of the SMTC
++	  kernel differs significantly from VSMP. It was found that SMTC cannot
++	  efficiently coexist in the same kernel binary with other modes of
++	  multiprocessor support, so enabling SMTC is a compile time decision.
++	  The choice between VSMP and SMTC is a bit delicate as it is affected
++	  by clockspeed, memory speed, the specific workload and other factors.
++	  As such the choice should not be made on an evaluation board such as
++	  the Malta but preferably on final target hardware.
+ 
+ 	  For further information see http://www.linux-mips.org/wiki/34K#SMTC
+ 
+diff --git a/arch/mips/include/asm/vpe.h b/arch/mips/include/asm/vpe.h
+index c6e1b96..e5e4033 100644
+--- a/arch/mips/include/asm/vpe.h
++++ b/arch/mips/include/asm/vpe.h
+@@ -26,12 +26,40 @@ struct vpe_notifications {
+ 	struct list_head list;
+ };
+ 
+-
++extern unsigned long physical_memsize;
+ extern int vpe_notify(int index, struct vpe_notifications *notify);
++extern void save_gp_address(unsigned int secbase, unsigned int rel);
++
++/*
++ * libc style I/O support hooks
++ */
+ 
+ extern void *vpe_get_shared(int index);
+ extern int vpe_getuid(int index);
+ extern int vpe_getgid(int index);
+ extern char *vpe_getcwd(int index);
+ 
++/*
++ * Kernel/Kernel message passing support hooks
++ */
++
++extern void *vpe_get_shared_area(int index, int type);
++
++/* "Well-Known" Area Types */
++
++#define VPE_SHARED_NULL 0
++#define VPE_SHARED_RESERVED -1
++
++struct vpe_shared_area {
++	int type;
++	void *addr;
++};
++
++/*
++ * IRQ assignment and initialization hook for RP services.
++ */
++
++int arch_get_xcpu_irq(void);
++
++int vpe_send_interrupt(int v, int i);
+ #endif /* _ASM_VPE_H */
+diff --git a/arch/mips/kernel/rtlx.c b/arch/mips/kernel/rtlx.c
+index d763f11..c5afb8c 100644
+--- a/arch/mips/kernel/rtlx.c
++++ b/arch/mips/kernel/rtlx.c
+@@ -58,12 +58,6 @@ static int sp_stopping;
+ 
+ extern void *vpe_get_shared(int index);
+ 
+-static void rtlx_dispatch(void)
+-{
+-	do_IRQ(MIPS_CPU_IRQ_BASE + MIPS_CPU_RTLX_IRQ);
+-}
+-
+-
+ /* Interrupt handler may be called before rtlx_init has otherwise had
+    a chance to run.
+ */
+@@ -465,20 +459,13 @@ static const struct file_operations rtlx_fops = {
+ 	.llseek =  noop_llseek,
+ };
+ 
+-static struct irqaction rtlx_irq = {
+-	.handler	= rtlx_interrupt,
+-	.name		= "RTLX",
+-};
+-
+-static int rtlx_irq_num = MIPS_CPU_IRQ_BASE + MIPS_CPU_RTLX_IRQ;
+-
+ static char register_chrdev_failed[] __initdata =
+ 	KERN_ERR "rtlx_module_init: unable to register device\n";
+ 
+ static int __init rtlx_module_init(void)
+ {
+ 	struct device *dev;
+-	int i, err;
++	int i, err, irq;
+ 
+ 	if (!cpu_has_mipsmt) {
+ 		printk("VPE loader: not a MIPS MT capable processor\n");
+@@ -518,18 +505,17 @@ static int __init rtlx_module_init(void)
+ 	notify.start = starting;
+ 	notify.stop = stopping;
+ 	vpe_notify(tclimit, &notify);
+-
+-	if (cpu_has_vint)
+-		set_vi_handler(MIPS_CPU_RTLX_IRQ, rtlx_dispatch);
+-	else {
++	irq = arch_get_xcpu_irq();
++	if (irq < 0) {
+ 		pr_err("APRP RTLX init on non-vectored-interrupt processor\n");
+ 		err = -ENODEV;
+ 		goto out_chrdev;
+ 	}
+ 
+-	rtlx_irq.dev_id = rtlx;
+-	setup_irq(rtlx_irq_num, &rtlx_irq);
+-
++	err = request_irq(irq, &rtlx_interrupt, IRQF_SHARED,
++		module_name, (void *)dev);
++	if (err)
++		goto out_chrdev;
+ 	return 0;
+ 
+ out_chrdev:
+-- 
+1.7.1
+

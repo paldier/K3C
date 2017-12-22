@@ -1,0 +1,194 @@
+diff -Nuar wide-dhcpv6-20080615/dhcp6c.c wide-dhcpv6-20080615_modif/dhcp6c.c
+--- wide-dhcpv6-20080615/dhcp6c.c	2011-05-05 14:29:26.833683356 +0530
++++ wide-dhcpv6-20080615_modif/dhcp6c.c	2011-05-04 17:18:19.989684812 +0530
+@@ -1980,9 +1980,9 @@
+ 	/* update stateful configuration information */
+ 	if (state != DHCP6S_RELEASE) {
+ 		update_ia(IATYPE_PD, &optinfo->iapd_list, ifp,
+-		    &optinfo->serverID, ev->authparam);
++		    &optinfo->serverID, ev->authparam, optinfo);
+ 		update_ia(IATYPE_NA, &optinfo->iana_list, ifp,
+-		    &optinfo->serverID, ev->authparam);
++		    &optinfo->serverID, ev->authparam, optinfo);
+ 	}
+ 
+ 	dhcp6_remove_event(ev);
+diff -Nuar wide-dhcpv6-20080615/dhcp6c_ia.c wide-dhcpv6-20080615_modif/dhcp6c_ia.c
+--- wide-dhcpv6-20080615/dhcp6c_ia.c	2011-05-05 14:29:26.829683411 +0530
++++ wide-dhcpv6-20080615_modif/dhcp6c_ia.c	2011-05-04 17:18:19.989684812 +0530
+@@ -111,12 +111,13 @@
+ #endif
+ 
+ void
+-update_ia(iatype, ialist, ifp, serverid, authparam)
++update_ia(iatype, ialist, ifp, serverid, authparam, optinfo)
+ 	iatype_t iatype;
+ 	struct dhcp6_list *ialist;
+ 	struct dhcp6_if *ifp;
+ 	struct duid *serverid;
+ 	struct authparam *authparam;
++	struct dhcp6_optinfo *optinfo;
+ {
+ 	struct ia *ia;
+ 	struct ia_conf *iac;
+@@ -174,7 +175,7 @@
+ 				iapdc = (struct iapd_conf *)iac;
+ 				if (update_prefix(ia, &siav->val_prefix6,
+ 				    &iapdc->iapd_pif_list, ifp, &ia->ctl,
+-				    callback)) {
++				    callback, optinfo)) {
+ 					dprintf(LOG_NOTICE, FNAME,
+ 					    "failed to update a prefix %s/%d",
+ 					    in6addr2str(&siav->val_prefix6.addr, 0),
+diff -Nuar wide-dhcpv6-20080615/dhcp6c_ia.h wide-dhcpv6-20080615_modif/dhcp6c_ia.h
+--- wide-dhcpv6-20080615/dhcp6c_ia.h	2007-03-21 15:22:55.000000000 +0530
++++ wide-dhcpv6-20080615_modif/dhcp6c_ia.h	2011-05-04 17:18:19.990684080 +0530
+@@ -52,5 +52,5 @@
+ };
+ 
+ extern void update_ia __P((iatype_t, struct dhcp6_list *,
+-    struct dhcp6_if *, struct duid *, struct authparam *));
++    struct dhcp6_if *, struct duid *, struct authparam *, struct dhcp6_optinfo *));
+ extern void release_all_ia __P((struct dhcp6_if *));
+diff -Nuar wide-dhcpv6-20080615/prefixconf.c wide-dhcpv6-20080615_modif/prefixconf.c
+--- wide-dhcpv6-20080615/prefixconf.c	2011-05-05 14:29:26.835683701 +0530
++++ wide-dhcpv6-20080615_modif/prefixconf.c	2011-05-05 14:34:27.173849368 +0530
+@@ -118,12 +118,12 @@
+ static struct dhcp6_timer *siteprefix_timo __P((void *));
+ 
+ static int add_ifprefix __P((struct siteprefix *,
+-    struct dhcp6_prefix *, struct prefix_ifconf *));
++    struct dhcp6_prefix *, struct prefix_ifconf *, struct dhcp6_if *,  struct dhcp6_optinfo *));
+ 
+ extern struct dhcp6_timer *client6_timo __P((void *));
+ static int pd_ifaddrconf __P((ifaddrconf_cmd_t, struct dhcp6_ifprefix *ifpfx));
+ 
+-#ifdef UPDATE_PD_IN_RADVD /* Added by Sundar */
++#if 0 /* Added by Sundar */
+ static int 
+ update_radvd_conf(a, pinfo, pre_len)
+ 	struct in6_addr *a;
+@@ -352,13 +352,14 @@
+ #endif 
+ 
+ int
+-update_prefix(ia, pinfo, pifc, dhcpifp, ctlp, callback)
++update_prefix(ia, pinfo, pifc, dhcpifp, ctlp, callback, optinfo)
+ 	struct ia *ia;
+ 	struct dhcp6_prefix *pinfo;
+ 	struct pifc_list *pifc;
+ 	struct dhcp6_if *dhcpifp;
+ 	struct iactl **ctlp;
+ 	void (*callback)__P((struct ia *));
++	struct dhcp6_optinfo *optinfo;
+ {
+ 	struct iactl_pd *iac_pd = (struct iactl_pd *)*ctlp;
+ 	struct siteprefix *sp;
+@@ -448,7 +449,7 @@
+ 				continue;
+ 			}
+ 
+-			add_ifprefix(sp, pinfo, pif);
++			add_ifprefix(sp, pinfo, pif, dhcpifp,  optinfo);
+ 			
+ 		}
+ 	}
+@@ -660,10 +661,12 @@
+ }
+ 
+ static int
+-add_ifprefix(siteprefix, prefix, pconf)
++add_ifprefix(siteprefix, prefix, pconf, dhcpifp, optinfo)
+ 	struct siteprefix *siteprefix;
+ 	struct dhcp6_prefix *prefix;
+ 	struct prefix_ifconf *pconf;
++	struct dhcp6_if *dhcpifp;
++	struct dhcp6_optinfo *optinfo;
+ {
+ 	struct dhcp6_ifprefix *ifpfx = NULL;
+ 	struct in6_addr *a;
+@@ -727,10 +730,71 @@
+ 	dprintf(LOG_DEBUG, FNAME, "Adding Radvd  %s/%d in radvd.conf a = %s and b=%d, paadr= %s", in6addr2str(&ifpfx->ifaddr,0) , ifpfx->plen, in6addr2str(a,0), ifpfx->plen, in6addr2str(&ifpfx->paddr, 0));  
+ 	for (i = 15; i >= pconf->ifid_len / 8; i--)
+ 		ifpfx->ifaddr.sin6_addr.s6_addr[i] = pconf->ifid[i];
++#ifdef UPDATE_PD_IN_RADVD
++	{
++#define RADVD_SCRIPT "/etc/rc.d/update_and_run_radvd.sh"
++		int status;
++		pid_t pid;
++		pid = fork();
++		if(pid == 0) { 	/* Child */
++			char *env[10];
++			char *argv[3];
++			char envbuf[sizeof(env)/sizeof(char *)-1][64];
++			int	i;
++			int dnsservers = 0;
++			struct dhcp6_listval *v;
++
++#if 1
++			for (v = TAILQ_FIRST(&optinfo->dns_list); v; v = TAILQ_NEXT(v, link))
++				dnsservers++;
++#endif
++			memset(env, 0, sizeof(env));
++			for (i=0; i<sizeof(env)/sizeof(char *)-1 ; i++) {
++				env[i] = envbuf[i];
++			}
++		
++			snprintf(env[0], sizeof(envbuf[0]), "PREFIX=%s/%d", in6addr2str(a, 0) , ifpfx->plen);
++			snprintf(env[1], sizeof(envbuf[0]), "PLIFETIME=%lu", prefix->pltime);
++			snprintf(env[2], sizeof(envbuf[0]), "VLIFETIME=%lu", prefix->vltime);
++			snprintf(env[3], sizeof(envbuf[0]), "EVENT_SRC=WAN");
++			snprintf(env[4], sizeof(envbuf[0]), "SRC_INTF=%s", dhcpifp->ifname);
++			snprintf(env[5], sizeof(envbuf[0]), "EVENT_TYPE=UP");
++			snprintf(env[6], sizeof(envbuf[0]), "INTF=%s", pconf->ifname);
++#if 1
++			if(dnsservers) {
++				i = 0;
++				for (v = TAILQ_FIRST(&optinfo->dns_list); v; v = TAILQ_NEXT(v, link)) {
++					char *addr;
++
++					addr = in6addr2str(&v->val_addr6, 0);
++					if(i < 2) {
++						snprintf(env[7+i], sizeof(envbuf[0]), "DNS%d=%s", i+1, addr);
++						i++;
++					}
++				}
++			}
++#endif
++			env[9] = NULL;
++			argv[0]= RADVD_SCRIPT;
++			argv[1]= "update";
++			argv[2]= NULL;
++			execve(RADVD_SCRIPT, argv, env);
++			dprintf(LOG_ERR, FNAME, "child:%s exec failed: %s", RADVD_SCRIPT, strerror(errno));
++			exit(0);
++		} else if (pid > 0 ) {  /* parent waits child to exit */
++			waitpid(pid, &status, 0);
++			printf("*********" RADVD_SCRIPT " exited with %d*******\n", status);
++		} else { 	/* error */
++			dprintf(LOG_DEBUG, FNAME, "Unable to fork to run %s\n", RADVD_SCRIPT);
++		}
++				
++	}
++#endif
++
+ 	if (pd_ifaddrconf(IFADDRCONF_ADD, ifpfx))
+ 		goto bad;
+ 
+-#ifdef UPDATE_PD_IN_RADVD /* Added by Sundar */
++#if 0 /* Added by Sundar */
+ 	dprintf(LOG_DEBUG, FNAME, "Adding prefix %s/%d in radvd.conf a = %s and b=%d , paddr = %s",
+ 			in6addr2str(&ifpfx->ifaddr, 0), ifpfx->plen, in6addr2str(a,0), prefix->plen, in6addr2str(&ifpfx->paddr, 0));
+ //	update_radvd_conf(prefix, pconf);
+diff -Nuar wide-dhcpv6-20080615/prefixconf.h wide-dhcpv6-20080615_modif/prefixconf.h
+--- wide-dhcpv6-20080615/prefixconf.h	2007-03-21 15:22:56.000000000 +0530
++++ wide-dhcpv6-20080615_modif/prefixconf.h	2011-05-04 17:18:19.991683848 +0530
+@@ -34,7 +34,7 @@
+ 
+ extern int update_prefix __P((struct ia *, struct dhcp6_prefix *,
+     struct pifc_list *, struct dhcp6_if *, struct iactl **,
+-    void (*)__P((struct ia *))));
++    void (*)__P((struct ia *)),  struct dhcp6_optinfo *));
+ extern int prefix6_add __P((struct dhcp6_if *, struct dhcp6_prefix *,
+ 			       struct duid *));
+ extern int prefix6_update __P((struct dhcp6_event *, struct dhcp6_list *,

@@ -1,0 +1,202 @@
+diff -Naur wide-dhcpv6-20080615/ipv6helper.c wide-dhcpv6-20080615_modified/ipv6helper.c
+--- wide-dhcpv6-20080615/ipv6helper.c	2011-07-20 18:54:27.083511711 +0530
++++ wide-dhcpv6-20080615_modified/ipv6helper.c	2011-07-20 18:57:33.878636692 +0530
+@@ -2,15 +2,81 @@
+ #include <unistd.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <error.h>
++#include <sys/types.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
+ #include <arpa/inet.h>
+ 
++
++# define dest_port 5555
++
++
++
+ void usage(char *argv0)
+ {
+ 	fprintf(stderr,
+-	    "usage: %s command [-t sixrd] [-p prefix] [-l prefixlength] [-i localipv4] [-m masklen]\n", argv0);
++	    "usage for type sixrd: %s command [-t sixrd] [-p prefix] [-l prefixlength] [-i localipv4] [-m masklen]\n", argv0);
++        fprintf(stderr,
++            "usage for type dslite: %s command [-t dslite] [-w wan_interface] [-r remote_ipv6_addr]\n", argv0);
++        fprintf(stderr,
++            "usage for type check_ipv6_addr: %s command [-t caddr6] [-r ipv6_addr]\n", argv0);
++//	return -1;
+ 	exit(1);
+ }
+ 
++int get_dslite_local_end(char *wan_intr, char *remote_end_ipv6)
++{
++        int fd;
++        char ipv6_addr[INET6_ADDRSTRLEN];
++        struct sockaddr_in6 source_address, dest_address;
++        socklen_t len, cnt;
++        len = sizeof(source_address);
++        if((fd = socket(PF_INET6, SOCK_DGRAM, 0)) == -1) {
++                perror("can not open socket\n");
++                exit(1);
++        }
++        if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, wan_intr, sizeof(wan_intr)) == -1) {
++                perror("setsockopt failed.\n");
++                exit(1);
++        }
++        dest_address.sin6_family = AF_INET6;
++        dest_address.sin6_flowinfo = 0;
++        dest_address.sin6_port = htons(dest_port);
++        if (inet_pton(AF_INET6, remote_end_ipv6, &(dest_address.sin6_addr)) <= 0) {
++                perror("Invalid IPv6 address\n");
++                exit(1);
++        }
++        if (connect(fd, (struct sockaddr *)&dest_address, sizeof(dest_address)) == -1) {
++                perror("connect failed\n");
++                exit(1);
++        }
++        if (getsockname(fd, (struct sockaddr *)&source_address, &len) == -1) {
++                perror("getsockname failed\n");
++                exit(1);
++        }
++        if(inet_ntop(AF_INET6, &(source_address.sin6_addr), ipv6_addr, INET6_ADDRSTRLEN) == NULL) {
++               perror("inet_ntop");
++               exit(1);
++        }
++        else {
++                printf("%s\n", ipv6_addr);
++        }
++	return 0;
++}
++
++int is_valid_ipv6_addr(char *addr)
++{
++	struct in6_addr ipv6_dst_addr;
++	int ret;
++	ret = inet_pton(AF_INET6, addr, &ipv6_dst_addr);
++	if (ret <= 0 ) {
++		return -10;
++	}
++	else
++		return 0;
++}
++
+ int print_ipv6_addr(uint8_t *d, uint8_t *dst_buf, uint32_t size)
+ {
+     return  snprintf(dst_buf, size,"%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+@@ -30,20 +96,38 @@
+         int ipv4masklen;
+         int prefixlen;
+         uint32_t maskedipv4;
++	char wan_intr[15], remote_ipv6[64], type[15];
+         int result, remainder,j;
+         uint32_t ipv4;
+-        int ret_ipv4;
++        int ret_ipv4, ret_val=1;
+ 
+-	while ((opt = getopt(argc, argv, "t:p:l:i:m:")) != -1) {
++	while ((opt = getopt(argc, argv, "t:p:l:i:m:w:r:")) != -1) {
+ 		switch(opt) 
+ 		{
+ 		case 't':
+ 			if (strcmp(optarg, "sixrd") == 0) {
+-				 if (argc < 11)
++				 if (argc < 11) {
++					usage(argv0);
++					return -1;
++				}
++				strncpy(type, "sixrd", sizeof(type));
++			}
++			else if (strcmp(optarg, "dslite") == 0 )  {
++				if (argc < 7)	{
+ 					usage(argv0);
++					return -1;
++				}
++				strncpy(type, "dslite", sizeof(type));
+ 			}
+-			else {
+-				usage(argv0);
++                        else if (strcmp(optarg, "caddr6") == 0 )  {
++                                if (argc < 5) {
++                                        usage(argv0);
++					return -1;
++				}
++				strncpy(type, "caddr6", sizeof(type));
++			}
++                        else {
++                                usage(argv0);
+ 				return -1;
+ 			}
+ 			break;
+@@ -60,6 +144,8 @@
+ 			break;
+ 		case 'l':
+ 			prefixlen = atoi(optarg);
++			if ((prefixlen < 0) || (prefixlen >64))
++				return -6;
+ 			break;
+ 		case 'i':
+ 			ret_ipv4 = inet_pton(AF_INET, optarg, &ipv4_dst_str);
+@@ -69,7 +155,26 @@
+ 			break;
+ 		case 'm':
+ 			ipv4masklen = atoi(optarg);
++                        if ((ipv4masklen < 0) || (ipv4masklen >32)) { 
++                                return -7;
++			}
++
+ 			break;
++		case 'w':
++			if (strlen(optarg) > 14) {
++				fprintf(stderr, "Invalid wan index");
++				return -8;
++			}
++			strncpy(wan_intr, optarg, sizeof(wan_intr));
++			break;	
++		case 'r':
++			if (strlen(optarg) > 63) {
++                                fprintf(stderr, "Invalid remote ipv6 address");
++                                return -8;
++                        }
++			strncpy(remote_ipv6, optarg, sizeof(remote_ipv6));
++			break;
++		
+ 		case '?':
+ 			usage(argv0);
+ 			return -4;
+@@ -78,7 +183,11 @@
+ 			return -5;
+ 		}
+ 	}
+-
++	if (!strcmp(type, "dslite"))
++		ret_val = get_dslite_local_end(wan_intr, remote_ipv6);
++	else if(!strcmp(type, "caddr6"))
++		ret_val = is_valid_ipv6_addr(remote_ipv6);
++	else if(!strcmp(type, "sixrd")) {	
+         d = (uint8_t *) &ipv6_dst_addr.s6_addr;
+         i = (uint32_t *)&ipv6_dst_addr.s6_addr32;
+         i[0] = ntohl(i[0]);
+@@ -113,7 +222,7 @@
+         i[3] = htonl(i[3]);
+         ipv4 = htonl(ipv4);
+ 	print_ipv6_addr(d, tun_ipv6_addr, sizeof(tun_ipv6_addr));
+-        printf("%s ", tun_ipv6_addr);
++        /*printf("%s ", tun_ipv6_addr);*/
+         i[1] = ntohl(i[1]);
+         i[2] = ntohl(i[2]);
+         if ((prefixlen + (32-ipv4masklen)) < 64) {
+@@ -124,6 +233,12 @@
+         i[1] = htonl(i[1]);
+         i[2] = htonl(i[2]);
+ 	print_ipv6_addr(d, br0_ipv6_addr, sizeof(br0_ipv6_addr));
+-        printf("%s\n", br0_ipv6_addr);
++        printf("%s %s\n", tun_ipv6_addr, br0_ipv6_addr);
+ 	return (0);
++	}
++	else {
++		usage(argv0);
++		return 1;
++	}	
++	return ret_val;
+ }

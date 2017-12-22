@@ -1,0 +1,3998 @@
+From 9950f583c0c824d1c361fa2ef79066a9db68214e Mon Sep 17 00:00:00 2001
+From: Andrei Danaila <andrei.danaila@intel.com>
+Date: Thu, 26 May 2016 14:10:13 -0700
+Subject: [PATCH 407/441] drivers: Port Puma6 driver code to Puma7
+
+Port Puma6 driver code to Puma7.
+
+Change-Id: Id8e88522fb97d94e048b6cf6dc21ddc5a9cf2c45
+Signed-off-by: Andrei Danaila <andrei.danaila@intel.com>
+---
+ drivers/acpi/sleep.c                  |  10 +-
+ drivers/char/Makefile                 |   2 +
+ drivers/char/aep/Makefile             |   4 +
+ drivers/char/aep/aep_api.c            | 279 ++++++++++++++++
+ drivers/char/aep/aep_core.c           | 610 ++++++++++++++++++++++++++++++++++
+ drivers/char/aep/aep_core.h           | 254 ++++++++++++++
+ drivers/char/aep/aep_host_ipc.c       | 218 ++++++++++++
+ drivers/char/aep/aep_host_ipc.h       |  75 +++++
+ drivers/char/aep/aep_host_ipc_defs.h  |  52 +++
+ drivers/char/aep/aep_host_ipc_utils.c | 256 ++++++++++++++
+ drivers/char/aep/aep_ipc_config.h     |  69 ++++
+ drivers/char/aep/aep_types.h          | 105 ++++++
+ drivers/char/iosf/Makefile            |  30 ++
+ drivers/char/iosf/_ce2600_iosf.c      | 254 ++++++++++++++
+ drivers/char/iosf/_ce2600_iosf.h      |  52 +++
+ drivers/char/iosf/_ce5300_iosf.c      | 282 ++++++++++++++++
+ drivers/char/iosf/_ce5300_iosf.h      |  52 +++
+ drivers/char/iosf/_iosf.c             | 391 ++++++++++++++++++++++
+ drivers/char/iosf/_iosf.h             |  54 +++
+ drivers/char/iosf/iosf_common.h       | 120 +++++++
+ drivers/char/iosf/iosf_core.c         | 185 +++++++++++
+ drivers/char/iosf/iosf_drv.c          | 249 ++++++++++++++
+ drivers/char/mem.c                    |  20 ++
+ drivers/i2c/busses/i2c-pxa.c          |  94 +++++-
+ firmware/Makefile                     |   2 +-
+ firmware/WHENCE                       |  13 +
+ 26 files changed, 3727 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/char/aep/Makefile
+ create mode 100644 drivers/char/aep/aep_api.c
+ create mode 100644 drivers/char/aep/aep_core.c
+ create mode 100644 drivers/char/aep/aep_core.h
+ create mode 100644 drivers/char/aep/aep_host_ipc.c
+ create mode 100644 drivers/char/aep/aep_host_ipc.h
+ create mode 100644 drivers/char/aep/aep_host_ipc_defs.h
+ create mode 100644 drivers/char/aep/aep_host_ipc_utils.c
+ create mode 100644 drivers/char/aep/aep_ipc_config.h
+ create mode 100644 drivers/char/aep/aep_types.h
+ create mode 100644 drivers/char/iosf/Makefile
+ create mode 100644 drivers/char/iosf/_ce2600_iosf.c
+ create mode 100644 drivers/char/iosf/_ce2600_iosf.h
+ create mode 100644 drivers/char/iosf/_ce5300_iosf.c
+ create mode 100644 drivers/char/iosf/_ce5300_iosf.h
+ create mode 100644 drivers/char/iosf/_iosf.c
+ create mode 100644 drivers/char/iosf/_iosf.h
+ create mode 100644 drivers/char/iosf/iosf_common.h
+ create mode 100644 drivers/char/iosf/iosf_core.c
+ create mode 100644 drivers/char/iosf/iosf_drv.c
+
+--- a/drivers/acpi/sleep.c
++++ b/drivers/acpi/sleep.c
+@@ -501,6 +501,7 @@ static int acpi_suspend_enter(suspend_st
+ 	acpi_status status = AE_OK;
+ 	u32 acpi_state = acpi_target_sleep_state;
+ 	int error;
++	unsigned int id = 0;
+ 
+ 	ACPI_FLUSH_CPU_CACHE();
+ 
+@@ -520,8 +521,13 @@ static int acpi_suspend_enter(suspend_st
+ 		break;
+ 	}
+ 
+-	/* This violates the spec but is required for bug compatibility. */
+-	acpi_write_bit_register(ACPI_BITREG_SCI_ENABLE, 1);
++#if IS_ENABLED(CONFIG_X86_PUMA6)
++        intelce_get_soc_info(&id, NULL);
++#endif
++        /* This violates the spec but is required for bug compatibility. */
++        if (CE2600_SOC_DEVICE_ID != id) {
++                acpi_write_bit_register(ACPI_BITREG_SCI_ENABLE, 1);
++        }
+ 
+ 	/* Reprogram control registers */
+ 	acpi_leave_sleep_state_prep(acpi_state);
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -3,6 +3,8 @@
+ #
+ 
+ obj-y				+= mem.o random.o
++obj-$(CONFIG_X86_PUMA6)         += iosf/
++obj-$(CONFIG_X86_PUMA6)         += aep/
+ obj-$(CONFIG_TTY_PRINTK)	+= ttyprintk.o
+ obj-y				+= misc.o
+ obj-$(CONFIG_ATARI_DSP56K)	+= dsp56k.o
+--- /dev/null
++++ b/drivers/char/aep/Makefile
+@@ -0,0 +1,4 @@
++# Intel AEP driver
++
++obj-y += aep_driver.o
++aep_driver-objs := aep_core.o aep_api.o aep_host_ipc.o aep_host_ipc_utils.o
+--- /dev/null
++++ b/drivers/char/aep/aep_api.c
+@@ -0,0 +1,279 @@
++/*
++* File Name: aep_api.c
++*/
++/*
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++
++  */
++#include <linux/aep.h>
++#include "aep_core.h"
++#include "aep_host_ipc.h"
++
++
++/**
++checks for API entry prerequisites for APIs.
++returns a non-success value if they are not all matched.
++*/
++static aep_result_t aep_api_enter(const char *fn_name)
++{
++	aep_result_t result = AEP_SUCCESS;
++	if (!aep_is_active()) {
++		LOG_ERROR("%s: Driver not Initalized\n", fn_name);
++		result = AEP_ERROR_ALREADY_INITIALIZED;
++	} else {
++		if (aep_hw_device_suspended()) {
++			LOG_ERROR("%s: Driver Suspended\n", fn_name);
++			result = AEP_ERROR_NO_RESOURCES;
++		}
++	}
++
++	return result;
++}
++
++/**
++Checks for valid state  for normal API functions
++result will be AEP_SUCCESS if the code immediately after this macro
++is run.
++calls lock_fn to acquire locks
++*/
++#define AEP_API_ENTER(result) do {\
++	AEP_FUNC_ENTER();                             \
++	*result = aep_api_enter(__func__);   \
++	if (*result != AEP_SUCCESS)                 \
++		goto exit;                       \
++	} while (0);
++
++/**
++Marks then end of the code to run if AEP_API_ENTER was run
++successfully.
++
++*/
++#define AEP_API_EXIT() do {\
++ exit:                 \
++	AEP_FUNC_EXIT();		\
++	} while (0);
++
++/*
++ * Read from GPIO register .
++ *
++ * aep_gpio_read(unsigned int reg_offset, unsigned int* value)
++ *
++ * Description:
++ *  This API is used to read GPIO register when the AEP is active.
++ *
++ * Precondition:
++ *  AEP must be active
++ *
++ * Parameters:
++ *  reg_offset   - GPIO  register offset to read from.
++ *  value        - [output], the read value.
++ *
++ * Return:
++ *  0 on Success, <0 on error.
++ */
++
++aep_result_t aep_gpio_read(uint32_t gpio_address_offset, uint32_t *reg_value)
++{
++	ipl_t gpio_ipl;
++	aep_ipc_sizes_t io_sizes;
++	uint32_t output;
++	aep_result_t rc = AEP_SUCCESS;
++
++	AEP_API_ENTER(&rc);
++
++	VERIFY(NULL != reg_value, exit, rc, AEP_ERROR_OPERATION_FAILED);
++
++	memset(&gpio_ipl, 0, sizeof(gpio_ipl));
++
++	gpio_ipl.gpio_read_write.gpio_addr_offset = gpio_address_offset;
++	gpio_ipl.gpio_read_write.transaction_type = GPIO_READ;
++
++	io_sizes.ipl_size = sizeof(ipl_gpio_read_write_t);
++	io_sizes.opl_size = sizeof(uint32_t);
++
++	rc = aep_host_send_ipc(IPC_AEP_READ_WRITE, io_sizes,
++						&gpio_ipl, (opl_t *)&output);
++
++
++	AEP_API_EXIT();
++
++	return rc;
++
++}
++EXPORT_SYMBOL(aep_gpio_read);
++
++
++/*
++ * Write to GPIO register.
++ *
++ * int aep_gpio_write(unsigned int reg_offset,
++ *                     unsigned int bit num, unsigned int value)
++ *
++ * Description:
++ *  This API is used to write to a GPIO register when the AEP is active.
++ *
++ * Precondition:
++ *  AEP must be active
++ *
++ * Parameters:
++ *  reg_offset   - GPIO  register offset to read from.
++ *  bit num        - The mask or bit num where value needs to be updated
++ *  config         - Value to be written
++ *
++ * Return:
++ *  0 on Success, <0 on error.
++ */
++aep_result_t aep_gpio_write(uint32_t gpio_address_offset,
++					uint32_t bit_num, uint32_t gpio_config)
++
++{
++	ipl_t gpio_ipl;
++	aep_ipc_sizes_t io_sizes;
++	aep_result_t rc = AEP_SUCCESS;
++
++	AEP_API_ENTER(&rc);
++
++	memset(&gpio_ipl, 0, sizeof(gpio_ipl));
++
++	gpio_ipl.gpio_read_write.gpio_addr_offset = gpio_address_offset;
++	gpio_ipl.gpio_read_write.transaction_type = GPIO_WRITE;
++	gpio_ipl.gpio_read_write.write_mask = (1<<bit_num);
++
++	if (0 == gpio_config)
++		gpio_ipl.gpio_read_write.write_data = 0;
++	else
++		gpio_ipl.gpio_read_write.write_data = (1<<bit_num);
++
++	io_sizes.ipl_size = sizeof(ipl_gpio_read_write_t);
++
++	rc = aep_host_send_ipc(IPC_AEP_READ_WRITE, io_sizes, &gpio_ipl, NULL);
++
++	AEP_API_EXIT();
++
++	return rc;
++
++}
++EXPORT_SYMBOL(aep_gpio_write);
++
++/*
++ * Write to GPIO register.
++ *
++ * int aep_gpio_write_lockfree(unsigned int reg_offset,
++ *                             unsigned int bit num, unsigned int value)
++ *
++ * Description:
++ *  This API is used to write to a GPIO register when the AEP is active.
++ *  It writes to GPIO register using workqueue, thus it will not block the
++ *  calling API to wait for a thread to release the lock for using AEP IPC.
++ *
++ * Precondition:
++ *  AEP must be active
++ *
++ * Parameters:
++ *  reg_offset   - GPIO  register offset to read from.
++ *  bit num        - The mask or bit num where value needs to be updated
++ *  config         - Value to be written
++ *
++ * Return:
++ *  0 on Success, <0 on error.
++ */
++aep_result_t aep_gpio_write_no_lock(uint32_t gpio_address_offset,
++					uint32_t bit_num, uint32_t gpio_config)
++{
++
++	ipl_t *gpio_ipl;
++	aep_ipc_sizes_t io_sizes;
++	aep_result_t rc = AEP_SUCCESS;
++
++	AEP_API_ENTER(&rc);
++
++	gpio_ipl = kmalloc(sizeof(ipl_t), GFP_ATOMIC);
++
++	if (NULL == gpio_ipl) {
++		printk(KERN_ERR "\n Null pointer: Memory allocation failed\n");
++		rc = AEP_OUT_OF_MEMORY;
++		goto exit;
++	}
++
++	memset(gpio_ipl, 0, sizeof(gpio_ipl));
++
++	gpio_ipl->gpio_read_write.gpio_addr_offset = gpio_address_offset;
++	gpio_ipl->gpio_read_write.transaction_type = GPIO_WRITE;
++	gpio_ipl->gpio_read_write.write_mask = (1<<bit_num);
++
++	if (0 == gpio_config)
++		gpio_ipl->gpio_read_write.write_data = 0;
++	else
++		gpio_ipl->gpio_read_write.write_data = (1<<bit_num);
++
++	io_sizes.ipl_size = sizeof(ipl_gpio_read_write_t);
++
++	rc = aep_host_send_ipc_wq(IPC_AEP_READ_WRITE, gpio_ipl, NULL);
++
++	AEP_API_EXIT();
++
++	return rc;
++
++}
++EXPORT_SYMBOL(aep_gpio_write_no_lock);
++/*
++ * Get AEP F/W Version.
++ *
++ * int aep_get_fw(void)
++ *
++ * Description:
++ *  This API is used to read the AEP F/W version
++ *
++ * Precondition:
++ *  This API can be only if the AEP is active.
++ *
++ * Parameters:
++ *  None.
++ *
++ * Return:
++ *  AEP F/W version
++ */
++
++aep_result_t aep_get_fw(uint32_t *fw_ver)
++{
++
++	aep_result_t rc = AEP_SUCCESS;
++	uint32_t fw_version;
++	aep_ipc_sizes_t io_sizes;
++
++	AEP_API_ENTER(&rc);
++
++	io_sizes.ipl_size = 0;
++	io_sizes.opl_size = sizeof(fw_version);
++
++	rc = aep_host_send_ipc(IPC_AEP_FW_VER, io_sizes,
++					NULL, (opl_t *) &fw_version);
++
++	AEP_API_EXIT();
++	return rc;
++
++}
++EXPORT_SYMBOL(aep_get_fw);
+--- /dev/null
++++ b/drivers/char/aep/aep_core.c
+@@ -0,0 +1,610 @@
++
++/*
++* File Name: aep_core.c
++*/
++/*
++
++	This file is provided under a dual BSD/GPLv2 license.	When using or
++	redistributing this file, you may do so under either license.
++
++	GPL LICENSE SUMMARY
++
++	Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++	This program is free software; you can redistribute it and/or modify
++	it under the terms of version 2 of the GNU General Public License as
++	published by the Free Software Foundation.
++
++	This program is distributed in the hope that it will be useful, but
++	WITHOUT ANY WARRANTY; without even the implied warranty of
++	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the GNU
++	General Public License for more details.
++
++	You should have received a copy of the GNU General Public License
++	along with this program; if not, write to the
++	Free Software Foundation, Inc.,
++	51 Franklin St - Fifth Floor,
++	Boston, MA 02110-1301 USA.
++	The full GNU General Public License is included in this distribution
++	in the file called LICENSE.GPL.
++
++	Contact Information:
++
++     Intel Corporation
++
++     2200 Mission College Blvd.
++
++     Santa Clara, CA  97052
++
++*/
++#include <linux/aep.h>
++#include "aep_core.h"
++#include "aep_host_ipc.h"
++#include "aep_host_ipc_defs.h"
++
++
++static aep_result_t aep_set_power_state(power_state_t requested_state);
++static bool aep_set_hardware_power_state(power_state_t requested_state);
++
++
++/**
++container for variables global to the driver.
++*/
++aep_globals_t aep_globals;
++
++/**
++TODO: document global variable aep_init_flag
++*/
++bool aep_init_flag;
++/**
++TODO: document global variable aep_global_log_level
++*/
++int AEP_global_log_level = AEP_LOG_ERROR;
++
++/*
++ * Get AEP F/W Status.
++ *
++ * bool  aep_is_active(void)
++ *
++ * Description:
++ *  This API is used to check if the AEP F/W is exist and running.
++ *  On A0 or B0 parts there is no AEP IP. The API will return false
++ *  On C0 part and above the AEP can be active or not active,
++ *  depend on the product design.
++ *
++ * Precondition:
++ *  This API can be call with out any precondition.
++ *
++ * Parameters:
++ *  None.
++ *
++ * Return:
++ *  false on Not Active
++ *  true on Active.
++ */
++bool aep_is_active(void)
++{
++	return aep_init_flag;
++}
++EXPORT_SYMBOL(aep_is_active);
++
++/*
++ * Determine if the hardware device is currently suspended.	This function is
++ * for use by generic APIs.
++ */
++bool aep_hw_device_suspended(void)
++{
++	bool result = false;
++
++	if (aep_globals.power.state != D0)
++		result = true;
++
++	return result;
++}
++
++/*
++ * Work Queue worker function.
++ *
++ * void aep_workq_func(struct work_struct *work)
++ *
++ * Description:
++ * This is a work queue worker function, called when ever there is new
++	AEP IPC message to proccess.
++ *
++ * Precondition:
++ *	This function called in Work Queue Context
++ *
++ * Parameters:
++ *	work_struct	- The calling WQ structure.
++ *
++ * Return:
++ *	none.
++ */
++void aep_workq_func(struct work_struct *work)
++{
++
++	char msg[AEP_ATM_MAILBOX_SIZE];
++	aep_ipc_sizes_t io_sizes;
++	aep_work_t *workq = (aep_work_t *)work;
++	int cmd_id	= 0;
++
++	memset(&io_sizes, 0x0, sizeof(aep_ipc_sizes_t));
++
++	if (workq->ipc_cmd != 0) {
++
++		io_sizes.ipl_size = sizeof(ipl_gpio_read_write_t);
++
++		if (AEP_IPC_RET_SUCCESS
++						 != hostIPC_SendCmd(workq->hipc,
++							workq->ipc_cmd,
++							io_sizes,
++							(ipl_t *)workq->ipl,
++							NULL)) {
++			printk(KERN_ERR
++					"AEP: Error - aep_send_command(cmd_id = %d) failed\n",
++					workq->ipc_cmd);
++
++			kfree((void *)workq->ipl);
++
++			kfree((void *)work);
++			return;
++		}
++
++		kfree((void *)workq->ipl);
++
++		kfree((void *)work);
++	} else {
++
++		/* Get Command ID */
++		/* Note: we need to store command_id locally,
++		becasue after we set the 'Done' Bit,
++		we can get new interrupt  */
++		cmd_id	= readl(workq->aep_io_addr + REG_HOST_DBL);
++
++		/* Read the payload from the mailbox, and set 'Done' bit */
++
++		if (AEP_SUCCESS != aep_host_read_ipc_msg(msg, 0,
++							AEP_ATM_MAILBOX_SIZE)) {
++			printk(KERN_ERR "AEP: Error - aep_recv_command failed\n");
++			return;
++		}
++
++		io_sizes.ipl_size = AEP_ATM_MAILBOX_SIZE;
++		/* Write payload to mailbox and send 'Complete' response */
++
++		if (AEP_SUCCESS !=
++							aep_host_send_response(
++					AEP_IPC_CMD_ID_COMPLETE_FLAG|cmd_id,
++							io_sizes,
++							(ipl_t *)msg)) {
++			printk(KERN_ERR
++						"AEP: Error - aep_send_command(cmd_id = %d) failed\n",
++				AEP_IPC_CMD_ID_COMPLETE_FLAG|cmd_id);
++			return;
++		}
++	}
++	return;
++}
++
++static irqreturn_t aep_intr_func(int irq, void *dev_id)
++{
++	irqreturn_t result;
++	aep_globals_t *aep_host = dev_id;
++
++	/* Check if AEP has sent a message*/
++	if (readl(aep_globals.io_addr +
++				CONFIG_HOST_IPC_REGISTER_STATUS_OFFSET) == 0) {
++		aep_host_cmd_t cmd_type;
++
++
++	/** Read and clear interrupt type */
++	cmd_type = readl(aep_globals.io_addr + REG_HOST_DBL);
++
++
++	/* Check if FW has sent Cmd Done Signal*/
++
++	if (cmd_type & AEP_IPC_CMD_ID_COMPLETE_FLAG) {
++		/** Wake up sync message event */
++		tasklet_schedule(&aep_host->finish_tasklet);
++	} else if (AEP_FW_NP_REQUEST == cmd_type) {
++			/*Todo */
++	}
++
++	result = IRQ_HANDLED;
++
++	goto out;
++
++	}
++
++	result = IRQ_NONE;
++
++out:
++
++	return result;
++
++}
++
++/* function to disable AEP IPC interrupts */
++aep_result_t aep_disable_ipc_interrupts(void)
++{
++	unsigned int interrupt_enable;
++	AEP_FUNC_ENTER();
++
++	/* read and disable the AEP host interrupt */
++	interrupt_enable = readl(aep_globals.io_addr +
++						 PV_TO_HOST_INTERRUPT_ENABLE);
++	writel(
++	interrupt_enable & ~AEP_HOST_INTERRUPT_ENABLE_HOST_Doorbell_Event,
++	aep_globals.io_addr + PV_TO_HOST_INTERRUPT_ENABLE
++	);
++	AEP_FUNC_EXIT();
++	return AEP_SUCCESS;
++}
++
++
++/* function to enable AEP IPC interrupts */
++aep_result_t aep_enable_ipc_interrupts(int irq_num)
++{
++	aep_result_t ret_val;
++	unsigned int interrupt_enable;
++	int ret;
++	AEP_FUNC_ENTER();
++
++	if (AEP_SUCCESS != aep_disable_ipc_interrupts())
++		LOG_ERROR("could not disable int\n");
++
++	/* register interrupt */
++
++	ret = request_irq(irq_num, aep_intr_func, IRQF_SHARED,
++						"AEP_ISR", &aep_globals);
++
++	if (ret) {
++		LOG_ERROR("could not map IRQ\n");
++		ret_val = AEP_ERROR_NO_RESOURCES;
++	}
++
++	interrupt_enable = readl(
++						aep_globals.io_addr +
++						PV_TO_HOST_INTERRUPT_ENABLE
++							);
++	writel(interrupt_enable | AEP_HOST_INTERRUPT_ENABLE_HOST_Doorbell_Event,
++			aep_globals.io_addr + PV_TO_HOST_INTERRUPT_ENABLE);
++
++	AEP_FUNC_EXIT();
++	return AEP_SUCCESS;
++}
++
++
++
++aep_result_t aep_unload_fw_dependent_components(void)
++{
++	aep_result_t result;
++	AEP_FUNC_ENTER();
++
++	LOG_DEBUG("disabling ipc interrupts\n");
++	result = aep_disable_ipc_interrupts();
++
++	if (result != AEP_SUCCESS)
++		LOG_ERROR("%d received from disable interrupts\n", result);
++
++	AEP_FUNC_EXIT();
++	return AEP_SUCCESS;
++}
++
++/**
++@brief starts communication with FW
++
++
++
++@retval AEP_SUCCESS : The communication was successfully started.
++@retval AEP_ERROR_NO_RESOURCES: There are no system resources available.
++
++*/
++aep_result_t aep_init_fw_comm(void)
++{
++	aep_result_t rc = AEP_ERROR_NO_RESOURCES;
++
++	rc = aep_host_ipc_initialize(
++						&aep_globals.finish_tasklet,
++						aep_globals.io_addr
++								);
++
++
++	if (AEP_SUCCESS != rc)
++		goto exit;
++
++	rc = aep_enable_ipc_interrupts(aep_globals.irq);
++
++	if (rc != AEP_SUCCESS) {
++		LOG_ERROR("initializing AEP interrupts\n");
++		goto exit;
++	}
++
++	rc = AEP_SUCCESS;
++
++exit:
++
++	AEP_FUNC_EXIT();
++	return rc;
++
++
++}
++
++
++static
++void aep_exit(void)
++{
++	LOG_DEBUG("Unlocad fw dependent components");
++	aep_unload_fw_dependent_components();
++	aep_host_ipc_deinitialize();
++}
++
++
++static
++int intelce_aep_probe(
++					struct pci_dev *pdev,
++					const struct pci_device_id *pci_id
++								)
++{
++
++	aep_result_t result = AEP_ERROR_OPERATION_FAILED;
++	int rc = -1;
++	unsigned int id, rev;
++	uint32_t fw_ver;
++	int ret;
++
++
++	aep_init_flag = false;
++
++	intelce_get_soc_info(&id, &rev);
++
++	if ((id != CE2600_SOC_DEVICE_ID) || (rev < C0_REV_ID))
++		return -ENODEV;
++
++	ret = pci_enable_device(pdev);
++	if (ret) {
++		dev_err(&pdev->dev, "can't enable device.\n");
++		goto cleanup_return;
++	}
++
++
++	aep_globals.io_addr = pci_ioremap_bar(pdev, INTELCE_AEP_BAR);
++
++	if (!aep_globals.io_addr) {
++		dev_err(&pdev->dev, "failed to remap registers\n");
++		ret = -ENOMEM;
++		goto cleanup_return;
++	}
++
++	if (!(readl(aep_globals.io_addr + AEP_PV_CONTROL_REG) & 0x1))
++		goto cleanup_return;
++
++	aep_globals.irq = pdev->irq;
++
++	result = aep_init_fw_comm();
++
++	if (AEP_SUCCESS != result) {
++		LOG_ERROR("Initializing FW Communication %x", result);
++
++		goto cleanup_return;
++	}
++
++	if (result != AEP_SUCCESS) {
++		LOG_ERROR("initializing FW Dependent Components\n");
++		AEP_FUNC_EXIT();
++		return result;
++	}
++	/* Create work queue for interrupt handler*/
++	aep_globals.aep_work_queue = create_workqueue("AEP_Workqueue");
++	if (aep_globals.aep_work_queue == NULL) {
++		printk(KERN_ERR "AEP: Failed to create workqueue\n");
++		return -1;
++	}
++
++	aep_globals.aep_req_work.aep_io_addr = aep_globals.io_addr;
++
++	/* indicate that the device has been initialized */
++	aep_init_flag = true;
++
++	aep_get_fw(&fw_ver);
++
++	rc = 0;
++cleanup_return:
++
++	if (rc != 0) {
++		pci_release_region(pdev, INTELCE_AEP_BAR);
++		pci_disable_device(pdev);
++		aep_exit();
++	}
++
++	return rc;
++}
++static void intelce_aep_remove(struct pci_dev *pdev)
++{
++
++}
++
++
++/*
++ * This is the suspend function we register with the Linux device model.
++ * It gets called whenever the kernel requests a change to the suspended
++ * state.
++ */
++int aep_suspend(struct device *dev)
++{
++	int result = 0;
++
++	if (AEP_SUCCESS != aep_set_power_state(D3))
++		result = -EBUSY;
++
++	return result;
++}
++
++
++/*
++ * This is the resume function we register with the Linux device model.
++ * It gets called whenever the kernel requests a change to the resumed state.
++ */
++int aep_resume(struct device *dev)
++{
++	return (AEP_SUCCESS == aep_set_power_state(D0)) ? 0 : -EBUSY;
++}
++
++
++/*
++ * This is the implementation of both suspend and resume into a single
++ * set_power_state function for simplicity.
++ */
++
++static aep_result_t aep_set_power_state(power_state_t requested_state)
++{
++	aep_result_t result = AEP_ERROR_FEATURE_NOT_IMPLEMENTED;
++
++	AEP_FUNC_ENTER();
++
++	/* If we're already in the requested state, there's nothing to do. */
++	if (aep_globals.power.state == requested_state) {
++		result = AEP_SUCCESS;
++	} else {
++		/* Success, save the new power state, return success. */
++		/* Attempt to change to the new power state. */
++		if (D3 == requested_state) {
++				/**
++				Prepares the aep driver for power save mode. SendsSets flags
++				to prevent API functions from
++				interacting with the firmware.
++				*/
++			if (!aep_set_hardware_power_state(requested_state)) {
++				result = AEP_ERROR_OPERATION_FAILED;
++			} else {
++				aep_globals.power.state = requested_state;
++				result = AEP_SUCCESS;
++			}
++		} else if (D0 == requested_state) {
++			/**
++			Prepares the vidpproc driver for normal running mode. effectively loads
++			all code that might try to interact
++			with the firmware, and sets
++			flags to allow API functions to
++			interact with the firmware
++			*/
++			aep_globals.power.state = requested_state;
++			result = AEP_SUCCESS;
++
++			if (!aep_set_hardware_power_state(requested_state)) {
++				result = AEP_ERROR_OPERATION_FAILED;
++
++			} else {
++	/*unsupported state*/
++				result = AEP_ERROR_INVALID_PARAMETER;
++			}
++		}
++	}
++
++	AEP_FUNC_EXIT();
++	return result;
++}
++
++/* Modify the power state of the hardware unit(s) controlled by this module. */
++static bool aep_set_hardware_power_state(power_state_t requested_state)
++{
++	/*
++	* Send IPC to AEP that Atom is going into suspend mode.
++	*/
++	/*
++	* If we are suspending, do whatever is needed to prevent software from
++	* accessing hardware registers.	This will include any I/O threads, and
++	* any top- or bottom- half interrupt handlers,
++		and any other threads that
++	* call module APIs.	The simplest way to accomplish this might be to
++	* acquire a device lock, check the power state, and refuse to access the
++	* hardware when the state is not D0.	It is likely that hardware
++	* device interrupts will need to be disabled/enabled here, too.
++	*/
++	bool result = false;
++	aep_result_t aep_result;
++	AEP_FUNC_ENTER();
++
++	if (D3 == requested_state) {
++		/**
++		Prepares the aep driver for power save mode.
++		*/
++		aep_result = aep_host_send_suspend_to_fw();
++
++		if (AEP_SUCCESS != aep_result) {
++			LOG_ERROR("Send suspend IPC to AEP\n");
++			goto exit;
++		}
++
++		aep_disable_ipc_interrupts();
++		aep_host_ipc_deinitialize();
++
++		result = true;
++	} else if (D0 == requested_state) {
++			/**
++			Restores the aep driver from power save mode.
++			*/
++			aep_result = aep_init_fw_comm();
++
++			if (AEP_SUCCESS != aep_result) {
++				LOG_ERROR("Initializing FW Communication");
++
++				goto exit;
++			}
++
++		result = true;
++
++	} else {
++		LOG_ERROR("Unsupported Power state\n");
++		result = false;
++	}
++
++exit:
++
++	AEP_FUNC_EXIT();
++	return result;
++}
++
++
++static const struct dev_pm_ops intelce_aep_pm_ops = {
++	.suspend	= aep_suspend,
++	.resume		= aep_resume,
++};
++
++
++
++static DEFINE_PCI_DEVICE_TABLE(intelce_aep_pci_ids) = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_INTELCE_AEP_DEVICE_ID) },
++	{ 0, },
++};
++MODULE_DEVICE_TABLE(pci, intelce_aep_pci_ids);
++
++static struct pci_driver intelce_aep_driver = {
++	.name = INTELCE_AEP_DRV_NAME,
++	.id_table = intelce_aep_pci_ids,
++	.probe = intelce_aep_probe,
++	.remove = intelce_aep_remove,
++#ifdef CONFIG_PM
++	.driver.pm = &intelce_aep_pm_ops,
++#endif
++};
++
++
++static int __init intelce_aep_init(void)
++{
++	return pci_register_driver(&intelce_aep_driver);
++
++}
++
++void __exit intelce_aep_exit(void)
++{
++	pci_unregister_driver(&intelce_aep_driver);
++}
++
++
++
++
++MODULE_AUTHOR("Intel Corporation, (C) 2013 - All Rights Reserved");
++MODULE_LICENSE("GPL v2");
++module_init(intelce_aep_init);
++module_exit(intelce_aep_exit);
+--- /dev/null
++++ b/drivers/char/aep/aep_core.h
+@@ -0,0 +1,254 @@
++/*
++* File Name: aep_core.h
++*/
++
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++*/
++
++#ifndef __AEP_CORE_H__
++#define __AEP_CORE_H__
++#include <linux/init.h>
++#include <linux/cdev.h>
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/printk.h>
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++#include <linux/pci.h>
++#include <linux/aep.h>
++#include <linux/atomic.h>
++#include "aep_types.h"
++#include "aep_ipc_config.h"
++
++
++#define INTELCE_AEP_DRV_NAME		"intelce_aep"
++#define PCI_INTELCE_AEP_DEVICE_ID  0x0956
++#define INTELCE_AEP_BAR        0
++#define C0_REV_ID                0x08
++
++
++/*Decorator for functions shared outside of a code file (i.e. not static)*/
++#ifdef VERBOSE_DEBUG
++#define DEBUG_OUT (...) do {OS_INFO("DEBUG: "__VA_ARGS__); } while (0)
++#else
++#define DEBUG_OUT (...)
++#endif
++
++
++#define AEP_LOG_DEBUG 3
++#define AEP_LOG_MSG 2
++#define AEP_LOG_WARNING 2
++#define AEP_LOG_ERROR 1
++#define AEP_LOG_NONE 0
++
++extern int AEP_global_log_level;
++
++#define OS_INFO(arg...)                                    \
++			do {   \
++				printk(KERN_ERR "%s:%s:", \
++				(strrchr(__FILE__, '/') \
++				 ? (char *)(strrchr(__FILE__, '/')+1)	\
++				  : __FILE__), __func__);  \
++				printk(arg);                                \
++			} while (0);
++
++
++#define AEP_STRINGIFY(x) #x
++#define AEP_TOSTRING(x) AEP_STRINGIFY(x)
++#define LOG_MSG(msg, ...)            \
++			do { \
++				if (AEP_LOG_MSG <= AEP_global_log_level) \
++					OS_INFO("AEP: " msg, ##__VA_ARGS__); \
++				} while (0);
++
++#define LOG_DEBUG(msg, ...) \
++	do { \
++			if (AEP_LOG_DEBUG <= AEP_global_log_level) \
++				OS_INFO("%d AEP DEBUG: " msg,\
++				__LINE__, ##__VA_ARGS__); \
++		} while (0);
++
++#define LOG_WARNING(msg, ...)   \
++	do { \
++			if (AEP_LOG_WARNING <= AEP_global_log_level) \
++				OS_INFO("%d AEP WARNING: " msg, \
++				__LINE__, ##__VA_ARGS__);\
++		} while (0);
++
++#define LOG_ERROR(msg, ...) \
++		do { \
++				if (AEP_LOG_ERROR <= AEP_global_log_level) \
++					printk(KERN_ERR "%d AEP ERROR: " msg,\
++					 __LINE__, ##__VA_ARGS__); \
++			} while (0);
++
++
++#ifdef AEP_TRACE
++#define AEP_FUNC_ENTER()   \
++			do { \
++				printk(KERN_INFO  "AEP >> %s:%s(%d)\n",\
++				 __FILE__, __func__, __LINE__);\
++			} while (0);
++
++#define AEP_FUNC_EXIT() \
++			do { \
++				printk(KERN_INFO "AEP << %s:%s(%d)\n", \
++				__FILE__, __func__, __LINE__);\
++			} while (0);
++
++#define AEP_TRACE_EVENT(msg, ...) \
++			do { \
++				printk(KERN_INFO "AEP :: %s:%s(%d) "msg"\n",\
++				 __FILE__, __func__, __LINE__, ##__VA_ARGS__); \
++			} while (0);
++
++#ifdef AEP_TRACE_VERBOSE
++#define AEP_FUNC_ENTER_V() \
++			do { \
++				printk(KERN_INFO "AEP >> %s:%s(%d)\n", \
++				__FILE__, __func__, __LINE__); \
++			} while	(0);
++
++#define AEP_FUNC_EXIT_V() \
++			do { \
++				printk(KERN_INFO "AEP << %s:%s(%d)\n", \
++				__FILE__, __func__, __LINE__); \
++			} while	(0);
++#else
++#define AEP_FUNC_ENTER_V()
++#define AEP_FUNC_EXIT_V()
++#endif
++#else
++#define AEP_FUNC_ENTER()
++#define AEP_FUNC_EXIT()
++#define AEP_TRACE_EVENT(...)
++#define AEP_FUNC_ENTER_V()
++#define AEP_FUNC_EXIT_V()
++#endif
++
++
++#define VERIFY_QUICK(expression, label) \
++			if (!(expression)) {\
++				goto label;\
++			}
++
++#define VERIFY(expression, label, rc, val) \
++			if (!(expression)) {           \
++				rc = val;                  \
++				goto label;                \
++			}
++
++#define PV_TO_HOST_INTERRUPT_ENABLE 0x1410
++
++#define AEP_HOST_INTERRUPT_ENABLE_HOST_Doorbell_Event 0x4
++
++#define CE_SOC_AEP_DEVICE_ID 0x0956
++#define CE_SOC_VENDOR_ID_INTEL        0x8086
++
++
++#define PCI_BUS_AEP   1
++#define PCI_DEV_AEP   7
++#define PCI_FUNC_AEP  0
++
++#define AEP_DEVICE_NAME "aep"
++
++#define AEP_ATM_MAILBOX_SIZE              0x40
++
++/**
++aep_internal_global_event_t defines the global  events
++supported by AEP.
++*/
++typedef enum aep_request_ipc_t {
++	AEP_NP_ATOM_IPC,
++	/**
++	Used internally to determine the number of IPC requests from AEP
++	*/
++	AEP_IPC_REQUEST_COUNT,
++} aep_request_ipc_t;
++
++
++/*
++   * Structure describing the current power state of the device and
++   * also providing a lock which can be used to synchronize any
++   * software operations that affect the power state.
++   */
++typedef enum { D0, D1, D2, D3 } power_state_t;
++
++typedef struct aep_power_status_t {
++	/** Current power state of the hardware device. */
++	power_state_t     state;
++} aep_power_status_t;
++
++typedef struct {
++	struct work_struct aep_work;
++	aep_fw_cmd_t ipc_cmd;
++	void __iomem *aep_io_addr;
++	host_ipc_handler  *hipc;
++	ipl_t *ipl;
++} aep_work_t;
++
++/**
++Stuct used to contain values global to the driver.
++*/
++typedef struct aep_globals_t {
++	/**
++	the current power settings for the underlying HW device.
++	*/
++	aep_power_status_t power;
++
++	/**
++	Mem i/o address
++	*/
++
++	void __iomem *io_addr;
++
++	int irq;
++	struct workqueue_struct	*aep_work_queue;
++	aep_work_t aep_req_work;
++
++	struct tasklet_struct finish_tasklet;
++
++} aep_globals_t;
++
++
++/**
++container for variables global to the driver.
++*/
++extern aep_globals_t aep_globals;
++
++/**
++main ISR entry point function
++*/
++
++bool aep_hw_device_suspended(void);
++
++void aep_workq_func(struct work_struct *work);
++
++#endif
+--- /dev/null
++++ b/drivers/char/aep/aep_host_ipc.c
+@@ -0,0 +1,218 @@
++/*---------------------------------------------------------------------------
++* File Name: aep_host_ipc.c
++*----------------------------------------------------------------------------
++*/
++/*
++
++This file is provided under a dual BSD/GPLv2 license.	When using or
++redistributing this file, you may do so under either license.
++
++GPL LICENSE SUMMARY
++
++Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++This program is free software; you can redistribute it and/or modify
++it under the terms of version 2 of the GNU General Public License as
++published by the Free Software Foundation.
++
++This program is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	See the GNU
++General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with this program; if not, write to the Free Software
++Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++The full GNU General Public License is included in this distribution
++in the file called LICENSE.GPL.
++
++Contact Information:
++
++*/
++
++/** This file defines wrapper functions to interact with the IPC.
++ * */
++#include "aep_core.h"
++#include "aep_host_ipc.h"
++#include "aep_host_ipc_defs.h"
++#include "aep_types.h"
++
++/* This global variable stores the host IPC handle. */
++host_ipc_handler _aep_host_ipc_handle;
++
++static void host_tasklet_finish(unsigned long param)
++{
++	host_ipc_handler *host;
++	host = (host_ipc_handler *) param;
++
++	del_timer(&host->timer);
++	host->error = AEP_IPC_RET_SUCCESS;
++	complete(host->done_data);
++
++}
++
++
++static void aep_ipc_timeout_timer(unsigned long data)
++{
++	host_ipc_handler *aep_host;
++
++	aep_host = (host_ipc_handler *) data;
++
++	if (aep_host->ipc_req) {
++		printk(KERN_ERR "%x: Timeout waiting for hardware "
++		"interrupt.\n", aep_host->ipc_req);
++
++		aep_host->error = -ETIMEDOUT;
++
++		tasklet_schedule(aep_host->schedule_tasklet);
++
++	}
++}
++
++
++/**
++ * Initialize IPC communication
++ *
++ * Function:	aep_host_ipc_initialize
++ *  Description:
++ *  This is used for initialize IPC comunication parameter with AEP
++ * Parameters:
++ *
++ */
++
++aep_result_t
++aep_host_ipc_initialize(struct tasklet_struct *schedule_tasklet,
++							void *base_addr)
++{
++	uint32_t aep_enabled;
++	aep_result_t result = AEP_SUCCESS;
++
++	_aep_host_ipc_handle.dev_base = base_addr;
++
++	/* Initialize synchronous message semaphore */
++	sema_init(&_aep_host_ipc_handle.sync_request_sema, 1);
++	sema_init(&_aep_host_ipc_handle.sync_reponse_sema, 1);
++	sema_init(&_aep_host_ipc_handle.sync_msg_sema, 1);
++
++	aep_enabled = readl(_aep_host_ipc_handle.dev_base + AEP_PV_CONTROL_REG);
++	if (!(aep_enabled & AEP_ENABLED)) {
++		result = AEP_ERROR_NOT_ENABLED;
++		goto exit;
++	}
++	tasklet_init(schedule_tasklet,
++				host_tasklet_finish,
++				(unsigned long) &_aep_host_ipc_handle);
++
++	_aep_host_ipc_handle.schedule_tasklet = schedule_tasklet;
++	setup_timer(&_aep_host_ipc_handle.timer, aep_ipc_timeout_timer,
++				(unsigned long) &_aep_host_ipc_handle);
++
++exit:
++	return result;
++}
++
++/* *
++ * Function:	aep_host_ipc_deinitialize
++ *
++ */
++
++aep_result_t aep_host_ipc_deinitialize()
++{
++	if (0 != _aep_host_ipc_handle.dev_base)
++		_aep_host_ipc_handle.dev_base = 0;
++
++	return AEP_SUCCESS;
++}
++
++
++/*
++	Function: aep_host_send_ipc will send IPC cmd request to AEP
++	and wait for task to be done by AEP
++
++*/
++aep_result_t
++aep_host_send_ipc(aep_fw_cmd_t ipc_cmd,
++				aep_ipc_sizes_t io_sizes,
++				ipl_t *ipl, opl_t *opl)
++{
++
++	aep_result_t rc = AEP_IPC_RET_ERROR;
++
++	if (AEP_IPC_RET_SUCCESS == hostIPC_SendCmd(&_aep_host_ipc_handle,
++											ipc_cmd,
++											io_sizes, ipl, opl))
++		rc = AEP_SUCCESS;
++
++	return rc;
++
++}
++
++
++aep_result_t
++aep_host_send_ipc_wq(aep_fw_cmd_t fw_cmd_ipc, ipl_t *ipl, opl_t *opl)
++{
++	aep_work_t *ipc_work;
++	int ret;
++	aep_result_t wq_ret_val = AEP_ERROR_OPERATION_FAILED;
++	ipc_work = kmalloc(sizeof(aep_work_t), GFP_ATOMIC);
++
++	if (ipc_work) {
++		ipc_work->aep_io_addr = NULL;
++		ipc_work->ipc_cmd = fw_cmd_ipc;
++		ipc_work->ipl = ipl;
++		ipc_work->hipc = &_aep_host_ipc_handle;
++
++		INIT_WORK((struct work_struct *)ipc_work, aep_workq_func);
++		ret = queue_work(aep_globals.aep_work_queue,
++							(struct work_struct *)ipc_work);
++		if (ret)
++			wq_ret_val = AEP_SUCCESS;
++		else
++			printk("\nFailed while adding to queue\n");
++	}
++
++	return wq_ret_val;
++}
++
++
++/*
++	Function: aep_host_send_response will send IPC response
++	to AEP for a request sent by AEP
++
++*/
++aep_result_t
++aep_host_send_response(aep_fw_cmd_t ipc_cmd,
++											aep_ipc_sizes_t io_sizes,
++											ipl_t *ipl)
++{
++
++	aep_result_t rc = AEP_IPC_RET_ERROR;
++
++	if (AEP_IPC_RET_SUCCESS == hostIPC_SendResponse(&_aep_host_ipc_handle,
++													ipc_cmd, io_sizes, ipl))
++		rc = AEP_SUCCESS;
++
++	return rc;
++
++}
++
++
++aep_result_t
++aep_host_read_ipc_msg(void *opl, uint32_t offset,
++							uint32_t opl_size)
++{
++
++	HostIPC_ReadSynchronousResponse(&_aep_host_ipc_handle, opl,
++									offset, opl_size);
++
++	return AEP_SUCCESS;
++
++}
++
++aep_result_t aep_host_send_suspend_to_fw()
++{
++	aep_result_t rc = AEP_IPC_RET_ERROR;
++
++	return rc;
++
++}
+--- /dev/null
++++ b/drivers/char/aep/aep_host_ipc.h
+@@ -0,0 +1,75 @@
++/*
++* File Name: aep_host_ipc.h
++*/
++
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++*/
++#ifndef AEP_HOST_IPC_H
++#define AEP_HOST_IPC_H
++/**
++ * DeInitialize IPC communication
++ *
++ * Function:	aep_host_ipc_deinitialize
++ *  Description:
++ *  This is used free all compoenents which were allocated
++ *	during initialization
++ * Parameters:
++ *
++ */
++
++aep_result_t aep_host_ipc_deinitialize(void);
++/**
++ * Initialize IPC communication
++ *
++ * Function:	aep_host_ipc_initialize
++ *  Description:
++ *  This is used for initialize IPC comunication parameter with AEP
++ * Parameters:
++ *
++ */
++
++aep_result_t aep_host_ipc_initialize(struct tasklet_struct *schedule_tasklet,
++										void *base_addr);
++
++aep_result_t aep_host_send_ipc(aep_fw_cmd_t ipc_cmd, aep_ipc_sizes_t io_sizes,
++								ipl_t *ipl, opl_t *opl);
++
++aep_result_t aep_host_send_ipc_wq(aep_fw_cmd_t fw_cmd_ipc,
++									ipl_t *ipl, opl_t *opl);
++
++aep_result_t aep_host_send_response(aep_fw_cmd_t ipc_cmd,
++											aep_ipc_sizes_t io_sizes,
++											ipl_t *ipl);
++aep_result_t aep_host_read_ipc_msg(void *opl, uint32_t offset,
++							uint32_t opl_size);
++
++aep_result_t aep_host_send_suspend_to_fw(void);
++
++#endif
+--- /dev/null
++++ b/drivers/char/aep/aep_host_ipc_defs.h
+@@ -0,0 +1,52 @@
++/*
++* File Name: aep_host_ipc_defs.h
++*/
++
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++*/
++#include "aep_core.h"
++#include "aep_types.h"
++
++aep_ipc_ret_t hostIPC_SendCmd(host_ipc_handler  *hipc,
++								aep_fw_cmd_t ipc_cmd,
++								aep_ipc_sizes_t io_sizes,
++								ipl_t *ipl,
++								opl_t *opl);
++
++aep_ipc_ret_t HostIPC_ReadSynchronousResponse(host_ipc_handler  *hipc,
++											 void *message_buf,
++											 int offset,
++											 int message_buf_size);
++
++aep_ipc_ret_t hostIPC_SendResponse(host_ipc_handler  *hipc,
++									aep_fw_cmd_t ipc_cmd,
++									aep_ipc_sizes_t io_sizes,
++									ipl_t *ipl);
++
+--- /dev/null
++++ b/drivers/char/aep/aep_host_ipc_utils.c
+@@ -0,0 +1,256 @@
++/*
++
++This file is provided under a dual BSD/GPLv2 license.  When using or
++redistributing this file, you may do so under either license.
++
++GPL LICENSE SUMMARY
++
++Copyright(c) 2005-2012 Intel Corporation. All rights reserved.
++
++This program is free software; you can redistribute it and/or modify
++it under the terms of version 2 of the GNU General Public License as
++published by the Free Software Foundation.
++
++This program is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with this program; if not, write to the Free Software
++Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++The full GNU General Public License is included in this distribution
++in the file called LICENSE.GPL.
++
++Contact Information:
++Intel Corporation
++2200 Mission College Blvd.
++Santa Clara, CA  97052
++
++*/
++#include <linux/delay.h>
++#include <linux/types.h>
++#include "aep_core.h"
++#include "aep_host_ipc_defs.h"
++#include "aep_ipc_config.h"
++#include "aep_types.h"
++#define AEP_IPC_TIMEOUT_US               1000000   /* 1 sec timeout */
++
++/**
++ * Function:  is_aep_ready
++ *
++ */
++
++aep_result_t
++is_aep_ready(host_ipc_handler *hipc, bool *is_cleared)
++{
++	uint32_t temp = 0;
++	uint32_t mask = (CONFIG_IPC_REGISTER_STAT_AEP_READY |
++					CONFIG_IPC_REGISTER_STAT_AEP_DONE);
++
++	temp = readl(hipc->dev_base + CONFIG_AEP_IPC_REGISTER_STATUS_OFFSET);
++	*is_cleared = ((temp & mask) == mask) ? true : false;
++
++	return AEP_SUCCESS;
++}
++
++
++/**
++@brief <H3>Description:</H3>
++   Private function which waits until it IPC status bit Done and Ready are set.
++*/
++
++aep_ipc_ret_t wait_for_aep_fw_ready(host_ipc_handler *hipc)
++{
++	uint32_t timeout = 0;
++	/** Wait until AEP signals message received */
++
++	while ((readl(hipc->dev_base + CONFIG_AEP_IPC_REGISTER_STATUS_OFFSET) &
++			 AEP_DBL_READY) != AEP_DBL_READY
++			) {
++		udelay(1);
++		if (timeout >= AEP_IPC_TIMEOUT_US) {
++			printk(KERN_ERR
++					"AEP: Error - aep_send_command() failed on timeout,\
++					 never got 'Ready' and 'Done'\n"
++					);
++			return -1;
++		}
++		timeout++;
++	}
++
++	return 0;
++}
++
++/*
++  Write to AEP IPC mailbox and send interrupt to AEP by writing to doorbell
++*/
++
++void HostIPC_StartSynchronousMessage(host_ipc_handler  *hipc,
++									const ipc_synchronous_message *syncm,
++									int ipl_size
++									)
++{
++
++	int i;
++	uint32_t nsize;
++	nsize = ipl_size;
++
++	/* copy the message */
++	for (i = 0; i < (int)nsize/4 ; i++) {
++		writel(syncm->data_payload[i],
++				hipc->dev_base + CONFIG_IPC_SYNC_MESSAGE_OFFSET + (i << 2)
++				);
++	}
++
++	mod_timer(&hipc->timer, jiffies + 10 * HZ);
++
++	writel(syncm->commandId, hipc->dev_base + REG_AEP_DBL);
++
++}
++
++aep_ipc_ret_t HostIPC_ReadSynchronousResponse(host_ipc_handler  *hipc,
++												void *message_buf, int offset,
++												int message_buf_size
++												)
++{
++	int i;
++	uint32_t nsize;
++	uint32_t *syncm;
++
++	nsize = message_buf_size;
++
++	syncm = (uint32_t *)message_buf;
++
++	if (nsize > 64)
++		nsize = 64;
++
++	for (i = 0; i < (int)nsize/4 ; i++) {
++		syncm[i] = readl(hipc->dev_base +
++							CONFIG_IPC_READ_SYNC_MESSAGE_OFFSET +
++							offset + (i << 2)
++						);
++	}
++
++	return AEP_IPC_RET_SUCCESS;
++}
++
++
++aep_ipc_ret_t hostIPC_SendResponse(host_ipc_handler  *hipc,
++									aep_fw_cmd_t ipc_cmd,
++									aep_ipc_sizes_t io_sizes,
++									ipl_t *ipl
++									)
++{
++	ipc_synchronous_message  sm;
++	bool is_ready = false;
++	aep_ipc_ret_t rc = AEP_IPC_RET_SUCCESS;
++
++	/*Acquire semaphore to send response to a message sent by AEP*/
++
++	down(&hipc->sync_reponse_sema);
++
++	do {
++		is_aep_ready(hipc, &is_ready);
++
++		if (is_ready) {
++
++			memset(&sm, 0, sizeof(sm));
++
++			sm.commandId = ipc_cmd;
++
++			if (NULL != ipl)
++				memcpy(&sm.data_payload, ipl, io_sizes.ipl_size);
++
++			down(&hipc->sync_msg_sema);
++
++			HostIPC_StartSynchronousMessage(hipc, &sm, sizeof(sm));
++
++			up(&hipc->sync_msg_sema);
++		} else {
++
++			/* wait for interrupt event to occur */
++
++			wait_for_aep_fw_ready(hipc);
++		}
++
++	} while (!is_ready);
++
++	/*Release semahore*/
++	up(&hipc->sync_reponse_sema);
++
++	return rc;
++}
++
++
++aep_ipc_ret_t hostIPC_SendCmd(host_ipc_handler  *hipc,
++								aep_fw_cmd_t ipc_cmd,
++								aep_ipc_sizes_t io_sizes,
++								ipl_t *ipl, opl_t *opl
++							)
++{
++	ipc_synchronous_message  sm;
++	uint32_t status;
++	DECLARE_COMPLETION_ONSTACK(complete);
++	bool is_ready = false;
++	aep_ipc_ret_t rc = AEP_IPC_RET_SUCCESS;
++
++	/*Acquire semaphore to send IPC cmd request to AEP*/
++
++	down(&hipc->sync_request_sema);
++
++	do {
++		is_aep_ready(hipc, &is_ready);
++
++		if (is_ready) {
++
++			memset(&sm, 0, sizeof(sm));
++
++			sm.commandId = ipc_cmd;
++
++			if (NULL != ipl)
++				memcpy(&sm.data_payload, ipl, io_sizes.ipl_size);
++
++
++			/* Acquire spin lock for writing to IPC registers */
++
++			down(&hipc->sync_msg_sema);
++
++			HostIPC_StartSynchronousMessage(hipc, &sm, sizeof(sm));
++
++			up(&hipc->sync_msg_sema);
++		} else {
++
++			/* wait for interrupt event to occur */
++
++			wait_for_aep_fw_ready(hipc);
++
++		}
++
++	} while (!is_ready);
++
++	hipc->done_data = &complete;
++
++	wait_for_completion(&complete);
++
++	rc = hipc->error;
++
++	if (AEP_IPC_RET_SUCCESS == rc) {
++
++		HostIPC_ReadSynchronousResponse(hipc, &status, 0, sizeof(uint32_t));
++
++		if (NULL != opl)
++			HostIPC_ReadSynchronousResponse(hipc, opl, 4, io_sizes.opl_size);
++
++		rc = status;
++
++	}
++	/* Set IPC status to done and ready to receive next message from AEP*/
++	writel(AEP_DBL_DONE, hipc->dev_base + CONFIG_HOST_IPC_REGISTER_STATUS_OFFSET);
++
++	/* Release semaphore */
++
++	up(&hipc->sync_request_sema);
++
++	return rc;
++}
+--- /dev/null
++++ b/drivers/char/aep/aep_ipc_config.h
+@@ -0,0 +1,69 @@
++/*
++
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++
++  */
++
++#ifndef __AEP_IPCLIB_CONFIG_H__
++#define __AEP_IPCLIB_CONFIG_H__
++
++#define AEP_PV_CONTROL_REG 0x00
++
++#define CONFIG_IPC_SYNC_MESSAGE_BUF_SIZE   64
++
++
++#define IPC_HOST_SLEEP_INTERVAL              100
++/* AEP IPC status */
++#define CONFIG_AEP_IPC_REGISTER_STATUS_OFFSET         0x140C
++/* Host IPC status register */
++#define CONFIG_HOST_IPC_REGISTER_STATUS_OFFSET        0x1404
++
++#define CONFIG_IPC_REGISTER_STAT_AEP_READY     0x01
++#define CONFIG_IPC_REGISTER_STAT_AEP_DONE      0x02
++#define REG_AEP_DBL                 0x1408
++#define REG_HOST_DBL                0x1400
++
++/* Synchronous (one at a time) message block (no queueing) */
++#define CONFIG_IPC_SYNC_MESSAGE_OFFSET          0x12C0
++#define CONFIG_IPC_READ_SYNC_MESSAGE_OFFSET          0x1280
++
++#define AEP_DBL_READY      0x3
++#define AEP_DBL_DONE       0x2
++#define AEP_ENABLED        0x1
++#define AEP_IPC_CMD_ID_COMPLETE_FLAG 0x80000000
++
++
++typedef enum {
++	AEP_IPC_RET_SUCCESS         = 0,
++	AEP_IPC_RET_ERROR         = -1,
++	AEP_IPC_RET_WAIT_TIMEOUT    = -2
++} aep_ipc_ret_t;
++
++typedef struct {
++	uint32_t commandId;
++	uint32_t data_payload[16];
++} ipc_synchronous_message;
++
++#endif
+--- /dev/null
++++ b/drivers/char/aep/aep_types.h
+@@ -0,0 +1,105 @@
++/*
++* File Name: aep_host_ipc.h
++*/
++
++/*
++  This file is provided under a dual BSD/GPLv2 license.  When using or
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2007-2012 Intel Corporation. All rights reserved.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++*/
++#ifndef AEP_TYPES_H
++#define AEP_TYPES_H
++
++/* Input payload*/
++
++#define AEP_INPUT_PAYLOAD_BYTE_SIZE 64
++
++typedef struct {
++	uint32_t data[16];
++} ipl_suspend_t;
++
++typedef enum {
++	GPIO_WRITE = 0,
++	GPIO_READ  = 1
++} aep_gpio_transaction_t;
++
++typedef struct {
++	uint32_t gpio_addr_offset;
++	uint32_t transaction_type;
++	uint32_t write_data;
++	uint32_t write_mask;
++} ipl_gpio_read_write_t;
++
++/* generic input payload structure */
++typedef union {
++	uint8_t  data[AEP_INPUT_PAYLOAD_BYTE_SIZE];
++	ipl_gpio_read_write_t  gpio_read_write;
++	ipl_suspend_t  suspend_ipl;
++} ipl_t;
++
++
++typedef struct {
++	uint32_t  data[16];
++} opl_t;
++
++typedef struct {
++	/*Explicit byte size of input payload for AEP HW*/
++	uint16_t        ipl_size;
++	/*Explicit byte size of output payload returned from AEP HW*/
++	uint16_t        opl_size;
++} aep_ipc_sizes_t;
++
++/** Context for Host IPC */
++typedef struct {
++	/** Device Handle for IPC Communication */
++	void __iomem *dev_base;
++	/*semaphore is for making IPC request to AEP*/
++	struct semaphore          sync_request_sema;
++	struct semaphore          sync_reponse_sema;
++	struct semaphore          sync_msg_sema;
++	/* semaphore for sending response to AEP */
++	struct timer_list timer;	/* Timer for timeouts */
++	int ipc_req;
++	uint32_t error;
++	struct tasklet_struct *schedule_tasklet;
++	void			*done_data;	/* completion data */
++
++} host_ipc_handler;
++
++/* IPC COMMANDS*/
++
++typedef enum {
++	IPC_AEP_FW_VER              = 0x4,
++	IPC_AEP_READ_WRITE          = 0x2,
++} aep_fw_cmd_t;
++
++/* AEP-To Host IPC COMMANDS */
++typedef enum {
++	AEP_FW_GPIO_CMD_DONE = 0x80000002,
++	AEP_FW_NP_REQUEST = 0x5
++} aep_host_cmd_t;
++#endif
+--- /dev/null
++++ b/drivers/char/iosf/Makefile
+@@ -0,0 +1,30 @@
++################################################################################
++#
++# Intel IOSF Linux driver
++# Copyright(c) 2010 - 2012 Intel Corporation.
++#
++# This program is free software; you can redistribute it and/or modify it
++# under the terms and conditions of the GNU General Public License,
++# version 2, as published by the Free Software Foundation.
++#
++# This program is distributed in the hope it will be useful, but WITHOUT
++# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++# more details.
++#
++# You should have received a copy of the GNU General Public License along with
++# this program; if not, write to the Free Software Foundation, Inc.,
++# 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++#
++# The full GNU General Public License is included in this distribution in
++# the file called "COPYING".
++#
++################################################################################
++
++#
++# Makefile for the Intel(R) IOSF low level device driver
++#
++
++obj-y += iosf.o
++
++iosf-objs := _iosf.o _ce5300_iosf.o _ce2600_iosf.o iosf_core.o iosf_drv.o
+--- /dev/null
++++ b/drivers/char/iosf/_ce2600_iosf.c
+@@ -0,0 +1,254 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name:_ce2600_iosf.c
++ * Driver for  IOSF(Intel On chip System Fabric)
++ *------------------------------------------------------------------------------
++ */
++
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/io.h>
++
++#include <linux/iosf_core.h>
++#include "iosf_common.h"
++
++#include "_ce2600_iosf.h"
++#include "_iosf.h"
++
++int _ce2600_iosf_port_is_valid(struct iosf_host * host, uint8_t dest_port)
++{
++	int ret = 0;
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_DFX_TG:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++		case IOSF_PORT_MOCA_AFE:
++			break;
++
++		default:
++				ret = -EINVAL;
++	}
++	return !ret;
++}
++
++int _ce2600_iosf_msg_opcode_is_valid(struct iosf_host * host, uint8_t opcode)
++{
++	int ret = -EINVAL;
++
++	if ( ((opcode >= 0x80) && (opcode <= 0x9F)) ||
++		 ((opcode >= 0xA0) && (opcode <= 0xFF) ) )
++		ret = 0;
++	return !ret;
++}
++
++int _ce2600_iosf_msg_data_opcode_is_valid(struct iosf_host * host, uint8_t opcode)
++{
++	int ret = -EINVAL;
++
++	if ( ((opcode >= 0x40) && (opcode <= 0x5F)) ||
++		 ((opcode >= 0x60) && (opcode <= 0x7F) ) )
++		ret = 0;
++	return !ret;
++}
++
++int _ce2600_iosf_reg_read32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t *value)
++{
++	uint8_t rd_opcode = 0;
++	int ret = 0;
++
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_DFX_TG:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++			rd_opcode = IOSF_OPCODE_CRRd;
++			break;
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++			rd_opcode = IOSF_OPCODE_RegRd;
++			break;
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++		case IOSF_PORT_MOCA_AFE:
++			rd_opcode = IOSF_OPCODE_0_RegRd;
++			break;
++
++		default:
++				ret = -EINVAL;
++
++
++	}
++	if (ret)
++		return ret;
++
++	return _common_iosf_reg_read32(host, dest_port, rd_opcode, offset, value);
++
++}
++
++int _ce2600_iosf_reg_write32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t value)
++{
++	uint8_t wr_opcode = 0;
++	int ret = 0;
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_DFX_TG:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++			wr_opcode = IOSF_OPCODE_CRWr;
++			break;
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++			wr_opcode = IOSF_OPCODE_RegWr;
++			break;
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++		case IOSF_PORT_MOCA_AFE:
++			wr_opcode = IOSF_OPCODE_1_RegWr;
++			break;
++
++		default:
++				ret = -EINVAL;
++
++	}
++
++	if (ret)
++		return ret;
++
++	return _common_iosf_reg_write32(host, dest_port, wr_opcode,  offset, value);
++
++}
++
++int _ce2600_iosf_reg_modify(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t mask,  uint32_t value)
++{
++	uint8_t rd_opcode = 0;
++	uint8_t wr_opcode = 0;
++	int ret = 0;
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_DFX_TG:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++			rd_opcode = IOSF_OPCODE_CRRd;
++			wr_opcode = IOSF_OPCODE_CRWr;
++			break;
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++			rd_opcode = IOSF_OPCODE_RegRd;
++			wr_opcode = IOSF_OPCODE_RegWr;
++			break;
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++		case IOSF_PORT_MOCA_AFE:
++			rd_opcode = IOSF_OPCODE_0_RegRd;
++			wr_opcode = IOSF_OPCODE_1_RegWr;
++			break;
++
++		default:
++				ret = -EINVAL;
++	}
++
++	if (ret)
++		return ret;
++
++	return _common_iosf_reg_modify(host, dest_port, rd_opcode, wr_opcode, offset, mask, value);
++
++}
+--- /dev/null
++++ b/drivers/char/iosf/_ce2600_iosf.h
+@@ -0,0 +1,52 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name:_ce2600_iosf.h
++ * Driver for  IOSF(Intel On chip System Fabric)
++ *------------------------------------------------------------------------------
++ */
++
++#ifndef _LINUX_CE2600_IOSF_H
++#define _LINUX_CE2600_IOSF_H
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/iosf_core.h>
++
++int _ce2600_iosf_port_is_valid(struct iosf_host * host, uint8_t dest_port);
++int _ce2600_iosf_msg_opcode_is_valid(struct iosf_host * host, uint8_t opcode);
++int _ce2600_iosf_msg_data_opcode_is_valid(struct iosf_host * host, uint8_t opcode);
++int _ce2600_iosf_reg_read32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t *value);
++int _ce2600_iosf_reg_write32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t value);
++int _ce2600_iosf_reg_modify(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t mask,  uint32_t value);
++
++#endif //__LINUX_DRV_IOSF_H
+--- /dev/null
++++ b/drivers/char/iosf/_ce5300_iosf.c
+@@ -0,0 +1,282 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name:_ce5300_iosf.c
++ * Driver for  IOSF(Intel On chip System Fabric)
++ *------------------------------------------------------------------------------
++ */
++
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/io.h>
++
++#include <linux/iosf_core.h>
++#include "iosf_common.h"
++
++#include "_ce5300_iosf.h"
++#include "_iosf.h"
++
++int  _ce5300_iosf_port_is_valid(struct iosf_host * host, uint8_t dest_port)
++{
++	int ret = 0;
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_ITUNIT1:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_ITUNIT2:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_ADAC:
++		case IOSF_PORT_HDMI_TX_AFE:
++		case IOSF_PORT_HDMI_RX_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_HPLL:
++		case IOSF_PORT_DPLL:
++		case IOSF_PORT_APLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++		case IOSF_PORT_REUT1:
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++			break;
++
++		default:
++				ret = -EINVAL;
++	}
++
++	return !ret;
++}
++
++int _ce5300_iosf_msg_opcode_is_valid(struct iosf_host * host, uint8_t opcode)
++{
++	int ret = -EINVAL;
++
++	if ( ((opcode >= 0x80) && (opcode <= 0x9F)) ||
++		 ((opcode >= 0xA0) && (opcode <= 0xFF) ) )
++		ret = 0;
++	return !ret;
++}
++
++int _ce5300_iosf_msg_data_opcode_is_valid(struct iosf_host * host, uint8_t opcode)
++{
++	int ret = -EINVAL;
++
++	if ( ((opcode >= 0x40) && (opcode <= 0x5F)) ||
++		 ((opcode >= 0x60) && (opcode <= 0x7F) ) )
++		ret = 0;
++	return !ret;
++}
++
++int _ce5300_iosf_reg_read32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t *value)
++{
++	uint8_t rd_opcode = 0;
++	int ret = 0;
++
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_ITUNIT1:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_ITUNIT2:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_ADAC:
++		case IOSF_PORT_HDMI_TX_AFE:
++		case IOSF_PORT_HDMI_RX_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_HPLL:
++		case IOSF_PORT_DPLL:
++		case IOSF_PORT_APLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++			rd_opcode = IOSF_OPCODE_CRRd;
++			break;
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++		case IOSF_PORT_REUT1:
++			rd_opcode = IOSF_OPCODE_RegRd;
++			break;
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++			rd_opcode = IOSF_OPCODE_0_RegRd;
++			break;
++
++		default:
++				ret = -EINVAL;
++
++
++	}
++	if (ret)
++		return ret;
++
++	return _common_iosf_reg_read32(host, dest_port, rd_opcode, offset, value);
++
++}
++
++int _ce5300_iosf_reg_write32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t value)
++{
++	uint8_t wr_opcode = 0;
++	int ret = 0;
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_ITUNIT1:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_ITUNIT2:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_ADAC:
++		case IOSF_PORT_HDMI_TX_AFE:
++		case IOSF_PORT_HDMI_RX_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_HPLL:
++		case IOSF_PORT_DPLL:
++		case IOSF_PORT_APLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++			wr_opcode = IOSF_OPCODE_CRWr;
++			break;
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++		case IOSF_PORT_REUT1:
++			wr_opcode = IOSF_OPCODE_RegWr;
++			break;
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++			wr_opcode = IOSF_OPCODE_1_RegWr;
++			break;
++
++		default:
++				ret = -EINVAL;
++
++	}
++
++	if (ret)
++		return ret;
++
++	return _common_iosf_reg_write32(host, dest_port,wr_opcode,  offset, value);
++
++}
++
++int _ce5300_iosf_reg_modify(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t mask,  uint32_t value)
++{
++	uint8_t rd_opcode = 0;
++	uint8_t wr_opcode = 0;
++	int ret = 0;
++
++	switch (dest_port)
++	{
++		case IOSF_PORT_VT:
++		case IOSF_PORT_MCU:
++		case IOSF_PORT_PUNIT:
++		case IOSF_PORT_CPUNIT:
++		case IOSF_PORT_ITUNIT1:
++		case IOSF_PORT_SAPms_BRIDGE:
++		case IOSF_PORT_ITUNIT2:
++		case IOSF_PORT_USB_AFE:
++		case IOSF_PORT_ADAC:
++		case IOSF_PORT_HDMI_TX_AFE:
++		case IOSF_PORT_HDMI_RX_AFE:
++		case IOSF_PORT_FPLL:
++		case IOSF_PORT_HPLL:
++		case IOSF_PORT_DPLL:
++		case IOSF_PORT_APLL:
++		case IOSF_PORT_PSF_0S:
++		case IOSF_PORT_PSF_0N:
++		case IOSF_PORT_PSF1:
++		case IOSF_PORT_PSF3:
++			rd_opcode = IOSF_OPCODE_CRRd;
++			wr_opcode = IOSF_OPCODE_CRWr;
++			break;
++
++		case IOSF_PORT_HUNIT:
++		case IOSF_PORT_BUNIT:
++		case IOSF_PORT_DDR_IO:
++		case IOSF_PORT_REUT0:
++		case IOSF_PORT_REUT1:
++			rd_opcode = IOSF_OPCODE_RegRd;
++			wr_opcode = IOSF_OPCODE_RegWr;
++			break;
++
++		case IOSF_PORT_DFX_LAKEMORE:
++		case IOSF_PORT_DFX_OMAR:
++		case IOSF_PORT_SATA_AFE:
++		case IOSF_PORT_PCIE_AFE:
++			rd_opcode = IOSF_OPCODE_0_RegRd;
++			wr_opcode = IOSF_OPCODE_1_RegWr;
++			break;
++
++		default:
++				ret = -EINVAL;
++	}
++
++	if (ret)
++		return ret;
++	return _common_iosf_reg_modify(host, dest_port, rd_opcode, wr_opcode, offset, mask, value);
++
++}
+--- /dev/null
++++ b/drivers/char/iosf/_ce5300_iosf.h
+@@ -0,0 +1,52 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name:_ce5300_iosf.h
++ * Driver for  IOSF(Intel On chip System Fabric)
++ *------------------------------------------------------------------------------
++ */
++
++#ifndef _LINUX_CE5300_IOSF_H
++#define _LINUX_CE5300_IOSF_H
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/iosf_core.h>
++
++int _ce5300_iosf_port_is_valid(struct iosf_host * host, uint8_t dest_port);
++int _ce5300_iosf_msg_opcode_is_valid(struct iosf_host * host, uint8_t opcode);
++int _ce5300_iosf_msg_data_opcode_is_valid(struct iosf_host * host, uint8_t opcode);
++int _ce5300_iosf_reg_read32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t *value);
++int _ce5300_iosf_reg_write32(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t value);
++int _ce5300_iosf_reg_modify(struct iosf_host * host, uint8_t dest_port, uint32_t offset, uint32_t mask,  uint32_t value);
++
++#endif //__LINUX_DRV_IOSF_H
+--- /dev/null
++++ b/drivers/char/iosf/_iosf.c
+@@ -0,0 +1,391 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name:_iosf.c
++ * Driver for  IOSF(Intel On chip System Fabric)
++ *------------------------------------------------------------------------------
++ */
++
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/iosf_core.h>
++#include "_ce5300_iosf.h"
++#include "_ce2600_iosf.h"
++#include "_iosf.h"
++
++int iosf_drv_init(void);
++void iosf_drv_exit(void);
++
++int  iosf_core_init(void);
++void iosf_core_exit(void);
++
++
++/* vendor, device, subvendor, subdevice, class, class_mask, driver_data */
++static DEFINE_PCI_DEVICE_TABLE(iosf_id_tables) = {
++	{ PCI_DEVICE( PCI_VENDOR_ID_INTEL, 0x0C40), .driver_data = 0},
++	{ PCI_DEVICE( PCI_VENDOR_ID_INTEL, 0x0931), .driver_data = 0},
++	{0 },
++};
++MODULE_DEVICE_TABLE(pci, iosf_id_tables);
++
++/* atom only reboot indicator
++ * return 1 if it is atom only reboot
++ * other: 0
++ * */
++int intelce_boot_mode = 0;
++
++struct iosf {
++	struct iosf_host	host;
++	spinlock_t lock;
++	struct pci_dev *dev;
++};
++
++static inline void iosf_config_write32(struct pci_dev *dev,unsigned offset, u32 value)
++{
++ // 		iosf_dbg("iosf pci config write offset 0x%x, value:%x\n",offset, value);
++		pci_write_config_dword(dev, offset, value);
++}
++
++static inline u32 iosf_config_read32(struct pci_dev *dev, unsigned offset)
++{
++		u32 value;
++ // 		iosf_dbg("iosf pci config read offset 0x%x\n",offset);
++		pci_read_config_dword(dev, offset,&value);
++		return value;
++}
++
++static inline struct iosf *to_iosf(const struct iosf_host *p)
++{
++	return container_of(p, struct iosf, host);
++}
++
++int  _common_iosf_reg_read32(struct iosf_host * host, uint8_t dest_port, uint8_t opcode, uint32_t offset, uint32_t *value)
++{
++	struct iosf *iosf;
++	struct pci_dev *dev;
++	u32 tmp;
++	unsigned long flags;
++
++	iosf = to_iosf(host);
++	dev = iosf->dev;
++	spin_lock_irqsave(&iosf->lock, flags);
++
++	tmp = (offset & (~0xFF));
++	iosf_config_write32(dev, CUNIT_SPRX, tmp);/* write offset[31:9] into CUNIT_SPRX[31:8] */
++	smp_mb();
++
++	tmp = ((opcode << 24)|(dest_port << 16)|((offset & 0xFF) << 8)|(0xF << 4));
++	iosf_config_write32(dev, CUNIT_SPR, tmp);/* write dest_port into CUNIT_SPR[31:24] opcode into CUNIT_SPR[23:16] */
++	smp_mb();/* offset[7:0] into CUNIT_SPR[15:8], byte_enable[3:0] into CUNIT_SPR[7:4] */
++	*value = iosf_config_read32(dev,CUNIT_SDR); /*read data out of CUNIT_SDR */
++
++	spin_unlock_irqrestore(&iosf->lock, flags);
++	return 0;
++}
++
++
++
++int  _common_iosf_reg_write32(struct iosf_host * host, uint8_t dest_port, uint8_t opcode, uint32_t offset, uint32_t value)
++{
++
++	struct iosf *iosf;
++	struct pci_dev *dev;
++	u32 tmp;
++	unsigned long flags;
++
++	iosf = to_iosf(host);
++	dev = iosf->dev;
++	spin_lock_irqsave(&iosf->lock, flags);
++
++	iosf_config_write32(dev, CUNIT_SDR, value); /* write the data into CUNIT_SDR register */
++	smp_wmb();
++
++	tmp = (offset & (~0xFF));
++	iosf_config_write32(dev, CUNIT_SPRX, tmp); /* write offset[31:9] into CUNIT_SPRX[31:8] */
++	smp_wmb();
++
++	tmp = ((opcode << 24)|(dest_port << 16)|((offset & 0xFF) << 8)|(0xF << 4));
++	iosf_config_write32(dev, CUNIT_SPR, tmp); /* write dest_port into CUNIT_SPR[31:24] opcode into CUNIT_SPR[23:16] */
++	smp_wmb();							/* offset[7:0] into CUNIT_SPR[15:8], byte_enable[3:0] into CUNIT_SPR[7:4] */
++
++	spin_unlock_irqrestore(&iosf->lock, flags);
++	return 0;
++}
++
++
++int  _common_iosf_reg_modify(struct iosf_host * host, uint8_t dest_port, uint8_t rd_opcode, uint8_t wr_opcode,  uint32_t offset, uint32_t mask, uint32_t value)
++{
++	struct iosf *iosf;
++	struct pci_dev *dev;
++	u32 tmp;
++	unsigned long flags;
++
++	iosf = to_iosf(host);
++	dev = iosf->dev;
++	spin_lock_irqsave(&iosf->lock, flags);
++
++	/* read operation */
++	tmp = (offset & (~0xFF));
++	iosf_config_write32(dev, CUNIT_SPRX, tmp);/* write offset[31:9] into CUNIT_SPRX[31:8] */
++	smp_mb();
++
++	tmp = ((rd_opcode << 24)|(dest_port << 16)|((offset & 0xFF) << 8)|(0xF << 4));
++	iosf_config_write32(dev, CUNIT_SPR, tmp);/* write dest_port into CUNIT_SPR[31:24] opcode into CUNIT_SPR[23:16] */
++	smp_mb();/* offset[7:0] into CUNIT_SPR[15:8], byte_enable[3:0] into CUNIT_SPR[7:4] */
++
++	tmp = iosf_config_read32(dev,CUNIT_SDR); /*read data out of CUNIT_SDR */
++
++	/* mask operation */
++	value = ((value & mask) | (tmp & (~mask)));
++
++	/*write operation */
++	iosf_config_write32(dev, CUNIT_SDR, value); /* write the data into CUNIT_SDR register */
++	smp_wmb();
++
++	tmp = (offset & (~0xFF));
++	iosf_config_write32(dev, CUNIT_SPRX, tmp); /* write offset[31:9] into CUNIT_SPRX[31:8] */
++	smp_wmb();
++
++	tmp = ((wr_opcode << 24)|(dest_port << 16)|((offset & 0xFF) << 8)|(0xF << 4));
++	iosf_config_write32(dev, CUNIT_SPR, tmp); /* write dest_port into CUNIT_SPR[31:24] opcode into CUNIT_SPR[23:16] */
++	smp_wmb();							/* offset[7:0] into CUNIT_SPR[15:8], byte_enable[3:0] into CUNIT_SPR[7:4] */
++
++	spin_unlock_irqrestore(&iosf->lock, flags);
++	return 0;
++}
++
++int  _common_iosf_msg(struct iosf_host * host, uint8_t dest_port, uint8_t opcode)
++{
++
++	struct iosf *iosf;
++	struct pci_dev *dev;
++	u32 tmp;
++	unsigned long flags;
++
++	iosf = to_iosf(host);
++	dev = iosf->dev;
++	spin_lock_irqsave(&iosf->lock,flags);
++
++	tmp = ((opcode << 24)|(dest_port << 16));
++	iosf_config_write32(dev, CUNIT_SPR, tmp); /* write dest_port into CUNIT_SPR[31:24] opcode into CUNIT_SPR[23:16] */
++	smp_wmb();							/* offset[7:0] into CUNIT_SPR[15:8], byte_enable[3:0] into CUNIT_SPR[7:4] */
++
++	spin_unlock_irqrestore(&iosf->lock, flags);
++	return 0;
++}
++
++int  _common_iosf_msg_data(struct iosf_host * host, uint8_t dest_port, uint8_t opcode, uint32_t data)
++{
++
++	struct iosf *iosf;
++	struct pci_dev *dev;
++	u32 tmp;
++	unsigned long flags;
++
++	iosf = to_iosf(host);
++	dev = iosf->dev;
++	spin_lock_irqsave(&iosf->lock,flags);
++
++	iosf_config_write32(dev, CUNIT_SDR, data); /* write the data into CUNIT_SDR register */
++	smp_wmb();
++
++	tmp = ((opcode << 24)|(dest_port << 16));
++	iosf_config_write32(dev, CUNIT_SPR, tmp); /* write dest_port into CUNIT_SPR[31:24] opcode into CUNIT_SPR[23:16] */
++	smp_wmb();							/* offset[7:0] into CUNIT_SPR[15:8], byte_enable[3:0] into CUNIT_SPR[7:4] */
++
++	spin_unlock_irqrestore(&iosf->lock, flags);
++	return 0;
++}
++
++static int intelce_get_boot_mode(void)
++{
++	struct iosf_host *host;
++	int last_reset_event;
++        int mode, ret;
++
++	host = iosf_request(0);
++	if (NULL == host) {
++		printk(KERN_ERR "Failed to open iosf device\n");
++		return -ENODEV;
++	}
++
++	if (kiosf_reg_read32(host, 4, 0xD7, &last_reset_event)) {
++		printk("%s:%d Error in kiosf_reg_read32 \n",__FUNCTION__,__LINE__);
++		ret = -EINVAL;
++		goto error_iosf_read;
++	}
++	mode = (last_reset_event >> 16) & 0xFF;
++	if (mode == 4) {
++		intelce_boot_mode = 1;
++        printk("This is atom only reboot\n");
++    }
++
++error_iosf_read:
++	iosf_release(host);
++	return ret;
++}
++
++#ifdef CONFIG_PM
++static int iosf_device_suspend(struct device *dev)
++{
++	//struct pci_dev *pdev = to_pci_dev(dev);
++	int ret = 0;
++
++	return ret;
++}
++
++static int iosf_device_resume(struct device *dev)
++{
++	//struct pci_dev *pdev = to_pci_dev(dev);
++	int ret = 0;
++
++	return ret;
++}
++static const struct dev_pm_ops iosf_pm_ops = {
++	.suspend    = iosf_device_suspend,
++	.resume     = iosf_device_resume,
++};
++#endif
++
++
++static int iosf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
++{
++
++	struct iosf *iosf;
++	int ret = 0;
++
++	pci_request_regions(pdev, "iosf");
++
++	iosf = kzalloc(sizeof *iosf, GFP_KERNEL);
++	if (IS_ERR(iosf)) {
++		dev_err(&pdev->dev, "failed to allocate memory\n");
++		ret = -ENOMEM;
++		goto free_mem_region;
++	}
++
++
++	spin_lock_init(&iosf->lock);
++	iosf->dev = pdev;
++	iosf->host.bus_id = (uint32_t)id->driver_data;
++	iosf->host.owner = THIS_MODULE;
++
++	switch (id->device) {
++		case  CE5300_SOC_DEVICE_ID:
++			iosf->host.port_is_valid = _ce5300_iosf_port_is_valid;
++			iosf->host.msg_opcode_is_valid = _ce5300_iosf_msg_opcode_is_valid;
++			iosf->host.msg_data_opcode_is_valid = _ce5300_iosf_msg_data_opcode_is_valid;
++			iosf->host.reg_read32= _ce5300_iosf_reg_read32;
++			iosf->host.reg_write32= _ce5300_iosf_reg_write32;
++			iosf->host.reg_modify= _ce5300_iosf_reg_modify;
++			iosf->host.msg= _common_iosf_msg;
++			iosf->host.msg_data= _common_iosf_msg_data;
++			break;
++
++		case CE2600_SOC_DEVICE_ID:
++			iosf->host.port_is_valid = _ce2600_iosf_port_is_valid;
++			iosf->host.msg_opcode_is_valid = _ce2600_iosf_msg_opcode_is_valid;
++			iosf->host.msg_data_opcode_is_valid = _ce2600_iosf_msg_data_opcode_is_valid;
++			iosf->host.reg_read32= _ce2600_iosf_reg_read32;
++			iosf->host.reg_write32= _ce2600_iosf_reg_write32;
++			iosf->host.reg_modify= _ce2600_iosf_reg_modify;
++			iosf->host.msg= _common_iosf_msg;
++			iosf->host.msg_data= _common_iosf_msg_data;
++			break;
++
++		default:
++			ret = -ENODEV;
++	}
++
++	if (ret)
++		goto free_mem;
++
++	ret =  iosf_register(&iosf->host);
++
++    if (CE2600_SOC_DEVICE_ID == id->device) {
++        intelce_get_boot_mode();
++    }
++
++	if (ret)
++		goto free_mem;
++
++	pci_set_drvdata(pdev, iosf);
++	return 0;
++
++
++free_mem:
++	kfree(iosf);
++
++free_mem_region:
++	pci_release_regions(pdev);
++
++	pci_set_drvdata(pdev, NULL);
++	return ret;
++}
++
++static void iosf_remove(struct pci_dev *pdev)
++{
++	struct iosf *iosf = pci_get_drvdata(pdev);
++
++	iosf_unregister(&iosf->host);
++	pci_release_regions(pdev);
++	kfree(iosf);
++	pci_set_drvdata(pdev, NULL);
++
++}
++
++static struct pci_driver iosf_driver = {
++	.name	= "iosf-sb",
++	.probe		= iosf_probe,
++	.remove		= iosf_remove,
++	.id_table	= iosf_id_tables,
++#ifdef CONFIG_PM
++	.driver.pm		= &iosf_pm_ops,
++#endif
++};
++
++static int __init iosf_init(void)
++{
++	iosf_core_init();
++	iosf_drv_init();
++	return pci_register_driver(&iosf_driver);
++}
++
++static void __exit iosf_exit(void)
++{
++	pci_unregister_driver(&iosf_driver);
++	iosf_drv_exit();
++	iosf_core_exit();
++}
++
++module_init(iosf_init);
++module_exit(iosf_exit);
+--- /dev/null
++++ b/drivers/char/iosf/_iosf.h
+@@ -0,0 +1,54 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name:_iosf.h
++ * Driver for  IOSF(Intel On chip System Fabric)
++ *------------------------------------------------------------------------------
++ */
++
++#ifndef _LINUX_DRV_IOSF_H
++#define _LINUX_DRV_IOSF_H
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/iosf_core.h>
++
++#define CUNIT_SPR             0xD0
++#define CUNIT_SDR             0xD4
++#define CUNIT_SPRX            0xD8
++#define CUNIT_SPRX2           0xDC
++
++int  _common_iosf_reg_read32(struct iosf_host * host, uint8_t dest_port, uint8_t opcode, uint32_t offset, uint32_t *value);
++int  _common_iosf_reg_write32(struct iosf_host * host, uint8_t dest_port, uint8_t opcode, uint32_t offset, uint32_t value);
++int  _common_iosf_reg_modify(struct iosf_host * host, uint8_t dest_port, uint8_t rd_opcode, uint8_t wr_opcode,  uint32_t offset, uint32_t mask, uint32_t     value);
++
++#endif //__LINUX_DRV_IOSF_H
+--- /dev/null
++++ b/drivers/char/iosf/iosf_common.h
+@@ -0,0 +1,120 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++* File Name: iosf_common.h
++*------------------------------------------------------------------------------
++*/
++//! \file
++#ifndef  __LINUX_IOSF_COMMON_H
++#define  __LINUX_IOSF_COMMON_H 
++
++
++#include <linux/types.h>
++
++#define IOSF_MAGIC (('I' << 24) || ('O' << 16) | ('S' << 8) | ('F'))
++
++struct iosf_info_user
++{
++	uint32_t  dest_port;
++	uint32_t  opcode;
++	uint32_t  offset;
++	uint32_t  mask;
++	uint32_t  flag;
++	uint32_t  value;
++
++};
++
++
++// IOSF PORT Definitions:
++#define IOSF_PORT_VT              0x00
++#define IOSF_PORT_MCU             0x01
++
++#define IOSF_PORT_HUNIT           0x02
++#define IOSF_PORT_BUNIT           0x03
++
++#define IOSF_PORT_PUNIT           0x04
++#define IOSF_PORT_CPUNIT          0x0A
++
++#define IOSF_PORT_PCIE_AFE        0x11
++
++#define IOSF_PORT_DFX_LAKEMORE    0x38
++#define IOSF_PORT_DFX_OMAR        0x39
++#define IOSF_PORT_DFX_TG          0x3A
++#define IOSF_PORT_ITUNIT1         0x40
++#define IOSF_PORT_SAPms_BRIDGE    0x41
++#define IOSF_PORT_ITUNIT2         0x42
++
++#define IOSF_PORT_DDR_IO          0x50
++#define IOSF_PORT_REUT0           0x54
++#define IOSF_PORT_REUT1           0x55
++#define IOSF_PORT_SATA_AFE        0x59
++#define IOSF_PORT_USB_AFE         0x60
++
++
++#define IOSF_PORT_ADAC            0x81
++#define IOSF_PORT_HDMI_TX_AFE     0x82
++#define IOSF_PORT_HDMI_RX_AFE     0x83
++
++#define IOSF_PORT_FPLL            0x88
++#define IOSF_PORT_HPLL            0x89
++#define IOSF_PORT_DPLL            0x8A
++#define IOSF_PORT_APLL            0x8B
++
++#define IOSF_PORT_MOCA_AFE        0x8E
++#define IOSF_PORT_MOCA_MAC        0x8F
++
++
++#define IOSF_PORT_PSF_0S          0x90  /* south */
++#define IOSF_PORT_PSF_0N		  0x32  /*north */
++
++
++#define IOSF_PORT_PSF1            0x91
++
++#define IOSF_PORT_PSF3            0x93
++
++
++
++#define  IOSF_8BITS_FLAG		1
++#define  IOSF_16BITS_FLAG		(1 << 1)
++#define  IOSF_32BITS_FLAG		(1 << 2)
++
++#define IOSF_IOC_MAGIC  'I'
++
++#define IOSF_IOC_RD		_IOW(IOSF_IOC_MAGIC, 1, struct iosf_info_user)
++#define IOSF_IOC_WR		_IOW(IOSF_IOC_MAGIC, 2, struct iosf_info_user)
++#define IOSF_IOC_MODIFY		_IOW(IOSF_IOC_MAGIC, 3, struct iosf_info_user)
++#define IOSF_IOC_MSG		_IOW(IOSF_IOC_MAGIC, 4, struct iosf_info_user)
++#define IOSF_IOC_MSG_DATA	_IOW(IOSF_IOC_MAGIC, 5, struct iosf_info_user)
++
++
++
++
++
++
++#endif // __LINUX_IOSF_COMMON_H
++
+--- /dev/null
++++ b/drivers/char/iosf/iosf_core.c
+@@ -0,0 +1,185 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name: iosf_core.c
++ *------------------------------------------------------------------------------
++ */
++
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/device.h>
++#include <linux/spinlock.h>
++#include <linux/fs.h>
++#include <linux/completion.h>
++#include <linux/workqueue.h>
++#include <linux/list.h>
++#include <linux/sched.h>
++#include <asm/atomic.h>
++
++
++#include <linux/iosf_core.h>
++#include "iosf_common.h"
++
++static gid_t gid = 510;
++module_param(gid, uint, S_IRUGO | S_IWUSR);
++
++struct class *iosf_class;
++
++static LIST_HEAD(iosf_host_list);
++static DEFINE_SPINLOCK(host_list_lock);
++
++int iosf_register(struct iosf_host *iosf)
++{
++	atomic_set(&iosf->users, 0);
++	spin_lock(&host_list_lock);
++	list_add_tail(&iosf->list, &iosf_host_list);
++	spin_unlock(&host_list_lock);
++
++	return 0;
++
++}
++EXPORT_SYMBOL(iosf_register);
++
++int iosf_unregister(struct iosf_host *iosf)
++{
++	if (atomic_read (&iosf->users) > 0)
++		return -EBUSY;
++
++	spin_lock(&host_list_lock);
++	list_del(&iosf->list);
++	spin_unlock(&host_list_lock);
++	return 0;
++}
++EXPORT_SYMBOL(iosf_unregister);
++
++struct iosf_host *iosf_request(uint32_t bus_id)
++{
++	struct iosf_host *p;
++
++	list_for_each_entry(p, &iosf_host_list, list)
++	{
++		if (bus_id == p->bus_id)
++		{
++			atomic_inc(&p->users);
++			return p;
++		}
++	}
++	return NULL;
++
++}
++EXPORT_SYMBOL(iosf_request);
++
++void iosf_release(struct iosf_host *host)
++{
++	atomic_dec(&host->users);
++}
++
++EXPORT_SYMBOL(iosf_release);
++
++
++int  kiosf_reg_read32(struct iosf_host *iosf, uint8_t dest_port, uint32_t offset, uint32_t *value)
++{
++	if ((0 != current_euid()) && (gid != current_egid())) return -EPERM;
++
++	if (!iosf->port_is_valid(iosf, dest_port))
++		return -EINVAL;
++
++	return iosf->reg_read32(iosf, dest_port, offset, value);
++
++}
++EXPORT_SYMBOL(kiosf_reg_read32);
++
++int  kiosf_reg_write32(struct iosf_host *iosf, uint8_t dest_port, uint32_t offset, uint32_t value)
++{
++	if ((0 != current_euid()) && (gid != current_egid())) return -EPERM;
++
++	if (!iosf->port_is_valid(iosf, dest_port))
++		return -EINVAL;
++
++	return iosf->reg_write32(iosf, dest_port, offset, value);
++
++}
++EXPORT_SYMBOL(kiosf_reg_write32);
++
++int  kiosf_reg_modify(struct iosf_host *iosf, uint8_t dest_port, uint32_t offset, uint32_t mask,  uint32_t value)
++{
++	if ((0 != current_euid()) && (gid != current_egid())) return -EPERM;
++
++	if (!iosf->port_is_valid(iosf, dest_port))
++		return -EINVAL;
++
++	return iosf->reg_modify(iosf, dest_port, offset, mask, value);
++
++}
++EXPORT_SYMBOL(kiosf_reg_modify);
++
++int kiosf_msg(struct iosf_host *iosf, uint8_t dest_port, uint8_t opcode)
++{
++	if ((0 != current_euid()) && (gid != current_egid())) return -EPERM;
++
++	if (!iosf->port_is_valid(iosf, dest_port) || !iosf->msg_opcode_is_valid(iosf, opcode))
++		return -EINVAL;
++
++	return iosf->msg(iosf, dest_port, opcode);
++
++}
++EXPORT_SYMBOL(kiosf_msg);
++
++int kiosf_msg_data(struct iosf_host *iosf, uint8_t dest_port, uint8_t opcode, uint32_t data)
++{
++	if ((0 != current_euid()) && (gid != current_egid())) return -EPERM;
++
++	if (!iosf->port_is_valid(iosf, dest_port) || !iosf->msg_data_opcode_is_valid(iosf, opcode))
++		return -EINVAL;
++
++	return iosf->msg_data(iosf, dest_port, opcode, data);
++
++}
++EXPORT_SYMBOL(kiosf_msg_data);
++
++int __init iosf_core_init(void)
++{
++
++	iosf_class = class_create(THIS_MODULE, "iosf");
++	if (IS_ERR(iosf_class))
++	{
++		printk(KERN_ERR "iosf class create failed!\n");
++		return -1;
++	}
++	return 0;
++}
++
++void __exit iosf_core_exit(void)
++{
++	class_destroy(iosf_class);
++
++}
++
+--- /dev/null
++++ b/drivers/char/iosf/iosf_drv.c
+@@ -0,0 +1,249 @@
++/*
++ *  GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2010-2013 Intel Corporation. All rights reserved.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *    Intel Corporation
++ *    2200 Mission College Blvd.
++ *    Santa Clara, CA  97052
++ *
++ */
++
++/*------------------------------------------------------------------------------
++ * File Name: iosf_drv.c
++ *------------------------------------------------------------------------------
++ */
++
++
++#include <linux/kernel.h>
++#include <linux/version.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/sched.h>
++#include <linux/interrupt.h>
++#include <linux/proc_fs.h>
++#include <linux/wait.h>
++
++#include <linux/list.h>
++#include <linux/interrupt.h>
++#include <linux/device.h>
++#include <linux/pci.h>
++#include <linux/cdev.h>
++#include <asm/uaccess.h>
++#include <asm/irq.h>
++#include <asm/io.h>
++
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,28)
++    #include <asm/semaphore.h>
++#else
++    #include <linux/semaphore.h>
++#endif
++
++#include "iosf_common.h"
++#include <linux/iosf_core.h>
++
++/* Driver identification */
++MODULE_AUTHOR("Intel Corporation, (C) 2006 - 2010 - All Rights Reserved");
++MODULE_DESCRIPTION("IOSF Device Driver for Linux 2.6");
++MODULE_SUPPORTED_DEVICE("Intel Media Processors");
++MODULE_LICENSE("Dual BSD/GPL"); /* Inform kernel that driver is not GPL. */
++
++/* Unique name for driver */
++#ifndef DEV_NAME
++#define DEV_NAME  "iosf"
++#endif
++const static char *devname = DEV_NAME;
++
++#ifndef MOD_NAME
++#define MOD_NAME "iosf.ko"
++#endif
++
++
++/* This function is the first function called to load the driver after an insmod */
++/* command */
++
++
++#define NR_IOSF_CHRDEVS  2
++
++static int iosf_major;
++
++extern  struct class *iosf_class;
++
++
++        
++/*------------------------------------------------------------------------------
++ * iosf_open
++ *------------------------------------------------------------------------------
++ */
++
++static int iosf_drv_open(struct inode *inode, struct file *filp)
++{
++		struct iosf_host *host;
++		uint32_t bus_id;
++		bus_id = iminor(inode);
++		host = iosf_request(bus_id);
++		
++		if (!host) return -ENODEV;
++
++		filp->private_data = host;
++        return 0;
++}
++        
++/*------------------------------------------------------------------------------
++ * scard_close
++ *------------------------------------------------------------------------------
++ */
++        
++static int iosf_drv_close(struct inode *inode, struct file *filp)
++{
++		struct iosf_host *host;
++
++		host = (struct iosf_host *)filp->private_data;
++		iosf_release(host);
++
++		filp->private_data = NULL;
++        return 0;
++}
++        
++
++/*------------------------------------------------------------------------------
++ * iosf_ioctl
++ *------------------------------------------------------------------------------
++ */
++static long iosf_unlocked_ioctl(struct file *filp, u_int cmd, u_long arg)
++{
++	struct iosf_info_user  iosf_info;
++	struct iosf_host *host;
++	void __user *argp = (void __user *)arg;
++	int ret = 0;
++       
++    /* Check for valid pointer to the parameter list */
++     if (0 == arg) 
++	 {
++     	printk(KERN_ERR "%s:%4i:  iosf chrdev ioctl failed\n", __FILE__, __LINE__);
++        return -EINVAL;
++     }
++
++	if (copy_from_user(&iosf_info, argp, sizeof(iosf_info)))
++		return -EFAULT;
++
++	host = (struct iosf_host *)filp->private_data;
++
++	
++
++        /* Execute ioctl request */
++	switch (cmd) 
++	{
++    	case IOSF_IOC_RD:
++			if (iosf_info.flag & IOSF_32BITS_FLAG)
++			{
++				ret = kiosf_reg_read32(host, iosf_info.dest_port, iosf_info.offset,&iosf_info.value);
++				if (copy_to_user(argp, &iosf_info, sizeof(iosf_info)))
++					return -EFAULT;
++			}
++			else if(iosf_info.flag & (IOSF_16BITS_FLAG | IOSF_8BITS_FLAG))
++			{
++				ret = -ENOSYS;
++			}
++			break;
++			
++		case IOSF_IOC_WR:
++			if (iosf_info.flag & IOSF_32BITS_FLAG)
++			{
++				ret = kiosf_reg_write32(host, iosf_info.dest_port, iosf_info.offset,iosf_info.value);
++			}
++			else if(iosf_info.flag & (IOSF_16BITS_FLAG | IOSF_8BITS_FLAG))
++			{
++				ret = -ENOSYS;
++			}
++			break;
++		case IOSF_IOC_MODIFY:
++			if (iosf_info.flag & IOSF_32BITS_FLAG)
++			{
++				ret = kiosf_reg_modify(host, iosf_info.dest_port, iosf_info.offset, iosf_info.mask, iosf_info.value);
++			}
++			else if(iosf_info.flag & (IOSF_16BITS_FLAG | IOSF_8BITS_FLAG))
++			{	
++				ret = -ENOSYS;
++			}
++			break;			
++		case IOSF_IOC_MSG:
++			ret = kiosf_msg(host, iosf_info.dest_port, iosf_info.opcode);
++			break;
++		case IOSF_IOC_MSG_DATA:
++			ret = kiosf_msg_data(host, iosf_info.dest_port, iosf_info.opcode, iosf_info.value);
++			break;
++		default:
++			break;
++		
++        }
++
++        return ret;
++}
++static unsigned int iosf_poll(struct file *filp, struct poll_table_struct *table)
++{
++	return -ENOSYS;
++}
++
++
++/* Structure to map driver functions to kernel */
++struct file_operations iosf_drv_fops = {
++        .owner   = THIS_MODULE,
++        .unlocked_ioctl   = iosf_unlocked_ioctl, 
++        .poll	 = iosf_poll,
++        .open    = iosf_drv_open, 
++        .release = iosf_drv_close,
++};
++
++/*------------------------------------------------------------------------------
++ * mdoule init
++ *------------------------------------------------------------------------------
++ */
++
++
++int
++iosf_drv_init(void)
++{
++	int ret = 0;
++	if ((iosf_major = register_chrdev(0, devname, &iosf_drv_fops)) < 0)
++	{ 
++	  	ret = iosf_major;
++		printk("iosf alloc character dev no failed!\n");
++		return ret;
++	 }
++				
++    return ret;
++
++}
++        
++/*------------------------------------------------------------------------------
++ * module exit
++ *------------------------------------------------------------------------------
++ */
++
++void
++iosf_drv_exit(void)
++{
++
++	unregister_chrdev(iosf_major, devname);
++	iosf_major = 0;
++
++}
+--- a/drivers/char/mem.c
++++ b/drivers/char/mem.c
+@@ -37,6 +37,26 @@
+ 
+ #define DEVPORT_MINOR	4
+ 
++#ifdef CONFIG_ARCH_GEN3
++int range_is_sys_ram(unsigned long pfn, unsigned long size)
++{
++        u64 from = ((u64)pfn) << PAGE_SHIFT;
++        u64 to = from + size;
++        u64 cursor = from;
++
++        while (cursor < to) {
++                if (page_is_ram(pfn)) {
++                        printk(KERN_INFO "system ram! pfn 0x%x.\n", (unsigned int)pfn);
++                        return 1;
++                }
++                cursor += PAGE_SIZE;
++                pfn++;
++        }
++        return 0;
++}
++EXPORT_SYMBOL(range_is_sys_ram);
++#endif
++
+ static inline unsigned long size_inside_page(unsigned long start,
+ 					     unsigned long size)
+ {
+--- a/drivers/i2c/busses/i2c-pxa.c
++++ b/drivers/i2c/busses/i2c-pxa.c
+@@ -46,6 +46,13 @@ struct pxa_reg_layout {
+ 	u32 icr;
+ 	u32 isr;
+ 	u32 isar;
++#ifdef CONFIG_GEN3_I2C
++        u32 iwcr;
++        u32 ismscr;
++        u32 ismlcr;
++        u32 ifmscr;
++        u32 ifmlcr;
++#endif  
+ };
+ 
+ enum pxa_i2c_types {
+@@ -77,7 +84,14 @@ static struct pxa_reg_layout pxa_reg_lay
+ 		.idbr =	0x0c,
+ 		.icr =	0x00,
+ 		.isr =	0x04,
+-		/* no isar register */
++#ifdef CONFIG_GEN3_I2C
++                .iwcr = 0x18,
++                .ismscr = 0x1c,
++                .ismlcr = 0x20,
++                .ifmscr = 0x24,
++                .ifmlcr = 0x28,
++#endif
++                /* no isar register */
+ 	},
+ };
+ 
+@@ -149,11 +163,21 @@ struct pxa_i2c {
+ 	void __iomem		*reg_icr;
+ 	void __iomem		*reg_isr;
+ 	void __iomem		*reg_isar;
++#ifdef CONFIG_GEN3_I2C
++        void __iomem            *reg_iwcr;
++        void __iomem            *reg_ismscr;
++        void __iomem            *reg_ismlcr;
++        void __iomem            *reg_ifmscr;
++        void __iomem            *reg_ifmlcr;
++#endif
+ 
+ 	unsigned long		iobase;
+ 	unsigned long		iosize;
+ 
+ 	int			irq;
++#ifdef CONFIG_GEN3_I2C
++        unsigned int            set_iwcr_flag :1;
++#endif
+ 	unsigned int		use_pio :1;
+ 	unsigned int		fast_mode :1;
+ 	unsigned int		high_mode:1;
+@@ -168,6 +192,19 @@ struct pxa_i2c {
+ #define _ISR(i2c)	((i2c)->reg_isr)
+ #define _ISAR(i2c)	((i2c)->reg_isar)
+ 
++#ifdef CONFIG_GEN3_I2C
++#define _IWCR(i2c)      ((i2c)->reg_iwcr)
++#define _ISMSCR(i2c)    ((i2c)->reg_ismscr)
++#define _ISMLCR(i2c)    ((i2c)->reg_ismlcr)
++#define _IFMSCR(i2c)    ((i2c)->reg_ifmscr)
++#define _IFMLCR(i2c)    ((i2c)->reg_ifmlcr)
++
++#define I2C_SCL_SM_S_VALUE    (0xA3)
++#define I2C_SCL_SM_L_VALUE    (0xA3)
++#define I2C_SCL_FM_S_VALUE    (0x16)
++#define I2C_SCL_FM_L_VALUE    (0x33)
++#endif
++
+ /*
+  * I2C Slave mode address
+  */
+@@ -459,6 +496,12 @@ static void i2c_pxa_reset(struct pxa_i2c
+ 	writel(I2C_ISR_INIT, _ISR(i2c));
+ 	writel(readl(_ICR(i2c)) & ~ICR_UR, _ICR(i2c));
+ 
++#ifdef CONFIG_GEN3_I2C 
++        /*set iwcr register to 0x12 on CE5300 platform other than CE5300 A0*/
++        if(i2c->set_iwcr_flag)
++                writel(0x12, _IWCR(i2c));
++#endif
++
+ 	if (i2c->reg_isar)
+ 		writel(i2c->slave_addr, _ISAR(i2c));
+ 
+@@ -472,10 +515,23 @@ static void i2c_pxa_reset(struct pxa_i2c
+ #endif
+ 
+ 	i2c_pxa_set_slave(i2c, 0);
+-
+ 	/* enable unit */
++#ifdef CONFIG_GEN3_I2C
++	writel(readl(_ICR(i2c)) | ICR_IUE | ICR_SCLE, _ICR(i2c));
++#else
+ 	writel(readl(_ICR(i2c)) | ICR_IUE, _ICR(i2c));
++#endif
+ 	udelay(100);
++#ifdef CONFIG_GEN3_I2C 
++        /*
++         * Set the SCL high phase/low phase timing value
++         * according to the hardware recommendation.
++         */
++        writel(I2C_SCL_SM_S_VALUE, _ISMSCR(i2c));
++        writel(I2C_SCL_SM_L_VALUE, _ISMLCR(i2c));
++        writel(I2C_SCL_FM_S_VALUE, _IFMSCR(i2c));
++        writel(I2C_SCL_FM_L_VALUE, _IFMLCR(i2c));
++#endif
+ }
+ 
+ 
+@@ -822,13 +878,23 @@ static int i2c_pxa_pio_xfer(struct i2c_a
+ {
+ 	struct pxa_i2c *i2c = adap->algo_data;
+ 	int ret, i;
++#ifdef CONFIG_GEN3_I2C
++        unsigned int former_mode = i2c->fast_mode;
+ 
++        i2c->fast_mode = (adap->mode ? 1 : 0);
++        /* reset i2c controller if mode changed */
++        if((former_mode != i2c->fast_mode)||(!(readl(_ICR(i2c)) & ICR_IUE)))
++                i2c_pxa_reset(i2c);
++#endif
++
++#ifndef CONFIG_GEN3_I2C
+ 	/* If the I2C controller is disabled we need to reset it
+ 	  (probably due to a suspend/resume destroying state). We do
+ 	  this here as we can then avoid worrying about resuming the
+ 	  controller before its users. */
+ 	if (!(readl(_ICR(i2c)) & ICR_IUE))
+ 		i2c_pxa_reset(i2c);
++#endif
+ 
+ 	for (i = adap->retries; i >= 0; i--) {
+ 		ret = i2c_pxa_do_pio_xfer(i2c, msgs, num);
+@@ -1053,6 +1119,15 @@ static int i2c_pxa_xfer(struct i2c_adapt
+ 	struct pxa_i2c *i2c = adap->algo_data;
+ 	int ret, i;
+ 
++#ifdef CONFIG_GEN3_I2C
++        unsigned int former_mode = i2c->fast_mode;
++
++        i2c->fast_mode = (adap->mode ? 1 : 0);
++        /* reset i2c controller if mode changed */
++        if(former_mode != i2c->fast_mode)
++                i2c_pxa_reset(i2c);
++#endif
++
+ 	for (i = adap->retries; i >= 0; i--) {
+ 		ret = i2c_pxa_do_xfer(i2c, msgs, num);
+ 		if (ret != I2C_RETRY)
+@@ -1194,6 +1269,13 @@ static int i2c_pxa_probe(struct platform
+ 	i2c->reg_isr = i2c->reg_base + pxa_reg_layout[i2c_type].isr;
+ 	if (i2c_type != REGS_CE4100)
+ 		i2c->reg_isar = i2c->reg_base + pxa_reg_layout[i2c_type].isar;
++#ifdef CONFIG_GEN3_I2C
++        i2c->reg_iwcr = i2c->reg_base + pxa_reg_layout[i2c_type].iwcr;
++        i2c->reg_ismscr = i2c->reg_base + pxa_reg_layout[i2c_type].ismscr;
++        i2c->reg_ismlcr = i2c->reg_base + pxa_reg_layout[i2c_type].ismlcr;
++        i2c->reg_ifmscr = i2c->reg_base + pxa_reg_layout[i2c_type].ifmscr;
++        i2c->reg_ifmlcr = i2c->reg_base + pxa_reg_layout[i2c_type].ifmlcr;
++#endif
+ 
+ 	i2c->iobase = res->start;
+ 	i2c->iosize = resource_size(res);
+@@ -1209,6 +1291,11 @@ static int i2c_pxa_probe(struct platform
+ 		i2c->slave = plat->slave;
+ #endif
+ 		i2c->adap.class = plat->class;
++#ifdef CONFIG_GEN3_I2C
++                i2c->adap.mode = plat->fast_mode;
++                i2c->set_iwcr_flag = plat->set_iwcr_flag;
++#endif
++
+ 	}
+ 
+ 	if (i2c->high_mode) {
+@@ -1238,8 +1325,11 @@ static int i2c_pxa_probe(struct platform
+ 	i2c->adap.algo_data = i2c;
+ 	i2c->adap.dev.parent = &dev->dev;
+ #ifdef CONFIG_OF
++#ifndef CONFIG_GEN3_I2C
+ 	i2c->adap.dev.of_node = dev->dev.of_node;
+ #endif
++#endif
++
+ 
+ 	ret = i2c_add_numbered_adapter(&i2c->adap);
+ 	if (ret < 0) {
+--- a/firmware/Makefile
++++ b/firmware/Makefile
+@@ -135,7 +135,7 @@ fw-shipped-$(CONFIG_USB_SERIAL_XIRCOM) +
+ fw-shipped-$(CONFIG_USB_VICAM) += vicam/firmware.fw
+ fw-shipped-$(CONFIG_VIDEO_CPIA2) += cpia2/stv0672_vp4.bin
+ fw-shipped-$(CONFIG_YAM) += yam/1200.bin yam/9600.bin
+-
++fw-shipped-$(CONFIG_USB_XHCI_HCD) += renesas/K2018090.mem
+ fw-shipped-all := $(fw-shipped-y) $(fw-shipped-m) $(fw-shipped-)
+ 
+ # Directories which we _might_ need to create, so we have a rule for them.
+--- a/firmware/WHENCE
++++ b/firmware/WHENCE
+@@ -5,6 +5,19 @@
+ This file attempts to document the origin and licensing information,
+ if known, for each piece of firmware distributed for use with the Linux
+ kernel.
++--------------------------------------------------------------------------
++
++Driver: xhci -- Renesas Electronics uPD720201 & uPD720202 USB3.0 Host Controller
++
++File: firmware/renesas/K2018090.mem
++
++Licence: Unknown and no source visible; but allegedly free to redistribut.
++    Marked:
++
++    Copyright (C) 2011-2012 Renesas Electronics
++    Corporation All Rights Reserved
++
++Support avaiable at: http://www.renesas.com/products/soc/usb_assp/product/
+ 
+ --------------------------------------------------------------------------
+ 

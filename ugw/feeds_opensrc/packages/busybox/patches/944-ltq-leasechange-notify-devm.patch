@@ -1,0 +1,175 @@
+Index: busybox-1.17.1/networking/udhcp/Config.src
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/Config.src	2013-06-19 12:59:49.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/Config.src	2013-06-19 13:12:55.000000000 +0530
+@@ -171,3 +171,11 @@
+ 	    maximum size of entire IP packet, and sends packets which are
+ 	    28 bytes too large.
+ 	  Seednet (ISP) VDSL: sends packets 2 bytes too large.
++
++config FEATURE_DHCP_TR69_HOSTS_OBJ
++	bool "Support for TR69 Hosts object"
++	default y
++	depends on UDHCPD
++	help
++	  Support for TR69 Hosts object.
++
+Index: busybox-1.17.1/networking/udhcp/common.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/common.c	2013-06-19 12:59:49.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/common.c	2013-06-19 13:10:58.000000000 +0530
+@@ -689,7 +689,7 @@
+ }
+ #endif
+ 
+-#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++#if defined ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION || CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
+ /*
+ 
+ This function takes pointer to the first enterprise no of the vendor specific options
+@@ -885,7 +885,8 @@
+ The data of the message sent is only needed in ADD
+ For a delete or write only the ipaddr matters
+ ********************************************************************************************/
+-int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr, uint8_t inFrom){
++int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr, uint8_t inFrom)
++{
+ 	int iFd, iRet;
+ 	x_IFX_IPC_Msg xMsg = {0};
+ 	char string[380] = {'\0'};
+@@ -893,17 +894,19 @@
+ 
+ 	log1( " WRITEMSG CALLED\n");
+ 	memset(&xMsg, 0, sizeof(x_IFX_IPC_Msg));
+-
++#if 0
+ 	if((operation == 1)&&(msg == NULL))
+ 		return -1; //error
+-
++#endif
+ 
+ 	xMsg.xHdr.ucFrom = inFrom;
+ 	xMsg.xHdr.ucTo = operation;
+ 	xMsg.xHdr.uiReserved = htonl(ipaddr);
+ 
++#ifndef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
+ 	// data is meaningful only in add
+-	if(operation == 1){
++	if(operation == 1)
++	{
+ 		log1( " WRITEMSG : FORM STRING TO BE POSTED \n");
+ 
+ 		if(inFrom == IFX_IPC_APP_ID_DHCPD){
+@@ -923,6 +926,24 @@
+ 		xMsg.xHdr.unMsgSize =  htons(string_len);
+ 		memcpy(xMsg.acMsg, (void *)string, string_len);
+ 	}
++#else
++	// data is meaningful only in add
++	if((operation == 1) && (inFrom == IFX_IPC_APP_ID_DHCPD))
++	{
++		log1( " WRITEMSG : FORM STRING TO BE POSTED \n");
++		if(msg != NULL)
++		{
++			string_len =  form_vsi_string(msg+4, string);
++			if(string_len < 0)
++			{
++				log1( "Failure in forminmg string data");
++				return -1;
++			}
++			xMsg.xHdr.unMsgSize =  htons(string_len);
++			memcpy(xMsg.acMsg, (void *)string, string_len);
++		}
++	}
++#endif
+ 
+ 	iFd = open(file,O_WRONLY | O_NONBLOCK);
+ 	log1( " WRITEMSG : FIFO OPENED WITH FD : %d \n", iFd);
+Index: busybox-1.17.1/networking/udhcp/common.h
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/common.h	2013-06-19 12:59:49.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/common.h	2013-06-19 13:10:32.000000000 +0530
+@@ -201,6 +201,9 @@
+ #define VSI_ENTERPRISE_NO_DSL	3561
+ #define IFX_IPC_APP_ID_DHCPD		211
+ #define IFX_IPC_APP_ID_DHCPC		212
++#ifdef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
++#define LTQ_IPC_APP_ID_DHCP_LEASE_CHANGE	222
++#endif
+ 
+ #define OPT_VSI_ENTPNO_LEN 4
+ #define SUBOPT_CODE		0
+Index: busybox-1.17.1/networking/udhcp/dhcpd.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpd.c	2013-06-19 12:59:49.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpd.c	2013-06-19 13:12:06.000000000 +0530
+@@ -662,7 +662,13 @@
+ 		switch (udhcp_sp_read(&rfds)) {
+ 		case SIGUSR1:
+ 			bb_info_msg("Received SIGUSR1");
++#ifdef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
++			dhcp_release_tr69_flag = 1;
++#endif
+ 			write_leases();
++#ifdef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
++			dhcp_release_tr69_flag = 0;
++#endif
+ 			/* why not just reset the timeout, eh */
+ 			timeout_end = monotonic_sec() + server_config.auto_time;
+ 			continue;
+@@ -861,6 +867,10 @@
+ 				/* client requested or configured IP matches the lease.
+ 				 * ACK it, and bump lease expiration time. */
+ 				send_ACK(&packet, lease->lease_nip);
++#ifdef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
++				if ( packet.ciaddr == 0 ) // Only in case of new request, we need to post meesage to devm stack. Avoid in case of renew.
++					writemsg(TR69_FIFO,NULL, 1, lease->lease_nip, LTQ_IPC_APP_ID_DHCP_LEASE_CHANGE);
++#endif
+ #ifndef CONFIG_FEATURE_DEVM_DEVICE  // TR-111 for gateway
+ #if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
+                         log1(
+@@ -947,6 +957,9 @@
+ 			) {
+ 				lease->expires = time(NULL);
+ 			}
++#ifdef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
++			writemsg(TR69_FIFO, NULL, 2, lease->lease_nip, LTQ_IPC_APP_ID_DHCP_LEASE_CHANGE);
++#endif
+ #ifndef CONFIG_FEATURE_DEVM_DEVICE  // TR-111 for gateway
+ #if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
+ 			// if TR-111 defined. post a message to TR-69 resetting
+Index: busybox-1.17.1/networking/udhcp/dhcpd.h
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpd.h	2013-06-19 12:59:49.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpd.h	2013-06-19 13:11:27.000000000 +0530
+@@ -99,6 +99,9 @@
+ #define SERVER_PORT 67
+ #endif
+ 
++#ifdef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
++volatile sig_atomic_t dhcp_release_tr69_flag;
++#endif
+ 
+ typedef uint32_t leasetime_t;
+ typedef int32_t signed_leasetime_t;
+Index: busybox-1.17.1/networking/udhcp/files.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/files.c	2013-06-19 12:59:49.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/files.c	2013-06-19 13:12:33.000000000 +0530
+@@ -272,7 +272,16 @@
+ 
+ 		g_leases[i].expires -= curr;
+ 		if ((signed_leasetime_t) g_leases[i].expires < 0)
++		{
+ 			g_leases[i].expires = 0;
++#ifdef CONFIG_FEATURE_DHCP_TR69_HOSTS_OBJ
++			if(dhcp_release_tr69_flag == 0)
++			{
++        		writemsg(TR69_FIFO, NULL, 2, g_leases[i].lease_nip, LTQ_IPC_APP_ID_DHCP_LEASE_CHANGE);
++			}
++#endif
++		}
++
+ 		g_leases[i].expires = htonl(g_leases[i].expires);
+ 
+ 		/* No error check. If the file gets truncated,

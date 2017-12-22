@@ -1,0 +1,58 @@
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/ap/hostapd.c hostapd-2.6/src/ap/hostapd.c
+--- hostapd-2.6-orig/src/ap/hostapd.c	2017-04-11 17:04:54.155958871 +0300
++++ hostapd-2.6/src/ap/hostapd.c	2017-04-11 17:32:40.083302065 +0300
+@@ -12,6 +12,7 @@
+ #include "utils/eloop.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/wpa_ctrl.h"
++#include "common/ltq-vendor.h"
+ #include "common/hw_features_common.h"
+ #include "drivers/driver.h"
+ #include "radius/radius_client.h"
+@@ -1339,9 +1340,19 @@ void hostapd_channel_list_updated(struct
+ }
+ 
+ 
++/* Must be aligned with drivers struct for vendor country command */
++#define COUNTRY_CODE_MAX_LEN 3
++typedef struct mtlk_country_code_data
++{
++	char	alpha2[COUNTRY_CODE_MAX_LEN];
++	u8	is_11b;
++} mtlk_country_code_data_t;
++
++
+ static int setup_interface(struct hostapd_iface *iface)
+ {
+ 	struct hostapd_data *hapd = iface->bss[0];
++	mtlk_country_code_data_t cc_data;
+ 	size_t i;
+ 
+ 	/*
+@@ -1395,6 +1406,13 @@ static int setup_interface(struct hostap
+ 			return -1;
+ 		}
+ 
++		os_memset(&cc_data, 0, sizeof(cc_data));
++		os_memcpy(cc_data.alpha2, country, 2); /* third char will not be sent */
++		cc_data.is_11b = (HOSTAPD_MODE_IEEE80211B == hapd->iconf->hw_mode);
++		if (hostapd_drv_vendor_cmd(hapd, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_COUNTRY_CODE,
++							(const u8*)&cc_data, sizeof(cc_data), NULL))
++			wpa_printf(MSG_INFO, "Failed to send driver vendor command LTQ_NL80211_VENDOR_SUBCMD_COUNTRY_CODE");
++
+ 		wpa_printf(MSG_DEBUG, "Previous country code %s, new country code %s",
+ 			   previous_country, country);
+ 
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug hostapd-2.6-orig/src/drivers/driver_nl80211.c hostapd-2.6/src/drivers/driver_nl80211.c
+--- hostapd-2.6-orig/src/drivers/driver_nl80211.c	2017-04-11 17:04:54.078960385 +0300
++++ hostapd-2.6/src/drivers/driver_nl80211.c	2017-04-11 17:19:33.096682592 +0300
+@@ -1392,9 +1392,6 @@ static int wpa_driver_nl80211_set_countr
+ 	alpha2[1] = alpha2_arg[1];
+ 	alpha2[2] = '\0';
+ 	
+-	nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_COUNTRY_CODE,
+-						(const u8*)alpha2, sizeof(alpha2), NULL);
+-
+ 	if (!nl80211_cmd(drv, msg, 0, NL80211_CMD_REQ_SET_REG) ||
+ 	    nla_put_string(msg, NL80211_ATTR_REG_ALPHA2, alpha2)) {
+ 		nlmsg_free(msg);

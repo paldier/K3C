@@ -1,0 +1,29 @@
+# In DNRD main, it first creates a socket for port 53, does a fork and the parent process exits.
+# Child process will be a daemon which then does continous select on the socket opened (and inherited) from parent.
+# Parent process before exiting closes standard file descriptors.
+# If, to illustrate, the socket descriptor obtained (when parent did socket call on port 53) is one of standard file descriptor 
+# and parent closes the same while exiting then child would keep doing select on the closed socket
+# resulting in EBADF error and high CPU utilization.
+# To overcome this, parent would now create dummy file descriptors until fresh socket fd is not one of standard file descriptors.
+# So that any further socket or open call never gets one of these standard file descriptors.
+diff -Naur dnrd-2.20.3/src/main.c dnrd-2.20.3-patch/src/main.c
+--- dnrd-2.20.3/src/main.c	2012-09-11 21:46:43.000000000 +0530
++++ dnrd-2.20.3-patch/src/main.c	2012-09-11 21:47:28.000000000 +0530
+@@ -159,6 +159,17 @@
+ 		}
+     else {
+ 			int opt = 1;
++			if(isock < 3) {
++				/* We have got a standard file descriptor (probably going to be closed)
++				 * Open dummy sockets until socket fd is < 3 and keep them open
++				 */
++				do {
++    			if ((isock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
++						log_err_exit(-1, "isock: Couldn't open socket");
++					}
++				} while (isock < 3);
++			}
++
+ 			setsockopt(isock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+     }
+ 

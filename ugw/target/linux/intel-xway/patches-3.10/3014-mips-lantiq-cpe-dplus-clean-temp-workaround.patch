@@ -1,0 +1,115 @@
+# HG changeset patch
+# Parent b52a9f898c8f65acff11c1e244bb4d41ac1b2d5b
+
+diff --git a/arch/mips/lantiq/xway/sysctrl.c b/arch/mips/lantiq/xway/sysctrl.c
+--- a/arch/mips/lantiq/xway/sysctrl.c
++++ b/arch/mips/lantiq/xway/sysctrl.c
+@@ -433,6 +433,97 @@ static void xbar_fpi_burst_disable(void)
+ 	}
+ }
+ 
++static char g_pkt_base[2048] __initdata __attribute__((__aligned__(32)));
++static unsigned int g_desc_base[2] __initdata __attribute__((__aligned__(32)));
++static void __init ltq_dplus_clean(void)
++{
++#define IFX_DMA                                 (KSEG1 | 0x1E104100)
++#define IFX_DMA_BASE                            IFX_DMA
++#define IFX_DMA_PS(i)                           (volatile u32*)(IFX_DMA_BASE + 0x40 + 0x30 * (i))
++#define IFX_DMA_PCTRL(i)                        (volatile u32*)(IFX_DMA_BASE + 0x44 + 0x30 * (i))
++#define IFX_DMA_CS(i)                           (volatile u32*)(IFX_DMA_BASE + 0x18 + 0x38 * (i))
++#define IFX_DMA_CCTRL(i)                        (volatile u32*)(IFX_DMA_BASE + 0x1C + 0x38 * (i))
++#define IFX_DMA_CDBA(i)                         (volatile u32*)(IFX_DMA_BASE + 0x20 + 0x38 * (i))
++#define IFX_DMA_CDLEN(i)                        (volatile u32*)(IFX_DMA_BASE + 0x24 + 0x38 * (i))
++#define IFX_DMA_CIS(i)                          (volatile u32*)(IFX_DMA_BASE + 0x28 + 0x38 * (i))
++#define IFX_DMA_CIE(i)                          (volatile u32*)(IFX_DMA_BASE + 0x2C + 0x38 * (i))
++#define IFX_DMA_IRNEN                           (volatile u32*)(IFX_DMA_BASE + 0xf4)
++#define IFX_REG_R32(_r)                    __raw_readl((volatile unsigned int *)(_r))
++#define IFX_REG_W32(_v, _r)               __raw_writel((_v), (volatile unsigned int *)(_r))
++#define IFX_REG_W32_MASK(_clr, _set, _r)   IFX_REG_W32((IFX_REG_R32((_r)) & ~(_clr)) | (_set), (_r))
++#define PPE_REG_ADDR(x)     ((volatile unsigned int *)KSEG1ADDR(0x1E180000 | (((x) + 0x4000) << 2)))
++
++#define DMRX_PGCNT_XRX200                      ((volatile unsigned int *)0xBE235854)
++#define DMRX_PKTCNT_XRX200                     ((volatile unsigned int *)0xBE235858)
++#define DSRX_PGCNT_XRX200                      ((volatile unsigned int *)0xBE235C4C)
++
++#define DMRX_PGCNT_XRX300          PPE_REG_ADDR(0x0615)
++#define DMRX_PKTCNT_XRX300         PPE_REG_ADDR(0x0616)
++#define DSRX_PGCNT_XRX300          PPE_REG_ADDR(0x0713)
++
++#define AR10_SWIP_MACRO                 0x1E108000
++#define AR10_SWIP_MACRO_REG(off)        ((volatile unsigned int *)KSEG1ADDR(AR10_SWIP_MACRO + (off) * 4))
++#define AR10_SWIP_TOP                   (AR10_SWIP_MACRO | (0x0C40 * 4))
++#define AR10_SWIP_TOP_REG(off)          ((volatile unsigned int *)KSEG1ADDR(AR10_SWIP_TOP + (off) * 4))
++#define PCE_PCTRL_REG(port, reg)        AR10_SWIP_MACRO_REG(0x480 + (port) * 0xA + (reg))    //  port < 12, reg < 4
++#define FDMA_PCTRL_REG(port)            AR10_SWIP_MACRO_REG(0xA80 + (port) * 6)  //  port < 7
++#define SDMA_PCTRL_REG(port)            AR10_SWIP_MACRO_REG(0xBC0 + (port) * 6)  //  port < 7
++
++    volatile unsigned int *desc_base = (volatile unsigned int *)KSEG1ADDR((unsigned int)g_desc_base);
++    int i, j, k;
++
++    for ( i = 0; i < 6; i++ )
++        IFX_REG_W32_MASK(1, 0, SDMA_PCTRL_REG(i));  //  stop port 0 - 5
++
++	if (of_machine_is_compatible("lantiq,ar10")) {
++    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX300) & 0x00FF) == 0 && (IFX_REG_R32(DSRX_PGCNT_XRX300) & 0x00FF) == 0 )
++       	   return;
++	}
++
++	if (of_machine_is_compatible("lantiq,vr9")) {
++    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX200) & 0x00FF) == 0 && (IFX_REG_R32(DSRX_PGCNT_XRX200) & 0x00FF) == 0 )
++       	   return;
++	}
++
++    IFX_REG_W32(0, IFX_DMA_PS(0));
++    IFX_REG_W32(0x1F68, IFX_DMA_PCTRL(0));
++    IFX_REG_W32(0, IFX_DMA_IRNEN);  // disable all DMA interrupt
++
++    for ( k = 0; k < 8; k++ ) {
++        unsigned int imap[8] = {0, 2, 4, 6, 20, 21, 22, 23};
++
++        i = imap[k];
++        IFX_REG_W32(i, IFX_DMA_CS(0));
++        IFX_REG_W32_MASK(0, 2, IFX_DMA_CCTRL(0));       //  reset channel
++        while ( (IFX_REG_R32(IFX_DMA_CCTRL(0)) & 2) );  //  wait until reset finish
++        IFX_REG_W32(0, IFX_DMA_CIE(0));                 //  disable channel interrupt
++        IFX_REG_W32(1, IFX_DMA_CDLEN(0));               //  only 1 descriptor
++        IFX_REG_W32(CPHYSADDR((unsigned int)desc_base), IFX_DMA_CDBA(0));       //  use local variable (array) as descriptor base address
++        desc_base[0] = 0x80000000 | sizeof(g_pkt_base);
++        desc_base[1] = CPHYSADDR((unsigned int)g_pkt_base);
++
++        IFX_REG_W32_MASK(0, 1, IFX_DMA_CCTRL(0));       //  start receiving
++        while ( 1 ) {
++            for ( j = 0; j < 1000 && (desc_base[0] & 0x80000000) != 0; j++ );   //  assume packet can be finished within 1000 loops
++            if ( (desc_base[0] & 0x80000000) != 0 )     //  no more packet
++                break;
++            desc_base[0] = 0x80000000 | sizeof(g_pkt_base);
++        }
++        IFX_REG_W32_MASK(1, 0, IFX_DMA_CCTRL(0));       //  stop receiving
++    }
++
++	if (of_machine_is_compatible("lantiq,ar10")) {
++    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX300) & 0x00FF) != 0 || (IFX_REG_R32(DMRX_PKTCNT_XRX300) & 0x00FF) != 0 || (IFX_REG_R32(DSRX_PGCNT_XRX300) & 0x00FF) != 0 )
++		pr_info("%s error: IFX_REG_R32(DMRX_PGCNT_XRX300) = 0x%08x, IFX_REG_R32(DMRX_PKTCNT_XRX300) = 0x%08x, IFX_REG_R32(DSRX_PGCNT_XRX300) = 0x%08x\n", __func__, IFX_REG_R32(DMRX_PGCNT_XRX300), IFX_REG_R32(DMRX_PKTCNT_XRX300), IFX_REG_R32(DSRX_PGCNT_XRX300));
++	}
++
++	if (of_machine_is_compatible("lantiq,vr9")) {
++    	if ( (IFX_REG_R32(DMRX_PGCNT_XRX200) & 0x00FF) != 0 || (IFX_REG_R32(DMRX_PKTCNT_XRX200) & 0x00FF) != 0 || (IFX_REG_R32(DSRX_PGCNT_XRX200) & 0x00FF) != 0 )
++		pr_info("%s error: IFX_REG_R32(DMRX_PGCNT_XRX200) = 0x%08x, IFX_REG_R32(DMRX_PKTCNT_XRX200) = 0x%08x, IFX_REG_R32(DSRX_PGCNT_XRX200) = 0x%08x\n", __func__, IFX_REG_R32(DMRX_PGCNT_XRX300), IFX_REG_R32(DMRX_PKTCNT_XRX200), IFX_REG_R32(DSRX_PGCNT_XRX200));
++	}
++	return;
++}
++
+ /* bring up all register ranges that we need for basic system control */
+ void __init ltq_soc_init(void)
+ {
+@@ -502,6 +593,10 @@ void __init ltq_soc_init(void)
+ 			panic("Failed to remap xbar resources");
+ 	}
+ 
++	if (of_machine_is_compatible("lantiq,ar10") ||
++		of_machine_is_compatible("lantiq,vr9")) {
++			ltq_dplus_clean();
++	}
+ 	/* make sure to unprotect the memory region where flash is located */
+ 	ltq_ebu_w32(ltq_ebu_r32(LTQ_EBU_BUSCON0) & ~EBU_WRDIS, LTQ_EBU_BUSCON0);
+ 

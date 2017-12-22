@@ -1,0 +1,156 @@
+Index: dot1ag-utils-1.0.1/src/dot1ag_eth.c
+===================================================================
+--- dot1ag-utils-1.0.1.orig/src/dot1ag_eth.c
++++ dot1ag-utils-1.0.1/src/dot1ag_eth.c
+@@ -26,6 +26,16 @@
+  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++/*
++ * HISTORY:
++ * 19-06-2013:
++ *   Original implementation of dot1agd was checking for addresses in the CCM
++ *   group (01:C2:80:00:00:30 to 37), and checks now for the LTM (or LBM) group
++ *   (.:38 to 3F) when a LBM is received. Following ITU-T Y.1731, LTM and LBM
++ *   group use the same multicast DA range.
++ *   - Lantiq Deutschland GmbH: Updated the terms of use and distribution.
++ */
++
+ #include "config.h"
+ 
+ #include <stdint.h>
+@@ -281,9 +291,10 @@ cfm_send_lbr(char *ifname, uint8_t *lbm_
+ 
+ 	/*
+ 	 * Destination mac address should be either our MAC address or the
+-	 * CCM group address.
++	 * LTM group address.
+ 	 */
+-	if (!(ETHER_IS_CCM_GROUP(lbm_ehdr->ether_dhost) ||
++
++	if (!(ETHER_IS_LTM_GROUP(lbm_ehdr->ether_dhost) ||
+ 		ETHER_IS_EQUAL(lbm_ehdr->ether_dhost, local_mac))) {
+ 		/* silently drop LBM */
+ 		return 0;
+Index: dot1ag-utils-1.0.1/src/ethping.c
+===================================================================
+--- dot1ag-utils-1.0.1.orig/src/ethping.c
++++ dot1ag-utils-1.0.1/src/ethping.c
+@@ -26,6 +26,16 @@
+  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++/*
++ * HISTORY:
++ * 19-06-2013:
++ *   When no MAC address is provided to ethping, if a md level is
++ *   given the multicast DA is set as previously defined : 01:C2:80:00:00:3<x>
++ *   to 01:C2:80:00:00:3F, where <x> is MD Level +8, and the MAC address of
++ *   interfaces that replied are printed.
++ *   - Lantiq Deutschland GmbH: Updated the terms of use and distribution.
++ */
++
+ #include "config.h"
+ 
+ #include <stdio.h>
+@@ -111,7 +121,9 @@ main(int argc, char **argv) {
+ 			usage();
+ 		}
+ 	}
+-	if (argc - optind != 1) {
++	
++	/* check that 0 or 1 argument (normally MAC address) is given after all options */
++	if ( argc - optind != 1 && argc - optind != 0 ) {
+ 		usage();
+ 	}
+ 
+@@ -122,9 +134,17 @@ main(int argc, char **argv) {
+ 
+ 	/* final command line argument is Ethernet address to ethping */
+ 	target = argv[optind];
+-	if (eth_addr_parse(remotemac, target) != 0) {
++	
++			/* if a md_level is provided and no remotemac, set LTM Group Destination MAC address */
++	if(target==NULL && md_level>=0 && md_level<=7) {
++		printf("no MAC address provided -> multicast address defined using md level: %d\n",md_level);
++		(void) eth_addr_parse(remotemac, ETHER_CFM_GROUP);
++		remotemac[5] = 0x30 + ((md_level + 8) & 0x0F);
++	}
++	else if (eth_addr_parse(remotemac, target) != 0) {
+ 		usage();
+ 		exit(EXIT_FAILURE);
++
+ 	}
+ 	/* command line argument parsing finished */
+ 
+@@ -249,8 +269,11 @@ main(int argc, char **argv) {
+ 			/* time_sent is time LBM was sent, set it to NOW */
+ 			(void) gettimeofday(&time_sent, NULL);
+ 			next_lbm = 0;
++			
++			printf("%d - Sequence %d\n", count, nextLBMtransID);
+ 		}
+-
++		
++		struct cfmencap *cfmencap;
+ 		n = pcap_next_ex(handle, &header, &pkt_data);
+ 		switch (n) {
+ 		case -1:
+@@ -259,14 +282,18 @@ main(int argc, char **argv) {
+ 		case 0:
+ 			break;
+ 		case 1:
++			cfmencap = (struct cfmencap *) pkt_data;
+ 			if (cfm_matchlbr((uint8_t *) pkt_data, localmac,
+ 					remotemac, vlan, md_level,
+ 					nextLBMtransID)) {
+ 				printf("%d bytes from ", header->caplen);
++				
++				/* prints MAC address of the interface that replied*/
+ 				printf("%02x:%02x:%02x:%02x:%02x:%02x",
+-					remotemac[0], remotemac[1],
+-					remotemac[2], remotemac[3],
+-					remotemac[4], remotemac[5]);
++					cfmencap->srcmac[0], cfmencap->srcmac[1],
++					cfmencap->srcmac[2], cfmencap->srcmac[3],
++					cfmencap->srcmac[4], cfmencap->srcmac[5]);
++					
+ 				printf(", sequence %d", nextLBMtransID);
+ 				(void) gettimeofday(&now, NULL);
+ 				printf(", %.3f ms\n", (now.tv_sec -
+Index: dot1ag-utils-1.0.1/src/ieee8021ag.c
+===================================================================
+--- dot1ag-utils-1.0.1.orig/src/ieee8021ag.c
++++ dot1ag-utils-1.0.1/src/ieee8021ag.c
+@@ -31,6 +31,16 @@
+  * http://standards.ieee.org/getieee802/download/802.1ag-2007.pdf
+  */
+ 
++/*
++ * HISTORY:
++ * 19-06-2013:
++ *   Implementation of ethping compares (with cfm_matchlbr()) MAC supplied to it
++ *   in command with SA of LBR : in case ethping uses a multicast DA, this
++ *   address must not be compared with the SA of the replier, as it will never
++ *   match.
++ *   - Lantiq Deutschland GmbH: Updated the terms of use and distribution.
++ */
++
+ #include "config.h"
+ 
+ #include <stdio.h>
+@@ -273,9 +283,10 @@ cfm_matchlbr(uint8_t *buf, uint8_t *dst,
+ 		if (cfmencap->dstmac[i] != dst[i]) {
+ 			return (0);
+ 		}
+-		if (cfmencap->srcmac[i] != src[i]) {
+-			return (0);
+-		}
++		/* In case the destination MAC address is a multicast, the source will not match */
++		//if (cfmencap->srcmac[i] != src[i]) {
++		//	return (0);
++		//}
+ 	}
+ 	cfmhdr = CFMHDR(buf);
+ 	if (cfmhdr->opcode != CFM_LBR) {
+

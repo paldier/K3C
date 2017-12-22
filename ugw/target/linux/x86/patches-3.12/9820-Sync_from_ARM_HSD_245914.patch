@@ -1,0 +1,1397 @@
+# HG changeset patch
+# Parent 5dddbb10a9e8e97083abf866d126bdbe0ff35c05
+
+--- a/include/linux/avalanche/generic/avalanche_pdsp_api.h
++++ b/include/linux/avalanche/generic/avalanche_pdsp_api.h
+@@ -145,6 +145,26 @@ typedef enum
+     PDSP_SESSION_CACHE_FLUSH_ALL    = 0x84,
+     PDSP_SESSION_CACHE_SESSION_TIMEOUT  = 0x85,
+ 
++#ifdef CONFIG_WIFI_PROXY
++    //Wifi TX commands
++    PDSP_CMD_WIFI_TX_INIT                = 0x83,
++    PDSP_CMD_WIFI_TX_ADD_CHANNEL         = 0x84,
++    PDSP_CMD_WIFI_TX_REMOVE_CHANNEL      = 0x85,
++    PDSP_CMD_WIFI_TX_START_CHANNEL       = 0x86,
++    PDSP_CMD_WIFI_TX_STOP_CHANNEL        = 0x87,
++    PDSP_CMD_WIFI_TX_INIT_DBG            = 0x88,
++    PDSP_CMD_WIFI_TX_SET_MAX_BURST       = 0x89,
++
++    //Wifi RX commands
++    PDSP_CMD_WIFI_RX_INIT                = 0x83,
++    PDSP_CMD_WIFI_RX_ADD_CHANNEL         = 0x84,
++    PDSP_CMD_WIFI_RX_REMOVE_CHANNEL      = 0x85,
++    PDSP_CMD_WIFI_RX_START_CHANNEL       = 0x86,
++    PDSP_CMD_WIFI_RX_STOP_CHANNEL        = 0x87,
++    PDSP_CMD_WIFI_RX_INIT_DBG            = 0x88,
++    PDSP_CMD_WIFI_RX_SET_MAX_BURST       = 0x89,
++#endif
++
+ #else
+     PP_HAL_PDSP_CMD_OPEN    =   0x80,
+     PP_HAL_PDSP_CMD_FLUSH_ALL,
+@@ -200,8 +220,8 @@ typedef enum
+ 
+     PDSP_ID_Recycler,                       //  Recycler PDSP
+     PDSP_ID_Accumulator,                    //  Accumulator PDSP
+-    PDSP_ID_Wifi_0,                         //  Wifi group - PDSP 0
+-    PDSP_ID_Wifi_1,                         //  Wifi group - PDSP 1
++    PDSP_ID_Wifi_TX,                        //  Wifi proxy - TX PDSP (Wifi_0)
++    PDSP_ID_Wifi_RX,                        //  Wifi proxy - RX PDSP (Wifi_1)
+     PDSP_ID_Moca,                           //  Moca PDSP
+     PDSP_ID_FCC_0,                          //  FCC_1  PDSP
+     PDSP_ID_FCC_1,                          //  FCC_0  PDSP
+--- a/include/linux/avalanche/generic/avalanche_pp_api.h
++++ b/include/linux/avalanche/generic/avalanche_pp_api.h
+@@ -40,6 +40,7 @@
+ 
+ #if PUMA7_SOC_TYPE
+ #include <asm-arm/arch-avalanche/puma7/puma7_cppi.h>
++#include <asm-arm/arch-avalanche/puma7/puma7_pp.h>
+ #endif
+ 
+ #else
+@@ -57,6 +58,7 @@
+ #include <linux/avalanche/generic/_tistdtypes.h>
+ #include <linux/avalanche/puma7/puma7_defs.h>
+ #include <linux/avalanche/puma7/puma7_cppi.h>
++#include <linux/avalanche/puma7/puma7_pp.h>
+ #else
+ #include "_tistdtypes.h"
+ #endif
+@@ -79,7 +81,7 @@
+ #define MAX_ALLOWED_QOS_CLUSTERS_PER_DEVICE             16
+ #else
+ #define AVALANCHE_PP_MAX_PID                            32
+-#define AVALANCHE_PP_MAX_VPID                           32
++#define AVALANCHE_PP_MAX_VPID                           51
+ #define AVALANCHE_PP_MAX_STATIC_ENTRIES                 (32 * 1024)
+ #define AVALANCHE_PP_MAX_LUT_ENTRIES                    (3 * 1024)
+ #define AVALANCHE_PP_MAX_ACCELERATED_SESSIONS           (AVALANCHE_PP_MAX_STATIC_ENTRIES + AVALANCHE_PP_MAX_LUT_ENTRIES)
+@@ -462,15 +464,12 @@ typedef struct // former TI_PP_VPID_STAT
+     Uint64      rx_broadcast_pkt;
+     Uint64      rx_multicast_pkt;
+     Uint64      rx_discard_pkt;
+-    Uint64      rx_res[3];
+ 
+     Uint64      tx_byte;
+     Uint64      tx_unicast_pkt;
+     Uint64      tx_broadcast_pkt;
+     Uint64      tx_multicast_pkt;
+     Uint64      tx_discard_pkt;
+-    Uint64      tx_error;
+-    Uint64      tx_res[2];
+ }AVALANCHE_PP_VPID_STATS_t;
+ #else
+ typedef struct // former TI_PP_VPID_STATS
+@@ -888,6 +887,20 @@ typedef struct
+ AVALANCHE_PP_PSI_t;
+ #endif
+ 
++#ifdef CONFIG_WIFI_PROXY
++/**
++ * @class wifi traffic class
++ * @vpid vpid of wifi device
++ * @wifi_session_info wifi specific session info
++ *  
++ */
++struct wifi_proxy_psi_t {
++    Uint8  class;
++    Uint8  vpid;
++    Uint16 wifi_session_info;
++};
++#endif
++
+ #ifndef CONFIG_WIFI_MESH_TUNNEL
+ 
+ #define AVALANCHE_PP_EGRESS_DROP_SESS    0x01
+@@ -915,12 +928,16 @@ typedef struct
+                                 #define AVALANCHE_PP_EGRESS_FIELD_ENABLE_DOCSIS                 0x08
+                                 #define AVALANCHE_PP_EGRESS_WH_IPv4                             0x10
+                                 #define AVALANCHE_PP_EGRESS_WH_IPv6                             0x20
++                                #define AVALANCHE_PP_EGRESS_WIFI_PID                            0x40
+     Uint16                      reserved;
+ 
+     __Avalanche_PP_LUTs_Data_t  lookup;
+ 
+     union
+     {
++#ifdef CONFIG_WIFI_PROXY
++        struct wifi_proxy_psi_t wifi_psi;
++#endif
+         AVALANCHE_PP_PSI_t      us_fields;
+         Uint32                  psi_word;
+     }
+@@ -1173,6 +1190,70 @@ PP_HAL_SESSION_RECORD_NON_ACCELERATED_ST
+  *  The structure describes the global statistics for the Packet Processor.
+  **************************************************************************/
+ #if PUMA7_OR_NEWER_SOC_TYPE
++
++typedef struct
++{
++    Uint32  cmp_recv      ;
++    Uint32  cmp_recv_valid;
++    Uint32  cmp_irq_cnt   ;
++    Uint32  req_sent      ;
++    Uint32  req_irq_cnt   ;
++    Uint32  dev_cnt5      ;
++
++} wifi_tx_dev_stats_t;
++
++typedef struct
++{
++    Uint32  req_recv      ;
++    Uint32  req_recv_valid;
++    Uint32  req_irq_cnt   ;
++    Uint32  cmp_sent      ;
++    Uint32  cmp_irq_cnt   ;
++    Uint32  dev_cnt5      ;
++} wifi_rx_dev_stats_t;
++
++typedef struct
++{
++    /* global */
++    Uint32  rx_pkts                ;
++    Uint32  tx_pkts                ;
++    Uint32  cmp_null_buffer        ;
++    Uint32  cmp_ring_full          ;
++    Uint32  cmp_ring_empty         ;
++    Uint32  cmp_pattern_buffer     ;
++    Uint32  req_int_desc_starvation;
++    Uint32  req_ring_full          ;
++    Uint32  req_ring_empty         ;
++    Uint32  global_9               ;
++} avalanche_pp_wifi_tx_stats_t;
++
++typedef struct
++{
++    Uint32 rx_pkts            ;
++    Uint32 tx_pkts            ;
++    Uint32 req_desc_starvation;
++    Uint32 req_null_buffer    ;
++    Uint32 req_zero_date_len  ;
++    Uint32 req_ring_full      ;
++    Uint32 req_ring_empty     ;
++    Uint32 cmp_buff_starvation;
++    Uint32 cmp_ring_full      ;
++    Uint32 cmp_ring_empty     ;
++} avalanche_pp_wifi_rx_stats_t;
++
++typedef struct
++{
++    avalanche_pp_wifi_tx_stats_t tx_stats;
++    avalanche_pp_wifi_rx_stats_t rx_stats;
++#ifdef __KERNEL__
++    wifi_tx_dev_stats_t tx_dev_stats[WIFI_DEVS_CNT];
++    wifi_rx_dev_stats_t rx_dev_stats[WIFI_DEVS_CNT];
++#else
++    wifi_tx_dev_stats_t tx_dev_stats[4];
++    wifi_rx_dev_stats_t rx_dev_stats[4];
++#endif
++} avalanche_pp_wifi_stats_t;
++
+ typedef struct
+ {
+     /* Classifier1 */
+@@ -1334,55 +1415,7 @@ typedef struct
+     Uint32      MC_res15;
+     Uint32      MC_res16;
+ 
+-    Uint32      WiFi_TX_res1;
+-    Uint32      WiFi_TX_res2;
+-    Uint32      WiFi_TX_res3;
+-    Uint32      WiFi_TX_res4;
+-    Uint32      WiFi_TX_res5;
+-    Uint32      WiFi_TX_res6;
+-    Uint32      WiFi_TX_res7;
+-    Uint32      WiFi_TX_res8;
+-    Uint32      WiFi_TX_res9;
+-    Uint32      WiFi_TX_res10;
+-    Uint32      WiFi_TX_res11;
+-    Uint32      WiFi_TX_res12;
+-    Uint32      WiFi_TX_res13;
+-    Uint32      WiFi_TX_res14;
+-    Uint32      WiFi_TX_res15;
+-    Uint32      WiFi_TX_res16;
+-    Uint32      WiFi_TX_res17;
+-    Uint32      WiFi_TX_res18;
+-    Uint32      WiFi_TX_res19;
+-    Uint32      WiFi_TX_res20;
+-    Uint32      WiFi_TX_res21;
+-    Uint32      WiFi_TX_res22;
+-    Uint32      WiFi_TX_res23;
+-    Uint32      WiFi_TX_res24;
+-
+-    Uint32      WiFi_RX_res1;
+-    Uint32      WiFi_RX_res2;
+-    Uint32      WiFi_RX_res3;
+-    Uint32      WiFi_RX_res4;
+-    Uint32      WiFi_RX_res5;
+-    Uint32      WiFi_RX_res6;
+-    Uint32      WiFi_RX_res7;
+-    Uint32      WiFi_RX_res8;
+-    Uint32      WiFi_RX_res9;
+-    Uint32      WiFi_RX_res10;
+-    Uint32      WiFi_RX_res11;
+-    Uint32      WiFi_RX_res12;
+-    Uint32      WiFi_RX_res13;
+-    Uint32      WiFi_RX_res14;
+-    Uint32      WiFi_RX_res15;
+-    Uint32      WiFi_RX_res16;
+-    Uint32      WiFi_RX_res17;
+-    Uint32      WiFi_RX_res18;
+-    Uint32      WiFi_RX_res19;
+-    Uint32      WiFi_RX_res20;
+-    Uint32      WiFi_RX_res21;
+-    Uint32      WiFi_RX_res22;
+-    Uint32      WiFi_RX_res23;
+-    Uint32      WiFi_RX_res24;
++    avalanche_pp_wifi_stats_t wifi_stats;
+ 
+     Uint32      MoCA_rx_pkts;
+     Uint32      MoCA_tx_pkts;
+@@ -1644,6 +1677,373 @@ extern AVALANCHE_PP_RET_e   avalanche_pp
+ extern Bool                  avalanche_pp_state_is_active( void );
+ extern Bool                  avalanche_pp_state_is_psm( void );
+ 
++/*---------------------*/
++/*    WIFI Proxy       */
++/*---------------------*/
++#ifdef CONFIG_WIFI_PROXY
++
++/**
++ * Ring configuration structure for the sender entity
++ * @base_addr ring base address 
++ * @elem_sz_order element size power of 2 order 
++ * @sz_mask ring size mask, number of elements can be written to
++ *          the ring in a mask form, (4 elements) = 0b11, (8
++ *          elements) = 0b111 and so on
++ * @hw_cnt_addr HW counter address
++ * @rmt_head_ptr_addr remote head pointer address 
++ * @note this struct is aligned to wifi fw pdsps mailbox 
++ *       commands, DO NOT change it.
++ * @note this struct MUST be 4 bytes aligned 
++ */
++struct send_ring_t {
++    Uint32  base_addr;
++    Uint16  elem_sz_order;
++    Uint16  sz_mask;
++    Uint32  hw_cnt_addr;
++    Uint32  rmt_head_ptr_addr;
++};
++
++/**
++ * Ring configuration structure for the receiver entity
++ * @base_addr ring base address
++ * @elem_sz_order element size power of 2 order 
++ * @sz_mask ring size mask, number of elements can be written to
++ *          the ring in a mask form, (4 elements) = 0b11, (8
++ *          elements) = 0b111 and so on
++ * @hw_cnt_addr HW counter address
++ * @rmt_tail_ptr_addr remote tail pointer address 
++ * @note this struct is aligned to wifi fw pdsps mailbox 
++ *       commands, DO NOT change it.
++ * @note this struct MUST be 4 bytes aligned 
++ */
++struct recv_ring_t {
++    Uint32  base_addr;
++    Uint16  elem_sz_order;
++    Uint16  sz_mask;
++    Uint32  hw_cnt_addr;
++    Uint32  rmt_tail_ptr_addr;
++};
++
++/**
++ * wifi tx channel rings configuration, FW to wifi SOC
++ * @req_ring used by the FW to send packets to wifi SOC
++ * @cmp_ring used by the wifi SOC to recycle buffers back to FW
++ * @note this struct MUST be 4 bytes aligned 
++ */
++struct wifi_proxy_tx_ch_t {
++    struct send_ring_t req_ring;
++    struct recv_ring_t cmp_ring;
++};
++
++/**
++ * wifi rx channel rings configuration, wifi SOC to FW
++ * @req_ring used by FW to send wifi SOC empty buffers to use
++ * @cmp_ring used by wifi SOC to send packets to FW
++ * @note this struct MUST be 4 bytes aligned 
++ */
++struct wifi_proxy_rx_ch_t {
++    struct send_ring_t cmp_ring;
++    struct recv_ring_t req_ring;
++};
++
++/**
++ * wifi device channel configuration. 
++ * @wifi_dev_id device's index 
++ * @tx_channel tx channel configuration 
++ * @rx_channel rx channel configuration 
++ */
++struct wifi_proxy_dev_ch_t {
++    wifi_dev_id_e       wifi_dev_id;
++    struct wifi_proxy_tx_ch_t tx_channel;
++    struct wifi_proxy_rx_ch_t rx_channel;
++};
++
++/** 
++ * wifi_proxy_fw_init_info_t 
++ * @bMgr tx & rx buffers's buffer manager 
++ * @bPool tx & rx buffers's buffer pool
++ * @tx_int_qMgr tx pdsp internal descriptors free queue manager 
++ * @tx_int_qNum tx pdsp internal descriptors free queue number 
++ * @tx_int_cnt number of desriptors in tx_int free queue 
++ * @rx_freeQNum rx pdsp free queue number
++ * @rx_freeQMgr rx pdsp free queue manager number
++ * @rx_destQNum rx pdsp destination queue number
++ * @rx_destQMgr rx pdsp destination queue manager number
++ */
++struct wifi_proxy_fw_init_info_t {
++    Uint32 bMgr; 
++    Uint32 bPool;
++    Uint32 tx_int_qMgr;
++    Uint32 tx_int_qNum;
++    Uint32 tx_int_cnt;
++    Uint32 rx_freeQNum;
++    Uint32 rx_freeQMgr;
++    Uint32 rx_destQNum;
++    Uint32 rx_destQMgr;
++};
++
++#ifdef CONFIG_WIFI_PROXY_DEBUG
++/** 
++ * wifi_proxy_debug_init_info_t 
++ * @counter_index PP's debug IP counter index (0-3)
++ * @buff_start_addr FW's log messages buffer start address, this 
++ *                  will be configured to the counter start
++ *                  address register
++ * @buff_end_addr FW's log messages buffer end address, this 
++ *                will be configured to the counter roll over
++ *                register
++ */
++struct wifi_proxy_debug_init_info_t {
++    Uint32 counter_index; 
++    Uint32 buff_start_addr;
++    Uint32 buff_end_addr;
++};
++#endif
++
++/**
++ * init info for initializing wifi proxy. 
++ * @buffers_base_addr base address to use for buffer pool.
++ * @buffer_sz buffer size of each buffer.
++ * @buffer_cnt number of buffers.
++ */
++struct wifi_proxy_init_info_t {
++    Uint32 buffers_base_addr;
++    Uint32 buffer_sz;
++    Uint32 buffer_cnt;
++};
++
++/** 
++ * wifi_proxy_init_ret_info_t 
++ * info returned as reply to wifi_proxy_init_info_t 
++ * @addresses addresses to map by atom 
++ * @lengths addresses lengths
++ */
++struct wifi_proxy_init_ret_info_t {
++    Uint32 addresses[2];
++    Uint32 lengths[2];
++};
++
++/**
++ * wifi_proxy_add_ch_info_t
++ * @dev_id device id 
++ * @tx_ch tx channel configuration, fw to wifi soc
++ * @rx_ch rx channel configuration, wifi soc to fw
++ * @author iemergi (2/2/2016)
++ */
++struct wifi_proxy_add_ch_info_t {
++    wifi_dev_id_e dev_id;
++    struct wifi_proxy_tx_ch_t tx_ch;
++    struct wifi_proxy_rx_ch_t rx_ch;
++};
++
++/**
++ * wifi proxy add channel return structure
++ * @fw_to_dev_req_tail_addr fw to dev request ring tail pointer 
++ *                   address in PDSP's local memory (DMEM)
++ * @fw_to_dev_cmp_head_addr fw to dev complete ring head pointer
++ *                   address in PDSP's local memory (DMEM)
++ * @dev_to_fw_cmp_tail_addr dev to fw complete ring tail pointer
++ *                   address in PDSP's local memory (DMEM)
++ * @dev_to_fw_req_head_addr dev to fw request ring head pointer 
++ *                   address in PDSP's local memory (DMEM)
++ */
++struct wifi_proxy_add_ch_ret_info_t {
++    Uint32 fw_to_dev_req_tail_addr;
++    Uint32 fw_to_dev_cmp_head_addr;
++    Uint32 dev_to_fw_cmp_tail_addr;
++    Uint32 dev_to_fw_req_head_addr;
++};
++
++/**
++ * wifi device statistics structure. 
++ * @tx_req_sent_pkt_num number of packets sent on tx request 
++ *                      ring
++ * @tx_cmp_recv_pkt_num number of packets receive on tx complete 
++ *                      ring
++ * @rx_cmp_sent_pkt_num number of packets sent on rx complete 
++ *                      ring
++ * @rx_req_recv_pkt_num number of packets received on rx request 
++ *                      ring
++ */
++struct pp_hal_wifi_device_stats{
++    wifi_dev_state_e state;
++    Uint32 tx_req_sent_pkt_num;
++    Uint32 tx_cmp_recv_pkt_num;
++    Uint32 rx_cmp_sent_pkt_num;
++    Uint32 rx_req_recv_pkt_num;
++};
++
++#define WIFI_TX_PDSP_DMEM_CTRL_OFFSET               0x100
++#define WIFI_TX_PDSP_DMEM_CTRL_DESC_PER_DEVS        0x000 + WIFI_TX_PDSP_DMEM_CTRL_OFFSET
++#define WIFI_TX_PDSP_DMEM_CTRL_PDSP_COPY_CNT_HIST   0x010 + WIFI_TX_PDSP_DMEM_CTRL_OFFSET
++#define WIFI_TX_PDSP_DMEM_DEVICE_CTRL_OFFSET        0x080 + WIFI_TX_PDSP_DMEM_CTRL_OFFSET
++#define WIFI_TX_PDSP_DMEM_DEVICE_DB_OFFSET          0x200
++#define WIFI_RX_PDSP_DMEM_CTRL_OFFSET               0x100
++#define WIFI_RX_PDSP_DMEM_CTRL_PDSP_COPY_CNT_HIST   0x000 + WIFI_RX_PDSP_DMEM_CTRL_OFFSET
++#define WIFI_RX_PDSP_DMEM_DEVICE_CTRL_OFFSET        0x080 + WIFI_RX_PDSP_DMEM_CTRL_OFFSET
++#define WIFI_RX_PDSP_DMEM_DEVICE_DB_OFFSET          0x200
++
++/**
++ * proxy tx pdsp devices control register layout
++ *  
++ * @suspend specify if the device is in suspend state
++ * @valid specify if the device's entry is valid 
++ * @stat_counters_off offset to device's statistical counters 
++ * @free_buffers number of buffers the device can use
++ * @max_buffers maximum number of buffers the device can use
++ *  
++ * @note the struct contains reserve fields in order to be align to 
++ * the actual memory layout 
++ */
++struct __attribute__((packed)) fw_tx_pdsp_devs_ctrl_reg {
++#if defined(__BIG_ENDIAN_BITFIELD)
++    Uint8   reserve:6,
++            suspend:1,
++            valid:1;
++#elif defined (__LITTLE_ENDIAN_BITFIELD)
++    Uint8   valid:1,
++            suspend:1,
++            reserve:6;
++#endif
++    Uint8   Breserve0;
++
++    Uint16  stat_counters_off;
++    Uint16  free_buffers;
++    Uint16  max_buffers ;
++};
++
++/**
++ * proxy tx pdsp devices database entry structure 
++ *  
++ * @req_ring request ring structure
++ * @req_ring_head request ring head pointer
++ * @req_ring_tail request ring tail pointer
++ * @cmp_ring complete request structure
++ * @cmp_ring_head complete ring head pointer
++ * @cmp_ring_tail complete ring tail pointer
++ * @mcdma_page_offset the offset to the page the McDMA is using 
++ * @mcdma_page_num_entries number of entries ceing copied to 
++ *                         mcdma_page_offset
++ * @mcdma_done_page_offset the offset to the page the McDMA is 
++ *                         done using
++ * @mcdma_done_num_entries number of entries copied to 
++ *                         mcdma_done_page_offset
++ * @pdsp_page_offset offset to next free page the pdsp can use 
++ * @mcdma_ch_regs_offset the offset to mcdma channel regs that 
++ *                       the device is using
++ * @pagesBase mcdma pages base offset 
++ *  
++ * @note the struct contains reserve fields in order to be align to 
++ * the actual memory layout 
++ */
++struct __attribute__((packed)) fw_tx_pdsp_devs_db_entry {
++    /* request ring */
++    struct send_ring_t req_ring;
++    Uint32             req_ring_head;
++    Uint32             req_ring_tail;
++    /* request ring control */
++    Uint16             input_q_off;
++    Uint16             internal_q_off;
++    Uint16             infra_dma_q;
++    Uint8              internal_desc_use_cnt;
++    Uint8              reserved;
++    /* complete ring */
++    struct recv_ring_t cmp_ring;
++    Uint32             cmp_ring_head;
++    Uint32             cmp_ring_tail;
++    /* complete ring control */
++    Uint16  mcdma_page_offset;
++    Uint16  pdsp_page_offset;
++    Uint8   mcdma_page_num_entries;
++    Uint8   mcdma_ch_regs_offset;
++    Uint16  pagesBase;
++};
++
++/**
++ * proxy rx pdsp devices control register layout
++ *  
++ * @suspend specify if the device is in suspend state
++ * @valid specify if the device's entry is valid 
++ * @pid device's pid
++ * @stat_counters_off offset to device's statistical counters 
++ * @free_buffers number of buffers the device can use
++ * @max_buffers maximum number of buffers the device can use 
++ *  
++ * @note the struct contains reserve fields in order to be align to 
++ * the actual memory layout 
++ */
++struct __attribute__((packed)) fw_rx_pdsp_devs_ctrl_reg {
++#if defined(__BIG_ENDIAN_BITFIELD)
++    Uint8   reserve:6,
++            suspend:1,
++            valid:1;
++#elif defined (__LITTLE_ENDIAN_BITFIELD)
++    Uint8   valid:1,
++            suspend:1,
++            reserve:6;
++#endif
++    Uint8   pid;
++    Uint16  stat_counters_off;
++    Uint16  free_buffers;
++    Uint16  max_buffers ;
++};
++/**
++ * proxy rx pdsp devices database entry structure 
++ *  
++ * @cmp_ring complete ring structure
++ * @cmp_ring_head complete ring head pointer
++ * @cmp_ring_tail complete ring tail pointer 
++ * @devBuffersLack specify how much buffers needs to be send to 
++ *                 the device on complete ring
++ * @req_ring request ring structure
++ * @req_ring_head request ring head pointer
++ * @req_ring_tail request ring tail pointer
++ * @mcdma_page_offset the offset to the page the McDMA is using 
++ * @mcdma_page_num_entries number of entries ceing copied to 
++ *                         mcdma_page_offset
++ * @mcdma_done_page_offset the offset to the page the McDMA is 
++ *                         done using
++ * @mcdma_done_num_entries number of entries copied to 
++ *                         mcdma_done_page_offset
++ * @mcdma_ch_regs_offset the offset to mcdma channel regs that 
++ *                       the device is using
++ * @pdsp_page_offset offset to next free page the pdsp can use 
++ * @pagesBase mcdma pages base offset 
++ * @note the struct contains reserve fields in order to be
++ * align to the actual memory layout 
++ */
++struct __attribute__((packed, aligned(64))) fw_rx_pdsp_devs_db_entry {
++    /* complete ring */
++    struct recv_ring_t cmp_ring;
++    Uint32             cmp_ring_head;
++    Uint32             cmp_ring_tail;
++    /* request ring control */
++    Uint16  devBuffersLack;
++    Uint16  Reserved16;
++    Uint32  Reserved32;
++    /* request ring */
++    struct send_ring_t req_ring;
++    Uint32             req_ring_head;
++    Uint32             req_ring_tail;
++    /* request ring control */
++    Uint16  mcdma_page_offset;
++    Uint16  next_free_page_offset;
++    Uint8   mcdma_page_num_entries;
++    Uint8   mcdma_ch_regs_offset;
++    Uint16  pagesBase;
++};
++
++AVALANCHE_PP_RET_e avalanche_pp_wifi_init(struct wifi_proxy_fw_init_info_t *init_info);
++AVALANCHE_PP_RET_e avalanche_pp_wifi_set_max_copy_burst(Uint8 max_burst);
++AVALANCHE_PP_RET_e avalanche_pp_add_wifi_dev_ch(struct wifi_proxy_add_ch_info_t *info,
++                                                struct wifi_proxy_add_ch_ret_info_t *ret_vals);
++AVALANCHE_PP_RET_e avalanche_pp_rem_wifi_dev_ch(wifi_dev_id_e wifi_dev_id);
++AVALANCHE_PP_RET_e avalanche_pp_start_wifi_dev_ch(wifi_dev_id_e wifi_dev_id);
++AVALANCHE_PP_RET_e avalanche_pp_stop_wifi_dev_ch(wifi_dev_id_e wifi_dev_id);
++AVALANCHE_PP_RET_e avalanche_pp_get_dev_ch_stats(wifi_dev_id_e dev_id, 
++                                                 struct pp_hal_wifi_device_stats *dev_stats);
++
++#endif
+ 
+ #if 0
+ 
+--- a/include/linux/avalanche/generic/pal_cppi41.h
++++ b/include/linux/avalanche/generic/pal_cppi41.h
+@@ -290,6 +290,18 @@ typedef struct
+     unsigned int qNum;    /* The queue number */
+ } Cppi4Queue;
+ 
++
++/**
++ * \brief The BufPool Tuple
++ * - The basic BufPool tuple in CPPI 4.1 used across all data
++ *   structures where a definition of a buffer pool is required.
++ */
++typedef struct
++{
++    Uint32 bMgr;        /**< The buffer manager number */
++    Uint32 bPool;       /**< The buffer pool number */
++} Cppi4BufPool;
++
+ /**
+  * \brief Queue Manager queue management region
+  *
+--- a/include/linux/avalanche/puma7/puma7_cppi_gqmgr1_q.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_gqmgr1_q.h
+@@ -484,22 +484,22 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_QOS_UNUSED_INPUT_Q5)                                    /* PAL_CPPI_PP_QMGR_G1_Q421 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_QOS_UNUSED_INPUT_Q6)                                    /* PAL_CPPI_PP_QMGR_G1_Q422 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_QOS_UNUSED_INPUT_Q7)                                    /* PAL_CPPI_PP_QMGR_G1_Q423 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q0)                                          /* PAL_CPPI_PP_QMGR_G1_Q424 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q1)                                          /* PAL_CPPI_PP_QMGR_G1_Q425 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q2)                                          /* PAL_CPPI_PP_QMGR_G1_Q426 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q3)                                          /* PAL_CPPI_PP_QMGR_G1_Q427 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q4)                                          /* PAL_CPPI_PP_QMGR_G1_Q428 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q5)                                          /* PAL_CPPI_PP_QMGR_G1_Q429 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q6)                                          /* PAL_CPPI_PP_QMGR_G1_Q430 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI0_PDSP_Q7)                                          /* PAL_CPPI_PP_QMGR_G1_Q431 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q0)                                          /* PAL_CPPI_PP_QMGR_G1_Q432 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q1)                                          /* PAL_CPPI_PP_QMGR_G1_Q433 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q2)                                          /* PAL_CPPI_PP_QMGR_G1_Q434 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q3)                                          /* PAL_CPPI_PP_QMGR_G1_Q435 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q4)                                          /* PAL_CPPI_PP_QMGR_G1_Q436 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q5)                                          /* PAL_CPPI_PP_QMGR_G1_Q437 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q6)                                          /* PAL_CPPI_PP_QMGR_G1_Q438 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI1_PDSP_Q7)                                          /* PAL_CPPI_PP_QMGR_G1_Q439 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV0_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q424 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV1_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q425 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV2_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q426 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV3_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q427 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV4_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q428 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV5_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q429 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV6_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q430 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV7_INTERNAL_Q)                                /* PAL_CPPI_PP_QMGR_G1_Q431 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV0_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q432 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV1_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q433 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV2_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q434 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV3_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q435 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV4_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q436 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV5_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q437 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV6_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q438 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV7_INPUT_Q)                                   /* PAL_CPPI_PP_QMGR_G1_Q439 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_SYNCH_Q0)                                               /* PAL_CPPI_PP_QMGR_G1_Q440 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_SYNCH_Q1)                                               /* PAL_CPPI_PP_QMGR_G1_Q441 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_SYNCH_Q2)                                               /* PAL_CPPI_PP_QMGR_G1_Q442 */\
+--- a/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h
+@@ -90,8 +90,8 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_SGMII0_HI_Q_NUM)                     /* PAL_CPPI_PP_QMGR_G2_Q27 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_SGMII1_LOW_Q_NUM)                    /* PAL_CPPI_PP_QMGR_G2_Q28 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_SGMII1_HI_Q_NUM)                     /* PAL_CPPI_PP_QMGR_G2_Q29 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WiFi_LOW_Q_NUM)                      /* PAL_CPPI_PP_QMGR_G2_Q30 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WiFi_HI_Q_NUM)                       /* PAL_CPPI_PP_QMGR_G2_Q31 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WIFI_LOW_Q_NUM)                      /* PAL_CPPI_PP_QMGR_G2_Q30 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WIFI_HI_Q_NUM)                       /* PAL_CPPI_PP_QMGR_G2_Q31 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_DPI_PDSP_Q0)                                          /* PAL_CPPI_PP_QMGR_G2_Q32 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_DPI_PDSP_Q1)                                          /* PAL_CPPI_PP_QMGR_G2_Q33 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_DPI_PDSP_Q2)                                          /* PAL_CPPI_PP_QMGR_G2_Q34 */\
+@@ -125,10 +125,10 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_MC_PDSP_Q6)                                           /* PAL_CPPI_PP_QMGR_G2_Q62 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_MC_PDSP_Q7)                                           /* PAL_CPPI_PP_QMGR_G2_Q63 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_PHY_Q_NUM)                                            /* PAL_CPPI_PP_QMGR_G2_Q64 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q65)                                                  /* PAL_CPPI_PP_QMGR_G2_Q65 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q66)                                                  /* PAL_CPPI_PP_QMGR_G2_Q66 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q67)                                                  /* PAL_CPPI_PP_QMGR_G2_Q67 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q68)                                                  /* PAL_CPPI_PP_QMGR_G2_Q68 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WIFI_DEVICE0_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G2_Q65 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WIFI_DEVICE1_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G2_Q65 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WIFI_DEVICE2_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G2_Q65 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WIFI_DEVICE3_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G2_Q65 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q69)                                                  /* PAL_CPPI_PP_QMGR_G2_Q69 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q70)                                                  /* PAL_CPPI_PP_QMGR_G2_Q70 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q71)                                                  /* PAL_CPPI_PP_QMGR_G2_Q71 */\
+@@ -387,22 +387,22 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q324)                                                 /* PAL_CPPI_PP_QMGR_G2_Q324 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q325)                                                 /* PAL_CPPI_PP_QMGR_G2_Q325 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q326)                                                 /* PAL_CPPI_PP_QMGR_G2_Q326 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_0_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q327 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_0_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q328 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_1_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q329 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_1_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q330 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_2_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q331 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_2_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q332 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_3_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q333 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_3_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q334 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_4_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q335 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_4_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q336 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_5_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q337 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_5_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q338 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_6_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q339 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_6_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q340 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_7_HI_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q341 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_LOW_TX_CH_7_LOW_Q_NUM)              /* PAL_CPPI_PP_QMGR_G2_Q342 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE0_HOST_RX_HI_Q_NUM)      /* PAL_CPPI_PP_QMGR_G2_Q327 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE0_HOST_RX_LOW_Q_NUM)     /* PAL_CPPI_PP_QMGR_G2_Q328 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE1_HOST_RX_HI_Q_NUM)      /* PAL_CPPI_PP_QMGR_G2_Q329 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE1_HOST_RX_LOW_Q_NUM)     /* PAL_CPPI_PP_QMGR_G2_Q330 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE2_HOST_RX_HI_Q_NUM)      /* PAL_CPPI_PP_QMGR_G2_Q331 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE2_HOST_RX_LOW_Q_NUM)     /* PAL_CPPI_PP_QMGR_G2_Q332 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE3_HOST_RX_Hi_Q_NUM)      /* PAL_CPPI_PP_QMGR_G2_Q333 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE3_HOST_RX_LOW_Q_NUM)     /* PAL_CPPI_PP_QMGR_G2_Q334 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE0_TX_FW_HI_Q_NUM)        /* PAL_CPPI_PP_QMGR_G2_Q335 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE0_TX_FW_LOW_Q_NUM)       /* PAL_CPPI_PP_QMGR_G2_Q336 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE1_TX_FW_HI_Q_NUM)        /* PAL_CPPI_PP_QMGR_G2_Q337 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE1_TX_FW_LOW_Q_NUM)       /* PAL_CPPI_PP_QMGR_G2_Q338 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE2_TX_FW_HI_Q_NUM)        /* PAL_CPPI_PP_QMGR_G2_Q339 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE2_TX_FW_LOWQ_NUM)        /* PAL_CPPI_PP_QMGR_G2_Q340 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE3_TX_FW_HI_Q_NUM)        /* PAL_CPPI_PP_QMGR_G2_Q341 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE3_TX_FW_LOWQ_NUM)        /* PAL_CPPI_PP_QMGR_G2_Q342 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q343)                                                 /* PAL_CPPI_PP_QMGR_G2_Q343 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_PP_EVENTS_Q0)                                         /* PAL_CPPI_PP_QMGR_G2_Q344 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_PP_EVENTS_Q1)                                         /* PAL_CPPI_PP_QMGR_G2_Q345 */\
+@@ -491,7 +491,7 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_RGMII1_HI_INFRA_HOST_FD_Q_NUM)                        /* PAL_CPPI_PP_QMGR_G2_Q428 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_SGMII0_HI_INFRA_HOST_FD_Q_NUM)                        /* PAL_CPPI_PP_QMGR_G2_Q429 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_SGMII1_HI_INFRA_HOST_FD_Q_NUM)                        /* PAL_CPPI_PP_QMGR_G2_Q430 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WiFi_HI_INFRA_HOST_FD_Q_NUM)                          /* PAL_CPPI_PP_QMGR_G2_Q431 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_INFRA_HOST_RX_FD_Q_NUM)                          /* PAL_CPPI_PP_QMGR_G2_Q431 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_NP2APP_HOST_FD_Q_NUM)                                 /* PAL_CPPI_PP_QMGR_G2_Q432 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_NP2APP_INFRA_PPINFO_HOST_FD_Q_NUM)                    /* PAL_CPPI_PP_QMGR_G2_Q433 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_NP2APP_INFRA_DATA_HOST_FD_Q_NUM)                      /* PAL_CPPI_PP_QMGR_G2_Q434 */\
+@@ -548,8 +548,8 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_SGMII1_DDR_LONG_RX_HIGH_EMB_FD_Q_NUM)                 /* PAL_CPPI_PP_QMGR_G2_Q485 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST2PP_INFRA_LOW_EMB_FD_Q_NUM)                       /* PAL_CPPI_PP_QMGR_G2_Q486 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_HOST2PP_INFRA_HIGH_EMB_FD_Q_NUM)                      /* PAL_CPPI_PP_QMGR_G2_Q487 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_RX_LOW_EMB_FD_Q_NUM)                             /* PAL_CPPI_PP_QMGR_G2_Q488 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_RX_HIGH_EMB_FD_Q_NUM)                            /* PAL_CPPI_PP_QMGR_G2_Q489 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_FW_TX_INTERNAL_EMB_FD_Q_NUM)                     /* PAL_CPPI_PP_QMGR_G2_Q488 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_FW_RX_EMB_FD_Q_NUM)                              /* PAL_CPPI_PP_QMGR_G2_Q489 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_VOICE_DSP_RX_EMB_FD_Q_NUM)                            /* PAL_CPPI_PP_QMGR_G2_Q490 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_VOICE_INFRA_RX_EMB_FD_Q_NUM)                          /* PAL_CPPI_PP_QMGR_G2_Q491 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q45)                                           /* PAL_CPPI_PP_QMGR_G2_Q492 */\
+--- a/include/linux/avalanche/puma7/puma7_cppi_prv.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_prv.h
+@@ -458,19 +458,19 @@ typedef enum PAL_CPPI_PP_QSMON_4_THREADs
+ 
+ typedef enum PAL_CPPI_PP_DESC_REGIONs
+ {
+-    PAL_CPPI_PP_RX_SHORT_NON_DOCSIS_INFRA_GLOBAL_DESC_REGION,           // 0
+-    PAL_CPPI_PP_RX_LONG_RX_XL_DOCSIS_GLOBAL_DESC_REGION,                // 1
+-    PAL_CPPI_PP_WIFI_GLOBAL_DESC_REGION,                                // 2
++    PAL_CPPI_PP_VOICE_GLOBAL_DESC_REGION,                               // 0
++    PAL_CPPI_PP_RX_SHORT_NON_DOCSIS_INFRA_GLOBAL_DESC_REGION,           // 1
++    PAL_CPPI_PP_RX_LONG_RX_XL_DOCSIS_GLOBAL_DESC_REGION,                // 2
+     PAL_CPPI_PP_DESC_REGION3,                                           // 3
+     PAL_CPPI_PP_DESC_REGION4,                                           // 4
+     PAL_CPPI_PP_DESC_REGION5,                                           // 5
+     PAL_CPPI_PP_DESC_REGION6,                                           // 6
+     PAL_CPPI_PP_DESC_REGION7,                                           // 7
+     PAL_CPPI_PP_TEARDOWN_GLOBAL_DESC_REGION,                            // 8
+-    PAL_CPPI_PP_VOICE_GLOBAL_DESC_REGION,                               // 9
+ 
+     // On-Chip regions...
+-    PAL_CPPI_PP_INTERNAL_EMB_GLOBAL_DESC_REGION,                        // 10
++    PAL_CPPI_PP_INTERNAL_EMB_GLOBAL_DESC_REGION,                        // 9
++    PAL_CPPI_PP_WIFI_FW_TX_INTERNAL_EMB_DESC_REGION,                    // 10
+     PAL_CPPI_PP_FCC_MONOLITHIC_GLOBAL_DESC_REGION,                      // 11
+     PAL_CPPI_PP_FCC_FORWARDING_GLOBAL_DESC_REGION,                      // 12
+     PAL_CPPI_PP_FCC_STREAMING_GLOBAL_DESC_REGION,                       // 13
+@@ -565,7 +565,9 @@ typedef enum PAL_CPPI_PP_DESC_REGIONs
+ #define PAL_CPPI_PP_RGMII1_HI_INFRA_HOST_FD_DESC_COUNT                                      32
+ #define PAL_CPPI_PP_SGMII0_HI_INFRA_HOST_FD_DESC_COUNT                                      32
+ #define PAL_CPPI_PP_SGMII1_HI_INFRA_HOST_FD_DESC_COUNT                                      32
+-#define PAL_CPPI_PP_WiFi_HI_INFRA_HOST_FD_DESC_COUNT                                        32
++#ifdef CONFIG_WIFI_PROXY
++#define PAL_CPPI_PP_WIFI_INFRA_HOST_RX_FD_DESC_COUNT                                        128
++#endif
+ 
+ #ifdef CONFIG_MACH_PUMA7_BOARD
+ #define PAL_CPPI_PP_MoCA_RX_LOW_SHORT_PRIVATE_PACKET_RAM_EMB_FD_DESC_COUNT                  64
+@@ -650,13 +652,9 @@ typedef enum PAL_CPPI_PP_DESC_REGIONs
+ #define PAL_CPPI_PP_SGMII1_RX_HIGH_PRIVATE_DDR_EMB_FD_DESC_COUNT                            64
+ #endif
+ 
+-#ifdef CONFIG_MACH_PUMA7_BOARD
+-#define PAL_CPPI_PP_WiFi_RX_LOW_EMB_FD_DESC_COUNT                                           (4 * 1024)
+-#define PAL_CPPI_PP_WiFi_RX_HIGH_EMB_FD_DESC_COUNT                                          64
+-#else
+-#define PAL_CPPI_PP_WiFi_RX_LOW_EMB_FD_DESC_COUNT                                           64
+-#define PAL_CPPI_PP_WiFi_RX_HIGH_EMB_FD_DESC_COUNT                                          64
+-#endif
++#define PAL_CPPI_PP_WIFI_FW_TX_FD_BASE                                                      (IO_ADDRESS(0xF3508000))
++#define PAL_CPPI_PP_WIFI_FW_TX_INTERNAL_EMB_FD_DESC_COUNT                                   (128)
++#define PAL_CPPI_PP_WIFI_FW_RX_EMB_FD_DESC_COUNT                                            (16384) /* must be aligned to number of buffers allocated by app-cpu for wifi buffers pool */
+ 
+ #ifdef CONFIG_MACH_PUMA7_BOARD
+ #define PAL_CPPI_PP_HOST2PP_LOW_HOST_FD_DESC_COUNT                                          512
+@@ -723,7 +721,7 @@ typedef enum PAL_CPPI_PP_BUFFER_POOLs
+     PAL_CPPI_PP_SHARED_RX_LOW_2KB_BUFFER_POOL,
+     PAL_CPPI_PP_SHARED_RX_LOW_4KB_BUFFER_POOL,
+     PAL_CPPI_PP_SHARED_RX_HIGH_BUFFER_POOL,
+-    PAL_CPPI_PP_BUFFER_POOL4,
++    PAL_CPPI_PP_WIFI_RX_TX_POOL,
+     PAL_CPPI_PP_BUFFER_POOL5,
+     PAL_CPPI_PP_BUFFER_POOL6,
+     PAL_CPPI_PP_BUFFER_POOL7,
+@@ -775,7 +773,7 @@ typedef enum PAL_CPPI_PP_BUFFER_POOLs
+ 
+ #define PAL_CPPI_PP_BUFFER_POOL4_COUNT                              0
+ #define PAL_CPPI_PP_BUFFER_POOL4_SIZE                               0
+-#define PAL_CPPI_PP_BUFFER_POOL4_REF_CNT                            0
++#define PAL_CPPI_PP_WIFI_RX_TX_POOL_REF_CNT                         0
+ 
+ #define PAL_CPPI_PP_BUFFER_POOL5_COUNT                              0
+ #define PAL_CPPI_PP_BUFFER_POOL5_SIZE                               0
+@@ -919,7 +917,7 @@ typedef enum PAL_CPPI_PP_DMA_BLOCKS
+     PAL_CPPI_PP_DMA05_RGMII0_RX,
+     PAL_CPPI_PP_DMA06_MoCA_RX_TX,
+     PAL_CPPI_PP_DMA07_ATOM_RX_TX,
+-    PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_TX_FCC_TX,
++    PAL_CPPI_PP_DMA08_RX_TX_INFRA_WIFI_PROXY_RX_TX,
+     PAL_CPPI_PP_DMA09_INFRA_RX_TX,
+     PAL_CPPI_PP_DMA10_INFRA_RX_TX,
+     PAL_CPPI_PP_DMA11_INFRA_RX_TX,
+@@ -1130,12 +1128,12 @@ typedef enum PAL_CPPI_PP_DMA07_ATOM_RX_C
+ #define PAL_CPPI_PP_DMA07_ATOM_TX_CH            0
+ #define PAL_CPPI_PP_DMA07_ATOM_TX_CHANNELS_NUM  1
+ 
+-// PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_TX_FCC_TX
+-#define PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_TX_FCC_TX_CH_CFG_BASE        (IO_ADDRESS(0xF3910000))
+-#define PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_TX_FCC_TX_GLOBAL_CTRL_BASE   (IO_ADDRESS(0xF3911000))
+-#define PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_TX_FCC_TX_SCHEDULER_BASE     (IO_ADDRESS(0xF3911020))
++// PAL_CPPI_PP_DMA08_RX_TX_INFRA_WIFI_PROXY_RX_TX
++#define PAL_CPPI_PP_DMA08_RX_TX_INFRA_WIFI_PROXY_RX_TX_CH_CFG_BASE        (IO_ADDRESS(0xF3910000))
++#define PAL_CPPI_PP_DMA08_RX_TX_INFRA_WIFI_PROXY_RX_TX_GLOBAL_CTRL_BASE   (IO_ADDRESS(0xF3911000))
++#define PAL_CPPI_PP_DMA08_RX_TX_INFRA_WIFI_PROXY_RX_TX_SCHEDULER_BASE     (IO_ADDRESS(0xF3911020))
+ // PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX
+-typedef enum PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_CHANNELS
++typedef enum PAL_CPPI_PP_DMA08_RX_WIFI_PROXY_INFRA_RX_CHANNELS
+ {
+     PAL_CPPI_PP_DMA08_MP2TS_RX_CH_0,
+     PAL_CPPI_PP_DMA08_MP2TS_RX_CH_1,
+@@ -1153,18 +1151,18 @@ typedef enum PAL_CPPI_PP_DMA08_MPEG_RX_I
+     PAL_CPPI_PP_DMA08_MP2TS_RX_CH_13,
+     PAL_CPPI_PP_DMA08_MP2TS_RX_CH_14,
+     PAL_CPPI_PP_DMA08_MP2TS_RX_CH_15,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_16,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_17,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_18,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_19,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_20,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_21,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_22,
+-    PAL_CPPI_PP_DMA08_INFRA_RX_CH_23,
+-    PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_CHANNELS_NUM
+-}PAL_CPPI_PP_DMA08_MPEG_RX_INFRA_RX_CHANNELS_e;
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE0_HOST_RX_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE1_HOST_RX_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE2_HOST_RX_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE3_HOST_RX_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE0_TX_FW_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE1_TX_FW_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE2_TX_FW_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE3_TX_FW_INFRA_RX_CH,
++    PAL_CPPI_PP_DMA08_RX_WIFI_PROXY_INFRA_RX_CHANNELS_NUM
++}PAL_CPPI_PP_DMA08_RX_WIFI_PROXY_INFRA_RX_CHANNELS_e;
+ // PAL_CPPI_PP_DMA08_INFRA_TX_FCC_TX
+-typedef enum PAL_CPPI_PP_DMA08_INFRA_TX_FCC_TX_CHANNELS
++typedef enum PAL_CPPI_PP_DMA08_RX_WIFI_PROXY_INFRA_TX_CHANNELS
+ {
+     PAL_CPPI_PP_DMA08_FCC_TX_CH_0,
+     PAL_CPPI_PP_DMA08_FCC_TX_CH_1,
+@@ -1182,16 +1180,16 @@ typedef enum PAL_CPPI_PP_DMA08_INFRA_TX_
+     PAL_CPPI_PP_DMA08_UNUSED_TX_CH_13,
+     PAL_CPPI_PP_DMA08_UNUSED_TX_CH_14,
+     PAL_CPPI_PP_DMA08_UNUSED_TX_CH_15,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_16,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_17,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_18,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_19,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_20,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_21,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_22,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_CH_23,
+-    PAL_CPPI_PP_DMA08_INFRA_TX_FCC_TX_CHANNELS_NUM
+-}PAL_CPPI_PP_DMA08_INFRA_TX_FCC_TX_CHANNELS_e;
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE0_HOST_RX_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE1_HOST_RX_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE2_HOST_RX_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE3_HOST_RX_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE0_TX_FW_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE1_TX_FW_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE2_TX_FW_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_WIFI_DEVICE3_TX_FW_INFRA_TX_CH,
++    PAL_CPPI_PP_DMA08_RX_WIFI_PROXY_INFRA_TX_CHANNELS_NUM
++}PAL_CPPI_PP_DMA08_RX_WIFI_PROXY_INFRA_TX_CHANNELS_e;
+ 
+ 
+ // PAL_CPPI_PP_DMA09_INFRA_RX_TX
+@@ -1560,9 +1558,9 @@ typedef enum PAL_CPPI_DSG_DMA_BLOCKS
+     4                                                                           4
+     5                                                                           5
+     -------------------------------------------                                 -------------------------------------------
+-    6       2           SGMII0 RX Low                                           6       2           WiFi RX Low
++    6       2           SGMII0 RX Low                                           6       2
+     -------------------------------------------                                 -------------------------------------------
+-    7       3           SGMII0 RX High                                          7       3           WiFi RX High
++    7       3           SGMII0 RX High                                          7       3
+     -------------------------------------------                                 -------------------------------------------
+     8       4           SGMII1 RX Low                                           8       4           NP2APP RX
+     -------------------------------------------                                 -------------------------------------------
+@@ -1572,13 +1570,13 @@ typedef enum PAL_CPPI_DSG_DMA_BLOCKS
+     -------------------------------------------                                 -------------------------------------------
+     11      7           RGMII0 RX High                                          11      7           APP2NP TX Complete
+     -------------------------------------------                                 -------------------------------------------
+-    12      8           RGMII1 RX Low                                           12      8
++    12      8           RGMII1 RX Low                                           12      8           WiFi RX 0
+     -------------------------------------------                                 -------------------------------------------
+-    13      9           RGMII1 RX High                                          13      9
++    13      9           RGMII1 RX High                                          13      9           WiFi RX 1
+     -------------------------------------------                                 -------------------------------------------
+-    14      10          ATOM RX Low                                             14      10
++    14      10          ATOM RX Low                                             14      10          WiFi RX 2
+     -------------------------------------------                                 -------------------------------------------
+-    15      11          ATOM RX High                                            15      11
++    15      11          ATOM RX High                                            15      11          WiFi RX 3
+     -------------------------------------------                                 -------------------------------------------
+     16      12          DOCSIS Management RX
+     17
+@@ -1656,19 +1654,21 @@ typedef enum PAL_CPPI_PP_ACCUMULATOR_INT
+     PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_3,                                                                        // 3
+     PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_4,                                                                        // 4
+     PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_5,                                                                        // 5
+-    PAL_CPPI_PP_WiFi_RX_LOW_INTD1_ACC_CH_NUM,                                                                       // 6
+-    PAL_CPPI_PP_WiFi_RX_HIGH_INTD1_ACC_CH_NUM,                                                                      // 7
++    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_6,                                                                        // 6
++    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_7,                                                                        // 7
+     PAL_CPPI_PP_NP2APP_RX_INTD1_ACC_CH_NUM,                                                                         // 8
+     PAL_CPPI_PP_NP2APP_TX_COMPLETE_INTD1_ACC_CH_NUM,                                                                // 9
+     PAL_CPPI_PP_APP2NP_RX_INTD1_ACC_CH_NUM,                                                                         // 10
+     PAL_CPPI_PP_APP2NP_TX_COMPLETE_INTD1_ACC_CH_NUM,                                                                // 11
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_12,                                                                       // 12
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_13,                                                                       // 13
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_14,                                                                       // 14
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_15,                                                                       // 15
++    PAL_CPPI_PP_WiFi_RX_0_INTD1_ACC_CH_NUM,                                                                         // 12
++    PAL_CPPI_PP_WiFi_RX_1_INTD1_ACC_CH_NUM,                                                                         // 13
++    PAL_CPPI_PP_WiFi_RX_2_INTD1_ACC_CH_NUM,                                                                         // 14
++    PAL_CPPI_PP_WiFi_RX_3_INTD1_ACC_CH_NUM,                                                                         // 15
+     PAL_CPPI_PP_INTD1_ACCUMULATOR_MAX_CHANNELS
+ }PAL_CPPI_PP_ACCUMULATOR_INTD1_CHANNELS_e;
+ 
++#define PAL_CPPI_PP_ACC_INTD1_CH_TO_ACC_CH(ch)		    ((ch) + PAL_CPPI_PP_INTD0_ACCUMULATOR_MAX_CHANNELS)
++
+ /*
+ +-+-+-+-+-+-+-+-+-+-+-+ +-+-+-+-+-+-+-+-+-+ +-+-+-+-+-+-+-+
+ |A|c|c|u|m|u|l|a|t|o|r| |I|n|t|e|r|r|u|p|t| |V|e|c|t|o|r|s|
+@@ -1707,13 +1707,14 @@ typedef enum PAL_CPPI_PP_ACCUMULATOR_INT
+     PAL_CPPI_PP_NP2APP_TX_COMPLETE_INTD1_ACC_INTV_NUM,                                                              // 5
+     PAL_CPPI_PP_APP2NP_RX_INTD1_ACC_INTV_NUM,                                                                       // 6
+     PAL_CPPI_PP_APP2NP_TX_COMPLETE_INTD1_ACC_INTV_NUM,                                                              // 7
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_INTV_NUM_8,                                                                      // 8
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_INTV_NUM_9,                                                                      // 9
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_INTV_NUM_10,                                                                     // 10
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_INTV_NUM_11,                                                                     // 11
++    PAL_CPPI_PP_WiFi_0_INTD1_ACC_INTV_NUM,                                                                          // 8
++    PAL_CPPI_PP_WiFi_1_INTD1_ACC_INTV_NUM,                                                                          // 9
++    PAL_CPPI_PP_WiFi_2_INTD1_ACC_INTV_NUM,                                                                          // 10
++    PAL_CPPI_PP_WiFi_3_INTD1_ACC_INTV_NUM,                                                                          // 11
+     PAL_CPPI_PP_ACCUMULATOR_INTD1_MAX_INTERRUPT_VECTORS
+ }PAL_CPPI_PP_ACCUMULATOR_INTD1_INTERRUPT_VECTORS_e;
+ 
++#define PAL_CPPI41_WPD_ACC_INTV_NUM(devInstance)       (PAL_CPPI_PP_WiFi_0_INTD1_ACC_INTV_NUM + (devInstance))
+ 
+ /**********************************************************************************************************************
+ 
+@@ -1815,7 +1816,7 @@ typedef enum PAL_CPPI_PP_SOURCE_PORTS
+ #define PAL_CPPI_PP_RGMII1_INFRA_HOST_FD_Q_NUM(pri)                            ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_RGMII1_HI_INFRA_HOST_FD_Q_NUM)
+ #define PAL_CPPI_PP_SGMII0_INFRA_HOST_FD_Q_NUM(pri)                            ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_SGMII0_HI_INFRA_HOST_FD_Q_NUM)
+ #define PAL_CPPI_PP_SGMII1_INFRA_HOST_FD_Q_NUM(pri)                            ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_SGMII1_HI_INFRA_HOST_FD_Q_NUM)
+-
++#define PAL_CPPI_PP_WIFI_INFRA_HOST_FD_Q_NUM(pri)                              ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_WIFI_INFRA_HOST_RX_FD_Q_NUM)
+ 
+ 
+ /* DOCSIS */
+@@ -1851,36 +1852,109 @@ typedef enum PAL_CPPI_PP_SOURCE_PORTS
+ #define PAL_CPPI_PP_HOST2PP_HOST_FD_Q_NUM(pri)                                  (PAL_CPPI_PP_QMGR_G2_HOST2PP_LOW_HOST_FD_Q_NUM + (pri))
+ #define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(pri)                         (PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_CH_BASE + (pri))
+ #define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT                            (PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_CH_LAST - PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_CH_BASE + 1)
++#define PAL_CPPI_NETDEV_BUILD_Q_INFO(qMgr, qNum)                                ( ((qMgr) << CPPI41_EM_PKTINFO_RETQMGR_SHIFT) | (qNum) )
+ 
+ #ifdef CONFIG_MACH_PUMA7_FPGA
+ #define PAL_CPPI_PP_TEARDOWN_FD_DESC_COUNT                                      (2 * PAL_CPPI41_NUM_DMA_BLOCK)
+ #else
+ #define PAL_CPPI_PP_TEARDOWN_FD_DESC_COUNT                                      (PAL_CPPI41_NUM_TOTAL_CHAN * 2 * PAL_CPPI41_NUM_DMA_BLOCK)
+ #endif
+-#define PAL_CPPI_PP_TEARDOWN_FD_DESC_SIZE                                       32
++#define PAL_CPPI_PP_TEARDOWN_FD_DESC_SIZE                                       (32)
++
++
++#define PAL_CPPI41_SR_GBE_INFRA_FD_HOST_DESC_COUNT                              (512)
++#define PAL_CPPI41_SR_GBE_INFRA_FD_HOST_BUFFER_SIZE                             (1600)
++#define PAL_CPPI41_SR_WPD_INFRA_FD_HOST_BUFFER_SIZE                             (1600)
++
++#define PAL_CPPI41_SR_GBE_HOST_RX_Q_BASE                                        (20)
++#define PAL_CPPI41_SR_DMA_FD_TEARDOWN_Q_NUM                                     (PAL_CPPI_PP_QMGR_G2_TEARDOWN_FD_Q_NUM)
++#define PAL_CPPI_GBE_INFRA_DMA_CH_COUNT                                         (2)
++#define PAL_CPPI_WPD_INFRA_DMA_CH_COUNT                                         (2)
++
++
++#define PAL_CPPI41_SR_GBE_TX_DATA_Q_COUNT                                       (1)
++#define PAL_CPPI41_SR_WPD_TX_DATA_Q_COUNT                                       (1)
++
++#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITIES_COUNT                                (4)
++#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_HIGH                                   (3)
++#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_MEDHIGH                                (2)
++#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_MEDLOW                                 (1)
++#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_LOW                                    (0)
++
++#define PAL_CPPI41_SR_WPD_QOS_Q_PRIORITIES_COUNT                                (4)
++#define PAL_CPPI41_SR_WPD_QOS_Q_PRIORITY_HIGH                                   (3)
++#define PAL_CPPI41_SR_WPD_QOS_Q_PRIORITY_MEDHIGH                                (2)
++#define PAL_CPPI41_SR_WPD_QOS_Q_PRIORITY_MEDLOW                                 (1)
++#define PAL_CPPI41_SR_WPD_QOS_Q_PRIORITY_LOW                                    (0)
++
++#define PAL_CPPI41_SR_HOST_TO_PP_Q_COUNT                                        (PAL_CPPI_PP_HOST2PP_Q_COUNT)
++
++
++/* WIFI */
++/* host rx - rx channels */
++/* convert wifi device id to host rx infra dma rx channel */
++#define WIFI_DEVICE_TO_WIFI_HOST_RX_INFRA_RX_CH(dev_id)                         \
++    ((dev_id) + PAL_CPPI_PP_DMA08_WIFI_DEVICE0_HOST_RX_INFRA_RX_CH)
++
++/* convert wifi device id to host rx infra dma rx channel output queue */
++#define WIFI_DEVICE_TO_WIFI_HOST_RX_INFRA_RX_CH_OUT_Q(dev_id)                   \
++    ((dev_id) + PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_WIFI_DEVICE0_Q_NUM)
++
++/* host rx infra dma rx channel output queue manager */
++#define WIFI_DEVICE_TO_WIFI_HOST_RX_INFRA_RX_CH_OUT_Q_MGR                       \
++    (PAL_CPPI_PP_QMGR_G2)
++
++/* host rx - tx channels */
++/* convert wifi device id to host rx infra dma tx channel */
++#define WIFI_DEVICE_TO_WIFI_HOST_RX_INFRA_TX_CH(dev_id)                         \
++    ((dev_id) + PAL_CPPI_PP_DMA08_WIFI_DEVICE0_HOST_RX_INFRA_TX_CH)
++
++/* convert wifi device id to host rx infra dma tx channel input queue */
++#define WIFI_DEVICE_TO_WIFI_HOST_RX_INFRA_TX_CH_INPUT_Q(dev_id)                 \
++    (((dev_id)*2) + PAL_CPPI_PP_QMGR_G2_CDMA8_INFRA_INPUT_WIFI_DEVICE0_HOST_RX_HI_Q_NUM)
++
++/* host rx infra dma tx channel input queue manager*/
++#define WIFI_DEVICE_TO_WIFI_HOST_RX_INFRA_TX_CH_INPUT_Q_MGR                     \
++    (PAL_CPPI_PP_QMGR_G2)
++
++/* tx fw - rx channels */
++/* convert wifi device id to tx fw infra dma rx channel */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INFRA_RX_CH(dev_id)                           \
++    ((dev_id) + PAL_CPPI_PP_DMA09_INFRA_TX_CH_0)
++
++/* convert wifi device id to tx fw infra dma rx channel output queue */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INFRA_RX_CH_OUT_Q(dev_id)                     \
++    ((dev_id) + PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV0_INTERNAL_Q)
+ 
++/* tx fw infra dma rx channel output queue manager */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INFRA_RX_CH_OUT_Q_MGR                         \
++    (PAL_CPPI_PP_QMGR_G1)
+ 
+-#define PAL_CPPI41_SR_GBE_INFRA_FD_HOST_DESC_COUNT                  512
+-#define PAL_CPPI41_SR_GBE_INFRA_FD_HOST_BUFFER_SIZE                 1600
++/* convert wifi device id to device's tx fw input queue */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INPUT_Q(dev_id)                               \
++    ((dev_id) + PAL_CPPI_PP_QMGR_G1_WIFI_TX_DEV0_INPUT_Q)
+ 
+-#define PAL_CPPI41_SR_GBE_HOST_RX_Q_BASE                            20
+-#define PAL_CPPI41_SR_DMA_FD_TEARDOWN_Q_NUM                         PAL_CPPI_PP_QMGR_G2_TEARDOWN_FD_Q_NUM
+-#define PAL_CPPI_GBE_INFRA_DMA_CH_COUNT                             2
++/* wifi device's tx fw input queue */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INPUT_Q_MGR                                   \
++    (PAL_CPPI_PP_QMGR_G1)
+ 
+-#define PAL_CPPI41_SR_GBE_TX_DATA_Q_COUNT                           1
++/* tx fw - tx channels */
++/* convert wifi device id to tx fw infra dma tx channel */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INFRA_TX_CH(dev_id)                           \
++    ((dev_id) + PAL_CPPI_PP_DMA09_INFRA_RX_CH_0)
+ 
+-#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITIES_COUNT                    4
+-#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_HIGH                       3
+-#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_MEDHIGH                    2
+-#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_MEDLOW                     1
+-#define PAL_CPPI41_SR_GBE_QOS_Q_PRIORITY_LOW                        0
++/* convert wifi device id to tx fw infra dma tx channel input queue */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INFRA_TX_CH_INPUT_Q(dev_id)                   \
++    (((dev_id)*2) + PAL_CPPI_PP_QMGR_G2_CDMA9_INFRA_INPUT_LOW_TX_CH_0_HI_Q_NUM)
+ 
+-#define PAL_CPPI41_SR_HOST_TO_PP_Q_COUNT                            PAL_CPPI_PP_HOST2PP_Q_COUNT
++/* tx fw infra dma tx channel input queue manager */
++#define WIFI_DEVICE_TO_WIFI_TX_FW_INFRA_TX_CH_INPUT_Q_MGR                       \
++    (PAL_CPPI_PP_QMGR_G2)
+ 
+ 
+ /* VOICE */
+-#define PAL_CPPI_PP_VOICE_DSP_C55_EMB_BD_COUNT                      256
+-#define PAL_CPPI41_VOICE_DSP_C55_EMB_BD_SIZE                        PAL_CPPI_PP_QMGR_GLOBAL_DEFAULT_DESC_SIZE
++#define PAL_CPPI_PP_VOICE_DSP_C55_EMB_BD_COUNT                                  (256)
++#define PAL_CPPI41_VOICE_DSP_C55_EMB_BD_SIZE                                    (PAL_CPPI_PP_QMGR_GLOBAL_DEFAULT_DESC_SIZE)
+ 
+ #if 0
+ 
+--- a/include/linux/avalanche/puma7/puma7_pp.h
++++ b/include/linux/avalanche/puma7/puma7_pp.h
+@@ -113,18 +113,18 @@ typedef enum PP_PID_NUM
+     PP_WiFi_PORT1_PID_NUM,             // 17
+     PP_WiFi_PORT2_PID_NUM,             // 18
+     PP_WiFi_PORT3_PID_NUM,             // 19
+-    PP_WiFi_PORT4_PID_NUM,             // 20
+-    PP_WiFi_PORT5_PID_NUM,             // 21
+-    PP_WiFi_PORT6_PID_NUM,             // 22
+-    PP_WiFi_PORT7_PID_NUM,             // 23
+-    PP_WiFi_PORT8_PID_NUM,             // 24
+-    PP_WiFi_PORT9_PID_NUM,             // 25
+-    PP_WiFi_PORT10_PID_NUM,            // 26
+-    PP_WiFi_PORT11_PID_NUM,            // 27
+-    PP_WiFi_PORT12_PID_NUM,            // 28
+-    PP_WiFi_PORT13_PID_NUM,            // 29
+-    PP_WiFi_PORT14_PID_NUM,            // 30
+-    PP_WiFi_PORT15_PID_NUM             // 31
++    PP_RESERVED_PID_NUM_20,            // 20
++    PP_RESERVED_PID_NUM_21,            // 21
++    PP_RESERVED_PID_NUM_22,            // 22
++    PP_RESERVED_PID_NUM_23,            // 23
++    PP_RESERVED_PID_NUM_24,            // 24
++    PP_RESERVED_PID_NUM_25,            // 25
++    PP_RESERVED_PID_NUM_26,            // 26
++    PP_RESERVED_PID_NUM_27,            // 27
++    PP_RESERVED_PID_NUM_28,            // 28
++    PP_RESERVED_PID_NUM_29,            // 29
++    PP_RESERVED_PID_NUM_30,            // 30
++    PP_RESERVED_PID_NUM_31,            // 31
+ }PP_PID_NUM_e;
+ 
+ #if 0
+@@ -194,6 +194,78 @@ typedef enum PAL_CPPI41_PP_QOS_CLUSTERS
+ #define PAL_CPPI41_PP_DOCSIS_TX_QOS_CLUSTER_COUNT       (PAL_CPPI41_PP_DOCSIS_TX_QOS_CLUSTER_LAST - PAL_CPPI41_PP_DOCSIS_TX_QOS_CLUSTER_BASE + 1)
+ #define PAL_CPPI41_PP_L2SW_QOS_CLUSTER_COUNT            (PAL_CPPI41_PP_L2SW_QOS_CLUSTER_LAST - PAL_CPPI41_PP_L2SW_QOS_CLUSTER_BASE + 1)
+ 
++/**
++ * wifi device indexes enumeration
++ */
++typedef enum {
++    WIFI_DEV_ID_0,
++    WIFI_DEV_ID_1,
++    WIFI_DEV_ID_2,
++    WIFI_DEV_ID_3,
++    WIFI_DEVS_CNT
++} wifi_dev_id_e;
++
++#ifdef CONFIG_WIFI_PROXY
++#define WIFI_DEVICE_ID_VALID(dev_id)                    (WIFI_DEV_ID_0 <= (dev_id) && (dev_id) < WIFI_DEVS_CNT)
++#define FOR_EACH_WIFI_DEVICE_ID(i)                      for (i = WIFI_DEV_ID_0; i < WIFI_DEVS_CNT; i++)
++#define WIFI_DEVICE_TO_PID(dev_id)                      ((dev_id) + PP_WiFi_PORT0_PID_NUM)
++#define IS_WIFI_PID(pid)                                (((pid) >= PP_WiFi_PORT0_PID_NUM) && ((pid) <= (PP_WiFi_PORT0_PID_NUM + (WIFI_DEVS_CNT - 1))))
++
++/**
++ * wifi vap indexes enumeration
++ */
++typedef enum {
++    WIFI_VAP_ID_0,
++    WIFI_VAP_ID_1,
++    WIFI_VAP_ID_2,
++    WIFI_VAP_ID_3,
++    WIFI_VAP_ID_4,
++    WIFI_VAP_ID_5,
++    WIFI_VAP_ID_6,
++    WIFI_VAP_ID_7,
++    WIFI_VAP_ID_8,
++    WIFI_VAP_ID_9,
++    WIFI_VAP_ID_10,
++    WIFI_VAP_ID_11,
++    WIFI_VAP_ID_12,
++    WIFI_VAP_ID_13,
++    WIFI_VAP_ID_14,
++    WIFI_VAP_ID_15,
++    WIFI_VAP_ID_16,
++    WIFI_VAP_ID_17,
++    WIFI_VAP_ID_18,
++    WIFI_VAP_ID_19,
++    WIFI_VAP_ID_20,
++    WIFI_VAP_ID_21,
++    WIFI_VAP_ID_22,
++    WIFI_VAP_ID_23,
++    WIFI_VAP_ID_24,
++    WIFI_VAP_ID_25,
++    WIFI_VAP_ID_26,
++    WIFI_VAP_ID_27,
++    WIFI_VAP_ID_28,
++    WIFI_VAP_ID_29,
++    WIFI_VAP_ID_30,
++    WIFI_VAP_ID_31,
++    WIFI_VAPS_CNT
++} wifi_vap_id_e;
++
++#define WIFI_VAP_ID_VALID(vap_id)       \
++            (WIFI_VAP_ID_0 <= (vap_id) && (vap_id) < WIFI_VAPS_CNT)
++#define FOR_EACH_WIFI_VAP_ID(i)         \
++            for (i = WIFI_VAP_ID_0; i < WIFI_VAPS_CNT; i++)
++
++/**
++ * wifi device states enumeration
++ */
++typedef enum {
++    WIFI_DEV_STATE_ACTIVE,
++    WIFI_DEV_STATE_SUSPEND,
++    WIFI_DEV_STATE_INVALID,
++    WIFI_DEV_STATSE_CNT
++} wifi_dev_state_e;
++#endif
++
+ 
+ /*************************************/
+ /* PP Registers addresses and macros */
+@@ -373,8 +445,8 @@ typedef enum PAL_CPPI41_PP_QOS_CLUSTERS
+ #define AVALANCHE_PP_MAILBOX_CLK_CTRL_DS_PDSP2          0x00000200
+ #define AVALANCHE_PP_MAILBOX_CLK_CTRL_ACCUMULATOR       0x00000100
+ #define AVALANCHE_PP_MAILBOX_CLK_CTRL_MOCA              0x00000080
+-#define AVALANCHE_PP_MAILBOX_CLK_CTRL_WIFI_0            0x00000040
+-#define AVALANCHE_PP_MAILBOX_CLK_CTRL_WIFI_1            0x00000020
++#define AVALANCHE_PP_MAILBOX_CLK_CTRL_WIFI_TX           0x00000040
++#define AVALANCHE_PP_MAILBOX_CLK_CTRL_WIFI_RX           0x00000020
+ #define AVALANCHE_PP_MAILBOX_CLK_CTRL_MC                0x00000010
+ #define AVALANCHE_PP_MAILBOX_CLK_CTRL_SEC_ENGINE        0x00000008
+ #define AVALANCHE_PP_MAILBOX_CLK_CTRL_SEC_PDSP          0x00000004
+@@ -412,8 +484,8 @@ typedef enum PAL_CPPI41_PP_QOS_CLUSTERS
+ #define AVALANCHE_PP_FCC_1_INTRPT_BNDL_RGN_BASE         (IO_ADDRESS(0xF3C21320))
+ #define AVALANCHE_PP_ACCUMULATOR_INTRPT_BNDL_RGN_BASE   (IO_ADDRESS(0xF3C21360))
+ #define AVALANCHE_PP_MOCA_INTRPT_BNDL_RGN_BASE          (IO_ADDRESS(0xF3C21380))
+-#define AVALANCHE_PP_WIFI_0_INTRPT_BNDL_RGN_BASE        (IO_ADDRESS(0xF3C213A0))
+-#define AVALANCHE_PP_WIFI_1_INTRPT_BNDL_RGN_BASE        (IO_ADDRESS(0xF3C213C0))
++#define AVALANCHE_PP_WIFI_TX_INTRPT_BNDL_RGN_BASE       (IO_ADDRESS(0xF3C213A0))
++#define AVALANCHE_PP_WIFI_RX_INTRPT_BNDL_RGN_BASE       (IO_ADDRESS(0xF3C213C0))
+ #define AVALANCHE_PP_MC_INTRPT_BNDL_RGN_BASE            (IO_ADDRESS(0xF3C21400))
+ #define AVALANCHE_PP_SEQUENCER_INTRPT_BNDL_RGN_BASE     (IO_ADDRESS(0xF3C21420))
+ #define AVALANCHE_PP_AQM_INTRPT_BNDL_RGN_BASE           (IO_ADDRESS(0xF3C21440))
+@@ -487,17 +559,17 @@ typedef enum PAL_CPPI41_PP_QOS_CLUSTERS
+ 
+ #define AVALANCHE_PP_DPI_CMD_RGN_BASE                   (IO_ADDRESS(0xF3F40000))
+ 
+-#define AVALANCHE_PP_WIFI_0_CMD_RGN_BASE                (IO_ADDRESS(0xF3F60000))
+-#define AVALANCHE_PP_WIFI_0_PARAM_RGN_BASE              (IO_ADDRESS(0xF3F60004))
+-#define AVALANCHE_PP_WIFI_0_IRAM_RGN_BASE               (IO_ADDRESS(0xF3F70000))
+-#define AVALANCHE_PP_WIFI_0_DBG_RGN_BASE                (IO_ADDRESS(0xF3F72000))
+-#define AVALANCHE_PP_WIFI_0_CTRL_RGN_BASE               (IO_ADDRESS(0xF3F73000))
+-
+-#define AVALANCHE_PP_WIFI_1_CMD_RGN_BASE                (IO_ADDRESS(0xF3FE0000))
+-#define AVALANCHE_PP_WIFI_1_PARAM_RGN_BASE              (IO_ADDRESS(0xF3FE0004))
+-#define AVALANCHE_PP_WIFI_1_IRAM_RGN_BASE               (IO_ADDRESS(0xF3FF0000))
+-#define AVALANCHE_PP_WIFI_1_DBG_RGN_BASE                (IO_ADDRESS(0xF3FF2000))
+-#define AVALANCHE_PP_WIFI_1_CTRL_RGN_BASE               (IO_ADDRESS(0xF3FF3000))
++#define AVALANCHE_PP_WIFI_TX_CMD_RGN_BASE               (IO_ADDRESS(0xF3F60000))
++#define AVALANCHE_PP_WIFI_TX_PARAM_RGN_BASE             (IO_ADDRESS(0xF3F60004))
++#define AVALANCHE_PP_WIFI_TX_IRAM_RGN_BASE              (IO_ADDRESS(0xF3F70000))
++#define AVALANCHE_PP_WIFI_TX_DBG_RGN_BASE               (IO_ADDRESS(0xF3F72000))
++#define AVALANCHE_PP_WIFI_TX_CTRL_RGN_BASE              (IO_ADDRESS(0xF3F73000))
++
++#define AVALANCHE_PP_WIFI_RX_CMD_RGN_BASE               (IO_ADDRESS(0xF3FE0000))
++#define AVALANCHE_PP_WIFI_RX_PARAM_RGN_BASE             (IO_ADDRESS(0xF3FE0004))
++#define AVALANCHE_PP_WIFI_RX_IRAM_RGN_BASE              (IO_ADDRESS(0xF3FF0000))
++#define AVALANCHE_PP_WIFI_RX_DBG_RGN_BASE               (IO_ADDRESS(0xF3FF2000))
++#define AVALANCHE_PP_WIFI_RX_CTRL_RGN_BASE              (IO_ADDRESS(0xF3FF3000))
+ 
+ #define AVALANCHE_PP_SEQUENCER_IRAM_RGN_BASE            (IO_ADDRESS(0xF3FC0000))
+ #define AVALANCHE_PP_SEQUENCER_DBG_RGN_BASE             (IO_ADDRESS(0xF3FC2000))
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -354,7 +354,7 @@ struct skb_shared_info {
+ 	struct skb_shared_hwtstamps hwtstamps;
+ 	__be32          ip6_frag_id;
+ 
+-#ifdef CONFIG_PPA_PUMA7
++#if defined(CONFIG_PPA_PUMA7) && !defined(CONFIG_ARM_AVALANCHE_SOC)
+ 	__u8 pid:6,
+ 	     dir:1,
+ 	pool_skb:1;
+@@ -2979,6 +2979,17 @@ static inline void skb_checksum_none_ass
+ #endif
+ }
+ 
++#if defined(CONFIG_PPA_PUMA7) && !defined(CONFIG_ARM_AVALANCHE_SOC)
++struct skb_buf_manager_cb {
++    bool (*is_bm_skb)(struct sk_buff *skb);
++    int  (*bm_free_skb)(struct sk_buff *skb);
++};
++
++int skb_register_buf_manager(struct skb_buf_manager_cb *cb);
++int skb_unregister_buf_manager(void);
++#endif
++
++
+ bool skb_partial_csum_set(struct sk_buff *skb, u16 start, u16 off);
+ 
+ u32 __skb_get_poff(const struct sk_buff *skb);
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -116,6 +116,10 @@ struct kmem_cache *skbuff_pp_info_cache
+ static struct skb_buf_manager_cb bm_cb;
+ #endif
+ 
++#if defined(CONFIG_PPA_PUMA7) && !defined(CONFIG_ARM_AVALANCHE_SOC)
++static struct skb_buf_manager_cb bm_cb;
++#endif
++
+ /**
+  *	skb_panic - private function for out-of-line support
+  *	@skb:	buffer
+@@ -661,7 +665,7 @@ static void skb_clone_fraglist(struct sk
+ static void skb_free_head(struct sk_buff *skb)
+ {
+ 
+-#ifdef CONFIG_PPA_PUMA7
++#if defined(CONFIG_PPA_PUMA7) && !defined(CONFIG_ARM_AVALANCHE_SOC)
+ 	if (bm_cb.is_bm_skb && bm_cb.is_bm_skb(skb)) {
+ 		bm_cb.bm_free_skb(skb);
+ 		return;
+@@ -3887,6 +3891,29 @@ unsigned int skb_gso_transport_seglen(co
+ }
+ EXPORT_SYMBOL_GPL(skb_gso_transport_seglen);
+ 
++#if defined(CONFIG_PPA_PUMA7) && !defined(CONFIG_ARM_AVALANCHE_SOC)
++int skb_register_buf_manager(struct skb_buf_manager_cb *cb)
++{
++    if (bm_cb.is_bm_skb) {
++        pr_err("buffer manager already registered\n");
++        return 1;
++        }
++
++    pr_info("skb buffer manager registered\n");
++    memcpy(&bm_cb, cb, sizeof(bm_cb));
++    return 0;
++}
++EXPORT_SYMBOL_GPL(skb_register_buf_manager);
++
++int skb_unregister_buf_manager(void)
++{
++    pr_info("skb buffer manager unregistered\n");
++    memset(&bm_cb, 0, sizeof(bm_cb));
++}
++EXPORT_SYMBOL_GPL(skb_unregister_buf_manager);
++
++#endif
++
+ static struct sk_buff *skb_reorder_vlan_header(struct sk_buff *skb)
+ {
+ 	if (skb_cow(skb, skb_headroom(skb)) < 0) {
+--- a/net/ti/pp/ti_hil_core.c
++++ b/net/ti/pp/ti_hil_core.c
+@@ -385,6 +385,7 @@ void ti_hil_clone_netdev_pp_info(struct
+     }
+ #endif
+ }
++EXPORT_SYMBOL(ti_hil_clone_netdev_pp_info);
+ 
+ #ifdef CONFIG_TI_PACKET_PROCESSOR_STATS
+ /**************************************************************************

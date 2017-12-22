@@ -1,0 +1,329 @@
+Nginx Upload Progress Module
+============================
+
+Introduction
+============
+
+nginx_uploadprogress_module is an implementation of an upload progress system, that monitors
+RFC1867 POST upload as they are transmitted to upstream servers.
+
+It works by tracking the uploads proxied by Nginx to upstream servers without 
+analysing the uploaded content and offers a web API to report upload progress in Javscript, Json or any
+other format (through the help of templates).
+
+It works because Nginx acts as an accelerator of an upstream server, storing uploaded POST content
+on disk, before transmitting it to the upstream server. Each individual POST upload request
+should contain a progress unique identifier.
+
+This module is Copyright (c) 2007-2012 Brice Figureau, and is licensed under the BSD license (see LICENSE).
+ * rbtree and shm_zone code is based on Igor Sysoev limit_zone Nginx module.
+ * expire header code is based on Igor Sysoev header_filter Nginx module.
+
+The JSON idea and the mechanism idea are based on Lighttpd mod_uploadprogress:
+http://blog.lighttpd.net/articles/2006/08/01/mod_uploadprogress-is-back
+
+
+WARNING: 
+ * when compiled with --with-debug, this module will produce high number of log messages.
+
+INCOMPATIBLE CHANGES
+====================
+
+v0.9.0:
+
+JSONP is now the default output of the progress probes. If you rely on this module serving
+the deprecated java output use:
+     upload_progress_java_output
+in the progress probe location.
+
+
+Installation
+============
+
+nginx_uploadprogress_module has been tested with Nginx 0.6.x, 0.7.x, 0.8.x and 1.0.x.
+
+Download the Nginx sources from http://nginx.net/ and unpack it.
+
+To build Nginx, change to the directory which contains the Nginx
+sources, and run the configuration script making sure to add the path
+to the nginx_uploadprogress_module sources using the --add-module option: ::
+
+ $ ./configure --add-module=/path/to/nginx_uploadprogress_module/
+
+Now you can build and install the software:
+
+ $ make
+
+and as root:
+
+ $ make install 
+ 
+ 
+Configuration
+=============
+
+Each upload request should be assigned a unique identifier. This unique identifier will be used
+to store the request and reference it to report.
+This identifier can be transmitted either as a GET argument or as an HTTP header whose name is X-Progress-ID.
+
+upload_progress
++++++++++++++++
+    :Syntax: upload_progress <zone_name> <zone_size>
+    :Default: none
+    :Context: http
+    :Description:
+    This directive enables the upload progress module and reserve <zone_size> bytes to the <zone_name> which
+    will be used to store the per-connection tracking information.
+    
+track_uploads
++++++++++++++
+    :Syntax: track_uploads <zone_name> <timeout>
+    :Default: none
+    :Context: location
+    :Description:
+    This directive enables tracking uploads for the current location. Each POST landing in this location will register
+    the request in the <zone_name> upload progress tracker.
+    Since Nginx doesn't support yet RFC 1867 upload, the location must be a proxy_pass or fastcgi location.
+    The POST _must_ have a query parameter called X-Progress-ID (or an HTTP header of the same name) whose value is the
+    unique identifier used to get progress information. If the POST has no such information, the upload will not be tracked.
+    The tracked connections are kept at most <timeout> seconds after they have been finished to be able to serve 
+    useful information to upload progress probes.
+    WARNING: this directive must be the last directive of the location. It must be in a proxy_pass or 
+    fastcgi_pass location.
+    
+report_uploads
+++++++++++++++
+    :Syntax: report_uploads <zone_name>
+    :Default: none
+    :Context: location
+    :Description:
+    This directive allows a location to report the upload progress that is tracked by track_uploads for <zone_name>.
+    The returned document is a Javascript text with the possible 4 results by default:
+      * the upload request hasn't been registered yet or is unknown:             
+                new Object({ 'state' : 'starting' })
+                
+        * the upload request has ended:
+                new Object({ 'state' : 'done' })
+        
+        * the upload request generated an HTTP error
+                new Object({ 'state' : 'error', 'status' : <error code> })
+            one error code that can be of use to track for the client is 413 (request entity too large).
+        
+        * the upload request is in progress:
+                new Object({ 'state' : 'uploading', 'received' : <size_received>, 'size' : <total_size>})
+    
+    It is possible to return pure json instead of this javascript (see upload_progress_json_output).
+    It is also possible to configure completely the response format with the directive:
+            upload_progress_template
+
+    The HTTP request to this location must have a X-Progress-ID parameter or HTTP header containing a valid
+    unique identifier of an in progress upload.
+
+upload_progress_content_type
+++++++++++++++++++++++++++++
+    :Syntax: upload_progress_content_type <content_type>
+    :Default: text/javascript
+    :Context: location
+    :Description:
+    This directive allows to change the upload progress probe response content-type.
+
+upload_progress_header
+++++++++++++++++++++++
+    :Syntax: upload_progress_header <progress-id>
+    :Default: X-Progress-ID
+    :Context: location
+    :Description:
+    This directive allows to change the header name of the progress ID.
+
+upload_progress_jsonp_parameter
+++++++++++++++++++++++
+    :Syntax: upload_progress_jsonp_parameter <callback_parameter>
+    :Default: callback
+    :Context: location
+    :Description:
+    This directive allows to change the name of the GET parameter with the jsonp callback name.
+
+upload_progress_java_output
++++++++++++++++++++++++++++
+    :Syntax: upload_progress_java_output
+    :Default: N/A
+    :Context: location
+    :Description:
+    This directive sets everything to output as eval() javascript compatible code.
+
+upload_progress_json_output
++++++++++++++++++++++++++++
+    :Syntax: upload_progress_json_output
+    :Default: N/A
+    :Context: location
+    :Description:
+    This directive sets everything to output as pure json.
+
+upload_progress_jsonp_output
+++++++++++++++++++++++++++++
+    :Syntax: upload_progress_jsonp_output
+    :Default: N/A
+    :Context: location
+    :Description:
+    This directive sets everything to output as jsonp (like json output, but with callback).
+
+upload_progress_template
+++++++++++++++++++++++++
+    :Syntax: upload_progress_template <state> <template>
+    :Default: none
+    :Context: location
+    :Description:
+    This directive can be used to install a progress response template.
+    The available list of state is:
+        * starting
+        * uploading
+        * error
+        * done
+
+    Nginx will replace the value of the following variables with their respective
+    value for the upload:
+        * $uploadprogress_length: total size of the upload
+        * $uploadprogress_received: what the server has received so far
+        * $uploadprogress_status: error code in case of HTTP error
+        * $uploadprogress_callback: jsonp callback name if provided as a GET query parameter with name 'callback'
+    
+    For instance to return XML (instead of the default Javascript or json):
+
+    upload_progress_content_type 'text/xml';
+    upload_progress_template starting '<upload><state>starting</state></upload>';
+    upload_progress_template uploading '<upload><state>uploading</state><size>$uploadprogress_length</size><uploaded>$uploadprogress_received</uploaded></upload>';
+    upload_progress_template done '<upload><state>done</state></upload>';
+    upload_progress_template error '<upload><state>error</state><code>$uploadprogress_status</code></upload>';
+
+    Example of jsonp response:
+
+    upload_progress_template starting "$uploadprogress_callback({ \"state\" : \"starting\"});";
+    upload_progress_template error "$uploadprogress_callback({ \"state\" : \"error\", \"status\" : $uploadprogress_status });";
+    upload_progress_template done "$uploadprogress_callback({ \"state\" : \"done\"});";
+    upload_progress_template uploading "$uploadprogress_callback({ \"state\" : \"uploading\", \"received\" : $uploadprogress_received, \"size\" : $uploadprogress_length });";
+
+Configuration Example:
++++++++++++++++++++++
+
+http {
+    
+    # reserve 1MB under the name 'proxied' to track uploads
+    upload_progress proxied 1m;
+
+  server {
+        listen       127.0.0.1 default;
+        server_name  _ *;
+        
+        root /path/to/root;
+        
+        location / {
+            # proxy to upstream server
+            proxy_pass http://127.0.0.1;
+            proxy_redirect default;
+            
+            # track uploads in the 'proxied' zone
+            # remember connections for 30s after they finished
+            track_uploads proxied 30s;
+        }
+        
+        location ^~ /progress {
+            # report uploads tracked in the 'proxied' zone
+            report_uploads proxied;
+        }
+}
+    
+
+Usage Example
+=============
+
+(based on Lighttd mod_uploadprogress module example):
+
+First we need a upload form:
+
+  <form id="upload" enctype="multipart/form-data" 
+    action="/upload.php" method="post" 
+    onsubmit="openProgressBar(); return true;">
+  <input type="hidden" name="MAX_FILE_SIZE" value="30000000"  />
+  <input name="userfile" type="file" label="fileupload" />
+  <input type="submit" value="Send File" />
+  </form>
+
+And a progress bar to visualize the progress:
+
+  <div>
+   <div id="progress" style="width: 400px; border: 1px solid black">
+    <div id="progressbar" 
+       style="width: 1px; background-color: black; border: 1px solid white">
+     &nbsp;
+    </div>
+   </div>
+   <div id="tp">(progress)</div>
+  </div>
+
+Then we need to generate the Unique Identifier and launch the upload on submit
+action. This also will start the ajax progress report mechanism.
+
+ interval = null;
+
+function openProgressBar() {
+ /* generate random progress-id */
+ uuid = "";
+ for (i = 0; i < 32; i++) {
+  uuid += Math.floor(Math.random() * 16).toString(16);
+ }
+ /* patch the form-action tag to include the progress-id */
+ document.getElementById("upload").action="/upload.php?X-Progress-ID=" + uuid;
+
+ /* call the progress-updater every 1000ms */
+ interval = window.setInterval(
+   function () {
+     fetch(uuid);
+   },
+   1000
+ );
+}
+
+function fetch(uuid) {
+ req = new XMLHttpRequest();
+ req.open("GET", "/progress", 1);
+ req.setRequestHeader("X-Progress-ID", uuid);
+ req.onreadystatechange = function () {
+  if (req.readyState == 4) {
+   if (req.status == 200) {
+    /* poor-man JSON parser */
+    var upload = eval(req.responseText);
+
+    document.getElementById('tp').innerHTML = upload.state;
+
+    /* change the width if the inner progress-bar */
+    if (upload.state == 'done' || upload.state == 'uploading') {
+     bar = document.getElementById('progressbar');
+     w = 400 * upload.received / upload.size;
+     bar.style.width = w + 'px';
+    }
+    /* we are done, stop the interval */
+    if (upload.state == 'done') {
+     window.clearTimeout(interval);
+    }
+   }
+  }
+ }
+ req.send(null);
+}
+
+Companion Software
+==================
+
+This software can also work with Valery Kholodkov' Nginx Upload Module:
+http://www.grid.net.ru/nginx/upload.en.html
+
+You can also use the following javascript libraries client side:
+http://drogomir.com/blog/2008/6/30/upload-progress-script-with-safari-support
+
+Note that when using jQuery AJAX for progress monitoring, such as:
+https://github.com/drogus/jquery-upload-progress
+you should be sure to set a upload_progress template parameter:
+upload_progress_json_output
+or
+upload_progress_jsonp_output
+depending on your jQuery AJAX dataType setting.

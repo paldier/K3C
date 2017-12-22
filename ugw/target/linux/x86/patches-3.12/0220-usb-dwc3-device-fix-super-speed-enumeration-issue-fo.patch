@@ -1,0 +1,144 @@
+From a6717d98e6726960fde91b5b26cb019cc5469798 Mon Sep 17 00:00:00 2001
+From: Jiebing Li <jiebing.li@intel.com>
+Date: Wed, 7 Jan 2015 11:58:11 +0800
+Subject: [PATCH 220/441] usb/dwc3-device: fix super speed enumeration issue
+ for CHT B1/C0
+
+There's a silicon issue on CHT that everytime DWC3 enters and then
+exits D0i3, bit 11 of GUSB3PIPECTL reg is cleared to 0, which leads
+to device enumerated as a high speed one by PC's USB3 port.
+
+This patch utilizes pci quirk method to set the bit when DWC3 is
+resumed back as a workaroud.
+
+Change-Id: Ice5f4ef5b870ffbc960134e1824ba4f6662a5d0d
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-9513
+Signed-off-by: Jiebing Li <jiebing.li@intel.com>
+(cherry picked from commit adadfa2074d8b161f9b293aa4a27b12a0713ea53)
+
+Conflicts manually resolved in:
+
+	drivers/usb/dwc3/dwc3-pci.c
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/usb/dwc3/core.c          | 13 +++++++++++++
+ drivers/usb/dwc3/core.h          |  3 +++
+ drivers/usb/dwc3/dwc3-pci.c      | 18 +++++++++++++++++-
+ drivers/usb/dwc3/platform_data.h |  4 ++++
+ 4 files changed, 37 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -676,6 +676,7 @@ static int dwc3_probe(struct platform_de
+ 		dwc->needs_fifo_resize = pdata->tx_fifo_resize;
+ 		dwc->dr_mode = pdata->dr_mode;
+ 		dwc->runtime_suspend = pdata->runtime_suspend;
++		dwc->quirks = pdata->quirks;
+ 	} else {
+ 		dwc->usb2_phy = devm_usb_get_phy(dev, USB_PHY_TYPE_USB2);
+ 		dwc->usb3_phy = devm_usb_get_phy(dev, USB_PHY_TYPE_USB3);
+@@ -969,6 +970,7 @@ static int dwc3_resume_common(struct dev
+ {
+ 	struct dwc3	*dwc = dev_get_drvdata(dev);
+ 	unsigned long	flags;
++	u32		reg;
+ 
+ 	if (atomic_dec_return(&dwc->suspend_depth) > 0) {
+ 		dev_info(dev, "%s: skipping resume. suspend_depth = %d\n",
+@@ -985,6 +987,17 @@ static int dwc3_resume_common(struct dev
+ 
+ 	dwc3_disable_multi_packet(dwc);
+ 
++	/* According to a CHT silicon issue,set the bit to 1
++	 * every time controller is resumed back as a workaround
++	 * in order to make sure super speed connection succeed.
++	 */
++	if (dwc->quirks & DWC3_QUIRK_P3P2TRAN_OK) {
++		reg = dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0));
++		reg |= DWC3_GUSB3PIPECTL_P3P2TRANOK;
++		dwc3_writel(dwc->regs, DWC3_GUSB3PIPECTL(0), reg);
++		udelay(500);
++	}
++
+ 	dwc3_suspend_phy(dwc, false);
+ 
+ 	dwc3_writel(dwc->regs, DWC3_GCTL, dwc->gctl);
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -175,6 +175,7 @@
+ /* Global USB3 PIPE Control Register */
+ #define DWC3_GUSB3PIPECTL_PHYSOFTRST	(1 << 31)
+ #define DWC3_GUSB3PIPECTL_SUSPHY	(1 << 17)
++#define DWC3_GUSB3PIPECTL_P3P2TRANOK	(1 << 11)
+ 
+ /* Global TX Fifo Size Register */
+ #define DWC3_GTXFIFOSIZ_TXFDEF(n)	((n) & 0xffff)
+@@ -742,6 +743,8 @@ struct dwc3 {
+ 
+ 	struct delayed_work	watchdog;
+ 	int			dpm_pulled_down;
++
++	unsigned int		quirks;
+ };
+ 
+ /* -------------------------------------------------------------------------- */
+--- a/drivers/usb/dwc3/dwc3-pci.c
++++ b/drivers/usb/dwc3/dwc3-pci.c
+@@ -43,6 +43,14 @@ struct dwc3_pci {
+ 	atomic_t		suspend_depth;
+ };
+ 
++struct dwc3_pci_fixes {
++	unsigned int		quirks;
++};
++
++static const struct dwc3_pci_fixes dwc3_intel_cht = {
++	.quirks		= DWC3_QUIRK_P3P2TRAN_OK,
++};
++
+ static int dwc3_pci_register_phys(struct dwc3_pci *glue)
+ {
+ 	struct usb_phy_gen_xceiv_platform_data pdata;
+@@ -147,6 +155,7 @@ static int dwc3_pci_probe(struct pci_dev
+ 	int			ret = -ENOMEM;
+ 	struct device		*dev = &pci->dev;
+ 	struct dwc3_platform_data	pdata;
++	const struct dwc3_pci_fixes	*fixes;
+ 
+ 	memset(&pdata, 0x00, sizeof(pdata));
+ 
+@@ -180,6 +189,10 @@ static int dwc3_pci_probe(struct pci_dev
+ 	}
+ 
+ 	pdata.runtime_suspend = true;
++	fixes = (const struct dwc3_pci_fixes *)id->driver_data;
++	if (fixes)
++		pdata.quirks = fixes->quirks;
++
+ 	ret = platform_device_add_data(dwc3, &pdata, sizeof(pdata));
+ 	if (ret)
+ 		goto err1;
+@@ -263,7 +276,10 @@ static const struct pci_device_id dwc3_p
+ 	},
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_BYT), },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_MRFLD), },
+-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_CHT), },
++	{
++		PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_CHT),
++		.driver_data	= (kernel_ulong_t)&dwc3_intel_cht,
++	},
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_CGM), },
+ 	{  }	/* Terminating Entry */
+ };
+--- a/drivers/usb/dwc3/platform_data.h
++++ b/drivers/usb/dwc3/platform_data.h
+@@ -25,4 +25,8 @@ struct dwc3_platform_data {
+ 	enum usb_dr_mode dr_mode;
+ 	bool tx_fifo_resize;
+ 	bool runtime_suspend;
++	unsigned int quirks;
++
++/* Core transitions directly between PHY power state P2 and P3*/
++#define DWC3_QUIRK_P3P2TRAN_OK				(1 << 0)
+ };

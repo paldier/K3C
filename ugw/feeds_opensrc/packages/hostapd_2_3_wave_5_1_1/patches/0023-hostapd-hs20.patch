@@ -1,0 +1,134 @@
+From 446c3d27126877b85cee58196ca22114a4883e4a Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Wed, 26 Oct 2016 12:58:52 +0300
+Subject: [PATCH 23/69] hostapd: hs20
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ hostapd/.config       |  6 ++++--
+ hostapd/config_file.c |  3 +--
+ hostapd/config_file.h |  1 +
+ hostapd/ctrl_iface.c  | 19 +++++++++++++++++++
+ hostapd/hostapd_cli.c | 18 ++++++++++++++++++
+ 5 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/hostapd/.config b/hostapd/.config
+index 44f8dd1..934dead 100644
+--- a/hostapd/.config
++++ b/hostapd/.config
+@@ -281,10 +281,12 @@ CONFIG_NO_RANDOM_POOL=y
+ # Interworking (IEEE 802.11u)
+ # This can be used to enable functionality to improve interworking with
+ # external networks.
+-#CONFIG_INTERWORKING=y
++CONFIG_INTERWORKING=y
+ 
+ # Hotspot 2.0
+-#CONFIG_HS20=y
++CONFIG_HS20=y
++
++CONFIG_P2P_MANAGER=y
+ 
+ # Enable SQLite database support in hlr_auc_gw, EAP-SIM DB, and eap_user_file
+ #CONFIG_SQLITE=y
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 90f1dc0..fb2599c 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -1649,8 +1649,7 @@ static int hs20_parse_conn_capab(struct hostapd_bss_config *bss, char *buf,
+ }
+ 
+ 
+-static int hs20_parse_wan_metrics(struct hostapd_bss_config *bss, char *buf,
+-				  int line)
++int hs20_parse_wan_metrics(struct hostapd_bss_config *bss, char *buf, int line)
+ {
+ 	u8 *wan_metrics;
+ 	char *pos;
+diff --git a/hostapd/config_file.h b/hostapd/config_file.h
+index c98bdb6..53876cb 100644
+--- a/hostapd/config_file.h
++++ b/hostapd/config_file.h
+@@ -13,5 +13,6 @@ struct hostapd_config * hostapd_config_read(const char *fname);
+ int hostapd_set_iface(struct hostapd_config *conf,
+ 		      struct hostapd_bss_config *bss, const char *field,
+ 		      char *value);
++int hs20_parse_wan_metrics(struct hostapd_bss_config *bss, char *buf, int line);		      
+ 
+ #endif /* CONFIG_FILE_H */
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index d7db4a7..c71235e 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -662,6 +662,22 @@ static int hostapd_ctrl_iface_hs20_deauth_req(struct hostapd_data *hapd,
+ 
+ #endif /* CONFIG_HS20 */
+ 
++static int hostapd_ctrl_iface_update_wan_metrics(struct hostapd_data *hapd,
++						const char *cmd)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	char buf[128];
++	int j;
++
++	os_strlcpy(buf, cmd, 128);
++	wpa_printf(MSG_DEBUG, "hostapd_ctrl_iface_update_wan_metrics, iface->num_bss=%zu"
++			,iface->num_bss);
++	for (j = 0; j < iface->num_bss; j++) {
++		if (hs20_parse_wan_metrics(iface->bss[j]->conf, buf, 0) != 0)
++			return -1;
++	}
++	return 0;
++}
+ 
+ #ifdef CONFIG_INTERWORKING
+ 
+@@ -2425,6 +2441,9 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 			reply_len = -1;
+ #endif /* CONFIG_WPS_NFC */
+ #endif /* CONFIG_WPS */
++	} else if (os_strncmp(buf, "UPDATE_WAN_METRICS ", 19) == 0) {
++		if (hostapd_ctrl_iface_update_wan_metrics(hapd, buf + 19))
++			reply_len = -1;
+ #ifdef CONFIG_INTERWORKING
+ 	} else if (os_strncmp(buf, "SET_QOS_MAP_SET ", 16) == 0) {
+ 		if (hostapd_ctrl_iface_set_qos_map_set(hapd, buf + 16))
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 5e62542..5d4cf88 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -781,6 +781,23 @@ static int hostapd_cli_cmd_license(struct wpa_ctrl *ctrl, int argc,
+ 	return 0;
+ }
+ 
++static int hostapd_cli_cmd_update_wan_metrics(struct wpa_ctrl *ctrl,
++				int argc, char *argv[])
++{
++	char buf[200];
++	int res;
++	
++	if (argc != 1) {
++		printf("Invalid 'update_wan_metrics' command - "
++			   "one argument is needed\n");
++		return -1;
++	}
++	
++	res = os_snprintf(buf, sizeof(buf), "UPDATE_WAN_METRICS %s", argv[0]);
++	if (res < 0 || res >= (int) sizeof(buf))
++		return -1;
++	return wpa_ctrl_command(ctrl, buf);
++}
+ 
+ static int hostapd_cli_cmd_set_qos_map_set(struct wpa_ctrl *ctrl,
+ 					   int argc, char *argv[])
+@@ -1343,6 +1360,7 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "set", hostapd_cli_cmd_set, NULL, NULL },
+ 	{ "get", hostapd_cli_cmd_get, NULL, NULL },
+ 	{ "set_qos_map_set", hostapd_cli_cmd_set_qos_map_set, NULL, NULL },
++	{ "update_wan_metrics", hostapd_cli_cmd_update_wan_metrics, NULL, NULL },
+ 	{ "send_qos_map_conf", hostapd_cli_cmd_send_qos_map_conf, NULL, NULL },
+ 	{ "chan_switch", hostapd_cli_cmd_chan_switch, NULL, NULL },
+ 	{ "hs20_wnm_notif", hostapd_cli_cmd_hs20_wnm_notif, NULL, NULL },
+-- 
+2.7.4
+

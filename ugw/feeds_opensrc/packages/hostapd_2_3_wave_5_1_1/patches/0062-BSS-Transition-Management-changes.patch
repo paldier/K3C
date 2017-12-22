@@ -1,0 +1,167 @@
+From c917204bb3ed65ff83ba99ccf2750ef82ca94b12 Mon Sep 17 00:00:00 2001
+From: Aaron Komisar <aaronx.komisar@intel.com>
+Date: Mon, 22 Aug 2016 14:24:15 +0300
+Subject: [PATCH 62/69] BSS Transition Management changes
+
+1. Added the option to send Optional Neighbor Preference in BSS Transition Management Request.
+2. Allow sending BSS Termination TSF (value of the TSF timer when BSS termination will occur) and Duration (unsigned
+2-octet integer that indicates the number of minutes for which the BSS is not present) in BSS Transition Management
+Request.
+3. Added the option not to include Cellular Preference in MBO IE (using -1).
+---
+ hostapd/ctrl_iface.c | 96 +++++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 68 insertions(+), 28 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 77c744c..0432f1e 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -897,14 +897,24 @@ static int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		/* TODO: TSF configurable/learnable */
+ 		bss_term_dur[0] = 4; /* Subelement ID */
+ 		bss_term_dur[1] = 10; /* Length */
+-		os_memset(bss_term_dur, 2, 8);
++
++		//BSS Termination TSF (value of the TSF timer when BSS termination will occur)
++		errno = 0;
++		u64 tsf = strtoull (pos, NULL, 10);
++		if (errno) {
++			wpa_printf(MSG_DEBUG, "Invalid TSF value in bss_term data");
++			return -1;
++		}
++		WPA_PUT_LE64(&bss_term_dur[2], tsf);
++
++		//Duration (unsigned 2-octet integer that indicates the number of minutes for which the BSS is not present).
+ 		end = os_strchr(pos, ',');
+ 		if (end == NULL) {
+ 			wpa_printf(MSG_DEBUG, "Invalid bss_term data");
+ 			return -1;
+ 		}
+ 		end++;
+-		WPA_PUT_LE16(&bss_term_dur[10], atoi(end));
++		WPA_PUT_LE16(&bss_term_dur[10], (short)atoi(end));
+ 	}
+ 
+ 
+@@ -971,31 +981,57 @@ static int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		pos++;
+ 
+ 		*nei_pos++ = atoi(pos); /* PHY Type */
++
+ 		end = os_strchr(pos, ' ');
+ 		tmp = os_strchr(pos, ',');
++
+ 		if (tmp && (!end || tmp < end)) {
+-			/* Optional Subelements (hexdump) */
+-			size_t len;
++			/* Optional Neighbor Preference */
++			pos = os_strchr(pos, ',');
++			pos ++;
+ 
+-			pos = tmp + 1;
+-			end = os_strchr(pos, ' ');
+-			if (end)
+-				len = end - pos;
+-			else
+-				len = os_strlen(pos);
+-			if (nei_pos + len / 2 > nei_rep + sizeof(nei_rep)) {
+-				wpa_printf(MSG_DEBUG,
+-					   "Not enough room for neighbor subelements");
+-				return -1;
++			//Check if Neighbor preference is valid.
++			//More than 3 characters indicates the last parameter is the sub-elements hexdump and not preference
++			char * next_delim = os_strchr(pos, ',');
++			if ((os_strlen(pos)<=3) || (end && (end - (tmp) <= 4)) || (next_delim && (next_delim - tmp <=4))){
++
++				int cand_pref = atoi(pos);
++				if (cand_pref < 0 || cand_pref > 255){
++					wpa_printf(MSG_DEBUG, "Invalid BSS Transition Candidate Preference value");
++					return -1;
++				}
++
++				*nei_pos++ = WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE;
++				*nei_pos++ = 1;
++				*nei_pos++ = cand_pref;
++
++				tmp = os_strchr(pos, ',');
+ 			}
+-			if (len & 0x01 ||
+-			    hexstr2bin(pos, nei_pos, len / 2) < 0) {
+-				wpa_printf(MSG_DEBUG,
+-					   "Invalid neighbor subelement info");
+-				return -1;
++
++			if (tmp && (!end || tmp < end)) {
++				/* Optional Subelements (hexdump) */
++				size_t len;
++
++				pos = tmp + 1;
++				end = os_strchr(pos, ' ');
++				if (end)
++					len = end - pos;
++				else
++					len = os_strlen(pos);
++				if (nei_pos + len / 2 > nei_rep + sizeof(nei_rep)) {
++					wpa_printf(MSG_DEBUG,
++						   "Not enough room for neighbor subelements");
++					return -1;
++				}
++				if (len & 0x01 ||
++					hexstr2bin(pos, nei_pos, len / 2) < 0) {
++					wpa_printf(MSG_DEBUG,
++						   "Invalid neighbor subelement info");
++					return -1;
++				}
++				nei_pos += len / 2;
++				pos = end;
+ 			}
+-			nei_pos += len / 2;
+-			pos = end;
+ 		}
+ 
+ 		nei_start[1] = nei_pos - nei_start - 2;
+@@ -1028,12 +1064,13 @@ static int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ #ifdef CONFIG_MBO
+ 	pos = os_strstr(cmd, "mbo=");
+ 	if (pos) {
+-		unsigned int mbo_reason, cell_pref, reassoc_delay;
++		unsigned int mbo_reason, reassoc_delay;
++		int cell_pref;
+ 		u8 *mbo_pos = mbo;
+ 
+-		ret = sscanf(pos, "mbo=%u:%u:%u", &mbo_reason,
++		ret = sscanf(pos, "mbo=%u:%u:%d", &mbo_reason,
+ 			     &reassoc_delay, &cell_pref);
+-		if (ret != 3) {
++		if (ret < 3) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "MBO requires three arguments: mbo=<reason>:<reassoc_delay>:<cell_pref>");
+ 			return -1;
+@@ -1047,7 +1084,8 @@ static int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		}
+ 
+ 		/* Valid values for Cellular preference are: 0, 1, 255 */
+-		if (cell_pref != 0 && cell_pref != 1 && cell_pref != 255) {
++		/* A value of -1 indicates that Cellular Data Connection Preference Attribute will not be added to MBO IE */
++		if (cell_pref != -1 && cell_pref != 0 && cell_pref != 1 && cell_pref != 255) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "Invalid MBO cellular capability %u",
+ 				   cell_pref);
+@@ -1065,9 +1103,11 @@ static int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		*mbo_pos++ = MBO_ATTR_ID_TRANSITION_REASON;
+ 		*mbo_pos++ = 1;
+ 		*mbo_pos++ = mbo_reason;
+-		*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
+-		*mbo_pos++ = 1;
+-		*mbo_pos++ = cell_pref;
++		if (cell_pref != -1){
++			*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
++			*mbo_pos++ = 1;
++			*mbo_pos++ = cell_pref;
++		}
+ 
+ 		if (reassoc_delay) {
+ 			*mbo_pos++ = MBO_ATTR_ID_ASSOC_RETRY_DELAY;
+-- 
+1.8.3.4
+

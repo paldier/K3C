@@ -1,0 +1,277 @@
+# HG changeset patch
+# Parent 6ba550c07ec807b97c6020318dc3718939c61be4
+
+--- a/net/bridge/Kconfig
++++ b/net/bridge/Kconfig
+@@ -80,3 +80,9 @@ config LTQ_MCAST_SNOOPING
+         default y
+         help
+           Lantiq Multicast Snooping support
++
++config MCAST_CLIENT_TRACK
++        tristate "MCAST client tracking"
++        default y
++        help
++          MCAST client tracking for single vif
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -195,12 +195,20 @@ static int deliver_clone(const struct ne
+ 					       struct sk_buff *skb))
+ {
+ 	struct net_device *dev = BR_INPUT_SKB_CB(skb)->brdev;
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++	int pp_session_bypass = (SKB_GET_PP_INFO_P(skb)->flags & TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS) ? 1 : 0;
++#endif
+ 
+ 	skb = skb_clone(skb, GFP_ATOMIC);
+ 	if (!skb) {
+ 		dev->stats.tx_dropped++;
+ 		return -ENOMEM;
+ 	}
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++	if (pp_session_bypass) {
++		SKB_GET_PP_INFO_P(skb)->flags |= TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS;
++	}
++#endif
+ 
+ 	__packet_hook(prev, skb);
+ 	return 0;
+@@ -251,6 +259,18 @@ static void br_flood(struct net_bridge *
+ 
+ 	prev = NULL;
+ 
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++#ifdef CONFIG_LTQ_MCAST_SNOOPING
++	if (!unicast && !bridge_igmp_snooping && !bridge_mld_snooping) {
++		SKB_GET_PP_INFO_P(skb)->flags |= TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS;
++	}
++#else
++	if (!unicast) {
++		SKB_GET_PP_INFO_P(skb)->flags |= TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS;
++	}
++#endif
++#endif
++
+ 	list_for_each_entry_rcu(p, &br->port_list, list) {
+ 		if (forward && (p->flags & BR_ISOLATE_MODE))
+ 			continue;
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -200,6 +200,9 @@ struct net_bridge_mg_entry
+     struct net_bridge_port	*port;
+     struct rcu_head			rcu;
+     u32						saddr_cnt;
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++    int16_t client_count;
++#endif
+     ipaddr_t				saddr[0];           /* Array of src ipaddr */
+ };
+ 
+--- a/net/bridge/ltq_br_mcast_snooping.c
++++ b/net/bridge/ltq_br_mcast_snooping.c
+@@ -26,11 +26,32 @@
+ #endif
+ #include "br_private.h"
+ 
++#include <linux/ti_hil.h>
++#include <linux/mroute.h>
++
+ int bridge_igmp_snooping = 0;
+ int bridge_mld_snooping = 0;
+ int bridge_igmp_snooping_dbg = 0;
+ 
++#define LOG_INFO(str, arg...) if (bridge_igmp_snooping_dbg) { printk(KERN_INFO "%s:%d "str, __FUNCTION__, __LINE__, ##arg); }
+ 
++/* This function will dump the net_bridge_mg_entry */
++static void
++print_net_bridge_mg_entry(struct net_bridge_mg_entry *e)
++{
++	int i;
++
++	/* can add more prints as per your need :( */
++	printk(KERN_INFO "port_no: %d client_count: %d\n", e->port->port_no, e->client_count);
++	if (e->gaddr.type == IPV4) {
++		printk(KERN_INFO "gaddr: 0x%X\n", e->gaddr.addr.ip4.s_addr);
++	}
++	for (i=0 ; i<e->saddr_cnt ; i++) {
++		if (e->saddr[i].type == IPV4) {
++			printk(KERN_INFO "Idx: %d saddr: 0x%X\n", i, e->saddr[i].addr.ip4.s_addr);
++		}
++	}
++}
+ 
+ #ifdef CONFIG_SYSCTL
+ static struct ctl_table_header *br_mcast_sysctl_header;
+@@ -352,6 +373,9 @@ static int br_mg_update_entry(struct net
+ 	new->filter_mode = filter;
+ 	new->compat_mode = compat;
+ 	new->saddr_cnt = saddr_cnt;
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++	new->client_count = old->client_count;
++#endif
+ 	for(i = 0; i < saddr_cnt; i++)
+ 		copy_ipaddr(&new->saddr[i], &saddr[i]);
+ 
+@@ -364,6 +388,68 @@ static int br_mg_update_entry(struct net
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++/* This function will be called under spin lock for port->mghash_lock */
++static int
++update_mg_client_count(struct net_bridge_port *port, struct net_bridge_mg_entry *entry, ipaddr_t *gaddr, int is_add_request)
++{
++	struct net_bridge_mg_entry *oentry = NULL;
++	struct hlist_head *head;
++	unsigned int hash;
++	struct net_bridge *br = port->br;
++	struct net_bridge_port *p = NULL;
++	int match = 0;
++
++	/* Check if same gaddr is exist for another port */
++	list_for_each_entry_rcu(p, &br->port_list, list) {
++		if (p == port) {
++			continue;
++		}
++		spin_lock(&p->mghash_lock);
++
++		hash = br_gaddr_hash(p, gaddr);
++		head = &p->mghash[hash];
++
++		oentry = _br_mg_get_entry(head, gaddr);
++		if (oentry) {
++			match++;
++			oentry->client_count = (is_add_request) ? oentry->client_count + 1 : oentry->client_count - 1;
++			LOG_INFO("Match found, IF name: %s port_no: %d client_count: %d\n", p->dev->name, p->port_no, oentry->client_count);
++			if (bridge_igmp_snooping_dbg) print_net_bridge_mg_entry(oentry);
++			if (oentry->client_count < 1) {
++				printk(KERN_CRIT "This should not happened !! oentry->client_count: %d < 1\n", oentry->client_count);
++			}
++		}
++		spin_unlock(&p->mghash_lock);
++	}
++	if (match > 0) {
++		entry->client_count = (is_add_request) ? entry->client_count + match : entry->client_count - match;
++		LOG_INFO("Entry updated for: IF name: %s port_no:%d client_count: %d\n", port->dev->name, port->port_no, entry->client_count);
++
++		if (bridge_igmp_snooping_dbg) print_net_bridge_mg_entry(entry);
++
++		/* If we have only one MC client, then we had PP session ... now we are 2 & PP doesn't support MC :( */
++		if (entry->client_count == 2) {
++			if (entry->gaddr.type == IPV4) {
++				/* TODO: This is not proper way to delete session from PP but as of now to avoid adding new API in hil, I am using Hil MultiCast delete session API.
++					ti_hil_pp_event API is only matching gaddr, So I am setting that only */
++				struct mfc_cache mc;
++				memset(&mc, 0, sizeof(mc));
++				mc.mfc_mcastgrp = gaddr->addr.ip4.s_addr;
++				printk(KERN_INFO "Deleting MC session from PP, mc.mfc_mcastgrp: 0x%X\n", mc.mfc_mcastgrp);
++				ti_hil_pp_event(TI_MC_SESSION_DELETED, (void *)&mc);
++			} else {
++				/* TODO: ipv6 session delete API */
++			}
++		} else if (entry->client_count < 1) {
++			printk(KERN_CRIT "This should not happened !! entry->client_count: %d < 1\n", entry->client_count);
++		}
++	}
++
++	return 0;
++}
++#endif
++
+ static void br_mg_del_table(struct net_bridge_port *port)
+ {
+ 	int i;
+@@ -373,6 +459,9 @@ static void br_mg_del_table(struct net_b
+ 		struct hlist_node *n;
+ 
+ 		hlist_for_each_entry_safe(entry, n, &port->mghash[i], hlist) {
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++			update_mg_client_count(port, entry, &entry->gaddr, 0);
++#endif
+ 			br_mg_delete_entry(entry);
+ 		}
+ 	}
+@@ -392,7 +481,12 @@ int br_mg_del_record(struct net_bridge_p
+ 
+ 	if (!IS_ADDR_UNSPECIFIED(gaddr)) {
+ 		entry = _br_mg_get_entry(head, gaddr);
+-		if (entry) br_mg_delete_entry(entry);
++		if (entry)  {
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++			update_mg_client_count(port, entry, &entry->gaddr, 0);
++#endif
++			br_mg_delete_entry(entry);
++		}
+ 	} else {
+ 		br_mg_del_table(port);
+ 	}
+@@ -430,15 +524,29 @@ int br_mg_add_entry(struct net_bridge_po
+ 		entry->filter_mode = filter;
+ 		entry->compat_mode = compat;
+ 		entry->saddr_cnt = saddr_cnt;
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++		entry->client_count = 1;
++#endif
++
+ 		for(i = 0; i < saddr_cnt; i++)
+ 			copy_ipaddr(&entry->saddr[i], &saddr[i]);
+ 
+ 		hlist_add_head_rcu(&entry->hlist, head);
++		LOG_INFO("Adding entry for if: %s port_no: %d\n", port->dev->name, port->port_no);
+ 	}
+ 	else {
+ 		/* Update existing entry */
+ 		br_mg_update_entry(port, entry, head, gaddr, filter, compat, saddr_cnt, saddr);
++		LOG_INFO("Updating entry for if: %s port_no: %d\n", port->dev->name, port->port_no);
++		entry = NULL;
++	}
++
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++	if (entry) {
++		/* Check if same gaddr is exist on another port as well */
++		update_mg_client_count(port, entry, gaddr, 1);
+ 	}
++#endif
+ 
+ 	spin_unlock(&port->mghash_lock);
+ 
+@@ -468,7 +576,7 @@ static int br_forward_query(struct net_b
+ 
+ /* Handle multicast data */
+ static int br_snoop_multicast_data(struct net_bridge_port *port, ipaddr_t *gaddr, 
+-                                   ipaddr_t *saddr)
++                                   ipaddr_t *saddr, struct sk_buff *skb)
+ {
+ 	struct net_bridge_mg_entry *entry;
+ 	int i, found = 0, filter_mode = 1, ret = 1;
+@@ -481,6 +589,12 @@ static int br_snoop_multicast_data(struc
+ 	rcu_read_lock();	// XXX: needed ???
+ 	filter_mode = entry->filter_mode;
+ 
++#ifdef CONFIG_MCAST_CLIENT_TRACK
++	if (entry->client_count > 1) {
++		SKB_GET_PP_INFO_P(skb)->flags |= TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS;
++	}
++#endif
++
+ 	for (i = 0; i < entry->saddr_cnt; i++) {
+ 		if(is_same_ipaddr(&entry->saddr[i], saddr)) {
+ 			found = 1;
+@@ -582,7 +696,7 @@ static int br_selective_flood6(struct ne
+ 		return 1;       /* Allow all other ICMPv6 packets  */
+ 	}
+ 
+-	return br_snoop_multicast_data(p, &daddr, &saddr);
++	return br_snoop_multicast_data(p, &daddr, &saddr, skb);
+ }
+ 
+ static int br_selective_flood4(struct net_bridge_port *p, struct sk_buff *skb)
+@@ -637,7 +751,7 @@ static int br_selective_flood4(struct ne
+ 	}
+ 
+ 
+-	return br_snoop_multicast_data(p, &daddr, &saddr);
++	return br_snoop_multicast_data(p, &daddr, &saddr, skb);
+ }
+ 
+ int br_selective_flood(struct net_bridge_port *p, struct sk_buff *skb)

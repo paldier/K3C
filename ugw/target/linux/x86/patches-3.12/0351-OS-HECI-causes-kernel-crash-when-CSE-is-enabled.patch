@@ -1,0 +1,77 @@
+From 59134e7b2401454a60290cf8fa377716a11f091c Mon Sep 17 00:00:00 2001
+From: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+Date: Thu, 18 Feb 2016 17:43:29 -0800
+Subject: [PATCH 351/441] OS: HECI causes kernel crash when CSE is enabled
+
+Change-Id: I9dad36764b21c102731fc518583ee891fff18ac7
+IssueID:   HSD# 243900
+IssueType: Defect
+Symptom:   HECI causes kernel crash when CSE is enabled.
+RootCause: HECI ISH driver is map to device id (2b98)
+Resolution: Added new txe driver (from GMIN) to enable CSE and updated device id to txe driver.
+Test:      Ran a test to verify boot behavior and Txe driver.
+Reviewer:  Warden Brett T
+ReviewID:  CCID-126571
+---
+ drivers/misc/heci/pci-ish.c | 2 +-
+ drivers/misc/mei/hbm.c      | 2 +-
+ drivers/misc/mei/init.c     | 8 ++++++++
+ drivers/misc/mei/pci-txe.c  | 1 +
+ 4 files changed, 11 insertions(+), 2 deletions(-)
+
+--- a/drivers/misc/heci/pci-ish.c
++++ b/drivers/misc/heci/pci-ish.c
+@@ -62,7 +62,7 @@ MODULE_PARM_DESC(nomsi, "don't use msi (
+ static struct pci_dev *heci_pci_device;
+ 
+ static DEFINE_PCI_DEVICE_TABLE(ish_pci_tbl) = {
+-	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x2B98)},
++	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x22D8)},
+ 	{0, }
+ };
+ 
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -654,7 +654,7 @@ int mei_hbm_dispatch(struct mei_device *
+ 	 */
+ 	if (dev->hbm_state == MEI_HBM_IDLE) {
+ 		dev_dbg(&dev->pdev->dev, "hbm: state is idle ignore spurious messages\n");
+-		return;
++		return 0;
+ 	}
+ 
+ 	switch (mei_msg->hbm_cmd) {
+--- a/drivers/misc/mei/init.c
++++ b/drivers/misc/mei/init.c
+@@ -93,6 +93,13 @@ int mei_reset(struct mei_device *dev)
+ 	interrupts_enabled = state != MEI_DEV_POWER_DOWN;
+ 	dev->dev_state = MEI_DEV_RESETTING;
+ 
++	dev->reset_count++;
++	if (dev->reset_count > MEI_MAX_CONSEC_RESET) {
++		dev_err(&dev->pdev->dev, "reset: reached maximal consecutive resets: disabling the device\n");
++		dev->dev_state = MEI_DEV_DISABLED;
++		return -ENODEV;
++	}
++
+ 	ret = mei_hw_reset(dev, interrupts_enabled);
+ 	/* fall through and remove the sw state even if hw reset has failed */
+ 
+@@ -357,6 +364,7 @@ void mei_device_init(struct mei_device *
+ 	init_waitqueue_head(&dev->wait_recvd_msg);
+ 	init_waitqueue_head(&dev->wait_stop_wd);
+ 	dev->dev_state = MEI_DEV_INITIALIZING;
++	dev->reset_count = 0;
+ 
+ 	mei_io_list_init(&dev->read_list);
+ 	mei_io_list_init(&dev->write_list);
+--- a/drivers/misc/mei/pci-txe.c
++++ b/drivers/misc/mei/pci-txe.c
+@@ -38,6 +38,7 @@
+ static const struct pci_device_id mei_txe_pci_tbl[] = {
+ 	{MEI_PCI_DEVICE(0x0F18, mei_txe_cfg)}, /* Baytrail */
+ 	{MEI_PCI_DEVICE(0x2298, mei_txe_cfg)}, /* Cherrytrail */
++	{MEI_PCI_DEVICE(0x2B98, mei_txe_cfg)}, /* Cougar mountain */
+ 	{0, }
+ };
+ MODULE_DEVICE_TABLE(pci, mei_txe_pci_tbl);

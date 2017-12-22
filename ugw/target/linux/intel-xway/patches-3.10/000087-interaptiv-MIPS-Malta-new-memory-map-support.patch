@@ -1,0 +1,591 @@
+From ef1917e18ec3ce712fc015cf9ebbd3be32423f8e Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Tue, 2 Apr 2013 13:30:14 -0700
+Subject: [PATCH 087/105] MIPS: Malta new memory map support
+
+Support of Malta memory map with direct mapping of physaddr to busaddr,
+with hole between 256MB - 512MB. It is needed for Malta 2GB IOCU support.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+(cherry picked from commit 2077826170e1bc22b23877a514b7e00581e945a7)
+---
+ arch/mips/Kconfig                                  |   17 ++++-
+ .../include/asm/mach-malta/kernel-entry-init.h     |   89 +++++++++++++++-----
+ arch/mips/include/asm/mach-malta/spaces.h          |   50 +++++++++++-
+ arch/mips/include/asm/mipsregs.h                   |    3 +
+ arch/mips/kernel/traps.c                           |    4 +
+ arch/mips/mm/c-r4k.c                               |    7 ++
+ arch/mips/mti-malta/malta-init.c                   |   27 ++++++-
+ arch/mips/mti-malta/malta-memory.c                 |   26 ++++++-
+ arch/mips/mti-malta/malta-setup.c                  |   73 +++++++++++++---
+ 9 files changed, 256 insertions(+), 40 deletions(-)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index 68bc20f..e60b6d1 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -1507,9 +1507,22 @@ config CPU_MIPS32_R2_EVA
+ 	  otherwise CPU_MIPS32_R1 is a safe bet for any MIPS32 system.
+ 	  If unsure, select just CPU_MIPS32_R2 or even CPU_MIPS32_R1.
+ 
++config EVA_OLD_MALTA_MAP
++	bool "Old memory map on Malta (sys controller 1.418)"
++	depends on EVA
++	help
++	  Choose this option to build EVA kernel for old Malta memory map.
++	  All memory are located above 0x80000000 and first 256M is mirrored
++	  to first 0x80000000. IOCU doesn't work.
++	  It is designed for systems with RocIt system controller 1.418/1.424
++	  and it is kept just for MTI testing purposes. (1.424 can be used
++	  with new memory map too).
++	  May or may not work with SMP - address aliasing is crazy for YAMON.
++
+ config EVA_3GB
+ 	bool "EVA support for 3GB memory"
+ 	depends on EVA
++	depends on EVA_OLD_MALTA_MAP
+ 	help
+ 	  Choose this option to build a EVA kernel supporting up to 3GB of
+ 	  physical memory. This option shifts uncacheble IO registers from KSEG1
+@@ -1517,8 +1530,8 @@ config EVA_3GB
+ 	  additional 1GB physical memory. Actually, to minimize changes in
+ 	  drivers and code the same name (KSEG1) will still be used but it's
+ 	  address will be changed. The physical I/O address is still the same.
+-	  On Malta board it doesn't give you 3GB but it can be used as a start
+-	  point for development.
++	  On Malta board with old memory map it doesn't give you 3GB but it
++	  can be used as a start point for development.
+ 
+ if CPU_LOONGSON2F
+ config CPU_NOP_WORKAROUNDS
+diff --git a/arch/mips/include/asm/mach-malta/kernel-entry-init.h b/arch/mips/include/asm/mach-malta/kernel-entry-init.h
+index e7cfc7d..1cfcf31 100644
+--- a/arch/mips/include/asm/mach-malta/kernel-entry-init.h
++++ b/arch/mips/include/asm/mach-malta/kernel-entry-init.h
+@@ -14,6 +14,9 @@
+ 	andi    \t1, 0x7    /* Config.K0 == CCA */
+ 	move    \t2, \t1
+ 	ins     \t2, \t1, 16, 3
++
++#ifdef CONFIG_EVA_OLD_MALTA_MAP
++
+ #ifdef CONFIG_EVA_3GB
+ 	li      \t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |            \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
+@@ -24,31 +27,82 @@
+ 	ins     \t0, \t1, 16, 3
+ 	mtc0    \t0, $5, 2
+ #ifdef CONFIG_SMP
+-	li      \t0, ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |          \
++	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+ 		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+ #else
+-	li      \t0, ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |          \
++	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+ 		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
+ 		(4 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+-#endif
++#endif /* CONFIG_SMP */
++	or      \t0, \t2
++	mtc0    \t0, $5, 3
++#else /* !CONFIG_EVA_3GB */
++	li      \t0, ((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |            \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+ 	or      \t0, \t2
++	mtc0    \t0, $5, 2
++#ifdef CONFIG_SMP
++	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++#else
++	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(4 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++#endif /* CONFIG_SMP */
++	ins     \t0, \t1, 16, 3
+ 	mtc0    \t0, $5, 3
++#endif /* CONFIG_EVA_3GB */
+ 	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
+ 		(6 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+ 		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
+ 		(4 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++
++#else /* !CONFIG_EVA_OLD_MALTA_MAP */
++
++#ifdef CONFIG_EVA_3GB
++	li      \t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |            \
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     \t0, \t1, 16, 3
++	mtc0    \t0, $5, 2
++	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |          \
++		(6 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(5 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+ 	or      \t0, \t2
+-	mtc0    \t0, $5, 4
+-#else
++	mtc0    \t0, $5, 3
++	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
++		(3 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
++		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
++		(1 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++#else /* !CONFIG_EVA_3GB */
+ 	li      \t0, ((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |            \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+@@ -57,33 +111,28 @@
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+ 	or      \t0, \t2
+ 	mtc0    \t0, $5, 2
+-#ifdef CONFIG_SMP
+ 	li      \t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |            \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+ 		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                \
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+-#else
+-	li      \t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |            \
+-		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |  \
+-		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+-		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                \
+-		(4 << MIPS_SEGCFG_PA_SHIFT) |                               \
+-		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
+-#endif
+ 	ins     \t0, \t1, 16, 3
+ 	mtc0    \t0, $5, 3
+ 	li      \t0, ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |         \
+-		(6 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(2 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) |                              \
+ 		(((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |             \
+-		(4 << MIPS_SEGCFG_PA_SHIFT) |                               \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                               \
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++#endif /* CONFIG_EVA_3GB */
++
++#endif /* CONFIG_EVA_OLD_MALTA_MAP */
++
+ 	or      \t0, \t2
+ 	mtc0    \t0, $5, 4
+-#endif
+ 	jal     mips_ihb
++
+ 	mfc0    \t0, $16, 5
+ 	li      \t2, 0x40000000      /* K bit */
+ 	or      \t0, \t0, \t2
+@@ -124,7 +173,7 @@ nonmt_processor:
+ 	.asciz	"SMTC kernel requires the MT ASE to run\n"
+ 	__FINIT
+ 0:
+-#endif
++#endif /* CONFIG_MIPS_MT_SMTC */
+ 
+ #ifdef CONFIG_EVA
+ 	sync
+@@ -165,7 +214,7 @@ nonmt_processor:
+ nonsc_processor:
+ 	.asciz  "Kernel requires the Segment/EVA to run\n"
+ 	__FINIT
+-#endif
++#endif /* CONFIG_EVA */
+ 
+ 0:
+ 	.endm
+@@ -181,7 +230,7 @@ nonsc_processor:
+ 	ehb
+ 	mfc0    t1, CP0_CONFIG
+ 	eva_entry   t1 t2 t0
+-#endif
++#endif /* CONFIG_EVA */
+ 
+ 	.endm
+ 
+diff --git a/arch/mips/include/asm/mach-malta/spaces.h b/arch/mips/include/asm/mach-malta/spaces.h
+index c0d97b1..ff1bf24 100644
+--- a/arch/mips/include/asm/mach-malta/spaces.h
++++ b/arch/mips/include/asm/mach-malta/spaces.h
+@@ -12,7 +12,9 @@
+ 
+ #ifdef CONFIG_EVA
+ 
+-/* Malta board EVA memory map basic's:
++#ifdef CONFIG_EVA_OLD_MALTA_MAP
++
++/* Classic (old) Malta board EVA memory map with system controller RocIt2-1.418
+ 
+    Phys memory - 80000000 to ffffffff - 2GB (last 64KB reserved for
+ 		 correct HIGHMEM macros arithmetics)
+@@ -20,6 +22,9 @@
+    Kernel code is located in the same place (80000000) just for keeping
+ 		 the same YAMON and other stuff, so KSEG0 is used "illegally",
+ 		 using Malta mirroring of 1st 256MB (see also __pa_symbol below)
++		 for SMP kernel and direct map to 80000000 for non-SMP.
++		 SMP kernel requires that because of way how YAMON starts
++		 secondary cores.
+    IO/UNCAC_ADDR ... well, even KSEG1 or KSEG3 but physaddr is 0UL (256MB-512MB)
+    CAC_ADDR      ... it used to revert effect of UNCAC_ADDR
+    VMALLOC is cut to C0000000 to E0000000 (KSEG2)
+@@ -31,12 +36,53 @@
+ #define HIGHMEM_START           _AC(0xffff0000, UL)
+ 
+ /* trick definition, just to use kernel symbols from KSEG0 but keep
+-   all dynamic memory in EVA's MUSUK KUSEG segment - I am lazy
++   all dynamic memory in EVA's MUSUK KUSEG segment (=0x80000000) - I am lazy
+    to move kernel code from 80000000 to zero
+    Don't copy it for other boards, it is likely to have a different kernel
+    location */
+ #define __pa_symbol(x)          (RELOC_HIDE((unsigned long)(x), 0))
+ 
++#define YAMON_BASE              _AC(0x80000000, UL)
++
++#else /* !CONFIG_EVA_OLD_MALTA_MAP */
++
++/* New Malta board EVA memory map basic's:
++
++   Phys memory - 00000000 to ffffffff - up to 4GB
++		 (last 64KB reserved for correct HIGHMEM macros arithmetics,
++		  memory hole 256M-512M is for I/O registers and PCI)
++		 For EVA_3G the first 512MB are not used, let's use 4GB memory.
++   KV memory   - 0 - 7fffffff (2GB) or even higher,
++   Kernel code is located in the same place (80000000) just for keeping
++		 the same YAMON and other stuff, at least for now.
++		 Need to be copied for 3GB configurations.
++   IO/UNCAC_ADDR ... well, even KSEG1 or KSEG3 but physaddr is 0UL (256MB-512MB)
++   CAC_ADDR      ... it used to revert effect of UNCAC_ADDR
++   VMALLOC is cut to C0000000 to E0000000 (KSEG2)
++   PKMAP/kmap_coherent should be not used - no HIGHMEM
++ */
++
++#define PAGE_OFFSET             _AC(0x0, UL)
++
++#ifdef CONFIG_EVA_3G
++/* skip first 512MB */
++#define PHYS_OFFSET             _AC(0x20000000, UL)
++#else
++#define PHYS_OFFSET             _AC(0x0, UL)
++#define YAMON_BASE              _AC(0x80000000, UL)
++#endif
++
++#define HIGHMEM_START           _AC(0xffff0000, UL)
++
++/* trick definition, just to use kernel symbols from KSEG0 but keep
++   all dynamic memory in EVA's MUSUK KUSEG segment - I am lazy
++   to move kernel code from 80000000 to zero
++   Don't copy it for other boards, it is likely to have a different kernel
++   location */
++#define __pa_symbol(x)          __pa(CPHYSADDR(RELOC_HIDE((unsigned long)(x), 0)))
++
++#endif /* CONFIG_EVA_OLD_MALTA_MAP */
++
+ /*  I put INDEX_BASE here to underline the fact that in EVA mode kernel
+     may be located somethere and not in CKSEG0, so CKSEG0 may have
+     a "surprise" location and index-based CACHE may give unexpected result */
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+index b14fcf2..d5b5213 100644
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -693,6 +693,9 @@
+ #define MIPS_SEGCFG_MK		_ULCAST_(1)
+ #define MIPS_SEGCFG_UK		_ULCAST_(0)
+ 
++/* ebase register bit definition */
++#define MIPS_EBASE_WG           _ULCAST_(11)
++
+ #ifndef __ASSEMBLY__
+ 
+ /*
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index 0008f08..0bb17d4 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -1797,6 +1797,10 @@ void __cpuinit per_cpu_trap_init(bool is_boot_cpu)
+ 
+ 	if (cpu_has_veic || cpu_has_vint) {
+ 		unsigned long sr = set_c0_status(ST0_BEV);
++#ifdef CONFIG_EVA
++		write_c0_ebase(ebase|MIPS_EBASE_WG);
++		back_to_back_c0_hazard();
++#endif
+ 		write_c0_ebase(ebase);
+ 		write_c0_status(sr);
+ 		/* Setting vector spacing enables EI/VI mode  */
+diff --git a/arch/mips/mm/c-r4k.c b/arch/mips/mm/c-r4k.c
+index 4c0e6d7..1e1d423 100644
+--- a/arch/mips/mm/c-r4k.c
++++ b/arch/mips/mm/c-r4k.c
+@@ -833,6 +833,13 @@ static inline void local_r4k_flush_icache_range(unsigned long start, unsigned lo
+ 		r4k_blast_icache();
+ 	else
+ 		blast_icache_range(start, end);
++#ifdef CONFIG_EVA
++	/* This is here to smooth effect of any kind of address aliasing.
++	   It is used only during boot, so - it doesn't create an impact on
++	   performance. LY22 */
++	bc_wback_inv(start, (end - start));
++	__sync();
++#endif
+ }
+ 
+ /* this function can be called for kernel OR user addresses,
+diff --git a/arch/mips/mti-malta/malta-init.c b/arch/mips/mti-malta/malta-init.c
+index 8cbb43a..ba88fb4 100644
+--- a/arch/mips/mti-malta/malta-init.c
++++ b/arch/mips/mti-malta/malta-init.c
+@@ -84,8 +84,13 @@ static void __init mips_nmi_setup(void)
+ 	extern char except_vec_nmi;
+ 
+ 	base = cpu_has_veic ?
++#ifndef CONFIG_EVA
+ 		(void *)(CAC_BASE + 0xa80) :
+ 		(void *)(CAC_BASE + 0x380);
++#else
++		(void *)(YAMON_BASE + 0xa80) :
++		(void *)(YAMON_BASE + 0x380);
++#endif
+ 	memcpy(base, &except_vec_nmi, 0x80);
+ 	local_flush_icache_range((unsigned long)base, (unsigned long)base + 0x80);
+ }
+@@ -96,8 +101,13 @@ static void __init mips_ejtag_setup(void)
+ 	extern char except_vec_ejtag_debug;
+ 
+ 	base = cpu_has_veic ?
++#ifndef CONFIG_EVA
+ 		(void *)(CAC_BASE + 0xa00) :
+ 		(void *)(CAC_BASE + 0x300);
++#else
++		(void *)(YAMON_BASE + 0xa00) :
++		(void *)(YAMON_BASE + 0x300);
++#endif
+ 	memcpy(base, &except_vec_ejtag_debug, 0x80);
+ 	local_flush_icache_range((unsigned long)base, (unsigned long)base + 0x80);
+ }
+@@ -235,7 +245,9 @@ mips_pci_controller:
+ 		MSC_READ(MSC01_PCI_BAR0, mask);
+ 		MSC_WRITE(MSC01_PCI_P2SCMSKL, mask & MSC01_PCI_BAR0_SIZE_MSK);
+ #else
+-		/* Setup the Malta max (2GB) memory for PCI DMA in host bridge
++#ifdef CONFIG_EVA_OLD_MALTA_MAP
++		/* Classic (old) Malta memory map:
++		   Setup the Malta max (2GB) memory for PCI DMA in host bridge
+ 		   in transparent addressing mode, starting from 80000000.
+ 		   Don't believe in registers content */
+ 		mask = 0x80000008;
+@@ -245,6 +257,19 @@ mips_pci_controller:
+ 		MSC_WRITE(MSC01_PCI_HEAD4, mask);
+ 		MSC_WRITE(MSC01_PCI_P2SCMSKL, mask);
+ 		MSC_WRITE(MSC01_PCI_P2SCMAPL, mask);
++#else
++		/* New Malta memory map:
++		   Setup the Malta max memory (4G) for PCI DMA in host bridge
++		   in transparent addressing mode, starting from 00000000.
++		   Don't believe in registers content */
++		mask = 0x00000008;
++		MSC_WRITE(MSC01_PCI_BAR0, mask);
++
++		mask = 0x00000000;
++		MSC_WRITE(MSC01_PCI_HEAD4, mask);
++		MSC_WRITE(MSC01_PCI_P2SCMSKL, mask);
++		MSC_WRITE(MSC01_PCI_P2SCMAPL, mask);
++#endif
+ #endif
+ 
+ 		/* Don't handle target retries indefinitely.  */
+diff --git a/arch/mips/mti-malta/malta-memory.c b/arch/mips/mti-malta/malta-memory.c
+index 0e50848..7243d0d 100644
+--- a/arch/mips/mti-malta/malta-memory.c
++++ b/arch/mips/mti-malta/malta-memory.c
+@@ -169,9 +169,11 @@ static inline fw_memblock_t * __init prom_getevamdesc(void)
+ 			printk("YAMON reports memsize=256M but doesn't report ememsize option\n");
+ 			printk("If you install > 256MB memory, upgrade YAMON or use boot option memsize=XXXM\n");
+ 		}
++#ifdef CONFIG_EVA_OLD_MALTA_MAP
+ 	/* Don't use last 64KB - it is just for macros arithmetics overflow */
+ 	if (memsize > 0x7fff0000)
+ 		memsize = 0x7fff0000;
++#endif
+ 
+ 	memset(mdesc, 0, sizeof(mdesc));
+ 
+@@ -198,10 +200,32 @@ static inline fw_memblock_t * __init prom_getevamdesc(void)
+ 	mdesc[3].base = mdesc[0].base + 0x00100000UL;
+ 	mdesc[3].size = CPHYSADDR(PFN_ALIGN((unsigned long)&_end)) - 0x00100000UL;
+ 
++#ifndef CONFIG_EVA_OLD_MALTA_MAP
++	if (memsize > 0x20000000) {
++		/* first 256MB */
++		mdesc[4].type = fw_free;
++		mdesc[4].base = mdesc[0].base + CPHYSADDR(PFN_ALIGN(&_end));
++		mdesc[4].size = mdesc[0].base + 0x10000000 - CPHYSADDR(mdesc[4].base);
++
++		/* I/O hole ... */
++
++		/* the rest of memory (256MB behind hole is lost) */
++		mdesc[5].type = fw_free;
++		mdesc[5].base = mdesc[0].base + 0x20000000;
++		mdesc[5].size = memsize - 0x20000000;
++	} else {
++		/* limit to 256MB, exclude I/O hole */
++		memsize = (memsize > 0x10000000)? 0x10000000 : memsize;
++
++		mdesc[4].type = fw_free;
++		mdesc[4].base = mdesc[0].base + CPHYSADDR(PFN_ALIGN(&_end));
++		mdesc[4].size = memsize - CPHYSADDR(mdesc[4].base);
++	}
++#else
+ 	mdesc[4].type = fw_free;
+ 	mdesc[4].base = mdesc[0].base + CPHYSADDR(PFN_ALIGN(&_end));
+ 	mdesc[4].size = memsize - CPHYSADDR(mdesc[4].base);
+-
++#endif
+ 	return &mdesc[0];
+ }
+ #endif /* CONFIG_EVA */
+diff --git a/arch/mips/mti-malta/malta-setup.c b/arch/mips/mti-malta/malta-setup.c
+index 9a8675d..c3384a3 100644
+--- a/arch/mips/mti-malta/malta-setup.c
++++ b/arch/mips/mti-malta/malta-setup.c
+@@ -251,6 +251,8 @@ void __init plat_eva_setup(void)
+ {
+ 	unsigned int val;
+ 
++#ifdef CONFIG_EVA_OLD_MALTA_MAP
++
+ #ifdef CONFIG_EVA_3GB
+ 	val = ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
+@@ -260,19 +262,65 @@ void __init plat_eva_setup(void)
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+ 	write_c0_segctl0(val);
+ 
+-	val = ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |
++	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++#else /* !CONFIG_EVA_3G */
++	val = ((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl0(val);
++
++	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT));
++#endif /* CONFIG_EVA_3G */
+ #ifdef CONFIG_SMP
+-	val |=  (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+ #else
+-	val |=  (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(4 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+ #endif
+ 	write_c0_segctl1(val);
++
++	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(6 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(4 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++
++#else /* !CONFIG_EVA_OLD_MALTA_MAP */
++
++#ifdef CONFIG_EVA_3GB
++	val = ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl0(val);
++
++	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(6 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(5 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++	write_c0_segctl1(val);
++
++	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(3 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT));
++	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
++		(1 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+ #else /* !CONFIG_EVA_3G */
+ 	val = ((MIPS_SEGCFG_MK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
+@@ -282,27 +330,24 @@ void __init plat_eva_setup(void)
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+ 	write_c0_segctl0(val);
+ 
+-	val = ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
++	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT));
+-#ifdef CONFIG_SMP
+-	val |= (((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
++	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
+ 		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+-#else
+-	val |= (((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |
+-		(4 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
+-		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
+-#endif
+ 	write_c0_segctl1(val);
+-#endif /* CONFIG_EVA_3G */
+ 
+ 	val = ((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
+-		(6 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(2 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT));
+ 	val |= (((MIPS_SEGCFG_MUSUK << MIPS_SEGCFG_AM_SHIFT) |
+-		(4 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
++		(0 << MIPS_SEGCFG_PA_SHIFT) | (mips_cca << MIPS_SEGCFG_C_SHIFT) |
+ 		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16);
++#endif /* CONFIG_EVA_3G */
++
++#endif /* CONFIG_EVA_OLD_MALTA_MAP */
++
+ 	write_c0_segctl2(val);
+ 	back_to_back_c0_hazard();
+ 
+-- 
+1.7.1
+

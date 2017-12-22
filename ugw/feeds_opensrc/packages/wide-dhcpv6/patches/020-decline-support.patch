@@ -1,0 +1,458 @@
+--- wide-dhcpv6-20080615/addrconf.c	2011-08-22 16:54:34.331642555 +0530
++++ wide-dhcpv6-20080615_decline_final/addrconf.c	2011-08-22 16:44:21.358641720 +0530
+@@ -74,6 +74,7 @@
+ #define iacna_reestablish_data common.reestablish_data
+ #define iacna_release_data common.release_data
+ #define iacna_cleanup common.cleanup
++#define DAD_TIMEOUT 2
+ 
+ struct statefuladdr {
+ 	TAILQ_ENTRY (statefuladdr) link;
+@@ -87,7 +88,7 @@
+ 
+ static struct statefuladdr *find_addr __P((struct statefuladdr_list *,
+     struct dhcp6_statefuladdr *));
+-static int remove_addr __P((struct statefuladdr *));
++int remove_addr __P((struct statefuladdr *));
+ static int isvalid_addr __P((struct iactl *));
+ static u_int32_t duration_addr __P((struct iactl *));
+ static void cleanup_addr __P((struct iactl *));
+@@ -97,17 +98,18 @@
+ 
+ static struct dhcp6_timer *addr_timo __P((void *));
+ 
+-static int na_ifaddrconf __P((ifaddrconf_cmd_t, struct statefuladdr *));
++static int na_ifaddrconf __P((ifaddrconf_cmd_t, struct statefuladdr *, struct dhcp6_event *));
+ 
+ extern struct dhcp6_timer *client6_timo __P((void *));
+ 
+ int
+-update_address(ia, addr, dhcpifp, ctlp, callback)
++update_address(ia, addr, dhcpifp, ctlp, callback, ev)
+ 	struct ia *ia;
+ 	struct dhcp6_statefuladdr *addr;
+ 	struct dhcp6_if *dhcpifp;
+ 	struct iactl **ctlp;
+ 	void (*callback)__P((struct ia *));
++        struct dhcp6_event *ev;
+ {
+ 	struct iactl_na *iac_na = (struct iactl_na *)*ctlp;
+ 	struct statefuladdr *sa;
+@@ -182,7 +184,7 @@
+ 	#endif 
+ 
+ 	if (sa->addr.vltime != 0)
+-		if (na_ifaddrconf(IFADDRCONF_ADD, sa) < 0)
++		if (na_ifaddrconf(IFADDRCONF_ADD, sa, ev) < 0)
+ 			return (-1);
+ 
+ 	/*
+@@ -235,7 +237,7 @@
+ 	return (NULL);
+ }
+ 
+-static int
++int
+ remove_addr(sa)
+ 	struct statefuladdr *sa;
+ {
+@@ -248,7 +250,7 @@
+ 		dhcp6_remove_timer(&sa->timer);
+ 
+ 	TAILQ_REMOVE(&sa->ctl->statefuladdr_head, sa, link);
+-	ret = na_ifaddrconf(IFADDRCONF_REMOVE, sa);
++	ret = na_ifaddrconf(IFADDRCONF_REMOVE, sa, NULL);
+ 	free(sa);
+ 
+ 	return (ret);
+@@ -387,15 +389,17 @@
+ }
+ 
+ static int
+-na_ifaddrconf(cmd, sa)
++na_ifaddrconf(cmd, sa, ev)
+ 	ifaddrconf_cmd_t cmd;
+ 	struct statefuladdr *sa;
++        struct dhcp6_event *ev;
+ {
+ 	struct dhcp6_statefuladdr *addr;
+ 	struct sockaddr_in6 sin6;
+         char sCommand[100];
+         static char source[INET6_ADDRSTRLEN];
+         int ret;
++         struct timeval timo;
+ 
+ 	addr = &sa->addr;
+ 	memset(&sin6, 0, sizeof(sin6));
+@@ -418,15 +422,37 @@
+ #endif
+ 	#endif
+        
+-	dprintf(LOG_NOTICE, FNAME, "RET = %d\n", ret); 
+-        //AMS 
+-        //if
+-        {
+-            inet_ntop(AF_INET6, &sin6.sin6_addr, source, INET6_ADDRSTRLEN);
++	dprintf(LOG_NOTICE, FNAME, "RET = %d\n", ret);
++ 
++        inet_ntop(AF_INET6, &sin6.sin6_addr, source, INET6_ADDRSTRLEN);
+             
+-            sprintf(sCommand,". /etc/rc.d/bringup_wanstatus %s %s ", sa->dhcpif->ifname, source);
+-		dprintf(LOG_NOTICE, FNAME, "Scommand = %s\n ", sCommand);
+-		system(sCommand);
++        sprintf(sCommand,". /etc/rc.d/bringup_wanstatus %s %s ", sa->dhcpif->ifname, source);
++        dprintf(LOG_NOTICE, FNAME, "Scommand = %s\n ", sCommand);
++	system(sCommand);
++
++        if (ev == NULL) {
++                dprintf(LOG_INFO, FNAME, "No event");
++                return (-1);
+         }
++        ev->sa_addr =  addr->addr;
++        ev->sa_ifname = sa->dhcpif->ifname;
++        ev->sa = sa;
++
++        if (ev->timer == NULL) {
++                  ev->timer = dhcp6_add_timer(client6_timo, ev);
++                  if (ev->timer == NULL) {
++                          dprintf(LOG_NOTICE, FNAME,
++                              "failed to add dad addr timer");
++                           remove_addr(sa); /* XXX */
++                           return (-1);
++                           }
++          }
++          /* update the timer */
++          timo.tv_sec = DAD_TIMEOUT;
++          timo.tv_usec = 0;
++
++          ev->state=DHCP6S_DECLINE; 
++          dhcp6_set_timer(&timo, ev->timer);
++
+         return ret;
+ }
+--- wide-dhcpv6-20080615/addrconf.h	2007-03-21 15:22:57.000000000 +0530
++++ wide-dhcpv6-20080615_decline_final/addrconf.h	2011-08-22 15:30:04.559642429 +0530
+@@ -32,4 +32,4 @@
+ typedef enum { ADDR6S_ACTIVE, ADDR6S_RENEW, ADDR6S_REBIND} addr6state_t;
+ 
+ extern int update_address __P((struct ia *, struct dhcp6_statefuladdr *,
+-    struct dhcp6_if *, struct iactl **, void (*)__P((struct ia *))));
++    struct dhcp6_if *, struct iactl **, void (*)__P((struct ia *)), struct dhcp6_event *));
+--- wide-dhcpv6-20080615/common.c	2011-08-22 16:54:34.401642338 +0530
++++ wide-dhcpv6-20080615_decline_final/common.c	2011-08-22 15:30:04.570642051 +0530
+@@ -645,6 +645,8 @@
+ 
+ 	if (ev->timer)
+ 		dhcp6_remove_timer(&ev->timer);
++//	if (ev->dad_timer)
++//		dhcp6_remove_timer(&ev->dad_timer);
+ 	TAILQ_REMOVE(&ev->ifp->event_list, ev, link);
+ 
+ 	for (sp = ev->servers; sp; sp = sp_next) {
+@@ -3544,6 +3546,10 @@
+ 		return ("RELEASE");
+ 	case DHCP6S_IDLE:
+ 		return ("IDLE");
++	case DHCP6S_DECLINE:
++		return ("DECLINE");
++	case DHCP6S_DECLINE_SENT:
++		return ("DECLINE_SENT");
+ 	default:
+ 		return ("???"); /* XXX */
+ 	}
+--- wide-dhcpv6-20080615/config.h	2011-08-22 16:54:34.387642191 +0530
++++ wide-dhcpv6-20080615_decline_final/config.h	2011-08-22 15:30:04.562642126 +0530
+@@ -125,7 +125,7 @@
+ 
+ 	struct dhcp6_if *ifp;
+ 	struct dhcp6_timer *timer;
+-
++/*        struct dhcp6_timer *dad_timer; */
+ 	struct duid serverid;
+ 
+ 	struct timeval tv_start; /* timestamp when the 1st msg is sent */
+@@ -140,6 +140,9 @@
+ 
+ 	u_int32_t xid;		/* current transaction ID */
+ 	int state;
++        struct in6_addr sa_addr;
++        char *sa_ifname;
++        struct statefuladdr *sa;
+ 
+ 	/* list of known servers */
+ 	struct dhcp6_serverinfo *current_server;
+@@ -187,7 +190,7 @@
+ 
+ /* client status code */
+ enum {DHCP6S_INIT, DHCP6S_SOLICIT, DHCP6S_INFOREQ, DHCP6S_REQUEST,
+-      DHCP6S_RENEW, DHCP6S_REBIND, DHCP6S_RELEASE, DHCP6S_IDLE
++      DHCP6S_RENEW, DHCP6S_REBIND, DHCP6S_RELEASE, DHCP6S_IDLE, DHCP6S_DECLINE, DHCP6S_DECLINE_SENT
+ #ifdef RECONFIGURE_CLIENT
+       ,DHCP6S_RECONF
+ #endif
+--- wide-dhcpv6-20080615/dhcp6c.c	2011-08-22 16:54:34.402642144 +0530
++++ wide-dhcpv6-20080615_decline_final/dhcp6c.c	2011-08-22 16:37:12.536642157 +0530
+@@ -119,6 +119,7 @@
+ static inline int get_val32 __P((char **, int *, u_int32_t *));
+ static inline int get_ifname __P((char **, int *, char *, int));
+ 
++int dad_parse(const char *, struct dhcp6_event *);
+ static void usage __P((void));
+ static void client6_init __P((void));
+ static void client6_startall __P((int));
+@@ -158,9 +159,20 @@
+ int client6_start __P((struct dhcp6_if *));
+ static void info_printf __P((const char *, ...));
+ 
++extern int remove_addr __P((struct statefuladdr *));
+ extern int client6_script __P((char *, int, struct dhcp6_optinfo *, char *));
+ 
+ #define MAX_ELAPSED_TIME 0xffff
++#define INTERFACEINFO "/proc/net/if_inet6"
++#define DAD_FLAGS 0x08
++#define DAD_FOUND 2
++
++#define IN6_ARE_ADDR_EQUAL(a,b) \
++        ((((__const uint32_t *) (a))[0] == ((__const uint32_t *) (b))[0])     \
++         && (((__const uint32_t *) (a))[1] == ((__const uint32_t *) (b))[1])  \
++         && (((__const uint32_t *) (a))[2] == ((__const uint32_t *) (b))[2])  \
++         && (((__const uint32_t *) (a))[3] == ((__const uint32_t *) (b))[3]))
++
+ 
+ int
+ main(argc, argv)
+@@ -863,6 +875,82 @@
+ 	return (NULL);
+ }
+ 
++int dad_parse(const char *file, struct dhcp6_event *ev) {
++    int i = 0;
++    int len = 0;
++    FILE *fp = NULL;
++    struct in6_addr addr6;
++    int ret=0;
++    char addrbuf[64];
++    char buf1[64],buf2[64],buf3[64],buf4[64],buf5[64],buf6[64];               /* max line length in /proc/net/if_inet6 */
++
++    if (file == NULL) {
++        dprintf(LOG_DEBUG, FNAME, "dad_parse: NULL filename");
++        return -1;
++   }
++   
++/* for testing
++    ret = DAD_FOUND;
++    return ret;
++*/
++  
++    if ((fp = fopen(file, "r")) == NULL) {
++        return -1;
++    }
++
++    while(!feof(fp))
++    {
++          memset(buf1,0,64);
++          memset(buf5,0,64);
++          memset(buf6,0,64);
++          fscanf(fp,"%s %s %s %s %s %s",buf1,buf2,buf3,buf4,buf5,buf6);                                                                                              
++          if (strlen(buf1) == 0 || strlen(buf5) == 0 || strlen(buf6) == 0)
++              continue;
++                      
++          len = 0;
++          
++          for (i = 0; i < 32; i += 4) {
++            char *tokentmp = &buf1;
++            strncpy(addrbuf + len, &tokentmp[i], 4);
++            len += 4;
++
++            if (i < 28) {
++                strncpy(addrbuf + len, ":", 1);
++                len += 1;
++            } else {
++                strncpy(addrbuf + len, "\0", 1);
++            }
++          }
++          
++          if (inet_pton(AF_INET6, addrbuf, &addr6) < 1) {
++            dprintf(LOG_DEBUG, FNAME, "dad_parse: failed to parse addrbuf");
++            abort();
++          }
++ 
++          int flags = strtol(buf5, NULL, 16);
++          
++          
++          /* IFA_F_DADFAILED = 0x08 linux/if_addr.h */
++          if ((flags & DAD_FLAGS) != 0) {
++              dprintf(LOG_DEBUG, FNAME, "dad_parse: duplicated IPv6 address detected");
++          } else {
++              continue;
++          }
++
++          if ((!strcmp(buf6, ev->sa_ifname)) && ((flags & DAD_FLAGS) != 0) && (IN6_ARE_ADDR_EQUAL(&addr6, &ev->sa_addr))) {
++             ret = DAD_FOUND;
++             break;
++          } else{
++             continue;
++          }
++
++    }
++    fclose(fp);    
++    return ret;
++
++}
++
++
+ struct dhcp6_timer *
+ client6_timo(arg)
+ 	void *arg;
+@@ -870,6 +958,7 @@
+ 	struct dhcp6_event *ev = (struct dhcp6_event *)arg;
+ 	struct dhcp6_if *ifp;
+ 	int state = ev->state;
++        int ret;
+ 
+ 	ifp = ev->ifp;
+ 	ev->timeouts++;
+@@ -906,6 +995,7 @@
+ 	case DHCP6S_REQUEST:
+ 	case DHCP6S_RELEASE:
+ 	case DHCP6S_INFOREQ:
++	case DHCP6S_DECLINE_SENT:
+ 		client6_send(ev);
+ 		break;
+ 	case DHCP6S_RENEW:
+@@ -960,6 +1050,27 @@
+ 		}
+ 		client6_send(ev);
+ 		break;
++
++	case DHCP6S_DECLINE:
++
++                    ret = dad_parse(INTERFACEINFO, ev);
++                    if (ret < 0) {
++			dprintf(LOG_INFO, FNAME,
++		    "parse INTERFACEINFO failed");
++                    }
++                    else if (ret == 2)
++                    {
++                        client6_send(ev);
++		        ev->state=DHCP6S_DECLINE_SENT;
++                        remove_addr(ev->sa);
++                    }
++                    else
++                    {
++                        dhcp6_remove_event(ev);
++			return (NULL);
++                    }
++                    break;
++
+ 	}
+ 
+ 	dhcp6_reset_timer(ev);
+@@ -1247,6 +1358,12 @@
+ 	case DHCP6S_INFOREQ:
+ 		dh6->dh6_msgtype = DH6_INFORM_REQ;
+ 		break;
++	case DHCP6S_DECLINE:
++		dh6->dh6_msgtype = DH6_DECLINE;
++		break;
++	case DHCP6S_DECLINE_SENT:
++		dh6->dh6_msgtype = DH6_DECLINE;
++		break;
+ 	default:
+ 		dprintf(LOG_ERR, FNAME, "unexpected state");
+ 		exit(1);	/* XXX */
+@@ -1283,6 +1400,8 @@
+ 	case DHCP6S_REQUEST:
+ 	case DHCP6S_RENEW:
+ 	case DHCP6S_RELEASE:
++	case DHCP6S_DECLINE:
++	case DHCP6S_DECLINE_SENT:
+ #ifdef RECONFIGURE_CLIENT
+ 	case DHCP6S_INFOREQ:
+ 		if(ev->state != DHCP6S_INFOREQ || (ev->sub_state == DHCP6S_RECONF))
+@@ -2035,6 +2154,8 @@
+ 	struct dhcp6_listval *lv;
+ 	struct dhcp6_event *ev;
+ 	int state;
++        char *decline_status;
++        char *decline_stat = "success";
+ 
+ 	/* find the corresponding event based on the received xid */
+ 	ev = find_event_withid(ifp, ntohl(dh6->dh6_xid) & DH6_XIDMASK);
+@@ -2049,6 +2170,8 @@
+ 	    state != DHCP6S_RENEW &&
+ 	    state != DHCP6S_REBIND &&
+ 	    state != DHCP6S_RELEASE &&
++	    state != DHCP6S_DECLINE &&
++	    state != DHCP6S_DECLINE_SENT &&
+ 	    (state != DHCP6S_SOLICIT ||
+ 	     !(ifp->send_flags & DHCIFF_RAPID_COMMIT))) {
+ 		dprintf(LOG_INFO, FNAME, "unexpected reply");
+@@ -2106,6 +2229,7 @@
+ 	     lv = TAILQ_NEXT(lv, link)) {
+ 		dprintf(LOG_INFO, FNAME, "status code: %s",
+ 		    dhcp6_stcodestr(lv->val_num16));
++                decline_status = dhcp6_stcodestr(lv->val_num16);
+ #ifdef DHCP6_TAHI_FIX
+ 	/*
+ 	 * If the client receives a Reply message with a Status Code containing
+@@ -2269,12 +2393,20 @@
+ 	/* update stateful configuration information */
+ 	if (state != DHCP6S_RELEASE) {
+ 		update_ia(IATYPE_PD, &optinfo->iapd_list, ifp,
+-		    &optinfo->serverID, ev->authparam, optinfo);
++		    &optinfo->serverID, ev->authparam, optinfo, ev);
+ 		update_ia(IATYPE_NA, &optinfo->iana_list, ifp,
+-		    &optinfo->serverID, ev->authparam, optinfo);
++		    &optinfo->serverID, ev->authparam, optinfo, ev);
+ 	}
+ 
+-	dhcp6_remove_event(ev);
++	/* dhcp6_remove_event(ev); Decline hander will remove it*/
++        if((ev->state != DHCP6S_DECLINE) && (ev->state != DHCP6S_DECLINE_SENT))
++        {
++		dhcp6_remove_event(ev);
++        }
++        else if((ev->state == DHCP6S_DECLINE_SENT) && !strcmp(decline_status, decline_stat))
++        {
++		dhcp6_remove_event(ev);
++        }
+ 
+ 	if (state == DHCP6S_RELEASE) {
+ 		/*
+--- wide-dhcpv6-20080615/dhcp6c_ia.c	2011-08-22 16:54:34.390642220 +0530
++++ wide-dhcpv6-20080615_decline_final/dhcp6c_ia.c	2011-08-22 15:30:04.565647396 +0530
+@@ -111,13 +111,14 @@
+ #endif
+ 
+ void
+-update_ia(iatype, ialist, ifp, serverid, authparam, optinfo)
++update_ia(iatype, ialist, ifp, serverid, authparam, optinfo, ev)
+ 	iatype_t iatype;
+ 	struct dhcp6_list *ialist;
+ 	struct dhcp6_if *ifp;
+ 	struct duid *serverid;
+ 	struct authparam *authparam;
+ 	struct dhcp6_optinfo *optinfo;
++        struct dhcp6_event *ev;
+ {
+ 	struct ia *ia;
+ 	struct ia_conf *iac;
+@@ -185,7 +186,7 @@
+ 			case DHCP6_LISTVAL_STATEFULADDR6:
+ 				ianac = (struct iana_conf *)iac;
+ 				if (update_address(ia, &siav->val_statefuladdr6,
+-				    ifp, &ia->ctl, callback)) {
++				    ifp, &ia->ctl, callback, ev)) {
+ 					dprintf(LOG_NOTICE, FNAME,
+ 					    "failed to update an address %s",
+ 					    in6addr2str(&siav->val_statefuladdr6.addr, 0));
+--- wide-dhcpv6-20080615/dhcp6c_ia.h	2011-08-22 16:54:34.357642603 +0530
++++ wide-dhcpv6-20080615_decline_final/dhcp6c_ia.h	2011-08-22 15:30:04.565647396 +0530
+@@ -52,5 +52,5 @@
+ };
+ 
+ extern void update_ia __P((iatype_t, struct dhcp6_list *,
+-    struct dhcp6_if *, struct duid *, struct authparam *, struct dhcp6_optinfo *));
++    struct dhcp6_if *, struct duid *, struct authparam *, struct dhcp6_optinfo *, struct dhcp6_event *));
+ extern void release_all_ia __P((struct dhcp6_if *));

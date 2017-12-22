@@ -1,0 +1,115 @@
+Index: mrd6-0.9.6/src/linux/us_mfa.cpp
+===================================================================
+--- mrd6-0.9.6.orig/src/linux/us_mfa.cpp	2010-07-07 23:22:25.000000000 +0530
++++ mrd6-0.9.6/src/linux/us_mfa.cpp	2010-07-07 23:23:01.773311000 +0530
+@@ -657,6 +657,96 @@
+ #endif
+ }
+ 
++/* 
++*  Desc: lq_filter analyzes  packets and decides whether to forward or drop(rfc2460,sec 4.2)
++*  return value: true / false
++*	if true  --> process the pkt further & forward it
++*	if false --> drop it
++*/
++
++#define IPV6_TLV_PAD0 		0
++#define IPV6_TLV_PADN 		1
++#define IPV6_TLV_ROUTERALERT  	5
++#define IPV6_TLV_JUMBO		194
++#define IPV6_TLV_HAO		201
++struct ip6_tlv {
++	uint8_t type;
++	uint8_t length;
++	uint8_t value[0];
++} __attribute__ ((packed));
++
++struct _ip6_ext {
++	uint8_t ip6e_nxt;
++	uint8_t ip6e_len;
++};
++static bool ip6_parse_tlv(uint8_t *buf, uint16_t hdrlen) {
++	int off = 0;
++	int len = hdrlen;
++
++
++	off += 2;
++	len -= 2;
++
++	while (len > 0) {
++		ip6_tlv *tlv = (ip6_tlv *)(buf + off);
++		int optlen = tlv->length + 2;
++
++		switch (tlv->type) {
++
++
++		case IPV6_TLV_PAD0:
++			optlen = 1;
++			break;
++
++		case IPV6_TLV_PADN:
++			break;
++
++		default: /* Other TLV code so scan list */
++			if (optlen > len) {
++				return false;
++			}
++			if ((int8_t)(tlv->type) < 0) {
++				switch ((tlv->type & 0xC0) >> 6) {
++				case 0: /* ignore */
++					break;
++
++				case 1:
++				case 2: 
++				case 3:
++					return false;
++				};
++			}
++			break;
++		}
++		off += optlen;
++		len -= optlen;
++	}
++
++	return true;
++
++}
++
++
++bool lq_filter(uint8_t *buf, uint16_t recvlen) {
++
++	ip6_hdr *hdr = (ip6_hdr *)buf;
++	uint8_t nxt = hdr->ip6_nxt;
++	_ip6_ext *ext = (_ip6_ext *)(buf + sizeof(ip6_hdr));
++	uint16_t len = recvlen;
++	int pointer = sizeof(ip6_hdr);
++
++	uint16_t hdrlen = (ext->ip6e_len + 1) * 8;
++	if((pointer + hdrlen) > len ) {
++		return false;
++	}
++	if (nxt == IPPROTO_HOPOPTS) {
++		uint8_t *ptr = buf + pointer ;
++		return ip6_parse_tlv(ptr, hdrlen);
++	}
++	return true;
++
++}
++
+ void us_mfa::handle_ipv6(int dev, uint8_t *buf, uint16_t len) {
+ 	ip6_hdr *hdr = (ip6_hdr *)buf;
+ 
+@@ -677,9 +767,12 @@
+ 	if ((hdr->ip6_dst.s6_addr[1] & ~0x3) == 0)
+ 		return;
+ 
+-	if ((hdr->ip6_dst.s6_addr[1] & 0x0f) == 0) /* Drop pkts to multicast addr with scope = 0 */
++	if ((hdr->ip6_dst.s6_addr[1] & 0x0f) == 0) 	/* Drop pkts to multicast addr with scope = 0 */
+ 		return;
+ 
++	if (lq_filter(buf, len) == false) { 		/* rfc2460 section:4.2 */
++		return;
++	}
+ 	hdr->ip6_hlim--;
+ 
+ 	us_mfa_group *grp = match_group(hdr->ip6_dst);

@@ -1,0 +1,170 @@
+From 05dd46eff51c763af852cd630378a14c3821a845 Mon Sep 17 00:00:00 2001
+From: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+Date: Wed, 11 Nov 2015 10:33:03 -0800
+Subject: [PATCH 117/441] Backporting gmin code to fix braswell boot issue.
+
+---
+ drivers/usb/dwc3/dwc3-pci.c       | 67 ++++++++++++++++++++++++++++++++++++---
+ drivers/usb/host/xhci-intel-cap.c |  2 ++
+ 2 files changed, 65 insertions(+), 4 deletions(-)
+
+--- a/drivers/usb/dwc3/dwc3-pci.c
++++ b/drivers/usb/dwc3/dwc3-pci.c
+@@ -25,6 +25,8 @@
+ #include <linux/usb/otg.h>
+ #include <linux/usb/usb_phy_gen_xceiv.h>
+ 
++#include "platform_data.h"
++
+ /* FIXME define these in <linux/pci_ids.h> */
+ #define PCI_VENDOR_ID_SYNOPSYS		0x16c3
+ #define PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3	0xabcd
+@@ -38,22 +40,29 @@ struct dwc3_pci {
+ 	struct platform_device	*dwc3;
+ 	struct platform_device	*usb2_phy;
+ 	struct platform_device	*usb3_phy;
++	atomic_t		suspend_depth;
+ };
+ 
+ static int dwc3_pci_register_phys(struct dwc3_pci *glue)
+ {
+ 	struct usb_phy_gen_xceiv_platform_data pdata;
+ 	struct platform_device	*pdev;
++	struct pci_dev	*pci_dev;
+ 	int			ret;
+ 
+ 	memset(&pdata, 0x00, sizeof(pdata));
+ 
+-	pdev = platform_device_alloc("usb_phy_gen_xceiv", 0);
++	pci_dev = to_pci_dev(glue->dev);
++
++    pdev = platform_device_alloc("usb_phy_gen_xceiv", 0);
++
+ 	if (!pdev)
+ 		return -ENOMEM;
++	pdev->dev.parent = glue->dev;
+ 
+ 	glue->usb2_phy = pdev;
+ 	pdata.type = USB_PHY_TYPE_USB2;
++	pdata.gpio_reset = -1;
+ 
+ 	ret = platform_device_add_data(glue->usb2_phy, &pdata, sizeof(pdata));
+ 	if (ret)
+@@ -164,6 +173,14 @@ static int dwc3_pci_probe(struct pci_dev
+ 		goto err3;
+ 	}
+ 
++	atomic_set(&glue->suspend_depth, 0);
++
++	pm_runtime_set_autosuspend_delay(dev, 100);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_allow(dev);
++	pm_runtime_mark_last_busy(dev);
++	pm_runtime_put_autosuspend(dev);
++
+ 	return 0;
+ 
+ err3:
+@@ -179,6 +196,9 @@ static void dwc3_pci_remove(struct pci_d
+ {
+ 	struct dwc3_pci	*glue = pci_get_drvdata(pci);
+ 
++	pm_runtime_forbid(glue->dev);
++	pm_runtime_set_suspended(glue->dev);
++
+ 	platform_device_unregister(glue->dwc3);
+ 	platform_device_unregister(glue->usb2_phy);
+ 	platform_device_unregister(glue->usb3_phy);
+@@ -186,7 +206,7 @@ static void dwc3_pci_remove(struct pci_d
+ 	pci_disable_device(pci);
+ }
+ 
+-static DEFINE_PCI_DEVICE_TABLE(dwc3_pci_id_table) = {
++static const struct pci_device_id dwc3_pci_id_table[] = {
+ 	{
+ 		PCI_DEVICE(PCI_VENDOR_ID_SYNOPSYS,
+ 				PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3),
+@@ -200,20 +220,28 @@ static DEFINE_PCI_DEVICE_TABLE(dwc3_pci_
+ MODULE_DEVICE_TABLE(pci, dwc3_pci_id_table);
+ 
+ #ifdef CONFIG_PM_SLEEP
+-static int dwc3_pci_suspend(struct device *dev)
++static int dwc3_pci_suspend_common(struct device *dev)
+ {
+ 	struct pci_dev	*pci = to_pci_dev(dev);
++	struct dwc3_pci	*glue = pci_get_drvdata(pci);
++
++	if (atomic_inc_return(&glue->suspend_depth) > 1)
++		return 0;
+ 
+ 	pci_disable_device(pci);
+ 
+ 	return 0;
+ }
+ 
+-static int dwc3_pci_resume(struct device *dev)
++static int dwc3_pci_resume_common(struct device *dev)
+ {
+ 	struct pci_dev	*pci = to_pci_dev(dev);
++	struct dwc3_pci	*glue = pci_get_drvdata(pci);
+ 	int		ret;
+ 
++	if (atomic_dec_return(&glue->suspend_depth) > 0)
++		return 0;
++
+ 	ret = pci_enable_device(pci);
+ 	if (ret) {
+ 		dev_err(dev, "can't re-enable device --> %d\n", ret);
+@@ -224,10 +252,41 @@ static int dwc3_pci_resume(struct device
+ 
+ 	return 0;
+ }
++
++static int dwc3_pci_suspend(struct device *dev)
++{
++	return dwc3_pci_suspend_common(dev);
++}
++
++static int dwc3_pci_resume(struct device *dev)
++{
++	return dwc3_pci_resume_common(dev);
++}
++
++#ifdef CONFIG_PM_RUNTIME
++
++static int dwc3_pci_runtime_suspend(struct device *dev)
++{
++	return dwc3_pci_suspend_common(dev);
++}
++
++static int dwc3_pci_runtime_resume(struct device *dev)
++{
++	return dwc3_pci_resume_common(dev);
++}
++
++#else
++
++#define dwc3_pci_runtime_suspend NULL
++#define dwc3_pci_runtime_resume NULL
++
++#endif
++
+ #endif /* CONFIG_PM_SLEEP */
+ 
+ static const struct dev_pm_ops dwc3_pci_dev_pm_ops = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(dwc3_pci_suspend, dwc3_pci_resume)
++	SET_RUNTIME_PM_OPS(dwc3_pci_runtime_suspend, dwc3_pci_runtime_resume, NULL)
+ };
+ 
+ static struct pci_driver dwc3_pci_driver = {
+--- a/drivers/usb/host/xhci-intel-cap.c
++++ b/drivers/usb/host/xhci-intel-cap.c
+@@ -50,6 +50,8 @@ int xhci_intel_vendor_cap_init(struct xh
+ 		retval = otg_set_host(hcd->phy->otg, &hcd->self);
+ 		if (retval)
+ 			usb_put_phy(hcd->phy);
++	} else {
++		hcd->phy = NULL;
+ 	}
+ 
+ 	xhci_dbg(xhci, "capability init done\n");

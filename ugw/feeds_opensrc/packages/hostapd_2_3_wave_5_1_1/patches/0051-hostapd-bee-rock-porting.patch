@@ -1,0 +1,3523 @@
+From 7ff50f542a1b1163a1d24afbd318e47c0e1edfb6 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Tue, 1 Nov 2016 18:26:54 +0200
+Subject: [PATCH] 51 hostapd bee rock porting.patch
+
+---
+ hostapd/config_file.c              |    2 +-
+ hostapd/ctrl_iface.c               | 1115 +++++++++++++++++++++++++++++++++++-
+ hostapd/ctrl_iface.h               |    5 +
+ hostapd/hostapd_cli.c              |  357 ++++++++++++
+ src/ap/ap_config.c                 |    2 +-
+ src/ap/ap_drv_ops.h                |   63 ++
+ src/ap/ctrl_iface_ap.c             |   10 +-
+ src/ap/dfs.c                       |  187 ++++--
+ src/ap/drv_callbacks.c             |   53 +-
+ src/ap/hostapd.c                   |  106 +++-
+ src/ap/hostapd.h                   |   11 +
+ src/ap/hw_features.c               |   57 +-
+ src/ap/hw_features.h               |   12 +
+ src/ap/ieee802_11_ht.c             |    4 +
+ src/ap/sta_info.c                  |   80 ++-
+ src/ap/utils.c                     |   79 +++
+ src/common/ltq-vendor.h            |    7 +
+ src/common/wpa_ctrl.h              |    3 +
+ src/drivers/driver.h               |  189 ++++++
+ src/drivers/driver_common.c        |    1 +
+ src/drivers/driver_nl80211.c       |  205 +++++++
+ src/drivers/driver_nl80211_event.c |   13 +
+ 22 files changed, 2488 insertions(+), 73 deletions(-)
+
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2851,7 +2851,7 @@ static int hostapd_config_fill(struct ho
+ 			conf->channel = atoi(pos);
+ 			conf->acs = conf->channel == 0;
+ #ifdef CONFIG_ACS
+-			conf->acs_algo = ACS_ALGO_SURVEY;
++			conf->acs_algo = ACS_ALGO_SMART;
+ #endif /* CONFIG_ACS */
+ 		}
+ 	}
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -26,8 +26,10 @@
+ #include "utils/common.h"
+ #include "utils/eloop.h"
+ #include "utils/module_tests.h"
++#include "common/wpa_ctrl.h"
+ #include "common/version.h"
+ #include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
+ #include "common/ctrl_iface_common.h"
+ #include "crypto/tls.h"
+ #include "drivers/driver.h"
+@@ -47,6 +49,8 @@
+ #include "ap/hs20.h"
+ #include "ap/wnm_ap.h"
+ #include "ap/wpa_auth.h"
++#include "ap/acs.h"
++#include "ap/hw_features.h"
+ #include "ap/beacon.h"
+ #include "ap/neighbor_db.h"
+ #include "ap/rrm.h"
+@@ -55,6 +59,7 @@
+ #include "fst/fst_ctrl_iface.h"
+ #include "config_file.h"
+ #include "ctrl_iface.h"
++#include "drivers/nl80211_copy.h"
+ 
+ 
+ #define HOSTAPD_CLI_DUP_VALUE_MAX_LEN 256
+@@ -1861,6 +1866,52 @@ static int hostapd_ctrl_get_fail(struct
+ 
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++void
++set_iface_conf(struct hostapd_iface *iface,
++        const struct hostapd_freq_params *freq_params)
++{
++  int vht_seg0_idx = 0, vht_seg1_idx = 0, vht_bw = VHT_CHANWIDTH_USE_HT;
++
++  if (freq_params->center_freq1)
++    vht_seg0_idx = 36 + (freq_params->center_freq1 - 5180) / 5;
++  if (freq_params->center_freq2)
++    vht_seg1_idx = 36 + (freq_params->center_freq2 - 5180) / 5;
++
++  switch (freq_params->bandwidth) {
++  case 0:
++  case 20:
++  case 40:
++    vht_bw = VHT_CHANWIDTH_USE_HT;
++    break;
++  case 80:
++    if (freq_params->center_freq2)
++      vht_bw = VHT_CHANWIDTH_80P80MHZ;
++    else
++      vht_bw = VHT_CHANWIDTH_80MHZ;
++    break;
++  case 160:
++    vht_bw = VHT_CHANWIDTH_160MHZ;
++    break;
++  default:
++    wpa_printf(MSG_WARNING, "Unknown CSA bandwidth: %d",
++         freq_params->bandwidth);
++    break;
++  }
++
++  iface->freq = freq_params->freq;
++  iface->conf->channel = freq_params->channel;
++  iface->conf->secondary_channel = freq_params->sec_channel_offset;
++  if (freq_params->bandwidth > 20 && iface->conf->secondary_channel == 0) {
++    if (vht_seg0_idx > iface->conf->channel)
++      iface->conf->secondary_channel = 1;
++    else
++      iface->conf->secondary_channel = -1;
++  }
++  iface->conf->vht_oper_centr_freq_seg0_idx = vht_seg0_idx;
++  iface->conf->vht_oper_centr_freq_seg1_idx = vht_seg1_idx;
++  iface->conf->vht_oper_chwidth = vht_bw;
++}
++
+ 
+ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ 					  char *pos)
+@@ -1869,11 +1920,83 @@ static int hostapd_ctrl_iface_chan_switc
+ 	struct csa_settings settings;
+ 	int ret;
+ 	unsigned int i;
++	struct hostapd_channel_data *channel;
++	int tx_ant = 0, rx_ant = 0;
++	u32 tx_ant_mask, rx_ant_mask;
++	char *str;
+ 
+ 	ret = hostapd_parse_csa_settings(pos, &settings);
+ 	if (ret)
+ 		return ret;
+ 
++	str = os_strstr(pos, "tx_ant=");
++  if (str) {
++    str += strlen("tx_ant=");
++    tx_ant = atoi(str);
++    if (tx_ant <= 0){
++      wpa_printf(MSG_ERROR, "chan_switch: invalid tx_ant provided");
++      return -1;
++    }
++  }
++  str = os_strstr(pos, "rx_ant=");
++  if (str) {
++    str += strlen("rx_ant=");
++    rx_ant = atoi(str);
++    if (rx_ant <= 0){
++      wpa_printf(MSG_ERROR, "chan_switch: invalid rx_ant provided");
++      return -1;
++    }
++  }
++  if ((tx_ant > 0 && rx_ant == 0) || (rx_ant > 0 && tx_ant == 0)) {
++    wpa_printf(MSG_ERROR, "chan_switch: changing only number of TX or RX "
++      "antennas is not possible");
++    return -1;
++  }
++
++  /* Check if active CAC */
++  if (iface->cac_started)
++    return -1;
++
++  if (tx_ant > 0) {
++    ret = hostapd_hw_get_antenna_mask(iface->bss[0], tx_ant, rx_ant,
++      &tx_ant_mask, &rx_ant_mask);
++    if (ret < 0) {
++      wpa_printf(MSG_ERROR, "chan_switch: getting antenna mask from antenna "
++        "number failed: %s", strerror(errno));
++    } else {
++      ret = hostapd_drv_set_antenna(iface->bss[0], tx_ant_mask, rx_ant_mask);
++      if (ret < 0) {
++        wpa_printf(MSG_ERROR, "chan_switch: setting antenna failed: %s",
++          strerror(errno));
++      }
++    }
++  }
++
++	/* ACS */
++	if (settings.freq_params.freq == 0) {
++	  if (acs_init(iface) == HOSTAPD_CHAN_ACS)
++	    return 0;
++	  else
++	    return -1;
++	}
++
++  channel = hostapd_hw_get_channel_data(iface, settings.freq_params.freq);
++  if (!channel)
++    return -1;
++  /* check if usable */
++  if (channel->flag & HOSTAPD_CHAN_DISABLED)
++    return -1;
++
++  /* check CAC required */
++  if ((channel->flag & HOSTAPD_CHAN_RADAR) &&
++      ((channel->flag & HOSTAPD_CHAN_DFS_MASK) != HOSTAPD_CHAN_DFS_AVAILABLE))
++  {
++    settings.freq_params.channel = channel->chan;
++    set_iface_conf(iface, &settings.freq_params);
++    hostapd_setup_interface_complete(iface, 0);
++    return 0;
++  }
++
+ 	for (i = 0; i < iface->num_bss; i++) {
+ 		ret = hostapd_switch_channel(iface->bss[i], &settings);
+ 		if (ret) {
+@@ -2309,6 +2432,1066 @@ static int hostapd_ctrl_driver_flags(str
+ }
+ 
+ 
++int hostapd_ctrl_iface_deny_mac(struct hostapd_data *hapd, const char *cmd)
++{
++  u8 addr[ETH_ALEN];
++  const char *pos;
++  struct hostapd_iface *iface = hapd->iface;
++  u8 remove = 0;
++  int ret, i;
++
++  if (hwaddr_aton(cmd, addr))
++    return -1;
++
++  pos = os_strchr(cmd, ' ');
++  if (pos) {
++    pos++;
++    if (os_strcmp(pos, "1") == 0)
++      remove = 1;
++  }
++
++  for (i = 0; i < iface->num_bss; i++) {
++    struct hostapd_data *bss = iface->bss[i];
++
++    ret = hostapd_drv_set_deny_mac(bss, addr, remove);
++    if (ret < 0)
++      return ret;
++  }
++  return 0;
++}
++
++int hostapd_ctrl_iface_sta_steer(struct hostapd_data *hapd, const char *cmd)
++{
++  u8 sta_addr[ETH_ALEN], bssid[ETH_ALEN];
++  const char *pos;
++  struct hostapd_iface *iface = hapd->iface;
++  struct sta_info *sta = NULL;
++  int ret, i;
++
++  if (hwaddr_aton(cmd, sta_addr))
++    return -1;
++
++  os_memset(bssid, 0, sizeof(bssid));
++  pos = os_strchr(cmd, ' ');
++  if (pos && (pos+1) != '\0') {
++    pos++;
++    if (hwaddr_aton(pos, bssid))
++      return -1;
++  }
++  ret = hostapd_drv_sta_steer(hapd, sta_addr, bssid);
++  for (i = 0; i < iface->num_bss; i++) {
++    struct hostapd_data *bss = iface->bss[i];
++
++    /* remove STA from all BSS, except the specified one */
++    if (os_memcmp(bss->own_addr, bssid, sizeof(bssid))) {
++      hostapd_drv_sta_disassoc(bss, sta_addr, WLAN_REASON_UNSPECIFIED);
++      sta = ap_get_sta(bss, sta_addr);
++      if (sta)
++        ap_sta_disassociate(bss, sta, WLAN_REASON_UNSPECIFIED);
++    }
++  }
++
++  return ret;
++}
++
++struct hostapd_data *get_bss_index(const char *cmd, struct hostapd_iface *iface)
++{
++  char *pos_end;
++  char bss_name[IFNAMSIZ + 1];
++  int i;
++
++  pos_end = os_strchr(cmd, ' ');
++  if (!pos_end)
++    pos_end = (char *)cmd + strlen(cmd);
++  memcpy(bss_name, cmd, pos_end - cmd);
++  bss_name[pos_end - cmd] = '\0';
++  for (i = 0; i < iface->num_bss; i++) {
++    struct hostapd_data *bss = iface->bss[i];
++
++    if (!strncmp(bss->conf->iface, bss_name, IFNAMSIZ))
++      return bss;
++  }
++  return NULL;
++}
++
++int hostapd_ctrl_iface_sta_allow(struct hostapd_data *hapd, const char *cmd)
++{
++  u8 sta_addr[ETH_ALEN];
++  int i, ret = 0, count = 0;
++  const char *pos;
++  struct hostapd_iface *iface = hapd->iface;
++  u8 *stations = NULL;
++
++    if (cmd[0] == ' ')
++      cmd++;
++    if (strlen(cmd) > 0) {
++      pos = cmd;
++      /* count the number of stations and verify the validity */
++      while (pos && pos != '\0') {
++        if (hwaddr_aton(pos, sta_addr))
++          return -1;
++        count++;
++        pos = os_strchr(pos, ' ');
++        if (pos)
++          pos++;
++      }
++      if (count == 0)
++        return -1;
++      stations = os_malloc(count * ETH_ALEN);
++      if (!stations)
++        return -ENOMEM;
++      pos = cmd;
++      for(i = 0; i < count; i++) {
++        hwaddr_aton(pos, stations + i * ETH_ALEN);
++        pos = os_strchr(pos, ' ') + 1;
++      }
++    }
++
++
++    for (i = 0; i < iface->num_bss; i++) {
++      struct hostapd_data *bss = iface->bss[i];
++
++      ret = hostapd_drv_sta_allow(bss, stations, count);
++      if (ret < 0)
++        break;
++    }
++
++  os_free(stations);
++  return ret;
++}
++
++
++int hostapd_ctrl_iface_get_sta_measurements(struct hostapd_data *hapd,
++  const char *cmd, char *buf, size_t buflen)
++{
++  u8 sta_addr[ETH_ALEN];
++  int ret, len = 0;
++  mtlk_sta_info_t sta_info;
++  struct sta_info *sta;
++
++  hapd = get_bss_index(cmd, hapd->iface);
++  if (hapd == NULL) {
++    ret = os_snprintf(buf, buflen, "FAIL\n");
++    if (ret < 0 || (size_t) ret >= buflen)
++      return 0;
++    return ret;
++  }
++
++  cmd = os_strchr(cmd, ' ');
++  if (cmd)
++    cmd++;
++  else {
++    ret = os_snprintf(buf, buflen, "FAIL\n");
++    if (ret < 0 || (size_t) ret >= buflen)
++      return 0;
++    return ret;
++  }
++
++  if (hwaddr_aton(cmd, sta_addr)) {
++    ret = os_snprintf(buf, buflen, "FAIL\n");
++    if (ret < 0 || (size_t) ret >= buflen)
++      return 0;
++    return ret;
++  }
++  sta = ap_get_sta(hapd, sta_addr);
++
++  ret = hostapd_drv_get_sta_measurements(hapd, sta_addr, &sta_info);
++  if (ret) {
++    ret = os_snprintf(buf, buflen, "FAIL\n");
++    if (ret < 0 || (size_t) ret >= buflen)
++      return 0;
++    return ret;
++  }
++
++  /* Device.WiFi.AccessPoint.{i}.AssociatedDevice.{i}. */
++  ret = os_snprintf(buf, buflen, "MACAddress="MACSTR"\n", MAC2STR(sta_addr));
++  if (ret >= buflen || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "OperatingStandard=");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  if (sta_info.peer_stats.NetModesSupported & MTLK_WSSA_11A_SUPPORTED) {
++    ret = os_snprintf(buf + len, buflen - len, "a ");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++  }
++  if (sta_info.peer_stats.NetModesSupported & MTLK_WSSA_11B_SUPPORTED) {
++    ret = os_snprintf(buf + len, buflen - len, "b ");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++  }
++  if (sta_info.peer_stats.NetModesSupported & MTLK_WSSA_11G_SUPPORTED) {
++    ret = os_snprintf(buf + len, buflen - len, "g ");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++  }
++  if (sta_info.peer_stats.NetModesSupported & MTLK_WSSA_11N_SUPPORTED) {
++    ret = os_snprintf(buf + len, buflen - len, "n ");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++  }
++  if (sta_info.peer_stats.NetModesSupported & MTLK_WSSA_11AC_SUPPORTED) {
++    ret = os_snprintf(buf + len, buflen - len, "ac ");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++  }
++  /* replace the last space with newline */
++  buf[len - 1] = '\n';
++  ret = os_snprintf(buf + len, buflen - len,
++    "AuthenticationState=%s\n",
++    sta ? (sta->flags & WLAN_STA_AUTH ? "1" : "0") : "UNKNOWN");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "LastDataDownlinkRate=%d\n",
++    sta_info.peer_stats.LastDataDownlinkRate);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "LastDataUplinkRate=%d\n",
++    sta_info.peer_stats.LastDataUplinkRate);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "SignalStrength=%d\n",
++    sta_info.peer_stats.SignalStrength);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "ShortTermRSSIAverage=%d %d %d %d\n",
++  sta_info.peer_stats.ShortTermRSSIAverage[0],
++  sta_info.peer_stats.ShortTermRSSIAverage[1],
++  sta_info.peer_stats.ShortTermRSSIAverage[2],
++  sta_info.peer_stats.ShortTermRSSIAverage[3]);
++  if (ret >= buflen - len || ret < 0)
++	return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "Retransmissions=%d\n",
++    sta_info.peer_stats.Retransmissions);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "Active=%s\n", sta ? "1" : "0");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  /* Device.WiFi.AccessPoint.{i}.AssociatedDevice.{i}.Stats. */
++  ret = os_snprintf(buf + len, buflen - len, "BytesSent=%d\n",
++    sta_info.peer_stats.traffic_stats.BytesSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "BytesReceived=%d\n",
++    sta_info.peer_stats.traffic_stats.BytesReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "PacketsSent=%d\n",
++    sta_info.peer_stats.traffic_stats.PacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "PacketsReceived=%d\n",
++    sta_info.peer_stats.traffic_stats.PacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "ErrorsSent=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "RetransCount=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "FailedRetransCount=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "RetryCount=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "MultipleRetryCount=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  /* ret = os_snprintf(buf + len, buflen - len, "PsState=%d\n",
++    sta_info.stationInfo & STA_INFO_PS_STATE);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;*/
++
++  return len;
++}
++
++
++int hostapd_ctrl_iface_get_vap_measurements(struct hostapd_data *hapd,
++  const char *cmd, char *buf, size_t buflen)
++{
++  int ret, len = 0;
++  struct mtlk_wssa_drv_tr181_vap_stats vap_stats;
++
++  hapd = get_bss_index(cmd, hapd->iface);
++  if (hapd == NULL) {
++    ret = os_snprintf(buf, buflen, "FAIL: bss index\n");
++    if (ret < 0 || (size_t) ret >= buflen)
++      return 0;
++    return ret;
++  }
++
++  ret = hostapd_drv_get_vap_measurements(hapd, &vap_stats);
++  if (ret) {
++    ret = os_snprintf(buf, buflen, "FAIL: vap measurements\n");
++    if (ret < 0 || (size_t) ret >= buflen)
++      return 0;
++    return ret;
++  }
++
++  ret = os_snprintf(buf + len, buflen - len, "Name=%s\n",
++    hapd->conf->iface);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "Enable=%d\n",
++    hapd->started);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "BSSID="MACSTR"\n",
++    MAC2STR(hapd->own_addr));
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "SSID=%s\n",
++    wpa_ssid_txt(hapd->conf->ssid.ssid,
++      hapd->conf->ssid.ssid_len));
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  /* Device.WiFi.SSID.{i}.Stats. */
++  ret = os_snprintf(buf + len, buflen - len, "BytesSent=%d\n",
++    vap_stats.traffic_stats.BytesSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "BytesReceived=%d\n",
++    vap_stats.traffic_stats.BytesReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "PacketsSent=%d\n",
++    vap_stats.traffic_stats.PacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "PacketsReceived=%d\n",
++    vap_stats.traffic_stats.PacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "ErrorsSent=%d\n",
++    vap_stats.error_stats.ErrorsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "RetransCount=%d\n",
++    vap_stats.RetransCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "FailedRetransCount=%d\n",
++    vap_stats.FailedRetransCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "RetryCount=%d\n",
++    vap_stats.RetryCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "MultipleRetryCount=%d\n",
++    vap_stats.MultipleRetryCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "ACKFailureCount=%d\n",
++    vap_stats.ACKFailureCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "AggregatedPacketCount=%d\n",
++    vap_stats.AggregatedPacketCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "ErrorsReceived=%d\n",
++    vap_stats.error_stats.ErrorsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "UnicastPacketsSent=%d\n",
++    vap_stats.traffic_stats.UnicastPacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "UnicastPacketsReceived=%d\n",
++    vap_stats.traffic_stats.UnicastPacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "DiscardPacketsSent=%d\n",
++    vap_stats.error_stats.DiscardPacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "DiscardPacketsReceived=%d\n",
++    vap_stats.error_stats.DiscardPacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "MulticastPacketsSent=%d\n",
++    vap_stats.traffic_stats.MulticastPacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "MulticastPacketsReceived=%d\n",
++    vap_stats.traffic_stats.MulticastPacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "BroadcastPacketsSent=%d\n",
++    vap_stats.traffic_stats.BroadcastPacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "BroadcastPacketsReceived=%d\n",
++    vap_stats.traffic_stats.BroadcastPacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "UnknownProtoPacketsReceived=%d\n",
++    vap_stats.UnknownProtoPacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++
++  return len;
++}
++
++
++int hostapd_ctrl_iface_get_radio_info(struct hostapd_data *hapd,
++  const char *cmd, char *buf, size_t buflen)
++{
++  int ret = 0, len = 0;
++  mtlk_radio_info_t radio_info;
++  enum hostapd_iface_state state = hapd->iface->state;
++
++  ret = hostapd_drv_get_radio_info(hapd, &radio_info);
++  if (ret) {
++    ret = os_snprintf(buf, buflen, "FAIL\n");
++    if (ret < 0 || (size_t) ret >= buflen)
++      return 0;
++    return ret;
++  }
++
++  ret = os_snprintf(buf + len, buflen - len, "Name=%s\n",
++    hapd->conf->iface);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "HostapdEnabled=%d\n",
++      (state == HAPD_IFACE_ENABLED) ? 1 : 0);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  /* Device.WiFi.Radio.{i}. */
++  ret = os_snprintf(buf + len, buflen - len, "TxEnabled=%d\n",
++      radio_info.hw.Enable);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "Channel=%d\n",
++      radio_info.hw.Channel);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  /* Device.WiFi.Radio.{i}.Stats. */
++  ret = os_snprintf(buf + len, buflen - len, "BytesSent=%d\n",
++    radio_info.hw_stats.traffic_stats.BytesSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "BytesReceived=%d\n",
++    radio_info.hw_stats.traffic_stats.BytesReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "PacketsSent=%d\n",
++    radio_info.hw_stats.traffic_stats.PacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "PacketsReceived=%d\n",
++    radio_info.hw_stats.traffic_stats.PacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "ErrorsSent=%d\n",
++    radio_info.hw_stats.error_stats.ErrorsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "ErrorsReceived=%d\n",
++    radio_info.hw_stats.error_stats.ErrorsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "DiscardPacketsSent=%d\n",
++    radio_info.hw_stats.error_stats.DiscardPacketsSent);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "DiscardPacketsReceived=%d\n",
++    radio_info.hw_stats.error_stats.DiscardPacketsReceived);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "PLCPErrorCount=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "FCSErrorCount=%d\n",
++    radio_info.hw_stats.FCSErrorCount);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "InvalidMACCount=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len,
++    "PacketsOtherReceived=UNKNOWN\n");
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "Noise=%d\n",
++    radio_info.hw_stats.Noise);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "BSS load=%d\n",
++      radio_info.load);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "TxPower=%.2f\n",
++      radio_info.tx_pwr_cfg / 100.);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "RxAntennas=%d\n",
++    radio_info.num_rx_antennas);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "TxAntennas=%d\n",
++    radio_info.num_tx_antennas);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
++  if (!radio_info.primary_center_freq) {
++    ret = os_snprintf(buf + len, buflen - len, "Freq=UNKNOWN\n");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++
++    ret = os_snprintf(buf + len, buflen - len, "OperatingChannelBandwidt=UNKNOWN\n");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++
++    ret = os_snprintf(buf + len, buflen - len, "Cf1=UNKNOWN\n");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++
++    ret = os_snprintf(buf + len, buflen - len, "Dfs_chan=UNKNOWN\n");
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++  } else {
++    ret = os_snprintf(buf + len, buflen - len, "Freq=%d\n",
++      radio_info.primary_center_freq);
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++
++    ret = os_snprintf(buf + len, buflen - len, "OperatingChannelBandwidt=%d\n",
++      radio_info.width);
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++
++    ret = os_snprintf(buf + len, buflen - len, "Cf1=%d\n",
++      radio_info.center_freq1);
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++
++    ret = os_snprintf(buf + len, buflen - len, "Dfs_chan=%d\n",
++      ieee80211_is_dfs(radio_info.primary_center_freq));
++    if (ret >= buflen - len || ret < 0)
++      return len;
++    len += ret;
++  }
++
++  return len;
++}
++
++
++int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const char *cmd)
++{
++  struct hostapd_unconnected_sta_req_params req;
++  char *pos;
++
++  os_memset(&req, 0, sizeof(req));
++
++  if (hwaddr_aton(cmd, req.addr))
++    return -1;
++
++  pos = os_strstr(cmd, " ");
++  if (pos) {
++    pos++;
++    req.freq = atoi(pos);
++    if (req.freq == 0){
++      wpa_printf(MSG_ERROR, "unconnected_sta: invalid freq provided");
++      return -1;
++    }
++  } else {
++    wpa_printf(MSG_ERROR, "unconnected_sta: freq not specified");
++        return -1;
++  }
++
++  pos = os_strstr(cmd, "center_freq1=");
++  if (pos) {
++    pos += strlen("center_freq1=");
++    req.center_freq1 = atoi(pos);
++    if (req.center_freq1 == 0){
++      wpa_printf(MSG_ERROR, "unconnected_sta: invalid center_freq1 provided");
++      return -1;
++    }
++  } else {
++    wpa_printf(MSG_ERROR, "unconnected_sta: center_freq1 not specified");
++        return -1;
++  }
++
++  pos = os_strstr(cmd, "center_freq2=");
++  if (pos) {
++    pos += strlen("center_freq2=");
++    req.center_freq2 = atoi(pos);
++    if (req.center_freq2 == 0){
++      wpa_printf(MSG_ERROR, "unconnected_sta: invalid center_freq2 provided");
++      return -1;
++    }
++  }
++
++  pos = os_strstr(cmd, "bandwidth=");
++  if (pos) {
++    pos += strlen("bandwidth=");
++    req.bandwidth = atoi(pos);
++    if (req.bandwidth == 0){
++      wpa_printf(MSG_ERROR, "unconnected_sta: invalid bandwidth provided");
++      return -1;
++    }
++  } else {
++    wpa_printf(MSG_ERROR, "unconnected_sta: bandwidth not specified");
++        return -1;
++  }
++  switch (req.bandwidth) {
++  case 20:
++    req.bandwidth = NL80211_CHAN_WIDTH_20;
++    break;
++  case 40:
++    req.bandwidth = NL80211_CHAN_WIDTH_40;
++    break;
++  case 80:
++    if (req.center_freq2)
++      req.bandwidth = NL80211_CHAN_WIDTH_80P80;
++    else
++      req.bandwidth = NL80211_CHAN_WIDTH_80;
++    break;
++  case 160:
++    req.bandwidth = NL80211_CHAN_WIDTH_160;
++    break;
++  default:
++    wpa_printf(MSG_ERROR, "unconnected_sta: invalid bandwidth provided");
++    return -1;
++  }
++
++  return hostapd_drv_unconnected_sta(hapd, &req);
++}
++
++
++int hostapd_ctrl_iface_set_failsafe_chan(struct hostapd_iface *iface, const char *cmd)
++{
++  char *pos;
++  struct hostapd_channel_data *channel;
++  struct hostapd_failsafe_freq_params old_freq_params;
++  int tx_ant = 0, rx_ant = 0;
++  int ret;
++
++  memcpy(&old_freq_params, &iface->failsafe, sizeof(iface->failsafe));
++  iface->failsafe.freq = atoi(cmd);
++
++  /* ACS requested, the rest of parameters are irrelevant */
++  if (iface->failsafe.freq == 0)
++    return 0;
++
++  channel = hostapd_hw_get_channel_data(iface, iface->failsafe.freq);
++  if (!channel) {
++    wpa_printf(MSG_ERROR, "set_failsafe_chan: invalid frequency %d provided, "
++      "channel not found", iface->failsafe.freq);
++    goto err;
++  }
++  if (channel->flag & HOSTAPD_CHAN_RADAR) {
++    wpa_printf(MSG_ERROR, "set_failsafe_chan: channel %d is DFS channel. It "
++      "cannot be failsafe", channel->chan);
++    goto err;
++  }
++
++  pos = os_strstr(cmd, "center_freq1=");
++  if (pos) {
++    pos += strlen("center_freq1=");
++    iface->failsafe.center_freq1 = atoi(pos);
++    if (iface->failsafe.center_freq1 == 0) {
++      wpa_printf(MSG_ERROR, "set_failsafe_chan: invalid center_freq1 provided");
++      goto err;
++    }
++  } else {
++    wpa_printf(MSG_ERROR, "set_failsafe_chan: center_freq1 not specified");
++    goto err;
++  }
++
++  pos = os_strstr(cmd, "center_freq2=");
++  if (pos) {
++    pos += strlen("center_freq2=");
++    iface->failsafe.center_freq2 = atoi(pos);
++    if (iface->failsafe.center_freq2 == 0) {
++      wpa_printf(MSG_ERROR, "set_failsafe_chan: invalid center_freq2 provided");
++      goto err;
++    }
++  }
++
++  pos = os_strstr(cmd, "bandwidth=");
++  if (pos) {
++    pos += strlen("bandwidth=");
++    iface->failsafe.bandwidth = atoi(pos);
++    if (iface->failsafe.bandwidth == 0) {
++      wpa_printf(MSG_ERROR, "set_failsafe_chan: invalid bandwidth provided");
++      goto err;
++    }
++    if (iface->failsafe.bandwidth != 20 &&
++      iface->failsafe.bandwidth != 40 &&
++      iface->failsafe.bandwidth != 80 &&
++      iface->failsafe.bandwidth != 160) {
++      wpa_printf(MSG_ERROR, "set_failsafe_chan: invalid bandwidth %d provided",
++        iface->failsafe.bandwidth);
++      goto err;
++    }
++  } else {
++    wpa_printf(MSG_ERROR, "set_failsafe_chan: bandwidth not specified");
++    goto err;
++  }
++
++  pos = os_strstr(cmd, "tx_ant=");
++  if (pos) {
++    pos += strlen("tx_ant=");
++    tx_ant = atoi(pos);
++    if (tx_ant <= 0){
++      wpa_printf(MSG_ERROR, "set_failsafe_chan: invalid tx_ant provided");
++      goto err;
++    }
++  }
++  pos = os_strstr(cmd, "rx_ant=");
++  if (pos) {
++    pos += strlen("rx_ant=");
++    rx_ant = atoi(pos);
++    if (rx_ant <= 0){
++      wpa_printf(MSG_ERROR, "set_failsafe_chan: invalid rx_ant provided");
++      goto err;
++    }
++  }
++  if ((tx_ant > 0 && rx_ant == 0) || (rx_ant > 0 && tx_ant == 0)) {
++    wpa_printf(MSG_ERROR, "set_failsafe_chan: changing only number of TX or RX "
++      "antennas is not possible");
++    goto err;
++  }
++  ret = hostapd_hw_get_antenna_mask(iface->bss[0], tx_ant, rx_ant,
++    &iface->failsafe.tx_ant, &iface->failsafe.rx_ant);
++  if (ret != 0) {
++      wpa_printf(MSG_ERROR, "chan_switch: getting antenna mask from antenna number failed: %s",
++        strerror(errno));
++      return ret;
++  }
++
++  return 0;
++
++err:
++  memcpy(&iface->failsafe, &old_freq_params, sizeof(iface->failsafe));
++  return -1;
++}
++
++
++int hostapd_ctrl_iface_get_failsafe_chan(struct hostapd_iface *iface,
++  const char *cmd, char *buf, size_t buflen)
++{
++  int ret = 0, len = 0;
++
++  if (iface->failsafe.freq == 0)
++    return os_snprintf(buf + len, buflen - len, "UNSPECIFIED\n");
++
++  ret = os_snprintf(buf + len, buflen - len, "%d center_freq1=%d "
++    "center_freq2=%d bandwidth=%d",
++    iface->failsafe.freq,
++    iface->failsafe.center_freq1,
++    iface->failsafe.center_freq2,
++    iface->failsafe.bandwidth);
++
++  if (ret >= buflen - len || ret < 0)
++    return ret;
++  len += ret;
++
++  if (iface->failsafe.tx_ant > 0) {
++    ret = os_snprintf(buf + len, buflen - len, " tx_ant=%d rx_ant=%d",
++      iface->failsafe.tx_ant,
++      iface->failsafe.rx_ant);
++    if (ret >= buflen - len || ret < 0)
++      return ret;
++    len += ret;
++  }
++
++  ret = os_snprintf(buf + len, buflen - len, "\n");
++  if (ret >= buflen - len || ret < 0)
++    return ret;
++  len += ret;
++
++  return len;
++}
++
++
++int hostapd_ctrl_iface_acs_report(struct hostapd_iface *iface,
++  const char *cmd, char *buf, size_t buflen)
++{
++  int ret = 0, len = 0, i;
++  struct hostapd_hw_modes *mode;
++
++  if (!iface->current_mode)
++    return -1;
++  mode = iface->current_mode;
++
++  for (i = 0; i < mode->num_candidates; i++) {
++    ret = os_snprintf(buf + len, buflen - len, "Ch=%d BW=%d",
++      mode->candidates[i].primary,
++      mode->candidates[i].width);
++    if (ret >= buflen - len || ret < 0)
++      break;
++    len += ret;
++
++    ret = os_snprintf(buf + len, buflen - len, " DFS=%d",
++      mode->candidates[i].radar_affected);
++    if (ret >= buflen - len || ret < 0)
++      break;
++    len += ret;
++
++    if (mode->candidates[i].filled_mask & CHDATA_TX_POWER) {
++      ret = os_snprintf(buf + len, buflen - len, " pow=%d",
++        mode->candidates[i].tx_power);
++      if (ret >= buflen - len || ret < 0)
++        break;
++      len += ret;
++    }
++
++    if (mode->candidates[i].filled_mask & CHDATA_NOISE_FLOOR) {
++      ret = os_snprintf(buf + len, buflen - len, " NF=%d",
++        mode->candidates[i].noise_floor);
++      if (ret >= buflen - len || ret < 0)
++        break;
++      len += ret;
++    }
++
++    ret = os_snprintf(buf + len, buflen - len, " bss=%d",
++      mode->candidates[i].num_bss);
++    if (ret >= buflen - len || ret < 0)
++      break;
++    len += ret;
++    ret = os_snprintf(buf + len, buflen - len, " pri=%d",
++      mode->candidates[i].num_bss_pri);
++    if (ret >= buflen - len || ret < 0)
++      break;
++    len += ret;
++
++    if (mode->candidates[i].filled_mask & CHDATA_LOAD) {
++      ret = os_snprintf(buf + len, buflen - len, " load=%d",
++        mode->candidates[i].channel_load);
++      if (ret >= buflen - len || ret < 0)
++        break;
++      len += ret;
++    }
++    ret = os_snprintf(buf + len, buflen - len, "\n");
++    if (ret >= buflen - len || ret < 0)
++      break;
++    len += ret;
++  }
++
++  return len;
++}
++
++/* checks weather channel exists */
++static int hostapd_ctrl_iface_restricted_chan_number_check_cb(struct hostapd_iface *iface,
++  int channel)
++{
++  if (!hostapd_hw_get_channel_data_from_ch(iface, channel))
++    return -1;
++  return 0;
++}
++
++/* Sets channel as restricted. Ignores channels that are already disabled. */
++static int hostapd_ctrl_iface_restricted_chan_number_cb(struct hostapd_iface *iface,
++  int channel)
++{
++  struct hostapd_channel_data* ch_data;
++
++  ch_data = hostapd_hw_get_channel_data_from_ch(iface, channel);
++  if (!ch_data)
++    return -1;
++  if (!(ch_data->flag & HOSTAPD_CHAN_DISABLED)) {
++    ch_data->flag |= HOSTAPD_CHAN_DISABLED;
++    ch_data->flag |= HOSTAPD_CHAN_RESTRICTED;
++  }
++
++  return 0;
++}
++
++/* checks weather any channel in given range exists */
++static int hostapd_ctrl_iface_restricted_chan_range_check_cb(struct hostapd_iface *iface,
++  int channel_from, int channel_to)
++{
++  Boolean exists = FALSE;
++  int i;
++
++  for (i = channel_from; i <= channel_to; i++) {
++    if (hostapd_hw_get_channel_data_from_ch(iface, i)) {
++      exists = TRUE;
++      break;
++    }
++  }
++  if (exists)
++    return 0;
++  else
++    return -1;
++}
++
++/* Sets channels in given range as restricted. Ignores channels that are already
++ * disabled. */
++static int hostapd_ctrl_iface_restricted_chan_range_cb(struct hostapd_iface *iface,
++  int channel_from, int channel_to)
++{
++  Boolean exists = FALSE;
++  int i;
++  struct hostapd_channel_data* ch_data;
++
++  for (i = channel_from; i <= channel_to; i++) {
++    ch_data = hostapd_hw_get_channel_data_from_ch(iface, i);
++    if (!ch_data)
++      continue;
++    exists = TRUE;
++    if (!(ch_data->flag & HOSTAPD_CHAN_DISABLED)) {
++      ch_data->flag |= HOSTAPD_CHAN_DISABLED;
++      ch_data->flag |= HOSTAPD_CHAN_RESTRICTED;
++    }
++  }
++  if (exists)
++    return 0;
++  else
++    return -1;
++}
++
++
++int hostapd_ctrl_iface_set_restricted_chan(struct hostapd_iface *iface, const char *cmd)
++{
++  char *end;
++  struct hostapd_hw_modes *mode;
++  int i;
++  struct hostapd_channel_data *ch;
++
++  if (!iface->current_mode)
++    return -1;
++  mode = iface->current_mode;
++
++  /* check list for validity */
++  if (hostapd_get_list(cmd, &end, iface,
++    hostapd_ctrl_iface_restricted_chan_number_check_cb,
++    hostapd_ctrl_iface_restricted_chan_range_check_cb))
++    return -1;
++
++  /* clear restricted flag on all channels */
++  for (i = 0; i < mode->num_channels; i++) {
++    ch = &iface->current_mode->channels[i];
++    if ((ch->flag & HOSTAPD_CHAN_DISABLED) &&
++      (ch->flag & HOSTAPD_CHAN_RESTRICTED)) {
++      ch->flag &= ~HOSTAPD_CHAN_DISABLED;
++      ch->flag &= ~HOSTAPD_CHAN_RESTRICTED;
++    }
++  }
++
++  /* set restricted flag on specified channels */
++  return hostapd_get_list(cmd, &end, iface,
++    hostapd_ctrl_iface_restricted_chan_number_cb,
++    hostapd_ctrl_iface_restricted_chan_range_cb);
++}
++
++
++int hostapd_ctrl_iface_get_restricted_chan(struct hostapd_iface *iface,
++  const char *cmd, char *buf, size_t buflen)
++{
++  int ret = 0, len = 0, i;
++  struct hostapd_hw_modes *mode;
++  struct hostapd_channel_data *ch;
++
++  if (!iface->current_mode)
++    return -1;
++  mode = iface->current_mode;
++
++  for (i = 0; i < mode->num_channels; i++) {
++    ch = &iface->current_mode->channels[i];
++    if ((ch->flag & HOSTAPD_CHAN_DISABLED) &&
++      (ch->flag & HOSTAPD_CHAN_RESTRICTED)) {
++        ret = os_snprintf(buf + len, buflen - len, "%d ", ch->chan);
++        if (ret >= buflen - len || ret < 0)
++          break;
++        len += ret;
++    }
++  }
++  if (len > 0)
++    buf[len - 1] = '\n';
++
++  return len;
++}
++
+ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -2540,6 +3723,47 @@ static int hostapd_ctrl_iface_receive_pr
+ 	} else if (os_strncmp(buf, "ACS_RECALC", 10) == 0) {
+ 		if (hostapd_ctrl_iface_acs_recalc(hapd->iface))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "DENY_MAC ", 9) == 0) {
++		if (hostapd_ctrl_iface_deny_mac(hapd, buf + 9))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "STA_STEER ", 10) == 0) {
++		printf("%s; *** Received from FAPI: 'STA_STEER' (buf= '%s') ***\n", __FUNCTION__, buf);
++		if (hostapd_ctrl_iface_sta_steer(hapd, buf + 10))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "STA_ALLOW", 9) == 0) {
++		printf("%s; *** Received from FAPI: 'STA_ALLOW' (buf= '%s') ***\n", __FUNCTION__, buf);
++		if (hostapd_ctrl_iface_sta_allow(hapd, buf + 9))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "GET_STA_MEASUREMENTS ", 21) == 0) {
++		printf("%s; *** Received from FAPI: 'GET_STA_MEASUREMENTS' (buf= '%s') ***\n", __FUNCTION__, buf);
++		reply_len = hostapd_ctrl_iface_get_sta_measurements(hapd, buf + 21, reply,
++					reply_size);
++	} else if (os_strncmp(buf, "GET_VAP_MEASUREMENTS ", 21) == 0) {
++		printf("%s; *** Received from FAPI: 'GET_VAP_MEASUREMENTS' (buf= '%s') ***\n", __FUNCTION__, buf);
++		reply_len = hostapd_ctrl_iface_get_vap_measurements(hapd, buf + 21, reply,
++					reply_size);
++	} else if (os_strncmp(buf, "GET_RADIO_INFO", 14) == 0) {
++		printf("%s; *** Received from FAPI: 'GET_RADIO_INFO' (buf= '%s') ***\n", __FUNCTION__, buf);
++		reply_len = hostapd_ctrl_iface_get_radio_info(hapd, NULL, reply,
++					reply_size);
++	} else if (os_strncmp(buf, "UNCONNECTED_STA_RSSI ", 21) == 0) {
++		if (hostapd_ctrl_iface_unconnected_sta(hapd, buf + 21))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "SET_FAILSAFE_CHAN ", 18) == 0) {
++		if (hostapd_ctrl_iface_set_failsafe_chan(hapd->iface, buf + 18))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "GET_FAILSAFE_CHAN", 17) == 0) {
++		reply_len = hostapd_ctrl_iface_get_failsafe_chan(hapd->iface, NULL, reply,
++					reply_size);
++	} else if (os_strncmp(buf, "GET_ACS_REPORT", 14) == 0) {
++		reply_len = hostapd_ctrl_iface_acs_report(hapd->iface, NULL, reply,
++					 reply_size);
++	} else if (os_strncmp(buf, "RESTRICTED_CHANNELS", 19) == 0) {
++		if (hostapd_ctrl_iface_set_restricted_chan(hapd->iface, buf + 19))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "GET_RESTRICTED_CHANNELS", 23) == 0) {
++		reply_len = hostapd_ctrl_iface_get_restricted_chan(hapd->iface, NULL, reply,
++					reply_size);
+ 	} else if (os_strcmp(buf, "ERP_FLUSH") == 0) {
+ 		ieee802_1x_erp_flush(hapd);
+ #ifdef RADIUS_SERVER
+@@ -2592,6 +3816,8 @@ static int hostapd_ctrl_iface_receive_pr
+ 	return reply_len;
+ }
+ 
++
++
+ static void hostapd_ctrl_iface_receive(int sock, void *eloop_ctx,
+ 				       void *sock_ctx)
+ {
+@@ -2704,9 +3930,42 @@ static void hostapd_ctrl_iface_msg_cb(vo
+ 				      const char *txt, size_t len)
+ {
+ 	struct hostapd_data *hapd = ctx;
++	char *buf, *pos;
++	size_t total, ifacelen;
++
+ 	if (hapd == NULL)
+ 		return;
+-	hostapd_ctrl_iface_send(hapd, level, type, txt, len);
++
++	pos = os_strchr(txt, ' ');
++	if (pos == NULL)
++		total = len;
++	else {
++		total = pos - txt;
++		pos++;
++	}
++
++	buf = os_malloc(len + sizeof(hapd->conf->iface));
++	if (buf == NULL)
++		return;
++
++	ifacelen = strlen(hapd->conf->iface);
++	os_memcpy(buf, txt, total);
++	buf[total] = ' ';
++	total++;
++	os_memcpy(buf + total, hapd->conf->iface, ifacelen);
++	total += ifacelen;
++	if (pos) {
++		buf[total] = ' ';
++		total++;
++		os_memcpy(buf + total, pos, len - (pos - txt));
++	}
++
++	/* send all events to the first VAP */
++	hapd = hapd->iface->bss[0];
++
++	hostapd_ctrl_iface_send(hapd, level, type, buf, len + ifacelen + 1);
++
++	os_free(buf);
+ }
+ 
+ 
+@@ -2963,6 +4222,8 @@ void hostapd_ctrl_iface_deinit(struct ho
+ {
+ 	struct wpa_ctrl_dst *dst, *prev;
+ 
++  wpa_msg(hapd->msg_ctx, MSG_INFO, HOSTAPD_DISCONNECTED);
++
+ 	if (hapd->ctrl_sock > -1) {
+ #ifndef CONFIG_CTRL_IFACE_UDP
+ 		char *fname;
+--- a/hostapd/ctrl_iface.h
++++ b/hostapd/ctrl_iface.h
+@@ -36,4 +36,10 @@ hostapd_global_ctrl_iface_deinit(struct
+ }
+ #endif /* CONFIG_NO_CTRL_IFACE */
+ 
++void
++set_iface_conf(struct hostapd_iface *iface,
++        const struct hostapd_freq_params *freq_params);
++struct hostapd_data *get_bss_index(const char *cmd, struct hostapd_iface *iface);
++
++
+ #endif /* CTRL_IFACE_H */
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -304,16 +304,16 @@ static int hostapd_cli_cmd_deauthenticat
+ 					  char *argv[])
+ {
+ 	char buf[64];
+-	if (argc < 1) {
+-		printf("Invalid 'deauthenticate' command - exactly one "
+-		       "argument, STA address, is required.\n");
++	if (argc < 2) {
++		printf("Invalid 'deauthenticate' command - two arguments: "
++		       "BSS name and STA address are required.\n");
+ 		return -1;
+ 	}
+-	if (argc > 1)
+-		os_snprintf(buf, sizeof(buf), "DEAUTHENTICATE %s %s",
+-			    argv[0], argv[1]);
++	if (argc > 2)
++		os_snprintf(buf, sizeof(buf), "DEAUTHENTICATE %s %s %s",
++			    argv[0], argv[1], argv[2]);
+ 	else
+-		os_snprintf(buf, sizeof(buf), "DEAUTHENTICATE %s", argv[0]);
++		os_snprintf(buf, sizeof(buf), "DEAUTHENTICATE %s %s", argv[0], argv[1]);
+ 	return wpa_ctrl_command(ctrl, buf);
+ }
+ 
+@@ -338,15 +338,15 @@ static int hostapd_cli_cmd_disassociate(
+ {
+ 	char buf[64];
+ 	if (argc < 1) {
+-		printf("Invalid 'disassociate' command - exactly one "
+-		       "argument, STA address, is required.\n");
++		printf("Invalid 'disassociate' command - two arguments: "
++		       "BSS name and STA address are required.\n");
+ 		return -1;
+ 	}
+-	if (argc > 1)
+-		os_snprintf(buf, sizeof(buf), "DISASSOCIATE %s %s",
+-			    argv[0], argv[1]);
++	if (argc > 2)
++		os_snprintf(buf, sizeof(buf), "DISASSOCIATE %s %s %s",
++			    argv[0], argv[1], argv[2]);
+ 	else
+-		os_snprintf(buf, sizeof(buf), "DISASSOCIATE %s", argv[0]);
++		os_snprintf(buf, sizeof(buf), "DISASSOCIATE %s %s", argv[0], argv[1]);
+ 	return wpa_ctrl_command(ctrl, buf);
+ }
+ 
+@@ -1082,7 +1082,7 @@ static int hostapd_cli_cmd_chan_switch(s
+ 		       "arguments (count and freq)\n"
+ 		       "usage: <cs_count> <freq> [sec_channel_offset=] "
+ 		       "[center_freq1=] [center_freq2=] [bandwidth=] "
+-		       "[blocktx] [ht|vht]\n");
++		       "[blocktx] [ht|vht] [tx_ant=] [rx_ant=]\n");
+ 		return -1;
+ 	}
+ 
+@@ -1282,6 +1282,335 @@ static int hostapd_cli_cmd_acs_recalc(st
+   return wpa_ctrl_command(ctrl, "ACS_RECALC");
+ }
+ 
++static int hostapd_cli_cmd_deny_mac(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total;
++
++  if (argc < 1 || argc > 2) {
++    printf("Invalid DENY_MAC command\n"
++           "usage: <addr> <[0]/1>\n");
++    return -1;
++  }
++
++  res = os_snprintf(cmd, sizeof(cmd), "DENY_MAC %s", argv[0]);
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long DENY_MAC command.\n");
++    return -1;
++  }
++
++  if (argc == 2) {
++    total = res;
++    tmp = cmd + total;
++    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[1]);
++    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++      printf("Too long DENY_MAC command.\n");
++      return -1;
++    }
++  }
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_sta_steer(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total;
++
++  if (argc < 1 || argc > 2) {
++    printf("Invalid STA_STEER command\n"
++           "usage: <addr> [BSSID]\n");
++    return -1;
++  }
++
++  res = os_snprintf(cmd, sizeof(cmd), "STA_STEER %s", argv[0]);
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long STA_STEER command.\n");
++    return -1;
++  }
++
++  if (argc == 2) {
++    total = res;
++    tmp = cmd + total;
++    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[1]);
++    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++      printf("Too long STA_STEER command.\n");
++      return -1;
++    }
++  }
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_sta_allow(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total, i;
++
++  res = os_snprintf(cmd, sizeof(cmd), "STA_ALLOW");
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long STA_ALLOW command.\n");
++    return -1;
++  }
++
++  total = res;
++  tmp = cmd + total;
++  for(i = 0; i < argc; i++) {
++    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[i]);
++    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++      printf("Too long STA_ALLOW command.\n");
++      return -1;
++    }
++    total += res;
++    tmp = cmd + total;
++  }
++
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_unconnected_sta(struct wpa_ctrl *ctrl,
++               int argc, char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total;
++
++  if (argc < 4) {
++    printf("Invalid unconnected_sta command: needs at least four "
++           "arguments (address, frequency, center frequency and bandwidth)\n"
++           "usage: <address> <freq> <center_freq1=> [center_freq2=] "
++           "<bandwidth=>\n");
++    return -1;
++  }
++
++  res = os_snprintf(cmd, sizeof(cmd), "UNCONNECTED_STA_RSSI %s %s %s %s",
++        argv[0], argv[1], argv[2], argv[3]);
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long UNCONNECTED_STA_RSSI command.\n");
++    return -1;
++  }
++
++  if (argc == 5) {
++    total = res;
++    tmp = cmd + total;
++    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[4]);
++    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++      printf("Too long UNCONNECTED_STA_RSSI command.\n");
++      return -1;
++    }
++  }
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_sta_measurements(struct wpa_ctrl *ctrl, int argc,
++  char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total, i;
++
++  if (argc != 2) {
++    printf("Invalid GET_STA_MEASUREMENTS command\n"
++           "usage: <BSS_name> <addr>\n");
++    return -1;
++  }
++
++  res = os_snprintf(cmd, sizeof(cmd), "GET_STA_MEASUREMENTS");
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long GET_STA_MEASUREMENTS command.\n");
++    return -1;
++  }
++
++  total = res;
++  tmp = cmd + total;
++  for(i = 0; i < argc; i++) {
++    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[i]);
++    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++      printf("Too long GET_STA_MEASUREMENTS command.\n");
++      return -1;
++    }
++    total += res;
++    tmp = cmd + total;
++  }
++
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_vap_measurements(struct wpa_ctrl *ctrl, int argc,
++  char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total;
++
++  if (argc != 1) {
++    printf("Invalid GET_VAP_MEASUREMENTS command\n"
++           "usage: <BSS_name>\n");
++    return -1;
++  }
++
++  res = os_snprintf(cmd, sizeof(cmd), "GET_VAP_MEASUREMENTS");
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long GET_VAP_MEASUREMENTS command.\n");
++    return -1;
++  }
++
++  total = res;
++  tmp = cmd + total;
++  res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[0]);
++  if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++    printf("Too long GET_VAP_MEASUREMENTS command.\n");
++    return -1;
++  }
++
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_radio_info(struct wpa_ctrl *ctrl, int argc,
++  char *argv[])
++{
++  char cmd[256];
++  int res;
++
++  if (argc != 0) {
++    printf("radio_info doesn't require parameters\n");
++    return -1;
++  }
++
++  res = os_snprintf(cmd, sizeof(cmd), "GET_RADIO_INFO");
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long GET_RADIO_INFO command.\n");
++    return -1;
++  }
++
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_set_failsafe_chan(struct wpa_ctrl *ctrl,
++               int argc, char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total, i;
++
++  if (argc < 3 || argc > 6) {
++    printf("Invalid set_failsafe_chan command\n"
++           "usage: <freq> <center_freq1=> [center_freq2=] "
++           "<bandwidth=> [tx_ant=] [rx_ant=]\n");
++    return -1;
++  }
++
++  res = os_snprintf(cmd, sizeof(cmd), "SET_FAILSAFE_CHAN");
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long SET_FAILSAFE_CHAN command.\n");
++    return -1;
++  }
++
++  total = res;
++  tmp = cmd + total;
++  for(i = 0; i < argc; i++) {
++    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[i]);
++    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++      printf("Too long SET_FAILSAFE_CHAN command.\n");
++      return -1;
++    }
++    total += res;
++    tmp = cmd + total;
++  }
++
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_get_failsafe_chan(struct wpa_ctrl *ctrl,
++               int argc, char *argv[])
++{
++  char cmd[18];
++
++  if (argc != 0) {
++    printf("get_failsafe_chan doesn't require parameters\n");
++    return -1;
++  }
++
++  os_snprintf(cmd, sizeof(cmd), "GET_FAILSAFE_CHAN");
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_acs_report(struct wpa_ctrl *ctrl,
++               int argc, char *argv[])
++{
++  char cmd[18];
++
++  if (argc != 0) {
++    printf("acs_report doesn't require parameters\n");
++    return -1;
++  }
++
++  os_snprintf(cmd, sizeof(cmd), "GET_ACS_REPORT");
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
++static int hostapd_cli_cmd_set_restricted_chan(struct wpa_ctrl *ctrl,
++               int argc, char *argv[])
++{
++  char cmd[256];
++  int res;
++  char *tmp;
++  int total = 0, i;
++
++  res = os_snprintf(cmd, sizeof(cmd), "RESTRICTED_CHANNELS");
++  if (res < 0 || (size_t) res >= sizeof(cmd) - 1) {
++    printf("Too long RESTRICTED_CHANNELS command.\n");
++    return -1;
++  }
++
++  total = res;
++  tmp = cmd + total;
++  for(i = 0; i < argc; i++) {
++    res = os_snprintf(tmp, sizeof(cmd) - total, " %s", argv[i]);
++    if (res < 0 || (size_t) res >= sizeof(cmd) - total - 1) {
++      printf("Too long RESTRICTED_CHANNELS command.\n");
++      return -1;
++    }
++    total += res;
++    tmp = cmd + total;
++  }
++
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++static int hostapd_cli_cmd_get_restricted_chan(struct wpa_ctrl *ctrl,
++               int argc, char *argv[])
++{
++  char cmd[24];
++
++  if (argc != 0) {
++    printf("get_restricted_chan doesn't require parameters\n");
++    return -1;
++  }
++
++  os_snprintf(cmd, sizeof(cmd), "GET_RESTRICTED_CHANNELS");
++  return wpa_ctrl_command(ctrl, cmd);
++}
++
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -1304,10 +1633,10 @@ static const struct hostapd_cli_cmd host
+ 	  "<addr> = add a new station" },
+ 	{ "deauthenticate", hostapd_cli_cmd_deauthenticate,
+ 	  hostapd_complete_deauthenticate,
+-	  "<addr> = deauthenticate a station" },
++	  "<BSS_name> <addr> = deauthenticate a station" },
+ 	{ "disassociate", hostapd_cli_cmd_disassociate,
+ 	  hostapd_complete_disassociate,
+-	  "<addr> = disassociate a station" },
++	  "<BSS_name> <addr> = disassociate a station" },
+ #ifdef CONFIG_TAXONOMY
+ 	{ "signature", hostapd_cli_cmd_signature, NULL,
+ 	  "<addr> = get taxonomy signature for a station" },
+@@ -1383,6 +1712,34 @@ static const struct hostapd_cli_cmd host
+ 	{ "req_lci", hostapd_cli_cmd_req_lci, NULL, NULL },
+ 	{ "req_range", hostapd_cli_cmd_req_range, NULL, NULL },
+ 	{ "driver_flags", hostapd_cli_cmd_driver_flags, NULL, NULL },
++	{ "deny_mac", hostapd_cli_cmd_deny_mac, NULL,
++	  "<addr> <[0]/1> 0-add;1-remove station to/from blacklist" },
++	{ "sta_steer", hostapd_cli_cmd_sta_steer, NULL,
++	  "<addr> [BSSID] steer station to specified (V)AP" },
++	{ "sta_allow", hostapd_cli_cmd_sta_allow, NULL,
++	  "[addr1] [addr2] ... [addrX] add station(s) to whitelist"
++	  "without parameters will allow all STA's on this radio" },
++	{ "unconnected_sta", hostapd_cli_cmd_unconnected_sta, NULL,
++	  "<addr> <freq> <center_freq1=> [center_freq2=] <bandwidth=> get unconnected station statistics" },
++	{ "sta_measurements", hostapd_cli_cmd_sta_measurements, NULL,
++	  "<BSS_name> <addr> get station measurements" },
++	{ "vap_measurements", hostapd_cli_cmd_vap_measurements, NULL,
++	  "<BSS_name> get VAP measurements" },
++	{ "radio_info", hostapd_cli_cmd_radio_info, NULL,
++	  "get radio info" },
++	{ "set_failsafe_chan", hostapd_cli_cmd_set_failsafe_chan, NULL,
++	  "<freq> <center_freq1=> [center_freq2=] <bandwidth=> "
++	  "[tx_ant=] [rx_ant=]"
++	  " set failsafe channel. Specify freq 0 for ACS" },
++	{ "get_failsafe_chan", hostapd_cli_cmd_get_failsafe_chan, NULL,
++	  "get failsafe channel" },
++	{ "acs_report", hostapd_cli_cmd_acs_report, NULL,
++	  "get ACS report" },
++	{ "set_restricted_chan", hostapd_cli_cmd_set_restricted_chan, NULL,
++	  "[list_of_channels]"
++	  " set restricted channels, list_of_channels example 1 6 11-13" },
++	{ "get_restricted_chan", hostapd_cli_cmd_get_restricted_chan, NULL,
++	  " get list of restricted channels" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -207,7 +207,7 @@ struct hostapd_config * hostapd_config_d
+ 	conf->acs_ch_list.num = 0;
+ #ifdef CONFIG_ACS
+ 	conf->acs_num_scans = 5;
+-	conf->acs_algo = ACS_ALGO_SURVEY;
++	conf->acs_algo = ACS_ALGO_SMART;
+ 	conf->acs_numbss_info_file = strdup("/tmp/acs_numbss_info.txt");
+ 	conf->acs_numbss_coeflist = os_malloc(sizeof(int) * (ACS_NUMBSS_NUM_COEFS + 1));
+ 	if (conf->acs_numbss_coeflist == NULL) {
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -349,4 +349,85 @@ static inline int hostapd_drv_stop_ap(st
+ 	return hapd->driver->stop_ap(hapd->drv_priv);
+ }
+ 
++static inline int hostapd_drv_set_deny_mac(struct hostapd_data *hapd,
++  const u8 *addr, const u8 remove)
++{
++  if (hapd->driver == NULL || hapd->driver->set_deny_mac_addr == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->set_deny_mac_addr(hapd->drv_priv, addr, remove);
++}
++
++static inline int hostapd_drv_sta_steer(struct hostapd_data *hapd,
++  const u8 *sta_addr, const u8 *bssid)
++{
++  if (hapd->driver == NULL || hapd->driver->sta_steer == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->sta_steer(hapd->drv_priv, sta_addr, bssid);
++}
++
++static inline int hostapd_drv_sta_allow(struct hostapd_data *hapd,
++  const u8 *stations, int count)
++{
++  if (hapd->driver == NULL || hapd->driver->sta_allow == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->sta_allow(hapd->drv_priv, stations, count);
++}
++
++static inline int hostapd_drv_get_sta_measurements(struct hostapd_data *hapd,
++  const u8 *addr, mtlk_sta_info_t *sta_info)
++{
++  if (hapd->driver == NULL || hapd->driver->get_sta_measurements == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->get_sta_measurements(hapd->drv_priv, addr, sta_info);
++}
++
++static inline int hostapd_drv_get_vap_measurements(struct hostapd_data *hapd,
++  struct mtlk_wssa_drv_tr181_vap_stats *vap_stats)
++{
++  if (hapd->driver == NULL || hapd->driver->get_vap_measurements == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->get_vap_measurements(hapd->drv_priv, vap_stats);
++}
++
++static inline int hostapd_drv_get_radio_info(struct hostapd_data *hapd,
++  mtlk_radio_info_t *radio_info)
++{
++  if (hapd->driver == NULL || hapd->driver->get_radio_info == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->get_radio_info(hapd->drv_priv, radio_info);
++}
++
++static inline int hostapd_drv_unconnected_sta(struct hostapd_data *hapd,
++  struct hostapd_unconnected_sta_req_params *req)
++{
++  if (hapd->driver == NULL || hapd->driver->unconnected_sta == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->unconnected_sta(hapd->drv_priv, req);
++}
++
++static inline int hostapd_drv_set_antenna(struct hostapd_data *hapd,
++  u32 tx_ant, u32 rx_ant)
++{
++  if (hapd->driver == NULL || hapd->driver->set_antenna == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->set_antenna(hapd->drv_priv, tx_ant, rx_ant);
++}
++
++static inline int hostapd_drv_get_capa(struct hostapd_data *hapd,
++  struct wpa_driver_capa *capa)
++{
++  if (hapd->driver == NULL || hapd->driver->get_capa == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->get_capa(hapd->drv_priv, capa);
++}
++
+ #endif /* AP_DRV_OPS */
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -21,6 +21,7 @@
+ #include "wps_hostapd.h"
+ #include "p2p_hostapd.h"
+ #include "ctrl_iface_ap.h"
++#include "../hostapd/ctrl_iface.h"
+ #include "ap_drv_ops.h"
+ #include "mbo_ap.h"
+ #include "taxonomy.h"
+@@ -144,6 +145,12 @@ static int hostapd_ctrl_iface_sta_mib(st
+ 	if (res >= 0)
+ 		len += res;
+ 
++  ret = os_snprintf(buf + len, buflen - len, "\nSignalStrength=%d",
++    (s32)sta->ssi_signal / 100);
++  if (ret < 0 || (size_t) ret >= buflen - len)
++    return len;
++  len += ret;
++
+ 	len += hostapd_get_sta_tx_rx(hapd, sta, buf + len, buflen - len);
+ 	len += hostapd_get_sta_conn_time(sta, buf + len, buflen - len);
+ 
+@@ -315,6 +322,16 @@ int hostapd_ctrl_iface_deauthenticate(st
+ 	wpa_dbg(hapd->msg_ctx, MSG_DEBUG, "CTRL_IFACE DEAUTHENTICATE %s",
+ 		txtaddr);
+ 
++  hapd = get_bss_index(txtaddr, hapd->iface);
++  if (hapd == NULL)
++    return -1;
++
++  txtaddr = os_strstr(txtaddr, " ");
++  if (txtaddr)
++    txtaddr++;
++  else
++    return -1;
++
+ 	if (hwaddr_aton(txtaddr, addr))
+ 		return -1;
+ 
+@@ -378,6 +395,16 @@ int hostapd_ctrl_iface_disassociate(stru
+ 	wpa_dbg(hapd->msg_ctx, MSG_DEBUG, "CTRL_IFACE DISASSOCIATE %s",
+ 		txtaddr);
+ 
++  hapd = get_bss_index(txtaddr, hapd->iface);
++  if (hapd == NULL)
++    return -1;
++
++  txtaddr = os_strstr(txtaddr, " ");
++  if (txtaddr)
++    txtaddr++;
++  else
++    return -1;
++
+ 	if (hwaddr_aton(txtaddr, addr))
+ 		return -1;
+ 
+@@ -595,10 +622,6 @@ int hostapd_parse_csa_settings(const cha
+ 	}
+ 
+ 	settings->freq_params.freq = atoi(end);
+-	if (settings->freq_params.freq == 0) {
+-		wpa_printf(MSG_ERROR, "chanswitch: invalid freq provided");
+-		return -1;
+-	}
+ 
+ #define SET_CSA_SETTING(str) \
+ 	do { \
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -19,6 +19,8 @@
+ #include "drivers/driver.h"
+ #include "dfs.h"
+ #include "acs.h"
++#include "hw_features.h"
++#include "../hostapd/ctrl_iface.h"
+ 
+ /* Must be aligned with driver structure */
+ struct vendor_cac_data
+@@ -477,6 +479,34 @@ dfs_get_valid_channel(struct hostapd_ifa
+ 	return chan;
+ }
+ 
++static struct hostapd_channel_data *
++dfs_get_valid_channel_failsafe(struct hostapd_iface *iface,
++          struct hostapd_freq_params* freq_params,
++          int *secondary_channel,
++          u8 *vht_oper_centr_freq_seg0_idx,
++          u8 *vht_oper_centr_freq_seg1_idx)
++{
++  struct hostapd_channel_data *channel;
++
++  channel = hostapd_hw_get_channel_data(iface, iface->failsafe.freq);
++  if (!channel)
++    return channel;
++
++  memset(freq_params, 0, sizeof(*freq_params));
++  freq_params->channel = channel->chan;
++  freq_params->freq = iface->failsafe.freq;
++  freq_params->center_freq1 = iface->failsafe.center_freq1;
++  freq_params->center_freq2 = iface->failsafe.center_freq2;
++  freq_params->bandwidth = iface->failsafe.bandwidth;
++  freq_params->vht_enabled = 1;
++  set_iface_conf(iface, freq_params);
++  *secondary_channel = iface->conf->secondary_channel;
++  *vht_oper_centr_freq_seg0_idx = iface->conf->vht_oper_centr_freq_seg0_idx;
++  *vht_oper_centr_freq_seg1_idx = iface->conf->vht_oper_centr_freq_seg1_idx;
++
++  return channel;
++}
++
+ 
+ static int set_dfs_state_freq(struct hostapd_iface *iface, int freq, u32 state)
+ {
+@@ -791,8 +821,10 @@ int hostapd_dfs_complete_cac(struct host
+ 			     int cf1, int cf2)
+ {
+ 	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, DFS_EVENT_CAC_COMPLETED
+-		"success=%d freq=%d ht_enabled=%d chan_offset=%d chan_width=%d cf1=%d cf2=%d",
+-		success, freq, ht_enabled, chan_offset, chan_width, cf1, cf2);
++		"success=%d freq=%d ht_enabled=%d chan_offset=%d chan_width=%d cf1=%d cf2=%d"
++	  " timeout=%d",
++		success, freq, ht_enabled, chan_offset, chan_width, cf1, cf2,
++		iface->dfs_cac_ms / 1000);
+ 
+ 	if (success) {
+ 		struct vendor_cac_data chan_data;
+@@ -872,24 +904,41 @@ dfs_get_debug_dfs_chan(struct hostapd_if
+ 
+ int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
+ {
+-	struct hostapd_channel_data *channel;
++	struct hostapd_channel_data *channel = NULL;
+ 	int secondary_channel;
+ 	u8 vht_oper_centr_freq_seg0_idx = 0;
+ 	u8 vht_oper_centr_freq_seg1_idx = 0;
+ 	int skip_radar = 0;
+-	int err = 1;
++	int err = 1, i;
++	int failsafe = 0;
++	struct csa_settings settings;
+ 
++    memset(&settings, 0, sizeof(settings));
+ 	/* Radar detected during active CAC */
+ 	iface->cac_started = 0;
+ 	if (iface->conf->dfs_debug_chan)
+ 		channel = dfs_get_debug_dfs_chan(iface, &secondary_channel,
+ 						&vht_oper_centr_freq_seg0_idx,
+ 						&vht_oper_centr_freq_seg1_idx);
+-	else
+-		channel = dfs_get_valid_channel(iface, &secondary_channel,
+-						&vht_oper_centr_freq_seg0_idx,
+-						&vht_oper_centr_freq_seg1_idx,
+-						skip_radar);
++	else if (iface->failsafe.freq != 0) {
++	  /* switch to failsafe channel */
++	  channel = dfs_get_valid_channel_failsafe(iface,
++	    &settings.freq_params,
++	    &secondary_channel,
++	    &vht_oper_centr_freq_seg0_idx,
++	    &vht_oper_centr_freq_seg1_idx);
++	  if (!channel) {
++	    wpa_printf(MSG_ERROR, "Invalid/no failsafe frequency specified %d\n",
++	      iface->failsafe.freq);
++	  } else
++	  failsafe = 1;
++	}
++
++  if (!channel)
++    channel = dfs_get_valid_channel(iface, &secondary_channel,
++            &vht_oper_centr_freq_seg0_idx,
++            &vht_oper_centr_freq_seg1_idx,
++            skip_radar);
+ 
+ 	if (!channel) {
+ 		wpa_printf(MSG_ERROR, "No valid channel available");
+@@ -902,23 +951,69 @@ int hostapd_dfs_start_channel_switch_cac
+ 		"freq=%d chan=%d sec_chan=%d", channel->freq,
+ 		channel->chan, secondary_channel);
+ 
+-	iface->freq = channel->freq;
+-	iface->conf->channel = channel->chan;
+-	iface->conf->secondary_channel = secondary_channel;
+-	iface->conf->vht_oper_centr_freq_seg0_idx =
+-		vht_oper_centr_freq_seg0_idx;
+-	iface->conf->vht_oper_centr_freq_seg1_idx =
+-		vht_oper_centr_freq_seg1_idx;
++	if (!failsafe) {
++    iface->freq = channel->freq;
++    iface->conf->channel = channel->chan;
++    iface->conf->secondary_channel = secondary_channel;
++    iface->conf->vht_oper_centr_freq_seg0_idx =
++      vht_oper_centr_freq_seg0_idx;
++    iface->conf->vht_oper_centr_freq_seg1_idx =
++      vht_oper_centr_freq_seg1_idx;
++	}
+ 	err = 0;
+ 
+-	hostapd_setup_interface_complete(iface, err);
++	iface->chan_switch_reason = HAPD_CHAN_SWITCH_RADAR_DETECTED;
++  /* check CAC required */
++  if ((channel->flag & HOSTAPD_CHAN_RADAR) &&
++      ((channel->flag & HOSTAPD_CHAN_DFS_MASK) != HOSTAPD_CHAN_DFS_AVAILABLE))
++    hostapd_setup_interface_complete(iface, err);
++  else {
++    settings.cs_count = 5;
++    settings.block_tx = 1;
++    if (!failsafe) {
++      err = hostapd_set_freq_params(&settings.freq_params,
++                  iface->conf->hw_mode,
++                  channel->freq,
++                  channel->chan,
++                  iface->conf->ieee80211n,
++                  iface->conf->ieee80211ac,
++                  secondary_channel,
++                  iface->conf->vht_oper_chwidth,
++                  vht_oper_centr_freq_seg0_idx,
++                  vht_oper_centr_freq_seg1_idx,
++                  iface->current_mode->vht_capab);
++
++      if (err) {
++        wpa_printf(MSG_ERROR, "DFS failed to calculate CSA freq params");
++        hostapd_disable_iface(iface);
++        return err;
++      }
++    }
++    if (failsafe && iface->failsafe.tx_ant > 0) {
++      err = hostapd_drv_set_antenna(iface->bss[0],
++        iface->failsafe.tx_ant,
++        iface->failsafe.rx_ant);
++      if (err < 0) {
++        wpa_printf(MSG_ERROR, "hostapd_dfs_start_channel_switch_cac: setting "
++          "antenna failed: %s", strerror(errno));
++      }
++    }
++    for (i = 0; i < iface->num_bss; i++) {
++      err = hostapd_switch_channel(iface->bss[i], &settings);
++      if (err) {
++        /* FIX: What do we do if CSA fails in the middle of
++         * submitting multi-BSS CSA requests? */
++        return err;
++      }
++    }
++  }
+ 	return err;
+ }
+ 
+ 
+ static int hostapd_dfs_start_channel_switch(struct hostapd_iface *iface)
+ {
+-	struct hostapd_channel_data *channel;
++	struct hostapd_channel_data *channel = NULL;
+ 	int secondary_channel;
+ 	u8 vht_oper_centr_freq_seg0_idx;
+ 	u8 vht_oper_centr_freq_seg1_idx;
+@@ -926,6 +1021,7 @@ static int hostapd_dfs_start_channel_swi
+ 	struct csa_settings csa_settings;
+ 	unsigned int i;
+ 	int err = 1;
++	int failsafe = 0;
+ 
+ 	wpa_printf(MSG_DEBUG, "%s called (CAC active: %s, CSA active: %s)",
+ 		   __func__, iface->cac_started ? "yes" : "no",
+@@ -948,13 +1044,27 @@ static int hostapd_dfs_start_channel_swi
+ 			goto switch_chan;
+ 	}
+ 
+-	/* Perform channel switch/CSA */
+-	channel = dfs_get_valid_channel(iface, &secondary_channel,
+-					&vht_oper_centr_freq_seg0_idx,
+-					&vht_oper_centr_freq_seg1_idx,
+-					skip_radar);
+-
++  os_memset(&csa_settings, 0, sizeof(csa_settings));
++  if (iface->failsafe.freq != 0) {
++    /* switch to failsafe channel */
++    channel = dfs_get_valid_channel_failsafe(iface,
++      &csa_settings.freq_params,
++      &secondary_channel,
++      &vht_oper_centr_freq_seg0_idx,
++      &vht_oper_centr_freq_seg1_idx);
++    failsafe = 1;
++  } else
++  /* Perform channel switch/CSA */
++  channel = dfs_get_valid_channel(iface, &secondary_channel,
++          &vht_oper_centr_freq_seg0_idx,
++          &vht_oper_centr_freq_seg1_idx,
++          skip_radar);
+ 	if (!channel) {
++		if (failsafe) {
++    		wpa_printf(MSG_ERROR, "Invalid/no failsafe frequency specified %d\n",
++      		iface->failsafe.freq);
++	  		failsafe = 0;
++	  }
+ 		/*
+ 		 * If there is no channel to switch immediately to, check if
+ 		 * there is another channel where we can switch even if it
+@@ -993,27 +1103,38 @@ switch_chan:
+ 		channel->chan, secondary_channel);
+ 
+ 	/* Setup CSA request */
+-	os_memset(&csa_settings, 0, sizeof(csa_settings));
+ 	csa_settings.cs_count = 5;
+ 	csa_settings.block_tx = 1;
+-	err = hostapd_set_freq_params(&csa_settings.freq_params,
+-				      iface->conf->hw_mode,
+-				      channel->freq,
+-				      channel->chan,
+-				      iface->conf->ieee80211n,
+-				      iface->conf->ieee80211ac,
+-				      secondary_channel,
+-				      iface->conf->vht_oper_chwidth,
+-				      vht_oper_centr_freq_seg0_idx,
+-				      vht_oper_centr_freq_seg1_idx,
+-				      iface->current_mode->vht_capab);
+-
+-	if (err) {
+-		wpa_printf(MSG_ERROR, "DFS failed to calculate CSA freq params");
+-		hostapd_disable_iface(iface);
+-		return err;
+-	}
+-
++	if (!failsafe) {
++    err = hostapd_set_freq_params(&csa_settings.freq_params,
++                iface->conf->hw_mode,
++                channel->freq,
++                channel->chan,
++                iface->conf->ieee80211n,
++                iface->conf->ieee80211ac,
++                secondary_channel,
++                iface->conf->vht_oper_chwidth,
++                vht_oper_centr_freq_seg0_idx,
++                vht_oper_centr_freq_seg1_idx,
++                iface->current_mode->vht_capab);
++
++    if (err) {
++      wpa_printf(MSG_ERROR, "DFS failed to calculate CSA freq params");
++      hostapd_disable_iface(iface);
++      return err;
++    }
++	}
++
++  if (failsafe && iface->failsafe.tx_ant > 0) {
++    err = hostapd_drv_set_antenna(iface->bss[0],
++      iface->failsafe.tx_ant,
++      iface->failsafe.rx_ant);
++    if (err < 0) {
++      wpa_printf(MSG_ERROR, "hostapd_dfs_start_channel_switch: setting antenna "
++        "failed: %s", strerror(errno));
++    }
++  }
++	iface->chan_switch_reason = HAPD_CHAN_SWITCH_RADAR_DETECTED;
+ 	for (i = 0; i < iface->num_bss; i++) {
+ 		err = hostapd_switch_channel(iface->bss[i], &csa_settings);
+ 		if (err)
+@@ -1106,7 +1227,7 @@ int hostapd_dfs_radar_detected(struct ho
+ 		return 0;
+ 
+ #ifdef CONFIG_ACS
+-  if (iface->conf->acs_init_done)
++  if (iface->failsafe.freq == 0 && iface->conf->acs_init_done)
+     acs_radar_switch(iface);
+   else
+ #endif
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -35,6 +35,7 @@
+ #include "dfs.h"
+ #include "beacon.h"
+ #include "mbo_ap.h"
++#include "acs.h"
+ 
+ 
+ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+@@ -475,6 +476,24 @@ void hostapd_event_sta_low_ack(struct ho
+ 		ap_sta_disassociate(hapd, sta, WLAN_REASON_DISASSOC_LOW_ACK);
+ }
+ 
++static char *width2str(int width)
++{
++  switch(width) {
++  case CHAN_WIDTH_80:
++    return "80";
++  case CHAN_WIDTH_80P80:
++    return "80+80";
++  case CHAN_WIDTH_160:
++    return "160";
++  case CHAN_WIDTH_20_NOHT:
++  case CHAN_WIDTH_20:
++    return "20";
++  case CHAN_WIDTH_40:
++  default:
++    return "40";
++  }
++}
++
+ 
+ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 			     int offset, int width, int cf1, int cf2)
+@@ -566,11 +585,24 @@ void hostapd_event_ch_switch(struct host
+ 		hostapd_cleanup_cs_params(hapd);
+ 		ieee802_11_set_beacon(hapd);
+ 
+-		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_CSA_FINISHED
+-			"freq=%d dfs=%d", freq, is_dfs);
++		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_CSA_FINISHED "freq=%d Channel=%d "
++				"OperatingChannelBandwidt=%s ExtensionChannel=%d cf1=%d cf2=%d reason=%s"
++				 " dfs_chan=%d",
++				freq, channel, width2str(width), offset, cf1, cf2,
++				hostapd_channel_switch_text(hapd->iface->chan_switch_reason),
++				is_dfs);
++
++		hapd->iface->chan_switch_reason = HAPD_CHAN_SWITCH_OTHER;
+ 	} else if (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_DFS_OFFLOAD) {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_CSA_FINISHED
+-			"freq=%d dfs=%d", freq, is_dfs);
++			"freq=%d Channel=%d "
++			"OperatingChannelBandwidt=%s ExtensionChannel=%d cf1=%d cf2=%d reason=%s"
++			" dfs_chan=%d",
++			freq, channel, width2str(width), offset, cf1, cf2,
++			hostapd_channel_switch_text(hapd->iface->chan_switch_reason),
++			is_dfs);
++
++		hapd->iface->chan_switch_reason = HAPD_CHAN_SWITCH_OTHER;
+ 	}
+ #endif /* NEED_AP_MLME */
+ }
+@@ -1026,6 +1058,20 @@ static void hostapd_event_ltq_chan_data(
+   hostapd_ltq_update_channel_data(iface, data, data_len);
+ }
+ 
++static void hostapd_event_ltq_unconnected_sta_rx(struct hostapd_data *hapd,
++  struct ltq_unconnected_sta *unc_sta)
++{
++  char buf[30];
++
++  os_snprintf(buf, sizeof(buf), MACSTR, MAC2STR(unc_sta->addr));
++  wpa_msg(hapd->msg_ctx, MSG_INFO,
++    UNCONNECTED_STA_RSSI "%s rx_bytes=%llu rx_packets=%u "
++    "rssi=%d %d %d %d",
++    buf, unc_sta->rx_bytes, unc_sta->rx_packets,
++    unc_sta->rssi[0], unc_sta->rssi[1], unc_sta->rssi[2], unc_sta->rssi[3]);
++}
++
++
+ struct hostapd_channel_data * hostapd_get_mode_channel(
+ 	struct hostapd_iface *iface, unsigned int freq)
+ {
+@@ -1311,6 +1357,10 @@ void wpa_supplicant_event(void *ctx, enu
+       data->ltq_chan_data.data_len);
+     break;
+ #endif
++	case EVENT_LTQ_UNCONNECTED_STA_RX:
++		hostapd_event_ltq_unconnected_sta_rx(hapd,
++			&data->ltq_unconnected_sta);
++		break;
+ 	case EVENT_ASSOC:
+ 		if (!data)
+ 			return;
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -13,6 +13,7 @@
+ #include "common/ieee802_11_defs.h"
+ #include "common/wpa_ctrl.h"
+ #include "common/hw_features_common.h"
++#include "drivers/driver.h"
+ #include "radius/radius_client.h"
+ #include "radius/radius_das.h"
+ #include "eap_server/tncs.h"
+@@ -1688,8 +1689,9 @@ static int hostapd_setup_interface_compl
+ 	struct hostapd_data *hapd = iface->bss[0];
+ 	size_t j;
+ 	u8 *prev_addr;
+-	int delay_apply_cfg = 0;
+ 	int res_dfs_offload = 0;
++	static int set_freq_done = 0;
++	struct hostapd_channel_data *channel;
+ 
+ 	if (err)
+ 		goto fail;
+@@ -1744,22 +1746,82 @@ static int hostapd_setup_interface_compl
+ 			wpa_printf(MSG_DEBUG,
+ 				   "%s: Mesh configuration will be applied while joining the mesh network",
+ 				   iface->bss[0]->conf->iface);
+-			delay_apply_cfg = 1;
+ 		}
+ #endif /* CONFIG_MESH */
+ 
+-		if (!delay_apply_cfg &&
+-		    hostapd_set_freq(hapd, hapd->iconf->hw_mode, iface->freq,
+-				     hapd->iconf->channel,
+-				     hapd->iconf->ieee80211n,
+-				     hapd->iconf->ieee80211ac,
+-				     hapd->iconf->secondary_channel,
+-				     hapd->iconf->vht_oper_chwidth,
+-				     hapd->iconf->vht_oper_centr_freq_seg0_idx,
+-				     hapd->iconf->vht_oper_centr_freq_seg1_idx)) {
+-			wpa_printf(MSG_ERROR, "Could not set channel for "
+-				   "kernel driver");
+-			goto fail;
++
++	  channel = hostapd_hw_get_channel_data(iface, iface->freq);
++	  if (!channel)
++	    goto fail;
++		if (!set_freq_done || (channel->flag & HOSTAPD_CHAN_RADAR)) {
++		  /* For DFS channels only hostapd_set_freq may be used, because
++		   * hostapd_switch_channel triggers CSA */
++      if (hostapd_set_freq(hapd, hapd->iconf->hw_mode, iface->freq,
++               hapd->iconf->channel,
++               hapd->iconf->ieee80211n,
++               hapd->iconf->ieee80211ac,
++               hapd->iconf->secondary_channel,
++               hapd->iconf->vht_oper_chwidth,
++               hapd->iconf->vht_oper_centr_freq_seg0_idx,
++               hapd->iconf->vht_oper_centr_freq_seg1_idx)) {
++        wpa_printf(MSG_ERROR, "Could not set channel for "
++             "kernel driver");
++        goto fail;
++      }
++      set_freq_done = 1;
++		} else {
++      struct csa_settings settings;
++
++      memset(&settings, 0, sizeof(settings));
++      if (hostapd_set_freq_params(&settings.freq_params,
++        hapd->iconf->hw_mode,
++        iface->freq,
++        hapd->iconf->channel,
++        hapd->iconf->ieee80211n,
++        hapd->iconf->ieee80211ac,
++        hapd->iconf->secondary_channel,
++        hapd->iconf->vht_oper_chwidth,
++        hapd->iconf->vht_oper_centr_freq_seg0_idx,
++        hapd->iconf->vht_oper_centr_freq_seg1_idx,
++        hapd->iface->current_mode->vht_capab))
++      {
++        wpa_printf(MSG_ERROR, "hostapd_set_freq_params failed: mode=%i, freq=%i, "
++             "channel=%i, ht_enabled=%i, vht_enabled=%i, "
++             "sec_channel_offset=%i, vht_open_cwidth=%i, "
++             "center_segment0=%i, center_segment1=%i",
++             hapd->iconf->hw_mode,
++             iface->freq,
++             hapd->iconf->channel,
++             hapd->iconf->ieee80211n,
++             hapd->iconf->ieee80211ac,
++             hapd->iconf->secondary_channel,
++             hapd->iconf->vht_oper_chwidth,
++             hapd->iconf->vht_oper_centr_freq_seg0_idx,
++             hapd->iconf->vht_oper_centr_freq_seg1_idx);
++        goto fail;
++      }
++      settings.cs_count = 5;
++
++      res = hostapd_switch_channel(hapd, &settings);
++      if (res) {
++        wpa_printf(MSG_ERROR, "hostapd_switch_channel failed: freq=%i, "
++             "ht_enabled=%i, vht_enabled=%i, "
++             "sec_channel_offset=%i, vht_open_cwidth=%i, "
++             "center_freq1=%i, center_freq2=%i",
++             settings.freq_params.freq,
++             settings.freq_params.ht_enabled,
++             settings.freq_params.vht_enabled,
++             settings.freq_params.sec_channel_offset,
++             settings.freq_params.bandwidth,
++             settings.freq_params.center_freq1,
++             settings.freq_params.center_freq2);
++          goto fail;
++      }
++      /* After calling hostapd_switch_channel
++       * hostapd_setup_bss/ieee802_11_set_beacon will fail with:
++       * "Cannot set beacons during CSA period", because hostapd_switch_channel
++       * starts CSA, therefore we need to exit here. */
++      return 0;
+ 		}
+ 	}
+ 
+@@ -1872,6 +1934,7 @@ dfs_offload:
+ 	for (j = 0; j < iface->num_bss; j++) {
+ 		hostapd_set_own_neighbor_report(iface->bss[j]);
+ 		hostapd_flush_old_stations(iface->bss[j], WLAN_REASON_PREV_AUTH_NOT_VALID);
++		hostapd_drv_sta_allow(hapd, NULL, 0);
+ 	}
+ 
+ 	return 0;
+@@ -2905,6 +2968,21 @@ const char * hostapd_state_text(enum hos
+ }
+ 
+ 
++const char * hostapd_channel_switch_text(enum hostapd_channel_switch_reason s)
++{
++  switch (s) {
++  case HAPD_CHAN_SWITCH_OTHER:
++    return "UNKNOWN";
++  case HAPD_CHAN_SWITCH_RADAR_DETECTED:
++    return "RADAR";
++  case HAPD_CHAN_SWITCH_20_40_COEX:
++    return "20/40_COEXISTANCE";
++  }
++
++  return "UNKNOWN";
++}
++
++
+ void hostapd_set_state(struct hostapd_iface *iface, enum hostapd_iface_state s)
+ {
+ 	wpa_printf(MSG_INFO, "%s: interface state %s->%s",
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -460,6 +460,13 @@ struct hostapd_iface {
+ 	void (*scan_cb)(struct hostapd_iface *iface);
+ 	int num_ht40_scan_tries;
+ 
++	enum hostapd_channel_switch_reason {
++		HAPD_CHAN_SWITCH_OTHER,
++		HAPD_CHAN_SWITCH_RADAR_DETECTED,
++		HAPD_CHAN_SWITCH_20_40_COEX
++	} chan_switch_reason;
++	struct hostapd_failsafe_freq_params failsafe;
++
+ 	struct dl_list sta_seen; /* struct hostapd_sta_info */
+ 	unsigned int num_sta_seen;
+ };
+@@ -494,6 +501,7 @@ int hostapd_remove_iface(struct hapd_int
+ void hostapd_channel_list_updated(struct hostapd_iface *iface, int initiator);
+ void hostapd_set_state(struct hostapd_iface *iface, enum hostapd_iface_state s);
+ const char * hostapd_state_text(enum hostapd_iface_state s);
++const char * hostapd_channel_switch_text(enum hostapd_channel_switch_reason s);
+ int hostapd_csa_in_progress(struct hostapd_iface *iface);
+ int hostapd_switch_channel(struct hostapd_data *hapd,
+ 			   struct csa_settings *settings);
+@@ -511,6 +519,9 @@ int hostapd_register_probereq_cb(struct
+ 					   int ssi_signal),
+ 				 void *ctx);
+ void hostapd_prune_associations(struct hostapd_data *hapd, const u8 *addr);
++int hostapd_get_list(const char *s, char **e, struct hostapd_iface *iface,
++  int (*number_cb)(struct hostapd_iface*, int),
++  int (*range_cb)(struct hostapd_iface*, int, int));
+ 
+ /* drv_callbacks.c (TODO: move to somewhere else?) */
+ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+--- a/src/ap/hw_features.c
++++ b/src/ap/hw_features.c
+@@ -1190,17 +1190,32 @@ static void hostapd_notify_bad_chans(str
+ int hostapd_acs_completed(struct hostapd_iface *iface, int err)
+ {
+ 	int ret = -1;
++	int dfs_channel = 0;
++	struct hostapd_channel_data* chan;
++	int freq;
+ 
+ 	if (err)
+ 		goto out;
+ 
+ 	switch (hostapd_check_chans(iface)) {
+ 	case HOSTAPD_CHAN_VALID:
++		freq = hostapd_hw_get_freq(iface->bss[0], iface->conf->channel);
++		chan = hostapd_hw_get_channel_data(iface, freq);
++		if (chan && (chan->flag & HOSTAPD_CHAN_RADAR))
++			dfs_channel = 1;
++
++#ifdef CONFIG_ACS
+ 		wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO,
+-			ACS_EVENT_COMPLETED "freq=%d channel=%d",
+-			hostapd_hw_get_freq(iface->bss[0],
+-					    iface->conf->channel),
+-			iface->conf->channel);
++				ACS_EVENT_COMPLETED "freq=%d channel=%d"
++				" OperatingChannelBandwidt=%d ExtensionChannel=%d cf1=%d cf2=%d"
++				" dfs_chan=%d",
++				freq, iface->conf->channel,
++				get_num_width(iface->conf->vht_oper_chwidth, iface->conf->secondary_channel),
++				iface->conf->secondary_channel,
++				acs_chan_to_freq(iface->conf->vht_oper_centr_freq_seg0_idx),
++				acs_chan_to_freq(iface->conf->vht_oper_centr_freq_seg1_idx),
++				dfs_channel);
++#endif /* CONFIG_ACS */
+ 		break;
+ 	case HOSTAPD_CHAN_ACS:
+ 		wpa_printf(MSG_ERROR, "ACS error - reported complete, but no result available");
+@@ -1320,3 +1335,69 @@ int hostapd_hw_get_channel(struct hostap
+ {
+ 	return hw_get_chan(hapd->iface->current_mode, freq);
+ }
++
++struct hostapd_channel_data* hostapd_hw_get_channel_data(struct hostapd_iface *iface, int freq)
++{
++  int i;
++  struct hostapd_channel_data *ch;
++
++  if (!iface->current_mode)
++    return NULL;
++
++  for (i = 0; i < iface->current_mode->num_channels; i++) {
++    ch = &iface->current_mode->channels[i];
++    if (ch->freq == freq)
++      return ch;
++  }
++
++  return NULL;
++}
++
++struct hostapd_channel_data* hostapd_hw_get_channel_data_from_ch(struct hostapd_iface *iface, int chan)
++{
++  int i;
++  struct hostapd_channel_data *ch;
++
++  if (!iface->current_mode)
++    return NULL;
++
++  for (i = 0; i < iface->current_mode->num_channels; i++) {
++    ch = &iface->current_mode->channels[i];
++    if (ch->chan == chan)
++      return ch;
++  }
++
++  return NULL;
++}
++
++/* Returns mask with lowest num_antennas bits of full_mask set */
++static u32 _hostapd_hw_get_antenna_mask (u32 full_mask, u32 num_antennas)
++{
++  u32 cur_bit, cur_mask, result = 0;
++
++  for (cur_bit = 0, cur_mask = 1; num_antennas && (cur_bit < (sizeof(result) << 3));
++    cur_bit++, cur_mask <<= 1) {
++    result |= full_mask & cur_mask;
++    if (full_mask & cur_mask) num_antennas--;
++  }
++  return result;
++}
++
++
++int hostapd_hw_get_antenna_mask(struct hostapd_data *hapd, int tx_ant,
++  int rx_ant, u32 *tx_ant_mask, u32 *rx_ant_mask)
++{
++  int ret;
++  struct wpa_driver_capa capa;
++
++  ret = hostapd_drv_get_capa(hapd, &capa);
++  if (ret != 0)
++    return ret;
++  *tx_ant_mask = _hostapd_hw_get_antenna_mask(capa.available_antennas_tx,
++    tx_ant);
++  *rx_ant_mask = _hostapd_hw_get_antenna_mask(capa.available_antennas_rx,
++    rx_ant);
++  return 0;
++}
++
++
+--- a/src/ap/hw_features.h
++++ b/src/ap/hw_features.h
+@@ -24,6 +24,10 @@ int hostapd_check_ht_capab(struct hostap
+ int hostapd_prepare_rates(struct hostapd_iface *iface,
+ 			  struct hostapd_hw_modes *mode);
+ void hostapd_stop_setup_timers(struct hostapd_iface *iface);
++struct hostapd_channel_data* hostapd_hw_get_channel_data(struct hostapd_iface *iface, int freq);
++struct hostapd_channel_data* hostapd_hw_get_channel_data_from_ch(struct hostapd_iface *iface, int chan);
++int hostapd_hw_get_antenna_mask(struct hostapd_data *hapd, int tx_ant,
++  int rx_ant, u32 *tx_ant_mask, u32 *rx_ant_mask);
+ #else /* NEED_AP_MLME */
+ static inline void
+ hostapd_free_hw_features(struct hostapd_hw_modes *hw_features,
+@@ -71,6 +75,20 @@ static inline void hostapd_stop_setup_ti
+ {
+ }
+ 
++static inline struct hostapd_channel_data* hostapd_hw_get_channel_data(struct hostapd_iface *iface, int freq)
++{
++  return NULL;
++}
++
++static inline struct hostapd_channel_data* hostapd_hw_get_channel_data_from_ch(struct hostapd_iface *iface, int chan)
++{
++  return NULL;
++}
++static inline int hostapd_hw_get_antenna_mask(struct hostapd_data *hapd, int tx_ant,
++  int rx_ant, u32 *tx_ant_mask, u32 *rx_ant_mask)
++{
++  return;
++}
+ #endif /* NEED_AP_MLME */
+ 
+ #endif /* HW_FEATURES_H */
+--- a/src/ap/ieee802_11_ht.c
++++ b/src/ap/ieee802_11_ht.c
+@@ -412,6 +412,8 @@ void hostapd_2040_coex_action(struct hos
+ 				       HOSTAPD_LEVEL_INFO,
+ 				       "Switching to 20 MHz operation");
+ 			iface->conf->secondary_channel = 0;
++
++			iface->chan_switch_reason = HAPD_CHAN_SWITCH_20_40_COEX;
+ 			ieee802_11_set_beacons(iface);
+ 		}
+ 		if (!iface->num_sta_ht40_intolerant &&
+@@ -732,5 +734,7 @@ void ap_ht2040_timeout(void *eloop_data,
+ 	wpa_printf(MSG_INFO, "Switching to 40 MHz operation");
+ 
+ 	iface->conf->secondary_channel = iface->secondary_ch;
++
++	iface->chan_switch_reason = HAPD_CHAN_SWITCH_20_40_COEX;
+ 	ieee802_11_set_beacons(iface);
+ }
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1214,7 +1214,28 @@ void ap_sta_set_authorized(struct hostap
+ 
+ 	if (authorized) {
+ 		char ip_addr[100];
++		char signal_strength[30];
++		char *rates, *capabilities;
++		int i, ret, len = 0;
++
++		/* 4 symbols per rate */
++		rates = os_malloc(WLAN_SUPP_RATES_MAX * 4);
++	  if (rates == NULL) {
++	    wpa_printf(MSG_ERROR, "malloc failed");
++	    return;
++	  }
++	  rates[0] = '\0';
++
++    capabilities = os_malloc(120);
++    if (capabilities == NULL) {
++      wpa_printf(MSG_ERROR, "malloc failed");
++			os_free(rates);
++      return;
++    }
++    capabilities[0] = '\0';
++
+ 		ip_addr[0] = '\0';
++		signal_strength[0] = '\0';
+ #ifdef CONFIG_P2P
+ 		if (wpa_auth_get_ip_addr(sta->wpa_sm, ip_addr_buf) == 0) {
+ 			os_snprintf(ip_addr, sizeof(ip_addr),
+@@ -1224,14 +1245,57 @@ void ap_sta_set_authorized(struct hostap
+ 		}
+ #endif /* CONFIG_P2P */
+ 
+-		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s",
+-			buf, ip_addr);
++		os_snprintf(signal_strength, sizeof(signal_strength),
++			" SignalStrength=%d", (s32)sta->ssi_signal / 100);
++
++		for(i = 0; i < sta->supported_rates_len; i++) {
++			if (i > 0)
++				ret = os_snprintf(rates + len, WLAN_SUPP_RATES_MAX * 4 - len,
++					" %d", sta->supported_rates[i]);
++			 else
++				ret = os_snprintf(rates + len, WLAN_SUPP_RATES_MAX * 4 - len,
++					" SupportedRates=%d", sta->supported_rates[i]);
++			len += ret;
++		}
++
++		len = 0;
++		if (sta->ht_capabilities) {
++			ret = os_snprintf(capabilities + len, 120 - len, " HT_CAP=%04X",
++				le_to_host16(sta->ht_capabilities->ht_capabilities_info));
++		len += ret;
++			for(i = 0; i < sizeof(sta->ht_capabilities->supported_mcs_set) /
++				sizeof(sta->ht_capabilities->supported_mcs_set[0]); i++) {
++				if (i > 0)
++					ret = os_snprintf(capabilities + len, 120 - len, " %02X",
++						sta->ht_capabilities->supported_mcs_set[i]);
++				else
++					ret = os_snprintf(capabilities + len, 120 - len, " HT_MCS=%02X",
++						sta->ht_capabilities->supported_mcs_set[i]);
++				len += ret;
++			}
++		}
++		if (sta->vht_capabilities) {
++			ret = os_snprintf(capabilities + len, 120 - len, " VHT_CAP=%08X",
++				le_to_host32(sta->vht_capabilities->vht_capabilities_info));
++			len += ret;
++			ret = os_snprintf(capabilities + len, 120 - len, " VHT_MCS=%04X %04X %04X %04X",
++				le_to_host16(sta->vht_capabilities->vht_supported_mcs_set.rx_map),
++				le_to_host16(sta->vht_capabilities->vht_supported_mcs_set.rx_highest),
++				le_to_host16(sta->vht_capabilities->vht_supported_mcs_set.tx_map),
++				le_to_host16(sta->vht_capabilities->vht_supported_mcs_set.tx_highest));
++			len += ret;
++		}
++
++		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s",
++			buf, ip_addr, signal_strength, rates, capabilities);
+ 
+ 		if (hapd->msg_ctx_parent &&
+ 		    hapd->msg_ctx_parent != hapd->msg_ctx)
+ 			wpa_msg_no_global(hapd->msg_ctx_parent, MSG_INFO,
+-					  AP_STA_CONNECTED "%s%s",
+-					  buf, ip_addr);
++					  AP_STA_CONNECTED "%s%s%s%s%s",
++					  buf, ip_addr, signal_strength, rates, capabilities);
++		os_free(rates);
++		os_free(capabilities);
+ 	} else {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_DISCONNECTED "%s", buf);
+ 
+--- a/src/ap/utils.c
++++ b/src/ap/utils.c
+@@ -94,3 +94,82 @@ void hostapd_prune_associations(struct h
+ 		hapd->iface->interfaces->for_each_interface(
+ 			hapd->iface->interfaces, prune_associations, &data);
+ }
++
++#define hostapd_skip_space while(isspace(*s)) s++
++#define get_number(x, s, e) (x = strtol(s, e, 10), *e != s)
++static int get_rnge(const char *s, char **e, struct hostapd_iface *iface,
++  int (*range_cb)(struct hostapd_iface*, int, int));
++/**
++ * hostapd_get_list - parses a list of numbers, in the form of "1 6 11-13".
++ * Range may start with one or several spaces.
++ * @s: String of numbers
++ * @e: Upon exit contains pointer to place in s that caused parsing failure
++ * @number_cb: function than will be called when number is found in s. Should
++ *             return 0 on success
++ * @range_cb: function than will be called when range is found in s. Should
++ *            return 0 on success
++ *
++ * Returns 0 - success; -1 - failure
++ */
++int hostapd_get_list(const char *s, char **e, struct hostapd_iface *iface,
++  int (*number_cb)(struct hostapd_iface*, int),
++  int (*range_cb)(struct hostapd_iface*, int, int))
++{
++  int x, ret;
++  int range, number;
++
++  hostapd_skip_space;
++  /* empty string - OK */
++  if ((*s) == '\0')
++    return 0;
++  while (1) {
++    range = get_rnge(s, e, iface, range_cb);
++    /* returns -1 on error */
++    if (range == -1)
++      break;
++    /* returns 0 if range not found */
++    if (!range) {
++      number = get_number(x, s, e);
++      if (number && number_cb) {
++        ret = number_cb(iface, x);
++        if (ret)
++          break;
++      }
++    }
++    if (!range && !number) break;
++    s = *e;
++
++    if ((*s) == '\0')
++      return 0;
++    if ((*s) == ' ') { s++; continue; }
++    break;
++  }
++  *(const char **)e = s;
++  return -1;
++}
++
++static int get_rnge(const char *s, char **e, struct hostapd_iface *iface,
++  int (*range_cb)(struct hostapd_iface*, int, int))
++{
++  int x, y, ret;
++  char *ee;
++  if (!get_number(x, s, &ee))
++    return 0;
++  s = ee;
++
++  if (*s != '-') {
++    *(const char **)e = s;
++    return 0;
++  }
++  s++;
++  if (!get_number(y, s, e))
++    return 0;
++  if (y <= x)
++    return 0;
++  if (range_cb) {
++    ret = range_cb(iface, x, y);
++    if (ret)
++      return ret;
++  }
++  return 1;
++}
+--- a/src/common/ltq-vendor.h
++++ b/src/common/ltq-vendor.h
+@@ -38,12 +38,19 @@ enum ltq_nl80211_vendor_subcmds {
+ 	LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE = 5,
+ 	LTQ_NL80211_VENDOR_SUBCMD_DFS_DEBUG = 6,
+ 	LTQ_NL80211_VENDOR_SUBCMD_CAC_COMPLETE = 7,
++	LTQ_NL80211_VENDOR_SUBCMD_SET_DENY_MAC = 8,
++	LTQ_NL80211_VENDOR_SUBCMD_STA_STEER = 9,
++	LTQ_NL80211_VENDOR_SUBCMD_GET_STA_MEASUREMENTS = 10,
++	LTQ_NL80211_VENDOR_SUBCMD_GET_UNCONNECTED_STA  = 11,
++	LTQ_NL80211_VENDOR_SUBCMD_GET_VAP_MEASUREMENTS = 12,
++	LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_INFO       = 13,
+ };
+ 
+ enum ltq_nl80211_vendor_events {
+ 	LTQ_NL80211_VENDOR_EVENT_RX_EAPOL = 0,
+   LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS = 1,
+   LTQ_NL80211_VENDOR_EVENT_CHAN_DATA = 2,
++	LTQ_NL80211_VENDOR_EVENT_UNCONNECTED_STA = 3,
+ };
+ 
+ #endif /* LTQ_VENDOR_H */
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -288,6 +288,9 @@ extern "C" {
+ /* BSS Transition Management Request received with MBO transition reason */
+ #define MBO_TRANSITION_REASON "MBO-TRANSITION-REASON "
+ 
++#define HOSTAPD_DISCONNECTED "HOSTAPD-DISCONNECTED"
++#define UNCONNECTED_STA_RSSI "UNCONNECTED-STA-RSSI "
++
+ /* BSS command information masks */
+ 
+ #define WPA_BSS_MASK_ALL		0xFFFDFFFF
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -54,6 +54,16 @@
+ #define HOSTAPD_CHAN_VHT_130_30 0x04000000
+ #define HOSTAPD_CHAN_VHT_150_10 0x08000000
+ 
++#define HOSTAPD_CHAN_RESTRICTED 0x10000000
++
++#define HOSTAPD_CHAN_RX_ANTENNAS 4
++
++#define MTLK_WSSA_11A_SUPPORTED  0x00000001
++#define MTLK_WSSA_11B_SUPPORTED  0x00000002
++#define MTLK_WSSA_11G_SUPPORTED  0x00000004
++#define MTLK_WSSA_11N_SUPPORTED  0x00000008
++#define MTLK_WSSA_11AC_SUPPORTED 0x00000010
++
+ /* Filter gratuitous ARP */
+ #define WPA_DATA_FRAME_FILTER_FLAG_ARP BIT(0)
+ /* Filter unsolicited Neighbor Advertisement */
+@@ -742,6 +752,13 @@ enum wps_mode {
+ 	WPS_MODE_PRIVACY
+ };
+ 
++struct hostapd_failsafe_freq_params {
++	int freq;
++	int center_freq1, center_freq2;
++	int bandwidth;
++	u32 tx_ant, rx_ant;
++};
++
+ /**
+  * struct hostapd_freq_params - Channel parameters
+  */
+@@ -1374,6 +1391,102 @@ struct wpa_driver_mesh_join_params {
+ 	unsigned int flags;
+ };
+ 
++
++struct hostapd_unconnected_sta_req_params {
++  u32 bandwidth;
++  u32 freq;
++  u32 center_freq1;
++  u32 center_freq2;
++  u8 addr[ETH_ALEN];
++};
++
++typedef struct mtlk_blacklist_cfg {
++  u8 addr[ETH_ALEN];
++  u8 remove;
++} mtlk_blacklist_cfg_t;
++
++struct mtlk_wssa_peer_traffic_stats {
++  u32 BytesSent;
++  u32 BytesReceived;
++  u32 PacketsSent;
++  u32 PacketsReceived;
++};
++
++struct mtlk_wssa_driver_traffic_stats {
++  u32 BytesSent;
++  u32 BytesReceived;
++  u32 PacketsSent;
++  u32 PacketsReceived;
++  u32 UnicastPacketsSent;
++  u32 UnicastPacketsReceived;
++  u32 MulticastPacketsSent;
++  u32 MulticastPacketsReceived;
++  u32 BroadcastPacketsSent;
++  u32 BroadcastPacketsReceived;
++} __attribute__ ((packed));
++
++struct mtlk_wssa_peer_error_stats {
++  u32 ErrorsSent;
++  u32 ErrorsReceived;
++  u32 DiscardPacketsSent;
++  u32 DiscardPacketsReceived;
++} __attribute__ ((packed));
++
++#define STA_INFO_PS_STATE 1
++
++struct mtlk_wssa_drv_tr181_peer_stats {
++  u32 StationId;
++  u32 NetModesSupported;
++  struct mtlk_wssa_peer_traffic_stats traffic_stats;
++  u32 Retransmissions;
++  u32 LastDataUplinkRate;
++  u32 LastDataDownlinkRate;
++  s32 SignalStrength;
++  s32 ShortTermRSSIAverage[4];
++} __attribute__ ((packed));
++
++typedef struct mtlk_sta_info {
++  struct mtlk_wssa_drv_tr181_peer_stats peer_stats;
++  /* u8 stationInfo; */
++} __attribute__ ((packed)) mtlk_sta_info_t;
++
++struct mtlk_wssa_drv_tr181_vap_stats {
++  struct mtlk_wssa_driver_traffic_stats traffic_stats;
++  struct mtlk_wssa_peer_error_stats error_stats;
++  u32 RetransCount;
++  u32 FailedRetransCount;
++  u32 RetryCount;
++  u32 MultipleRetryCount;
++  u32 ACKFailureCount;
++  u32 AggregatedPacketCount;
++  u32 UnknownProtoPacketsReceived;
++} __attribute__ ((packed));
++
++struct mtlk_wssa_drv_tr181_hw {
++  u8 Enable;
++  u8 Channel;
++} __attribute__ ((packed));
++
++struct mtlk_wssa_drv_tr181_hw_stats {
++  struct mtlk_wssa_driver_traffic_stats traffic_stats;
++  struct mtlk_wssa_peer_error_stats error_stats;
++  u32 FCSErrorCount;
++  s32 Noise;
++} __attribute__ ((packed));
++
++typedef struct mtlk_radio_info {
++  struct mtlk_wssa_drv_tr181_hw hw;
++  struct mtlk_wssa_drv_tr181_hw_stats hw_stats;
++  u8 load;
++  u32 tx_pwr_cfg;
++  u8 num_tx_antennas;
++  u8 num_rx_antennas;
++  u32 primary_center_freq; /* center frequency in MHz */
++  u32 center_freq1;
++  u32 center_freq2;
++  u32 width; /* 20,40,80,... */
++} __attribute__ ((packed)) mtlk_radio_info_t;
++
+ /**
+  * struct wpa_driver_capa - Driver capability information
+  */
+@@ -1621,6 +1734,10 @@ struct wpa_driver_capa {
+ 
+ 	/* Maximum number of supported CSA counters */
+ 	u16 max_csa_counters;
++
++	/* Bitmap of antennas which are available to be configured as TX/RX antennas.
++	 */
++	unsigned int available_antennas_tx, available_antennas_rx;
+ };
+ 
+ 
+@@ -3549,6 +3666,77 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*set_mac_addr)(void *priv, const u8 *addr);
+ 
++  /**
++   * set_deny_mac_addr - Add/remove MAC address to/from blacklist
++   * @priv: Private driver interface data
++   * @addr: MAC address to use
++   * @remove: 1 - remove address from blacklist, 0 - add address to blacklist
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*set_deny_mac_addr)(void *priv, const u8 *addr, const u8 remove);
++
++  /**
++   * sta_steer - Steer station to required VAP
++   * @priv: Private driver interface data
++   * @sta_addr: Station MAC address
++   * @bssid: VAP to steer to
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*sta_steer)(void *priv, const u8 *sta_addr, const u8 *bssid);
++
++  /**
++   * sta_allow - Add station(s) to whitelist
++   * @priv: Private driver interface data
++   * @stations: Array of station MAC addresses
++   * @count: Number of stations
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*sta_allow)(void *priv, const u8 *stations, int count);
++
++  /**
++   * get_sta_measurements - Get station measurements
++   * @priv: Private driver interface data
++   * @sta_addr: Station MAC address
++   * @sta_info: Pointer to station statistics structure (filled by the function)
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*get_sta_measurements)(void *priv, const u8 *sta_addr,
++    mtlk_sta_info_t *sta_info);
++
++  /**
++   * get_vap_measurements - Get VAP measurements
++   * @priv: Private driver interface data
++   * @vap_stats: Pointer to VAP statistics structure (filled by the function)
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*get_vap_measurements)(void *priv,
++    struct mtlk_wssa_drv_tr181_vap_stats *vap_stats);
++
++  /**
++   * get_radio_info - Get radio info
++   * @priv: Private driver interface data
++   * @radio_info: Pointer to radio_info structure (filled by the function)
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*get_radio_info)(void *priv, mtlk_radio_info_t *radio_info);
++
++  /**
++   * unconnected_sta - Trigger unconnected station statistics
++   * @priv: Private driver interface data
++   * @req: Input parameters
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*unconnected_sta)(void *priv, struct hostapd_unconnected_sta_req_params *req);
++
++  /**
++   * set_antenna - Set antenna configuration on the device.
++   * @priv: Private driver interface data
++   * @tx_ant: Bitmap of allowed antennas to use for TX
++   * @rx_ant: Bitmap of allowed antennas to use for RX
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*set_antenna)(void *priv, u32 tx_ant, u32 rx_ant);
++
+ #ifdef CONFIG_MACSEC
+ 	int (*macsec_init)(void *priv, struct macsec_init_params *params);
+ 
+@@ -4142,6 +4330,7 @@ enum wpa_event_type {
+ 	EVENT_EAPOL_RX,
+ 	EVENT_LTQ_FLUSH_STATIONS_RX,
+   EVENT_LTQ_CHAN_DATA,
++	EVENT_LTQ_UNCONNECTED_STA_RX,
+ 
+ 	/**
+ 	 * EVENT_SIGNAL_CHANGE - Indicate change in signal strength
+@@ -4926,6 +5115,16 @@ union wpa_event_data {
+   } ltq_chan_data;
+ 
+ 	/**
++	   * struct ltq_unconnected_sta - Data for LTQ_UNCONNECTED_STA events
++	   */
++	struct ltq_unconnected_sta {
++	  u64 rx_bytes;
++	  u32 rx_packets;
++	  s8 rssi[HOSTAPD_CHAN_RX_ANTENNAS];
++	  u8 addr[ETH_ALEN];
++	} ltq_unconnected_sta;
++
++	/**
+ 	 * signal_change - Data for EVENT_SIGNAL_CHANGE events
+ 	 */
+ 	struct wpa_signal_info signal_change;
+@@ -5215,6 +5414,14 @@ static inline void drv_event_ltq_chan_da
+   wpa_supplicant_event(ctx, EVENT_LTQ_CHAN_DATA, &event);
+ }
+ 
++static inline void drv_event_ltq_unconnected_sta(void *ctx, const u8 *data, size_t data_len)
++{
++   union wpa_event_data event;
++   os_memset(&event, 0, sizeof(event));
++   memcpy(&event.ltq_unconnected_sta, data, data_len);
++   wpa_supplicant_event(ctx, EVENT_LTQ_UNCONNECTED_STA_RX, &event);
++}
++
+ /* driver_common.c */
+ void wpa_scan_results_free(struct wpa_scan_results *res);
+ 
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -55,6 +55,7 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(EAPOL_RX);
+ 	E2S(LTQ_FLUSH_STATIONS_RX);
+   E2S(LTQ_CHAN_DATA);
++	E2S(LTQ_UNCONNECTED_STA_RX);
+ 	E2S(SIGNAL_CHANGE);
+ 	E2S(INTERFACE_ENABLED);
+ 	E2S(INTERFACE_DISABLED);
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -5621,6 +5621,7 @@ int nl80211_get_aid(void *priv, u16 *aid
+ 		wpa_printf(MSG_DEBUG, "Received a new AID %hu", *aid);
+ 	}
+ 
++	wpabuf_free(rsp_aid);
+ 	return res;
+ }
+ 
+@@ -5646,6 +5647,241 @@ int nl80211_free_aid(void *priv, u16 *ai
+ 	return res;
+ }
+ 
++int nl80211_set_deny_mac_addr(void *priv, const u8 *addr, const u8 remove)
++{
++  int ret;
++  mtlk_blacklist_cfg_t blacklist;
++
++  os_memcpy(blacklist.addr, addr, ETH_ALEN);
++  blacklist.remove = remove;
++  ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++    LTQ_NL80211_VENDOR_SUBCMD_SET_DENY_MAC, (u8*) &blacklist, sizeof(blacklist),
++    NULL);
++
++  if (ret < 0)
++    wpa_printf(MSG_ERROR, "nl80211: sending SET_DENY_MAC failed: %i (%s)",
++         ret, strerror(-ret));
++  else
++    wpa_printf(MSG_DEBUG, MACSTR " %s blacklist", MAC2STR(addr),
++      remove ? "removed from" : "added to");
++
++  return ret;
++}
++
++int nl80211_sta_steer(void *priv, const u8 *sta_addr, const u8 *bssid)
++{
++  int ret;
++  u8 data[ETH_ALEN << 1];
++
++  os_memcpy(data, sta_addr, ETH_ALEN);
++  os_memcpy(data + ETH_ALEN, bssid, ETH_ALEN);
++  ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++    LTQ_NL80211_VENDOR_SUBCMD_STA_STEER, data, sizeof(data), NULL);
++
++  if (ret < 0)
++    wpa_printf(MSG_ERROR, "nl80211: sending STA_STEER failed: %i (%s)",
++         ret, strerror(-ret));
++  else
++    wpa_printf(MSG_DEBUG, MACSTR " steered to " MACSTR, MAC2STR(sta_addr),
++      MAC2STR(bssid));
++
++  return ret;
++}
++
++int nl80211_sta_allow(void *priv, const u8 *stations, int count)
++{
++  int i, ret, final_ret = 0;
++  mtlk_blacklist_cfg_t blacklist;
++
++  os_memset(&blacklist, 0, sizeof(blacklist));
++  /* remove STA from blacklist */
++  blacklist.remove = 1;
++  if (count > 0) {
++    for (i = 0; i < count; i++) {
++      os_memcpy(blacklist.addr, stations + i * ETH_ALEN, ETH_ALEN);
++      ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++        LTQ_NL80211_VENDOR_SUBCMD_SET_DENY_MAC, (u8*) &blacklist,
++        sizeof(blacklist), NULL);
++
++      if (ret < 0) {
++        wpa_printf(MSG_ERROR, "nl80211: failed to remove station " MACSTR
++          " from the blacklist: %i (%s)",
++          MAC2STR(stations + i * ETH_ALEN), ret, strerror(-ret));
++        final_ret = ret;
++      }
++      else
++        wpa_printf(MSG_DEBUG, MACSTR " removed from blacklist",
++          MAC2STR(stations + i * ETH_ALEN));
++    }
++  } else
++    /* with all 0's STA MAC will allow all STAs */
++    final_ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++            LTQ_NL80211_VENDOR_SUBCMD_SET_DENY_MAC, (u8*) &blacklist,
++            sizeof(blacklist), NULL);
++
++  return final_ret;
++}
++
++
++int nl80211_get_sta_measurements(void *priv, const u8 *sta_addr,
++  mtlk_sta_info_t *sta_info)
++{
++  int ret;
++  struct wpabuf *rsp;
++
++  /* sizeof(*peer_stats) + NLA_HDRLEN + NLA_ALLIGN */
++  rsp = wpabuf_alloc(NLA_ALIGN(sizeof(struct nlattr) + sizeof(*sta_info)));
++  if (!rsp) {
++    return -ENOBUFS;
++  }
++
++  ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++    LTQ_NL80211_VENDOR_SUBCMD_GET_STA_MEASUREMENTS, sta_addr, ETH_ALEN, rsp);
++
++  if (ret) {
++    wpa_printf(MSG_ERROR, "nl80211: sending/receiving GET_STA_MEASUREMENTS "
++      "failed: %i (%s)", ret, strerror(-ret));
++    goto out;
++  }
++  if (rsp->used != sizeof(*sta_info)) {
++    ret = -EMSGSIZE;
++    wpa_printf(MSG_ERROR, "nl80211: driver returned %d bytes instead of %d",
++      rsp->used, sizeof(*sta_info));
++    goto out;
++  }
++  memcpy(sta_info, rsp->buf, sizeof(*sta_info));
++  wpa_printf(MSG_DEBUG, "nl80211: Received station measurements for station "
++    MACSTR, MAC2STR(sta_addr));
++
++out:
++  wpabuf_free(rsp);
++  return ret;
++}
++
++
++int nl80211_get_vap_measurements(void *priv,
++  struct mtlk_wssa_drv_tr181_vap_stats *vap_stats)
++{
++  int ret;
++  struct wpabuf *rsp;
++
++  /* sizeof(*vap_stats) + NLA_HDRLEN + NLA_ALLIGN */
++  rsp = wpabuf_alloc(NLA_ALIGN(sizeof(struct nlattr) + sizeof(*vap_stats)));
++  if (!rsp) {
++    return -ENOBUFS;
++  }
++
++  ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++    LTQ_NL80211_VENDOR_SUBCMD_GET_VAP_MEASUREMENTS, NULL, 0, rsp);
++
++  if (ret) {
++    wpa_printf(MSG_ERROR, "nl80211: sending/receiving GET_VAP_MEASUREMENTS "
++      "failed: %i (%s)", ret, strerror(-ret));
++    goto out;
++  }
++  if (rsp->used != sizeof(*vap_stats)) {
++    ret = -EMSGSIZE;
++    wpa_printf(MSG_ERROR, "nl80211: driver returned %d bytes instead of %d",
++      rsp->used, sizeof(*vap_stats));
++    goto out;
++  }
++
++  memcpy(vap_stats, rsp->buf, sizeof(*vap_stats));
++  wpa_printf(MSG_DEBUG, "nl80211: Received VAP measurements");
++
++out:
++  wpabuf_free(rsp);
++  return ret;
++}
++
++
++int nl80211_get_radio_info(void *priv, mtlk_radio_info_t *radio_info)
++{
++  int ret;
++  struct wpabuf *rsp;
++
++  /* sizeof(*radio_info) + NLA_HDRLEN + NLA_ALLIGN */
++  rsp = wpabuf_alloc(NLA_ALIGN(sizeof(struct nlattr) + sizeof(*radio_info)));
++  if (!rsp) {
++    return -ENOBUFS;
++  }
++
++  ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++    LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_INFO, NULL, 0, rsp);
++
++  if (ret) {
++    wpa_printf(MSG_ERROR, "nl80211: sending/receiving GET_RADIO_INFO "
++      "failed: %i (%s)", ret, strerror(-ret));
++    goto out;
++  }
++  if (rsp->used != sizeof(*radio_info)) {
++    ret = -EMSGSIZE;
++    wpa_printf(MSG_ERROR, "nl80211: driver returned %d bytes instead of %d",
++      rsp->used, sizeof(*radio_info));
++    goto out;
++  }
++
++  memcpy(radio_info, rsp->buf, sizeof(*radio_info));
++  wpa_printf(MSG_DEBUG, "nl80211: Received radio info");
++
++out:
++  wpabuf_free(rsp);
++  return ret;
++}
++
++
++int nl80211_unconnected_sta(void *priv, struct hostapd_unconnected_sta_req_params *req)
++{
++  int res = 0;
++
++  res = nl80211_vendor_cmd(priv, OUI_LTQ,
++    LTQ_NL80211_VENDOR_SUBCMD_GET_UNCONNECTED_STA, (u8*) req, sizeof(*req), NULL);
++  if (res) {
++    wpa_printf(MSG_ERROR, "nl80211: UNCONNECTED_STA failed: %i (%s)", res,
++      strerror(-res));
++  }
++
++  return res;
++}
++
++
++static int nl80211_put_antenna_params(struct nl_msg *msg,
++  u32 tx_ant, u32 rx_ant)
++{
++  wpa_printf(MSG_DEBUG, "  * TX 0x%x", tx_ant);
++  if (nla_put_u32(msg, NL80211_ATTR_WIPHY_ANTENNA_TX, tx_ant))
++    return -ENOBUFS;
++  wpa_printf(MSG_DEBUG, "  * RX 0x%x", rx_ant);
++  if (nla_put_u32(msg, NL80211_ATTR_WIPHY_ANTENNA_RX, rx_ant))
++    return -ENOBUFS;
++
++  return 0;
++}
++
++int nl80211_set_antenna(void *priv, u32 tx_ant, u32 rx_ant)
++{
++  int ret = 0;
++  struct i802_bss *bss = priv;
++  struct wpa_driver_nl80211_data *drv = bss->drv;
++  struct nl_msg *msg;
++
++  wpa_printf(MSG_DEBUG, "nl80211: Set antenna mask");
++
++  msg = nl80211_drv_msg(drv, 0, NL80211_CMD_SET_WIPHY);
++  if (!msg || nl80211_put_antenna_params(msg, tx_ant, rx_ant) < 0) {
++    nlmsg_free(msg);
++    return -1;
++  }
++
++  ret = send_and_recv_msgs(drv, msg, NULL, NULL);
++  if (ret != 0) {
++    wpa_printf(MSG_DEBUG, "nl80211: Failed to set antenna mask: "
++         "%d (%s)", ret, strerror(-ret));
++  }
++
++  return ret;
++}
++
+ 
+ static int i802_set_tx_queue_params(void *priv, int queue, int aifs,
+ 				    int cw_min, int cw_max, int burst_time)
+@@ -9501,6 +9737,14 @@ const struct wpa_driver_ops wpa_driver_n
+ 	.set_qos_map = nl80211_set_qos_map,
+ 	.set_wowlan = nl80211_set_wowlan,
+ 	.set_mac_addr = nl80211_set_mac_addr,
++	.set_deny_mac_addr = nl80211_set_deny_mac_addr,
++	.sta_steer = nl80211_sta_steer,
++	.sta_allow = nl80211_sta_allow,
++	.get_sta_measurements = nl80211_get_sta_measurements,
++	.get_vap_measurements = nl80211_get_vap_measurements,
++	.get_radio_info = nl80211_get_radio_info,
++	.unconnected_sta = nl80211_unconnected_sta,
++	.set_antenna = nl80211_set_antenna,
+ #ifdef CONFIG_MESH
+ 	.init_mesh = wpa_driver_nl80211_init_mesh,
+ 	.join_mesh = wpa_driver_nl80211_join_mesh,
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1974,6 +1974,16 @@ static void ltq_nl80211_handle_chan_data
+ 	drv_event_ltq_chan_data(drv->ctx, data, len);
+ }
+ 
++static void ltq_nl80211_handle_unconnected_sta(struct wpa_driver_nl80211_data *drv,
++                           const u8 *data, size_t len)
++{
++ 	wpa_printf(MSG_INFO, "nl80211: Receive LTQ vendor event:Unconnected station, ctx=%p",
++     			drv->ctx);
++
++  	drv_event_ltq_unconnected_sta(drv->ctx, data, len);
++}
++
++
+ static void nl80211_vendor_event_ltq(struct wpa_driver_nl80211_data *drv,
+ 										u32 subcmd, u8 *data, size_t len)
+ {       
+@@ -1987,6 +1997,9 @@ static void nl80211_vendor_event_ltq(str
+ 		case LTQ_NL80211_VENDOR_EVENT_CHAN_DATA:
+ 			ltq_nl80211_handle_chan_data(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_UNCONNECTED_STA:
++			ltq_nl80211_handle_unconnected_sta(drv, data, len);
++			break;
+        default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported LTQ vendor event %u", subcmd);
+ 			break;

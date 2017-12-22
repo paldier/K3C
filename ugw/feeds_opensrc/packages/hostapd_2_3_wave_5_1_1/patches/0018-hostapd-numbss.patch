@@ -1,0 +1,855 @@
+From 72812e5890d0b5f5902e4b7409712a9e0549654e Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Mon, 5 Sep 2016 16:21:20 +0300
+Subject: [PATCH 18/69] hostapd: numbss
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ hostapd/config_file.c |  34 +++-
+ hostapd/hostapd.conf  |  29 ++-
+ src/ap/acs.c          | 544 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ src/ap/ap_config.c    |  21 +-
+ src/ap/ap_config.h    |  26 +++
+ src/ap/ap_drv_ops.c   |  10 +-
+ src/drivers/driver.h  |  24 +++
+ 7 files changed, 674 insertions(+), 14 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index f3ccce1..7c10c96 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2653,7 +2653,7 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 	} else if (os_strcmp(buf, "channel") == 0) {
+-		if (os_strcmp(pos, "acs_survey") == 0) {
++		if (os_strcmp(pos, "acs_survey") == 0 || os_strcmp(pos, "acs_numbss") == 0) {
+ #ifndef CONFIG_ACS
+ 			wpa_printf(MSG_ERROR, "Line %d: tries to enable ACS but CONFIG_ACS disabled",
+ 				   line);
+@@ -2661,12 +2661,42 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ #else /* CONFIG_ACS */
+ 			conf->acs = 1;
+ 			conf->channel = 0;
++			conf->acs_algo = (os_strcmp(pos, "acs_numbss") == 0
++							? ACS_ALGO_NUMBSS
++							: ACS_ALGO_SURVEY);
+ #endif /* CONFIG_ACS */
+ 		} else {
+ 			conf->channel = atoi(pos);
+ 			conf->acs = conf->channel == 0;
++#ifdef CONFIG_ACS
++			conf->acs_algo = ACS_ALGO_SURVEY;
++#endif /* CONFIG_ACS */
+ 		}
+-	} else if (os_strcmp(buf, "chanlist") == 0) {
++	}
++#ifdef CONFIG_ACS
++	else if (os_strcmp(buf, "acs_numbss_info_file") == 0) {
++		os_free(conf->acs_numbss_info_file);
++		conf->acs_numbss_info_file = os_strdup(pos);
++	} else if (os_strcmp(buf, "acs_numbss_coeflist") == 0) {
++		int i = 0;
++		if (hostapd_parse_intlist(&conf->acs_numbss_coeflist, pos)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid ACS NUMBSS coefficient list",
++				line);
++			return 1;
++		}
++		/* it would be great to adopt a rule that "int-lists" contain their
++		 * element count in the member at index 0, then we wouldn't have to count...
++		 */
++		while (conf->acs_numbss_coeflist[i] >= 0)
++			i++;
++		if (i != ACS_NUMBSS_NUM_COEFS) {
++			wpa_printf(MSG_ERROR, "Line %d: ACS NUMBSS coefficient list has %i elements instead of %i",
++				line, i, ACS_NUMBSS_NUM_COEFS);
++			return 1;
++		}
++	}
++#endif /* CONFIG_ACS */
++	else if (os_strcmp(buf, "chanlist") == 0) {
+ 		if (hostapd_parse_chanlist(conf, pos)) {
+ 			wpa_printf(MSG_ERROR, "Line %d: invalid channel list",
+ 				   line);
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index c244624..11dda86 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -144,7 +144,9 @@ hw_mode=g
+ #
+ # If CONFIG_ACS build option is enabled, the channel can be selected
+ # automatically at run time by setting channel=acs_survey or channel=0, both of
+-# which will enable the ACS survey based algorithm.
++# which will enable the ACS survey based algorithm, or by setting
++# channel=acs_numbss, which will enable the ACS number-of-BSS-es
++# based algorithm.
+ channel=1
+ 
+ # ACS tuning - Automatic Channel Selection
+@@ -174,6 +176,31 @@ channel=1
+ #acs_num_scans=5
+ #acs_chan_bias=1:0.8 6:0.8 11:0.8
+ 
++# ACS NumBSS method tuning
++# When channel=acs_numbss is set, additional configuration parameters
++# are avaialble.
++# acs_numbss_info_file specifies the path to a file where the method will
++# log the crucial things, e.g. the bss-es heard, badness-es calculated, etc.
++# acs_numbss_coeflist specifies the 15 coefficients or weights to use when
++# calculating how much the already present BSS-es would affect a new BSS
++# on each particular channel and what bandwidth to use.
++# To be precise, The first four are the weights to apply to the numbers of
++# BSS-es that have their primary, secondary, tertiary or quaternary channels,
++# respectively, coincide with the primary channel of a potential new BSS with
++# its primary channel on the current channel.  The next four are the weights
++# to apply to the numbers of BSS-es that have their primary, secondary,
++# tertiary or quaternary channels, respectively, coincide with the secondary
++# channel of a potential new BSS with its primary channel on the current one.
++# The next four are the weights to apply to the numbers of BSS-es that have
++# their primary, secondary, tertiary or quaternary channels, respectively,
++# coincide with the tertiary channels of a potential new BSS with its primary
++# channel on the current one.  The last three are the weights to apply when
++# comparing the badness of best channel for 20, 40 and 80 MHz, respectively.
++#
++# Defaults:
++# acs_numbss_info_file=/tmp/acs_numbss_info.txt
++# acs_numbss_coeflist=4 0 2 0 0 0 2 0 1 0 0 0 9 3 1
++
+ # Channel list restriction. This option allows hostapd to select one of the
+ # provided channels when a channel should be automatically selected.
+ # Channel list can be provided as range using hyphen ('-') or individual
+diff --git a/src/ap/acs.c b/src/ap/acs.c
+index 5e83805..d310c55 100644
+--- a/src/ap/acs.c
++++ b/src/ap/acs.c
+@@ -283,9 +283,13 @@ static void acs_cleanup(struct hostapd_iface *iface)
+ 
+ static void acs_fail(struct hostapd_iface *iface)
+ {
+-	wpa_printf(MSG_ERROR, "ACS: Failed to start");
++	wpa_printf(MSG_ERROR, "ACS: failed");
+ 	acs_cleanup(iface);
+-	hostapd_disable_iface(iface);
++
++	if (iface->current_mode->num_channels)
++		iface->conf->channel = iface->current_mode->channels[0].chan; /* first chan in mode */
++	else
++		hostapd_disable_iface(iface);
+ }
+ 
+ 
+@@ -841,20 +845,537 @@ fail:
+ 	acs_fail(iface);
+ }
+ 
++#define VHT_OPER_CHWIDTH_20_40 0
++#define VHT_OPER_CHWIDTH_80    1
++#define VHT_OPER_CHWIDTH_160   2
++#define VHT_OPER_CHWIDTH_80_80 3
++
++static inline unsigned acs_freq_to_chan(int freq)
++{
++	u8 chan;
++	ieee80211_freq_to_chan(freq, &chan);
++	return chan;
++}
++
++static void acs_record_bsses(struct hostapd_iface *iface, struct wpa_scan_results *scan_res, FILE *fp)
++{
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	int i, j;
++
++	wpa_printf(MSG_DEBUG, "ACS: recording BSS-es");
++
++	/* init the counters */
++	for (j = 0; j < mode->num_channels; j++) {
++		struct hostapd_channel_data *chan = &mode->channels[j];
++		chan->num_bss_pri = chan->num_bss_sec = chan->num_bss_tert = chan->num_bss_quat = 0;
++		chan->num_bss_conflicting_20 = chan->num_bss_conflicting_ht40plus = chan->num_bss_conflicting_ht40minus = 0;
++	}
++
++	fprintf(fp, "# ssid                          \twidth\tprimary\tsecondary\tcenter0\tcenter1\n");
++
++	for (i = 0; i < scan_res->num; i++) {
++		struct wpa_scan_res *bss = scan_res->res[i];
++		struct ieee802_11_elems elems;
++		struct ieee80211_ht_capabilities *ht_cap = NULL;
++		struct ieee80211_ht_operation *ht_oper = NULL;
++		struct ieee80211_vht_operation *vht_oper = NULL;
++		int bss_sec_freq = 0;
++		int bss_center_freq0 = bss->freq;
++		int bss_center_freq1 = 0;
++		int bss_width = 0;
++		const char *bss_printable_width = "20";
++
++		ieee802_11_parse_elems((u8 *) (bss + 1), bss->ie_len, &elems, 0);
++
++		/* get the HT capabilities element, needed later when we analyze each channel */
++		if (elems.ht_capabilities)
++			ht_cap = (struct ieee80211_ht_capabilities *) elems.ht_capabilities;
++
++		/* get the secondary channel's frequency */
++		if (elems.ht_operation) {
++			ht_oper = (struct ieee80211_ht_operation *) elems.ht_operation;
++
++			if (ht_oper->ht_param & HT_INFO_HT_PARAM_STA_CHNL_WIDTH) {
++				int sec = ht_oper->ht_param & HT_INFO_HT_PARAM_SECONDARY_CHNL_OFF_MASK;
++				if (sec == HT_INFO_HT_PARAM_SECONDARY_CHNL_ABOVE) {
++					bss_printable_width = "40";
++					bss_sec_freq = bss->freq + 20;
++				} else if (sec == HT_INFO_HT_PARAM_SECONDARY_CHNL_BELOW) {
++					bss_printable_width = "40";
++					bss_sec_freq = bss->freq - 20;
++				}
++
++				bss_center_freq0 = (bss->freq + bss_sec_freq) / 2;
++			}
++		}
++
++		/* get the vht operational info if in 5 GHz band */
++		if (mode->mode == HOSTAPD_MODE_IEEE80211A
++		    && elems.vht_operation) {
++			vht_oper = (struct ieee80211_vht_operation *) elems.vht_operation;
++			bss_width = vht_oper->vht_op_info_chwidth;
++
++			if (bss_width > VHT_OPER_CHWIDTH_20_40) {
++				bss_printable_width = bss_width == VHT_OPER_CHWIDTH_80 ? "80" : "160";
++
++				bss_center_freq0 = 5000 + 5 * vht_oper->vht_op_info_chan_center_freq_seg0_idx;
++				if (bss_width == VHT_OPER_CHWIDTH_80_80) {
++					bss_printable_width = "80+80";
++					bss_center_freq1 = 5000 + 5 * vht_oper->vht_op_info_chan_center_freq_seg1_idx;
++				}
++			}
++		}
++
++		fprintf(fp, "%-32.*s\t%5s\t%7u\t%9u\t%7u\t%7u\n",
++			elems.ssid_len, elems.ssid, bss_printable_width,
++			acs_freq_to_chan(bss->freq),
++			bss_sec_freq > 0 ? acs_freq_to_chan(bss_sec_freq) : 0,
++			acs_freq_to_chan(bss_center_freq0),
++			bss_center_freq1 > 0 ? acs_freq_to_chan(bss_center_freq1) : 0);
++
++		/* increase the relevant counters in every channel affected */
++		for (j = 0; j < mode->num_channels; j++) {
++			struct hostapd_channel_data *chan = &mode->channels[j];
++
++			if (chan->freq == bss->freq) {
++				chan->num_bss_pri++;
++
++				if (ht_cap
++				    && (le_to_host16(ht_cap->ht_capabilities_info) & HT_CAP_INFO_40MHZ_INTOLERANT)) {
++					chan->num_bss_conflicting_ht40minus++;
++					chan->num_bss_conflicting_ht40plus++;
++				} else if (bss_sec_freq == bss->freq + 20) {   /* bss has upper bonding */
++					chan->num_bss_conflicting_ht40minus++; /* so we can't have lower */
++				} else if (bss_sec_freq == bss->freq - 20) {   /* and vice versa */
++					chan->num_bss_conflicting_ht40plus++;
++				}
++			} else {
++				if (chan->freq == bss_sec_freq) { /* BSS's secondary channel is on current */
++					chan->num_bss_sec++;
++				} else if (bss_width == VHT_OPER_CHWIDTH_80) {
++					if (bss_center_freq0 - 40 + 10 <= chan->freq
++					    && chan->freq <= bss_center_freq0 + 40 - 10) /* BSS's tertiary channel is on current */
++						chan->num_bss_tert++;
++				} else if (bss_width == VHT_OPER_CHWIDTH_80_80) {
++					if (bss_center_freq0 - 40 + 10 <= chan->freq
++					    && chan->freq <= bss_center_freq0 + 40 - 10) /* BSS's tertiary channel is on current */
++						chan->num_bss_tert++;
++					if (bss_center_freq1 > 0
++					    && bss_center_freq1 - 40 + 10 <= chan->freq
++					    && chan->freq <= bss_center_freq1 + 40 - 10) /* BSS's quaternary channel is on current */
++						chan->num_bss_quat++;
++				}
++				else if (bss_width == VHT_OPER_CHWIDTH_160) {
++					if (bss_center_freq0 - 80 + 10 <= chan->freq
++					    && chan->freq <= bss_center_freq0 + 80 - 10) {
++						/* BSS's tertiary or quaternary channel is on current */
++						int side_pri = bss->freq < bss_center_freq0 ? -1 : 1;
++						int side_chan = chan->freq < bss_center_freq0 ? -1 : 1;
++						if (side_pri == side_chan)
++							chan->num_bss_tert++;
++						else
++							chan->num_bss_quat++;
++					}
++				}
++
++				if (chan->freq - 15 <= bss->freq && bss->freq <= chan->freq + 15)
++					chan->num_bss_conflicting_20++;
++
++				if ((chan->freq - 15 <= bss->freq && bss->freq <= chan->freq + 35)
++				    || (chan->freq - 15 <= bss_sec_freq && bss_sec_freq <= chan->freq + 35))
++					chan->num_bss_conflicting_ht40plus++;
++
++				if ((chan->freq - 35 <= bss->freq && bss->freq <= chan->freq + 15)
++				    || (chan->freq - 35 <= bss_sec_freq && bss_sec_freq <= chan->freq + 15))
++					chan->num_bss_conflicting_ht40minus++;
++			}
++		}
++	}
++}
++
++#define ACS_NUMBSS_TOO_MANY_STAS 100
++
++static void acs_compute_badness(struct hostapd_iface *iface, FILE *fp)
++{
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	int *coefs = iface->conf->acs_numbss_coeflist;
++	int j;
++
++	wpa_printf(MSG_DEBUG, "ACS: computing badness");
++
++	fprintf(fp, "\n# p_w1\tp_w2\tp_w3\tp_w4\ts_w1\ts_w2\ts_w3\ts_w4\tt_w1\tt_w2\tt_w3\tt_w4\tw20\tw40\tw80\n");
++	fprintf(fp, "%6i\t%4i\t%4i\t%4i\t%4i\t%4i\t%4i\t%4i\t%4i\t%4i\t%4i\t%4i\t%3i\t%3i\t%3i\n",
++		coefs[ACS_NUMBSS_P_W1], coefs[ACS_NUMBSS_P_W2],
++		coefs[ACS_NUMBSS_P_W3], coefs[ACS_NUMBSS_P_W4],
++		coefs[ACS_NUMBSS_S_W1], coefs[ACS_NUMBSS_S_W2],
++		coefs[ACS_NUMBSS_S_W3], coefs[ACS_NUMBSS_S_W4],
++		coefs[ACS_NUMBSS_T_W1], coefs[ACS_NUMBSS_T_W2],
++		coefs[ACS_NUMBSS_T_W3], coefs[ACS_NUMBSS_T_W4],
++		coefs[ACS_NUMBSS_W20], coefs[ACS_NUMBSS_W40], coefs[ACS_NUMBSS_W80]);
++
++	/* compute the "badness" for 20 MHz */
++	for (j = 0; j < mode->num_channels; j++) {
++		struct hostapd_channel_data *chan = &mode->channels[j];
++
++		chan->badness20 = -1;
++		chan->badness40plus = -1;
++		chan->badness40minus = -1;
++		chan->badness80 = -1;
++
++		if (chan->flag & HOSTAPD_CHAN_DISABLED)
++			continue;
++
++		/* avoid working with numbers that are too large */
++		if (chan->num_bss_pri > ACS_NUMBSS_TOO_MANY_STAS)
++			chan->num_bss_pri = ACS_NUMBSS_TOO_MANY_STAS;
++		if (chan->num_bss_sec > ACS_NUMBSS_TOO_MANY_STAS)
++			chan->num_bss_sec = ACS_NUMBSS_TOO_MANY_STAS;
++		if (chan->num_bss_tert > ACS_NUMBSS_TOO_MANY_STAS)
++			chan->num_bss_tert = ACS_NUMBSS_TOO_MANY_STAS;
++		if (chan->num_bss_quat > ACS_NUMBSS_TOO_MANY_STAS)
++			chan->num_bss_quat = ACS_NUMBSS_TOO_MANY_STAS;
++
++		if (chan->num_bss_conflicting_20 == 0)
++			chan->badness20 = (coefs[ACS_NUMBSS_P_W1] * chan->num_bss_pri
++					   + coefs[ACS_NUMBSS_P_W2] * chan->num_bss_sec
++					   + coefs[ACS_NUMBSS_P_W3] * chan->num_bss_tert
++					   + coefs[ACS_NUMBSS_P_W4] * chan->num_bss_quat);
++	}
++
++	if (!iface->conf->ieee80211n
++	    || !(iface->conf->ht_capab & HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET)) {
++		wpa_printf(MSG_DEBUG, "ACS: skipping badness 40 computation (not configured)");
++		return;
++	}
++
++	/* compute the "badness" for 40 MHz */
++	for (j = 0; j < mode->num_channels; j++) {
++		struct hostapd_channel_data *sec_chan_up, *sec_chan_down;
++		struct hostapd_channel_data *chan = &mode->channels[j];
++
++		if (chan->badness20 == -1) /* if it was no good for 20, it can't be good for 40 */
++			continue;
++
++		sec_chan_up = acs_find_chan(iface, chan->freq + 20);
++		sec_chan_down = acs_find_chan(iface, chan->freq - 20);
++
++		/*
++		wpa_printf(MSG_DEBUG, "ACS: chan=%hi, sec_chan_up=%hi, usable=%i",
++			   chan->chan, sec_chan_up ? sec_chan_up->chan : (short) 0,
++			   sec_chan_up ? (sec_chan_up->chan < 14 || acs_usable_ht40_chan(chan)) : 0);
++		*/
++
++		if (sec_chan_up
++		    && (sec_chan_up->chan < 14 || acs_usable_ht40_chan(chan))
++		    && chan->num_bss_conflicting_ht40plus == 0)
++			chan->badness40plus = (chan->badness20
++					       + coefs[ACS_NUMBSS_S_W1] * sec_chan_up->num_bss_pri
++					       + coefs[ACS_NUMBSS_S_W2] * sec_chan_up->num_bss_sec
++					       + coefs[ACS_NUMBSS_S_W3] * sec_chan_up->num_bss_tert
++					       + coefs[ACS_NUMBSS_S_W4] * sec_chan_up->num_bss_quat);
++
++		/*
++		wpa_printf(MSG_DEBUG, "ACS: chan=%hi, sec_chan_down=%hi, usable=%i",
++			   chan->chan, sec_chan_down ? sec_chan_down->chan : (short) 0,
++			   sec_chan_down ? (chan->chan < 14 || acs_usable_ht40_chan(sec_chan_down)) : 0);
++		*/
++
++		if (sec_chan_down
++		    && (chan->chan < 14 || acs_usable_ht40_chan(sec_chan_down))
++		    && chan->num_bss_conflicting_ht40minus == 0)
++			chan->badness40minus = (chan->badness20
++						+ coefs[ACS_NUMBSS_S_W1] * sec_chan_down->num_bss_pri
++						+ coefs[ACS_NUMBSS_S_W2] * sec_chan_down->num_bss_sec
++						+ coefs[ACS_NUMBSS_S_W3] * sec_chan_down->num_bss_tert
++						+ coefs[ACS_NUMBSS_S_W4] * sec_chan_down->num_bss_quat);
++	}
++
++	if (mode->mode != HOSTAPD_MODE_IEEE80211A
++	    || !iface->conf->ieee80211ac) {
++		wpa_printf(MSG_DEBUG, "ACS: skipping badness 80 computation (wrong mode or not configured)");
++		return;
++	}
++
++	/* compute the "badness" for 80 MHz */
++	for (j = 0; j < mode->num_channels; j++) {
++		struct hostapd_channel_data *chan1, *chan2, *chan3, *chan_1, *chan_2, *chan_3;
++		struct hostapd_channel_data *chan = &mode->channels[j];
++
++		/* we could retrieve the neighboring channels ourselves faster, but all the
++		 * checks that need to be done are a pain. Therefore, we use the find function
++		 * even though it slows the execution a little.
++		 */
++		chan1 = acs_find_chan(iface, chan->freq + 20);
++		chan2 = acs_find_chan(iface, chan->freq + 40);
++		chan3 = acs_find_chan(iface, chan->freq + 60);
++		chan_1 = acs_find_chan(iface, chan->freq - 20);
++		chan_2 = acs_find_chan(iface, chan->freq - 40);
++		chan_3 = acs_find_chan(iface, chan->freq - 60);
++
++		/*
++		wpa_printf(MSG_DEBUG, "ACS: chan_3=%hi, chan_2=%hi, chan_1=%hi, chan=%hi, chan1=%hi, chan2=%hi, chan3=%hi",
++			   chan_3 ? chan_3->chan : (short) 0, chan_2 ? chan_2->chan : (short) 0, chan_1 ? chan_1->chan : (short) 0,
++			   chan->chan, chan1 ? chan1->chan : (short) 0, chan2 ? chan2->chan : (short) 0, chan3 ? chan3->chan : (short) 0);
++		*/
++
++		if (acs_usable_vht80_chan(chan)) { /* ours is the lowest chan in possible 80 MHz range */
++			chan->prim_chan_idx = 0;
++
++			if (chan->badness40plus == -1) /* if it was no good for 40+, it can't be good for 80 */
++				continue;
++
++			if (chan1 && chan2 && chan3
++			    && chan->num_bss_conflicting_ht40plus == 0)
++				chan->badness80 = (chan->badness40plus
++						   + coefs[ACS_NUMBSS_T_W1] * (chan2->num_bss_pri + chan3->num_bss_pri)
++						   + coefs[ACS_NUMBSS_T_W2] * (chan2->num_bss_sec + chan3->num_bss_sec)
++						   + coefs[ACS_NUMBSS_T_W3] * (chan2->num_bss_tert + chan3->num_bss_tert)
++						   + coefs[ACS_NUMBSS_T_W4] * (chan2->num_bss_quat + chan3->num_bss_quat));
++		} else if (chan_1 && acs_usable_vht80_chan(chan_1)) { /* ours is the second chan in 80 Mhz */
++			chan->prim_chan_idx = 1;
++
++			if (chan->badness40minus == -1) /* if it was no good for 40-, it can't be good for 80 */
++				continue;
++
++			if (chan1 && chan2
++			    && chan->num_bss_conflicting_ht40minus == 0)
++				chan->badness80 = (chan->badness40minus
++						   + coefs[ACS_NUMBSS_T_W1] * (chan1->num_bss_pri + chan2->num_bss_pri)
++						   + coefs[ACS_NUMBSS_T_W2] * (chan1->num_bss_sec + chan2->num_bss_sec)
++						   + coefs[ACS_NUMBSS_T_W3] * (chan1->num_bss_tert + chan2->num_bss_tert)
++						   + coefs[ACS_NUMBSS_T_W4] * (chan1->num_bss_quat + chan2->num_bss_quat));
++		} else if (chan_2 && acs_usable_vht80_chan(chan_2)) { /* ours is the third chan in 80 Mhz */
++			chan->prim_chan_idx = 2;
++
++			if (chan->badness40plus == -1) /* if it was no good for 40+, it can't be good for 80 */
++				continue;
++
++			if (chan_1 && chan1
++			    && chan->num_bss_conflicting_ht40plus == 0)
++				chan->badness80 = (chan->badness40plus
++						   + coefs[ACS_NUMBSS_T_W1] * (chan_2->num_bss_pri + chan_1->num_bss_pri)
++						   + coefs[ACS_NUMBSS_T_W2] * (chan_2->num_bss_sec + chan_1->num_bss_sec)
++						   + coefs[ACS_NUMBSS_T_W3] * (chan_2->num_bss_tert + chan_1->num_bss_tert)
++						   + coefs[ACS_NUMBSS_T_W4] * (chan_2->num_bss_quat + chan_1->num_bss_quat));
++		} else if (chan_3 && acs_usable_vht80_chan(chan_3)) { /* ours is the last chan in 80 Mhz */
++			chan->prim_chan_idx = 3;
++
++			if (chan->badness40minus == -1) /* if it was no good for 40-, it can't be good for 80 */
++				continue;
++
++			if (chan_1 && chan_2
++			    && chan->num_bss_conflicting_ht40minus == 0)
++				chan->badness80 = (chan->badness40minus
++						   + coefs[ACS_NUMBSS_T_W1] * (chan_3->num_bss_pri + chan_2->num_bss_pri)
++						   + coefs[ACS_NUMBSS_T_W2] * (chan_3->num_bss_sec + chan_2->num_bss_sec)
++						   + coefs[ACS_NUMBSS_T_W3] * (chan_3->num_bss_tert + chan_2->num_bss_tert)
++						   + coefs[ACS_NUMBSS_T_W4] * (chan_3->num_bss_quat + chan_2->num_bss_quat));
++		}
++	}
++}
++
++static void acs_find_min_badness(struct hostapd_iface *iface, FILE *fp)
++{
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	int *coefs = iface->conf->acs_numbss_coeflist;
++	struct hostapd_channel_data *chan20 = NULL;
++	struct hostapd_channel_data *chan40plus = NULL;
++	struct hostapd_channel_data *chan40minus = NULL;
++	struct hostapd_channel_data *chan80 = NULL;
++	int min20 = -1;
++	int min40plus = -1;
++	int min40minus = -1;
++	int min40 = -1;
++	int min80 = -1;
++	int n_chans = 1;
++	int j;
++
++	wpa_printf(MSG_DEBUG, "ACS: finding minimum badness");
++
++	fprintf(fp, "\n# channel\t flags\tnum_bss1\tnum_bss2\tnum_bss3\tnum_bss4"
++		"\tnum_confl20\tnum_confl40+\tnum_confl40-\tbadness20\tbadness40+\tbadness40-\tbadness80\n");
++
++	for (j = 0; j < mode->num_channels; j++) {
++		struct hostapd_channel_data *chan = &mode->channels[j];
++		fprintf(fp, "%9i\t0x%04x\t%8u\t%8u\t%8u\t%8u\t%11u\t%12u\t%12u\t%9i\t%10i\t%10i\t%9i\n",
++			chan->chan, chan->flag,
++			chan->num_bss_pri, chan->num_bss_sec, chan->num_bss_tert, chan->num_bss_quat,
++			chan->num_bss_conflicting_20, chan->num_bss_conflicting_ht40plus, chan->num_bss_conflicting_ht40minus,
++			chan->badness20, chan->badness40plus, chan->badness40minus, chan->badness80);
++
++		if ((unsigned) chan->badness20 < (unsigned) min20) {
++			min20 = chan->badness20;
++			chan20 = chan;
++		}
++
++		if ((unsigned) chan->badness40plus < (unsigned) min40plus) {
++			min40plus = chan->badness40plus;
++			chan40plus = chan;
++		}
++
++		if ((unsigned) chan->badness40minus < (unsigned) min40minus) {
++			min40minus = chan->badness40minus;
++			chan40minus = chan;
++		}
++
++		if ((unsigned) chan->badness80 < (unsigned) min80) {
++			min80 = chan->badness80;
++			chan80 = chan;
++		}
++	}
++
++	fprintf(fp, "\n# best20\tmin_badness20\tbest40+\tmin_badness40+\tbest40-\tmin_badness40-\tbest80\tmin_badness80\n");
++	fprintf(fp, "%8hi\t%13i\t%7hi\t%14i\t%7hi\t%14i\t%6hi\t%13i\n",
++		chan20 ? chan20->chan : 0, min20,
++		chan40plus ? chan40plus->chan : 0, min40plus,
++		chan40minus ? chan40minus->chan : 0, min40minus,
++		chan80 ? chan80->chan : 0, min80);
++
++	wpa_printf(MSG_DEBUG, "ACS: best20: %hi (badness %i)", chan20 ? chan20->chan : 0, min20);
++	wpa_printf(MSG_DEBUG, "ACS: best40+: %hi (badness %i)", chan40plus ? chan40plus->chan : 0, min40plus);
++	wpa_printf(MSG_DEBUG, "ACS: best40-: %hi (badness %i)", chan40minus ? chan40minus->chan : 0, min40minus);
++	wpa_printf(MSG_DEBUG, "ACS: best80: %hi (badness %i)", chan80 ? chan80->chan : 0, min80);
++
++	/* Now we choose between 80, 40 and 20 MHz */
++	min40 = (unsigned) min40minus < (unsigned) min40plus ? min40minus : min40plus;
++
++	if (iface->conf->ieee80211n
++	    && iface->conf->secondary_channel
++	    && min40 != -1)
++		n_chans = 2;
++
++	if (mode->mode == HOSTAPD_MODE_IEEE80211A
++	    && iface->conf->ieee80211ac
++	    && iface->conf->vht_oper_chwidth > VHT_OPER_CHWIDTH_80) {
++		wpa_printf(MSG_ERROR, "ACS: currently there is no support for 160 MHz or 80+80 MHz modes, considering 80");
++		iface->conf->vht_oper_chwidth = VHT_OPER_CHWIDTH_80;
++	}
++
++	if (mode->mode == HOSTAPD_MODE_IEEE80211A
++	    && iface->conf->ieee80211ac
++	    && iface->conf->vht_oper_chwidth > VHT_OPER_CHWIDTH_20_40
++	    && min40 != -1
++	    && min80 != -1)
++		n_chans = 4;
++
++	if (n_chans == 4) {
++		if (coefs[ACS_NUMBSS_W40] * min40 < coefs[ACS_NUMBSS_W80] * min80) {
++			wpa_printf(MSG_DEBUG, "ACS: 40 MHz badness %i superior to 80 MHz badness %i: switching to 40 MHz",
++				   min40, min80);
++			n_chans = 2;
++		} else if (coefs[ACS_NUMBSS_W20] * min20 < coefs[ACS_NUMBSS_W80] * min80) {
++			wpa_printf(MSG_DEBUG, "ACS: 20 MHz badness %i superior to 80 MHz badness %i: switching to 20 MHz",
++				   min20, min80);
++			n_chans = 1;
++		}
++	}
++
++	if (n_chans == 2
++	    && coefs[ACS_NUMBSS_W20] * min20 < coefs[ACS_NUMBSS_W40] * min40) {
++		wpa_printf(MSG_DEBUG, "ACS: 20 MHz badness %i superior to 40 MHz badness %i: switching to 20 MHz", min20, min40);
++		n_chans = 1;
++	}
++
++	if (n_chans == 4) {
++		iface->conf->channel = chan80->chan;
++		iface->conf->secondary_channel = (chan80->prim_chan_idx & 0x01) ? -1 : 1;
++		wpa_printf(MSG_DEBUG, "ACS: Chose 80 MHz bandwidth with primary channel %hi (badness %i)", chan80->chan, min80);
++	} else if (n_chans == 2) {
++		iface->conf->vht_oper_chwidth = VHT_OPER_CHWIDTH_20_40;
++
++		if (min40plus == min40) {
++			iface->conf->channel = chan40plus->chan;
++			iface->conf->secondary_channel = 1;
++		} else {
++			iface->conf->channel = chan40minus->chan;
++			iface->conf->secondary_channel = -1;
++		}
++
++		wpa_printf(MSG_DEBUG, "ACS: Chose 40 MHz bandwidth with primary channel %hi (badness %i, %s bonding)",
++			   iface->conf->channel, min40, iface->conf->secondary_channel > 0 ? "upper" : "lower");
++	} else if (chan20) {
++		iface->conf->vht_oper_chwidth = VHT_OPER_CHWIDTH_20_40;
++		iface->conf->channel = chan20->chan;
++		iface->conf->secondary_channel = 0;
++		wpa_printf(MSG_DEBUG, "ACS: Chose 20 MHz bandwidth on channel %hi (badness %i)", chan20->chan, min20);
++	} else {
++		for (j = 0; j < mode->num_channels; j++) {
++			struct hostapd_channel_data *chan = &mode->channels[j];
++
++			if (!(chan->flag & HOSTAPD_CHAN_DISABLED))
++				break;
++		}
++
++		if (j >= mode->num_channels) {
++			wpa_printf(MSG_ERROR, "ACS: every channel disabled");
++			j = 0;
++		}
++
++		iface->conf->channel = mode->channels[j].chan;
++		iface->conf->vht_oper_chwidth = VHT_OPER_CHWIDTH_20_40;
++		iface->conf->secondary_channel = 0;
++		wpa_printf(MSG_ERROR, "ACS: NumBSS-based approach failed, picking channel %hi", iface->conf->channel);
++	}
++
++	acs_adjust_vht_center_freq(iface);
++}
++
++static void acs_count_bsses(struct hostapd_iface *iface, struct wpa_scan_results *scan_res)
++{
++	FILE *fp = fopen(iface->conf->acs_numbss_info_file, "w");
++
++	if (!fp) {
++		wpa_printf(MSG_ERROR, "Error opening the ACS NUMBSS info file '%s': %s",
++			   iface->conf->acs_numbss_info_file, strerror(errno));
++		fp = stderr;
++	}
++
++	acs_record_bsses(iface, scan_res, fp);
++
++	acs_compute_badness(iface, fp);
++
++	acs_find_min_badness(iface, fp);
++
++	if (fp != stderr && fclose(fp))
++		wpa_printf(MSG_ERROR, "Error closing the ACS NUMBSS info file: %s", strerror(errno));
++
++	/* hostapd_setup_interface_complete() will return -1 on failure and 0 on success */
++	if (hostapd_acs_completed(iface, 0) == 0) {
++		acs_cleanup(iface);
++		return;
++	}
++
++	/* If we're here then somehow ACS chose an invalid channel */
++	wpa_printf(MSG_ERROR, "ACS: NUMBSS procedure failed. If reporting, please include your config file and info file '%s'.", iface->conf->acs_numbss_info_file);
++	acs_fail(iface);
++}
++
+ 
+ static void acs_scan_complete(struct hostapd_iface *iface)
+ {
++	struct wpa_scan_results *scan_res = NULL;
+ 	int err;
+ 
+ 	iface->scan_cb = NULL;
+ 
+-	wpa_printf(MSG_DEBUG, "ACS: Using survey based algorithm (acs_num_scans=%d)",
+-		   iface->conf->acs_num_scans);
++	if (iface->conf->acs_algo == ACS_ALGO_SURVEY) {
++		wpa_printf(MSG_DEBUG, "ACS: Using survey based algorithm (acs_num_scans=%d)",
++			   iface->conf->acs_num_scans);
+ 
+-	err = hostapd_drv_get_survey(iface->bss[0], 0);
+-	if (err) {
+-		wpa_printf(MSG_ERROR, "ACS: Failed to get survey data");
+-		goto fail;
++		err = hostapd_drv_get_survey(iface->bss[0], 0);
++		if (err) {
++			wpa_printf(MSG_ERROR, "ACS: Failed to get survey data");
++			goto fail;
++		}
++	} else if (iface->conf->acs_algo == ACS_ALGO_NUMBSS) {
++		wpa_printf(MSG_DEBUG, "ACS: Using num-BSS based algorithm (acs_num_scans=%d)",
++			   iface->conf->acs_num_scans);
++
++		scan_res = hostapd_driver_get_scan_results(iface->bss[0]);
++		if (scan_res == NULL) {
++			wpa_printf(MSG_ERROR, "ACS: Failed to get num-BSS data");
++			goto fail;
++		}
+ 	}
+ 
+ 	if (++iface->acs_num_completed_scans < iface->conf->acs_num_scans) {
+@@ -867,7 +1388,12 @@ static void acs_scan_complete(struct hostapd_iface *iface)
+ 		return;
+ 	}
+ 
+-	acs_study(iface);
++	if (iface->conf->acs_algo == ACS_ALGO_SURVEY) {
++		acs_study(iface);
++	} else if (iface->conf->acs_algo == ACS_ALGO_NUMBSS) {
++		acs_count_bsses(iface, scan_res);
++	}
++
+ 	return;
+ fail:
+ 	hostapd_acs_completed(iface, 1);
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 4c29509..f621cf7 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -98,6 +98,10 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	bss->sae_anti_clogging_threshold = 5;
+ }
+ 
++#ifdef CONFIG_ACS
++static const int acs_numbss_coeflist_defaults[ACS_NUMBSS_NUM_COEFS + 1] =
++{ 4, 0, 2, 0, 0, 0, 2, 0, 1, 0, 0, 0, 9, 3, 1, -1 };
++#endif /* CONFIG_ACS */
+ 
+ struct hostapd_config * hostapd_config_defaults(void)
+ {
+@@ -161,7 +165,7 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->send_probe_response = 1;
+ 	/* Set to invalid value means do not add Power Constraint IE */
+ 	conf->local_pwr_constraint = -1;
+-  conf->ap_max_num_sta = MAX_STA_COUNT;
++	conf->ap_max_num_sta = MAX_STA_COUNT;
+ 
+ 	conf->wmm_ac_params[0] = ac_be;
+ 	conf->wmm_ac_params[1] = ac_bk;
+@@ -200,6 +204,19 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->acs_ch_list.num = 0;
+ #ifdef CONFIG_ACS
+ 	conf->acs_num_scans = 5;
++	conf->acs_algo = ACS_ALGO_SURVEY;
++	conf->acs_numbss_info_file = strdup("/tmp/acs_numbss_info.txt");
++	conf->acs_numbss_coeflist = os_malloc(sizeof(int) * (ACS_NUMBSS_NUM_COEFS + 1));
++	if (conf->acs_numbss_coeflist == NULL) {
++		wpa_printf(MSG_ERROR, "Failed to allocate memory for "
++			   "configuration data.");
++		os_free(conf->bss);
++		os_free(conf);
++		os_free(bss->radius);
++		os_free(bss);		
++		return NULL;
++	}
++	memcpy(conf->acs_numbss_coeflist, acs_numbss_coeflist_defaults, sizeof(acs_numbss_coeflist_defaults));
+ #endif /* CONFIG_ACS */
+ 
+ 	return conf;
+@@ -616,6 +633,8 @@ void hostapd_config_free(struct hostapd_config *conf)
+ 	os_free(conf->driver_params);
+ #ifdef CONFIG_ACS
+ 	os_free(conf->acs_chan_bias);
++	os_free(conf->acs_numbss_info_file);
++	os_free(conf->acs_numbss_coeflist);
+ #endif /* CONFIG_ACS */
+ 	wpabuf_free(conf->lci);
+ 	wpabuf_free(conf->civic);
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 4e5540a..757f2ac 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -702,6 +702,12 @@ struct hostapd_config {
+ 
+ #ifdef CONFIG_ACS
+ 	unsigned int acs_num_scans;
++	enum {
++		ACS_ALGO_SURVEY = 0,
++		ACS_ALGO_NUMBSS = 1
++	} acs_algo;
++	char *acs_numbss_info_file;
++	int *acs_numbss_coeflist;
+ 	struct acs_bias {
+ 		int channel;
+ 		double bias;
+@@ -713,6 +719,26 @@ struct hostapd_config {
+ 	struct wpabuf *civic;
+ };
+ 
++#ifdef CONFIG_ACS
++enum acs_numbss_coefs {
++	ACS_NUMBSS_P_W1,
++	ACS_NUMBSS_P_W2,
++	ACS_NUMBSS_P_W3,
++	ACS_NUMBSS_P_W4,
++	ACS_NUMBSS_S_W1,
++	ACS_NUMBSS_S_W2,
++	ACS_NUMBSS_S_W3,
++	ACS_NUMBSS_S_W4,
++	ACS_NUMBSS_T_W1,
++	ACS_NUMBSS_T_W2,
++	ACS_NUMBSS_T_W3,
++	ACS_NUMBSS_T_W4,
++	ACS_NUMBSS_W20,
++	ACS_NUMBSS_W40,
++	ACS_NUMBSS_W80,
++	ACS_NUMBSS_NUM_COEFS
++};
++#endif
+ 
+ int hostapd_mac_comp(const void *a, const void *b);
+ struct hostapd_config * hostapd_config_defaults(void);
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index c42a17d..7e72aa0 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -500,8 +500,16 @@ int hostapd_set_freq(struct hostapd_data *hapd, enum hostapd_hw_mode mode,
+ 				    vht_oper_chwidth,
+ 				    center_segment0, center_segment1,
+ 				    hapd->iface->current_mode ?
+-				    hapd->iface->current_mode->vht_capab : 0))
++				    hapd->iface->current_mode->vht_capab : 0)) {
++		wpa_printf(MSG_ERROR, "hostapd_set_freq_params failed: mode=%i, freq=%i, "
++				"channel=%i, ht_enabled=%i, vht_enabled=%i, "
++				"sec_channel_offset=%i, vht_open_cwidth=%i, "
++				"center_segment0=%i, center_segment1=%i",
++				mode, freq, channel, ht_enabled, vht_enabled,
++				sec_channel_offset, vht_oper_chwidth, center_segment0, 
++				center_segment1);
+ 		return -1;
++	}
+ 
+ 	if (hapd->driver == NULL)
+ 		return 0;
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 5b31f93..c4d950a 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -125,6 +125,30 @@ struct hostapd_channel_data {
+ 	 * need to set this)
+ 	 */
+ 	long double interference_factor;
++	/* number of BSS-es with primary channels on this channel */
++	unsigned num_bss_pri;
++	/* number of HT BSS-es with secondary channels on this channel */
++	unsigned num_bss_sec;
++	/* number of VHT 80 MHz or wider BSS-es with "tertiary" (not the ones used for HT) channels on this channel */
++	unsigned num_bss_tert;
++	/* number of VHT 160 or 80+80 BSS-es with "quaternary" (not the ones used for 80 or less) channels on this channel */
++	unsigned num_bss_quat;
++	/* number of BSS-es that are too close on neighboring channels */
++	unsigned num_bss_conflicting_20;
++	/* number of BSS-es that are in conflict with HT40+ on this channel */
++	unsigned num_bss_conflicting_ht40plus;
++	/* number of BSS-es that are in conflict with HT40- on this channel */
++	unsigned num_bss_conflicting_ht40minus;
++	/* the badness of this channel when used as a 20 MHz channel */
++	int badness20;
++	/* the badness of this channel when used as primary in a 40 MHz upper bonding setup */
++	int badness40plus;
++	/* the badness of this channel when used as primary in a 40 MHz lower bonding setup */
++	int badness40minus;
++	/* the badness of this channel when used as primary in an 80 Mhz setup */
++	int badness80;
++	/* primary chan idx for the 80-MHz range if this chan gets used as the primary */
++	unsigned prim_chan_idx;
+ #endif /* CONFIG_ACS */
+ 
+ 	/**
+-- 
+1.8.3.4
+

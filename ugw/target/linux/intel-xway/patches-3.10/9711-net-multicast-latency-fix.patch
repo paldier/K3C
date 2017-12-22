@@ -1,0 +1,79 @@
+# HG changeset patch
+# Parent 089f96def6df11f0bd13a3f812cd1be0d995b753
+From:
+Date: Thu, 24 Sep 2013 17:38:48 +0100
+Subject: Lantiq multicast latency optimization
+
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -640,3 +640,7 @@ config TCP_MD5SIG
+ 	  on the Internet.
+ 
+ 	  If unsure, say N.
++
++config LTQ_MCAST_LATENCY_OPTIMIZATION
++        bool "Lantiq Multicast Latency Optimization"
++	default y
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -113,7 +113,13 @@
+ 
+ #define IGMP_V1_Router_Present_Timeout		(400*HZ)
+ #define IGMP_V2_Router_Present_Timeout		(400*HZ)
++
++#ifdef CONFIG_LTQ_MCAST_LATENCY_OPTIMIZATION
++#define IGMP_Unsolicited_Report_Interval        (2*HZ)
++#else
+ #define IGMP_Unsolicited_Report_Interval	(10*HZ)
++#endif
++
+ #define IGMP_Query_Response_Interval		(10*HZ)
+ #define IGMP_Unsolicited_Report_Count		2
+ 
+@@ -1178,7 +1184,14 @@ static void igmp_group_dropped(struct ip
+ 		/* IGMPv3 */
+ 		igmpv3_add_delrec(in_dev, im);
+ 
++#ifdef CONFIG_LTQ_MCAST_LATENCY_OPTIMIZATION
++		in_dev->mr_ifc_count = in_dev->mr_qrv ? in_dev->mr_qrv :IGMP_Unsolicited_Report_Count;
++		in_dev_hold(in_dev);
++		igmp_ifc_timer_expire((unsigned long)in_dev);
++#else
+ 		igmp_ifc_event(in_dev);
++#endif
++
+ 	}
+ #endif
+ }
+@@ -1199,17 +1212,29 @@ static void igmp_group_added(struct ip_m
+ 	if (in_dev->dead)
+ 		return;
+ 	if (IGMP_V1_SEEN(in_dev) || IGMP_V2_SEEN(in_dev)) {
++#ifdef CONFIG_LTQ_MCAST_LATENCY_OPTIMIZATION
++		atomic_inc(&im->refcnt);
++		igmp_timer_expire((unsigned long)im);
++#else
+ 		spin_lock_bh(&im->lock);
+ 		igmp_start_timer(im, IGMP_Initial_Report_Delay);
+ 		spin_unlock_bh(&im->lock);
++#endif
+ 		return;
+ 	}
+ 	/* else, v3 */
+ 
+ 	im->crcount = in_dev->mr_qrv ? in_dev->mr_qrv :
+ 		IGMP_Unsolicited_Report_Count;
++
++#ifdef CONFIG_LTQ_MCAST_LATENCY_OPTIMIZATION
++	in_dev->mr_ifc_count = in_dev->mr_qrv ? in_dev->mr_qrv : IGMP_Unsolicited_Report_Count;
++        in_dev_hold(in_dev);
++        igmp_ifc_timer_expire((unsigned long)in_dev);
++#else
+ 	igmp_ifc_event(in_dev);
+ #endif
++#endif
+ }
+ 
+ 

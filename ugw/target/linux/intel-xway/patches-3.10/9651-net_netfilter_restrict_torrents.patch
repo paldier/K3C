@@ -1,0 +1,207 @@
+This patch is to handle large quantity of low priority sessions like torrents and restrict them to configured max threshold. Beyond this threshold,only high priority sessions are admitted.
+
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -40,6 +40,9 @@ extern void nf_conntrack_cleanup_start(v
+ 
+ extern void nf_conntrack_init_end(void);
+ extern void nf_conntrack_cleanup_end(void);
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++extern void destroy_conntrack(struct nf_conntrack *nfct);
++#endif
+ 
+ extern bool
+ nf_ct_get_tuple(const struct sk_buff *skb,
+diff --git a/include/uapi/linux/sysctl.h b/include/uapi/linux/sysctl.h
+--- a/include/uapi/linux/sysctl.h
++++ b/include/uapi/linux/sysctl.h
+@@ -325,6 +325,15 @@ enum
+ 	NET_NF_CONNTRACK_FRAG6_LOW_THRESH=30,
+ 	NET_NF_CONNTRACK_FRAG6_HIGH_THRESH=31,
+ 	NET_NF_CONNTRACK_CHECKSUM=32,
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++	NET_NF_CONNTRACK_LOW_PRIO_MAX=33,
++	NET_NF_CONNTRACK_LOW_PRIO_THRESH=34,
++	NET_NF_CONNTRACK_DEFAULT_PRIO_MAX=35,
++	NET_NF_CONNTRACK_DEFAULT_PRIO_THRESH=36,
++	NET_NF_CONNTRACK_LOW_PRIO_DATA_RATE=37,
++	NET_NF_CONNTRACK_DEFAULT_PRIO_DATA_RATE=38,
++	NET_NF_CONNTRACK_SESSION_LIMIT_ENABLE=39,
++#endif
+ };
+ 
+ /* /proc/sys/net/ipv4 */
+diff --git a/kernel/sysctl_binary.c b/kernel/sysctl_binary.c
+--- a/kernel/sysctl_binary.c
++++ b/kernel/sysctl_binary.c
+@@ -698,7 +698,15 @@ static const struct bin_table bin_net_ne
+ 	{ CTL_INT,	NET_NF_CONNTRACK_FRAG6_LOW_THRESH,	"nf_conntrack_frag6_low_thresh" },
+ 	{ CTL_INT,	NET_NF_CONNTRACK_FRAG6_HIGH_THRESH,	"nf_conntrack_frag6_high_thresh" },
+ 	{ CTL_INT,	NET_NF_CONNTRACK_CHECKSUM,		"nf_conntrack_checksum" },
+-
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++	{ CTL_INT,	NET_NF_CONNTRACK_LOW_PRIO_MAX,		"nf_conntrack_low_prio_max" },
++	{ CTL_INT,	NET_NF_CONNTRACK_LOW_PRIO_THRESH,	"nf_conntrack_low_prio_thresh" },
++	{ CTL_INT,	NET_NF_CONNTRACK_DEFAULT_PRIO_MAX,	"nf_conntrack_default_prio_max" },
++	{ CTL_INT,	NET_NF_CONNTRACK_DEFAULT_PRIO_THRESH,	"nf_conntrack_default_prio_thresh" },
++	{ CTL_INT,	NET_NF_CONNTRACK_LOW_PRIO_DATA_RATE,	"nf_conntrack_low_prio_data_rate" },
++	{ CTL_INT,	NET_NF_CONNTRACK_DEFAULT_PRIO_DATA_RATE,"nf_conntrack_default_prio_data_rate" },
++	{ CTL_INT,	NET_NF_CONNTRACK_SESSION_LIMIT_ENABLE,	"nf_conntrack_session_limit_enable" },
++#endif
+ 	{}
+ };
+ 
+diff --git a/net/ipv4/netfilter/iptable_mangle.c b/net/ipv4/netfilter/iptable_mangle.c
+--- a/net/ipv4/netfilter/iptable_mangle.c
++++ b/net/ipv4/netfilter/iptable_mangle.c
+@@ -17,6 +17,10 @@
+ #include <net/route.h>
+ #include <linux/ip.h>
+ #include <net/ip.h>
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_session_limit.h>
++#endif
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
+@@ -91,6 +95,10 @@ iptable_mangle_hook(unsigned int hook,
+ 		return ipt_do_table(skb, hook, in, out,
+ 				    dev_net(out)->ipv4.iptable_mangle);
+ 	/* PREROUTING/INPUT/FORWARD: */
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++	if (hook == NF_INET_PRE_ROUTING )
++		return(do_session_limit(hook,skb,in,out));
++#endif
+ 	return ipt_do_table(skb, hook, in, out,
+ 			    dev_net(in)->ipv4.iptable_mangle);
+ }
+diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -2,6 +2,7 @@ netfilter-objs := core.o nf_log.o nf_que
+ 
+ nf_conntrack-y	:= nf_conntrack_core.o nf_conntrack_standalone.o nf_conntrack_expect.o nf_conntrack_helper.o nf_conntrack_proto.o nf_conntrack_l3proto_generic.o nf_conntrack_proto_generic.o nf_conntrack_proto_tcp.o nf_conntrack_proto_udp.o nf_conntrack_extend.o nf_conntrack_acct.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMEOUT) += nf_conntrack_timeout.o
++nf_conntrack-$(CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS) +=nf_conntrack_session_limit.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMESTAMP) += nf_conntrack_timestamp.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_EVENTS) += nf_conntrack_ecache.o
+ nf_conntrack-$(CONFIG_NF_CONNTRACK_LABELS) += nf_conntrack_labels.o
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -40,6 +40,9 @@
+ #include <net/netfilter/nf_conntrack_expect.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_core.h>
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS /* [ */
++#include <net/netfilter/nf_conntrack_session_limit.h>
++#endif
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
+ #include <net/netfilter/nf_conntrack_ecache.h>
+@@ -207,7 +210,11 @@ clean_from_lists(struct nf_conn *ct)
+ 	nf_ct_remove_expectations(ct);
+ }
+ 
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS /* [ */
++void
++#else
+ static void
++#endif
+ destroy_conntrack(struct nf_conntrack *nfct)
+ {
+ 	struct nf_conn *ct = (struct nf_conn *)nfct;
+@@ -261,6 +268,9 @@ destroy_conntrack(struct nf_conntrack *n
+ 	pr_debug("destroy_conntrack: returning ct=%p to slab\n", ct);
+ 	nf_conntrack_free(ct);
+ }
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS 
++EXPORT_SYMBOL(destroy_conntrack);
++#endif
+ 
+ void nf_ct_delete_from_lists(struct nf_conn *ct)
+ {
+@@ -984,6 +994,10 @@ init_conntrack(struct net *net, struct n
+ #ifdef CONFIG_NF_CONNTRACK_SECMARK
+ 		ct->secmark = exp->master->secmark;
+ #endif
++#ifdef CONFIG_NF_CONNTRACK_EXTMARK
++		ct->extmark = exp->master->extmark;
++#endif
++
+ 		nf_conntrack_get(&ct->master->ct_general);
+ 		NF_CT_STAT_INC(net, expect_new);
+ 	} else {
+diff --git a/net/netfilter/nf_conntrack_standalone.c b/net/netfilter/nf_conntrack_standalone.c
+--- a/net/netfilter/nf_conntrack_standalone.c
++++ b/net/netfilter/nf_conntrack_standalone.c
+@@ -24,6 +24,9 @@
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++#include <net/netfilter/nf_conntrack_session_limit.h>
++#endif
+ #include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_expect.h>
+@@ -483,6 +486,57 @@ static ctl_table nf_ct_sysctl_table[] = 
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
++#ifdef CONFIG_LTQ_HANDLE_CONNTRACK_SESSIONS
++	{
++		.procname       = "nf_conntrack_default_prio_max",
++		.data           = &nf_conntrack_default_prio_max,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec,
++	},
++	{
++		.procname       = "nf_conntrack_default_prio_thresh",
++		.data           = &nf_conntrack_default_prio_thresh,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec,
++	},
++	{
++		.procname       = "nf_conntrack_low_prio_max",
++		.data           = &nf_conntrack_low_prio_max,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec,
++	},
++	{
++		.procname       = "nf_conntrack_low_prio_thresh",
++		.data           = &nf_conntrack_low_prio_thresh,
++		.maxlen         = sizeof(int),
++		.mode           = 0644,
++		.proc_handler   = proc_dointvec,
++	},
++       {
++                .procname       = "nf_conntrack_low_prio_data_rate",
++                .data           = &nf_conntrack_low_prio_data_rate,
++                .maxlen         = sizeof(int),
++                .mode           = 0644,
++                .proc_handler   = proc_dointvec,
++       },
++       {
++                .procname       = "nf_conntrack_default_prio_data_rate",
++                .data           = &nf_conntrack_default_prio_data_rate,
++                .maxlen         = sizeof(int),
++                .mode           = 0644,
++                .proc_handler   = proc_dointvec,
++       },
++       {
++                .procname       = "nf_conntrack_session_limit_enable",
++                .data           = &nf_conntrack_session_limit_enable,
++                .maxlen         = sizeof(int),
++                .mode           = 0644,
++                .proc_handler   = proc_dointvec,
++       },
++#endif
+ 	{ }
+ };
+ 

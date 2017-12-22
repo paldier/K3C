@@ -1,0 +1,101 @@
+From 3d4d065d18dc78950f2e234cd92d08097c413597 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Sun, 21 Aug 2016 11:34:40 +0300
+Subject: [PATCH 58/69] mbo: add support of AP mbo_cell_aware
+
+add option to configure the AP mbo_cell_aware in the .conf file:
+mbo_cell_aware=1
+add option to configure the AP mbo_cell_aware from the cli via the existing 'SET' command.
+usage: "set mbo_cell_aware <0/1>".
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/config_file.c      |  2 ++
+ hostapd/ctrl_iface.c       | 17 +++++++++++++++++
+ src/ap/ap_config.h         |  1 +
+ src/ap/ieee802_11_shared.c | 12 +++++++-----
+ 4 files changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 69c4e97..67f4570 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3729,6 +3729,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ #ifdef CONFIG_MBO
+ 	} else if (os_strcmp(buf, "mbo") == 0) {
+ 		bss->mbo_enabled = atoi(pos);
++	} else if (os_strcmp(buf, "mbo_cell_aware") == 0) {
++		bss->mbo_cell_aware = atoi(pos);	
+ #endif /* CONFIG_MBO */
+ #ifdef CONFIG_TESTING_OPTIONS
+ #define PARSE_TEST_PROBABILITY(_val)				\
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index c054c19..9eee931 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1370,6 +1370,23 @@ static int hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd)
+ 		 * TODO: Need to configure drivers that do AP MLME offload with
+ 		 * disallowing station logic.
+ 		 */
++	} else if (os_strcasecmp(cmd, "mbo_cell_aware") == 0) {
++		int val;
++
++		if (!hapd->conf->mbo_enabled) {
++			wpa_printf(MSG_DEBUG, "MBO: mbo is not enabled");
++			return -1;
++		}
++
++		val = atoi(value);
++		if (val < 0 || val > 1) {
++			wpa_printf(MSG_DEBUG,
++				"MBO: mbo_cell_aware value is out of range (can be 0 or 1)");
++			return -1;
++		}
++
++		hapd->conf->mbo_cell_aware = val;
++		ieee802_11_update_beacons(hapd->iface);
+ #endif /* CONFIG_MBO */
+ 	} else {
+ 		struct sta_info *sta;
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 2f6153f..0463825 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -593,6 +593,7 @@ struct hostapd_bss_config {
+ 
+ #ifdef CONFIG_MBO
+ 	int mbo_enabled;
++	int mbo_cell_aware;
+ #endif /* CONFIG_MBO */
+ 
+ 	int ftm_responder;
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index 6e6fc7e..17398af 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -545,15 +545,17 @@ u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
+ 	if (!hapd->conf->mbo_enabled)
+ 		return eid;
+ 
+-	*mbo_pos++ = MBO_ATTR_ID_AP_CAPA_IND;
+-	*mbo_pos++ = 1;
+-	/* Not Cellular aware */
+-	*mbo_pos++ = 0;
+-
+ 	if (hapd->mbo_assoc_disallow) {
+ 		*mbo_pos++ = MBO_ATTR_ID_ASSOC_DISALLOW;
+ 		*mbo_pos++ = 1;
+ 		*mbo_pos++ = hapd->mbo_assoc_disallow;
++	} else {
++		*mbo_pos++ = MBO_ATTR_ID_AP_CAPA_IND;
++		*mbo_pos++ = 1;
++		if (hapd->conf->mbo_cell_aware)
++			*mbo_pos++ = MBO_AP_CAPA_CELL_AWARE;
++		else
++			*mbo_pos++ = 0; /* Not Cellular aware */
+ 	}
+ 
+ 	pos += mbo_add_ie(pos, len, mbo, mbo_pos - mbo);
+-- 
+2.7.4
+

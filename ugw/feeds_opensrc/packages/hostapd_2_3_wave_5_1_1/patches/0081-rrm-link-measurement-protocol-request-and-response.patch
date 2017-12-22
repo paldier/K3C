@@ -1,0 +1,889 @@
+From 97673401d1a34f4cbcdf3feebef33131236a0f86 Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Mon, 31 Oct 2016 14:51:37 +0200
+Subject: [PATCH 1/6] rrm: link measurement protocol - request and response
+
+To enable the support of link measurement from the conf file:
+rrm_link_measurement=1
+
+To enable the support of manipulate the link measurements from conf file:
+rrm_manipulate_measurement=1
+if this flag is enabled, then upon link measurement request from the STA,
+the AP will make the measurements and notify the "AP-Manager"
+instead of sending the response.
+
+Request from AP to STA:
+req_link_measurement <dst>
+
+Response from STA to AP:
+RRM-LINK-MEASUREMENT-RECEIVED <sta_mac_addr>
+tpc_report=<transmit_power>,<link_margin>
+rx_ant_id=<rx_ant_id> tx_ant_id=<tx_ant_id> rcpi=<rcpi> rsni=<rsni>
+[dmg_link_margin=<activity>,<mcs>,<link_margin>,<snr>,<reference_timestamp>]
+[dmg_link_adapt_ack=<activity>,<reference_timestamp>]
+
+Request from STA to AP:
+RRM-LINK-MEASUREMENT-REQUEST-RECEIVED <sta_mac_addr>
+dialog_token=<dialog_token> tpc_report=<transmit_power>,<link_margin>
+rx_ant_id=<rx_ant_id> tx_ant_id=<tx_ant_id> rcpi=<rcpi> rsni=<rsni>
+[dmg_link_margin=<activity>,<mcs>,<link_margin>,<snr>,<reference_timestamp>]
+[dmg_link_adapt_ack=<activity>,<reference_timestamp>]
+
+Response from AP to STA:
+link_measurement_report <dst> <dialog_token> <rx_ant_id> <tx_ant_id>
+<rcpi> <rsni> tpc_report=<transmit_power>,<link_margin>
+[dmg_link_margin=<activity>,<mcs>,<link_margin>,<snr>,<reference_timestamp>]
+[dmg_link_adapt_ack=<activity>,<reference_timestamp>]
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/config_file.c        |   8 +-
+ hostapd/ctrl_iface.c         | 271 +++++++++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c        |  33 ++++++
+ src/ap/ap_config.h           |   2 +
+ src/ap/hostapd.h             |   1 +
+ src/ap/ieee802_11.c          |   7 +-
+ src/ap/rrm.c                 | 271 ++++++++++++++++++++++++++++++++++++++++++-
+ src/ap/rrm.h                 |   8 +-
+ src/common/ieee802_11_defs.h |  21 ++++
+ src/common/wpa_ctrl.h        |   5 +
+ src/drivers/driver.h         |   1 +
+ 11 files changed, 619 insertions(+), 9 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 0f1b69f..0d5a87a 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3915,8 +3915,12 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		conf->civic = wpabuf_parse_bin(pos);
+ 	} else if (os_strcmp(buf, "rrm_neighbor_report") == 0) {
+ 		if (atoi(pos))
+-			bss->radio_measurements[0] |=
+-				WLAN_RRM_CAPS_NEIGHBOR_REPORT;
++			bss->radio_measurements[0] |= WLAN_RRM_CAPS_NEIGHBOR_REPORT;
++	} else if (os_strcmp(buf, "rrm_link_measurement") == 0) {
++		if (atoi(pos))
++			bss->radio_measurements[0] |= WLAN_RRM_CAPS_LINK_MEASUREMENT;
++	} else if (os_strcmp(buf, "rrm_manipulate_measurement") == 0) {
++		bss->rrm_manipulate_measurement = atoi(pos);
+ 	} else if (os_strcmp(buf, "gas_address3") == 0) {
+ 		bss->gas_address3 = atoi(pos);
+ 	} else if (os_strcmp(buf, "ftm_responder") == 0) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 36cfa3c..5b0c4e7 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2594,6 +2594,266 @@ exit:
+ 			ap_ch_rep_len, req_elem_p, req_elem_len);
+ }
+ 
++static int hostapd_ctrl_iface_req_link_measurement(struct hostapd_data *hapd,
++		char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	char *token, *context = NULL;
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: REQ_LINK_MEASUREMENT - Bad destination address");
++		return -1;
++	}
++
++	return hostapd_send_link_measurement_req(hapd, addr);
++}
++
++static int hostapd_ctrl_iface_link_measurement_report(struct hostapd_data *hapd,
++		char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	char *token, *context = NULL;
++	char *pos, *cmd_end;
++
++	struct rrm_link_measurement_report link_msmt_report;
++	struct dmg_link_margin dmg_margin, *dmg_margin_p = NULL;
++	struct dmg_link_adaptation_ack dmg_ack, *dmg_ack_p = NULL;
++
++	os_memset(&link_msmt_report, 0, sizeof(link_msmt_report));
++	os_memset(&dmg_margin, 0, sizeof(dmg_margin));
++	os_memset(&dmg_ack, 0, sizeof(dmg_ack));
++
++	cmd_end = cmd + strlen(cmd);
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, addr)) {
++		wpa_printf(MSG_ERROR, "CTRL: LINK_MEASUREMENT_REPORT - Bad destination address");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - dialog token is missing");
++		return -1;
++	}
++	link_msmt_report.dialog_token = atoi(token);
++	if (link_msmt_report.dialog_token <= 0
++		|| link_msmt_report.dialog_token > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - dialog token is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - rx_ant_id is missing");
++		return -1;
++	}
++	link_msmt_report.rx_ant_id = atoi(token);
++	if (link_msmt_report.rx_ant_id <= 0 || link_msmt_report.rx_ant_id > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - rx_ant_id is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - tx_ant_id is missing");
++		return -1;
++	}
++	link_msmt_report.tx_ant_id = atoi(token);
++	if (link_msmt_report.tx_ant_id <= 0 || link_msmt_report.tx_ant_id > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - tx_ant_id is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR, "CTRL: LINK_MEASUREMENT_REPORT - rcpi is missing");
++		return -1;
++	}
++	link_msmt_report.rcpi = atoi(token);
++	if (link_msmt_report.rcpi < 0 || link_msmt_report.rcpi > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - rcpi is out of range");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - rsni is missing");
++		return -1;
++	}
++	link_msmt_report.rsni = atoi(token);
++	if (link_msmt_report.rsni < 0 || link_msmt_report.rsni > 0xff) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - rsni out of range");
++		return -1;
++	}
++
++	token = token + strlen(token) + 1;
++	if (token >= cmd_end) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: LINK_MEASUREMENT_REPORT - tpc_report is missing");
++		return -1;
++	}
++
++	pos = os_strstr(token, "tpc_report=");
++	if (pos) {
++		char *end, *comma;
++		pos += 11;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma = os_strchr(pos, ',');
++		if (!comma || comma == pos || comma >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - tpc_report format is invalid");
++			return -1;
++		}
++		link_msmt_report.tpc.tx_power = atoi(pos);
++		if (link_msmt_report.tpc.tx_power < 0
++			|| link_msmt_report.tpc.tx_power > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - tpc_report.tx_power is invalid");
++			return -1;
++		}
++		comma++;
++		link_msmt_report.tpc.link_margin = atoi(comma);
++		if (link_msmt_report.tpc.link_margin < 0
++			|| link_msmt_report.tpc.link_margin > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - tpc_report.link_margin is invalid");
++			return -1;
++		}
++		link_msmt_report.tpc.eid = WLAN_EID_TPC_REPORT;
++		link_msmt_report.tpc.len = 2;
++	}
++
++	/* optional tokens */
++	pos = os_strstr(token, "dmg_link_margin=");
++	if (pos) {
++		char *end, *comma1, *comma2, *comma3, *comma4;
++		pos += 16;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma1 = os_strchr(pos, ',');
++		if (!comma1 || comma1 == pos || comma1 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_link_margin format is invalid");
++			return -1;
++		}
++		comma1++;
++		comma2 = os_strchr(comma1, ',');
++		if (!comma2 || comma2 == comma1 || comma2 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_link_margin format is invalid");
++			return -1;
++		}
++		comma2++;
++		comma3 = os_strchr(comma2, ',');
++		if (!comma3 || comma3 == comma2 || comma3 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_link_margin format is invalid");
++			return -1;
++		}
++		comma3++;
++		comma4 = os_strchr(comma3, ',');
++		if (!comma4 || comma4 == comma3 || comma4 >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_link_margin format is invalid");
++			return -1;
++		}
++		comma4++;
++		dmg_margin.activity = atoi(pos);
++		if (dmg_margin.activity < 0 || dmg_margin.activity > 6) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_margin.activity is invalid");
++			return -1;
++		}
++		dmg_margin.mcs = atoi(comma1);
++		if (dmg_margin.mcs < 0 || dmg_margin.mcs > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_margin.mcs is invalid");
++			return -1;
++		}
++		dmg_margin.link_margin = atoi(comma2);
++		if (dmg_margin.link_margin < -128 || dmg_margin.link_margin > 127) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_margin.link_margin is invalid");
++			return -1;
++		}
++		dmg_margin.snr = atoi(comma3);
++		if (dmg_margin.snr < 0 || dmg_margin.snr > 0xff) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_margin.snr is invalid");
++			return -1;
++		}
++		dmg_margin.ref_timestamp = atoi(comma4);
++		if (dmg_margin.ref_timestamp < 0) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_margin.ref_timestamp is invalid");
++			return -1;
++		}
++		dmg_margin.eid = WLAN_EID_DMG_LINK_MARGIN;
++		dmg_margin.len = 8;
++		dmg_margin_p = &dmg_margin;
++	}
++
++	pos = os_strstr(token, "dmg_link_adapt_ack=");
++	if (pos) {
++		char *end, *comma;
++		pos += 19;
++		end = os_strchr(pos, ' ');
++		if (!end) {
++			end = pos + os_strlen(pos);
++		}
++		comma = os_strchr(pos, ',');
++		if (!comma || comma == pos || comma >= end) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_link_adapt_ack format is invalid");
++			return -1;
++		}
++		dmg_ack.activity = atoi(pos);
++		if (dmg_ack.activity < 0 || dmg_ack.activity > 6) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_ack.activity is invalid");
++			return -1;
++		}
++		comma++;
++		dmg_ack.ref_timestamp = atoi(comma);
++		if (dmg_ack.ref_timestamp < 0) {
++			wpa_printf(MSG_ERROR,
++					"CTRL: LINK_MEASUREMENT_REPORT - dmg_ack.ref_timestamp is invalid");
++			return -1;
++		}
++		dmg_ack.eid = WLAN_EID_DMG_LINK_ADAPTATION_ACK;
++		dmg_ack.len = 5;
++		dmg_ack_p = &dmg_ack;
++	}
++
++	wpa_printf(MSG_DEBUG, MACSTR
++			" dialog_token=%d rx_ant_id=%d tx_ant_id=%d rcpi=%d rsni=%d tpc_report=%d,%d dmg_margin=%d,%d,%d,%d,%d dmg_ack=%d,%d",
++			MAC2STR(addr), link_msmt_report.dialog_token,
++			link_msmt_report.rx_ant_id, link_msmt_report.tx_ant_id,
++			link_msmt_report.rcpi, link_msmt_report.rsni,
++			link_msmt_report.tpc.tx_power, link_msmt_report.tpc.link_margin,
++			dmg_margin.activity, dmg_margin.mcs, dmg_margin.link_margin,
++			dmg_margin.snr, dmg_margin.ref_timestamp, dmg_ack.activity,
++			dmg_ack.ref_timestamp);
++
++	return hostapd_send_link_measurement_report(hapd, addr, link_msmt_report,
++			dmg_margin_p, dmg_ack_p);
++}
+ 
+ static int hostapd_ctrl_iface_set_neighbor(struct hostapd_data *hapd, char *buf)
+ {
+@@ -3043,6 +3303,11 @@ int hostapd_ctrl_iface_get_sta_measurements(struct hostapd_data *hapd,
+   if (ret >= buflen - len || ret < 0)
+     return len;
+   len += ret;
++  ret = os_snprintf(buf + len, buflen - len, "TxMgmtPwr=%d\n",
++    sta_info.TxMgmtPwr);
++  if (ret >= buflen - len || ret < 0)
++    return len;
++  len += ret;
+   ret = os_snprintf(buf + len, buflen - len, "ErrorsSent=UNKNOWN\n");
+   if (ret >= buflen - len || ret < 0)
+     return len;
+@@ -4306,6 +4571,12 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "REQ_BEACON ", 11) == 0) {
+ 		if (hostapd_ctrl_iface_req_beacon(hapd, buf + 11))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "REQ_LINK_MEASUREMENT ", 21) == 0) {
++		if (hostapd_ctrl_iface_req_link_measurement(hapd, buf + 21))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "LINK_MEASUREMENT_REPORT ", 24) == 0) {
++		if (hostapd_ctrl_iface_link_measurement_report(hapd, buf + 24))
++			reply_len = -1;
+ 	} else if (os_strcmp(buf, "DRIVER_FLAGS") == 0) {
+ 		reply_len = hostapd_ctrl_driver_flags(hapd->iface, reply,
+ 						      reply_size);
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 9228c6f..4ed4f7d 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1322,6 +1322,37 @@ static int hostapd_cli_cmd_req_beacon(struct wpa_ctrl *ctrl, int argc,
+ }
+ 
+ 
++
++static int hostapd_cli_cmd_req_link_measurement(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 1) {
++		printf("Invalid req_link_measurement command - requires destination address\n");
++		return -1;
++	}
++
++	res = os_snprintf(cmd, sizeof(cmd), "REQ_LINK_MEASUREMENT %s", argv[0]);
++	if (os_snprintf_error(sizeof(cmd), res)) {
++		printf("Too long REQ_LINK_MEASUREMENT command.\n");
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
++static int hostapd_cli_cmd_link_measurement_report(struct wpa_ctrl *ctrl, int argc,
++	     char *argv[])
++{
++	if (argc < 7) {
++		printf("Invalid link_measurement_report command: needs at least 7 arguments: - dst address, dialog token, tx power, rx ant id, tx ant id, rcpi, rsni, tpc report + some optional arguments\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "LINK_MEASUREMENT_REPORT", 7, argc, argv);
++}
++
+ static int hostapd_cli_cmd_driver_flags(struct wpa_ctrl *ctrl, int argc,
+ 					char *argv[])
+ {
+@@ -1805,6 +1836,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "req_lci", hostapd_cli_cmd_req_lci, NULL, NULL },
+ 	{ "req_range", hostapd_cli_cmd_req_range, NULL, NULL },
+ 	{ "req_beacon", hostapd_cli_cmd_req_beacon, NULL, NULL },
++	{ "req_link_measurement", hostapd_cli_cmd_req_link_measurement, NULL, NULL },
++	{ "link_measurement_report", hostapd_cli_cmd_link_measurement_report, NULL, NULL },
+ 	{ "driver_flags", hostapd_cli_cmd_driver_flags, NULL, NULL },
+ 	{ "deny_mac", hostapd_cli_cmd_deny_mac, NULL,
+ 	  "<addr> <[0]/1> 0-add;1-remove station to/from blacklist" },
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index b8853a9..d9111e8 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -583,6 +583,8 @@ struct hostapd_bss_config {
+ 
+ 	u8 radio_measurements[RRM_CAPABILITIES_IE_LEN];
+ 
++	int rrm_manipulate_measurement;
++
+ 	int vendor_vht;
+ 	int use_sta_nsts;
+ 
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index ac18a93..7d53a47 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -305,6 +305,7 @@ struct hostapd_data {
+ 	u8 lci_req_token;
+ 	u8 range_req_token;
+ 	u8 beacon_req_token;
++	u8 link_measurement_token;
+ 	unsigned int lci_req_active:1;
+ 	unsigned int range_req_active:1;
+ 	unsigned int beacon_req_active:1;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index a0f1dde..8273840 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -2560,7 +2560,7 @@ static int robust_action_frame(u8 category)
+ 
+ 
+ static int handle_action(struct hostapd_data *hapd,
+-			 const struct ieee80211_mgmt *mgmt, size_t len)
++			 const struct ieee80211_mgmt *mgmt, size_t len, int ssi_signal)
+ {
+ 	struct sta_info *sta;
+ 	sta = ap_get_sta(hapd, mgmt->sa);
+@@ -2677,7 +2677,8 @@ static int handle_action(struct hostapd_data *hapd,
+ 		}
+ 		break;
+ 	case WLAN_ACTION_RADIO_MEASUREMENT:
+-		hostapd_handle_radio_measurement(hapd, (const u8 *) mgmt, len);
++		hostapd_handle_radio_measurement(hapd, (const u8 *) mgmt, len,
++				ssi_signal);
+ 		return 1;
+ 	}
+ 
+@@ -2811,7 +2812,7 @@ int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len,
+ 		break;
+ 	case WLAN_FC_STYPE_ACTION:
+ 		wpa_printf(MSG_DEBUG, "mgmt::action");
+-		ret = handle_action(hapd, mgmt, len);
++		ret = handle_action(hapd, mgmt, len, fi->ssi_signal);
+ 		break;
+ 	default:
+ 		hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
+diff --git a/src/ap/rrm.c b/src/ap/rrm.c
+index 907d98c..31ed3fb 100644
+--- a/src/ap/rrm.c
++++ b/src/ap/rrm.c
+@@ -163,6 +163,136 @@ static void hostapd_handle_radio_msmt_report(struct hostapd_data *hapd,
+ 	}
+ }
+ 
++static void hostapd_handle_link_msmt_report(struct hostapd_data *hapd,
++					     const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	const u8 *pos, *ie, *end;
++	u8 token;
++	struct rrm_link_measurement_report link_msmt_report;
++	struct dmg_link_margin dmg_margin;
++	struct dmg_link_adaptation_ack dmg_adapt;
++	char dmg_margin_str[50], dmg_adapt_str[50];
++
++	end = buf + len;
++	token = mgmt->u.action.u.rrm.dialog_token;
++	pos = mgmt->u.action.u.rrm.variable;
++
++	wpa_printf(MSG_DEBUG, "link measurement report token %u len %zu",
++			token, len);
++
++	os_memcpy(&link_msmt_report.tpc, pos, 4);
++	link_msmt_report.rx_ant_id = pos[4];
++	link_msmt_report.tx_ant_id = pos[5];
++	link_msmt_report.rcpi = pos[6];
++	link_msmt_report.rsni = pos[7];
++
++	dmg_margin_str[0] = '\0';
++	if ((ie = get_ie(pos, end - pos, WLAN_EID_DMG_LINK_MARGIN))
++			&& (ie[1] == 8)) {
++		os_memcpy(&dmg_margin, ie, 10);
++		os_snprintf(dmg_margin_str, sizeof(dmg_margin_str),
++			" dmg_link_margin=%d,%d,%d,%d,%d", dmg_margin.activity,
++			dmg_margin.mcs, dmg_margin.link_margin, dmg_margin.snr,
++			dmg_margin.ref_timestamp);
++	}
++
++	dmg_adapt_str[0] = '\0';
++	if ((ie = get_ie(pos, end - pos, WLAN_EID_DMG_LINK_ADAPTATION_ACK))
++			&& (ie[1] == 5)) {
++		os_memcpy(&dmg_adapt, ie, 7);
++		os_snprintf(dmg_adapt_str, sizeof(dmg_adapt_str),
++			" dmg_link_adapt_ack=%d,%d", dmg_adapt.activity,
++			dmg_adapt.ref_timestamp);
++	}
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, RRM_EVENT_LINK_MEASUREMENT_RXED MACSTR
++			" tpc_report=%d,%d rx_ant_id=%d tx_ant_id=%d rcpi=%d rsni=%d%s%s",
++			MAC2STR(mgmt->sa), link_msmt_report.tpc.tx_power,
++			link_msmt_report.tpc.link_margin, link_msmt_report.rx_ant_id,
++			link_msmt_report.tx_ant_id, link_msmt_report.rcpi,
++			link_msmt_report.rsni, dmg_margin_str, dmg_adapt_str);
++}
++
++static void hostapd_handle_link_msmt_request(struct hostapd_data *hapd,
++					     const u8 *buf, size_t len, int ssi_signal)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	const u8 *pos;
++	int i;
++	u8 token;
++
++	struct rrm_link_measurement_report link_msmt_report;
++	mtlk_radio_info_t radio_info;
++
++	os_memset(&link_msmt_report, 0, sizeof(link_msmt_report));
++
++	token = mgmt->u.action.u.rrm.dialog_token;
++	pos = mgmt->u.action.u.rrm.variable;
++
++	if (!(hapd->conf->radio_measurements[0] & WLAN_RRM_CAPS_LINK_MEASUREMENT)) {
++		wpa_printf(MSG_DEBUG, "AP not support link measurement, token %u",
++			   token);
++		return;
++	}
++
++	if (!(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_TX_POWER_INSERTION)) {
++		wpa_printf(MSG_DEBUG, "TX power insertion not supported, token %u",
++			   token);
++		return;
++	}
++
++	wpa_printf(MSG_DEBUG, "link measurement request token %u len %zu",
++			token, len);
++
++	link_msmt_report.dialog_token = token;
++	link_msmt_report.tpc.eid = WLAN_EID_TPC_REPORT;
++	link_msmt_report.tpc.len = 2;
++	link_msmt_report.tpc.link_margin = 0; /* unknown */
++
++	for (i = 0; i < mode->num_channels; i++) {
++		if (mode->channels[i].chan == iface->conf->channel) {
++			link_msmt_report.tpc.tx_power = mode->channels[i].max_tx_power;
++			break;
++		}
++	}
++
++	if (!(hostapd_drv_get_radio_info(hapd, &radio_info))) {
++		if (radio_info.num_tx_antennas == 1)
++			link_msmt_report.tx_ant_id = 1;
++		else if (radio_info.num_tx_antennas > 1)
++			link_msmt_report.tx_ant_id = 255; /* multiple antennas */
++
++		/* the rx antenna id is 1 in case of 1 antenna exist
++		 * or unique configuration of multiple antennas */
++		link_msmt_report.rx_ant_id = radio_info.num_rx_antennas;
++	}
++
++	if (!ssi_signal)
++		link_msmt_report.rcpi = 255; /* not available */
++	else if (ssi_signal < -110)
++		link_msmt_report.rcpi = 0;
++	else if (ssi_signal >= 0)
++		link_msmt_report.rcpi = 220;
++	else
++		link_msmt_report.rcpi = (ssi_signal + 110) * 2;
++	link_msmt_report.rsni = 255; /* 255 indicates that RSNI is not available */
++
++	if (!hapd->conf->rrm_manipulate_measurement)
++		hostapd_send_link_measurement_report(hapd, mgmt->sa, link_msmt_report,
++				NULL, NULL);
++	else
++		wpa_msg(hapd->msg_ctx, MSG_INFO,
++				RRM_EVENT_LINK_MEASUREMENT_REQUEST_RXED MACSTR
++				" dialog_token=%d rx_ant_id=%d tx_ant_id=%d rcpi=%d rsni=%d tpc_report=%d,%d",
++				MAC2STR(mgmt->sa), link_msmt_report.dialog_token,
++				link_msmt_report.rx_ant_id, link_msmt_report.tx_ant_id,
++				link_msmt_report.rcpi, link_msmt_report.rsni,
++				link_msmt_report.tpc.tx_power,
++				link_msmt_report.tpc.link_margin);
++}
+ 
+ static u16 hostapd_parse_location_lci_req_age(const u8 *buf, size_t len)
+ {
+@@ -363,7 +493,7 @@ static void hostapd_handle_nei_report_req(struct hostapd_data *hapd,
+ 
+ 
+ void hostapd_handle_radio_measurement(struct hostapd_data *hapd,
+-				      const u8 *buf, size_t len)
++				      const u8 *buf, size_t len, int ssi_signal)
+ {
+ 	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
+ 
+@@ -381,6 +511,12 @@ void hostapd_handle_radio_measurement(struct hostapd_data *hapd,
+ 	case WLAN_RRM_RADIO_MEASUREMENT_REPORT:
+ 		hostapd_handle_radio_msmt_report(hapd, buf, len);
+ 		break;
++	case WLAN_RRM_LINK_MEASUREMENT_REQUEST:
++		hostapd_handle_link_msmt_request(hapd, buf, len, ssi_signal);
++		break;
++	case WLAN_RRM_LINK_MEASUREMENT_REPORT:
++		hostapd_handle_link_msmt_report(hapd, buf, len);
++		break;
+ 	case WLAN_RRM_NEIGHBOR_REPORT_REQUEST:
+ 		hostapd_handle_nei_report_req(hapd, buf, len);
+ 		break;
+@@ -598,7 +734,7 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 		const u8* req_elem, unsigned int req_elem_len)
+ {
+ 	struct wpabuf *buf;
+-	struct sta_info *sta;
++	struct sta_info *sta = NULL;
+ 	u8 *len;
+ 	int ret, i;
+ 	const u8 wildcard_bssid[ETH_ALEN] = {
+@@ -607,7 +743,7 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 
+ 	wpa_printf(MSG_DEBUG, "Request beacon: dest addr: " MACSTR ", mode: %d",
+ 			MAC2STR(addr), mode);
+-	
++
+ 	for (i = 0; i < hapd->iface->num_bss; i++) {
+ 		sta = ap_get_sta(hapd->iface->bss[i], addr);
+ 		if (sta) {
+@@ -749,6 +885,135 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ }
+ 
+ 
++int hostapd_send_link_measurement_req(struct hostapd_data *hapd, const u8 *addr)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	int ret, i;
++	s8 max_tx_power = 0;
++	mtlk_sta_info_t sta_info;
++
++	wpa_printf(MSG_DEBUG, "request link measurement: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "request link measurement: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[0] & WLAN_RRM_CAPS_LINK_MEASUREMENT)) {
++		wpa_printf(MSG_ERROR,
++			   "request link measurement: Destination station does not support link measurement in RRM");
++		return -1;
++	}
++
++	if (hostapd_drv_get_sta_measurements(hapd, addr, &sta_info)) {
++		wpa_printf(MSG_ERROR, "request link measurement: get tx power used failed");
++		return -1;
++	}
++
++	for (i = 0; i < mode->num_channels; i++) {
++		if (mode->channels[i].chan == iface->conf->channel) {
++			max_tx_power = mode->channels[i].max_tx_power;
++			break;
++		}
++	}
++
++	/* Link Measurement request (5)*/
++	buf = wpabuf_alloc(5);
++	if (!buf)
++		return -1;
++
++	hapd->link_measurement_token++;
++	if (!hapd->link_measurement_token) /* For wraparounds */
++		hapd->link_measurement_token++;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.4 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_LINK_MEASUREMENT_REQUEST);
++	wpabuf_put_u8(buf, hapd->link_measurement_token); /* Dialog Token */
++	wpabuf_put_u8(buf, sta_info.TxMgmtPwr); /* tx power used */
++	wpabuf_put_u8(buf, max_tx_power); /* tx max power */
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++	return ret;
++}
++
++int hostapd_send_link_measurement_report(struct hostapd_data *hapd,
++		const u8 *addr, struct rrm_link_measurement_report link_msmt_report,
++		struct dmg_link_margin *dmg_margin,
++		struct dmg_link_adaptation_ack *dmg_ack)
++{
++	struct wpabuf *buf;
++	struct sta_info *sta = NULL;
++	int ret, i;
++
++	wpa_printf(MSG_DEBUG, "link measurement report: dest addr: " MACSTR
++			,MAC2STR(addr));
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!sta || !(sta->flags & WLAN_STA_AUTHORIZED)) {
++		wpa_printf(MSG_ERROR,
++			   "link measurement report: Destination address is not connected");
++		return -1;
++	}
++
++	if (!(sta->rrm_enabled_capa[0] & WLAN_RRM_CAPS_LINK_MEASUREMENT)) {
++		wpa_printf(MSG_ERROR,
++			   "link measurement report: Destination station does not support link measurement in RRM");
++		return -1;
++	}
++
++	/* Link Measurement response (11)
++	 * + optional dmg link margin(10)
++	 * + optional dmg link adaptation ack(7)*/
++	buf = wpabuf_alloc(11 + 10 + 7);
++	if (!buf)
++		return -1;
++
++	/* IEEE P802.11-REVmc/D6.0, 9.6.7.5 */
++	wpabuf_put_u8(buf, WLAN_ACTION_RADIO_MEASUREMENT);
++	wpabuf_put_u8(buf, WLAN_RRM_LINK_MEASUREMENT_REPORT);
++	wpabuf_put_u8(buf, link_msmt_report.dialog_token);
++	wpabuf_put_data(buf, (const void *) &link_msmt_report.tpc, 4);
++	wpabuf_put_u8(buf, link_msmt_report.rx_ant_id);
++	wpabuf_put_u8(buf, link_msmt_report.tx_ant_id);
++	wpabuf_put_u8(buf, link_msmt_report.rcpi);
++	wpabuf_put_u8(buf, link_msmt_report.rsni);
++
++	if (dmg_margin)
++		wpabuf_put_data(buf, (const void *) dmg_margin, 10);
++
++	if (dmg_ack)
++		wpabuf_put_data(buf, (const void *) dmg_ack, 7);
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++
++	return ret;
++}
++
+ void hostapd_clean_rrm(struct hostapd_data *hapd)
+ {
+ 	hostpad_free_neighbor_db(hapd);
+diff --git a/src/ap/rrm.h b/src/ap/rrm.h
+index 496e71f..d14c15f 100644
+--- a/src/ap/rrm.h
++++ b/src/ap/rrm.h
+@@ -18,7 +18,7 @@
+ #define RRM_RANGE_REQ_MAX_RESPONDERS 16
+ 
+ void hostapd_handle_radio_measurement(struct hostapd_data *hapd,
+-				      const u8 *buf, size_t len);
++				      const u8 *buf, size_t len, int ssi_signal);
+ int hostapd_send_lci_req(struct hostapd_data *hapd, const u8 *addr);
+ int hostapd_send_range_req(struct hostapd_data *hapd, const u8 *addr,
+ 			   u16 random_interval, u8 min_ap,
+@@ -29,6 +29,12 @@ int hostapd_send_beacon_req(struct hostapd_data *hapd, const u8 *addr,
+ 		struct wpa_ssid_value* ssid, u8* rep_cond, u8* rep_cond_threshold,
+ 		u8* rep_detail,	const u8* ap_ch_rep, unsigned int ap_ch_rep_len,
+ 		const u8* req_elem, unsigned int req_elem_len);
++int hostapd_send_link_measurement_req(struct hostapd_data *hapd,
++		const u8 *addr);
++int hostapd_send_link_measurement_report(struct hostapd_data *hapd,
++		const u8 *addr, struct rrm_link_measurement_report link_msmt_report,
++		struct dmg_link_margin *dmg_margin,
++		struct dmg_link_adaptation_ack *dmg_ack);
+ void hostapd_clean_rrm(struct hostapd_data *hapd);
+ 
+ #endif /* RRM_H */
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 12c9f52..968d248 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -281,7 +281,9 @@
+ #define WLAN_EID_MIC 140
+ #define WLAN_EID_CCKM 156
+ #define WLAN_EID_MULTI_BAND 158
++#define WLAN_EID_DMG_LINK_MARGIN 162
+ #define WLAN_EID_SESSION_TRANSITION 164
++#define WLAN_EID_DMG_LINK_ADAPTATION_ACK 172
+ #define WLAN_EID_VHT_CAP 191
+ #define WLAN_EID_VHT_OPERATION 192
+ #define WLAN_EID_VHT_EXTENDED_BSS_LOAD 193
+@@ -1608,6 +1610,25 @@ struct rrm_link_measurement_report {
+ 	u8 variable[0];
+ } STRUCT_PACKED;
+ 
++/* IEEE Std 802.11-2012, 9.4.2.142.1 - DMG link margin element frame format */
++struct dmg_link_margin {
++	u8 eid;
++	u8 len;
++	u8 activity;
++	u8 mcs;
++	s8 link_margin;
++	u8 snr;
++	le32 ref_timestamp;
++} STRUCT_PACKED;
++
++/* IEEE Std 802.11-2012, 9.4.2.143 - DMG link margin element frame format */
++struct dmg_link_adaptation_ack {
++	u8 eid;
++	u8 len;
++	u8 activity;
++	le32 ref_timestamp;
++} STRUCT_PACKED;
++
+ /* IEEE Std 802.11ad-2012 - Multi-band element */
+ struct multi_band_ie {
+ 	u8 eid; /* WLAN_EID_MULTI_BAND */
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index 1a35deb..98b9253 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -245,6 +245,11 @@ extern "C" {
+ #define RRM_EVENT_BEACON_REP_RXED "RRM-BEACON-REP-RECEIVED "
+ #define RRM_EVENT_BEACON_REP_FAILED "RRM-BEACON-REP-REQUEST-FAILED "
+ 
++
++#define RRM_EVENT_LINK_MEASUREMENT_RXED "RRM-LINK-MEASUREMENT-RECEIVED "
++#define RRM_EVENT_LINK_MEASUREMENT_REQUEST_RXED \
++	"RRM-LINK-MEASUREMENT-REQUEST-RECEIVED "
++
+ /* hostapd control interface - fixed message prefixes */
+ #define WPS_EVENT_PIN_NEEDED "WPS-PIN-NEEDED "
+ #define WPS_EVENT_NEW_AP_SETTINGS "WPS-NEW-AP-SETTINGS "
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 1179d96..f0b9796 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1448,6 +1448,7 @@ struct mtlk_wssa_drv_tr181_peer_stats {
+ typedef struct mtlk_sta_info {
+   struct mtlk_wssa_drv_tr181_peer_stats peer_stats;
+   /* u8 stationInfo; */
++  s8 TxMgmtPwr;
+ } __attribute__ ((packed)) mtlk_sta_info_t;
+ 
+ struct mtlk_wssa_drv_tr181_vap_stats {
+-- 
+2.10.1
+

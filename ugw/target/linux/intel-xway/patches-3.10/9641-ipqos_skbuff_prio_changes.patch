@@ -1,0 +1,167 @@
+This patch is to derive skb->priority from skb->mark, which has been filled (during PREROUTING hook processing) for various IPQoS scenarios.
+Function which is written for this purpose will be called for both routed and bridged traffics (ip_output and br_forward_finish respectively)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -65,6 +65,10 @@
+ #define SKB_MAX_HEAD(X)		(SKB_MAX_ORDER((X), 0))
+ #define SKB_MAX_ALLOC		(SKB_MAX_ORDER(0, 2))
+ 
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++
++#endif
++
+ /* return minimum truesize of one skb containing X bytes of data */
+ #define SKB_TRUESIZE(X) ((X) +						\
+ 			 SKB_DATA_ALIGN(sizeof(struct sk_buff)) +	\
+@@ -2543,6 +2547,12 @@ extern struct sk_buff *skb_segment(struc
+ 
+ unsigned int skb_gso_transport_seglen(const struct sk_buff *skb);
+ 
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++
++extern int skb_mark_priority(struct sk_buff *skb);
++
++#endif
++
+ static inline void *skb_header_pointer(const struct sk_buff *skb, int offset,
+ 				       int len, void *buffer)
+ {
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -86,6 +86,19 @@ config LTQ_UDP_REDIRECT
+           You can say Y here if you want to use hooks from kernel for
+           UDP re-direction (KPI2UDP redirection)
+ 
++config LANTIQ_IPQOS
++	bool "IPQOS support"
++	help
++	  Infineon IPQOS support
++
++config LANTIQ_IPQOS_MARK_SKBPRIO
++	bool "Will derive skb prio from nfmark(0-31) bits 6-9"
++	depends on LANTIQ_IPQOS
++	help
++	  Select this to to derive skb priority from nfmark.
++
++	  If unsure, say N.
++
+ if INET
+ source "net/ipv4/Kconfig"
+ source "net/ipv6/Kconfig"
+diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -70,6 +70,9 @@ int br_dev_queue_push_xmit(struct sk_buf
+ 
+ int br_forward_finish(struct sk_buff *skb)
+ {
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++	skb_mark_priority(skb);
++#endif
+ 	return BR_HOOK(NFPROTO_BRIDGE, NF_BR_POST_ROUTING, skb, NULL, skb->dev,
+ 		       br_dev_queue_push_xmit);
+ 
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -3245,6 +3245,34 @@ void __init skb_init(void)
+ #endif
+ }
+ 
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++
++/*
++ * Function to mark priority based on specific criteria
++ */
++int skb_mark_priority(struct sk_buff *skb)
++{
++        unsigned old_priority=skb->priority;
++        /*
++         * IPQoS in UGW: added copy of nfmark set in classifier to skb->priority to be used in hardware queues
++         */
++        /* nfmark range = 1-8 if QoS is enabled; priority range = 0-7; else preserve original priority */
++#ifdef CONFIG_NETWORK_EXTMARK
++	if(skb->extmark)
++	{
++		unsigned value;
++		GET_DATA_FROM_MARK_OPT(skb->extmark, QUEPRIO_MASK, QUEPRIO_START_BIT_POS, value);
++		if (value)
++			skb->priority = value - 1;
++	}
++#endif
++
++        return (old_priority);
++}
++EXPORT_SYMBOL(skb_mark_priority);
++
++#endif
++
+ /**
+  *	skb_to_sgvec - Fill a scatter-gather list from a socket buffer
+  *	@skb: Socket buffer containing the buffers to be mapped
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -249,10 +249,16 @@ static int ip_finish_output(struct sk_bu
+ 		return dst_output(skb);
+ 	}
+ #endif
++
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++	skb_mark_priority(skb);
++#endif
+ 	if (skb->len > ip_skb_dst_mtu(skb) && !skb_is_gso(skb))
+ 		return ip_fragment(skb, ip_finish_output2);
+ 	else
++	{
+ 		return ip_finish_output2(skb);
++	}
+ }
+ 
+ int ip_mc_output(struct sk_buff *skb)
+@@ -477,6 +483,9 @@ int ip_fragment(struct sk_buff *skb, int
+ 	__be16 not_last_frag;
+ 	struct rtable *rt = skb_rtable(skb);
+ 	int err = 0;
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++	__u32 old_priority = skb->priority;
++#endif
+ 
+ 	dev = rt->dst.dev;
+ 
+@@ -578,6 +587,9 @@ int ip_fragment(struct sk_buff *skb, int
+ 				ip_send_check(iph);
+ 			}
+ 
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++			skb->priority = old_priority;
++#endif
+ 			err = output(skb);
+ 
+ 			if (!err)
+@@ -720,6 +732,9 @@ slow_path:
+ 
+ 		ip_send_check(iph);
+ 
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++		skb2->priority = old_priority;
++#endif
+ 		err = output(skb2);
+ 		if (err)
+ 			goto fail;
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -94,6 +94,9 @@ static int ip6_finish_output2(struct sk_
+ 	struct in6_addr *nexthop;
+ 	int ret;
+ 
++#ifdef CONFIG_LANTIQ_IPQOS_MARK_SKBPRIO
++	skb_mark_priority(skb);
++#endif
+ 	if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr)) {
+ 		struct inet6_dev *idev = ip6_dst_idev(skb_dst(skb));
+ 

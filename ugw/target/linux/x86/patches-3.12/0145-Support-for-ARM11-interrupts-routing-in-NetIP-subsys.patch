@@ -1,0 +1,213 @@
+From 8aca4d5526798d68ff671e3d95ccf78f7bfe6742 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Wed, 12 Aug 2015 10:35:37 -0700
+Subject: [PATCH 145/441] Support for ARM11 interrupts routing in NetIP
+ subsystem driver.
+
+---
+ arch/x86/NetIP_SubSystem/netip_subsystem_defs.h |  3 +-
+ arch/x86/NetIP_SubSystem/netip_subsystem_lld.c  | 57 ++++++++++++++++++++-----
+ arch/x86/hw_mailbox/hw_mbox_drv.c               |  4 +-
+ include/linux/netip_subsystem.h                 | 17 +++++++-
+ kernel/hwmutex.c                                |  4 +-
+ 5 files changed, 69 insertions(+), 16 deletions(-)
+
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_defs.h
+@@ -33,7 +33,7 @@
+ #include <linux/kthread.h>
+ #include <linux/netip_subsystem.h>
+ 
+-#define NETSS_DRV_DBG 1
++//#define NETSS_DRV_DBG 1
+ #ifdef NETSS_DRV_DBG
+ #define NETSS_DBG_PRINT(fmt, args...) printk(fmt, ##args)
+ #else
+@@ -92,6 +92,7 @@ struct net_subsystem_drv_data {
+    void __iomem *bridge_reg_base; /* Mapped io bridge register base address mmio region2 of Net-IP  */
+    netss_subdevice_mmio_t subdev_mmios[NETSS_SUBDEVICE_MAX];
+    netss_subdev_irq_info_t irqs[NETSS_SUBDEVICE_MAX];
++   netss_subdev_irq_info_t arm11_irqs[64];
+    struct pci_dev *dev;
+    struct mutex netss_lock;
+    struct task_struct * handshake_thread; /* Thread that exchange messages with netip during boot */
+--- a/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
++++ b/arch/x86/NetIP_SubSystem/netip_subsystem_lld.c
+@@ -73,10 +73,18 @@ net_ip_mmios_t net_ip_mmios;
+ struct net_subsystem_drv_data *pnetss_drv_data;
+ extern netss_sysfs_attributes_info_t g_netss_sysfs_attributes_info;
+ 
+-void netss_subdev_register_irq(netss_subdevices_t subdevice, netss_subdev_irq_info_t *irq_info)
++void netss_subdev_register_irq(netss_subdevices_t subdevice, int arm11_int_id, netss_subdev_irq_info_t *irq_info)
+ {
+-    pnetss_drv_data->irqs[subdevice].func = irq_info->func;
+-    pnetss_drv_data->irqs[subdevice].args = irq_info->args;
++    if(subdevice != NETSS_ARM11) 
++    {
++       pnetss_drv_data->irqs[subdevice].func = irq_info->func;
++       pnetss_drv_data->irqs[subdevice].args = irq_info->args;
++    }
++    else
++    {
++       pnetss_drv_data->arm11_irqs[arm11_int_id].func = irq_info->func;
++       pnetss_drv_data->arm11_irqs[arm11_int_id].args = irq_info->args;
++    }
+ }
+ 
+ EXPORT_SYMBOL(netss_subdev_register_irq);
+@@ -107,6 +115,15 @@ int netss_get_subdevice_mmio_info(netss_
+           mmio->size = NETSS_SUBDEV_HWMBX_MMIO_SIZE;
+           ret = 0;
+       break;
++      case NETSS_PP_DPIPROXY:
++         mmio->base = net_ip_mmios.region1_base + NETSS_SUBDEV_DPIPROXY_MMIO_OFFSET;
++         mmio->size = NETSS_SUBDEV_DPIPROXY_MMIO_SIZE;
++         ret = 0;
++      break; 
++      case NETSS_PP_HOSTPROXY:
++         mmio->base = net_ip_mmios.region1_base + NETSS_SUBDEV_HOSTPROXY_MMIO_OFFSET;
++         mmio->size = NETSS_SUBDEV_HOSTPROXY_MMIO_SIZE;
++         ret = 0;
+       default:
+          ret = -1;
+    }
+@@ -132,13 +149,28 @@ static irqreturn_t net_subsystem_isr(int
+    for(i=0; i<NETSS_SUBDEVICE_MAX; i++)
+    {
+       if((reg_val >> i) & 1)  {
+-         if(pnet_ss->irqs[i].func != NULL) {
+-            NETSS_DBG_PRINT("Interrupt of subdevice %d\n", i);
+-            pnet_ss->irqs[i].func(irq, pnet_ss->irqs[i].args);
+-            /*Prepare interrupt acknowledge mask */
+-            ack_intr |= (1 << i);
++         /*Prepare interrupt acknowledge mask */
++         ack_intr |= (1 << i);
++	 if(i != NETSS_ARM11) {
++            if(pnet_ss->irqs[i].func != NULL) {
++               NETSS_DBG_PRINT("Interrupt of subdevice %d\n", i);
++               pnet_ss->irqs[i].func(irq, pnet_ss->irqs[i].args);
++            } else {
++               NETSS_DBG_PRINT("No irq registered, ingoring interrupt of NetIP subdevice %d\n", i);
++            }
+          } else {
+-            NETSS_DBG_PRINT("No irq registered, ingoring interrupt of NetIP subdevice %d\n", i);
++               void __iomem *reg_ptr;
++               reg_ptr = (void __iomem *)ioremap_nocache(net_ip_mmios.region1_base + 0x3C22040, 4);
++               if(reg_ptr != NULL) { 
++                  /**ARM11 is bundle of 64 interrupts, to find out the cause for the interrupt
++                   * read those register and call the corresponding interrupt handler  */
++                  reg_val = be32_to_cpu(__raw_readl(reg_ptr));
++                  /*May need to read register, and call corresponding arm11_irq */
++                  if(pnet_ss->arm11_irqs[0].func != NULL) {
++                     pnet_ss->arm11_irqs[0].func(irq, pnet_ss->arm11_irqs[0].args);
++                  }
++                  iounmap(reg_ptr);
++               }
+          }
+       }
+    }
+@@ -201,7 +233,6 @@ static int netss_probe(struct pci_dev *p
+       ret = -ENOMEM;
+       goto free_resource;
+    }
+-
+    pnetss_drv_data->bridge_reg_base = (void __iomem *)ioremap_nocache(net_ip_mmios.region2_base,net_ip_mmios.region2_size);
+    if (!pnetss_drv_data->bridge_reg_base) {
+       dev_err( &pdev->dev, "error, failed to ioremap mutex registers\n");
+@@ -235,6 +266,11 @@ static int netss_probe(struct pci_dev *p
+       pnetss_drv_data->irqs[i].func = NULL;
+       pnetss_drv_data->irqs[i].args = NULL;
+    }
++   for(i=0; i<NETSS_ARM11_INTRPTS_MAX; i++)
++   {
++      pnetss_drv_data->arm11_irqs[i].func = NULL;
++      pnetss_drv_data->arm11_irqs[i].args = NULL;
++   }
+    mutex_init(&pnetss_drv_data->netss_lock);
+    mutex_init(&pnetss_drv_data->netip_msg.lock);
+    pci_set_drvdata(pnetss_drv_data->dev,pnetss_drv_data);
+@@ -276,6 +312,7 @@ static void netss_remove(struct pci_dev
+    /*wake up and stop the thread */
+    netss_stop_handshake_thread();
+    pm_runtime_disable(&pdev->dev);
++   iounmap(pnetss_drv_data->bridge_reg_base);
+    kfree(pnetss_drv_data);
+    pci_release_regions(pdev);
+    //pci_disable_msi(pnetss_drv_data->dev); 
+--- a/arch/x86/hw_mailbox/hw_mbox_drv.c
++++ b/arch/x86/hw_mailbox/hw_mbox_drv.c
+@@ -4108,7 +4108,7 @@ static int __init hwMbox_drv_init(void)
+        netss_subdev_irq_info_t irq_info;
+        irq_info.func = &hwMbox_drv_isr;
+        irq_info.args = &hwMboxDriverData;
+-       netss_subdev_register_irq(NETSS_HW_MAILBOX, &irq_info);
++       netss_subdev_register_irq(NETSS_HW_MAILBOX, -1, &irq_info);
+     }
+ #endif
+ 
+@@ -4271,7 +4271,7 @@ static void __exit hwMbox_drv_exit(void)
+     netss_subdev_irq_info_t irq_info;
+     irq_info.func = NULL;
+     irq_info.args = NULL;
+-    netss_subdev_register_irq(NETSS_HW_MAILBOX, &irq_info);
++    netss_subdev_register_irq(NETSS_HW_MAILBOX, -1, &irq_info);
+     iounmap(hwMboxDriverData.reg_base);
+ #endif
+    chnint_cleanup(HW_MBOX_CHANNEL_COUNT);
+--- a/include/linux/netip_subsystem.h
++++ b/include/linux/netip_subsystem.h
+@@ -38,10 +38,25 @@
+ #define NETIP_BRIDGE_IMR_OFFSET 0x2028
+ #define NETIP_BRIDGE_ISR_OFFSET 0x202C
+ #define NETIP_BRIDGE_IRQ_MASK 0x1FF
++
+ #define NETSS_SUBDEV_HWMUTEX_MMIO_OFFSET (0x190000)
+ #define NETSS_SUBDEV_HWMUTEX_MMIO_SIZE (0x10000)
+ #define NETSS_SUBDEV_HWMBX_MMIO_OFFSET (0x1A0000)
+ #define NETSS_SUBDEV_HWMBX_MMIO_SIZE (0x20000)
++#define NETSS_SUBDEV_WIFIPROXY1_MMIO_OFFSET (0)
++#define NETSS_SUBDEV_WIFIPROXY1_MMIO_SIZE (0)
++#define NETSS_SUBDEV_WIFIPROXY2_MMIO_OFFSET (0)
++#define NETSS_SUBDEV_WIFIPROXY2_MMIO_SIZE (0)
++#define NETSS_SUBDEV_DPIPROXY_MMIO_OFFSET (0x3000000)
++#define NETSS_SUBDEV_DPIPROXY_MMIO_SIZE (0x1000000)
++#define NETSS_SUBDEV_HOSTPROXY_MMIO_OFFSET (0x9000000)
++#define NETSS_SUBDEV_HOSTPROXY_MMIO_SIZE (0x1000000)
++#define NETSS_SUBDEV_ARM11_MMIO_OFFSET (0x1A0000)
++#define NETSS_SUBDEV_ARM11_MMIO_SIZE (0x20000)
++#define NETSS_SUBDEV_MOCA_MMIO_OFFSET (0xE800000)
++#define NETSS_SUBDEV_MOCA_MMIO_SIZE (0x800000)
++
++#define NETSS_ARM11_INTRPTS_MAX (64)  /*ARM11 is a bundle of 64 interrupts */
+ 
+ typedef enum {
+    NETSS_HW_MAILBOX = 0,
+@@ -69,7 +84,7 @@ typedef struct netss_subdevice_mmio {
+ }netss_subdevice_mmio_t;
+ 
+ 
+-void netss_subdev_register_irq(netss_subdevices_t subdevice, netss_subdev_irq_info_t *irq_info);
++void netss_subdev_register_irq(netss_subdevices_t subdevice, int arm11_int_id, netss_subdev_irq_info_t *irq_info);
+ bool netss_driver_ready(void);
+ int netss_get_subdevice_mmio_info(netss_subdevices_t subdevice, netss_subdevice_mmio_t *mmio);
+ 
+--- a/kernel/hwmutex.c
++++ b/kernel/hwmutex.c
+@@ -368,7 +368,7 @@ int hw_mutex_register (struct hw_master
+      netss_subdev_irq_info_t irq_info;
+      irq_info.func = &hw_mutex_isr;
+      irq_info.args = pmaster;
+-     netss_subdev_register_irq(NETSS_HW_MUTEX, &irq_info);
++     netss_subdev_register_irq(NETSS_HW_MUTEX, -1, &irq_info);
+ #endif
+    }
+    return 0;
+@@ -385,7 +385,7 @@ void hw_mutex_unregister(struct hw_maste
+    netss_subdev_irq_info_t irq_info;
+    irq_info.func = NULL;
+    irq_info.args = NULL;
+-   netss_subdev_register_irq(NETSS_HW_MUTEX, &irq_info);
++   netss_subdev_register_irq(NETSS_HW_MUTEX, -1, &irq_info);
+ #endif
+ 
+    hw_master_glob = NULL;

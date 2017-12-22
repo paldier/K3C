@@ -1,0 +1,114 @@
+Index: busybox-1.17.1/miscutils/Config.src
+===================================================================
+--- busybox-1.17.1.orig/miscutils/Config.src	2014-04-13 18:38:41.000000000 +0530
++++ busybox-1.17.1/miscutils/Config.src	2014-04-13 19:00:55.000000000 +0530
+@@ -654,4 +654,12 @@
+ 	  certain amount of time, the watchdog device assumes the system has
+ 	  hung, and will cause the hardware to reboot.
+ 
++config WATCHDOG_PER_VPE
++	bool "Launch watchdog on any CPU"
++	default n
++	depends on WATCHDOG
++	help
++	  Supports "-P cpu#" to launch watchdog application on any CPU/VPE.
++	  Used if SoC supports Per-VPE Watchdog.
++
+ endmenu
+Index: busybox-1.17.1/miscutils/watchdog.c
+===================================================================
+--- busybox-1.17.1.orig/miscutils/watchdog.c	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/miscutils/watchdog.c	2014-04-13 20:05:55.000000000 +0530
+@@ -16,6 +16,9 @@
+ #define OPT_FOREGROUND  (1 << 0)
+ #define OPT_STIMER      (1 << 1)
+ #define OPT_HTIMER      (1 << 2)
++#ifdef CONFIG_WATCHDOG_PER_VPE
++#define OPT_AFFINITY 	(1 << 3)
++#endif
+ 
+ static void watchdog_shutdown(int sig UNUSED_PARAM)
+ {
+@@ -41,9 +44,48 @@
+ 	unsigned htimer_duration = 60000; /* reboots after N ms if not restarted */
+ 	char *st_arg;
+ 	char *ht_arg;
++#ifdef CONFIG_WATCHDOG_PER_VPE
++	cpu_set_t mask;
++ 	int process_affinity = -1;
++	char *af_arg;
++#endif
+ 
+ 	opt_complementary = "=1"; /* must have exactly 1 argument */
++#ifndef CONFIG_WATCHDOG_PER_VPE
+ 	opts = getopt32(argv, "Ft:T:", &st_arg, &ht_arg);
++#else
++	opts = getopt32(argv, "Ft:T:P:", &st_arg, &ht_arg, &af_arg);
++
++	if (opts & OPT_AFFINITY)
++		process_affinity = xatoi_u(af_arg);
++
++	if (process_affinity == -1) {
++		printf("[-P CPU] option not set. Default affinity set to 0 (CPU 0) \n");
++		process_affinity = 0;
++ 	}
++
++	/* convert CPU # -> cpumask */
++	process_affinity = 1 << process_affinity ;
++
++	if (process_affinity >= 0 ) { /* Affinity was specified, translate it into cpu_set_t */
++        unsigned i;
++	
++		af_arg = itoa(process_affinity);
++        /* Do not allow zero mask: */
++        unsigned long long m = xstrtoull_range(af_arg, 0, 1, ULLONG_MAX);
++        enum { CNT_BIT = CPU_SETSIZE < sizeof(m)*8 ? CPU_SETSIZE : sizeof(m)*8 };
++
++        CPU_ZERO(&mask);
++        for (i = 0; i < CNT_BIT; i++) {
++            unsigned long long bit = (1ULL << i);
++            if (bit & m)
++                CPU_SET(i, &mask);
++        }
++
++		if (sched_setaffinity(0, sizeof(mask), &mask))
++			bb_perror_msg_and_die("can't %cet pid %d's affinity", 's');
++    }
++#endif
+ 
+ 	/* We need to daemonize *before* opening the watchdog as many drivers
+ 	 * will only allow one process at a time to do so.  Since daemonizing
+Index: busybox-1.17.1/include/usage.src.h
+===================================================================
+--- busybox-1.17.1.orig/include/usage.src.h	2014-04-13 20:43:06.000000000 +0530
++++ busybox-1.17.1/include/usage.src.h	2014-04-13 21:03:39.000000000 +0530
+@@ -4812,6 +4812,19 @@
+        "Mon Dec 17 10:31:42 GMT 2000\n" \
+        "Mon Dec 17 10:31:44 GMT 2000"
+ 
++#ifdef CONFIG_WATCHDOG_PER_VPE
++#define watchdog_trivial_usage \
++       "[-t N[ms]] [-T N[ms]] [-P CPU] [-F] DEV"
++#define watchdog_full_usage "\n\n" \
++       "Periodically write to watchdog device DEV\n" \
++     "\nOptions:" \
++     "\n	-T N	Reboot after N seconds if not reset (default 60)" \
++     "\n	-t N	Reset every N seconds (default 30)" \
++     "\n	-P CPU	Set affinity to CPU (default 0 - CPU0)" \
++     "\n	-F	Run in foreground" \
++     "\n" \
++     "\nUse 500ms to specify period in milliseconds"
++#else
+ #define watchdog_trivial_usage \
+        "[-t N[ms]] [-T N[ms]] [-F] DEV"
+ #define watchdog_full_usage "\n\n" \
+@@ -4821,7 +4834,8 @@
+      "\n	-t N	Reset every N seconds (default 30)" \
+      "\n	-F	Run in foreground" \
+      "\n" \
+-     "\nUse 500ms to specify period in milliseconds" \
++     "\nUse 500ms to specify period in milliseconds"
++#endif
+ 
+ #define wc_trivial_usage \
+        "[OPTIONS] [FILE]..."

@@ -1,0 +1,280 @@
+From fd7eb34fe3295dcad4f29e1b753504c78ce48c4f Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Tue, 1 Nov 2016 18:32:39 +0200
+Subject: [PATCH] mbo: add support to configure mbo_bss_assoc_disallow
+
+this option allows to configure a single VAP to disallow associations.
+to make it per VAP, we need to pass the VAP bssid.
+new assoc_disallow MBO IE will be sent in beacon/probe response/assoc response
+instead of the current cell_aware MBO IE.
+it will affect only MBO stations.
+non-MBO stations will not be affected by this command.
+the value to pass to this command can be 0 to 5.
+0: disable the disallow (allow association).
+1-5: enable the disallow, and the value is the disallow reason code.
+
+usage: "mbo_bss_assoc_disallow <bssid> <0-5>".
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/ctrl_iface.c       | 59 ++++++++++++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c      | 22 +++++++++++++++++
+ src/ap/drv_callbacks.c     |  8 +++++++
+ src/ap/hostapd.h           |  1 +
+ src/ap/ieee802_11.c        | 20 ++++++++++++----
+ src/ap/ieee802_11_shared.c | 10 +++++---
+ src/ap/mbo_ap.c            |  1 +
+ src/ap/sta_info.h          |  1 +
+ 8 files changed, 114 insertions(+), 8 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 2b47c0a..cd20c71 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2253,6 +2253,60 @@ static int hostapd_ctrl_iface_req_range(struct hostapd_data *hapd, char *cmd)
+ 				      responders, n_responders);
+ }
+ 
++#ifdef CONFIG_MBO
++static int hostapd_ctrl_iface_mbo_bss_assoc_disallow(struct hostapd_data *hapd, char *cmd)
++{
++	char *token, *context = NULL;
++	int val, i;
++	u8 bssid[ETH_ALEN];
++	struct hostapd_data *target_bss = NULL;
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, bssid)) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - Bad bssid address");
++		return -1;
++	}
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		if (os_memcmp(bssid, hapd->iface->bss[i]->own_addr, ETH_ALEN) == 0) {
++			target_bss = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!target_bss) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - there is no iface with the given bssid");
++		return -1;
++	}
++
++	if (!target_bss->conf->mbo_enabled) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - mbo is not enabled");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - enable/disable is missing");
++		return -1;
++	}
++
++	val = atoi(token);
++	if (val < 0 || val > 5) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - enable/disable value is out of range");
++		return -1;
++	}
++
++	target_bss->mbo_bss_assoc_disallow = val;
++	ieee802_11_update_beacons(target_bss->iface);
++
++	return 0;
++}
++#endif /* CONFIG_MBO */
+ 
+ static int hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd)
+ {
+@@ -3851,6 +3905,11 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "GET_RESTRICTED_CHANNELS", 23) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_restricted_chan(hapd->iface, NULL, reply,
+ 					reply_size);
++#ifdef CONFIG_MBO
++	} else if (os_strncmp(buf, "MBO_BSS_ASSOC_DISALLOW ", 23) == 0) {
++		if (hostapd_ctrl_iface_mbo_bss_assoc_disallow(hapd, buf + 23))
++			reply_len = -1;
++#endif /* CONFIG_MBO */
+ 	} else if (os_strcmp(buf, "ERP_FLUSH") == 0) {
+ 		ieee802_1x_erp_flush(hapd);
+ #ifdef RADIUS_SERVER
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 7a1dd11..50fa8e8 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1623,6 +1623,25 @@ static int hostapd_cli_cmd_get_restricted_chan(struct wpa_ctrl *ctrl,
+   return wpa_ctrl_command(ctrl, cmd);
+ }
+ 
++#ifdef CONFIG_MBO
++static int hostapd_cli_cmd_mbo_bss_assoc_disallow(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 2) {
++		printf("Invalid mbo_bss_assoc_disallow command - requires <BSSID> and <0> to disable or <1-5> to enable(the specified number is the disallow reason code)\n");
++		return -1;
++	}
++
++	res = os_snprintf(cmd, sizeof(cmd), "MBO_BSS_ASSOC_DISALLOW %s %s", argv[0], argv[1]);
++	if (os_snprintf_error(sizeof(cmd), res)) {
++		printf("Too long MBO_BSS_ASSOC_DISALLOW command.\n");
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
++#endif /* CONFIG_MBO */
+ 
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+@@ -1752,6 +1771,9 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  " set restricted channels, list_of_channels example 1 6 11-13" },
+ 	{ "get_restricted_chan", hostapd_cli_cmd_get_restricted_chan, NULL,
+ 	  " get list of restricted channels" },
++#ifdef CONFIG_MBO
++	{ "mbo_bss_assoc_disallow", hostapd_cli_cmd_mbo_bss_assoc_disallow, NULL, NULL },
++#endif /* CONFIG_MBO */
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 3e687f0..acb2fd9 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -363,6 +363,14 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 	}
+ 
+ #ifdef CONFIG_MBO
++	mbo_ap_check_sta_assoc(hapd, sta, &elems);
++
++	if (hapd->conf->mbo_enabled && hapd->mbo_bss_assoc_disallow &&
++		sta->mbo_supported) {
++		wpa_printf(MSG_INFO, "MBO: AP configure to reject associations");
++		return WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
++	}
++
+ 	if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
+ 	    elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
+ 	    hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 8251610..c48ae0c 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -296,6 +296,7 @@ struct hostapd_data {
+ 
+ #ifdef CONFIG_MBO
+ 	unsigned int mbo_assoc_disallow;
++	unsigned int mbo_bss_assoc_disallow;
+ #endif /* CONFIG_MBO */
+ 
+ 	struct dl_list nr_db;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index fbbfe32..31f0c3a 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -1834,6 +1834,12 @@ static u16 check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ #ifdef CONFIG_MBO
+ 	mbo_ap_check_sta_assoc(hapd, sta, &elems);
+ 
++	if (hapd->conf->mbo_enabled && hapd->mbo_bss_assoc_disallow &&
++		sta->mbo_supported) {
++		wpa_printf(MSG_INFO, "MBO: AP configure to reject associations");
++		return WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
++	}
++
+ 	if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
+ 	    elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
+ 	    hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
+@@ -2083,7 +2089,10 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 		p = hostapd_eid_p2p_manage(hapd, p);
+ #endif /* CONFIG_P2P_MANAGER */
+ 
+-	p = hostapd_eid_mbo(hapd, p, buf + sizeof(buf) - p);
++#ifdef CONFIG_MBO
++	if (sta->mbo_supported)
++		p = hostapd_eid_mbo(hapd, p, buf + sizeof(buf) - p);
++#endif /* CONFIG_MBO */
+ 
+ 	if (hapd->conf->assocresp_elements &&
+ 	    (size_t) (buf + sizeof(buf) - p) >=
+@@ -2227,12 +2236,13 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	}
+ 
+ #ifdef CONFIG_MBO
+-	if (hapd->conf->mbo_enabled && hapd->mbo_assoc_disallow) {
+-		resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+-		goto fail;
+-	}
++       if (hapd->conf->mbo_enabled && hapd->mbo_assoc_disallow) {
++               resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
++               goto fail;
++       }
+ #endif /* CONFIG_MBO */
+ 
++
+ 	/*
+ 	 * sta->capability is used in check_assoc_ies() for RRM enabled
+ 	 * capability element.
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index 17398af..df80779 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -549,6 +549,10 @@ u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
+ 		*mbo_pos++ = MBO_ATTR_ID_ASSOC_DISALLOW;
+ 		*mbo_pos++ = 1;
+ 		*mbo_pos++ = hapd->mbo_assoc_disallow;
++	} else if (hapd->mbo_bss_assoc_disallow) {
++		*mbo_pos++ = MBO_ATTR_ID_ASSOC_DISALLOW;
++		*mbo_pos++ = 1;
++		*mbo_pos++ = hapd->mbo_bss_assoc_disallow;
+ 	} else {
+ 		*mbo_pos++ = MBO_ATTR_ID_AP_CAPA_IND;
+ 		*mbo_pos++ = 1;
+@@ -570,10 +574,10 @@ u8 hostapd_mbo_ie_len(struct hostapd_data *hapd)
+ 		return 0;
+ 
+ 	/*
+-	 * MBO IE header (6) + Capability Indication attribute (3) +
+-	 * Association Disallowed attribute (3) = 12
++	 * MBO IE header (6) + Capability Indication attribute (3) or
++	 * Association Disallowed attribute (3) = 9
+ 	 */
+-	return 6 + 3 + (hapd->mbo_assoc_disallow ? 3 : 0);
++	return 6 + 3;
+ }
+ 
+ #endif /* CONFIG_MBO */
+diff --git a/src/ap/mbo_ap.c b/src/ap/mbo_ap.c
+index 43b0bf1..dfe2184 100644
+--- a/src/ap/mbo_ap.c
++++ b/src/ap/mbo_ap.c
+@@ -93,6 +93,7 @@ void mbo_ap_check_sta_assoc(struct hostapd_data *hapd, struct sta_info *sta,
+ 	len = elems->mbo_len - 4;
+ 	wpa_hexdump(MSG_DEBUG, "MBO: Association Request attributes", pos, len);
+ 
++	sta->mbo_supported = 1;
+ 	attr = get_ie(pos, len, MBO_ATTR_ID_CELL_DATA_CAPA);
+ 	if (attr && attr[1] >= 1)
+ 		sta->cell_capa = attr[2];
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index edfbc86..24ed912 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -212,6 +212,7 @@ struct sta_info {
+ 	u8 cell_capa; /* 0 = unknown (not an MBO STA); otherwise,
+ 		       * enum mbo_cellular_capa values */
+ 	struct mbo_non_pref_chan_info *non_pref_chan;
++	unsigned int mbo_supported:1;
+ #endif /* CONFIG_MBO */
+ 
+ 	u8 *supp_op_classes; /* Supported Operating Classes element, if
+-- 
+2.7.4
+

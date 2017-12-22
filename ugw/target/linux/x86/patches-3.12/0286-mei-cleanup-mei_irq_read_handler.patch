@@ -1,0 +1,156 @@
+From 90714cc438792b2df52501a516c43b0aeb9e693d Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Mon, 11 Nov 2013 13:26:08 +0200
+Subject: [PATCH 286/441] mei: cleanup mei_irq_read_handler
+
+1. Simplify function flow
+2. Display errors in error or warnings level instead of debug.
+3. Remove excessive debug messages
+
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 10ee90743e99fb06a0881a35731263c1845275dd)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/interrupt.c | 79 ++++++++++++++++++++++----------------------
+ drivers/misc/mei/mei_dev.h   | 10 ++++++
+ 2 files changed, 50 insertions(+), 39 deletions(-)
+
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -301,13 +301,11 @@ int mei_irq_read_handler(struct mei_devi
+ 		struct mei_cl_cb *cmpl_list, s32 *slots)
+ {
+ 	struct mei_msg_hdr *mei_hdr;
+-	struct mei_cl *cl_pos = NULL;
+-	struct mei_cl *cl_next = NULL;
+-	int ret = 0;
++	struct mei_cl *cl;
++	int ret;
+ 
+ 	if (!dev->rd_msg_hdr) {
+ 		dev->rd_msg_hdr = mei_read_hdr(dev);
+-		dev_dbg(&dev->pdev->dev, "slots =%08x.\n", *slots);
+ 		(*slots)--;
+ 		dev_dbg(&dev->pdev->dev, "slots =%08x.\n", *slots);
+ 	}
+@@ -315,61 +313,64 @@ int mei_irq_read_handler(struct mei_devi
+ 	dev_dbg(&dev->pdev->dev, MEI_HDR_FMT, MEI_HDR_PRM(mei_hdr));
+ 
+ 	if (mei_hdr->reserved || !dev->rd_msg_hdr) {
+-		dev_dbg(&dev->pdev->dev, "corrupted message header.\n");
++		dev_err(&dev->pdev->dev, "corrupted message header 0x%08X\n",
++				dev->rd_msg_hdr);
+ 		ret = -EBADMSG;
+ 		goto end;
+ 	}
+ 
+-	if (mei_hdr->host_addr || mei_hdr->me_addr) {
+-		list_for_each_entry_safe(cl_pos, cl_next,
+-					&dev->file_list, link) {
+-			dev_dbg(&dev->pdev->dev,
+-					"list_for_each_entry_safe read host"
+-					" client = %d, ME client = %d\n",
+-					cl_pos->host_client_id,
+-					cl_pos->me_client_id);
+-			if (mei_cl_hbm_equal(cl_pos, mei_hdr))
+-				break;
+-		}
+-
+-		if (&cl_pos->link == &dev->file_list) {
+-			dev_dbg(&dev->pdev->dev, "corrupted message header\n");
+-			ret = -EBADMSG;
+-			goto end;
+-		}
+-	}
+-	if (((*slots) * sizeof(u32)) < mei_hdr->length) {
+-		dev_err(&dev->pdev->dev,
+-				"we can't read the message slots =%08x.\n",
++	if (mei_slots2data(*slots) < mei_hdr->length) {
++		dev_err(&dev->pdev->dev, "less data available than length=%08x.\n",
+ 				*slots);
+ 		/* we can't read the message */
+ 		ret = -ERANGE;
+ 		goto end;
+ 	}
+ 
+-	/* decide where to read the message too */
+-	if (!mei_hdr->host_addr) {
+-		dev_dbg(&dev->pdev->dev, "call mei_hbm_dispatch.\n");
++	/*  HBM message */
++	if (mei_hdr->host_addr == 0 && mei_hdr->me_addr == 0) {
+ 		mei_hbm_dispatch(dev, mei_hdr);
+-		dev_dbg(&dev->pdev->dev, "end mei_hbm_dispatch.\n");
+-	} else if (mei_hdr->host_addr == dev->iamthif_cl.host_client_id &&
+-		   (MEI_FILE_CONNECTED == dev->iamthif_cl.state) &&
+-		   (dev->iamthif_state == MEI_IAMTHIF_READING)) {
++		ret = 0;
++		dev_dbg(&dev->pdev->dev, "mei_hbm_dispatch.\n");
++		goto reset_slots;
++	}
++
++	/* find recepient cl */
++	list_for_each_entry(cl, &dev->file_list, link) {
++		if (mei_cl_hbm_equal(cl, mei_hdr)) {
++			cl_dbg(dev, cl, "got a message\n");
++			break;
++		}
++	}
++
++	/* if no recepient cl was found we assume corrupted header\n */
++	if (&cl->link == &dev->file_list) {
++		dev_err(&dev->pdev->dev, "no destination client found 0x%08X\n",
++				dev->rd_msg_hdr);
++		ret = -EBADMSG;
++		goto end;
++	}
+ 
+-		dev_dbg(&dev->pdev->dev, "call mei_amthif_irq_read_msg.\n");
+-		dev_dbg(&dev->pdev->dev, MEI_HDR_FMT, MEI_HDR_PRM(mei_hdr));
++	if (mei_hdr->host_addr == dev->iamthif_cl.host_client_id &&
++	    MEI_FILE_CONNECTED == dev->iamthif_cl.state &&
++	    dev->iamthif_state == MEI_IAMTHIF_READING) {
+ 
+ 		ret = mei_amthif_irq_read_msg(dev, mei_hdr, cmpl_list);
+-		if (ret)
++		if (ret) {
++			dev_err(&dev->pdev->dev, "mei_amthif_irq_read_msg failed = %d\n",
++					ret);
+ 			goto end;
++		}
+ 	} else {
+-		dev_dbg(&dev->pdev->dev, "call mei_cl_irq_read_msg.\n");
+-		dev_dbg(&dev->pdev->dev, MEI_HDR_FMT, MEI_HDR_PRM(mei_hdr));
+ 		ret = mei_cl_irq_read_msg(dev, mei_hdr, cmpl_list);
+-		if (ret)
++		if (ret) {
++			dev_err(&dev->pdev->dev, "mei_cl_irq_read_msg failed = %d\n",
++					ret);
+ 			goto end;
++		}
+ 	}
+ 
++reset_slots:
+ 	/* reset the number of slots and header */
+ 	*slots = mei_count_full_read_slots(dev);
+ 	dev->rd_msg_hdr = 0;
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -456,6 +456,16 @@ static inline u32 mei_data2slots(size_t
+ 	return DIV_ROUND_UP(sizeof(struct mei_msg_hdr) + length, 4);
+ }
+ 
++/**
++ * mei_slots2data- get data in slots - bytes from slots
++ * @slots -  number of available slots
++ * returns  - number of bytes in slots
++ */
++static inline u32 mei_slots2data(int slots)
++{
++	return slots * 4;
++}
++
+ /*
+  * mei init function prototypes
+  */

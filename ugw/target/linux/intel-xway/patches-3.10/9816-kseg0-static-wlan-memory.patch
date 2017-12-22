@@ -1,0 +1,164 @@
+# HG changeset patch
+# Parent 08a073098d4a8a8e7297b868169094abfed1a1dd
+
+diff --git a/arch/mips/kernel/module.c b/arch/mips/kernel/module.c
+--- a/arch/mips/kernel/module.c
++++ b/arch/mips/kernel/module.c
+@@ -42,6 +42,11 @@ struct mips_hi16 {
+ static LIST_HEAD(dbe_list);
+ static DEFINE_SPINLOCK(dbe_lock);
+ 
++#ifdef CONFIG_STATIC_WLAN_MEMORY
++extern unsigned int wlan_flag;
++extern void *wlan_pgaddr;
++#endif
++
+ /*
+  * Get the potential max trampolines size required of the init and
+  * non-init sections. Only used if we cannot find enough contiguous
+@@ -123,6 +128,12 @@ static void *alloc_phys(unsigned long si
+ 	struct page *page;
+ 	struct page *p;
+ 
++#ifdef CONFIG_STATIC_WLAN_MEMORY
++	if (wlan_flag == 1) {
++		wlan_flag = 0;
++		return wlan_pgaddr;
++	}
++#endif
+ 	size = PAGE_ALIGN(size);
+ 	order = get_order(size);
+ 
+@@ -192,8 +203,16 @@ void module_free(struct module *mod, voi
+ 	if (is_phys_addr(module_region)) {
+ 		if (mod->module_init == module_region)
+ 			free_phys(module_region, mod->init_size);
+-		else if (mod->module_core == module_region)
+-			free_phys(module_region, mod->core_size);
++#ifdef CONFIG_STATIC_WLAN_MEMORY
++		else if (mod->module_core == module_region) {
++			if (strcmp(mod->name, "mtlk")){
++				free_phys(module_region, mod->core_size);
++			}
++		}
++#else
++		else if (mod->module_core == module_region) 
++				free_phys(module_region, mod->core_size);
++#endif
+ 		else
+ 			BUG();
+ 	} else {
+diff --git a/init/main.c b/init/main.c
+--- a/init/main.c
++++ b/init/main.c
+@@ -160,6 +160,48 @@ static const char *panic_later, *panic_p
+ 
+ extern const struct obs_kernel_param __setup_start[], __setup_end[];
+ 
++#ifdef CONFIG_STATIC_WLAN_MEMORY
++void *wlan_pgaddr;
++
++
++static void* alloc_phys_wlan(void)
++{
++        unsigned order;
++        struct page *page;
++        struct page *p;
++	unsigned long size;
++
++	size = (CONFIG_STATIC_WLAN_MEMORY_SIZE * 1024 * 1024);
++
++        size = PAGE_ALIGN(size);
++        order = get_order(size);
++
++        page = alloc_pages(GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN |
++                        __GFP_THISNODE, order);
++        if (!page)
++                return NULL;
++
++        split_page(page, order);
++
++        for (p = page + (size >> PAGE_SHIFT); p < page + (1 << order); ++p)
++                __free_page(p);
++
++        return page_address(page);
++}
++
++
++static void wlan_wave_reserve_mem (void) {
++	unsigned long base_w, size;
++
++	wlan_pgaddr = alloc_phys_wlan();
++	base_w = virt_to_phys(wlan_pgaddr);
++
++	size = PAGE_ALIGN(CONFIG_STATIC_WLAN_MEMORY_SIZE * 1024 * 1024);
++	reserve_bootmem(base_w, size, BOOTMEM_DEFAULT);
++}
++#endif
++
++
+ static int __init obsolete_checksetup(char *line)
+ {
+ 	const struct obs_kernel_param *p;
+@@ -881,6 +923,10 @@ static noinline void __init kernel_init_
+ 
+ 	do_basic_setup();
+ 
++#ifdef CONFIG_STATIC_WLAN_MEMORY
++	wlan_wave_reserve_mem();
++#endif
++
+ 	/* Open the /dev/console on the rootfs, this should never fail */
+ 	if (sys_open((const char __user *) "/dev/console", O_RDWR, 0) < 0)
+ 		pr_err("Warning: unable to open an initial console.\n");
+diff --git a/kernel/module.c b/kernel/module.c
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -71,6 +71,10 @@
+ #define ARCH_SHF_SMALL 0
+ #endif
+ 
++#ifdef CONFIG_STATIC_WLAN_MEMORY
++unsigned int wlan_flag = 0;
++#endif
++
+ /*
+  * Modules' sections will be aligned on page boundaries
+  * to ensure complete separation of code and data, but
+@@ -2957,6 +2961,15 @@ static struct module *layout_and_allocat
+ 	layout_sections(mod, info);
+ 	layout_symtab(mod, info);
+ 
++#ifdef CONFIG_STATIC_WLAN_MEMORY
++	wlan_flag = 0;
++
++	/* prior reservation of phys mem for mtlk is already taken care */
++        if (!strcmp(mod->name, "mtlk")){
++        	wlan_flag = 1;
++        }
++#endif
++
+ 	/* Allocate and move to the final place */
+ 	err = move_module(mod, info);
+ 	if (err)
+diff --git a/net/wireless/Kconfig b/net/wireless/Kconfig
+--- a/net/wireless/Kconfig
++++ b/net/wireless/Kconfig
+@@ -166,3 +166,17 @@ config LIB80211_DEBUG
+ 	  from lib80211.
+ 
+ 	  If unsure, say N.
++
++config STATIC_WLAN_MEMORY
++	bool "Reserve memory for WAVE WLAN driver"
++	default y
++	help
++	  Say Y here to enable reserve memory for WLAN to ensure WAVE module is always loaded to kseg0
++
++config STATIC_WLAN_MEMORY_SIZE
++	int "WAVE WLAN module allocation size (normal mode => 1, debug mode => 2)"
++	depends on STATIC_WLAN_MEMORY
++	range 1 2
++	default 1
++	help
++	  Specify WLAN memory allocation size - typically, no debug driver is ~1MB, debug driver is ~1.5MB

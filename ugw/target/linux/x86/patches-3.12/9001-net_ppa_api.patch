@@ -1,0 +1,1989 @@
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -342,6 +342,8 @@ source "drivers/net/wan/Kconfig"
+ 
+ source "drivers/net/ieee802154/Kconfig"
+ 
++source "drivers/net/lantiq_ppa/Kconfig"
++
+ config XEN_NETDEV_FRONTEND
+ 	tristate "Xen network device frontend driver"
+ 	depends on XEN
+--- a/drivers/net/Makefile
++++ b/drivers/net/Makefile
+@@ -74,4 +74,6 @@ obj-$(CONFIG_USB_CDC_PHONET)   += usb/
+ 
+ obj-$(CONFIG_HYPERV_NET) += hyperv/
+ obj-$(CONFIG_NTB_NETDEV) += ntb_netdev.o
++
++obj-$(CONFIG_LTQ_PPA) += lantiq_ppa/
+ obj-$(CONFIG_LPAL_DIRECTPATH) += lpal_api/
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -2982,6 +2982,116 @@ static void *unit_find(struct idr *p, in
+ 	return idr_find(p, n);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++#if (defined(CONFIG_PPPOL2TP) || defined(CONFIG_PPPOL2TP_MODULE))
++enum{
++PPPOL2TP_GET_SESSION_ID=1,
++PPPOL2TP_GET_TUNNEL_ID,
++PPPOL2TP_GET_BASEIF,
++PPPOL2TP_GET_ADDR,
++PPPOL2TP_GET_DMAC,
++};
++#endif
++
++#if (defined(CONFIG_PPPOE) || defined(CONFIG_PPPOE_MODULE))
++extern int32_t ppa_get_pppoe_info(struct net_device *dev, void *po, uint32_t pppoe_id, void *value);
++#endif
++#if (defined(CONFIG_PPPOATM) || defined(CONFIG_PPPOATM_MODULE))
++struct pppoatm_vcc;
++extern int32_t ppa_get_pppoa_info(struct net_device *dev, void *pvcc, uint32_t pppoa_id, void *value);
++#endif
++#if (defined(CONFIG_PPPOL2TP) || defined(CONFIG_PPPOL2TP_MODULE))
++extern int32_t ppa_get_pppol2tp_info(struct net_device *dev, void *po, uint32_t pppol2tp_id, void *value);
++#endif
++
++/*it's very unlikely we need lock_kernel here to prevent the device being destroyed*/
++int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value)
++{
++	struct ppp *ppp;
++	struct channel *pch;
++	struct list_head *list;
++	int32_t ret = -EFAULT;
++    struct ppp_net *pn;
++	
++	if(unlikely(!ppp_dev || !value)){
++		/* printk("PPP arg error\n"); */
++		return ret;
++	}
++
++    ppp = netdev_priv(ppp_dev);
++
++	if (unlikely(!(ppp_dev->flags & IFF_POINTOPOINT) || !ppp)){
++		/* printk("PPP device in abnormal status!\n"); */
++		return ret;
++	}
++
++	/*check ppp validity */
++
++	//ppp_lock(ppp);
++	if(unlikely(ppp->file.dead || atomic_read(&ppp->file.refcnt) == 0 || !ppp->dev || ppp->n_channels == 0)){
++		/* printk("PPP device is dead, being destroyed!\n"); */
++		goto err_unlockppp;
++	}
++
++	/*don't support multipul link*/
++	if(unlikely(ppp->flags & SC_MULTILINK)){
++		/* printk("Don't support multiple link\n"); */
++		goto err_unlockppp;
++	}
++
++	list = &ppp->channels;
++	if(unlikely(list_empty(list))){
++		/* printk("PPP channel list empty!\n"); */
++		goto err_unlockppp;
++	}
++
++	list = list->next;
++	pch = list_entry(list, struct channel, clist);
++
++	if(unlikely(!pch->chan)){
++		/* printk("PPP cannot get channel!\n"); */
++		goto err_unlockppp;
++	}
++
++    pn = ppp_pernet(pch->chan_net);
++
++	//ppp_unlock(ppp);
++	//spin_lock_bh(&pn->all_channels_lock); /* we only need to guarantee the channel won't be destroyed, release ppp's lock to increase speed */
++	
++	if((ppp_info_id & PPA_PPP_MASK) == PPA_PPPOE_ID){
++#if (defined(CONFIG_PPPOE) || defined(CONFIG_PPPOE_MODULE))
++		ret = ppa_get_pppoe_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
++#endif
++	}else if((ppp_info_id & PPA_PPP_MASK) == PPA_PPPOL2TP_ID){
++#if (defined(CONFIG_PPPOL2TP) || defined(CONFIG_PPPOL2TP_MODULE))
++		if((ppp_info_id >>PPA_PPP_MASK_LEN) == PPPOL2TP_GET_DMAC)
++		{
++			ret = ppa_get_pppol2tp_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, (uint8_t *)value);
++		}
++		else
++		{
++			ret = ppa_get_pppol2tp_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
++		}
++#endif
++	}else{
++#if (defined(CONFIG_PPPOATM) || defined(CONFIG_PPPOATM_MODULE))
++		ret = ppa_get_pppoa_info(ppp_dev, pch->chan->private, ppp_info_id >>PPA_PPP_MASK_LEN, value);
++#endif
++	}
++	//spin_unlock_bh(&pn->all_channels_lock);
++
++	return ret;
++
++
++err_unlockppp:
++	//ppp_unlock(ppp);
++
++	return ret;
++}
++EXPORT_SYMBOL(ppa_ppp_get_info);
++
++#endif
+ /* Module/initialization stuff */
+ 
+ module_init(ppp_init);
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -1213,6 +1213,121 @@ static void __exit pppoe_exit(void)
+ 	unregister_pernet_device(&pppoe_net_ops);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++extern int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value);
++enum{
++	PPPOE_GET_ADDR = 1,
++	PPPOE_GET_SESSION_ID,
++	PPPOE_GET_ETH_ADDR,
++};
++
++int32_t ppa_check_pppoe_addr_valid(struct net_device *dev, struct pppoe_addr *pa)
++{
++	struct pppox_sock *po=NULL;
++	struct pppoe_net *pn;
++    struct net_device *pppoe_netdev;
++	int32_t ret = -EFAULT;
++
++	if((pa->dev == NULL) || (pa->remote == NULL) || (pa->sid == NULL))
++		return ret;
++
++    pn = pppoe_pernet(dev_net(dev));
++    if (pppoe_netdev = dev_get_by_name(dev_net(dev), pa->dev)) {
++	    dev_put (pppoe_netdev);
++    }
++	po = get_item(pn, pa->sid, pa->remote, pppoe_netdev->ifindex);
++	if (!po){
++		printk("Cannot find the pppoe addr in hash table \n");
++		goto err;
++	}	
++
++	if (!po->pppoe_dev || 
++		(po->pppoe_pa.remote[0] | po->pppoe_pa.remote[1] | po->pppoe_pa.remote[2] |
++		 po->pppoe_pa.remote[3] | po->pppoe_pa.remote[4] | po->pppoe_pa.remote[5]) == 0){
++		 printk("no pppoe device or remote address is zero\n");
++		goto err;
++	}
++
++	ret = 0;
++
++err:
++	if (po)
++		sock_put(sk_pppox(po));
++
++	return ret;
++}
++
++int32_t ppa_pppoe_get_pppoe_addr(struct net_device *dev, struct pppoe_addr *pa)
++{
++	uint32_t id = (PPPOE_GET_ADDR << PPA_PPP_MASK_LEN) | PPA_PPPOE_ID;
++
++	return ppa_ppp_get_info(dev, id, pa);
++}
++
++__u16 ppa_pppoe_get_pppoe_session_id(struct net_device *dev)
++{
++	uint16_t seid = 0;
++	uint32_t id = (PPPOE_GET_SESSION_ID << PPA_PPP_MASK_LEN) | PPA_PPPOE_ID;
++
++	ppa_ppp_get_info(dev, id, &seid);
++
++	return seid;
++}
++
++__u16 ppa_get_pkt_pppoe_session_id(struct sk_buff *skb)
++{
++	if(!skb)
++		return 0;
++	
++	return ppa_pppoe_get_pppoe_session_id(skb->dev);
++}
++
++int32_t ppa_pppoe_get_eth_netif(struct net_device *dev, char pppoe_eth_ifname[IFNAMSIZ])
++{
++	uint32_t id = (PPPOE_GET_ETH_ADDR << PPA_PPP_MASK_LEN) | PPA_PPPOE_ID;
++
++	return ppa_ppp_get_info(dev, id, pppoe_eth_ifname);
++}
++
++int32_t ppa_get_pppoe_info(struct net_device *dev, void *po, uint32_t pppoe_id, void *value)
++{
++	struct pppoe_addr pa;
++
++	if(!po){
++		printk("No pppoe sock \n");
++		return -1;
++	}
++
++	if((pppox_sk(po)->chan.private != po)){
++		return -1;
++	}
++
++	pa = pppox_sk(po)->pppoe_pa;
++
++	if(ppa_check_pppoe_addr_valid(dev, &pa) < 0)
++		return -1;
++
++	switch(pppoe_id){
++		case PPPOE_GET_ADDR:
++			*(struct pppoe_addr *)value = pa; break;
++		case PPPOE_GET_SESSION_ID:
++			*(u_int16_t *)value = pa.sid; break;
++		case PPPOE_GET_ETH_ADDR:
++			memcpy(value, pa.dev, sizeof(pa.dev));  break;
++		default:
++			return -1;
++	}
++
++	return 0;
++		
++}
++
++EXPORT_SYMBOL(ppa_pppoe_get_pppoe_addr);
++EXPORT_SYMBOL(ppa_pppoe_get_pppoe_session_id);
++EXPORT_SYMBOL(ppa_get_pkt_pppoe_session_id);
++EXPORT_SYMBOL(ppa_pppoe_get_eth_netif);
++EXPORT_SYMBOL(ppa_get_pppoe_info);
++#endif
+ module_init(pppoe_init);
+ module_exit(pppoe_exit);
+ 
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -268,3 +268,6 @@ void pid_ns_release_proc(struct pid_name
+ {
+ 	kern_unmount(ns->proc_mnt);
+ }
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++EXPORT_SYMBOL(proc_root);
++#endif
+--- a/include/linux/ppp_channel.h
++++ b/include/linux/ppp_channel.h
+@@ -75,6 +75,11 @@ extern int ppp_unit_number(struct ppp_ch
+ /* Get the device name associated with a channel, or NULL if none */
+ extern char *ppp_dev_name(struct ppp_channel *);
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++extern int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value);
++#endif
++
++
+ /*
+  * SMP locking notes:
+  * The channel code must ensure that when it calls ppp_unregister_channel,
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -33,10 +33,12 @@
+ /*
+  * Generic access of ipvs struct
+  */
++#if IS_ENABLED(CONFIG_IP_VS)
+ static inline struct netns_ipvs *net_ipvs(struct net* net)
+ {
+ 	return net->ipvs;
+ }
++#endif
+ /*
+  * Get net ptr from skb in traffic cases
+  * use skb_sknet when call is from userland (ioctl or netlink)
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -47,6 +47,12 @@
+ #define NEXTHDR_MAX		255
+ 
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++static inline void ipv6_addr_copy(struct in6_addr *a1, const struct in6_addr *a2)
++{
++   memcpy(a1, a2, sizeof(struct in6_addr));
++}
++#endif
+ 
+ #define IPV6_DEFAULT_HOPLIMIT   64
+ #define IPV6_DEFAULT_MCASTHOPS	1
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -326,6 +326,15 @@ void init_nf_conntrack_hash_rnd(void);
+ 
+ void nf_conntrack_tmpl_insert(struct net *net, struct nf_conn *tmpl);
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++uint32_t get_hash_from_ct(const struct nf_conn *ct, uint8_t dir, struct nf_conntrack_tuple* tuple);
++int get_hash_from_skb(struct sk_buff *skb, 
++                      unsigned char pf, 
++                      uint32_t *u32_hash, 
++                      struct nf_conntrack_tuple* tuple );
++#endif
++
++
+ #define NF_CT_STAT_INC(net, count)	  __this_cpu_inc((net)->ct.stat->count)
+ #define NF_CT_STAT_INC_ATOMIC(net, count) this_cpu_inc((net)->ct.stat->count)
+ 
+--- a/include/uapi/linux/ppp-ioctl.h
++++ b/include/uapi/linux/ppp-ioctl.h
+@@ -116,4 +116,12 @@ struct pppol2tp_ioc_stats {
+ #define SIOCGPPPVER     (SIOCDEVPRIVATE + 1)	/* NEVER change this!! */
+ #define SIOCGPPPCSTATS  (SIOCDEVPRIVATE + 2)
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#define PPA_PPP_MASK_LEN   2
++#define PPA_PPP_MASK    3
++#define PPA_PPPOE_ID       0x00000001
++#define PPA_PPPOA_ID    0x00000002
++#define PPA_PPPOL2TP_ID 0x00000003
++#endif
++
+ #endif /* _PPP_IOCTL_H */
+--- a/init/main.c
++++ b/init/main.c
+@@ -148,6 +148,8 @@ static char *ramdisk_execute_command;
+ unsigned int reset_devices;
+ EXPORT_SYMBOL(reset_devices);
+ 
++EXPORT_SYMBOL(saved_command_line);
++
+ static int __init set_reset_devices(char *str)
+ {
+ 	reset_devices = 1;
+--- a/net/8021q/vlan_dev.c
++++ b/net/8021q/vlan_dev.c
+@@ -22,6 +22,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/skbuff.h>
+@@ -67,9 +68,12 @@ static int vlan_dev_rebuild_header(struc
+ 
+ 	return 0;
+ }
+-
++#if defined(CONFIG_LTQ_PPA_API_MODULE) || defined(CONFIG_LTQ_PPA_API)
++u16 vlan_dev_get_egress_qos_mask(struct net_device *dev, struct sk_buff *skb)
++#else
+ static inline u16
+ vlan_dev_get_egress_qos_mask(struct net_device *dev, struct sk_buff *skb)
++#endif
+ {
+ 	struct vlan_priority_tci_mapping *mp;
+ 
+@@ -363,6 +367,32 @@ static int vlan_dev_stop(struct net_devi
+ 	netif_carrier_off(dev);
+ 	return 0;
+ }
++#if defined(CONFIG_LTQ_PPA_API_MODULE) || defined(CONFIG_LTQ_PPA_API)
++int vlan_dev_get_vid(const char *dev_name, unsigned short* result)
++{
++	struct net_device *dev = dev_get_by_name(&init_net, dev_name);
++    
++	int rv = 0;
++	if (dev) {
++		if (dev->priv_flags & IFF_802_1Q_VLAN) {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 10)
++			*result = vlan_dev_info(dev)->vlan_id;
++#else
++		   *result = vlan_dev_priv(dev)->vlan_id;
++#endif
++			rv = 0;
++		} else {
++			rv = -EINVAL;
++		}
++		dev_put(dev);
++	} else {
++		rv = -ENODEV;
++	}
++	return rv;
++}
++#endif
++
++
+ 
+ static int vlan_dev_set_mac_address(struct net_device *dev, void *p)
+ {
+@@ -852,3 +882,8 @@ void vlan_setup(struct net_device *dev)
+ 
+ 	memset(dev->broadcast, 0, ETH_ALEN);
+ }
++#if defined(CONFIG_LTQ_PPA_API_MODULE) || defined(CONFIG_LTQ_PPA_API)
++EXPORT_SYMBOL(vlan_dev_get_vid);
++EXPORT_SYMBOL(vlan_dev_get_egress_qos_mask);
++#endif
++
+--- a/net/atm/br2684.c
++++ b/net/atm/br2684.c
+@@ -524,6 +524,10 @@ free_skb:
+ 	dev_kfree_skb(skb);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int);
++#endif
++
+ /*
+  * Assign a vcc to a dev
+  * Note: we do not have explicit unassign, but look at _push()
+@@ -595,7 +599,11 @@ static int br2684_regvcc(struct atm_vcc
+ 	barrier();
+ 	atmvcc->push = br2684_push;
+ 	atmvcc->pop = br2684_pop;
+-	atmvcc->release_cb = br2684_release_cb;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++   if ( ppa_hook_mpoa_setup )
++		ppa_hook_mpoa_setup(atmvcc, brdev->payload == p_routed ? 3 : 0, brvcc->encaps == BR2684_ENCAPS_LLC ? 1 : 0);     //  IPoA or EoA w/o FCS
++#endif
++   atmvcc->release_cb = br2684_release_cb;
+ 	atmvcc->owner = THIS_MODULE;
+ 
+ 	/* initialize netdev carrier state */
+@@ -878,9 +886,109 @@ static void __exit br2684_exit(void)
+ 	}
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++int ppa_br2684_get_vcc(struct net_device *netdev, struct atm_vcc **pvcc)
++{
++    if ( netdev && (uint32_t)br2684_start_xmit == (uint32_t)netdev->netdev_ops->ndo_start_xmit)
++    {
++        struct br2684_dev *brdev;
++        struct br2684_vcc *brvcc;
++
++  
++        brdev = (struct br2684_dev *)BRPRIV(netdev);
++        brvcc = list_empty(&brdev->brvccs) ? NULL : list_entry(brdev->brvccs.next, struct br2684_vcc, brvccs);
++
++        if ( brvcc )
++        {
++            *pvcc = brvcc->atmvcc;
++            return 0;
++        }
++    }
++
++    return -1;
++}
++
++int32_t ppa_if_is_br2684(struct net_device *netdev, char *ifname)
++{
++    if ( !netdev )
++    {
++        netdev = dev_get_by_name(&init_net,ifname);
++        if ( !netdev )
++            return 0;   //  can not get
++        else
++            dev_put(netdev);
++    }
++
++    return (uint32_t)br2684_start_xmit == (uint32_t)netdev->netdev_ops->ndo_start_xmit ? 1 : 0;
++}
++
++int32_t ppa_if_is_ipoa(struct net_device *netdev, char *ifname)
++{
++    if ( !netdev )
++    {
++        netdev = dev_get_by_name(&init_net,ifname);
++        if ( !netdev )
++            return 0;
++        else
++            dev_put(netdev);
++    }
++
++    if ( ppa_if_is_br2684(netdev, ifname) )
++    {
++        struct br2684_dev *brdev;
++        //struct br2684_vcc *brvcc;
++
++//  #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
++        //brdev = (struct br2684_dev *)netif->priv;
++        brdev = BRPRIV(netdev);
++//  #else
++//        brdev = (struct br2684_dev *)((char *)(netif) - (unsigned long)(&((struct br2684_dev *)0)->net_dev));
++//  #endif
++        //brvcc = list_empty(&brdev->brvccs) ? NULL : list_entry(brdev->brvccs.next, struct br2684_vcc, brvccs);
++
++        //return brvcc && brvcc->payload == p_routed ? 1 : 0;
++        return brdev && brdev->payload == p_routed ? 1 : 0;
++    }
++
++    return 0;
++}
++#endif
++
++#ifdef CONFIG_WAN_VLAN_SUPPORT
++int br2684_vlan_dev_get_vid(struct net_device *dev, uint16_t *vid)
++{
++	int ret=0;
++	struct br2684_dev *brdev;
++
++	if (!dev || !vid)
++		return -EINVAL;
++
++	dev_hold(dev);
++	brdev = BRPRIV(dev);
++
++	if (brdev->vlan.tag_vlan_enable) {
++		*vid = brdev->vlan.vlan_vci;
++	} else {
++		ret=-EINVAL;
++	}
++
++	pr_debug("(%s) Returning VLAN Id [%d]; VLAN enable [%d] for [%s]\n",
++		__func__, *vid, brdev->vlan.tag_vlan_enable, dev->name);
++
++	dev_put(dev);
++	return ret;
++}
++EXPORT_SYMBOL(br2684_vlan_dev_get_vid);
++#endif
++
+ module_init(br2684_init);
+ module_exit(br2684_exit);
+ 
+ MODULE_AUTHOR("Marcell GAL");
+ MODULE_DESCRIPTION("RFC2684 bridged protocols over ATM/AAL5");
+ MODULE_LICENSE("GPL");
++#if defined(CONFIG_LTQ_PPA_API_MODULE)
++  EXPORT_SYMBOL(ppa_if_is_ipoa);
++  EXPORT_SYMBOL(ppa_if_is_br2684);
++  EXPORT_SYMBOL(ppa_br2684_get_vcc);
++#endif
+--- a/net/atm/common.c
++++ b/net/atm/common.c
+@@ -908,3 +908,7 @@ module_exit(atm_exit);
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS_NETPROTO(PF_ATMPVC);
+ MODULE_ALIAS_NETPROTO(PF_ATMSVC);
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int) = NULL;
++EXPORT_SYMBOL(ppa_hook_mpoa_setup);
++#endif
+--- a/net/atm/mpc.c
++++ b/net/atm/mpc.c
+@@ -602,6 +602,10 @@ non_ip:
+ 	return mpc->old_ops->ndo_start_xmit(skb, dev);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int);
++#endif
++
+ static int atm_mpoa_vcc_attach(struct atm_vcc *vcc, void __user *arg)
+ {
+ 	int bytes_left;
+@@ -644,7 +648,10 @@ static int atm_mpoa_vcc_attach(struct at
+ 
+ 	vcc->proto_data = mpc->dev;
+ 	vcc->push = mpc_push;
+-
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_mpoa_setup )
++		ppa_hook_mpoa_setup(vcc, 3, 1);	//  IPoA, LLC
++#endif
+ 	return 0;
+ }
+ 
+--- a/net/atm/pppoatm.c
++++ b/net/atm/pppoatm.c
+@@ -390,6 +390,9 @@ static const struct ppp_channel_ops pppo
+ 	.ioctl = pppoatm_devppp_ioctl,
+ };
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern void (*ppa_hook_mpoa_setup)(struct atm_vcc *, int, int);
++#endif
+ static int pppoatm_assign_vcc(struct atm_vcc *atmvcc, void __user *arg)
+ {
+ 	struct atm_backend_ppp be;
+@@ -431,7 +434,11 @@ static int pppoatm_assign_vcc(struct atm
+ 	atmvcc->user_back = pvcc;
+ 	atmvcc->push = pppoatm_push;
+ 	atmvcc->pop = pppoatm_pop;
+-	atmvcc->release_cb = pppoatm_release_cb;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_mpoa_setup )
++        ppa_hook_mpoa_setup(atmvcc, 2, pvcc->encaps == e_llc ? 1 : 0);  //  PPPoA
++#endif
++   atmvcc->release_cb = pppoatm_release_cb;
+ 	__module_get(THIS_MODULE);
+ 	atmvcc->owner = THIS_MODULE;
+ 
+@@ -492,6 +499,76 @@ static void __exit pppoatm_exit(void)
+ 	deregister_atm_ioctl(&pppoatm_ioctl_ops);
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++
++extern int32_t ppa_ppp_get_info(struct net_device *ppp_dev, uint32_t ppp_info_id, void *value);
++
++enum{
++	PPA_PPPOA_GET_VCC = 1,
++	PPA_PPPOA_CHECK_IFACE,
++};
++
++int32_t ppa_get_pppoa_info(struct net_device *dev, void *pvcc, uint32_t pppoa_id, void *value)
++{
++	struct atm_vcc **patmvcc = (struct atm_vcc **)value;
++    struct pppoatm_vcc *p_atm_vcc = (struct pppoatm_vcc *)pvcc;
++
++	if(!p_atm_vcc){
++		return -1;
++	}
++
++	if(p_atm_vcc->chan.private != pvcc){
++		return -1;
++	}
++	
++	switch(pppoa_id){
++		case PPA_PPPOA_GET_VCC:
++			* patmvcc = p_atm_vcc->atmvcc;
++			break;
++
++		case PPA_PPPOA_CHECK_IFACE:
++			break;
++
++		default:
++			break;
++	}
++
++	return 0;
++}
++
++int32_t ppa_pppoa_get_vcc(struct net_device *dev, struct atm_vcc **patmvcc)
++{
++    uint32_t id = (PPA_PPPOA_GET_VCC << PPA_PPP_MASK_LEN) | PPA_PPPOA_ID;
++
++	return ppa_ppp_get_info(dev, id, (void *) patmvcc);
++
++}
++
++int32_t ppa_if_is_pppoa(struct net_device *dev, char *ifname)
++{
++    uint32_t id = (PPA_PPPOA_CHECK_IFACE << PPA_PPP_MASK_LEN) | PPA_PPPOA_ID;
++
++    if ( !dev )
++    {
++        dev = dev_get_by_name(&init_net,ifname);
++        if ( dev )
++            dev_put(dev);
++        else{
++            return 0;   //  can not get
++        }
++    }
++
++    if(ppa_ppp_get_info(dev, id, &id) >= 0){
++		return 1;
++    }
++
++	return 0;
++}
++
++EXPORT_SYMBOL(ppa_get_pppoa_info);
++EXPORT_SYMBOL(ppa_pppoa_get_vcc);
++EXPORT_SYMBOL(ppa_if_is_pppoa);
++#endif
+ module_init(pppoatm_init);
+ module_exit(pppoatm_exit);
+ 
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -11,6 +11,7 @@
+  *	2 of the License, or (at your option) any later version.
+  */
+ 
++#include <linux/version.h>
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+ #include <linux/rculist.h>
+@@ -26,6 +27,9 @@
+ #include <linux/if_vlan.h>
+ #include "br_private.h"
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
+ static struct kmem_cache *br_fdb_cache __read_mostly;
+ static int fdb_insert(struct net_bridge *br, struct net_bridge_port *source,
+ 		      const unsigned char *addr, u16 vid);
+@@ -84,6 +88,10 @@ static void fdb_rcu_free(struct rcu_head
+ 
+ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f)
+ {
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_bridge_entry_delete_fn != NULL )
++        ppa_hook_bridge_entry_delete_fn(f->addr.addr, br->dev, 0);
++#endif
+ 	hlist_del_rcu(&f->hlist);
+ 	fdb_notify(br, f, RTM_DELNEIGH);
+ 	call_rcu(&f->rcu, fdb_rcu_free);
+@@ -183,6 +191,19 @@ void br_fdb_cleanup(unsigned long _data)
+ 
+ 		hlist_for_each_entry_safe(f, n, &br->hash[i], hlist) {
+ 			unsigned long this_timer;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++            if ( ppa_hook_bridge_entry_hit_time_fn != NULL && !f->is_local )
++            {
++                uint32_t last_hit_time;
++
++                if ( ppa_hook_bridge_entry_hit_time_fn(f->addr.addr, br->dev,  &last_hit_time) == PPA_HIT )
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 36)
++                f->ageing_timer = last_hit_time * HZ;
++#else
++                f->updated = last_hit_time * HZ;
++#endif
++            }
++#endif
+ 			if (f->is_static)
+ 				continue;
+ 			this_timer = f->updated + delay;
+@@ -473,6 +494,11 @@ void br_fdb_update(struct net_bridge *br
+ 			/* fastpath: update of existing entry */
+ 			fdb->dst = source;
+ 			fdb->updated = jiffies;
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++	//update an existing bridge entry used from xrx500
++        if ( ppa_hook_bridge_entry_add_fn != NULL && source->dev )
++            ppa_hook_bridge_entry_add_fn((unsigned char *)addr, br->dev, source->dev, PPA_F_BRIDGE_ACCEL_MODE);
++#endif
+ 		}
+ 	} else {
+ 		spin_lock(&br->hash_lock);
+@@ -484,6 +510,10 @@ void br_fdb_update(struct net_bridge *br
+ 		/* else  we lose race and someone else inserts
+ 		 * it first, don't bother updating
+ 		 */
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ppa_hook_bridge_entry_add_fn != NULL && source->dev )
++            ppa_hook_bridge_entry_add_fn((unsigned char *)addr, br->dev, source->dev, 0);
++#endif
+ 		spin_unlock(&br->hash_lock);
+ 	}
+ }
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -24,6 +24,10 @@
+ #endif
+ #include "br_private.h"
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
++
+ static int deliver_clone(const struct net_bridge_port *prev,
+ 			 struct sk_buff *skb,
+ 			 void (*__packet_hook)(const struct net_bridge_port *p,
+@@ -52,6 +56,15 @@ int br_dev_queue_push_xmit(struct sk_buf
+ 	} else {
+ 		skb_push(skb, ETH_HLEN);
+ 		br_drop_fake_rtable(skb);
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)) && (defined( CONFIG_LTQ_BRIDGE_LEARNING))
++		if ( ppa_hook_session_add_fn != NULL )
++		{
++			ppa_hook_session_add_fn(skb, 
++					NULL, 
++					PPA_F_BRIDGED_SESSION);
++		}
++#endif
+ 		dev_queue_xmit(skb);
+ 	}
+ 
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@ -41,6 +41,9 @@
+ #ifdef CONFIG_SYSCTL
+ #include <linux/sysctl.h>
+ #endif
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
+ 
+ #define skb_origaddr(skb)	 (((struct bridge_skb_cb *) \
+ 				 (skb->nf_bridge->data))->daddr.ipv4)
+@@ -695,6 +698,14 @@ static unsigned int br_nf_pre_routing(un
+ 		return NF_DROP;
+ 	br = p->br;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)) && (defined( CONFIG_LTQ_BRIDGE_LEARNING))
++	if ( ppa_hook_session_add_fn != NULL )
++	{
++		ppa_hook_session_add_fn(skb, 
++				NULL, PPA_F_BRIDGED_SESSION|PPA_F_BEFORE_NAT_TRANSFORM);
++	}
++#endif
++
+ 	if (IS_IPV6(skb) || IS_VLAN_IPV6(skb) || IS_PPPOE_IPV6(skb)) {
+ 		if (!brnf_call_ip6tables && !br->nf_call_ip6tables)
+ 			return NF_ACCEPT;
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3273,6 +3273,7 @@ int netif_rx(struct sk_buff *skb)
+ 	net_timestamp_check(netdev_tstamp_prequeue, skb);
+ 
+ 	trace_netif_rx(skb);
++
+ #ifdef CONFIG_RPS
+ 	if (static_key_false(&rps_needed)) {
+ 		struct rps_dev_flow voidflow, *rflow = &voidflow;
+@@ -3658,10 +3659,21 @@ out:
+ 	return ret;
+ }
+ 
++#if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
++extern int32_t (*ppa_sw_fastpath_send_hook)(struct sk_buff *skb);
++#endif
++
+ static int __netif_receive_skb(struct sk_buff *skb)
+ {
+ 	int ret;
+ 
++#if defined(CONFIG_LTQ_PPA_API_SW_FASTPATH)
++	if(ppa_sw_fastpath_send_hook!=NULL) {
++		if(ppa_sw_fastpath_send_hook(skb) == 0)
++			return NET_RX_SUCCESS;
++	}
++#endif
++
+ 	if (sk_memalloc_socks() && skb_pfmemalloc(skb)) {
+ 		unsigned long pflags = current->flags;
+ 
+@@ -3683,6 +3695,7 @@ static int __netif_receive_skb(struct sk
+ 	return ret;
+ }
+ 
++
+ /**
+  *	netif_receive_skb - process receive buffer from network
+  *	@skb: buffer to process
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@ -778,6 +778,17 @@ static struct pernet_operations ipgre_ta
+ 	.size = sizeof(struct ip_tunnel_net),
+ };
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern uint32_t (*ppa_is_ipv4_gretap_fn)(struct net_device *dev);
++static uint32_t ppa_is_ipv4_gretap(struct net_device *dev)
++{
++
++  if( dev->netdev_ops == (&gre_tap_netdev_ops) )
++    return 1;
++  return 0;
++}
++#endif
++
+ static int __init ipgre_init(void)
+ {
+ 	int err;
+@@ -806,6 +817,10 @@ static int __init ipgre_init(void)
+ 	if (err < 0)
+ 		goto tap_ops_failed;
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  ppa_is_ipv4_gretap_fn = ppa_is_ipv4_gretap;
++#endif
++
+ 	return 0;
+ 
+ tap_ops_failed:
+@@ -821,6 +836,9 @@ pnet_tap_faied:
+ 
+ static void __exit ipgre_fini(void)
+ {
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  ppa_is_ipv4_gretap_fn = NULL;
++#endif
+ 	rtnl_link_unregister(&ipgre_tap_ops);
+ 	rtnl_link_unregister(&ipgre_link_ops);
+ 	gre_cisco_unregister(&ipgre_protocol);
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -79,6 +79,10 @@
+ #include <linux/mroute.h>
+ #include <linux/netlink.h>
+ #include <linux/tcp.h>
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
++
+ 
+ int sysctl_ip_default_ttl __read_mostly = IPDEFTTL;
+ EXPORT_SYMBOL(sysctl_ip_default_ttl);
+@@ -192,6 +196,23 @@ static inline int ip_finish_output2(stru
+ 		skb = skb2;
+ 	}
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ppa_hook_session_add_fn != NULL )
++        {
++            struct nf_conn *ct;
++
++            enum ip_conntrack_info ctinfo;
++            uint32_t flags;
++    
++            ct = nf_ct_get(skb, &ctinfo);
++    
++            flags = 0;  //  post routing
++            flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ? PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
++    
++            ppa_hook_session_add_fn(skb, ct, flags);
++        }
++#endif
++
+ 	rcu_read_lock_bh();
+ 	nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);
+ 	neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -1660,6 +1660,18 @@ static struct rtnl_link_ops ip6gre_tap_o
+ 	.fill_info	= ip6gre_fill_info,
+ };
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++extern uint32_t (*ppa_is_ipv6_gretap_fn)(struct net_device *dev);
++static uint32_t ppa_is_ipv6_gretap(struct net_device *dev)
++{
++
++  if( dev->netdev_ops == (&ip6gre_tap_netdev_ops) )
++    return 1;
++  
++  return 0;
++}
++#endif
++
+ /*
+  *	And now the modules code and kernel interface.
+  */
+@@ -1688,6 +1700,10 @@ static int __init ip6gre_init(void)
+ 	if (err < 0)
+ 		goto tap_ops_failed;
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  ppa_is_ipv6_gretap_fn = ppa_is_ipv6_gretap;
++#endif
++
+ out:
+ 	return err;
+ 
+@@ -1702,6 +1718,9 @@ add_proto_failed:
+ 
+ static void __exit ip6gre_fini(void)
+ {
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  ppa_is_ipv6_gretap_fn = NULL;
++#endif
+ 	rtnl_link_unregister(&ip6gre_tap_ops);
+ 	rtnl_link_unregister(&ip6gre_link_ops);
+ 	inet6_del_protocol(&ip6gre_protocol, IPPROTO_GRE);
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -56,6 +56,10 @@
+ #include <net/checksum.h>
+ #include <linux/mroute6.h>
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++	#include <net/ppa_api.h>
++#endif
++
+ static int ip6_finish_output2(struct sk_buff *skb)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+@@ -104,6 +108,27 @@ static int ip6_finish_output2(struct sk_
+ 		}
+ 	}
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++	if ( ppa_hook_session_add_fn != NULL )
++	{
++#ifdef CONFIG_NF_CONNTRACK
++		struct nf_conn *ct;
++#else
++		struct ip_conntrack *ct;
++#endif
++		enum ip_conntrack_info ctinfo;
++		uint32_t flags;
++#ifdef CONFIG_NF_CONNTRACK
++		ct = nf_ct_get(skb, &ctinfo);
++#else
++		ct = ip_conntrack_get(skb, &ctinfo);
++#endif
++		flags = 0; //  post routing
++		flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ? PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;  
++		ppa_hook_session_add_fn(skb, ct, flags);
++	}
++#endif
++
+ 	rcu_read_lock_bh();
+ 	nexthop = rt6_nexthop((struct rt6_info *)dst);
+ 	neigh = __ipv6_neigh_lookup_noref(dst->dev, nexthop);
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -20,6 +20,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/capability.h>
+ #include <linux/errno.h>
+@@ -59,6 +60,9 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#include <net/ppa_stack_al.h>
++#endif
+ MODULE_AUTHOR("Ville Nuorvala");
+ MODULE_DESCRIPTION("IPv6 tunneling device");
+ MODULE_LICENSE("GPL");
+@@ -92,6 +96,22 @@ static int ip6_tnl_dev_init(struct net_d
+ static void ip6_tnl_dev_setup(struct net_device *dev);
+ static struct rtnl_link_ops ip6_link_ops __read_mostly;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    extern int (*ppa_get_ip4ip6_dmac_fn)(struct net_device *, uint8_t *mac);
++#else
++    extern int (*ppa_get_ip4ip6_dmac_fn)(struct net_device *, struct sk_buff *skb, uint8_t *mac);
++#endif
++    extern struct net_device * (*ppa_get_ip4ip6_phyif_fn)(struct net_device *);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    static int ppa_get_ip4ip6_dmac(struct net_device *dev, uint8_t *mac);
++#else
++    static int ppa_get_ip4ip6_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac);
++#endif
++    static  struct net_device *ppa_get_ip4ip6_phyif(struct net_device *dev);
++#endif
++
++
+ static int ip6_tnl_net_id __read_mostly;
+ struct ip6_tnl_net {
+ 	/* the IPv6 tunnel fallback device */
+@@ -1831,6 +1851,11 @@ static int __init ip6_tunnel_init(void)
+ 	if (err < 0)
+ 		goto rtnl_link_failed;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++    ppa_get_ip4ip6_dmac_fn = ppa_get_ip4ip6_dmac;
++    ppa_get_ip4ip6_phyif_fn = ppa_get_ip4ip6_phyif;
++#endif
++
+ 	return 0;
+ 
+ rtnl_link_failed:
+@@ -1856,8 +1881,191 @@ static void __exit ip6_tunnel_cleanup(vo
+ 	if (xfrm6_tunnel_deregister(&ip6ip6_handler, AF_INET6))
+ 		pr_info("%s: can't deregister ip6ip6\n", __func__);
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++    ppa_get_ip4ip6_dmac_fn = NULL;
++    ppa_get_ip4ip6_phyif_fn = NULL;
++#endif
++
++
+ 	unregister_pernet_device(&ip6_tnl_net_ops);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++static struct net_device *ppa_get_ip4ip6_phyif(struct net_device *dev)
++{
++    struct ip6_tnl *t = netdev_priv(dev);
++    struct dst_entry *dst;
++    
++#if 1
++	struct flowi6 fl6;
++	__u8 dsfield;
++	int err;
++	struct dst_entry *ndst = NULL;
++	struct net *net = dev_net(dev);
++
++	memcpy(&fl6, &t->fl.u.ip6, sizeof (fl6));
++	fl6.flowi6_proto = IPPROTO_IPIP;
++
++	if ((dst = ip6_tnl_dst_check(t)) != NULL){
++        	if(dst->dev != dev)
++            		return dst->dev;
++    	} else { 
++		ndst = ip6_route_output(net, NULL, &fl6);
++
++		if (ndst->error) {
++			goto tx_err_link_failure;
++		}
++		ndst = xfrm_lookup(net, ndst, flowi6_to_flowi(&fl6), NULL, 0);
++		if (IS_ERR(ndst)) {
++			err = PTR_ERR(ndst);
++			ndst = NULL;
++			goto tx_err_link_failure;
++		}
++		dst = ndst;
++
++        	if(dst->dev != dev) {
++            		return dst->dev;
++		}
++	}
++tx_err_link_failure:
++	return NULL;
++
++#else 
++    if ((dst = ip6_tnl_dst_check(t)) != NULL){
++        if(dst->dev != dev)
++            return dst->dev;
++    }
++#endif
++
++    return NULL;
++}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++static int ppa_get_ip4ip6_dmac(struct net_device *dev,uint8_t *mac)
++#else
++int ppa_get_ip4ip6_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac)
++#endif
++{
++    struct ip6_tnl *t = netdev_priv(dev);
++    struct dst_entry *dst = NULL;
++    struct hh_cache *hh;
++
++    
++	if(!mac){
++        return -1;
++    }
++
++#if 1	
++	struct flowi6 fl6;
++	__u8 dsfield;
++	int err;
++	struct dst_entry *ndst = NULL;
++	struct net *net = dev_net(dev);
++
++	memcpy(&fl6, &t->fl.u.ip6, sizeof (fl6));
++	fl6.flowi6_proto = IPPROTO_IPIP;
++
++	if ((dst = ip6_tnl_dst_check(t)) == NULL || dst->dev == dev){
++    		
++		ndst = ip6_route_output(net, NULL, &fl6);
++
++		if (ndst->error) {
++			//goto tx_err_link_failure;
++                        return -1;
++		}
++		ndst = xfrm_lookup(net, ndst, flowi6_to_flowi(&fl6), NULL, 0);
++		if (IS_ERR(ndst)) {
++			err = PTR_ERR(ndst);
++			ndst = NULL;
++			//goto tx_err_link_failure;
++                        return -1;
++		}
++		dst = ndst;
++
++        	if(dst->dev == dev) {
++            		return -1;
++		}
++	}
++        dst_hold(dst);
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    hh = dst->hh;
++    if(!hh){
++       if ( dst->neighbour 
++                && (dst->neighbour->ha[0] != 0
++                || dst->neighbour->ha[1] != 0
++                || dst->neighbour->ha[2] != 0
++                || dst->neighbour->ha[3] != 0
++                || dst->neighbour->ha[4] != 0
++                || dst->neighbour->ha[5] != 0) ){
++                
++            memcpy(mac, (uint8_t *)dst->neighbour->ha, ETH_ALEN);
++        }else{
++            goto MAC_ERROR;
++        }
++#else
++    struct neighbour *neigh;
++    //neigh = dst_neigh_lookup_skb(dst,skb);
++    neigh = dst_neigh_lookup(dst,&(t->parms.raddr));
++    if(neigh == NULL)
++    {
++       return -1;
++    }
++
++    if(dst->dev->header_ops->cache == NULL)
++    {
++       ppa_neigh_hh_init(neigh,dst);   
++       ppa_neigh_update_hhs(neigh);
++    }
++
++    hh = &neigh->hh;
++    if ( !hh )
++    {
++        if ( neigh
++            && (neigh->ha[0] != 0
++                || neigh->ha[1] != 0
++                || neigh->ha[2] != 0
++                || neigh->ha[3] != 0
++                || neigh->ha[4] != 0
++                || neigh->ha[5] != 0) )
++        {
++            memcpy(mac, (uint8_t *)neigh->ha, ETH_ALEN);
++        }else{
++            goto MAC_ERROR;
++        }
++
++#endif
++    }else{
++        unsigned int seq;
++
++        do {
++            seq = read_seqbegin(&hh->hh_lock);
++            if ( hh->hh_len != ETH_HLEN )
++            {
++                //printk("head length is not correct: hh->hh_len = %d, ETH_HLEN = %d\n", (int)hh->hh_len, ETH_HLEN);
++                goto MAC_ERROR;
++            }
++            else
++            {
++                memcpy(mac, (uint8_t *)hh->hh_data + HH_DATA_ALIGN(hh->hh_len) - hh->hh_len, ETH_ALEN);
++            }
++        } while ( read_seqretry(&hh->hh_lock, seq) );
++    }
++
++    dst_release(dst);
++
++    return 0;
++    
++MAC_ERROR:
++
++    dst_release(dst);
++    return -1;
++    
++}
++
++#endif
++
+ module_init(ip6_tunnel_init);
+ module_exit(ip6_tunnel_cleanup);
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -19,6 +19,7 @@
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
++#include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/capability.h>
+ #include <linux/errno.h>
+@@ -35,7 +36,7 @@
+ #include <linux/init.h>
+ #include <linux/netfilter_ipv4.h>
+ #include <linux/if_ether.h>
+-
++#include <linux/inetdevice.h>
+ #include <net/sock.h>
+ #include <net/snmp.h>
+ 
+@@ -56,6 +57,10 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#include <net/ppa_stack_al.h>
++#include <net/arp.h>
++#endif
+ /*
+    This version of net/ipv6/sit.c is cloned of net/ipv4/ip_gre.c
+ 
+@@ -76,6 +81,22 @@ static bool check_6rd(struct ip_tunnel *
+ 		      __be32 *v4dst);
+ static struct rtnl_link_ops sit_link_ops __read_mostly;
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    extern int (*ppa_get_6rd_dmac_fn)(struct net_device *, uint8_t *mac,uint32_t daddr);
++#else
++    extern int (*ppa_get_6rd_dmac_fn)(struct net_device *, struct sk_buff *skb, uint8_t *mac,uint32_t daddr);
++#endif
++    extern struct net_device * (*ppa_get_6rd_phyif_fn)(struct net_device *);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    static int ppa_get_6rd_dmac(struct net_device *dev, uint8_t *mac,uint32_t daddr);
++#else
++    static int ppa_get_6rd_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac,uint32_t daddr);
++#endif
++    static  struct net_device *ppa_get_6rd_phyif(struct net_device *dev);
++#endif
++
++
+ static int sit_net_id __read_mostly;
+ struct sit_net {
+ 	struct ip_tunnel __rcu *tunnels_r_l[HASH_SIZE];
+@@ -1736,6 +1757,12 @@ static int __init sit_init(void)
+ 		pr_info("%s: can't register ip4ip4\n", __func__);
+ 		goto xfrm_tunnel4_failed;
+ 	}
++
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++    ppa_get_6rd_dmac_fn = ppa_get_6rd_dmac;
++    ppa_get_6rd_phyif_fn = ppa_get_6rd_phyif;
++#endif
++
+ 	err = rtnl_link_register(&sit_link_ops);
+ 	if (err < 0)
+ 		goto rtnl_link_failed;
+@@ -1752,6 +1779,153 @@ xfrm_tunnel_failed:
+ 	goto out;
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++int ppa_get_6rd_dmac(struct net_device *dev, uint8_t *mac,uint32_t daddr)
++#else
++int ppa_get_6rd_dmac(struct net_device *dev, struct sk_buff *skb,uint8_t *mac,uint32_t daddr)
++#endif
++{
++	struct ip_tunnel *t;
++	struct iphdr *iph;
++	struct rtable *rt = NULL;
++	int ret = -1;
++	struct neighbour* neigh;
++	struct hh_cache *hh = NULL;
++	struct dst_entry *dst = NULL;
++
++	__be32 pkey = 0;
++
++	t = netdev_priv(dev);
++	iph = &t->parms.iph;
++
++	if (0 == daddr) {
++		daddr = iph->daddr;
++	}
++
++	if( daddr ) {
++		struct flowi4 fl; 
++		memset(&fl,0,sizeof(fl));
++		fl.flowi4_tos = RT_TOS(iph->tos);
++		fl.flowi4_oif = t->parms.link;
++		fl.flowi4_proto = t->parms.iph.protocol; 
++		fl.daddr = iph->daddr;
++		fl.saddr = iph->saddr; 
++
++		rt = ip_route_output_key(dev_net(dev), &fl);
++		if(IS_ERR(rt))
++			return ret;
++	} else {
++		return ret; //No daddr so cannot get dmac
++	}
++
++	/* 
++	 * Note: Since sbk's outer IP is not yer formed when packet reached here. 
++	 * 
++	 */
++	//nexthop = (__force u32) rt_nexthop(rt, iph->daddr);
++	/**To calculate MAC addr of nxt hop based on it is dst addr / gateway addr */
++	if (rt->rt_gateway)
++		pkey = (__be32 ) rt->rt_gateway;
++	else if (skb)
++		pkey = (__be32)iph->daddr; 
++	neigh = __ipv4_neigh_lookup(rt->dst.dev, (__force u32)(pkey));
++	//  neigh = __ipv4_neigh_lookup(rt->dst.dev, (__force u32)(iph->daddr));
++	if(neigh) {
++		dst = &rt->dst;
++
++		ppa_neigh_hh_init(neigh,dst);   
++		ppa_neigh_update_hhs(neigh);
++		hh = &neigh->hh;
++
++		if( !hh ) {
++        	if ( neigh && (neigh->ha[0] != 0
++						|| neigh->ha[1] != 0
++						|| neigh->ha[2] != 0
++						|| neigh->ha[3] != 0
++						|| neigh->ha[4] != 0
++						|| neigh->ha[5] != 0) ) {
++				memcpy(mac, (uint8_t *)neigh->ha, ETH_ALEN);
++				ret = 0;
++			}
++		} else {
++
++			unsigned int seq;
++			do {
++
++				seq = read_seqbegin(&hh->hh_lock);
++				if ( hh->hh_len == ETH_HLEN ) {
++					memcpy(mac, 
++							(uint8_t *)hh->hh_data + HH_DATA_ALIGN(hh->hh_len) - hh->hh_len, 
++							ETH_ALEN);
++					ret = 0;
++				} else
++					ret = -1;
++			} while ( read_seqretry(&hh->hh_lock, seq) );
++		}
++		neigh_release(neigh);
++	}
++	ip_rt_put(rt);
++	return ret;
++}
++
++static  struct net_device *ppa_get_6rd_phyif(struct net_device *dev)
++{
++    struct ip_tunnel *tunnel;
++    struct iphdr *iph;
++    struct rtable *rt = NULL;
++    struct net_device *phydev = NULL;
++
++    tunnel = netdev_priv(dev);
++    iph = &tunnel->parms.iph;
++
++    if (iph->daddr) {
++		
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++      struct flowi fl = { .nl_u = { .ip4_u =
++					      { .daddr = iph->daddr,
++						.saddr = iph->saddr,
++						.tos = RT_TOS(iph->tos) } },
++				    .oif = tunnel->parms.link,
++				    .proto = IPPROTO_IPV6 };
++#else
++
++
++      struct flowi4 fl; 
++      fl.flowi4_tos = RT_TOS(iph->tos);
++		fl.flowi4_oif = tunnel->parms.link;
++		fl.flowi4_proto = IPPROTO_IPV6; 
++		fl.daddr = iph->daddr;
++		fl.saddr = iph->saddr; 
++
++#endif
++
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,8,10)
++    	if (!ip_route_output_key(dev_net(dev), &rt, &fl)) {
++#else
++	rt=ip_route_output_key(dev_net(dev),&fl); {
++#endif
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,36)
++              phydev = rt->u.dst.dev;
++#else
++              phydev = rt->dst.dev;
++#endif
++			ip_rt_put(rt);
++	}
++     } //if (iph->daddr)
++     else
++	//phydev = ip_dev_find(&init_net, iph->saddr);
++	phydev = __ip_dev_find(&init_net, iph->saddr,false);
++
++
++    return phydev;   
++}
++
++#endif
++
++
+ module_init(sit_init);
+ module_exit(sit_cleanup);
+ MODULE_LICENSE("GPL");
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -98,6 +98,7 @@
+ #include <net/udp.h>
+ #include <net/xfrm.h>
+ #include <net/inet_common.h>
++#include <net/flow.h>
+ 
+ #include <asm/byteorder.h>
+ #include <linux/atomic.h>
+@@ -1857,6 +1858,251 @@ static void __exit pppol2tp_exit(void)
+ 	unregister_pernet_device(&pppol2tp_net_ops);
+ }
+ 
++#if (defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE))
++
++enum{
++PPPOL2TP_GET_SESSION_ID=1,
++PPPOL2TP_GET_TUNNEL_ID,
++PPPOL2TP_GET_BASEIF,
++PPPOL2TP_GET_ADDR,
++PPPOL2TP_GET_DMAC,
++PPPOL2TP_GET_SADDR,
++PPPOL2TP_GET_DADDR,
++};
++
++__u16 ppa_pppol2tp_get_l2tp_session_id(struct net_device *dev)
++{
++	uint16_t seid=0;
++	uint32_t id = (PPPOL2TP_GET_SESSION_ID << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++
++	ppa_ppp_get_info(dev, id, &seid);
++
++	return seid;
++}
++
++__u16 ppa_pppol2tp_get_l2tp_tunnel_id(struct net_device *dev)
++{
++	uint16_t tuid=0;
++	uint32_t id = (PPPOL2TP_GET_TUNNEL_ID << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++
++	ppa_ppp_get_info(dev, id, &tuid);
++
++	return tuid;
++}
++
++int32_t ppa_pppol2tp_get_base_netif(struct net_device *dev, char pppol2tp_eth_ifname[IFNAMSIZ])
++{
++	uint32_t id = (PPPOL2TP_GET_BASEIF << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++
++	return ppa_ppp_get_info(dev, id, pppol2tp_eth_ifname);
++}
++
++int32_t ppa_pppol2tp_get_l2tp_addr(struct net_device *dev, struct pppol2tp_addr *pa)
++{
++	uint32_t id = (PPPOL2TP_GET_ADDR << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, pa);
++}
++
++int32_t ppa_pppol2tp_get_l2tp_dmac(struct net_device *dev, uint8_t *mac)
++{
++	uint32_t id = (PPPOL2TP_GET_DMAC << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, mac);
++}
++int32_t ppa_pppol2tp_get_src_addr(struct net_device *dev, uint32_t *outer_srcip)
++{
++	uint32_t id = (PPPOL2TP_GET_SADDR << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, outer_srcip);
++}
++int32_t ppa_pppol2tp_get_dst_addr(struct net_device *dev, uint32_t *outer_dstip)
++{
++	uint32_t id = (PPPOL2TP_GET_DADDR << PPA_PPP_MASK_LEN) | PPA_PPPOL2TP_ID;
++	return ppa_ppp_get_info(dev, id, outer_dstip);
++}
++
++void ppa_pppol2tp_get_saddr( struct net_device *dev, struct sock *sk_tun, uint32_t *outer_srcip )
++{
++	struct inet_sock *inet;
++	uint32_t src_ip;
++
++	inet = inet_sk(sk_tun);
++	src_ip = inet->inet_saddr;
++
++	*outer_srcip = src_ip;
++}
++
++void ppa_pppol2tp_get_daddr( struct net_device *dev, struct sock *sk_tun, uint32_t *outer_dstip )
++{
++	struct inet_sock *inet;
++	uint32_t dst_ip;
++
++	inet = inet_sk(sk_tun);
++	dst_ip = inet->inet_daddr;
++
++	*outer_dstip = dst_ip;
++}
++
++void ppa_pppol2tp_get_eth( struct net_device *dev, struct sock *sk_tun, void *devname)
++{
++	struct inet_sock *inet;
++	struct net_device *phydev = NULL;
++
++	inet = inet_sk(sk_tun);
++
++	if (inet->inet_daddr) {
++		struct flowi fl = { .u.ip4 = { .daddr = inet->inet_daddr,
++									   .saddr = inet->inet_saddr,
++									   .flowi4_tos = RT_TOS(inet->tos),
++									   .flowi4_oif = sk_tun->sk_bound_dev_if,
++									   .flowi4_proto = sk_tun->sk_protocol } };
++		struct rtable *rt;
++		if ((rt = ip_route_output_key(dev_net(dev), (struct flowi4 *)&fl))) {
++			phydev = rt->dst.dev;
++			memcpy(devname, (phydev->name), sizeof(phydev->name));
++		}
++	}
++}
++
++int32_t ppa_pppol2tp_get_dmac( struct net_device *dev, struct sock *sk_tun, uint8_t *mac)
++{
++	struct rtable *rt = NULL;
++	struct dst_entry *dst = NULL;
++	struct neighbour *neighbour = NULL;
++	struct inet_sock *inet;
++
++	inet = inet_sk(sk_tun);
++	dst = sk_tun->sk_dst_cache;
++	rt = (struct rtable *)__sk_dst_check(sk_tun, 0);
++	if ( rt == NULL )
++	{
++		if ( inet->inet_daddr ) {
++
++			struct flowi f1 = { .u.ip4 = { .daddr = inet->inet_daddr,
++										   .saddr = inet->inet_saddr,
++										   .flowi4_tos = RT_TOS(inet->tos),
++										   .flowi4_proto = sk_tun->sk_protocol,
++										   .flowi4_flags = inet_sk_flowi_flags(sk_tun),
++										   .flowi4_oif = sk_tun->sk_bound_dev_if } };
++
++			if ((rt = ip_route_output_key(dev_net(dev), (struct flowi4 *)&f1)))
++			{
++				dst = &rt->dst;
++			}
++		}
++	}
++	dst = &rt->dst;
++	if(!dst)
++	{
++		goto MAC_ERROR;
++	}
++	neighbour = dst_neigh_lookup(dst, &inet->inet_daddr);
++	if ( neighbour
++			&& (neighbour->ha[0] != 0
++			|| neighbour->ha[1] != 0
++			|| neighbour->ha[2] != 0
++			|| neighbour->ha[3] != 0
++			|| neighbour->ha[4] != 0
++			|| neighbour->ha[5] != 0) ){
++		 memcpy(mac, (uint8_t *)(neighbour->ha), ETH_ALEN);
++	}else{
++		goto MAC_ERROR;
++	}
++
++	return 0;
++
++MAC_ERROR:
++
++return -1;
++}
++
++int32_t ppa_get_pppol2tp_info(struct net_device *dev, void *po, uint32_t pppol2tp_id, void *value)
++{
++	struct pppol2tp_addr *pa;
++	struct pppol2tp_session *pls;
++	struct l2tp_session *session;
++	struct l2tp_tunnel *tunnel;
++	char devname[IFNAMSIZ];
++	struct net_device *pppol2tp_dev;
++	struct sock *sk_tun;
++	struct sock *sk;
++	struct inet_sock *inet;
++	int32_t ret = 0;
++
++	if(!po)
++	{
++		/* printk("No pppol2tp sock \n"); */
++		return -1;
++	}
++
++	sk = (struct sock *)po;
++
++	session = pppol2tp_sock_to_session(sk);
++	if(!session)
++	{
++		/* printk("No pppol2tp sock \n"); */
++		return -1;
++	}
++	pls = l2tp_session_priv(session);
++	sk_tun = pls->tunnel_sock;
++	tunnel = l2tp_sock_to_tunnel(sk_tun);
++	if(!tunnel)
++	{
++		/* printk("No pppol2tp sock \n"); */
++		return -1;
++	}
++
++	inet = inet_sk(sk_tun);
++
++	if((pppol2tp_dev = dev_get_by_name(dev_net(dev),devname)))
++		dev_put(pppol2tp_dev);
++
++	switch(pppol2tp_id){
++	case PPPOL2TP_GET_SESSION_ID:
++		*(u_int16_t *)value = session->peer_session_id;
++			break;
++	case PPPOL2TP_GET_TUNNEL_ID:
++		*(u_int16_t *)value = tunnel->peer_tunnel_id;
++			break;
++	case PPPOL2TP_GET_ADDR:
++		pa = (struct pppol2tp_addr *)value;
++		pa->fd  = tunnel->fd;
++		pa->pid = pls->owner;
++		pa->s_tunnel = tunnel->tunnel_id;
++		pa->d_tunnel = tunnel->peer_tunnel_id;
++		pa->s_session = session->session_id;
++		pa->d_session = session->peer_session_id;
++		pa->addr.sin_family = AF_INET;
++		pa->addr.sin_port = inet->inet_dport;
++		pa->addr.sin_addr.s_addr = inet->inet_daddr;
++			break;
++	case PPPOL2TP_GET_BASEIF:
++		ppa_pppol2tp_get_eth(dev,sk_tun,value);
++			break;
++	case PPPOL2TP_GET_DMAC:
++		ret = ppa_pppol2tp_get_dmac(dev,sk_tun,(uint8_t *)value);
++			break;
++	case PPPOL2TP_GET_SADDR:
++		ppa_pppol2tp_get_saddr(dev,sk_tun,(uint32_t *)value);
++			break;
++	case PPPOL2TP_GET_DADDR:
++		ppa_pppol2tp_get_daddr(dev,sk_tun,(uint32_t *)value);
++			break;
++	default:
++		return -1;
++	}
++
++	return 0;
++}
++
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_session_id);
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_tunnel_id);
++EXPORT_SYMBOL(ppa_pppol2tp_get_base_netif);
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_addr);
++EXPORT_SYMBOL(ppa_pppol2tp_get_l2tp_dmac);
++EXPORT_SYMBOL(ppa_pppol2tp_get_src_addr);
++EXPORT_SYMBOL(ppa_pppol2tp_get_dst_addr);
++EXPORT_SYMBOL(ppa_get_pppol2tp_info);
++#endif
++
+ module_init(pppol2tp_init);
+ module_exit(pppol2tp_exit);
+ 
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -28,6 +28,11 @@
+ #endif /* CONFIG_APPCPU_GW_PP_HANDLE */
+ #include "nf_internals.h"
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++#endif
++
++
+ static DEFINE_MUTEX(afinfo_mutex);
+ 
+ const struct nf_afinfo __rcu *nf_afinfo[NFPROTO_NUMPROTO] __read_mostly;
+@@ -218,6 +223,16 @@ next_hook:
+ 	    ti_hil_pp_event (TI_CT_NETFILTER_DISCARD_PKT, (void *)skb);
+ 	}
+ #endif /* CONFIG_APPCPU_GW_PP_HANDLE */
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ppa_hook_session_del_fn != NULL )
++        {
++            struct nf_conn *ct = NULL;
++            enum ip_conntrack_info ctinfo;
++        
++            ct = nf_ct_get(skb, &ctinfo);
++            ppa_hook_session_del_fn(ct, PPA_F_SESSION_ORG_DIR | PPA_F_SESSION_REPLY_DIR);
++        }
++#endif
+                 kfree_skb(skb);
+                 ret = NF_DROP_GETERR(verdict);
+ 		if (ret == 0)
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -55,6 +55,11 @@
+ #include <net/netfilter/nf_nat_core.h>
+ #include <net/netfilter/nf_nat_helper.h>
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++  #include <net/ppa_api.h>
++  static atomic_t g_ppa_force_timeout = {0};
++#endif
++
+ #define NF_CONNTRACK_VERSION	"0.5.0"
+ /*Some random value to indicate that the delete is due to CT timeout.
+  *this is required to differentiate conntrack_flush related delete.
+@@ -197,6 +202,12 @@ static void
+ clean_from_lists(struct nf_conn *ct)
+ {
+ 	pr_debug("clean_from_lists(%p)\n", ct);
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_session_del_fn != NULL )
++    {
++        ppa_hook_session_del_fn(ct, PPA_F_SESSION_ORG_DIR | PPA_F_SESSION_REPLY_DIR);
++    }
++#endif
+ 	hlist_nulls_del_rcu(&ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode);
+ 	hlist_nulls_del_rcu(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode);
+ 
+@@ -215,6 +226,12 @@ destroy_conntrack(struct nf_conntrack *n
+ 	NF_CT_ASSERT(atomic_read(&nfct->use) == 0);
+ 	NF_CT_ASSERT(!timer_pending(&ct->timeout));
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_session_del_fn != NULL )
++    {
++        ppa_hook_session_del_fn(ct, PPA_F_SESSION_ORG_DIR | PPA_F_SESSION_REPLY_DIR);
++    }
++#endif
+ 	/* To make sure we don't get any weird locking issues here:
+ 	 * destroy_conntrack() MUST NOT be called with a write lock
+ 	 * to nf_conntrack_lock!!! -HW */
+@@ -366,6 +383,28 @@ delete_record:
+ 	  return;
+ 	}
+ #else /*PP on ATOM specific conntrack ti_hil_pp_event has to go in here */
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++      /* if this function is called from within a timer interrupt then the timer
++         has actually expired. We need to make this distinction since this function 
++         is also called to remove conntrack's for various reasons other than inactivity
++         timeout */
++         
++    if ( !atomic_read(&g_ppa_force_timeout) && ppa_hook_inactivity_status_fn != NULL)
++    {
++        if ( ppa_hook_inactivity_status_fn((PPA_U_SESSION *)ct) == PPA_HIT )
++        {
++            nf_ct_refresh(ct, 0, 60 * HZ); //to check again after default seconds
++
++            if( !timer_pending(&ct->timeout) )
++            {
++                ct->timeout.expires = jiffies + 60 * HZ;
++                add_timer(&ct->timeout);
++            }
++            return;
++        }
++    }
++#endif
++
+ 	/*go ahead and clear the ct record */
+ 	tstamp = nf_conn_tstamp_find(ct);
+ 	if (tstamp && tstamp->stop == 0)
+@@ -1145,6 +1184,19 @@ nf_conntrack_in(struct net *net, u_int8_
+ 
+ 	if (set_reply && !test_and_set_bit(IPS_SEEN_REPLY_BIT, &ct->status))
+ 		nf_conntrack_event_cache(IPCT_REPLY, ct);
++
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        if ( ret == NF_ACCEPT && ct != NULL && ppa_hook_session_add_fn != NULL )
++        {
++            uint32_t flags;
++    
++            flags = PPA_F_BEFORE_NAT_TRANSFORM;
++            flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ? PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
++    
++            ppa_hook_session_add_fn(skb, ct, flags);
++        }
++#endif
++
+ out:
+ 	if (tmpl) {
+ 		/* Special case: we have to repeat this hook, assign the
+@@ -1235,6 +1287,14 @@ acct:
+ 			atomic64_add(skb->len, &acct[CTINFO2DIR(ctinfo)].bytes);
+ 		}
+ 	}
++
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++    if ( ppa_hook_set_inactivity_fn != NULL )
++    {
++        ppa_hook_set_inactivity_fn((PPA_U_SESSION *)ct, extra_jiffies / HZ);
++    }
++#endif
++
+ }
+ EXPORT_SYMBOL_GPL(__nf_ct_refresh_acct);
+ 
+@@ -1376,6 +1436,10 @@ void nf_ct_iterate_cleanup(struct net *n
+ 	struct nf_conn *ct;
+ 	unsigned int bucket = 0;
+ 
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        atomic_inc(&g_ppa_force_timeout);
++#endif
++
+ 	while ((ct = get_next_corpse(net, iter, data, &bucket)) != NULL) {
+ 		/* Time to push up daises... */
+ 		if (del_timer(&ct->timeout))
+@@ -1385,6 +1449,10 @@ void nf_ct_iterate_cleanup(struct net *n
+ 
+ 		nf_ct_put(ct);
+ 	}
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++        atomic_dec(&g_ppa_force_timeout);
++#endif
++
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_iterate_cleanup);
+ 
+@@ -1799,3 +1867,72 @@ err_slabname:
+ err_stat:
+ 	return ret;
+ }
++
++#if defined(CONFIG_LTQ_PPA_API) || defined(CONFIG_LTQ_PPA_API_MODULE)
++uint32_t get_hash_from_ct(const struct nf_conn *ct, uint8_t dir, struct nf_conntrack_tuple* tuple)
++{
++	*tuple = ct->tuplehash[dir].tuple;
++	return hash_conntrack_raw(tuple, nf_ct_zone(ct));
++}
++EXPORT_SYMBOL(get_hash_from_ct);
++
++int get_hash_from_skb(struct sk_buff *skb, 
++		unsigned char pf, 
++		uint32_t * u32_hash, 
++		struct nf_conntrack_tuple *tuple)
++{
++	u_int8_t protonum;
++	unsigned int dataoff;
++	enum ip_conntrack_info ctinfo;
++	struct nf_conn *tmpl = NULL; 
++	struct nf_conntrack_l3proto *l3proto;
++	struct nf_conntrack_l4proto *l4proto;
++	struct net_device *netdev=skb->dev;
++	u16 zone;
++	int ret;
++
++	if (skb->nfct) {
++		tmpl = (struct nf_conn *)skb->nfct;
++	}
++	zone = tmpl ? nf_ct_zone(tmpl) : NF_CT_DEFAULT_ZONE;
++
++	if( pf == 0 ) {  
++		if (skb->protocol == htons(ETH_P_IP)) {
++			pf = PF_INET;
++		} else if (skb->protocol == htons(ETH_P_IPV6)) {
++			pf = PF_INET6;
++		} //else - hanlde PPPoE 
++
++		if( pf == 0 ) return -1;
++	}
++
++	l3proto = __nf_ct_l3proto_find(pf);
++	ret = l3proto->get_l4proto(skb, skb_network_offset(skb), &dataoff, &protonum);
++	if (ret <= 0) {
++		return -1;
++	}
++
++	l4proto = __nf_ct_l4proto_find(pf, protonum);
++	if (l4proto->error != NULL) { 
++		//TODO: Pass pre routing/post routing hooknum
++		//ret = l4proto->error(dev_net(netdev), tmpl, skb, dataoff, &ctinfo, pf, NF_INET_PRE_ROUTING); 
++		ret = l4proto->error(dev_net(netdev), tmpl, skb, dataoff, &ctinfo, pf, NF_INET_POST_ROUTING); 
++		if (ret <= 0) {
++			return -1;
++		}
++	}
++
++	if (!nf_ct_get_tuple(skb, skb_network_offset(skb),
++				dataoff, pf, protonum, tuple, l3proto,
++				l4proto)) {
++		pr_debug("Can't get tuple\n");
++		return -1;
++	}
++
++	*u32_hash = hash_conntrack_raw(tuple, zone);
++
++	return 0;
++}
++EXPORT_SYMBOL(get_hash_from_skb);
++#endif
++

@@ -1,0 +1,275 @@
+From 5c7ec87fdb5f93225c06f1f95bfa470574ec5f88 Mon Sep 17 00:00:00 2001
+From: Vinay Patel <vinay.r.patel@intel.com>
+Date: Thu, 21 Jan 2016 14:44:23 -0700
+Subject: [PATCH 252/441]     Title:      Enable AC DC indication during low
+ power mode     IssueID:    CPM-231     IssueType:  ECR     Symptom:    NA
+ RootCause:  NA     Resolution: Enable the PMIC AC DC indication interrupt in
+ LPM mode     Test:       Unit test.     Reviewer:   Sindhura Granghi
+ ReviewID:   CCID-122569
+
+---
+ drivers/regulator/int34d9-regulator.c       | 155 +++++++++++++++++-----------
+ include/linux/regulator/int34d9-regulator.h |   3 +-
+ 2 files changed, 99 insertions(+), 59 deletions(-)
+
+--- a/drivers/regulator/int34d9-regulator.c
++++ b/drivers/regulator/int34d9-regulator.c
+@@ -1,7 +1,7 @@
+ /*
+  * int34d9-regulator.c - Puma7 Rohm regulator driver
+  *
+- * Copyright (c) 2015, Intel Corporation.
++ * Copyright (c) 2015 - 2016, Intel Corporation.
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+  * the Free Software Foundation; either version 2 of the License, or
+@@ -302,6 +302,29 @@ int puma7_rohm_regulator_init(void *driv
+    return ret;
+ }
+ 
++static int puma7_rohm_ac_dc_indication(struct puma7_rohm_pmic *pmic, int ac_dc)
++{
++   int ret = 0;
++   struct acpi_object_list input;
++   union acpi_object param;
++   acpi_status status;
++
++   param.type = ACPI_TYPE_INTEGER;
++   param.integer.value = ac_dc;
++
++   input.count = 1;
++   input.pointer = &param;
++   
++   status = acpi_evaluate_object(pmic->handle, "PADI", &input, NULL);
++
++   if (!ACPI_SUCCESS(status)) {
++      dev_err(&pmic->client->dev, "Puma ACPI PADI method execution failed!\n");
++      ret = -EINVAL;
++   }
++
++   return ret;
++}
++
+ /* PMIC interrupt handler */
+ static irqreturn_t puma7_rohm_pmic_isr(int irq, void *data)
+ {
+@@ -329,8 +352,12 @@ static irqreturn_t puma7_rohm_pmic_isr(i
+          return IRQ_NONE;
+       }
+       pwr_src = (reg_val & PUMA7_ROHM_PMIC_SPWRSRC_SDCINDET) ? 1 : 0; // 0 = Disconnected   1 = Connected
+-      acpi_bus_generate_netlink_event(ACPI_PUMA7_ROHM_CLASS, ACPI_PUMA7_ROHM_DEVICE_NAME, PUMA7_ROHM_BATTERY_NOTIFY_STATUS_CHANGE, pwr_src);
+-   
++      
++      if ((puma7_rohm_ac_dc_indication(pmic, pwr_src)) < 0) {
++         dev_err(&pmic->client->dev, "puma7_rohm_ac_dc_indication error! %s\n", __func__);
++         return IRQ_NONE;
++      }
++      
+       reg_val = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_PWRSRCIRQ_REG, PUMA7_ROHM_PMIC_THRMIRQ_DCINDET);
+       if (reg_val < 0) {
+          dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
+@@ -345,36 +372,38 @@ static irqreturn_t puma7_rohm_pmic_isr(i
+ static int puma7_rohm_regulator_probe(struct i2c_client *client,
+ 				   const struct i2c_device_id *i2c_id)
+ {
+-	struct regulator_dev **rdev;
+-	struct device *dev = &client->dev;
+-	struct puma7_rohm_platform_data *pdata; 
++   struct regulator_dev **rdev;
++   struct device *dev = &client->dev;
++   struct puma7_rohm_platform_data *pdata; 
+    struct puma7_rohm_subdev_data *sub;
+-	struct regulator_config config = { };
+-	struct puma7_rohm_pmic *pmic;
+-	int i, ret = -EINVAL;
+-	unsigned long driver_private_data;
++   struct regulator_config config = { };
++   struct puma7_rohm_pmic *pmic;
++   int i, ret = -EINVAL;
++   unsigned long driver_private_data;
+    unsigned int gpio_index;
+    struct acpi_gpio_info info;
+-   
+-	driver_private_data = i2c_id->driver_data;
++   int pwr_src;
++   int reg_val;
+ 
+-	pmic = devm_kzalloc(dev, sizeof(struct puma7_rohm_pmic) +
+-			sizeof(struct regulator_dev *) * PUMA7_ROHM_SUPPLY_NUMBER,
+-			GFP_KERNEL);
+-	if (!pmic)
+-		return -ENOMEM;
++   driver_private_data = i2c_id->driver_data;
+ 
+-	pmic->client = client;
++   pmic = devm_kzalloc(dev, sizeof(struct puma7_rohm_pmic) +
++   		sizeof(struct regulator_dev *) * PUMA7_ROHM_SUPPLY_NUMBER,
++   		GFP_KERNEL);
++   if (!pmic)
++   	return -ENOMEM;
++
++   pmic->client = client;
+    pmic->handle = ACPI_HANDLE(dev);
+-   
++
+    rdev = pmic->rdev;
+    pdata = &(pmic->platform_data);
+-   
++
+    pdata->num_subdevs = PUMA7_ROHM_SUPPLY_NUMBER;
+    pdata->subdevs = devm_kzalloc(dev, sizeof(struct puma7_rohm_subdev_data) *
+-						PUMA7_ROHM_SUPPLY_NUMBER, GFP_KERNEL);
+-	if (!pdata->subdevs)
+-		return -ENOMEM;
++   					PUMA7_ROHM_SUPPLY_NUMBER, GFP_KERNEL);
++   if (!pdata->subdevs)
++      return -ENOMEM;
+    sub = pdata->subdevs;
+    for (i = 0; i < PUMA7_ROHM_SUPPLY_NUMBER; i++) {
+       sub->id = puma7_rohm_reg[i].id;
+@@ -384,35 +413,35 @@ static int puma7_rohm_regulator_probe(st
+       sub++;
+    }
+ 
+-	/* Finally register regulators */
+-	for (i = 0; i < pdata->num_subdevs; i++) {
+-		config.dev = dev;
+-		config.init_data = &(pdata->subdevs[i].regulator_data);
+-		config.driver_data = pmic;
+-
+-		rdev[i] = regulator_register(&puma7_rohm_reg[i], &config);
+-		if (IS_ERR(rdev[i])) {
+-			ret = PTR_ERR(rdev[i]);
+-			dev_err(&client->dev, "failed to register %s\n", puma7_rohm_reg[i].name);
+-			goto err_unregister;
+-		}
+-	}
++   /* Finally register regulators */
++   for (i = 0; i < pdata->num_subdevs; i++) {
++      config.dev = dev;
++      config.init_data = &(pdata->subdevs[i].regulator_data);
++      config.driver_data = pmic;
++
++      rdev[i] = regulator_register(&puma7_rohm_reg[i], &config);
++      if (IS_ERR(rdev[i])) {
++         ret = PTR_ERR(rdev[i]);
++         dev_err(&client->dev, "failed to register %s\n", puma7_rohm_reg[i].name);
++         goto err_unregister;
++      }
++   }
+ 
+-	i2c_set_clientdata(client, pmic);
++   i2c_set_clientdata(client, pmic);
+ 
+    if ((gpio_index = acpi_get_gpio_by_index(&client->dev, 0,  &info)) < 0) {
+-		dev_err(dev, "GPIO INT resource not found for PMIC device : %s\n", __func__);
++      dev_err(dev, "GPIO INT resource not found for PMIC device : %s\n", __func__);
+    } else if((ret = gpio_request(gpio_index, "PMIC")) != 0) {
+-		dev_err(dev, "gpio_request failed for %d! : %s\n", gpio_index, __func__);
++      dev_err(dev, "gpio_request failed for %d! : %s\n", gpio_index, __func__);
+    } else if ((ret = gpio_direction_input(gpio_index)) != 0) {
+-		dev_err(dev, "gpio_direction_input failed for %d: %s\n", gpio_index, __func__);
++      dev_err(dev, "gpio_direction_input failed for %d: %s\n", gpio_index, __func__);
+    } else {
+       client->irq = gpio_to_irq(gpio_index);
+-   	ret = devm_request_threaded_irq(dev, client->irq, NULL,
+-   					puma7_rohm_pmic_isr,
+-   					IRQF_TRIGGER_RISING |
+-   					IRQF_ONESHOT,
+-   					ACPI_PUMA7_ROHM_DEVICE_NAME, pmic);
++      ret = devm_request_threaded_irq(dev, client->irq, NULL,
++      				puma7_rohm_pmic_isr,
++      				IRQF_TRIGGER_RISING |
++      				IRQF_ONESHOT,
++      				ACPI_PUMA7_ROHM_DEVICE_NAME, pmic);
+    }
+ 
+    if (ret == 0) {  
+@@ -427,31 +456,41 @@ static int puma7_rohm_regulator_probe(st
+          dev_err(dev, "puma7_rohm_pmic_write failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_MTHRMIRQ_REG, __func__);
+       } else if ((ret = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_MPWRSRCIRQS0_REG, ~(PUMA7_ROHM_PMIC_THRMIRQ_DCINDET))) < 0) {
+          dev_err(dev, "puma7_rohm_pmic_write failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_MPWRSRCIRQS0_REG, __func__);
++      } else if ((ret = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_MPWRSRCIRQSX_REG, ~(PUMA7_ROHM_PMIC_THRMIRQ_DCINDET))) < 0) {
++         dev_err(dev, "puma7_rohm_pmic_write failed for 0x%x: %s\n", PUMA7_ROHM_PMIC_MPWRSRCIRQSX_REG, __func__);
++      } else if((reg_val = puma7_rohm_pmic_read(pmic, PUMA7_ROHM_PMIC_SPWRSRC_REG)) < 0){
++         dev_err(dev, "puma7_rohm_pmic_read error! %s\n", __func__);
+       } else {
+-	      return 0;
++         pwr_src = (reg_val & PUMA7_ROHM_PMIC_SPWRSRC_SDCINDET) ? 1 : 0; // 0 = Disconnected   1 = Connected
++         
++         if((puma7_rohm_ac_dc_indication(pmic, pwr_src)) < 0) {
++            dev_err(dev, "puma7_rohm_ac_dc_indication error! %s\n", __func__);
++         } else {
++           return 0;
++         }
+       }
+    }
+ 
+ err_unregister:
+-	while (--i >= 0)
+-		regulator_unregister(rdev[i]);
+-   
+-return ret;
++      while (--i >= 0)
++         regulator_unregister(rdev[i]);
++
++   return ret;
+    
+ }
+ 
+ static int puma7_rohm_regulator_remove(struct i2c_client *client)
+ {
+-	
+-	struct puma7_rohm_pmic *pmic = i2c_get_clientdata(client);
+-	int i;
+ 
+-	for (i = 0; i < PUMA7_ROHM_SUPPLY_NUMBER; i++) {
+-		regulator_unregister(pmic->rdev[i]);
++   struct puma7_rohm_pmic *pmic = i2c_get_clientdata(client);
++   int i;
++
++   for (i = 0; i < PUMA7_ROHM_SUPPLY_NUMBER; i++) {
++      regulator_unregister(pmic->rdev[i]);
+    }
+ 
+    gpio_free(client->irq);
+-	return 0;
++   return 0;
+ }
+ 
+ 
+@@ -481,13 +520,13 @@ static struct i2c_driver puma7_rohm_driv
+ 
+ static int __init puma7_rohm_init(void)
+ {
+-	return i2c_add_driver(&puma7_rohm_driver);
++   return i2c_add_driver(&puma7_rohm_driver);
+ }
+ rootfs_initcall(puma7_rohm_init);
+ 
+ static void __exit puma7_rohm_exit(void)
+ {
+-	i2c_del_driver(&puma7_rohm_driver);
++   i2c_del_driver(&puma7_rohm_driver);
+ }
+ module_exit(puma7_rohm_exit);
+ 
+--- a/include/linux/regulator/int34d9-regulator.h
++++ b/include/linux/regulator/int34d9-regulator.h
+@@ -1,7 +1,7 @@
+ /*
+  * int34d9-regulator.h - Puma7 SoC ROHM PMIC Driver
+  *
+- * Copyright (C) 2015 Intel Corporation. All rights reserved.
++ * Copyright (C) 2015 - 2016 Intel Corporation. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License version
+@@ -56,6 +56,7 @@ enum PUMA7_ROHM_REGULATOR_SUPPLIES {
+ #define PUMA7_ROHM_PMIC_MIRQLVL1_REG      0x0E
+ #define PUMA7_ROHM_PMIC_MTHRMIRQ_REG      0x12
+ #define PUMA7_ROHM_PMIC_MPWRSRCIRQS0_REG  0x0F
++#define PUMA7_ROHM_PMIC_MPWRSRCIRQSX_REG  0x10
+ #define PUMA7_ROHM_PMIC_SPWRSRC_REG       0x1E
+ #define PUMA7_ROHM_PMIC_SPWRSRC_SDCINDET  0x02
+ 

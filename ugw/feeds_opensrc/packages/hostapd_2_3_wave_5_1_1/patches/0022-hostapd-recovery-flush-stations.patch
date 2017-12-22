@@ -1,0 +1,269 @@
+From 1e17ee546e7c39274cc36940dee81d70752369c7 Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Wed, 26 Oct 2016 12:55:15 +0300
+Subject: [PATCH 22/69] hostapd: recovery flush stations
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ src/ap/drv_callbacks.c             | 12 ++++++++++++
+ src/ap/hostapd.c                   | 28 ++++++++++++++++++++++++++++
+ src/ap/hostapd.h                   |  1 +
+ src/common/ltq-vendor.h            |  5 +++++
+ src/drivers/driver.h               | 27 +++++++++++++++++++++++++++
+ src/drivers/driver_common.c        |  1 +
+ src/drivers/driver_nl80211.c       | 16 ++++++++++++++--
+ src/drivers/driver_nl80211_event.c | 14 +++++++++++++-
+ 8 files changed, 101 insertions(+), 3 deletions(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index eb35b5d..178d2a3 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -947,6 +947,13 @@ static void hostapd_mgmt_tx_cb(struct hostapd_data *hapd, const u8 *buf,
+ 
+ #endif /* NEED_AP_MLME */
+ 
++static void hostapd_event_ltq_flush_stations_rx(struct hostapd_data *hapd,
++               const u8 *data, size_t data_len)
++{
++  struct hostapd_iface *iface = hapd->iface;
++
++  hostapd_ltq_clear_old(iface);
++}
+ 
+ static int hostapd_event_new_sta(struct hostapd_data *hapd, const u8 *addr)
+ {
+@@ -1264,6 +1271,11 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 				       data->eapol_rx.data,
+ 				       data->eapol_rx.data_len);
+ 		break;
++	case EVENT_LTQ_FLUSH_STATIONS_RX:
++		hostapd_event_ltq_flush_stations_rx(hapd, 
++				       data->ltq_flush_stations.data,
++				       data->ltq_flush_stations.data_len);
++		break;
+ 	case EVENT_ASSOC:
+ 		if (!data)
+ 			return;
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 7725c02..444296f 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -152,6 +152,34 @@ static void hostapd_clear_old(struct hostapd_iface *iface)
+ 	}
+ }
+ 
++void hostapd_ltq_clear_old(struct hostapd_iface *iface)
++{
++   size_t j;
++   struct hostapd_data *hapd = iface->bss[0];
++
++   wpa_printf(MSG_DEBUG, "Clean up STA DB");
++   /*
++    * Deauthenticate all stations since the new configuration may not
++    * allow them to use the BSS anymore.
++    */
++   for (j = 0; j < iface->num_bss; j++) {
++      hostapd_flush_old_stations(iface->bss[j],
++                  WLAN_REASON_PREV_AUTH_NOT_VALID);
++      hostapd_broadcast_wep_clear(iface->bss[j]);
++
++#ifndef CONFIG_NO_RADIUS
++      /* TODO: update dynamic data based on changed configuration
++       * items (e.g., open/close sockets, etc.) */
++      radius_client_flush(iface->bss[j]->radius, 0);
++#endif /* CONFIG_NO_RADIUS */
++  }
++
++  wpa_printf(MSG_DEBUG, "Send sync_done command");
++	if (hapd->driver && hapd->driver->sync_done) {
++		hapd->driver->sync_done(hapd->drv_priv);
++  }
++}
++
+ 
+ int hostapd_reload_config(struct hostapd_iface *iface)
+ {
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index dec46f6..b43058e 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -539,4 +539,5 @@ void fst_hostapd_fill_iface_obj(struct hostapd_data *hapd,
+ 				struct fst_wpa_obj *iface_obj);
+ #endif /* CONFIG_FST */
+ 
++void hostapd_ltq_clear_old(struct hostapd_iface *iface);
+ #endif /* HOSTAPD_H */
+diff --git a/src/common/ltq-vendor.h b/src/common/ltq-vendor.h
+index b31fb0d..79c3aa2 100644
+--- a/src/common/ltq-vendor.h
++++ b/src/common/ltq-vendor.h
+@@ -25,6 +25,9 @@
+  * @LTQ_NL80211_VENDOR_SUBCMD_FREE_AID: Free AID request. 
+  *  
+  * @LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL: Send EAPoL request.
++ *
++ * @LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE: Sync the operations between hostapd and
++ * driver
+  */
+ enum ltq_nl80211_vendor_subcmds {
+ 	LTQ_NL80211_VENDOR_SUBCMD_UNSPEC = 0,
+@@ -32,10 +35,12 @@ enum ltq_nl80211_vendor_subcmds {
+ 	LTQ_NL80211_VENDOR_SUBCMD_FREE_AID = 2,
+ 	LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL = 3,
+ 	LTQ_NL80211_VENDOR_SUBCMD_COUNTRY_CODE = 4,
++  LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE = 5,
+ };
+ 
+ enum ltq_nl80211_vendor_events {
+ 	LTQ_NL80211_VENDOR_EVENT_RX_EAPOL = 0,
++  LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS = 1,
+ };
+ 
+ #endif /* LTQ_VENDOR_H */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 501cb43..f7ea26e 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3315,6 +3315,15 @@ struct wpa_driver_ops {
+    */
+   int (*free_aid)(void *priv, u16 *aid);
+ 
++  /**
++   * sync_done - Notify driver that hostapd STA database is synced.
++   * @priv: Private driver interface data
++   * Returns: 0 on success, -1 on failure
++   *
++   * This function is used to notify driver that hostapd STA database is synced.
++   */
++  int (*sync_done)(void *priv);
++
+ 	/**
+ 	 * roaming - Set roaming policy for driver-based BSS selection
+ 	 * @priv: Private driver interface data
+@@ -3930,6 +3939,7 @@ enum wpa_event_type {
+ 	 * deliver the receive EAPOL frames from the driver.
+ 	 */
+ 	EVENT_EAPOL_RX,
++	EVENT_LTQ_FLUSH_STATIONS_RX,
+ 
+ 	/**
+ 	 * EVENT_SIGNAL_CHANGE - Indicate change in signal strength
+@@ -4701,6 +4711,14 @@ union wpa_event_data {
+ 	} eapol_rx;
+ 
+ 	/**
++	 * struct ltq_flush_stations - Data for LTQ_FLUSH_STATIONS events
++	 */
++	struct ltq_flush_stations {
++		const u8 *data;
++		size_t data_len;
++	} ltq_flush_stations;
++
++	/**
+ 	 * signal_change - Data for EVENT_SIGNAL_CHANGE events
+ 	 */
+ 	struct wpa_signal_info signal_change;
+@@ -4972,6 +4990,15 @@ static inline void drv_event_eapol_rx(void *ctx, const u8 *src, const u8 *data,
+ 	wpa_supplicant_event(ctx, EVENT_EAPOL_RX, &event);
+ }
+ 
++static inline void drv_event_ltq_flush_stations(void *ctx, const u8 *data, size_t data_len)
++{
++   union wpa_event_data event;
++   os_memset(&event, 0, sizeof(event));
++   event.ltq_flush_stations.data = data;
++   event.ltq_flush_stations.data_len = data_len;
++   wpa_supplicant_event(ctx, EVENT_LTQ_FLUSH_STATIONS_RX, &event);
++}
++
+ /* driver_common.c */
+ void wpa_scan_results_free(struct wpa_scan_results *res);
+ 
+diff --git a/src/drivers/driver_common.c b/src/drivers/driver_common.c
+index c7107ba..7a5623e 100644
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -53,6 +53,7 @@ const char * event_to_string(enum wpa_event_type event)
+ 	E2S(RX_PROBE_REQ);
+ 	E2S(NEW_STA);
+ 	E2S(EAPOL_RX);
++	E2S(LTQ_FLUSH_STATIONS_RX);
+ 	E2S(SIGNAL_CHANGE);
+ 	E2S(INTERFACE_ENABLED);
+ 	E2S(INTERFACE_DISABLED);
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index f031bb7..dcb1e10 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3441,7 +3441,6 @@ static int nl80211_set_mesh_config(void *priv,
+ }
+ #endif /* CONFIG_MESH */
+ 
+-
+ static int wpa_driver_nl80211_set_ap(void *priv,
+ 				     struct wpa_driver_ap_params *params)
+ {
+@@ -4432,6 +4431,19 @@ static int nl80211_send_eapol_data(void *priv,
+ 	return ret;
+ }
+ 
++static int nl80211_send_sync_done(void *priv)
++{
++	int ret;
++
++	ret = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE,
++							 NULL, 0, NULL);
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: SYNC DONE: %s",
++			   strerror(errno));
++
++	return ret;
++}
++
+ 
+ static const u8 rfc1042_header[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
+ 
+@@ -9481,7 +9493,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ #endif /* !ANDROID_LIB_STUB */
+ #endif /* ANDROID */
+ 	.vendor_cmd = nl80211_vendor_cmd,
+-	.vendor_cmd = nl80211_vendor_cmd,
++	.sync_done = nl80211_send_sync_done,
+ 	.set_qos_map = nl80211_set_qos_map,
+ 	.set_wowlan = nl80211_set_wowlan,
+ 	.set_mac_addr = nl80211_set_mac_addr,
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 2a6f0a7..43ec870 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1981,13 +1981,25 @@ static void ltq_nl80211_handle_eapol(struct wpa_driver_nl80211_data *drv,
+        drv_event_eapol_rx(drv->ctx, eth->h_source, data + ethhdr_len, len - ethhdr_len);
+ }
+ 
++static void ltq_nl80211_handle_flush_stations(struct wpa_driver_nl80211_data *drv,
++                             const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive LTQ vendor event:Flush Stations, ctx=%p",
++		drv->ctx);
++
++	drv_event_ltq_flush_stations(drv->ctx, data, len);
++}
++
+ static void nl80211_vendor_event_ltq(struct wpa_driver_nl80211_data *drv,
+ 										u32 subcmd, u8 *data, size_t len)
+ {       
+ 	switch (subcmd) {
+-       case LTQ_NL80211_VENDOR_EVENT_RX_EAPOL:
++		case LTQ_NL80211_VENDOR_EVENT_RX_EAPOL:
+ 			ltq_nl80211_handle_eapol(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS:
++			ltq_nl80211_handle_flush_stations(drv, data, len);
++			break;
+        default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported LTQ vendor event %u", subcmd);
+ 			break;
+-- 
+2.7.4
+

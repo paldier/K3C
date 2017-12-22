@@ -1,0 +1,262 @@
+From 0b148e5be4ef4bf521f18b2631caf4fa317802f9 Mon Sep 17 00:00:00 2001
+From: Alexander Usyskin <alexander.usyskin@intel.com>
+Date: Wed, 19 Feb 2014 17:35:49 +0200
+Subject: [PATCH 318/441] mei: make return values consistent across the driver
+
+1. Propagate ENOTTY  to user space if the client is not present
+in the system
+2. Use ETIME consistently on timeouts
+3. Return EIO on write failures
+4. Return ENODEV on recoverable device failures such as resets
+
+Change-Id: Ia2f78da70d1d1c6bdda4b52fc2dfc68d9f7e57bf
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 09ded736d335cff5ab276131852ece5b3e2fb927)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/amthif.c    | 12 +++++-------
+ drivers/misc/mei/client.c    | 26 ++++++++++++++------------
+ drivers/misc/mei/hbm.c       |  2 +-
+ drivers/misc/mei/hw-me.c     |  8 ++++----
+ drivers/misc/mei/interrupt.c |  4 ++--
+ drivers/misc/mei/main.c      |  2 +-
+ drivers/misc/mei/nfc.c       |  6 +++---
+ drivers/misc/mei/wd.c        |  6 +++---
+ 8 files changed, 33 insertions(+), 33 deletions(-)
+
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@ -78,10 +78,9 @@ int mei_amthif_host_init(struct mei_devi
+ 
+ 	i = mei_me_cl_by_uuid(dev, &mei_amthif_guid);
+ 	if (i < 0) {
+-		ret = i;
+ 		dev_info(&dev->pdev->dev,
+-			"amthif: failed to find the client %d\n", ret);
+-		return ret;
++			"amthif: failed to find the client %d\n", i);
++		return -ENOTTY;
+ 	}
+ 
+ 	cl->me_client_id = dev->me_clients[i].client_id;
+@@ -174,14 +173,13 @@ int mei_amthif_read(struct mei_device *d
+ 	/* Only possible if we are in timeout */
+ 	if (!cl || cl != &dev->iamthif_cl) {
+ 		dev_dbg(&dev->pdev->dev, "bad file ext.\n");
+-		return -ETIMEDOUT;
++		return -ETIME;
+ 	}
+ 
+ 	i = mei_me_cl_by_id(dev, dev->iamthif_cl.me_client_id);
+-
+ 	if (i < 0) {
+ 		dev_dbg(&dev->pdev->dev, "amthif client not found.\n");
+-		return -ENODEV;
++		return -ENOTTY;
+ 	}
+ 	dev_dbg(&dev->pdev->dev, "checking amthif data\n");
+ 	cb = mei_amthif_find_read_list_entry(dev, file);
+@@ -222,7 +220,7 @@ int mei_amthif_read(struct mei_device *d
+ 			dev_dbg(&dev->pdev->dev, "amthif Time out\n");
+ 			/* 15 sec for the message has expired */
+ 			list_del(&cb->list);
+-			rets = -ETIMEDOUT;
++			rets = -ETIME;
+ 			goto free;
+ 		}
+ 	}
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -712,7 +712,7 @@ int mei_cl_read_start(struct mei_cl *cl,
+ 	i = mei_me_cl_by_id(dev, cl->me_client_id);
+ 	if (i < 0) {
+ 		cl_err(dev, cl, "no such me client %d\n", cl->me_client_id);
+-		return  -ENODEV;
++		return  -ENOTTY;
+ 	}
+ 
+ 	cb = mei_io_cb_init(cl, NULL);
+@@ -900,13 +900,12 @@ int mei_cl_write(struct mei_cl *cl, stru
+ 	cl->writing_state = MEI_WRITING;
+ 	cb->buf_idx = mei_hdr.length;
+ 
+-	rets = buf->size;
+ out:
+ 	if (mei_hdr.msg_complete) {
+-		if (mei_cl_flow_ctrl_reduce(cl)) {
+-			rets = -ENODEV;
++		rets = mei_cl_flow_ctrl_reduce(cl);
++		if (rets < 0)
+ 			goto err;
+-		}
++
+ 		list_add_tail(&cb->list, &dev->write_waiting_list.list);
+ 	} else {
+ 		list_add_tail(&cb->list, &dev->write_list.list);
+@@ -916,15 +915,18 @@ out:
+ 	if (blocking && cl->writing_state != MEI_WRITE_COMPLETE) {
+ 
+ 		mutex_unlock(&dev->device_lock);
+-		if (wait_event_interruptible(cl->tx_wait,
+-			cl->writing_state == MEI_WRITE_COMPLETE)) {
+-				if (signal_pending(current))
+-					rets = -EINTR;
+-				else
+-					rets = -ERESTARTSYS;
+-		}
++		rets = wait_event_interruptible(cl->tx_wait,
++				cl->writing_state == MEI_WRITE_COMPLETE);
+ 		mutex_lock(&dev->device_lock);
++		/* wait_event_interruptible returns -ERESTARTSYS */
++		if (rets) {
++			if (signal_pending(current))
++				rets = -EINTR;
++			goto err;
++		}
+ 	}
++
++	rets = buf->size;
+ err:
+ 	return rets;
+ }
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -161,7 +161,7 @@ int mei_hbm_start_wait(struct mei_device
+ 	if (ret <= 0 && (dev->hbm_state <= MEI_HBM_START)) {
+ 		dev->hbm_state = MEI_HBM_IDLE;
+ 		dev_err(&dev->pdev->dev, "waiting for mei start failed\n");
+-		return -ETIMEDOUT;
++		return -ETIME;
+ 	}
+ 	return 0;
+ }
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -258,7 +258,7 @@ static int mei_me_hw_ready_wait(struct m
+ 	mutex_lock(&dev->device_lock);
+ 	if (!err && !dev->recvd_hw_ready) {
+ 		if (!err)
+-			err = -ETIMEDOUT;
++			err = -ETIME;
+ 		dev_err(&dev->pdev->dev,
+ 			"wait hw ready failed. status = %d\n", err);
+ 		return err;
+@@ -317,7 +317,7 @@ static bool mei_me_hbuf_is_empty(struct
+  *
+  * @dev: the device structure
+  *
+- * returns -1(ESLOTS_OVERFLOW) if overflow, otherwise empty slots count
++ * returns -EOVERFLOW if overflow, otherwise empty slots count
+  */
+ static int mei_me_hbuf_empty_slots(struct mei_device *dev)
+ {
+@@ -340,7 +340,7 @@ static size_t mei_me_hbuf_max_len(const
+ 
+ 
+ /**
+- * mei_write_message - writes a message to mei device.
++ * mei_me_write_message - writes a message to mei device.
+  *
+  * @dev: the device structure
+  * @header: mei HECI header of message
+@@ -395,7 +395,7 @@ static int mei_me_write_message(struct m
+  *
+  * @dev: the device structure
+  *
+- * returns -1(ESLOTS_OVERFLOW) if overflow, otherwise filled slots count
++ * returns -EOVERFLOW if overflow, otherwise filled slots count
+  */
+ static int mei_me_count_full_read_slots(struct mei_device *dev)
+ {
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -350,7 +350,7 @@ int mei_irq_read_handler(struct mei_devi
+ 		dev_err(&dev->pdev->dev, "less data available than length=%08x.\n",
+ 				*slots);
+ 		/* we can't read the message */
+-		ret = -ERANGE;
++		ret = -EBADMSG;
+ 		goto end;
+ 	}
+ 
+@@ -482,7 +482,7 @@ int mei_irq_write_handler(struct mei_dev
+ 			if (mei_wd_send(dev))
+ 				dev_dbg(&dev->pdev->dev, "wd send failed.\n");
+ 			else if (mei_cl_flow_ctrl_reduce(&dev->wd_cl))
+-				return -ENODEV;
++				return -EIO;
+ 			dev->wd_pending = false;
+ 		}
+ 	}
+--- a/drivers/misc/mei/main.c
++++ b/drivers/misc/mei/main.c
+@@ -340,7 +340,7 @@ static ssize_t mei_write(struct file *fi
+ 
+ 	id = mei_me_cl_by_id(dev, cl->me_client_id);
+ 	if (id < 0) {
+-		rets = -ENODEV;
++		rets = -ENOTTY;
+ 		goto out;
+ 	}
+ 
+--- a/drivers/misc/mei/nfc.c
++++ b/drivers/misc/mei/nfc.c
+@@ -362,7 +362,7 @@ static int mei_nfc_send(struct mei_cl_de
+ 	if (!wait_event_interruptible_timeout(ndev->send_wq,
+ 				ndev->recv_req_id == ndev->req_id, HZ)) {
+ 		dev_err(&dev->pdev->dev, "NFC MEI command timeout\n");
+-		err = -ETIMEDOUT;
++		err = -ETIME;
+ 	} else {
+ 		ndev->req_id++;
+ 	}
+@@ -501,7 +501,7 @@ int mei_nfc_host_init(struct mei_device
+ 	i = mei_me_cl_by_uuid(dev, &mei_nfc_info_guid);
+ 	if (i < 0) {
+ 		dev_info(&dev->pdev->dev, "nfc: failed to find the client\n");
+-		ret = -ENOENT;
++		ret = -ENOTTY;
+ 		goto err;
+ 	}
+ 
+@@ -519,7 +519,7 @@ int mei_nfc_host_init(struct mei_device
+ 	i = mei_me_cl_by_uuid(dev, &mei_nfc_guid);
+ 	if (i < 0) {
+ 		dev_info(&dev->pdev->dev, "nfc: failed to find the client\n");
+-		ret = -ENOENT;
++		ret = -ENOTTY;
+ 		goto err;
+ 	}
+ 
+--- a/drivers/misc/mei/wd.c
++++ b/drivers/misc/mei/wd.c
+@@ -53,7 +53,7 @@ static void mei_wd_set_start_timeout(str
+  *
+  * @dev: the device structure
+  *
+- * returns -ENENT if wd client cannot be found
++ * returns -ENOTTY if wd client cannot be found
+  *         -EIO if write has failed
+  *         0 on success
+  */
+@@ -73,7 +73,7 @@ int mei_wd_host_init(struct mei_device *
+ 	id = mei_me_cl_by_uuid(dev, &mei_wd_guid);
+ 	if (id < 0) {
+ 		dev_info(&dev->pdev->dev, "wd: failed to find the client\n");
+-		return id;
++		return -ENOTTY;
+ 	}
+ 
+ 	cl->me_client_id = dev->me_clients[id].client_id;
+@@ -185,7 +185,7 @@ int mei_wd_stop(struct mei_device *dev)
+ 		ret = 0;
+ 	} else {
+ 		if (!ret)
+-			ret = -ETIMEDOUT;
++			ret = -ETIME;
+ 		dev_warn(&dev->pdev->dev,
+ 			"wd: stop failed to complete ret=%d.\n", ret);
+ 	}

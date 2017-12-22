@@ -1,0 +1,980 @@
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/hostapd/Makefile hostapd-2.6/hostapd/Makefile
+--- hostapd-2.6-orig/hostapd/Makefile	2017-04-18 12:09:08.658602591 +0300
++++ hostapd-2.6/hostapd/Makefile	2017-04-18 12:11:19.045979447 +0300
+@@ -82,6 +82,7 @@ OBJS += ../src/ap/beacon.o
+ OBJS += ../src/ap/bss_load.o
+ OBJS += ../src/ap/neighbor_db.o
+ OBJS += ../src/ap/rrm.o
++OBJS += ../src/ap/atf.o
+ 
+ OBJS_c = hostapd_cli.o
+ OBJS_c += ../src/common/wpa_ctrl.o
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/hostapd/config_file.c hostapd-2.6/hostapd/config_file.c
+--- hostapd-2.6-orig/hostapd/config_file.c	2017-04-18 12:09:08.658602591 +0300
++++ hostapd-2.6/hostapd/config_file.c	2017-04-18 12:11:19.045979447 +0300
+@@ -3948,6 +3948,13 @@ static int hostapd_config_fill(struct ho
+ 		bss->ftm_responder = atoi(pos);
+ 	} else if (os_strcmp(buf, "ftm_initiator") == 0) {
+ 		bss->ftm_initiator = atoi(pos);
++	} else if (os_strcmp(buf, "atf_config_file") == 0) {
++		os_free(conf->atf_config_file);
++		conf->atf_config_file = os_strdup(pos);
++		if (conf->atf_config_file != NULL && conf->atf_config_file[0] != '\0')
++			hostapd_atf_read_config (&conf->atf_cfg, conf->atf_config_file);
++		else
++			hostapd_atf_clean_config(&conf->atf_cfg);
+ 	} else {
+ 		wpa_printf(MSG_ERROR,
+ 			   "Line %d: unknown configuration item '%s'",
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/hostapd/ctrl_iface.c hostapd-2.6/hostapd/ctrl_iface.c
+--- hostapd-2.6-orig/hostapd/ctrl_iface.c	2017-04-18 12:09:08.657602611 +0300
++++ hostapd-2.6/hostapd/ctrl_iface.c	2017-04-18 12:11:19.047979407 +0300
+@@ -60,6 +60,7 @@
+ #include "config_file.h"
+ #include "ctrl_iface.h"
+ #include "drivers/nl80211_copy.h"
++#include "ap/atf.h"
+ 
+ 
+ #define HOSTAPD_CLI_DUP_VALUE_MAX_LEN 256
+@@ -5383,6 +5384,12 @@ int hostapd_ctrl_iface_get_radio_info(st
+   return len;
+ }
+ 
++int hostapd_ctrl_iface_update_atf_cfg(struct hostapd_data *hapd)
++{
++	int ret_code = hostapd_drv_send_atf_quotas(hapd, NULL /*reread cfg file*/, 0, 0);
++	return ret_code;
++}
++
+ #ifdef CONFIG_MBO
+ static int hostapd_ctrl_iface_cellular_pref_set(struct hostapd_data *hapd, char *cmd)
+ {
+@@ -6267,6 +6274,9 @@ static int hostapd_ctrl_iface_receive_pr
+ 		printf("%s; *** Received from FAPI: 'GET_RADIO_INFO' (buf= '%s') ***\n", __FUNCTION__, buf);
+ 		reply_len = hostapd_ctrl_iface_get_radio_info(hapd, NULL, reply,
+ 					reply_size);
++	} else if (os_strncmp(buf, "UPDATE_ATF_CFG", 14) == 0) {
++		if (hostapd_ctrl_iface_update_atf_cfg(hapd))
++			reply_len = -1;
+ 	} else if (os_strncmp(buf, "UNCONNECTED_STA_RSSI ", 21) == 0) {
+ 		if (hostapd_ctrl_iface_unconnected_sta(hapd, buf + 21))
+ 			reply_len = -1;
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/hostapd/hostapd_cli.c hostapd-2.6/hostapd/hostapd_cli.c
+--- hostapd-2.6-orig/hostapd/hostapd_cli.c	2017-04-18 12:09:08.657602611 +0300
++++ hostapd-2.6/hostapd/hostapd_cli.c	2017-04-18 12:11:19.047979407 +0300
+@@ -1741,6 +1741,18 @@ static int hostapd_cli_cmd_radio_info(st
+ }
+ 
+ 
++static int hostapd_cli_cmd_update_atf_cfg(struct wpa_ctrl *ctrl, int argc,
++  char *argv[])
++{
++  if (argc != 0) {
++    printf("update_atf_cfg doesn't require parameters\n");
++    return -1;
++  }
++
++  return wpa_ctrl_command(ctrl, "UPDATE_ATF_CFG");
++}
++
++
+ static int hostapd_cli_cmd_set_failsafe_chan(struct wpa_ctrl *ctrl,
+                int argc, char *argv[])
+ {
+@@ -2027,6 +2039,8 @@ static const struct hostapd_cli_cmd host
+ 	  "<BSS_name> get VAP measurements" },
+ 	{ "radio_info", hostapd_cli_cmd_radio_info, NULL,
+ 	  "get radio info" },
++	{ "update_atf_cfg", hostapd_cli_cmd_update_atf_cfg, NULL,
++	  "refresh air time fairness configuration" },
+ 	{ "set_failsafe_chan", hostapd_cli_cmd_set_failsafe_chan, NULL,
+ 	  "<freq> <center_freq1=> [center_freq2=] <bandwidth=> "
+ 	  "[tx_ant=] [rx_ant=]"
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/Makefile hostapd-2.6/src/ap/Makefile
+--- hostapd-2.6-orig/src/ap/Makefile	2017-04-18 12:09:08.667602411 +0300
++++ hostapd-2.6/src/ap/Makefile	2017-04-18 12:11:19.047979407 +0300
+@@ -59,7 +59,8 @@ LIB_OBJS= \
+ 	wpa_auth_glue.o \
+ 	wpa_auth_ie.o \
+ 	wps_hostapd.o \
+-	x_snoop.o
++	x_snoop.o \
++	atf.o
+ 
+ libap.a: $(LIB_OBJS)
+ 	$(AR) crT $@ $?
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/ap_config.c hostapd-2.6/src/ap/ap_config.c
+--- hostapd-2.6-orig/src/ap/ap_config.c	2017-04-18 12:09:08.666602431 +0300
++++ hostapd-2.6/src/ap/ap_config.c	2017-04-18 12:11:19.048979387 +0300
+@@ -744,6 +744,9 @@ void hostapd_config_free(struct hostapd_
+ 	wpabuf_free(conf->lci);
+ 	wpabuf_free(conf->civic);
+ 
++	hostapd_atf_clean_config(&conf->atf_cfg);
++	os_free(conf->atf_config_file);
++
+ 	os_free(conf);
+ }
+ 
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/ap_config.h hostapd-2.6/src/ap/ap_config.h
+--- hostapd-2.6-orig/src/ap/ap_config.h	2017-04-18 12:09:08.666602431 +0300
++++ hostapd-2.6/src/ap/ap_config.h	2017-04-18 12:11:19.048979387 +0300
+@@ -18,6 +18,7 @@
+ #include "wps/wps.h"
+ #include "fst/fst.h"
+ #include "vlan.h"
++#include "atf.h"
+ 
+ /**
+  * mesh_conf - local MBSS state and settings
+@@ -769,6 +770,9 @@ struct hostapd_config {
+ 
+ 	struct wpabuf *lci;
+ 	struct wpabuf *civic;
++
++	char *atf_config_file;     /* Air Time Fairness configuration filename */
++	struct atf_config atf_cfg; /* Air Time Fairness configuration */
+ };
+ 
+ #ifdef CONFIG_ACS
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/ap_drv_ops.c hostapd-2.6/src/ap/ap_drv_ops.c
+--- hostapd-2.6-orig/src/ap/ap_drv_ops.c	2017-04-18 12:09:08.664602471 +0300
++++ hostapd-2.6/src/ap/ap_drv_ops.c	2017-04-18 12:11:19.048979387 +0300
+@@ -368,6 +368,7 @@ int hostapd_sta_add(struct hostapd_data 
+ 		    size_t last_assoc_req_len, int ssi_signal)
+ {
+ 	struct hostapd_sta_add_params params;
++	int ret_code;
+ 
+ 	if (hapd->driver == NULL)
+ 		return 0;
+@@ -392,7 +393,12 @@ int hostapd_sta_add(struct hostapd_data 
+ 	params.last_assoc_req = last_assoc_req;
+ 	params.last_assoc_req_len = last_assoc_req_len;
+ 	params.ssi_signal = ssi_signal;
+-	return hapd->driver->sta_add(hapd->drv_priv, &params);
++
++	ret_code = hapd->driver->sta_add(hapd->drv_priv, &params);
++	if (ret_code == 0)
++		hostapd_drv_send_atf_quotas(hapd, addr, 1, 0);
++
++	return ret_code;
+ }
+ 
+ 
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/ap_drv_ops.h hostapd-2.6/src/ap/ap_drv_ops.h
+--- hostapd-2.6-orig/src/ap/ap_drv_ops.h	2017-04-18 12:09:08.666602431 +0300
++++ hostapd-2.6/src/ap/ap_drv_ops.h	2017-04-18 12:11:19.049979367 +0300
+@@ -159,12 +159,48 @@ static inline int hostapd_drv_get_inact_
+ 	return hapd->driver->get_inact_sec(hapd->drv_priv, addr);
+ }
+ 
++static inline int hostapd_drv_send_atf_quotas(struct hostapd_data *hapd,
++		const u8* changed_sta, /* if NULL, ATF config changed */
++		int in_driver, int not_in_driver)
++{
++	int res = 0;
++
++	/* Do we have ATF function enabled? */
++	if (hapd->iconf->atf_config_file == NULL || hapd->iconf->atf_config_file[0] == '\0') {
++		hapd->iface->atf_enabled = 0;
++		return -ENOTSUP;
++	}
++
++	/* Re-read ATF configuration file */
++	if (changed_sta == NULL &&
++		hostapd_atf_read_config (&hapd->iconf->atf_cfg, hapd->iconf->atf_config_file))
++		return -EINVAL;
++
++	/* Do it even if ATF is OFF. It traces the "in driver" flags for stations. */
++	mtlk_atf_quotas_t* atf_quotas = hostapd_atf_calc_quotas(&hapd->iconf->atf_cfg,
++									hapd, changed_sta, in_driver, not_in_driver);
++
++	if (atf_quotas != NULL) { /* Is NULL if ATF quotas are already up to date */
++		res = hapd->driver->send_atf_quotas(hapd->drv_priv, atf_quotas);
++		os_free (atf_quotas); /* allocated by os_zalloc in hostapd_atf_calc_quotas */
++	}
++
++	return res;
++}
++
+ static inline int hostapd_drv_sta_remove(struct hostapd_data *hapd,
+ 					 const u8 *addr)
+ {
++	int ret_code;
++
+ 	if (!hapd->driver || !hapd->driver->sta_remove || !hapd->drv_priv)
+ 		return 0;
+-	return hapd->driver->sta_remove(hapd->drv_priv, addr);
++
++	ret_code = hapd->driver->sta_remove(hapd->drv_priv, addr);
++	if (ret_code == 0)
++		hostapd_drv_send_atf_quotas(hapd, addr, 0, 1);
++
++	return ret_code;
+ }
+ 
+ static inline int hostapd_drv_hapd_send_eapol(struct hostapd_data *hapd,
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/atf.c hostapd-2.6/src/ap/atf.c
+--- hostapd-2.6-orig/src/ap/atf.c	1970-01-01 03:00:00.000000000 +0300
++++ hostapd-2.6/src/ap/atf.c	2017-04-18 12:12:53.266083801 +0300
+@@ -0,0 +1,580 @@
++#include "includes.h"
++#include "common.h"
++#include "drivers/driver.h"
++#include "hostapd.h"
++#include "sta_info.h"
++#include "atf.h"
++
++static struct atf_vap_config* add_vap_to_atf_config(struct atf_config* atf_cfg)
++{
++	struct atf_vap_config* new_vap;
++
++	/* Allocate space for an increased vap_cfg array */
++	int old_len = sizeof(struct atf_vap_config) * atf_cfg->n_vaps;
++	int new_len = old_len + sizeof(struct atf_vap_config);
++	struct atf_vap_config* new_vap_cfg = os_malloc(new_len);
++	if (new_vap_cfg == NULL)
++		return NULL;
++
++	/* Move the existing data to the newly allocated array */
++	if (old_len > 0) {
++		os_memcpy (new_vap_cfg, atf_cfg->vap_cfg, old_len);
++		os_free (atf_cfg->vap_cfg);
++	}
++	atf_cfg->vap_cfg = new_vap_cfg;
++
++	new_vap = new_vap_cfg + atf_cfg->n_vaps;
++	atf_cfg->n_vaps++;
++	memset (new_vap, 0, sizeof(struct atf_vap_config));
++	return new_vap;
++}
++
++static struct atf_sta_grant* add_sta_to_vap_config(struct atf_vap_config* vap_cfg)
++{
++	struct atf_sta_grant* new_sta;
++
++	/* Allocate space for an increased vap_cfg array */
++	int old_len = sizeof(struct atf_vap_config) * vap_cfg->n_stations;
++	int new_len = old_len + sizeof(struct atf_vap_config);
++	struct atf_sta_grant* new_sta_grants = os_malloc(new_len);
++
++	if (new_sta_grants == NULL)
++		return NULL;
++
++	/* Move the existing data to the newly allocated array */
++	if (old_len > 0) {
++		os_memcpy (new_sta_grants, vap_cfg->sta_grants, old_len);
++		os_free (vap_cfg->sta_grants);
++	}
++	vap_cfg->sta_grants = new_sta_grants;
++
++	new_sta = new_sta_grants + vap_cfg->n_stations;
++	vap_cfg->n_stations++;
++	memset (new_sta, 0, sizeof(struct atf_sta_grant));
++	return new_sta;
++}
++
++/* Free allocated memory and reset contents */
++void hostapd_atf_clean_config(struct atf_config* atf_cfg)
++{
++	int n_vap;
++
++	for (n_vap = 0; n_vap < atf_cfg->n_vaps; n_vap++) {
++		struct atf_vap_config* vap = &atf_cfg->vap_cfg[n_vap];
++		os_free(vap->vap_name);
++		os_free(vap->sta_grants);
++	}
++
++	os_free (atf_cfg->vap_cfg);
++	memset (atf_cfg, 0, sizeof(struct atf_config));
++}
++
++/* Find a token in the given character string. Besides the characters recognized as
++ * spaces by isspace (including '\t' and '\n'), additional delimiters are passed
++ * by 'delimiters' argument.
++ */
++static void read_token (char **p, char** token_start, int* token_len, char* delimiters)
++{
++	/* skip possible spaces before token */
++	while (isspace(**p))
++		(*p)++;
++	*token_start = *p;
++
++	/* find the end of the token */
++	while (**p != '\0' && !isspace(**p) && os_strchr(delimiters, **p) == NULL)
++		(*p)++;
++	*token_len = *p - *token_start;
++
++	/* skip possible spaces after token */
++	while (isspace(**p))
++		(*p)++;
++}
++
++/* Produce a copy of original cfg file -- to verify that configuration has been correctly read */
++/* Only used for debugging purposes */
++static void hostapd_atf_dbg_print_config(struct atf_config* atf_cfg, const char* fname)
++{
++	char buf[256];
++	int i_vap;
++	FILE *f;
++
++	os_snprintf (buf, sizeof(buf), "%s.tst", fname);
++	f = fopen(buf, "w");
++	if (f == NULL)
++		return;
++
++	fprintf(f, "distr_type = %d\n", atf_cfg->distr_type);
++	fprintf(f, "algo_type = %d\n", atf_cfg->algo_type);
++	fprintf(f, "weighted_type = %d\n", atf_cfg->weighted_type);
++	fprintf(f, "interval = %d\n", atf_cfg->interval);
++	fprintf(f, "free_time = %d\n", atf_cfg->free_time);
++
++	for (i_vap = 0; i_vap < atf_cfg->n_vaps; i_vap++) {
++		int i_sta;
++		struct atf_vap_config *vap = atf_cfg->vap_cfg + i_vap;
++		fprintf(f, "\n[%s]\n", vap->vap_name);
++
++		fprintf(f, "vap_grant = %d\n", vap->vap_grant);
++		for (i_sta = 0; i_sta < vap->n_stations; i_sta++) {
++			struct atf_sta_grant *sta = vap->sta_grants + i_sta;
++			fprintf(f, "sta = " MACSTR ", %d\n",
++					MAC2STR(sta->sta_mac), sta->sta_grant);
++		}
++	}
++
++	fclose (f);
++}
++
++/* Read ATF configuration from file */
++int hostapd_atf_read_config(struct atf_config* atf_cfg, const char* fname)
++{
++	char buf[256], *pos;
++	int line = 0;
++	struct atf_vap_config* curr_vap = NULL;
++	FILE *f = fopen(fname, "r");
++	if (f == NULL) {
++		wpa_printf(MSG_ERROR, "ATF: Could not open config file '%s'.", fname);
++		return -1;
++	}
++
++	hostapd_atf_clean_config(atf_cfg);
++
++	/* We don't use any special handling for '\n' because isspace('\n') returns true. */
++	while (fgets(buf, sizeof(buf), f)) {
++		line++;
++
++		/* Skip leading spaces. */
++		pos = buf;
++		while (isspace(*pos))
++			pos++;
++
++		if (atf_cfg->per_vap && *pos == '[') { /* New section (VAP name in square brackets) */
++			char *name = pos;
++			int  name_len = 0;
++
++			/* Extract VAP name from square brackets */
++			pos++; /* go past '[' */
++			read_token (&pos, &name, &name_len, "[]=,#");
++			if (*pos != ']' || name_len == 0)
++				goto syntax_error;
++
++			curr_vap = add_vap_to_atf_config(atf_cfg);
++			if (curr_vap == NULL)
++				goto mem_error;
++			curr_vap->vap_name = os_malloc (name_len+1);
++			if (curr_vap->vap_name == NULL)
++				goto mem_error;
++			os_memcpy(curr_vap->vap_name, name, name_len);
++			curr_vap->vap_name[name_len] = 0;
++		}
++		else if (*pos != '\0' && *pos != '#') { /* <name> = <value> */
++			char *name, *value, *endptr;
++			int  name_len, value_len;
++			read_token (&pos, &name, &name_len, "=");
++			if(*pos != '=')
++				goto syntax_error;
++			pos++;
++
++			/* Value is the rest of the line, it can contain spaces */
++			/* However, cut off the leading and trailing spaces */
++			while (isspace(*pos))
++				(pos)++;
++			value = pos;
++			value_len = 0;
++			while (*pos != '\0' && *pos != '#') {
++				if (!isspace(*pos))
++					value_len = pos - value + 1;
++				pos++;
++			}
++
++			/* Make name and value null-terminated strings */
++			name[name_len] = 0;
++			value[value_len] = 0;
++
++			/* We are before [<vap_name>] header. Per-radio parameters expected */
++			if (strcmp(name, "debug") == 0) {
++				atf_cfg->debug = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "distr_type") == 0) {
++				atf_cfg->distr_type = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "algo_type") == 0) {
++				atf_cfg->algo_type = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "weighted_type") == 0) {
++				atf_cfg->weighted_type = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "interval") == 0) {
++				atf_cfg->interval = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "free_time") == 0) {
++				atf_cfg->free_time = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "vap_enabled") == 0) {
++				atf_cfg->per_vap = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "station_enabled") == 0) {
++				atf_cfg->per_station = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (curr_vap && strcmp(name, "vap_grant") == 0) {
++				curr_vap->vap_grant = strtol(value, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "sta") == 0) {
++				char *sta_mac, *sta_grant, *endptr;
++				int  sta_mac_len, sta_grant_len;
++				struct atf_sta_grant* sta;
++
++				if (atf_cfg->per_station == 0)
++					continue; /* ignore it */
++
++				if (curr_vap == NULL) {
++					if (atf_cfg->per_vap)
++						goto syntax_error; /* per VAP mode, but didn't see [VAP] above */
++
++					/* NULL value of curr_vap->vap_name indicates that it is per radio */
++					curr_vap = add_vap_to_atf_config(atf_cfg);
++					if (curr_vap == NULL)
++						goto mem_error;
++				}
++
++				/* split the value to two comma-separated parts */
++				read_token (&value, &sta_mac, &sta_mac_len, ",");
++				if (*value != ',')
++					goto syntax_error;
++				value++;
++				read_token (&value, &sta_grant, &sta_grant_len, ",");
++
++				/* Make the MAC and grant parts null-terminated */
++				sta_mac[sta_mac_len] = 0;
++				sta_grant[sta_grant_len] = 0;
++
++				sta = add_sta_to_vap_config(curr_vap);
++				if (hwaddr_aton(sta_mac, sta->sta_mac))
++					goto syntax_error;
++				sta->sta_grant = strtol(sta_grant, &endptr, 10);
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else /* Unknown parameter name */
++				goto syntax_error;
++		}
++	}
++
++	fclose (f);
++	if (atf_cfg->debug)
++		hostapd_atf_dbg_print_config(atf_cfg, fname);
++	wpa_printf(MSG_DEBUG, "ATF: Reading config file %s successful (%d lines)", fname, line);
++	return 0; /* success */
++
++syntax_error:
++	fclose (f);
++	wpa_printf(MSG_ERROR, "ATF: Syntax error in config file '%s', line %d.", fname, line);
++	hostapd_atf_clean_config(atf_cfg);
++	return -1;
++
++mem_error:
++	fclose (f);
++	wpa_printf(MSG_ERROR, "ATF: Insufficient memory to parse config file '%s'.", fname);
++	hostapd_atf_clean_config(atf_cfg);
++	return -1;
++}
++
++static inline u16 sta_id_in_driver(struct sta_info* sta)
++{
++	return sta->aid - 1; /* station indexes in Driver are 0-based */
++}
++
++static int update_atf_active_status_for_station (struct sta_info* sta,
++		int in_driver, int not_in_driver,
++		u32* sta_in_driver, u32* sta_has_quota)
++{
++	u32 idx = sta->aid / 32;
++	u32 bit = BIT(sta->aid % 32);
++
++	if (in_driver)
++		sta_in_driver[idx] |= bit;
++	if (not_in_driver)
++		sta_in_driver[idx] &= ~bit;
++
++	if ((sta_has_quota[idx] & bit) == 0) {
++		/* STA does not have ATF quota yet. Shall we give it?*/
++		/* Give quota if STA is in Driver and it has an 'authorized' flag. */
++		if ((sta_in_driver[idx] & bit) != 0 &&
++				(sta->flags & WLAN_STA_AUTHORIZED) != 0) {
++			sta_has_quota[idx] |= bit;
++			return 1; /* Station changed its status */
++		}
++	}
++	else if (not_in_driver) {
++		/* Switch STA status to inactive when it is removed from Driver */
++		sta_has_quota[idx] &= ~bit;
++		return 1; /* Station changed its status */
++	}
++
++	return 0;
++}
++
++static inline int is_sta_active(struct sta_info* sta, u32* sta_has_quota)
++{
++	u32 idx = sta->aid / 32;
++	u32 bit = BIT(sta->aid % 32);
++
++	return (sta_has_quota[idx] & bit) != 0;
++ }
++
++static int count_active_stations_in_bss(struct hostapd_data *bss,
++		u32* sta_has_quota)
++{
++	int count = 0;
++	struct sta_info* sta;
++
++	for (sta = bss->sta_list; sta != NULL; sta = sta->next) {
++		if (is_sta_active(sta, sta_has_quota))
++			count++;
++	}
++	return count;
++}
++
++static void distribute_sta_quotas_per_radio(
++		struct atf_vap_config* vap_cfg, /* per radio station list */
++		size_t num_bss, struct hostapd_data **bss, /* Configured BSS-es */
++		uint16_t* sta_grant, /* per-station quotas */
++		u32* sta_has_quota)
++{
++	int n_bss, n_sta, total_stations = 0, remaining_quota = ATF_GRANT_SCALE;
++
++	for (n_bss = 0; n_bss < num_bss; n_bss++)
++		total_stations += count_active_stations_in_bss(bss[n_bss], sta_has_quota);
++	if (total_stations == 0)
++		return;
++
++	/* Distribute the configured quotas for connected stations */
++	if (vap_cfg) {
++		for (n_sta = 0; n_sta < vap_cfg->n_stations; n_sta++)
++		{
++			struct atf_sta_grant* sta_cfg = vap_cfg->sta_grants + n_sta;
++			struct sta_info* sta = NULL;
++
++			/* Find a station given in configuration. Search through all BSS */
++			for (n_bss = 0; n_bss < num_bss; n_bss++) {
++				sta = ap_get_sta(bss[n_bss], sta_cfg->sta_mac);
++				if (sta && is_sta_active(sta, sta_has_quota)) {
++
++					wpa_printf(MSG_DEBUG, "ATF: STA " MACSTR " (id = %d) gets grant %d",
++							MAC2STR(sta->addr), sta_id_in_driver(sta), sta_cfg->sta_grant);
++
++					sta_grant[sta_id_in_driver(sta)] = sta_cfg->sta_grant;
++					remaining_quota -= (int)sta_cfg->sta_grant;
++				}
++			}
++		}
++	}
++
++	/* Distribute the remaining quota equally between stations */
++	if (remaining_quota > 0) {
++		uint16_t remaining_per_sta = remaining_quota / total_stations;
++
++		wpa_printf(MSG_DEBUG, "ATF: Distributing remaining grant equally per radio. "
++				"Each of %d stations gets %d.", total_stations, remaining_per_sta);
++
++		for (n_bss = 0; n_bss < num_bss; n_bss++) {
++			struct sta_info *sta;
++
++			for (sta = bss[n_bss]->sta_list; sta != NULL; sta = sta->next) {
++				if (is_sta_active(sta, sta_has_quota))
++					sta_grant[sta_id_in_driver(sta)] += remaining_per_sta;
++			}
++		}
++	}
++}
++
++static void distribute_sta_quotas_per_vap(
++		struct atf_vap_config* vap_cfg, /* per-vap cfg, includes station list */
++		struct hostapd_data *bss, /* BSS from hostapd config */
++		uint16_t* sta_grant, /* per-station quotas */
++		u32* sta_has_quota)
++{
++	int n_sta, remaining_in_vap = vap_cfg->vap_grant;
++	int count_in_bss = count_active_stations_in_bss(bss, sta_has_quota);
++
++	/* Cycle by stations in configuration and see which of them are connected */
++	for (n_sta = 0; n_sta < vap_cfg->n_stations; n_sta++)
++	{
++		struct atf_sta_grant* sta_cfg = vap_cfg->sta_grants + n_sta;
++		struct sta_info* sta = ap_get_sta(bss, sta_cfg->sta_mac);
++
++		if (sta && is_sta_active(sta, sta_has_quota)) {
++			uint16_t station_grant = ((uint32_t)(vap_cfg->vap_grant) * sta_cfg->sta_grant
++					+ ATF_GRANT_SCALE / 2) / ATF_GRANT_SCALE;
++			if (station_grant <= 0)
++				station_grant = 1; /* Ensure a positive value */
++
++			wpa_printf(MSG_DEBUG, "ATF: STA %s/" MACSTR " (id = %d) gets grant %d",
++					vap_cfg->vap_name, MAC2STR(sta->addr), sta_id_in_driver(sta), station_grant);
++
++			sta_grant[sta_id_in_driver(sta)] = station_grant;
++			remaining_in_vap -= (int)station_grant;
++		}
++	}
++
++	/* Split the remaining VAP grant equally between stations in this VAP */
++	if (remaining_in_vap > 0 && count_in_bss) {
++		uint16_t remaining_per_sta = remaining_in_vap / count_in_bss;
++		struct sta_info *sta;
++
++		wpa_printf(MSG_DEBUG, "ATF: Distributing remaining grant equally. Each of %d stations gets %d.",
++				count_in_bss, remaining_per_sta);
++
++		for (sta = bss->sta_list; sta != NULL; sta = sta->next) {
++			if (is_sta_active(sta, sta_has_quota))
++				sta_grant[sta_id_in_driver(sta)] += remaining_per_sta;
++		}
++	}
++}
++
++/* Calculate quotas and format a message to be sent to Driver */
++mtlk_atf_quotas_t* hostapd_atf_calc_quotas(struct atf_config* atf_cfg,
++		struct hostapd_data *hapd, /* BSS the changed station belongs to */
++		const u8* changed_sta, /* station that changes its status */
++		int in_driver, int not_in_driver)
++{
++	uint16_t *sta_grant, *vap_grant;  /* variable addresses in mtlk_atf_quotas_t */
++	int n_bss, data_len;
++	mtlk_atf_quotas_t* atf_quotas;
++	int max_stations = hapd->iconf->ap_max_num_sta;
++
++	/* Check if quotas need to be recalculated. */
++	if (changed_sta != NULL) { /* STA state changed */
++		struct sta_info *sta = ap_get_sta(hapd, changed_sta);
++		if (sta == NULL || sta->aid >= max_stations)
++			return NULL; /* The STA isn't (yet) under ATF control */
++
++		if (!update_atf_active_status_for_station(sta, in_driver, not_in_driver,
++				hapd->iface->atf_sta_in_driver, hapd->iface->atf_sta_has_quota))
++			return NULL; /* 'active' state for station did not change */
++
++		if (!hapd->iface->atf_enabled)
++			return NULL; /* ATF function is OFF */
++
++		wpa_printf(MSG_DEBUG, "ATF: Recalculating quotas because STA " MACSTR
++				" (aid %d) became %s", MAC2STR(changed_sta), sta->aid,
++				is_sta_active(sta, hapd->iface->atf_sta_has_quota) ? "active" : "inactive");
++	}
++	else { /* ATF config changed */
++		if (!hapd->iface->atf_enabled && !hapd->iconf->atf_cfg.distr_type)
++			return NULL; /* ATF function is OFF and also was OFF before */
++		hapd->iface->atf_enabled = hapd->iconf->atf_cfg.distr_type;
++
++		wpa_printf(MSG_DEBUG, "ATF: Recalculating quotas because config has "
++				"changed, num_bss=%d, max_sta=%d",
++				hapd->iface->num_bss, max_stations);
++	}
++
++	/* Calculate extra data size and allocate memory for "SET_ATF_QUOTAS" message */
++	data_len = sizeof(uint16_t) * (max_stations + hapd->iface->num_bss);
++	atf_quotas = os_zalloc (sizeof(mtlk_atf_quotas_t) + data_len);
++	if (atf_quotas == NULL)
++		return NULL;
++	vap_grant = atf_quotas->data;
++	sta_grant = vap_grant + hapd->iface->num_bss;
++
++	/* Fill in per-radio parameters */
++	atf_quotas->debug         = atf_cfg->debug;
++	atf_quotas->distr_type    = atf_cfg->distr_type;
++	atf_quotas->algo_type     = atf_cfg->algo_type;
++	atf_quotas->weighted_type = atf_cfg->weighted_type;
++	atf_quotas->interval      = atf_cfg->interval;
++	atf_quotas->free_time     = atf_cfg->free_time;
++	atf_quotas->nof_bss       = hapd->iface->num_bss;
++	atf_quotas->nof_sta       = max_stations;
++	atf_quotas->data_len      = data_len;
++
++	if (atf_cfg->per_vap)
++	{
++		for (n_bss = 0; n_bss < hapd->iface->num_bss; n_bss++) {
++			int i;
++
++			/* Find and apply ATF configuration for this BSS */
++			for (i=0; i < atf_cfg->n_vaps; i++) {
++				struct atf_vap_config *vap_cfg = atf_cfg->vap_cfg + i;
++				struct hostapd_data *bss = hapd->iface->bss[n_bss];
++				if (vap_cfg->vap_name && strcmp(bss->conf->iface, vap_cfg->vap_name) == 0) {
++
++					wpa_printf(MSG_DEBUG, "ATF: Calculating quotas for %s (%d stations in DB)",
++							bss->conf->iface, bss->num_sta);
++
++					vap_grant[n_bss] = vap_cfg->vap_grant;
++					distribute_sta_quotas_per_vap(vap_cfg, bss, sta_grant,
++							hapd->iface->atf_sta_has_quota);
++					break;
++				}
++			}
++		}
++	}
++	else { /* per radio */
++
++		wpa_printf(MSG_DEBUG, "ATF: Calculating quotas per radio");
++		distribute_sta_quotas_per_radio(atf_cfg->vap_cfg,
++				hapd->iface->num_bss, hapd->iface->bss,
++				sta_grant, hapd->iface->atf_sta_has_quota);
++	}
++
++	return atf_quotas;
++}
++
++
++/* Does ATF configuration and capacity allow the given station to connect */
++int hostapd_atf_is_sta_allowed(struct hostapd_data *bss, const u8 *address)
++{
++	struct atf_config* atf_cfg = &bss->iconf->atf_cfg;
++	struct atf_vap_config* vap_cfg = NULL;
++	int n_sta, total_quotas = 0;
++
++	/* Find ATF configuration to use */
++	if (atf_cfg->per_vap) {
++		int i;
++
++		/* Find ATF configuration for this BSS */
++		for (i=0; i < atf_cfg->n_vaps; i++) {
++			struct atf_vap_config *cfg = atf_cfg->vap_cfg + i;
++			if (cfg->vap_name && strcmp(bss->conf->iface, cfg->vap_name) == 0) {
++				vap_cfg = cfg;
++				break;
++			}
++		}
++	}
++	else
++		vap_cfg = bss->iconf->atf_cfg.vap_cfg; /* use per-radio configuration */
++
++	if (vap_cfg == NULL)
++		return 1; /* No stations nor VAPS (or an invalid ATF config) */
++
++	/* Is this STA in the list? Is the sum of assigned quotas below 100%? */
++	for (n_sta = 0; n_sta < vap_cfg->n_stations; n_sta++) {
++		struct atf_sta_grant* sta_grant = vap_cfg->sta_grants + n_sta;
++		if (memcmp(sta_grant->sta_mac, address, ETH_ALEN) == 0)
++			return 1; /* listed stations are always allowed */
++		total_quotas += sta_grant->sta_grant;
++	}
++
++	/* Unlisted stations are allowed if the total configured quota is below 100% */
++	return total_quotas < ATF_GRANT_SCALE;
++}
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/atf.h hostapd-2.6/src/ap/atf.h
+--- hostapd-2.6-orig/src/ap/atf.h	1970-01-01 03:00:00.000000000 +0300
++++ hostapd-2.6/src/ap/atf.h	2017-04-18 12:11:19.049979367 +0300
+@@ -0,0 +1,52 @@
++#ifndef ATF_H
++#define ATF_H
++
++#define ATF_GRANT_SCALE 10000 /* Grant equal to this number corresponds to 100% of air time */
++
++struct hostapd_data;
++struct mtlk_atf_quota;
++
++struct atf_sta_grant
++{
++	uint8_t    sta_mac[ETH_ALEN];
++	uint16_t   sta_grant;
++};
++
++struct atf_vap_config
++{
++	char*     vap_name;
++	uint16_t  vap_grant;
++	int       n_stations;    /* number of stations having grants */
++	struct    atf_sta_grant* sta_grants;
++};
++
++struct atf_config /* Air Time Fairness configuration */
++{
++	uint8_t   debug;         /* do debug printing to logs */
++	uint8_t   distr_type;    /* disabled / dynamic / static */
++	uint8_t   algo_type;     /* global or weighted */
++	uint8_t   weighted_type; /* PER_STATION / PER_STATION_PER_AC / PER_VAP / ... */
++	uint8_t   per_vap;       /* 1 - ATF is per VAP (0 - per radio) */
++	uint8_t   per_station;   /* 0 - station list is disallowed */
++	uint32_t  interval;      /* as in .conf file, passed to FW unchanged */
++	uint32_t  free_time;     /* as in .conf file, passed to FW unchanged */
++
++	uint32_t  n_vaps;
++	struct atf_vap_config* vap_cfg; /* memory allocated for n_vaps VAPs */
++};
++
++/* Free allocated memory and reset contents */
++void hostapd_atf_clean_config(struct atf_config* atf_cfg);
++
++/* Read ATF configuration from file */
++int hostapd_atf_read_config(struct atf_config* atf_cfg, const char* pathname);
++
++/* Calculate quotas and format a message to be sent to Driver */
++struct mtlk_atf_quotas* hostapd_atf_calc_quotas(struct atf_config* atf_cfg,
++		struct hostapd_data *hapd, const u8* changed_sta,
++		int in_driver, int not_in_driver);
++
++/* Does ATF configuration and capacity allow the given station to connect */
++int hostapd_atf_is_sta_allowed(struct hostapd_data *bss, const u8 *address);
++
++#endif /* ATF_H */
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/hostapd.h hostapd-2.6/src/ap/hostapd.h
+--- hostapd-2.6-orig/src/ap/hostapd.h	2017-04-18 12:09:08.664602471 +0300
++++ hostapd-2.6/src/ap/hostapd.h	2017-04-18 12:11:19.049979367 +0300
+@@ -483,6 +483,10 @@ struct hostapd_iface {
+ 	unsigned int num_sta_seen;
+ 
+ 	struct beacon_request last_beacon_req;
++
++	int atf_enabled; /* If ATF is currently enabled in FW */
++	u32 atf_sta_in_driver[2048/32]; // One bit per aid
++	u32 atf_sta_has_quota[2048/32]; // One bit per aid
+ };
+ 
+ /* hostapd.c */
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/ap/sta_info.c hostapd-2.6/src/ap/sta_info.c
+--- hostapd-2.6-orig/src/ap/sta_info.c	2017-04-18 12:09:08.665602451 +0300
++++ hostapd-2.6/src/ap/sta_info.c	2017-04-18 12:11:19.050979347 +0300
+@@ -690,7 +690,11 @@ struct sta_info * ap_sta_add(struct host
+ 			   num_sta_total, hapd->iconf->ap_max_num_sta);
+ 		return NULL;
+ 	}
+-
++	if (hapd->iconf->atf_cfg.distr_type && hostapd_atf_is_sta_allowed(hapd, addr) == 0) {
++		wpa_printf(MSG_INFO, "ATF: Configuration/capacity doesn't allow station "
++				MACSTR " to connect", MAC2STR(addr));
++		return NULL;
++	}
+ 	sta = os_zalloc(sizeof(struct sta_info));
+ 	if (sta == NULL) {
+ 		wpa_printf(MSG_ERROR, "malloc failed");
+@@ -1366,6 +1370,9 @@ void ap_sta_set_authorized(struct hostap
+ 					  AP_STA_DISCONNECTED "%s", buf);
+ 	}
+ 
++	/* Update ATF quotas if station is already in driver */
++	hostapd_drv_send_atf_quotas(hapd, sta->addr, 0, 0);
++
+ #ifdef CONFIG_FST
+ 	if (hapd->iface->fst) {
+ 		if (authorized)
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/common/ltq-vendor.h hostapd-2.6/src/common/ltq-vendor.h
+--- hostapd-2.6-orig/src/common/ltq-vendor.h	2017-04-18 12:09:08.672602309 +0300
++++ hostapd-2.6/src/common/ltq-vendor.h	2017-04-18 12:11:19.050979347 +0300
+@@ -44,6 +44,7 @@ enum ltq_nl80211_vendor_subcmds {
+ 	LTQ_NL80211_VENDOR_SUBCMD_GET_UNCONNECTED_STA  = 11,
+ 	LTQ_NL80211_VENDOR_SUBCMD_GET_VAP_MEASUREMENTS = 12,
+ 	LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_INFO       = 13,
++	LTQ_NL80211_VENDOR_SUBCMD_SET_ATF_QUOTAS       = 14,  /* Air time fairness data */
+ };
+ 
+ enum ltq_nl80211_vendor_events {
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/drivers/driver.h hostapd-2.6/src/drivers/driver.h
+--- hostapd-2.6-orig/src/drivers/driver.h	2017-04-18 12:09:08.661602531 +0300
++++ hostapd-2.6/src/drivers/driver.h	2017-04-18 12:11:19.051979327 +0300
+@@ -1519,6 +1519,23 @@ typedef struct mtlk_radio_info {
+   u32 width; /* 20,40,80,... */
+ } __attribute__ ((packed)) mtlk_radio_info_t;
+ 
++/* ATF: Air Time Fairness (a variable length message) */
++
++
++
++typedef struct mtlk_atf_quotas {
++  uint8_t   debug;
++  uint8_t   distr_type;    /* disabled / dynamic / static */
++  uint8_t   algo_type;     /* global or weighted */
++  uint8_t   weighted_type; /* PER_STATION / PER_STATION_PER_AC / PER_VAP / ... */
++  uint32_t  interval;      /* in microseconds */
++  uint32_t  free_time;     /* in microseconds */
++  uint16_t  nof_bss;
++  uint16_t  nof_sta;
++  uint16_t  data_len;
++  uint16_t  data[0];    /* Actual layout: u16 vap_grant[nof_bss]; u16 sta_grant[nof_sta]; */
++} __attribute__ ((packed))  mtlk_atf_quotas_t;
++
+ /**
+  * struct wpa_driver_capa - Driver capability information
+  */
+@@ -3752,6 +3769,14 @@ struct wpa_driver_ops {
+   int (*get_radio_info)(void *priv, mtlk_radio_info_t *radio_info);
+ 
+   /**
++   * send_atf_quotas - Send Air Time Fairness quotas to Driver
++   * Quotas are calculated basing on ATF configuration and a set
++   * of stations currently being connected.
++   * Returns: 0 on success, -1 on failure
++   */
++  int (*send_atf_quotas)(void *priv, mtlk_atf_quotas_t* atf_quotas);
++
++  /**
+    * unconnected_sta - Trigger unconnected station statistics
+    * @priv: Private driver interface data
+    * @req: Input parameters
+diff -Npur --exclude=.cproject --exclude=.project --exclude=.settings --exclude=hostapd_debug --exclude='*.orig' hostapd-2.6-orig/src/drivers/driver_nl80211.c hostapd-2.6/src/drivers/driver_nl80211.c
+--- hostapd-2.6-orig/src/drivers/driver_nl80211.c	2017-04-18 12:09:08.661602531 +0300
++++ hostapd-2.6/src/drivers/driver_nl80211.c	2017-04-18 12:11:19.052979307 +0300
+@@ -5829,6 +5829,17 @@ out:
+   return ret;
+ }
+ 
++int nl80211_send_atf_quotas(void *priv, mtlk_atf_quotas_t* atf_quotas)
++{
++  int ret = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SET_ATF_QUOTAS,
++		  (u8*)atf_quotas, sizeof(mtlk_atf_quotas_t) + atf_quotas->data_len, NULL);
++
++  if (ret < 0)
++    wpa_printf(MSG_ERROR, "nl80211: sending SET_ATF_CFG failed: %i (%s)",
++         ret, strerror(-ret));
++
++  return ret;
++}
+ 
+ int nl80211_unconnected_sta(void *priv, struct hostapd_unconnected_sta_req_params *req)
+ {
+@@ -9743,6 +9754,7 @@ const struct wpa_driver_ops wpa_driver_n
+ 	.get_sta_measurements = nl80211_get_sta_measurements,
+ 	.get_vap_measurements = nl80211_get_vap_measurements,
+ 	.get_radio_info = nl80211_get_radio_info,
++	.send_atf_quotas = nl80211_send_atf_quotas,
+ 	.unconnected_sta = nl80211_unconnected_sta,
+ 	.set_antenna = nl80211_set_antenna,
+ #ifdef CONFIG_MESH

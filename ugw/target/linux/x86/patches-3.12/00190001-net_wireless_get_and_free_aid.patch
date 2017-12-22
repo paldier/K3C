@@ -1,0 +1,958 @@
+diff -Npur -x'*.*.rej' -x'*.*.orig' -x'*.patch' b00/include/net/cfg80211.h b01/include/net/cfg80211.h
+--- b00/include/net/cfg80211.h	2016-09-27 17:13:04.000000000 +0300
++++ b01/include/net/cfg80211.h	2016-09-27 17:13:04.000000000 +0300
+@@ -2660,6 +2660,34 @@ struct wiphy_coalesce_support {
+ };
+ 
+ /**
++ * enum wiphy_vendor_command_flags - validation flags for vendor commands
++ * @WIPHY_VENDOR_CMD_NEED_WDEV: vendor command requires wdev
++ * @WIPHY_VENDOR_CMD_NEED_NETDEV: vendor command requires netdev
++ * @WIPHY_VENDOR_CMD_NEED_RUNNING: interface/wdev must be up & running
++ *	(must be combined with %_WDEV or %_NETDEV)
++ */
++enum wiphy_vendor_command_flags {
++	WIPHY_VENDOR_CMD_NEED_WDEV = BIT(0),
++	WIPHY_VENDOR_CMD_NEED_NETDEV = BIT(1),
++	WIPHY_VENDOR_CMD_NEED_RUNNING = BIT(2),
++};
++
++/**
++ * struct wiphy_vendor_command - vendor command definition
++ * @info: vendor command identifying information, as used in nl80211
++ * @flags: flags, see &enum wiphy_vendor_command_flags
++ * @doit: callback for the operation, note that wdev is %NULL if the
++ *	flags didn't ask for a wdev and non-%NULL otherwise; the data
++ *	pointer may be %NULL if userspace provided no data at all
++ */
++struct wiphy_vendor_command {
++	struct nl80211_vendor_cmd_info info;
++	u32 flags;
++	int (*doit)(struct wiphy *wiphy, struct wireless_dev *wdev,
++		    const void *data, int data_len);
++};
++
++/**
+  * struct wiphy - wireless hardware description
+  * @reg_notifier: the driver's regulatory notification callback,
+  *	note that if your driver uses wiphy_apply_custom_regulatory()
+@@ -2770,6 +2798,11 @@ struct wiphy_coalesce_support {
+  * @extended_capabilities_mask: mask of the valid values
+  * @extended_capabilities_len: length of the extended capabilities
+  * @coalesce: packet coalescing support information
++ *
++ * @vendor_commands: array of vendor commands supported by the hardware
++ * @n_vendor_commands: number of vendor commands
++ * @vendor_events: array of vendor events supported by the hardware
++ * @n_vendor_events: number of vendor events
+  */
+ struct wiphy {
+ 	/* assign these fields before you register the wiphy */
+@@ -2881,6 +2914,10 @@ struct wiphy {
+ 
+ 	const struct wiphy_coalesce_support *coalesce;
+ 
++	const struct wiphy_vendor_command *vendor_commands;
++	const struct nl80211_vendor_cmd_info *vendor_events;
++	int n_vendor_commands, n_vendor_events;
++
+ 	char priv[0] __aligned(NETDEV_ALIGN);
+ };
+ 
+@@ -3811,6 +3848,121 @@ void wiphy_rfkill_start_polling(struct w
+  */
+ void wiphy_rfkill_stop_polling(struct wiphy *wiphy);
+ 
++/**
++ * DOC: Vendor commands
++ *
++ * Occasionally, there are special protocol or firmware features that
++ * can't be implemented very openly. For this and similar cases, the
++ * vendor command functionality allows implementing the features with
++ * (typically closed-source) userspace and firmware, using nl80211 as
++ * the configuration mechanism.
++ *
++ * A driver supporting vendor commands must register them as an array
++ * in struct wiphy, with handlers for each one, each command has an
++ * OUI and sub command ID to identify it.
++ *
++ * Note that this feature should not be (ab)used to implement protocol
++ * features that could openly be shared across drivers. In particular,
++ * it must never be required to use vendor commands to implement any
++ * "normal" functionality that higher-level userspace like connection
++ * managers etc. need.
++ */
++
++struct sk_buff *__cfg80211_alloc_reply_skb(struct wiphy *wiphy,
++					   enum nl80211_commands cmd,
++					   enum nl80211_attrs attr,
++					   int approxlen);
++
++struct sk_buff *__cfg80211_alloc_event_skb(struct wiphy *wiphy,
++					   enum nl80211_commands cmd,
++					   enum nl80211_attrs attr,
++					   int vendor_event_idx,
++					   int approxlen, gfp_t gfp);
++
++void __cfg80211_send_event_skb(struct sk_buff *skb, gfp_t gfp);
++
++/**
++ * cfg80211_vendor_cmd_alloc_reply_skb - allocate vendor command reply
++ * @wiphy: the wiphy
++ * @approxlen: an upper bound of the length of the data that will
++ *	be put into the skb
++ *
++ * This function allocates and pre-fills an skb for a reply to
++ * a vendor command. Since it is intended for a reply, calling
++ * it outside of a vendor command's doit() operation is invalid.
++ *
++ * The returned skb is pre-filled with some identifying data in
++ * a way that any data that is put into the skb (with skb_put(),
++ * nla_put() or similar) will end up being within the
++ * %NL80211_ATTR_VENDOR_DATA attribute, so all that needs to be done
++ * with the skb is adding data for the corresponding userspace tool
++ * which can then read that data out of the vendor data attribute.
++ * You must not modify the skb in any other way.
++ *
++ * When done, call cfg80211_vendor_cmd_reply() with the skb and return
++ * its error code as the result of the doit() operation.
++ *
++ * Return: An allocated and pre-filled skb. %NULL if any errors happen.
++ */
++static inline struct sk_buff *
++cfg80211_vendor_cmd_alloc_reply_skb(struct wiphy *wiphy, int approxlen)
++{
++	return __cfg80211_alloc_reply_skb(wiphy, NL80211_CMD_VENDOR,
++					  NL80211_ATTR_VENDOR_DATA, approxlen);
++}
++
++/**
++ * cfg80211_vendor_cmd_reply - send the reply skb
++ * @skb: The skb, must have been allocated with
++ *	cfg80211_vendor_cmd_alloc_reply_skb()
++ *
++ * Since calling this function will usually be the last thing
++ * before returning from the vendor command doit() you should
++ * return the error code.  Note that this function consumes the
++ * skb regardless of the return value.
++ *
++ * Return: An error code or 0 on success.
++ */
++int cfg80211_vendor_cmd_reply(struct sk_buff *skb);
++
++/**
++ * cfg80211_vendor_event_alloc - allocate vendor-specific event skb
++ * @wiphy: the wiphy
++ * @event_idx: index of the vendor event in the wiphy's vendor_events
++ * @approxlen: an upper bound of the length of the data that will
++ *	be put into the skb
++ * @gfp: allocation flags
++ *
++ * This function allocates and pre-fills an skb for an event on the
++ * vendor-specific multicast group.
++ *
++ * When done filling the skb, call cfg80211_vendor_event() with the
++ * skb to send the event.
++ *
++ * Return: An allocated and pre-filled skb. %NULL if any errors happen.
++ */
++static inline struct sk_buff *
++cfg80211_vendor_event_alloc(struct wiphy *wiphy, int approxlen,
++			    int event_idx, gfp_t gfp)
++{
++	return __cfg80211_alloc_event_skb(wiphy, NL80211_CMD_VENDOR,
++					  NL80211_ATTR_VENDOR_DATA,
++					  event_idx, approxlen, gfp);
++}
++
++/**
++ * cfg80211_vendor_event - send the event
++ * @skb: The skb, must have been allocated with cfg80211_vendor_event_alloc()
++ * @gfp: allocation flags
++ *
++ * This function sends the given @skb, which must have been allocated
++ * by cfg80211_vendor_event_alloc(), as an event. It always consumes it.
++ */
++static inline void cfg80211_vendor_event(struct sk_buff *skb, gfp_t gfp)
++{
++	__cfg80211_send_event_skb(skb, gfp);
++}
++
+ #ifdef CONFIG_NL80211_TESTMODE
+ /**
+  * DOC: Test mode
+@@ -3846,8 +3998,12 @@ void wiphy_rfkill_stop_polling(struct wi
+  *
+  * Return: An allocated and pre-filled skb. %NULL if any errors happen.
+  */
+-struct sk_buff *cfg80211_testmode_alloc_reply_skb(struct wiphy *wiphy,
+-						  int approxlen);
++static inline struct sk_buff *
++cfg80211_testmode_alloc_reply_skb(struct wiphy *wiphy, int approxlen)
++{
++	return __cfg80211_alloc_reply_skb(wiphy, NL80211_CMD_TESTMODE,
++					  NL80211_ATTR_TESTDATA, approxlen);
++}
+ 
+ /**
+  * cfg80211_testmode_reply - send the reply skb
+@@ -3861,7 +4017,10 @@ struct sk_buff *cfg80211_testmode_alloc_
+  *
+  * Return: An error code or 0 on success.
+  */
+-int cfg80211_testmode_reply(struct sk_buff *skb);
++static inline int cfg80211_testmode_reply(struct sk_buff *skb)
++{
++	return cfg80211_vendor_cmd_reply(skb);
++}
+ 
+ /**
+  * cfg80211_testmode_alloc_event_skb - allocate testmode event
+@@ -3884,8 +4043,13 @@ int cfg80211_testmode_reply(struct sk_bu
+  *
+  * Return: An allocated and pre-filled skb. %NULL if any errors happen.
+  */
+-struct sk_buff *cfg80211_testmode_alloc_event_skb(struct wiphy *wiphy,
+-						  int approxlen, gfp_t gfp);
++static inline struct sk_buff *
++cfg80211_testmode_alloc_event_skb(struct wiphy *wiphy, int approxlen, gfp_t gfp)
++{
++	return __cfg80211_alloc_event_skb(wiphy, NL80211_CMD_TESTMODE,
++					  NL80211_ATTR_TESTDATA, -1,
++					  approxlen, gfp);
++}
+ 
+ /**
+  * cfg80211_testmode_event - send the event
+@@ -3897,7 +4061,10 @@ struct sk_buff *cfg80211_testmode_alloc_
+  * by cfg80211_testmode_alloc_event_skb(), as an event. It always
+  * consumes it.
+  */
+-void cfg80211_testmode_event(struct sk_buff *skb, gfp_t gfp);
++static inline void cfg80211_testmode_event(struct sk_buff *skb, gfp_t gfp)
++{
++	__cfg80211_send_event_skb(skb, gfp);
++}
+ 
+ #define CFG80211_TESTMODE_CMD(cmd)	.testmode_cmd = (cmd),
+ #define CFG80211_TESTMODE_DUMP(cmd)	.testmode_dump = (cmd),
+diff -Npur -x'*.*.rej' -x'*.*.orig' -x'*.patch' b00/include/uapi/linux/nl80211.h b01/include/uapi/linux/nl80211.h
+--- b00/include/uapi/linux/nl80211.h	2016-09-27 17:13:04.000000000 +0300
++++ b01/include/uapi/linux/nl80211.h	2016-09-27 17:13:04.000000000 +0300
+@@ -581,7 +581,14 @@
+  *	operation, %NL80211_ATTR_MAC contains the peer MAC address, and
+  *	%NL80211_ATTR_REASON_CODE the reason code to be used (only with
+  *	%NL80211_TDLS_TEARDOWN).
+- * @NL80211_CMD_TDLS_MGMT: Send a TDLS management frame.
++ * @NL80211_CMD_TDLS_MGMT: Send a TDLS management frame. The
++ *	%NL80211_ATTR_TDLS_ACTION attribute determines the type of frame to be
++ *	sent. Public Action codes (802.11-2012 8.1.5.1) will be sent as
++ *	802.11 management frames, while TDLS action codes (802.11-2012
++ *	8.5.13.1) will be encapsulated and sent as data frames. The currently
++ *	supported Public Action code is %WLAN_PUB_ACTION_TDLS_DISCOVER_RES
++ *	and the currently supported TDLS actions codes are given in
++ *	&enum ieee80211_tdls_actioncode.
+  *
+  * @NL80211_CMD_UNEXPECTED_FRAME: Used by an application controlling an AP
+  *	(or GO) interface (i.e. hostapd) to ask for unexpected frames to
+@@ -686,6 +693,21 @@
+  *	other station that transmission must be blocked until the channel
+  *	switch is complete.
+  *
++ * @NL80211_CMD_VENDOR: Vendor-specified command/event. The command is specified
++ *	by the %NL80211_ATTR_VENDOR_ID attribute and a sub-command in
++ *	%NL80211_ATTR_VENDOR_SUBCMD. Parameter(s) can be transported in
++ *	%NL80211_ATTR_VENDOR_DATA.
++ *	For feature advertisement, the %NL80211_ATTR_VENDOR_DATA attribute is
++ *	used in the wiphy data as a nested attribute containing descriptions
++ *	(&struct nl80211_vendor_cmd_info) of the supported vendor commands.
++ *	This may also be sent as an event with the same attributes.
++ *
++ * @NL80211_CMD_SET_QOS_MAP: Set Interworking QoS mapping for IP DSCP values.
++ *	The QoS mapping information is included in %NL80211_ATTR_QOS_MAP. If
++ *	that attribute is not included, QoS mapping is disabled. Since this
++ *	QoS mapping is relevant for IP packets, it is only valid during an
++ *	association. This is cleared on disassociation and AP restart.
++ *
+  * @NL80211_CMD_MAX: highest used command number
+  * @__NL80211_CMD_AFTER_LAST: internal use
+  */
+@@ -853,6 +875,10 @@ enum nl80211_commands {
+ 
+ 	NL80211_CMD_CHANNEL_SWITCH,
+ 
++    NL80211_CMD_VENDOR,
++
++	NL80211_CMD_SET_QOS_MAP,
++
+ 	/* add new commands above here */
+ 
+ 	/* used to define NL80211_CMD_MAX below */
+@@ -988,7 +1014,7 @@ enum nl80211_commands {
+  * 	to query the CRDA to retrieve one regulatory domain. This attribute can
+  * 	also be used by userspace to query the kernel for the currently set
+  * 	regulatory domain. We chose an alpha2 as that is also used by the
+- * 	IEEE-802.11d country information element to identify a country.
++ * 	IEEE-802.11 country information element to identify a country.
+  * 	Users can also simply ask the wireless core to set regulatory domain
+  * 	to a specific alpha2.
+  * @NL80211_ATTR_REG_RULES: a nested array of regulatory domain regulatory
+@@ -1496,6 +1522,39 @@ enum nl80211_commands {
+  * @NL80211_ATTR_RXMGMT_FLAGS: flags for nl80211_send_mgmt(), u32.
+  *	As specified in the &enum nl80211_rxmgmt_flags.
+  *
++ * @NL80211_ATTR_STA_SUPPORTED_CHANNELS: array of supported channels.
++ *
++ * @NL80211_ATTR_STA_SUPPORTED_OPER_CLASSES: array of supported
++ *      supported operating classes.
++ *
++ * @NL80211_ATTR_HANDLE_DFS: A flag indicating whether user space
++ *	controls DFS operation in IBSS mode. If the flag is included in
++ *	%NL80211_CMD_JOIN_IBSS request, the driver will allow use of DFS
++ *	channels and reports radar events to userspace. Userspace is required
++ *	to react to radar events, e.g. initiate a channel switch or leave the
++ *	IBSS network.
++ *
++ * @NL80211_ATTR_SUPPORT_5_MHZ: A flag indicating that the device supports
++ *	5 MHz channel bandwidth.
++ * @NL80211_ATTR_SUPPORT_10_MHZ: A flag indicating that the device supports
++ *	10 MHz channel bandwidth.
++ *
++ * @NL80211_ATTR_OPMODE_NOTIF: Operating mode field from Operating Mode
++ *	Notification Element based on association request when used with
++ *	%NL80211_CMD_NEW_STATION; u8 attribute.
++ *
++ * @NL80211_ATTR_VENDOR_ID: The vendor ID, either a 24-bit OUI or, if
++ *	%NL80211_VENDOR_ID_IS_LINUX is set, a special Linux ID (not used yet)
++ * @NL80211_ATTR_VENDOR_SUBCMD: vendor sub-command
++ * @NL80211_ATTR_VENDOR_DATA: data for the vendor command, if any; this
++ *	attribute is also used for vendor command feature advertisement
++ * @NL80211_ATTR_VENDOR_EVENTS: used for event list advertising in the wiphy
++ *	info, containing a nested array of possible events
++ *
++ * @NL80211_ATTR_QOS_MAP: IP DSCP mapping for Interworking QoS mapping. This
++ *	data is in the format defined for the payload of the QoS Map Set element
++ *	in IEEE Std 802.11-2012, 8.4.2.97.
++ *
+  * @NL80211_ATTR_MAX: highest attribute number currently defined
+  * @__NL80211_ATTR_AFTER_LAST: internal use
+  */
+@@ -1806,6 +1865,24 @@ enum nl80211_attrs {
+ 
+ 	NL80211_ATTR_RXMGMT_FLAGS,
+ 
++	NL80211_ATTR_STA_SUPPORTED_CHANNELS,
++
++	NL80211_ATTR_STA_SUPPORTED_OPER_CLASSES,
++
++	NL80211_ATTR_HANDLE_DFS,
++
++	NL80211_ATTR_SUPPORT_5_MHZ,
++	NL80211_ATTR_SUPPORT_10_MHZ,
++
++	NL80211_ATTR_OPMODE_NOTIF,
++
++	NL80211_ATTR_VENDOR_ID,
++	NL80211_ATTR_VENDOR_SUBCMD,
++	NL80211_ATTR_VENDOR_DATA,
++	NL80211_ATTR_VENDOR_EVENTS,
++
++	NL80211_ATTR_QOS_MAP,
++
+ 	/* add attributes here, update the policy in nl80211.c */
+ 
+ 	__NL80211_ATTR_AFTER_LAST,
+@@ -2206,10 +2283,9 @@ enum nl80211_band_attr {
+  * @NL80211_FREQUENCY_ATTR_FREQ: Frequency in MHz
+  * @NL80211_FREQUENCY_ATTR_DISABLED: Channel is disabled in current
+  *	regulatory domain.
+- * @NL80211_FREQUENCY_ATTR_PASSIVE_SCAN: Only passive scanning is
+- *	permitted on this channel in current regulatory domain.
+- * @NL80211_FREQUENCY_ATTR_NO_IBSS: IBSS networks are not permitted
+- *	on this channel in current regulatory domain.
++ * @NL80211_FREQUENCY_ATTR_NO_IR: no mechanisms that initiate radiation
++ * 	are permitted on this channel, this includes sending probe
++ * 	requests, or modes of operation that require beaconing.
+  * @NL80211_FREQUENCY_ATTR_RADAR: Radar detection is mandatory
+  *	on this channel in current regulatory domain.
+  * @NL80211_FREQUENCY_ATTR_MAX_TX_POWER: Maximum transmission power in mBm
+@@ -2236,8 +2312,8 @@ enum nl80211_frequency_attr {
+ 	__NL80211_FREQUENCY_ATTR_INVALID,
+ 	NL80211_FREQUENCY_ATTR_FREQ,
+ 	NL80211_FREQUENCY_ATTR_DISABLED,
+-	NL80211_FREQUENCY_ATTR_PASSIVE_SCAN,
+-	NL80211_FREQUENCY_ATTR_NO_IBSS,
++	NL80211_FREQUENCY_ATTR_NO_IR,
++	__NL80211_FREQUENCY_ATTR_NO_IBSS,
+ 	NL80211_FREQUENCY_ATTR_RADAR,
+ 	NL80211_FREQUENCY_ATTR_MAX_TX_POWER,
+ 	NL80211_FREQUENCY_ATTR_DFS_STATE,
+@@ -2253,6 +2329,9 @@ enum nl80211_frequency_attr {
+ };
+ 
+ #define NL80211_FREQUENCY_ATTR_MAX_TX_POWER NL80211_FREQUENCY_ATTR_MAX_TX_POWER
++#define NL80211_FREQUENCY_ATTR_PASSIVE_SCAN	NL80211_FREQUENCY_ATTR_NO_IR
++#define NL80211_FREQUENCY_ATTR_NO_IBSS		NL80211_FREQUENCY_ATTR_NO_IR
++#define NL80211_FREQUENCY_ATTR_NO_IR		NL80211_FREQUENCY_ATTR_NO_IR
+ 
+ /**
+  * enum nl80211_bitrate_attr - bitrate attributes
+@@ -2395,8 +2474,9 @@ enum nl80211_sched_scan_match_attr {
+  * @NL80211_RRF_DFS: DFS support is required to be used
+  * @NL80211_RRF_PTP_ONLY: this is only for Point To Point links
+  * @NL80211_RRF_PTMP_ONLY: this is only for Point To Multi Point links
+- * @NL80211_RRF_PASSIVE_SCAN: passive scan is required
+- * @NL80211_RRF_NO_IBSS: no IBSS is allowed
++ * @NL80211_RRF_NO_IR: no mechanisms that initiate radiation are allowed,
++ * 	this includes probe requests or modes of operation that require
++ * 	beaconing.
+  */
+ enum nl80211_reg_rule_flags {
+ 	NL80211_RRF_NO_OFDM		= 1<<0,
+@@ -2406,10 +2486,17 @@ enum nl80211_reg_rule_flags {
+ 	NL80211_RRF_DFS			= 1<<4,
+ 	NL80211_RRF_PTP_ONLY		= 1<<5,
+ 	NL80211_RRF_PTMP_ONLY		= 1<<6,
+-	NL80211_RRF_PASSIVE_SCAN	= 1<<7,
+-	NL80211_RRF_NO_IBSS		= 1<<8,
++	NL80211_RRF_NO_IR		= 1<<7,
++	__NL80211_RRF_NO_IBSS		= 1<<8,
+ };
+ 
++#define NL80211_RRF_PASSIVE_SCAN	NL80211_RRF_NO_IR
++#define NL80211_RRF_NO_IBSS		NL80211_RRF_NO_IR
++#define NL80211_RRF_NO_IR		NL80211_RRF_NO_IR
++
++/* For backport compatibility with older userspace */
++#define NL80211_RRF_NO_IR_ALL		(NL80211_RRF_NO_IR | __NL80211_RRF_NO_IBSS)
++
+ /**
+  * enum nl80211_dfs_regions - regulatory DFS regions
+  *
+@@ -3040,21 +3127,35 @@ enum nl80211_key_attributes {
+  *	in an array of rates as defined in IEEE 802.11 7.3.2.2 (u8 values with
+  *	1 = 500 kbps) but without the IE length restriction (at most
+  *	%NL80211_MAX_SUPP_RATES in a single array).
+- * @NL80211_TXRATE_MCS: HT (MCS) rates allowed for TX rate selection
++ * @NL80211_TXRATE_HT: HT (MCS) rates allowed for TX rate selection
+  *	in an array of MCS numbers.
++ * @NL80211_TXRATE_VHT: VHT rates allowed for TX rate selection,
++ *	see &struct nl80211_txrate_vht
+  * @__NL80211_TXRATE_AFTER_LAST: internal
+  * @NL80211_TXRATE_MAX: highest TX rate attribute
+  */
+ enum nl80211_tx_rate_attributes {
+ 	__NL80211_TXRATE_INVALID,
+ 	NL80211_TXRATE_LEGACY,
+-	NL80211_TXRATE_MCS,
++	NL80211_TXRATE_HT,
++	NL80211_TXRATE_VHT,
+ 
+ 	/* keep last */
+ 	__NL80211_TXRATE_AFTER_LAST,
+ 	NL80211_TXRATE_MAX = __NL80211_TXRATE_AFTER_LAST - 1
+ };
+ 
++#define NL80211_TXRATE_MCS NL80211_TXRATE_HT
++#define NL80211_VHT_NSS_MAX		8
++
++/**
++ * struct nl80211_txrate_vht - VHT MCS/NSS txrate bitmap
++ * @mcs: MCS bitmap table for each NSS (array index 0 for 1 stream, etc.)
++ */
++struct nl80211_txrate_vht {
++	__u16 mcs[NL80211_VHT_NSS_MAX];
++};
++
+ /**
+  * enum nl80211_band - Frequency band
+  * @NL80211_BAND_2GHZ: 2.4 GHz ISM band
+@@ -3860,11 +3961,11 @@ enum nl80211_radar_event {
+  *
+  * Channel states used by the DFS code.
+  *
+- * @IEEE80211_DFS_USABLE: The channel can be used, but channel availability
++ * @NL80211_DFS_USABLE: The channel can be used, but channel availability
+  *	check (CAC) must be performed before using it for AP or IBSS.
+- * @IEEE80211_DFS_UNAVAILABLE: A radar has been detected on this channel, it
++ * @NL80211_DFS_UNAVAILABLE: A radar has been detected on this channel, it
+  *	is therefore marked as not available.
+- * @IEEE80211_DFS_AVAILABLE: The channel has been CAC checked and is available.
++ * @NL80211_DFS_AVAILABLE: The channel has been CAC checked and is available.
+  */
+ 
+ enum nl80211_dfs_state {
+@@ -3917,4 +4018,24 @@ enum nl80211_rxmgmt_flags {
+ 	NL80211_RXMGMT_FLAG_ANSWERED = 1 << 0,
+ };
+ 
++/*
++ * If this flag is unset, the lower 24 bits are an OUI, if set
++ * a Linux nl80211 vendor ID is used (no such IDs are allocated
++ * yet, so that's not valid so far)
++ */
++#define NL80211_VENDOR_ID_IS_LINUX	0x80000000
++
++/**
++ * struct nl80211_vendor_cmd_info - vendor command data
++ * @vendor_id: If the %NL80211_VENDOR_ID_IS_LINUX flag is clear, then the
++ *	value is a 24-bit OUI; if it is set then a separately allocated ID
++ *	may be used, but no such IDs are allocated yet. New IDs should be
++ *	added to this file when needed.
++ * @subcmd: sub-command ID for the command
++ */
++struct nl80211_vendor_cmd_info {
++	__u32 vendor_id;
++	__u32 subcmd;
++};
++
+ #endif /* __LINUX_NL80211_H */
+diff -Npur -x'*.*.rej' -x'*.*.orig' -x'*.patch' b00/net/wireless/core.h b01/net/wireless/core.h
+--- b00/net/wireless/core.h	2016-09-27 17:13:04.000000000 +0300
++++ b01/net/wireless/core.h	2016-09-27 17:13:04.000000000 +0300
+@@ -67,9 +67,7 @@ struct cfg80211_registered_device {
+ 	struct work_struct scan_done_wk;
+ 	struct work_struct sched_scan_results_wk;
+ 
+-#ifdef CONFIG_NL80211_TESTMODE
+-	struct genl_info *testmode_info;
+-#endif
++    struct genl_info *cur_cmd_info;
+ 
+ 	struct work_struct conn_work;
+ 	struct work_struct event_work;
+diff -Npur -x'*.*.rej' -x'*.*.orig' -x'*.patch' b00/net/wireless/nl80211.c b01/net/wireless/nl80211.c
+--- b00/net/wireless/nl80211.c	2016-09-27 17:13:04.000000000 +0300
++++ b01/net/wireless/nl80211.c	2016-09-27 17:13:04.000000000 +0300
+@@ -30,9 +30,9 @@ static int nl80211_crypto_settings(struc
+ 				   struct cfg80211_crypto_settings *settings,
+ 				   int cipher_limit);
+ 
+-static int nl80211_pre_doit(struct genl_ops *ops, struct sk_buff *skb,
++static int nl80211_pre_doit(const struct genl_ops *ops, struct sk_buff *skb,
+ 			    struct genl_info *info);
+-static void nl80211_post_doit(struct genl_ops *ops, struct sk_buff *skb,
++static void nl80211_post_doit(const struct genl_ops *ops, struct sk_buff *skb,
+ 			      struct genl_info *info);
+ 
+ /* the netlink family */
+@@ -348,6 +348,9 @@ static const struct nla_policy nl80211_p
+ 	[NL80211_ATTR_MDID] = { .type = NLA_U16 },
+ 	[NL80211_ATTR_IE_RIC] = { .type = NLA_BINARY,
+ 				  .len = IEEE80211_MAX_DATA_LEN },
++	[NL80211_ATTR_VENDOR_ID] = { .type = NLA_U32 },
++	[NL80211_ATTR_VENDOR_SUBCMD] = { .type = NLA_U32 },
++	[NL80211_ATTR_VENDOR_DATA] = { .type = NLA_BINARY },
+ 	[NL80211_ATTR_PEER_AID] = { .type = NLA_U16 },
+ 	[NL80211_ATTR_CH_SWITCH_COUNT] = { .type = NLA_U32 },
+ 	[NL80211_ATTR_CH_SWITCH_BLOCK_TX] = { .type = NLA_FLAG },
+@@ -1557,6 +1560,41 @@ static int nl80211_send_wiphy(struct cfg
+ 		if (nl80211_send_coalesce(msg, dev))
+ 			goto nla_put_failure;
+ 
++		state->split_start++;
++		break;
++	case 11:
++		if (dev->wiphy.n_vendor_commands) {
++			const struct nl80211_vendor_cmd_info *info;
++			struct nlattr *nested;
++
++			nested = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA);
++			if (!nested)
++				goto nla_put_failure;
++
++			for (i = 0; i < dev->wiphy.n_vendor_commands; i++) {
++				info = &dev->wiphy.vendor_commands[i].info;
++				if (nla_put(msg, i + 1, sizeof(*info), info))
++					goto nla_put_failure;
++			}
++			nla_nest_end(msg, nested);
++		}
++
++		if (dev->wiphy.n_vendor_events) {
++			const struct nl80211_vendor_cmd_info *info;
++			struct nlattr *nested;
++
++			nested = nla_nest_start(msg,
++						NL80211_ATTR_VENDOR_EVENTS);
++			if (!nested)
++				goto nla_put_failure;
++
++			for (i = 0; i < dev->wiphy.n_vendor_events; i++) {
++				info = &dev->wiphy.vendor_events[i];
++				if (nla_put(msg, i + 1, sizeof(*info), info))
++					goto nla_put_failure;
++			}
++			nla_nest_end(msg, nested);
++		}
+ 		/* done */
+ 		state->split_start = 0;
+ 		break;
+@@ -6599,12 +6637,114 @@ static int nl80211_set_mcast_rate(struct
+ 	return err;
+ }
+ 
++static struct sk_buff *
++__cfg80211_alloc_vendor_skb(struct cfg80211_registered_device *rdev,
++			    int approxlen, u32 portid, u32 seq,
++			    enum nl80211_commands cmd,
++			    enum nl80211_attrs attr,
++			    const struct nl80211_vendor_cmd_info *info,
++			    gfp_t gfp)
++{
++	struct sk_buff *skb;
++	void *hdr;
++	struct nlattr *data;
++
++	skb = nlmsg_new(approxlen + 100, gfp);
++	if (!skb)
++		return NULL;
++
++	hdr = nl80211hdr_put(skb, portid, seq, 0, cmd);
++	if (!hdr) {
++		kfree_skb(skb);
++		return NULL;
++	}
++
++	if (nla_put_u32(skb, NL80211_ATTR_WIPHY, rdev->wiphy_idx))
++		goto nla_put_failure;
++
++	if (info) {
++		if (nla_put_u32(skb, NL80211_ATTR_VENDOR_ID,
++				info->vendor_id))
++			goto nla_put_failure;
++		if (nla_put_u32(skb, NL80211_ATTR_VENDOR_SUBCMD,
++				info->subcmd))
++			goto nla_put_failure;
++	}
++
++	data = nla_nest_start(skb, attr);
++
++	((void **)skb->cb)[0] = rdev;
++	((void **)skb->cb)[1] = hdr;
++	((void **)skb->cb)[2] = data;
++
++	return skb;
++
++ nla_put_failure:
++	kfree_skb(skb);
++	return NULL;
++}
++
++struct sk_buff *__cfg80211_alloc_event_skb(struct wiphy *wiphy,
++					   enum nl80211_commands cmd,
++					   enum nl80211_attrs attr,
++					   int vendor_event_idx,
++					   int approxlen, gfp_t gfp)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_dev(wiphy);
++	const struct nl80211_vendor_cmd_info *info;
++
++	switch (cmd) {
++	case NL80211_CMD_TESTMODE:
++		if (WARN_ON(vendor_event_idx != -1))
++			return NULL;
++		info = NULL;
++		break;
++	case NL80211_CMD_VENDOR:
++		if (WARN_ON(vendor_event_idx < 0 ||
++			    vendor_event_idx >= wiphy->n_vendor_events))
++			return NULL;
++		info = &wiphy->vendor_events[vendor_event_idx];
++		break;
++	default:
++		WARN_ON(1);
++		return NULL;
++	}
++
++	return __cfg80211_alloc_vendor_skb(rdev, approxlen, 0, 0,
++					   cmd, attr, info, gfp);
++}
++EXPORT_SYMBOL(__cfg80211_alloc_event_skb);
+ 
+-#ifdef CONFIG_NL80211_TESTMODE
+ static struct genl_multicast_group nl80211_testmode_mcgrp = {
+ 	.name = "testmode",
+ };
+ 
++static struct genl_multicast_group nl80211_vendor_mcgrp = {
++	.name = "vendor",
++};
++
++void __cfg80211_send_event_skb(struct sk_buff *skb, gfp_t gfp)
++{
++	struct cfg80211_registered_device *rdev = ((void **)skb->cb)[0];
++	void *hdr = ((void **)skb->cb)[1];
++	struct nlattr *data = ((void **)skb->cb)[2];
++	unsigned int mcgrp_id = nl80211_testmode_mcgrp.id;
++
++	/* clear CB data for netlink core to own from now on */
++	memset(skb->cb, 0, sizeof(skb->cb));
++
++	nla_nest_end(skb, data);
++	genlmsg_end(skb, hdr);
++
++	if (data->nla_type == NL80211_ATTR_VENDOR_DATA)
++		mcgrp_id = nl80211_vendor_mcgrp.id;
++
++	genlmsg_multicast_netns(wiphy_net(&rdev->wiphy), skb, 0,
++				mcgrp_id, gfp);
++}
++EXPORT_SYMBOL(__cfg80211_send_event_skb);
++
++#ifdef CONFIG_NL80211_TESTMODE
+ static int nl80211_testmode_do(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
+@@ -6730,96 +6870,6 @@ static int nl80211_testmode_dump(struct 
+ 	rtnl_unlock();
+ 	return err;
+ }
+-
+-static struct sk_buff *
+-__cfg80211_testmode_alloc_skb(struct cfg80211_registered_device *rdev,
+-			      int approxlen, u32 portid, u32 seq, gfp_t gfp)
+-{
+-	struct sk_buff *skb;
+-	void *hdr;
+-	struct nlattr *data;
+-
+-	skb = nlmsg_new(approxlen + 100, gfp);
+-	if (!skb)
+-		return NULL;
+-
+-	hdr = nl80211hdr_put(skb, portid, seq, 0, NL80211_CMD_TESTMODE);
+-	if (!hdr) {
+-		kfree_skb(skb);
+-		return NULL;
+-	}
+-
+-	if (nla_put_u32(skb, NL80211_ATTR_WIPHY, rdev->wiphy_idx))
+-		goto nla_put_failure;
+-	data = nla_nest_start(skb, NL80211_ATTR_TESTDATA);
+-
+-	((void **)skb->cb)[0] = rdev;
+-	((void **)skb->cb)[1] = hdr;
+-	((void **)skb->cb)[2] = data;
+-
+-	return skb;
+-
+- nla_put_failure:
+-	kfree_skb(skb);
+-	return NULL;
+-}
+-
+-struct sk_buff *cfg80211_testmode_alloc_reply_skb(struct wiphy *wiphy,
+-						  int approxlen)
+-{
+-	struct cfg80211_registered_device *rdev = wiphy_to_dev(wiphy);
+-
+-	if (WARN_ON(!rdev->testmode_info))
+-		return NULL;
+-
+-	return __cfg80211_testmode_alloc_skb(rdev, approxlen,
+-				rdev->testmode_info->snd_portid,
+-				rdev->testmode_info->snd_seq,
+-				GFP_KERNEL);
+-}
+-EXPORT_SYMBOL(cfg80211_testmode_alloc_reply_skb);
+-
+-int cfg80211_testmode_reply(struct sk_buff *skb)
+-{
+-	struct cfg80211_registered_device *rdev = ((void **)skb->cb)[0];
+-	void *hdr = ((void **)skb->cb)[1];
+-	struct nlattr *data = ((void **)skb->cb)[2];
+-
+-	if (WARN_ON(!rdev->testmode_info)) {
+-		kfree_skb(skb);
+-		return -EINVAL;
+-	}
+-
+-	nla_nest_end(skb, data);
+-	genlmsg_end(skb, hdr);
+-	return genlmsg_reply(skb, rdev->testmode_info);
+-}
+-EXPORT_SYMBOL(cfg80211_testmode_reply);
+-
+-struct sk_buff *cfg80211_testmode_alloc_event_skb(struct wiphy *wiphy,
+-						  int approxlen, gfp_t gfp)
+-{
+-	struct cfg80211_registered_device *rdev = wiphy_to_dev(wiphy);
+-
+-	return __cfg80211_testmode_alloc_skb(rdev, approxlen, 0, 0, gfp);
+-}
+-EXPORT_SYMBOL(cfg80211_testmode_alloc_event_skb);
+-
+-void cfg80211_testmode_event(struct sk_buff *skb, gfp_t gfp)
+-{
+-	struct cfg80211_registered_device *rdev = ((void **)skb->cb)[0];
+-	void *hdr = ((void **)skb->cb)[1];
+-	struct nlattr *data = ((void **)skb->cb)[2];
+-
+-	/* clear CB data for netlink core to own from now on */
+-	memset(skb->cb, 0, sizeof(skb->cb));
+-
+-	nla_nest_end(skb, data);
+-	genlmsg_end(skb, hdr);
+-	genlmsg_multicast_netns(wiphy_net(&rdev->wiphy), skb, 0,
+-				nl80211_testmode_mcgrp.id, gfp);
+-}
+-EXPORT_SYMBOL(cfg80211_testmode_event);
+ #endif
+ 
+ static int nl80211_connect(struct sk_buff *skb, struct genl_info *info)
+@@ -8788,6 +8838,110 @@ static int nl80211_crit_protocol_stop(st
+ 	return 0;
+ }
+ 
++static int nl80211_vendor_cmd(struct sk_buff *skb, struct genl_info *info)
++{
++	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++	struct wireless_dev *wdev =
++		__cfg80211_wdev_from_attrs(genl_info_net(info), info->attrs);
++	int i, err;
++	u32 vid, subcmd;
++
++	if (!rdev->wiphy.vendor_commands)
++		return -EOPNOTSUPP;
++
++	if (IS_ERR(wdev)) {
++		err = PTR_ERR(wdev);
++		if (err != -EINVAL)
++			return err;
++		wdev = NULL;
++	} else if (wdev->wiphy != &rdev->wiphy) {
++		return -EINVAL;
++	}
++
++	if (!info->attrs[NL80211_ATTR_VENDOR_ID] ||
++	    !info->attrs[NL80211_ATTR_VENDOR_SUBCMD])
++		return -EINVAL;
++
++	vid = nla_get_u32(info->attrs[NL80211_ATTR_VENDOR_ID]);
++	subcmd = nla_get_u32(info->attrs[NL80211_ATTR_VENDOR_SUBCMD]);
++	for (i = 0; i < rdev->wiphy.n_vendor_commands; i++) {
++		const struct wiphy_vendor_command *vcmd;
++		void *data = NULL;
++		int len = 0;
++
++		vcmd = &rdev->wiphy.vendor_commands[i];
++
++		if (vcmd->info.vendor_id != vid || vcmd->info.subcmd != subcmd)
++			continue;
++
++		if (vcmd->flags & (WIPHY_VENDOR_CMD_NEED_WDEV |
++				   WIPHY_VENDOR_CMD_NEED_NETDEV)) {
++			if (!wdev)
++				return -EINVAL;
++			if (vcmd->flags & WIPHY_VENDOR_CMD_NEED_NETDEV &&
++			    !wdev->netdev)
++				return -EINVAL;
++
++			if (vcmd->flags & WIPHY_VENDOR_CMD_NEED_RUNNING) {
++				if (wdev->netdev &&
++				    !netif_running(wdev->netdev))
++					return -ENETDOWN;
++				if (!wdev->netdev && !wdev->p2p_started)
++					return -ENETDOWN;
++			}
++		} else {
++			wdev = NULL;
++		}
++
++		if (info->attrs[NL80211_ATTR_VENDOR_DATA]) {
++			data = nla_data(info->attrs[NL80211_ATTR_VENDOR_DATA]);
++			len = nla_len(info->attrs[NL80211_ATTR_VENDOR_DATA]);
++		}
++
++		rdev->cur_cmd_info = info;
++		err = rdev->wiphy.vendor_commands[i].doit(&rdev->wiphy, wdev,
++							  data, len);
++		rdev->cur_cmd_info = NULL;
++		return err;
++	}
++
++	return -EOPNOTSUPP;
++}
++
++struct sk_buff *__cfg80211_alloc_reply_skb(struct wiphy *wiphy,
++					   enum nl80211_commands cmd,
++					   enum nl80211_attrs attr,
++					   int approxlen)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_dev(wiphy);
++
++	if (WARN_ON(!rdev->cur_cmd_info))
++		return NULL;
++
++	return __cfg80211_alloc_vendor_skb(rdev, approxlen,
++					   rdev->cur_cmd_info->snd_portid,
++					   rdev->cur_cmd_info->snd_seq,
++					   cmd, attr, NULL, GFP_KERNEL);
++}
++EXPORT_SYMBOL(__cfg80211_alloc_reply_skb);
++
++int cfg80211_vendor_cmd_reply(struct sk_buff *skb)
++{
++	struct cfg80211_registered_device *rdev = ((void **)skb->cb)[0];
++	void *hdr = ((void **)skb->cb)[1];
++	struct nlattr *data = ((void **)skb->cb)[2];
++
++	if (WARN_ON(!rdev->cur_cmd_info)) {
++		kfree_skb(skb);
++		return -EINVAL;
++	}
++
++	nla_nest_end(skb, data);
++	genlmsg_end(skb, hdr);
++	return genlmsg_reply(skb, rdev->cur_cmd_info);
++}
++EXPORT_SYMBOL_GPL(cfg80211_vendor_cmd_reply);
++
+ #define NL80211_FLAG_NEED_WIPHY		0x01
+ #define NL80211_FLAG_NEED_NETDEV	0x02
+ #define NL80211_FLAG_NEED_RTNL		0x04
+@@ -8799,7 +8953,7 @@ static int nl80211_crit_protocol_stop(st
+ #define NL80211_FLAG_NEED_WDEV_UP	(NL80211_FLAG_NEED_WDEV |\
+ 					 NL80211_FLAG_CHECK_NETDEV_UP)
+ 
+-static int nl80211_pre_doit(struct genl_ops *ops, struct sk_buff *skb,
++static int nl80211_pre_doit(const struct genl_ops *ops, struct sk_buff *skb,
+ 			    struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev;
+@@ -8868,7 +9022,7 @@ static int nl80211_pre_doit(struct genl_
+ 	return 0;
+ }
+ 
+-static void nl80211_post_doit(struct genl_ops *ops, struct sk_buff *skb,
++static void nl80211_post_doit(const struct genl_ops *ops, struct sk_buff *skb,
+ 			      struct genl_info *info)
+ {
+ 	if (info->user_ptr[1]) {
+@@ -9512,6 +9666,14 @@ static struct genl_ops nl80211_ops[] = {
+ 		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
+ 				  NL80211_FLAG_NEED_RTNL,
+ 	},
++	{
++		.cmd = NL80211_CMD_VENDOR,
++		.doit = nl80211_vendor_cmd,
++		.policy = nl80211_policy,
++		.flags = GENL_ADMIN_PERM,
++		.internal_flags = NL80211_FLAG_NEED_NETDEV_UP |
++				  NL80211_FLAG_NEED_RTNL,
++	},
+ };
+ 
+ static struct genl_multicast_group nl80211_mlme_mcgrp = {
+@@ -11296,6 +11458,10 @@ int nl80211_init(void)
+ 	if (err)
+ 		goto err_out;
+ 
++	err = genl_register_mc_group(&nl80211_fam, &nl80211_vendor_mcgrp);
++	if (err)
++		goto err_out;
++
+ #ifdef CONFIG_NL80211_TESTMODE
+ 	err = genl_register_mc_group(&nl80211_fam, &nl80211_testmode_mcgrp);
+ 	if (err)

@@ -1,0 +1,115 @@
+Index: mrd6-0.9.6/include/mrd/mrd.h
+===================================================================
+--- mrd6-0.9.6.orig/include/mrd/mrd.h	2008-01-24 16:29:47.000000000 +0530
++++ mrd6-0.9.6/include/mrd/mrd.h	2010-07-01 11:43:53.989097000 +0530
+@@ -435,6 +435,10 @@
+ 	bool should_log(int level) const;
+ 	base_stream &log() const;
+ 	base_stream &fatal() const;
++	void lq_event();
++	bool lq_discovered_src; /* TAHI test fix*/
++	
++	
+ 
+ 	static uint32_t get_randu32();
+ 
+Index: mrd6-0.9.6/src/Makefile
+===================================================================
+--- mrd6-0.9.6.orig/src/Makefile	2007-06-25 05:28:28.000000000 +0530
++++ mrd6-0.9.6/src/Makefile	2010-07-01 11:43:54.065014000 +0530
+@@ -92,7 +92,7 @@
+ DEST_PREFIX = $(DESTDIR)$(PREFIX)
+ 
+ CXXFLAGS = $(INCLUDES) -ansi -Wall -Wno-multichar -fno-exceptions -fPIC \
+-	   -D$(PLATFORM) $(addprefix -D,$(MODULE_OPTIONS))
++	   -D$(PLATFORM) -DLINUX_NO_MMAP $(addprefix -D,$(MODULE_OPTIONS))
+ 
+ ifeq ($(OPTIMIZE),yes)
+ 	ifeq ($(SPACE_OPTIMIZE),yes)
+Index: mrd6-0.9.6/src/linux/us_mfa.cpp
+===================================================================
+--- mrd6-0.9.6.orig/src/linux/us_mfa.cpp	2007-01-07 07:41:27.000000000 +0530
++++ mrd6-0.9.6/src/linux/us_mfa.cpp	2010-07-01 11:43:54.097006000 +0530
+@@ -280,6 +280,7 @@
+ 	} else {
+ 		((us_mfa *)g_mrd->mfa())->discovered_source(iif, hdr->ip6_dst,
+ 							    hdr->ip6_src);
++		g_mrd->lq_discovered_src = true; 
+ 	}
+ }
+ 
+@@ -638,10 +639,18 @@
+ 
+ 		while ((len = g_mrd->ipktb->recvfrom(m_rawsock.fd(),
+ 					(sockaddr *)&sa, &salen)) > 0) {
+-			if (sa.sll_protocol == htons(ETH_P_IPV6)
+-				&& sa.sll_pkttype != PACKET_OUTGOING)
++			if (sa.sll_protocol == htons(ETH_P_IPV6) 
++				&& sa.sll_pkttype != PACKET_OUTGOING) {
+ 				handle_ipv6(sa.sll_ifindex,
+ 					g_mrd->ipktb->buffer(), len);
++
++				if(g_mrd->lq_discovered_src == true) {
++					g_mrd->lq_event();
++					handle_ipv6(sa.sll_ifindex,
++						g_mrd->ipktb->buffer(), len);
++					g_mrd->lq_discovered_src = false;
++				}
++			}
+ 		}
+ #ifndef LINUX_NO_MMAP
+ 	}
+Index: mrd6-0.9.6/src/mrd.cpp
+===================================================================
+--- mrd6-0.9.6.orig/src/mrd.cpp	2008-01-24 16:29:47.000000000 +0530
++++ mrd6-0.9.6/src/mrd.cpp	2010-07-01 11:43:54.134001000 +0530
+@@ -800,6 +800,7 @@
+ 	m_tasks_time_spent = 0;
+ 
+ 	m_startup = 0;
++	lq_discovered_src = false;
+ }
+ 
+ mrd::~mrd() {
+@@ -1321,6 +1322,32 @@
+ 	broadcast_event(mrd::InterfaceStateChanged, intf, true);
+ }
+ 
++void mrd::lq_event()
++{
++	clock_t a, b;
++	tms _tmp;
++	uint32_t accum;
++	int _clk = sysconf(_SC_CLK_TCK);
++
++	if (!m_tasks.empty() && m_state == Running) {
++		a = times(&_tmp);
++		do {
++			task t = m_tasks.front();
++			m_tasks.pop_front();
++			t.target->event(t.event, t.argument);
++
++			m_tasks_stat++;
++			b = times(&_tmp);
++
++			accum = (b - a) * 1000 / _clk;
++
++			/* run tasks while time-spent < 10ms. */
++		} while (!m_tasks.empty() && accum < 10);
++
++		m_tasks_time_spent += accum;
++	}
++}
++
+ void mrd::processloop() {
+ 	change_state(Running);
+ 
+@@ -1449,6 +1476,8 @@
+ interface *mrd::found_interface(int index, const char *name, int type,
+ 				int mtu, int flags) {
+ 	interface *intf;
++	if(index == 1)
++		return 0;
+ 	if ((intf = get_interface_by_index(index)))
+ 		return intf;
+ 

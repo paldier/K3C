@@ -1,0 +1,589 @@
+From eb6eea707ab910e1e8fc21947cd1d98d74f31916 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Thu, 19 Nov 2015 12:43:31 -0700
+Subject: [PATCH 232/441] Deleting the old Regulator driver.
+
+---
+ drivers/regulator/Kconfig                   |   7 -
+ drivers/regulator/Makefile                  |   1 -
+ drivers/regulator/int34d9-regulator.c       | 432 ----------------------------
+ include/linux/regulator/int34d9-regulator.h | 113 --------
+ 4 files changed, 553 deletions(-)
+ delete mode 100644 drivers/regulator/int34d9-regulator.c
+ delete mode 100644 include/linux/regulator/int34d9-regulator.h
+
+--- a/drivers/regulator/Kconfig
++++ b/drivers/regulator/Kconfig
+@@ -571,12 +571,5 @@ config REGULATOR_WM8994
+ 	  This driver provides support for the voltage regulators on the
+ 	  WM8994 CODEC.
+ 
+-config REGULATOR_INT34D9
+-	tristate "Puma7 Rohm PMIC"
+-	depends on I2C
+-	help
+-	  This driver controls a Puma7 Rohm voltage output
+-	  regulator via I2C bus.
+-
+ endif
+ 
+--- a/drivers/regulator/Makefile
++++ b/drivers/regulator/Makefile
+@@ -76,6 +76,5 @@ obj-$(CONFIG_REGULATOR_WM831X) += wm831x
+ obj-$(CONFIG_REGULATOR_WM8350) += wm8350-regulator.o
+ obj-$(CONFIG_REGULATOR_WM8400) += wm8400-regulator.o
+ obj-$(CONFIG_REGULATOR_WM8994) += wm8994-regulator.o
+-obj-$(CONFIG_REGULATOR_INT34D9) += int34d9-regulator.o
+ 
+ ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
+--- a/drivers/regulator/int34d9-regulator.c
++++ /dev/null
+@@ -1,432 +0,0 @@
+-/*
+- * int34d9-regulator.c - Puma7 Rohm regulator driver
+- *
+- * Copyright (c) 2015, Intel Corporation.
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- */
+-
+-#include <linux/module.h>
+-#include <linux/platform_device.h>
+-#include <linux/i2c.h>
+-#include <linux/err.h>
+-#include <linux/slab.h>
+-#include <linux/delay.h>
+-#include <linux/interrupt.h>
+-#include <linux/mutex.h>
+-#include <linux/regulator/int34d9-regulator.h>
+-#include <asm/iosf_mbi.h>
+-
+-static DEFINE_MUTEX(puma7_rohm_mutex);
+-
+-static s32 puma7_rohm_pmic_write(struct puma7_rohm_pmic *pmic, u8 reg, u8 val)
+-{
+-   s32 ret_val;
+-
+-   mutex_lock(&puma7_rohm_mutex);
+-
+-   ret_val = i2c_smbus_write_byte_data(pmic->client, reg, val);
+-      
+-   mutex_unlock(&puma7_rohm_mutex);
+-   
+-   return ret_val;
+-}
+-
+-static s32 puma7_rohm_pmic_read(struct puma7_rohm_pmic *pmic, u8 reg)
+-{
+-   s32 ret_val;
+-
+-   mutex_lock(&puma7_rohm_mutex);
+-   
+-   ret_val = i2c_smbus_read_byte_data(pmic->client, reg);
+-
+-   mutex_unlock(&puma7_rohm_mutex);
+-
+-   return ret_val;
+-}
+-
+-static int puma7_rohm_regulator_is_enabled(struct regulator_dev *rdev)
+-{
+-   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
+-   u32 mask = rdev->desc->enable_mask;
+-   u8 reg = (u8)rdev->desc->enable_reg;
+-   s32 reg_val;
+-
+-   reg_val = puma7_rohm_pmic_read(pmic, reg);
+-   if(reg_val < 0) {
+-      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
+-      return reg_val;
+-   } 
+-   return ((reg_val & mask)? 0 : 1);
+-}
+-
+-static s32 puma7_rohm_regulator_enable(struct regulator_dev *rdev)
+-{
+-   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
+-   u32 mask = rdev->desc->enable_mask;
+-   u8 reg = (u8)rdev->desc->enable_reg;
+-   s32 reg_val;
+-   s32 ret_val;
+-
+-   reg_val = puma7_rohm_pmic_read(pmic, reg);
+-   if(reg_val < 0) {
+-      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
+-      return reg_val;
+-   } 
+-
+-   reg_val = reg_val & ~mask;
+-
+-   ret_val = puma7_rohm_pmic_write(pmic, reg, reg_val);
+-   if(ret_val < 0) {
+-      dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
+-   }
+-   
+-   return ret_val;
+-}
+-
+-static int puma7_rohm_regulator_disable(struct regulator_dev *rdev)
+-{
+-   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
+-   u32 mask = rdev->desc->enable_mask;
+-   u8 reg = (u8)rdev->desc->enable_reg;
+-   s32 reg_val, ret_val;
+-
+-   reg_val = puma7_rohm_pmic_read(pmic, reg);
+-   if(reg_val < 0) {
+-      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
+-      return reg_val;
+-   } 
+-
+-   reg_val = reg_val | mask;
+-   
+-   ret_val = puma7_rohm_pmic_write(pmic, reg, reg_val);
+-   if(ret_val < 0) {
+-      dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
+-   }
+-   
+-   return ret_val;
+-}
+-
+-static int puma7_rohm_pmic_set_lpm_mode(struct regulator_dev *rdev, 
+-                                          unsigned int mode)
+-{
+-   struct puma7_rohm_pmic *pmic = rdev_get_drvdata(rdev);
+-   u8 reg_val;
+-   s32 ret_val;
+-
+-	switch (mode) {
+-   	case PUMA7_ROHM_PMIC_MODE_ACTIVE:
+-   		reg_val = PUMA7_ROHM_LPM_CFG_ACTIVE;
+-   		break;
+-   	case PUMA7_ROHM_PMIC_MODE_BBU:
+-   		reg_val = PUMA7_ROHM_LPM_CFG_BBU;
+-   		break;
+-   	case PUMA7_ROHM_PMIC_MODE_FAST_STANDBY:
+-   		reg_val = PUMA7_ROHM_LPM_CFG_FAST_STANDBY;
+-   		break;
+-      case PUMA7_ROHM_PMIC_MODE_DEEP_STANDBY:
+-         reg_val = PUMA7_ROHM_LPM_CFG_DEEP_STANDBY;
+-         break;
+-      default:
+-         return -EINVAL;
+-	}
+-   
+-   ret_val = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_LPMCTRL_REG, reg_val);
+-   if(ret_val < 0) {
+-      dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
+-   }
+-   
+-   return ret_val;
+-}
+-
+-
+-static struct regulator_ops puma7_rohm_regulator_ops = {
+-	.is_enabled = puma7_rohm_regulator_is_enabled,
+-	.enable = puma7_rohm_regulator_enable,
+-	.disable = puma7_rohm_regulator_disable,
+-};
+-
+-static struct regulator_ops puma7_rohm_pmic_ops = {
+-   .set_suspend_mode = puma7_rohm_pmic_set_lpm_mode,
+-};
+-
+-static const struct regulator_desc puma7_rohm_reg[] = {
+-	{
+-		.name = "VPLT_DCDC",
+-		.id = PUMA7_ROHM_VPLT,
+-		.ops = &puma7_rohm_regulator_ops,
+-		.type = REGULATOR_VOLTAGE,
+-		.owner = THIS_MODULE,
+-		.enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-		.enable_mask = PUMA7_ROHM_VPLT_EN_MASK,
+-	},
+-	{
+-		.name = "VCC0_VID_BUCK",
+-		.id = PUMA7_ROHM_VCC0,
+-		.ops = &puma7_rohm_regulator_ops,
+-		.type = REGULATOR_VOLTAGE,
+-		.owner = THIS_MODULE,
+-      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-      .enable_mask = PUMA7_ROHM_VCC0_EN_MASK,
+-	},
+-	{
+-		.name = "V3P3_EXT_DCDC",
+-		.id = PUMA7_ROHM_V3P3_EXT,
+-		.ops = &puma7_rohm_regulator_ops,
+-		.type = REGULATOR_VOLTAGE,
+-		.owner = THIS_MODULE,
+-      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-      .enable_mask = PUMA7_ROHM_V3P3_EXT_EN_MASK,
+-	},
+-	{
+-		.name = "VNN_VID_BUCK",
+-		.id = PUMA7_ROHM_VNN,
+-		.ops = &puma7_rohm_regulator_ops,
+-		.type = REGULATOR_VOLTAGE,
+-		.owner = THIS_MODULE,
+-      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-      .enable_mask = PUMA7_ROHM_VNN_EN_MASK,
+-	},
+-	{
+-		.name = "V1P15_BUCK",
+-		.id = PUMA7_ROHM_V1P15,
+-		.ops = &puma7_rohm_regulator_ops,
+-		.type = REGULATOR_VOLTAGE,
+-		.owner = THIS_MODULE,
+-      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-      .enable_mask = PUMA7_ROHM_V1P15_EN_MASK,
+-	},
+-   {
+-      .name = "V1P05A_BUCK",
+-      .id = PUMA7_ROHM_V1P05A,
+-      .ops = &puma7_rohm_regulator_ops,
+-      .type = REGULATOR_VOLTAGE,
+-      .owner = THIS_MODULE,
+-      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-      .enable_mask = PUMA7_ROHM_V1P05A_EN_MASK,
+-   },
+-   {
+-      .name = "VDDQ_BUCK",
+-      .id = PUMA7_ROHM_VDDQ,
+-      .ops = &puma7_rohm_regulator_ops,
+-      .type = REGULATOR_VOLTAGE,
+-      .owner = THIS_MODULE,
+-      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-      .enable_mask = PUMA7_ROHM_VDDQ_EN_MASK,
+-   },
+-   {
+-      .name = "V1P8A_BUCK",
+-      .id = PUMA7_ROHM_V1P8A,
+-      .ops = &puma7_rohm_regulator_ops,
+-      .type = REGULATOR_VOLTAGE,
+-      .owner = THIS_MODULE,
+-      .enable_reg = PUMA7_ROHM_PMIC_LPMCTRL_REG,
+-      .enable_mask = PUMA7_ROHM_V1P8A_EN_MASK,
+-   },
+-   {
+-      .name = "PMIC_VIRTUAL",
+-      .id = PUMA7_ROHM_VIRTUAL,
+-      .ops = &puma7_rohm_pmic_ops,
+-      .type = REGULATOR_VOLTAGE,
+-      .owner = THIS_MODULE,
+-   },
+-};
+-
+-int puma7_rohm_regulator_init(void *driver_data)
+-{
+-   struct puma7_rohm_subdev_data *sub = driver_data;
+-
+-   printk(KERN_INFO "Puma7 Rohm %s regulator %d initialised\n",  sub->name, sub->id);
+-
+-   return 0;
+-}
+-
+-/* PMIC interrupt handler */
+-static irqreturn_t puma7_rohm_pmic_isr(int irq, void *data)
+-{
+-   struct puma7_rohm_pmic *pmic = data;
+-   acpi_status status;
+-   u8 reg_val;
+-
+-   reg_val = puma7_rohm_pmic_read(pmic, PUMA7_ROHM_PMIC_IRQLVL1_REG);
+-   if(reg_val < 0) {
+-      dev_err(&pmic->client->dev, "puma7_rohm_pmic_read error! %s\n", __func__);
+-      return IRQ_NONE;
+-   } else if ( reg_val & PUMA7_ROHM_PMIC_IRQLVL1_THRM) {
+-      acpi_bus_generate_netlink_event(ACPI_PUMA7_ROHM_CLASS, ACPI_PUMA7_ROHM_DEVICE_NAME, PUMA7_ROHM_THERMAL_NOTIFY_CRITICAL, 0);
+-   
+-      reg_val = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_THRMIRQ_REG, PUMA7_ROHM_PMIC_THRMIRQ_PMICHOT);
+-      if (reg_val < 0) {
+-         dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
+-         return IRQ_NONE;
+-      }
+-   } else if ( reg_val & PUMA7_ROHM_PMIC_IRQLVL1_PWRSRC) {
+-      acpi_bus_generate_netlink_event(ACPI_PUMA7_ROHM_CLASS, ACPI_PUMA7_ROHM_DEVICE_NAME, PUMA7_ROHM_BATTERY_NOTIFY_STATUS_CHANGE, 0);
+-   
+-      reg_val = puma7_rohm_pmic_write(pmic, PUMA7_ROHM_PMIC_PWRSRCIRQ_REG, PUMA7_ROHM_PMIC_THRMIRQ_DCINDET);
+-      if (reg_val < 0) {
+-         dev_err(&pmic->client->dev, "puma7_rohm_pmic_write error! %s\n", __func__);
+-         return IRQ_NONE;
+-      }
+-   }
+-
+-   status = acpi_evaluate_object(pmic->handle, pmic->pathname, NULL, NULL);
+-   if (ACPI_FAILURE(status)) {
+-      dev_err(&pmic->client->dev, "acpi_evaluate_object error! %s\n", __func__);
+-      return IRQ_NONE;
+-   }
+-
+-   return IRQ_HANDLED;
+-}
+-
+-
+-static int puma7_rohm_regulator_probe(struct i2c_client *client,
+-				   const struct i2c_device_id *i2c_id)
+-{
+-	struct regulator_dev **rdev;
+-	struct device *dev = &client->dev;
+-	struct puma7_rohm_platform_data *pdata; 
+-   struct puma7_rohm_subdev_data *sub;
+-	struct regulator_config config = { };
+-	struct puma7_rohm_pmic *pmic;
+-	int i, ret = -EINVAL;
+-	unsigned long driver_private_data;
+-
+-	driver_private_data = i2c_id->driver_data;
+-
+-	pmic = devm_kzalloc(dev, sizeof(struct puma7_rohm_pmic) +
+-			sizeof(struct regulator_dev *) * PUMA7_ROHM_SUPPLY_NUMBER,
+-			GFP_KERNEL);
+-	if (!pmic)
+-		return -ENOMEM;
+-
+-	pmic->client = client;
+-   pmic->handle = ACPI_HANDLE(dev);
+-   if (!pmic->handle) {
+-		dev_warn(dev, "PMIC ACPI handle not found : %s\n", __func__);
+-      strcpy(pmic->pathname, "\\_SB.PMI0.CLRP");
+-   } else {
+-      strcpy(pmic->pathname, "CLRP");
+-   }
+-   
+-   rdev = pmic->rdev;
+-   pdata = &(pmic->platform_data);
+-   
+-   pdata->num_subdevs = PUMA7_ROHM_SUPPLY_NUMBER;
+-   pdata->subdevs = devm_kzalloc(dev, sizeof(struct puma7_rohm_subdev_data) *
+-						PUMA7_ROHM_SUPPLY_NUMBER, GFP_KERNEL);
+-	if (!pdata->subdevs)
+-		return -ENOMEM;
+-   sub = pdata->subdevs;
+-   for (i = 0; i < PUMA7_ROHM_SUPPLY_NUMBER; i++) {
+-      sub->id = puma7_rohm_reg[i].id;
+-      strcpy(sub->name, puma7_rohm_reg[i].name);
+-      sub->regulator_data.regulator_init = puma7_rohm_regulator_init;
+-      sub->regulator_data.driver_data =  sub;    
+-      sub++;
+-   }
+-
+-	/* Finally register regulators */
+-	for (i = 0; i < pdata->num_subdevs; i++) {
+-		config.dev = dev;
+-		config.init_data = &(pdata->subdevs[i].regulator_data);
+-		config.driver_data = pmic;
+-
+-		rdev[i] = regulator_register(&puma7_rohm_reg[i], &config);
+-		if (IS_ERR(rdev[i])) {
+-			ret = PTR_ERR(rdev[i]);
+-			dev_err(&client->dev, "failed to register %s\n", puma7_rohm_reg[i].name);
+-			goto err_unregister;
+-		}
+-	}
+-
+-	i2c_set_clientdata(client, pmic);
+-
+-   if (!client->irq) {
+-		dev_warn(dev, "No IRQ issued by PMIC device : %s\n", __func__);
+-      client->irq = PUMA7_ROHM_PMIC_IRQ_NUM; 
+-   } 
+-   
+-	ret = devm_request_threaded_irq(dev, client->irq, NULL,
+-					puma7_rohm_pmic_isr,
+-					IRQF_TRIGGER_RISING |
+-					IRQF_ONESHOT,
+-					ACPI_PUMA7_ROHM_DEVICE_NAME, pmic);
+-	if (ret) {
+-      dev_err(dev, "Failed to request Regulator IRQ %d: %d\n", client->irq, ret);
+-		goto err_unregister;
+-	}
+-   
+-	return 0;
+-
+-err_unregister:
+-	while (--i >= 0)
+-		regulator_unregister(rdev[i]);
+-   
+-return ret;
+-   
+-}
+-
+-static int puma7_rohm_regulator_remove(struct i2c_client *client)
+-{
+-	
+-	struct puma7_rohm_pmic *pmic = i2c_get_clientdata(client);
+-	int i;
+-
+-	for (i = 0; i < PUMA7_ROHM_SUPPLY_NUMBER; i++) {
+-		regulator_unregister(pmic->rdev[i]);
+-   }
+-   
+-	return 0;
+-}
+-
+-
+-static const struct i2c_device_id puma7_rohm_id[] = {
+-	{ .name = ACPI_PUMA7_ROHM_DEVICE_NAME, .driver_data = 0 },
+-	{ }
+-};
+-MODULE_DEVICE_TABLE(i2c, puma7_rohm_id);
+-
+-
+-static struct acpi_device_id puma7_rohm_acpi_match[] = {
+-	{ ACPI_PUMA7_ROHM_DEVICE_NAME, 0},
+-	{ },
+-};
+-MODULE_DEVICE_TABLE(acpi, puma7_rohm_acpi_match);
+-
+-static struct i2c_driver puma7_rohm_driver = {
+-	.probe = puma7_rohm_regulator_probe,
+-   .remove = puma7_rohm_regulator_remove,   
+-	.driver		= {
+-		.name	= ACPI_PUMA7_ROHM_DEVICE_NAME,
+-		.owner	= THIS_MODULE,
+-      .acpi_match_table = ACPI_PTR(puma7_rohm_acpi_match),
+-	},
+-	.id_table	= puma7_rohm_id,
+-};
+-
+-static int __init puma7_rohm_init(void)
+-{
+-	return i2c_add_driver(&puma7_rohm_driver);
+-}
+-subsys_initcall(puma7_rohm_init);
+-
+-static void __exit puma7_rohm_exit(void)
+-{
+-	i2c_del_driver(&puma7_rohm_driver);
+-}
+-module_exit(puma7_rohm_exit);
+-
+-/* Module information */
+-MODULE_DESCRIPTION("PUMA7 ROHM voltage regulator driver");
+-MODULE_AUTHOR("Vinay Patel");
+-MODULE_LICENSE("GPL v2");
+-
+--- a/include/linux/regulator/int34d9-regulator.h
++++ /dev/null
+@@ -1,113 +0,0 @@
+-/*
+- * int34d9-regulator.h - Puma7 SoC ROHM PMIC Driver
+- *
+- * Copyright (C) 2015 Intel Corporation. All rights reserved.
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License version
+- * 2 as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * 
+- */
+-
+-#ifndef __LINUX_REGULATOR_INT34D9_H__
+-#define __LINUX_REGULATOR_INT34D9_H__
+-
+-#include <linux/regulator/machine.h>
+-#include <linux/regulator/driver.h>
+-#include <linux/acpi.h>
+-
+-enum PUMA7_ROHM_REGULATOR_SUPPLIES {
+-   PUMA7_ROHM_VPLT,  
+-   PUMA7_ROHM_VCC0,  
+-   PUMA7_ROHM_V3P3_EXT, 
+-   PUMA7_ROHM_VNN,    
+-   PUMA7_ROHM_V1P15,  
+-   PUMA7_ROHM_V1P05A, 
+-   PUMA7_ROHM_VDDQ,   
+-   PUMA7_ROHM_V1P8A,  
+-   PUMA7_ROHM_VIRTUAL,
+-   PUMA7_ROHM_SUPPLY_NUMBER
+-};
+-
+-#define PUMA7_ROHM_PMIC_MODE_ACTIVE          0x1
+-#define PUMA7_ROHM_PMIC_MODE_BBU             0x2
+-#define PUMA7_ROHM_PMIC_MODE_FAST_STANDBY    0x4
+-#define PUMA7_ROHM_PMIC_MODE_DEEP_STANDBY    0x8
+-
+-#define PUMA7_ROHM_LPM_CFG_ACTIVE          0x0
+-#define PUMA7_ROHM_LPM_CFG_BBU             0x19
+-#define PUMA7_ROHM_LPM_CFG_FAST_STANDBY    0x1F
+-#define PUMA7_ROHM_LPM_CFG_DEEP_STANDBY    0xFF
+-
+-#define PUMA7_ROHM_PMIC_LPMCTRL_REG       0x54
+-#define PUMA7_ROHM_PMIC_IRQLVL1_REG       0x02
+-#define PUMA7_ROHM_PMIC_IRQLVL1_THRM      0x02
+-#define PUMA7_ROHM_PMIC_IRQLVL1_PWRSRC    0x01
+-#define PUMA7_ROHM_PMIC_THRMIRQ_REG       0x05
+-#define PUMA7_ROHM_PMIC_THRMIRQ_PMICHOT   0x01
+-#define PUMA7_ROHM_PMIC_PWRSRCIRQ_REG     0x03
+-#define PUMA7_ROHM_PMIC_THRMIRQ_DCINDET   0x02
+-
+-/* CGM ROHM PMIC is connected to APIC IRQ76 */
+-#define PUMA7_ROHM_PMIC_IRQ_NUM 76
+-
+-#define PUMA7_ROHM_VPLT_EN_MASK        0x80  
+-#define PUMA7_ROHM_VCC0_EN_MASK        0x40
+-#define PUMA7_ROHM_V3P3_EXT_EN_MASK    0x20
+-#define PUMA7_ROHM_VNN_EN_MASK         0x10
+-#define PUMA7_ROHM_V1P15_EN_MASK       0x08
+-#define PUMA7_ROHM_V1P05A_EN_MASK      0x04
+-#define PUMA7_ROHM_VDDQ_EN_MASK        0x02
+-#define PUMA7_ROHM_V1P8A_EN_MASK       0x01
+-
+-#define PUMA7_ROHM_THERMAL_NOTIFY_CRITICAL      0x86
+-#define PUMA7_ROHM_BATTERY_NOTIFY_STATUS_CHANGE 0x82  
+-#define ACPI_PUMA7_ROHM_CLASS       "regulator"
+-#define ACPI_PUMA7_ROHM_DEVICE_NAME	"INT34D9"
+-
+-
+-/**
+- * struct puma7_rohm_subdev_data - regulator subdev data
+- * @id: regulator id
+- * @name: name of regulator
+- * @regulator_data: regulator initialisation data
+- */
+-struct puma7_rohm_subdev_data {
+-   int         id;
+-   const char *name;
+-   struct regulator_init_data regulator_data;
+-};
+-
+-/**
+- * struct puma7_rohm_platform_data - platform data for PUMA7 ROHM PMIC
+- * @num_subdevs: total number of regulators
+- * @subdevs: pointer to regulatrs used
+- */
+-struct puma7_rohm_platform_data {
+-   int num_subdevs;
+-   struct puma7_rohm_subdev_data *subdevs;
+-};
+-
+-/**
+- * struct puma7_rohm_pmic - Puma7 Rohm PMIC device
+- * @client: points to i2c slave PMIC device
+- * @handle: handle to the ACPI PMIC device
+- * @pathname: name in ACPI namespace
+- * @platform_data: platform data for PUMA7 ROHM PMIC
+- * @rdev: points to regulator device within PMIC
+- */
+-struct puma7_rohm_pmic {
+-   struct i2c_client *client;
+-   acpi_handle handle;
+-   acpi_string pathname[20];
+-   struct puma7_rohm_platform_data platform_data;
+-   struct regulator_dev *rdev[];
+-};
+- 
+-#endif /* __LINUX_REGULATOR_INT34D9_H__ */

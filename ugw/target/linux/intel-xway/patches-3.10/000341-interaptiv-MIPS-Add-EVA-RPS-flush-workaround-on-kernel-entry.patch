@@ -1,0 +1,79 @@
+From cf9774a20708f1b0779b6fa6dd15d246408b04c6 Mon Sep 17 00:00:00 2001
+From: James Hogan <james.hogan@imgtec.com>
+Date: Fri, 10 Jul 2015 11:25:58 +0100
+Subject: [PATCH] MIPS: Add EVA RPS flush workaround on kernel entry
+
+Add a KConfig option when EVA is enabled to flush the Return Prediction
+Stack (RPS) present on some MIPS cores on entry to the kernel from user
+mode.
+
+This is important for EVA capable cores such as interAptiv which don't
+flush automatically on exceptions, which would otherwise allow untrusted
+user software to trigger kernel mode speculative fetches of virtual
+addresses which are sensitive in the kernel address layout (due to EVA's
+overlapping user/kernel segment layouts).
+
+Signed-off-by: James Hogan <james.hogan@imgtec.com>
+---
+ arch/mips/Kconfig                  | 15 +++++++++++++++
+ arch/mips/include/asm/stackframe.h | 23 +++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -1554,6 +1554,21 @@ config EVA_3GB
+ 	  (because of PCI bridges loop) but it can be used as a start point
+ 	  for development.
+ 
++config CPU_RPS_WORKAROUNDS
++	bool "Flush Return Prediction Stack on user -> kernel transition"
++	default y
++	depends on EVA
++	help
++	  This option flushes the Return Prediction Stack (RPS) present on some
++	  MIPS cores on entry to the kernel from user mode. This is important
++	  for EVA capable cores such as interAptiv which don't flush
++	  automatically on exceptions, which would otherwise allow untrusted
++	  user software to trigger kernel mode speculative fetches of virtual
++	  addresses which are sensitive in the kernel address layout (due to
++	  EVA's overlapping user/kernel segment layouts).
++
++	  Say Y if using EVA non-Legacy segment layouts with interAptiv.
++
+ if CPU_LOONGSON2F
+ config CPU_NOP_WORKAROUNDS
+ 	bool
+diff --git a/arch/mips/include/asm/stackframe.h b/arch/mips/include/asm/stackframe.h
+--- a/arch/mips/include/asm/stackframe.h
++++ b/arch/mips/include/asm/stackframe.h
+@@ -166,6 +166,29 @@ 1:		move	ra, k0
+ 		.set	noreorder
+ 		bltz	k0, 8f
+ 		 move	k1, sp
++#ifdef CONFIG_CPU_RPS_WORKAROUNDS
++		/*
++		 * The Return Prediction Stack (RPS) can be manipulated by user
++		 * mode (within the range of addresses userland can execute
++		 * from), but on some MIPS cores (interAptiv) it doesn't get
++		 * flushed when exceptions are taken. With EVA, user mode can
++		 * execute from virtual addresses which may be sensitive IO
++		 * regions in kernel mode.
++		 *
++		 * In some cases the kernel will set the return address to
++		 * ret_from_*, and jr to the exception handler. That sequence
++		 * isn't recognised as a function call (it looks more like a
++		 * tail call), so if nested calls don't evict the last user
++		 * address in the RPS, it will mispredict the return, and may
++		 * fetch from the user controlled address.
++		 *
++		 * We can flush the RPS by turning it on and off (Config7.RPS),
++		 * or by writing to EntryHi. We do the latter here on entry from
++		 * user mode as it should be harmless on other cores.
++		 */
++		MFC0	k0, CP0_ENTRYHI
++		MTC0	k0, CP0_ENTRYHI
++#endif
+ 		.set	reorder
+ 		/* Called from user mode, new stack. */
+ 		get_saved_sp

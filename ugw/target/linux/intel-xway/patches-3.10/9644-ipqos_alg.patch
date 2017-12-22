@@ -1,0 +1,272 @@
+This patch is to introduce FTP ALG to be able to classify FTP application type traffic.
+
+IPQoS patch for ALG
+
+diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -26,6 +26,22 @@
+ 
+ #include <net/netfilter/nf_conntrack_tuple.h>
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++#define LANTIQ_ALG_APP_ICMP        0x01000000
++#define LANTIQ_ALG_APP_FTP         0x02000000
++#define LANTIQ_ALG_APP_PPTP        0x03000000
++#define LANTIQ_ALG_APP_SIP         0x04000000
++#define LANTIQ_ALG_APP_CUSEEME     0x05000000
++#define LANTIQ_ALG_APP_H323        0x06000000
++#define LANTIQ_ALG_APP_RTSP        0x07000000
++#define LANTIQ_ALG_APP_IPSEC       0x08000000
++
++#define LANTIQ_ALG_PROTO_CTRL      0x00
++#define LANTIQ_ALG_PROTO_RTP       0x00010000
++#define LANTIQ_ALG_PROTO_RTCP      0x00020000
++#define LANTIQ_ALG_PROTO_DATA      0x00030000
++#endif  //CONFIG_LANTIQ_ALG_QOS
++
+ /* per conntrack: protocol private data */
+ union nf_conntrack_proto {
+ 	/* insert conntrack proto private data here */
+@@ -90,6 +106,11 @@ struct nf_conn {
+ 
+ 	/* Timer function; drops refcnt when it goes off. */
+ 	struct timer_list timeout;
++	
++#ifdef CONFIG_LANTIQ_ALG_QOS
++	int lantiq_alg_qos_mark;
++	int rtcp_expect_registered;
++#endif
+ 
+ #if defined(CONFIG_NF_CONNTRACK_MARK)
+ 	u_int32_t mark;
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -99,6 +99,11 @@ config LANTIQ_IPQOS_MARK_SKBPRIO
+ 
+ 	  If unsure, say N.
+ 
++config LANTIQ_ALG_QOS
++	bool "FTP connection tracking support"
++	help
++		FTP ALG support
++
+ if INET
+ source "net/ipv4/Kconfig"
+ source "net/ipv6/Kconfig"
+diff --git a/net/netfilter/nf_conntrack_ftp.c b/net/netfilter/nf_conntrack_ftp.c
+--- a/net/netfilter/nf_conntrack_ftp.c
++++ b/net/netfilter/nf_conntrack_ftp.c
+@@ -33,6 +33,15 @@ MODULE_DESCRIPTION("ftp connection track
+ MODULE_ALIAS("ip_conntrack_ftp");
+ MODULE_ALIAS_NFCT_HELPER("ftp");
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++#include <net/netfilter/nf_conntrack_core.h>
++#if 0
++#define DEBUGP printk
++#else
++#define DEBUGP(format, args...)
++#endif
++#endif
++
+ /* This is slow, but it's simple. --RR */
+ static char *ftp_buffer;
+ 
+@@ -310,6 +319,23 @@ static int find_pattern(const char *data
+ 	return 1;
+ }
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++	/*
++	 * The expect function for FTP ALG
++	 * This will mark the ALG protocol family for the FTP data/control traffic.
++	 */
++static void  ftp_expectfn(struct nf_conn *ct,struct nf_conntrack_expect *exp)
++{
++	spin_lock_bh(&nf_ftp_lock);
++	DEBUGP("\nMaster conntracker lantiq_alg_qos_mark is : %x \n",ct->lantiq_alg_qos_mark );
++	ct->lantiq_alg_qos_mark = LANTIQ_ALG_APP_FTP | LANTIQ_ALG_PROTO_DATA;
++	DEBUGP("\n Marked the Child conntrackeri with value: %x !!! \n",ct->lantiq_alg_qos_mark );
++
++	spin_unlock_bh(&nf_ftp_lock);
++	//return NF_ACCEPT; /* unused */
++}
++#endif
++
+ /* Look up to see if we're just after a \n. */
+ static int find_nl_seq(u32 seq, const struct nf_ct_ftp_master *info, int dir)
+ {
+@@ -494,6 +520,20 @@ skip_nl_seq:
+ 			  &ct->tuplehash[!dir].tuple.src.u3, daddr,
+ 			  IPPROTO_TCP, NULL, &cmd.u.tcp.port);
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++	/*  this is used to differentiate protocols in nf_nat_follow_master  */
++	exp->master->rtcp_expect_registered = 1;
++			   
++	DEBUGP("SRC PORT %d",exp->tuple.src.u.tcp.port);
++	DEBUGP("DST PORT %d",exp->tuple.dst.u.tcp.port);
++	/*
++	 * Set the Expect Function for FTP ALG
++	 */
++	exp->expectfn = ftp_expectfn;
++#else
++	exp->expectfn = NULL;
++#endif
++
+ 	/* Now, NAT might want to mangle the packet, and register the
+ 	 * (possibly changed) expectation itself. */
+ 	nf_nat_ftp = rcu_dereference(nf_nat_ftp_hook);
+diff --git a/net/netfilter/nf_nat_helper.c b/net/netfilter/nf_nat_helper.c
+--- a/net/netfilter/nf_nat_helper.c
++++ b/net/netfilter/nf_nat_helper.c
+@@ -26,6 +26,16 @@
+ #include <net/netfilter/nf_nat_core.h>
+ #include <net/netfilter/nf_nat_helper.h>
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++#if 0
++#define DEBUGP printk
++#define DUMP_OFFSET(x)	printk("offset_before=%d, offset_after=%d, correction_pos=%u\n", x->offset_before, x->offset_after, x->correction_pos);
++#else
++#define DEBUGP(format, args...)
++#define DUMP_OFFSET(x)
++#endif
++#endif
++
+ #define DUMP_OFFSET(x) \
+ 	pr_debug("offset_before=%d, offset_after=%d, correction_pos=%u\n", \
+ 		 x->offset_before, x->offset_after, x->correction_pos);
+@@ -417,6 +427,31 @@ void nf_nat_follow_master(struct nf_conn
+ {
+ 	struct nf_nat_range range;
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++	if(exp->master->rtcp_expect_registered == 1) { 
++		DEBUGP("\nMaster conntracker lantiq_alg_qos_mark is : %x \n",ct->lantiq_alg_qos_mark );
++		ct->lantiq_alg_qos_mark = LANTIQ_ALG_APP_FTP | LANTIQ_ALG_PROTO_DATA;
++		DEBUGP("\n Marked the Child conntrackeri with value: %x !!! \n",ct->lantiq_alg_qos_mark );
++	}
++	 
++	else if(exp->master->rtcp_expect_registered == 2 ) {
++		DEBUGP("\nMaster conntracker lantiq_alg_qos_mark(RTSP) is : %x \n",ct->lantiq_alg_qos_mark ); 
++		ct->lantiq_alg_qos_mark = LANTIQ_ALG_APP_RTSP | LANTIQ_ALG_PROTO_RTP;
++	}
++	
++	else if (exp->master->rtcp_expect_registered == 3 ) {
++		ct->lantiq_alg_qos_mark = LANTIQ_ALG_APP_H323 | LANTIQ_ALG_PROTO_RTP;
++	}
++		
++	else if (exp->master->rtcp_expect_registered == 4 ) {
++		ct->lantiq_alg_qos_mark = LANTIQ_ALG_APP_H323 | LANTIQ_ALG_PROTO_RTCP;
++	}
++				   
++	else if (exp->master->rtcp_expect_registered == 5 ) {
++		ct->lantiq_alg_qos_mark = LANTIQ_ALG_APP_H323;
++	}
++#endif
++
+ 	/* This must be a fresh one. */
+ 	BUG_ON(ct->status & IPS_NAT_DONE_MASK);
+ 
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -42,6 +42,28 @@
+ #include <net/act_api.h>
+ #include <net/pkt_cls.h>
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++#include <net/netfilter/nf_conntrack_expect.h>
++#include <net/netfilter/nf_conntrack_l3proto.h>
++#include <net/netfilter/nf_conntrack_l4proto.h>
++#include <net/netfilter/nf_conntrack_helper.h>
++#include <net/netfilter/nf_conntrack_core.h>
++
++// For debugging
++#if 0
++#define DEBUGP printk
++#else
++#define DEBUGP(format, args...)
++#endif
++
++#if 0  // for testing purpose
++#define LANTIQ_ALG_QOS_DBG printk
++#else
++#define LANTIQ_ALG_QOS_DBG(format, args...)
++#endif
++
++#endif /* CONFIG_LANTIQ_ALG_QOS */
++
+ struct tc_u_knode {
+ 	struct tc_u_knode	*next;
+ 	u32			handle;
+@@ -115,6 +137,21 @@ static int u32_classify(struct sk_buff *
+ #endif
+ 	int i, r;
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++	struct nf_conn *alg_ip_conntrack;   //,*alg_master_conntrack;
++	enum ip_conntrack_info ctinfo;
++	//alg_master_conntrack = ip_conntrack_get(skb,&ctinfo);
++	alg_ip_conntrack = nf_ct_get(skb,&ctinfo);  //(struct ip_conntrack *) alg_master_conntrack->master;
++
++	if ( alg_ip_conntrack ) {
++		LANTIQ_ALG_QOS_DBG("\n[u32_classify: lantiq_alg_qos_mark value obatined is: %x ]\n",
++			alg_ip_conntrack->lantiq_alg_qos_mark );
++	}
++  else {
++		LANTIQ_ALG_QOS_DBG("\n[u32_classify: alg_ip_conntrack is NULL ] \n" );
++	}
++#endif  // CONFIG_LANTIQ_ALG_QOS
++
+ next_ht:
+ 	n = ht->ht[sel];
+ 
+@@ -122,6 +159,11 @@ next_knode:
+ 	if (n) {
+ 		struct tc_u32_key *key = n->sel.keys;
+ 
++#ifdef CONFIG_LANTIQ_ALG_QOS
++	DEBUGP ("sel.nkeys: %x\n", n->sel.nkeys);
++	DEBUGP ("skb->dev->ifindex: %x\n", skb->dev->ifindex);
++#endif
++
+ #ifdef CONFIG_CLS_U32_PERF
+ 		n->pf->rcnt += 1;
+ 		j = 0;
+@@ -145,6 +187,32 @@ next_knode:
+ 		}
+ #endif
+ 		for (i = n->sel.nkeys; i > 0; i--, key++) {
++#ifdef CONFIG_LANTIQ_ALG_QOS
++	if(key->off == 0x1000) {
++		if ( !alg_ip_conntrack) {
++			return -1;
++		}
++
++	//if(((alg_ip_conntrack->lantiq_alg_qos_mark & key->mask ) == key->val) || (((skb->dev->ifindex) & key->mask) == key->val))
++		if((alg_ip_conntrack->lantiq_alg_qos_mark & key->mask ) == key->val) {
++			DEBUGP ("[**SUCCESS** [190] Offset: %x  Offset2: %x Offmask %x: keyValue: %x Mask: %x skb->tc_index: %x lantiq_alg_qos_mark: %x ] \n", key->off, off2, key->offmask, key->val, key->mask, skb->tc_index,alg_ip_conntrack->lantiq_alg_qos_mark );
++			continue;
++		}
++		else if(((skb->dev->ifindex) & key->mask) == key->val) {
++			DEBUGP ("[**SUCCESS** [190] Offset: %x  Offset2: %x Offmask %x: keyValue: %x Mask: %x skb->tc_index: %x lantiq_phy_mask: %x ] \n", key->off, off2, key->offmask, key->val, key->mask, skb->tc_index,skb->dev->ifindex);
++			continue;
++		}
++		else {
++			DEBUGP ("[**FAILURE**:[184] Offset: %x  Offset2: %x Offmask %x: keyValue: %x Mask: %x skb->tc_index: %x lantiq_alg_qos_mark: %x ] \n", key->off, off2, key->offmask, key->val, key->mask, skb->tc_index,alg_ip_conntrack->lantiq_alg_qos_mark );
++			n = n->next;
++			goto next_knode;
++		}
++  }
++
++	DEBUGP ("[192] Offset: %x  Offset2: %x Offmask %x: Value: %x Mask: %x\n", key->off, off2, key->offmask, key->val, key->mask);
++
++#endif // CONFIG_LANTIQ_ALG_QOS
++
+ 			int toff = off + key->off + (off2 & key->offmask);
+ 			__be32 *data, hdata;
+ 

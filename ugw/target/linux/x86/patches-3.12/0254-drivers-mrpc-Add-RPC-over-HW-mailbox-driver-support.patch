@@ -1,0 +1,2450 @@
+From f265922297897d36a37b3493fc0ea1a20bb30eeb Mon Sep 17 00:00:00 2001
+From: Tomer Eliyahu <tomer.b.eliyahu@intel.com>
+Date: Thu, 7 Jan 2016 20:39:56 +0200
+Subject: [PATCH 254/441] drivers: mrpc: Add RPC over HW mailbox driver support
+
+This commit adds the mrpc driver which enables RPC like functionality
+over the HW mailbox.
+The mrpc driver provides the means for clients running on the APP-CPU
+to call remote procedures running on the NP-CPU and vice versa on top of
+HW mailbox Rx and Tx channels of type OP.
+A client blocks upon issuing an mrpc_call and unblocks only after the
+final response arrives.
+Example kernel modules for client and server are available under examples.
+
+Change-Id: I5e32744be3247eb93e9ef65da9e104634156c258
+Signed-off-by: Tomer Eliyahu <tomer.b.eliyahu@intel.com>
+---
+ arch/x86/hw_mailbox/hw_mbox_drv.c           |   37 +
+ drivers/Kconfig                             |    2 +
+ drivers/Makefile                            |    2 +
+ drivers/mrpc/Kconfig                        |   28 +
+ drivers/mrpc/Makefile                       |    2 +
+ drivers/mrpc/core/Makefile                  |    1 +
+ drivers/mrpc/core/mrpc.c                    | 1158 +++++++++++++++++++++++++++
+ drivers/mrpc/core/puma7_npcpu_appcpu_defs.h |   92 +++
+ drivers/mrpc/examples/Makefile              |    2 +
+ drivers/mrpc/examples/client_example.c      |  441 ++++++++++
+ drivers/mrpc/examples/mrpc_examples.h       |   98 +++
+ drivers/mrpc/examples/server_example.c      |  313 ++++++++
+ include/linux/hw_mbox_defs.h                |    4 +-
+ include/linux/mrpc.h                        |  153 ++++
+ lib/kobject.c                               |    1 +
+ 15 files changed, 2332 insertions(+), 2 deletions(-)
+ create mode 100755 drivers/mrpc/Kconfig
+ create mode 100755 drivers/mrpc/Makefile
+ create mode 100644 drivers/mrpc/core/Makefile
+ create mode 100644 drivers/mrpc/core/mrpc.c
+ create mode 100755 drivers/mrpc/core/puma7_npcpu_appcpu_defs.h
+ create mode 100755 drivers/mrpc/examples/Makefile
+ create mode 100644 drivers/mrpc/examples/client_example.c
+ create mode 100644 drivers/mrpc/examples/mrpc_examples.h
+ create mode 100644 drivers/mrpc/examples/server_example.c
+ create mode 100644 include/linux/mrpc.h
+
+--- a/arch/x86/hw_mailbox/hw_mbox_drv.c
++++ b/arch/x86/hw_mailbox/hw_mbox_drv.c
+@@ -1969,6 +1969,43 @@ int hwMbox_sendAckOpcode(hw_mbox_Masters
+ EXPORT_SYMBOL(hwMbox_sendAckOpcode);
+ 
+ /**************************************************************************/
++/*! \fn int hwMbox_getChannelConfig(hw_mbox_Masters_e peer,
++                                    hw_mbox_type_e mboxType,
++                                    Bool isPeerCommander,
++                                    hw_mbox_channelConfig_t *cfg)
++ **************************************************************************
++ *  \brief Get channel configuration.
++ *  \param[in] peer - channel peer .
++ *  \param[in] mboxType - channel type.
++ *  \param[in] isPeerCommander - indicates whether the peer is the commander
++ *                               of the channel.
++ *  \param[out] cfg - channel configuration, if found.
++ *  \return [ 0 on success / error otherwise ].
++ **************************************************************************/
++int hwMbox_getChannelConfig(hw_mbox_Masters_e peer,
++                            hw_mbox_type_e mboxType,
++                            Bool isPeerCommander,
++                            hw_mbox_channelConfig_t *cfg)
++{
++    Uint32 paramCID;
++
++    if (cfg == NULL)
++    {
++        PRINTK_ERR("cfg == NULL!");
++        return -1;
++    }
++
++    CHECK_IS_DRV_INITIALIZED(return (-1));
++
++    CHECK_FIND_CID_IN_LUT(peer, mboxType, isPeerCommander, return (-1), paramCID);
++
++    memcpy(cfg, &CHN_CFG(paramCID), HW_MBOX_CHANNEL_CONFIG_SIZE);
++
++    return 0;
++}
++EXPORT_SYMBOL(hwMbox_getChannelConfig);
++
++/**************************************************************************/
+ /*! \fn int hwMbox_registerRecvOpcode(hw_mbox_Masters_e commander,
+                                       hwMboxRecvOpcodeCallback pOpcodeCallbackFunc,
+                                       Uint32 tag,
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -166,4 +166,6 @@ source "drivers/reset/Kconfig"
+ 
+ source "drivers/fmc/Kconfig"
+ 
++source "drivers/mrpc/Kconfig"
++
+ endmenu
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -152,3 +152,5 @@ obj-$(CONFIG_VME_BUS)		+= vme/
+ obj-$(CONFIG_IPACK_BUS)		+= ipack/
+ obj-$(CONFIG_NTB)		+= ntb/
+ obj-$(CONFIG_FMC)		+= fmc/
++obj-$(CONFIG_MRPC)		+= mrpc/
++
+--- /dev/null
++++ b/drivers/mrpc/Kconfig
+@@ -0,0 +1,28 @@
++config MRPC
++    tristate "RPC over HW Mailbox support"
++    depends on HW_MAILBOX
++    default n
++    help
++       Enable Puma7 RPC over HW mailbox driver support
++
++config MRPC_EXAMPLES
++    bool "RPC over HW Mailbox examples"
++    depends on MRPC
++    default n
++    help
++       Choose y to compile client/server examples
++
++config MRPC_CLIENT_EXAMPLE
++    tristate "RPC over HW Mailbox client example"
++    depends on MRPC_EXAMPLES
++    default n
++    help
++       RPC over HW mailbox example client
++
++config MRPC_SERVER_EXAMPLE
++    tristate "RPC over HW Mailbox server example"
++    depends on MRPC_EXAMPLES
++    default n
++    help
++       RPC over HW mailbox example server
++
+--- /dev/null
++++ b/drivers/mrpc/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_MRPC)		+= core/
++obj-$(CONFIG_MRPC_EXAMPLES)	+= examples/
+--- /dev/null
++++ b/drivers/mrpc/core/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_MRPC) += mrpc.o
+--- /dev/null
++++ b/drivers/mrpc/core/mrpc.c
+@@ -0,0 +1,1158 @@
++/*
++ *
++ * mrpc.c
++ * Description:
++ * MRPC (RPC over HW Mailbox) driver implementation
++ *
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ":%s:%d " fmt "\n", __func__, __LINE__
++
++/************************************************/
++/**                    Includes                 */
++/************************************************/
++#include <linux/platform_device.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/kernel.h>
++#include <linux/byteorder/generic.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
++#include <linux/err.h>
++#include <linux/hw_mbox_defs.h>
++#include <linux/mrpc.h>
++#include "puma7_npcpu_appcpu_defs.h"
++
++/************************************************/
++/**           Structures & Enums                */
++/************************************************/
++#ifdef DEBUG
++#define DBG(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
++#else
++#define DBG(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
++#endif
++
++#define MAX_NAME_SIZE                       50
++#define DEFAULT_CLIENT_WAIT_TIMEOUT_MS      200
++
++#ifdef CONFIG_ARM_AVALANCHE_SOC
++#define MRPC_HW_MBOX_THIS HW_MBOX_MASTER_NP_CPU
++#define MRPC_HW_MBOX_OTHER HW_MBOX_MASTER_APP_CPU
++#else
++#define MRPC_HW_MBOX_THIS HW_MBOX_MASTER_APP_CPU
++#define MRPC_HW_MBOX_OTHER HW_MBOX_MASTER_NP_CPU
++#endif
++
++enum mrpc_msg_type {
++    MRPC_CALL_MSG  = 0,     /* client call message */
++    MRPC_REPLY_MSG,         /* server reply message */
++    MRPC_ERROR_MSG
++};
++
++/* mrpc header structure */
++struct mrpc_hdr {
++    __be32 signature;       /* mrpc signature */
++    __u8 msg_type;          /* message type */
++    __be32 id;              /* client/server id */
++    __u8 proc;              /* proc id */
++    __be32 ret;             /* proc return val */
++    union {
++        struct {
++            __be32 arglen;  /* argument length [bytes] */
++            __be32 replen;  /* reply length [bytes] */
++            __u8 data[0];   /* data starts here */
++        } payload;
++        struct {
++            __be32 errcode; /* signed error code */
++        } error;
++    } u;
++/* macros to easily access mrpc_hdr union members */
++#define h_arglen u.payload.arglen
++#define h_arg u.payload.data
++#define h_replen u.payload.replen
++#define h_rep u.payload.data
++#define h_errcode u.error.errcode
++};
++
++/* structure representing an MRPC client */
++struct mrpc_client {
++    struct list_head list;
++    struct mrpc_private *mrpc;  /* mrpc driver database pointer */
++    struct kobject kobj;        /* kobject for sysfs */
++    unsigned int id;            /* Client ID */
++    char name[MAX_NAME_SIZE];   /* Client name */
++    struct mutex lock;          /* Client mutex (synchronize calls) */
++    wait_queue_head_t wait;     /* Client wait queue for replies */
++    unsigned long timeout;      /* default timeout[ms] when using mrpc_call */
++    struct mrpc_hdr *rep;       /* Client reply pointer */
++    spinlock_t rep_lock;        /* Client reply spinlock */
++};
++#define to_mrpc_client(x) container_of(x, struct mrpc_client, kobj)
++
++/* structure representing a server work to run a remote procedure */
++struct mrpc_server_work {
++    struct work_struct work;
++    struct mrpc_server *server; /* server pointer */
++    __u8 proc;                  /* procedure id */
++    void *arg;                  /* argument pointer */
++    ssize_t arg_len;            /* argument length */
++    void *rep;                  /* reply pointer */
++    ssize_t rep_len;            /* reply length */
++};
++
++/* structure representing an MRPC server */
++struct mrpc_server {
++    struct list_head list;
++    struct mrpc_private *mrpc;      /* mrpc driver database pointer */
++    struct kobject kobj;            /* kobj for sysfs */
++    unsigned int id;                /* server id */
++    char name[MAX_NAME_SIZE];       /* server name */
++    struct mutex lock;              /* server lock */
++    struct workqueue_struct *wq;    /* server work queue for serving client calls */
++    struct mrpc_procinfo *procs;    /* server procs */
++    u32 num_procs;                  /* server number of procs */
++};
++#define to_mrpc_server(x) container_of(x, struct mrpc_server, kobj)
++
++/* structre representing the mrpc driver */
++struct mrpc_private {
++    struct platform_device *pdev;       /* platform device pointer */
++    struct mutex lock;                  /* mrpc lock for lists access */
++    struct list_head clients;           /* registered clients list */
++    struct list_head servers;           /* registered servers list */
++    struct kset *clients_kset;          /* kset for clients sysfs */
++    struct kset *servers_kset;          /* kset for servers sysfs */
++    hw_mbox_Masters_e this_cpu;         /* this cpu HW_MBOX master */
++    hw_mbox_Masters_e other_cpu;        /* other cpu HW_MBOX master */
++    hw_mbox_channelConfig_t txch_cfg;   /* tx channel configuration */
++    hw_mbox_channelConfig_t rxch_cfg;   /* rx channel configuration */
++    Uint32 tag;                         /* MRPC driver HW MBOX tag */
++};
++
++/************************************************/
++/**           Extern Functions                  */
++/************************************************/
++extern int hwMbox_isReady(void);
++extern int hwMbox_sendOpcode(hw_mbox_Masters_e, Uint32 ,Uint8 *, Uint32, Uint32, Uint32 *);
++extern int hwMbox_sendAckOpcode(hw_mbox_Masters_e );
++extern int hwMbox_sendReplyOpcode(hw_mbox_Masters_e ,Uint8 *, Uint32 );
++extern int hwMbox_registerRecvOpcode(hw_mbox_Masters_e ,
++                                     hwMboxRecvOpcodeCallback, Uint32, Uint32);
++extern int hwMbox_getChannelConfig(hw_mbox_Masters_e peer,
++                                   hw_mbox_type_e mboxType,
++                                   Bool isPeerCommander,
++                                   hw_mbox_channelConfig_t *cfg);
++
++/************************************************/
++/**                Globals                      */
++/************************************************/
++static struct mrpc_private *this;   /* global pointer for private database */
++
++/************************************************/
++/**                    Implementation           */
++/************************************************/
++
++/* copy h2 to h1 and convert endianess to *host* byte order */
++static inline void copy_header(struct mrpc_hdr *h1, struct mrpc_hdr *h2)
++{
++    BUG_ON(!h1);
++    BUG_ON(!h2);
++
++    h1->signature = ntohl(h2->signature);
++    h1->proc = h2->proc;
++    h1->ret = ntohl(h2->ret);
++    h1->id = ntohl(h2->id);
++    h1->msg_type = h2->msg_type;
++    if (h1->msg_type == MRPC_ERROR_MSG) {
++        h1->h_errcode = ntohl(h2->h_errcode);
++    } else {
++        h1->h_arglen = ntohl(h2->h_arglen);
++        h1->h_replen = ntohl(h2->h_replen);
++    }
++}
++
++/* dump mrpc header in host byte order */
++static inline void dump_header(struct mrpc_hdr *h, bool ntoh)
++{
++    pr_err("dump header");
++    pr_err("signature: 0x%08x", ntoh ? ntohl(h->signature) : h->signature);
++    pr_err("id: %d", ntoh ? ntohl(h->id) : h->id);
++    pr_err("msg_type: %d", h->msg_type);
++    pr_err("proc: %d", h->proc);
++    pr_err("ret: %d", ntoh ? ntohl(h->ret): h->ret);
++    pr_err("errcode: %d", ntoh ? ntohl(h->h_errcode) : h->h_errcode);
++}
++
++/* simple sanity check for incoming messages */
++static inline int validate_header(struct mrpc_hdr *hdr)
++{
++    /* sanity checks */
++    if (!hdr) {
++        pr_err("NULL pointer received");
++        return MRPC_ERR_INVALID_HEADER;
++    }
++    if (ntohl(hdr->signature) != 0x4d525043) {
++        pr_err("mrpc signature error");
++        return MRPC_ERR_INVALID_SIGNATURE;
++    }
++
++    return 0;
++}
++
++/**
++ * server_send_error
++ * sends an error back to the mrpc client
++ *
++ * @param s      server handle
++ * @param proc   ptoc id
++ * @param err    error code to send
++ *
++ * @return 0 for success, hw_mbox error code otherwise
++ */
++static inline int server_send_error(struct mrpc_server *s, u8 proc, int err)
++{
++    unsigned int reply_len;
++    struct mrpc_hdr hdr = {
++        .id = htonl(s->id),
++        .msg_type = MRPC_ERROR_MSG,
++        .proc = proc,
++        .signature = htonl(0x4d525043),
++        .h_errcode = htonl(err)
++    };
++    int ret;
++
++    mutex_lock(&s->lock);
++    ret = hwMbox_sendOpcode(s->mrpc->other_cpu, s->mrpc->tag, (Uint8 *)&hdr,
++                            sizeof(hdr) + sizeof(hwMbox_opcodeMessage_t),
++                            sizeof(hdr), &reply_len);
++    mutex_unlock(&s->lock);
++
++    return ret;
++}
++
++/**
++ * server_send_reply
++ * send a reply back to the client
++ *
++ * @param s      server handle
++ * @param proc   proc id
++ * @param rep    reply pointer
++ * @param replen reply length (bytes)
++ * @param retval remote procedure return value
++ *
++ * @return 0 for success, error code otherwise
++ */
++static inline int server_send_reply(struct mrpc_server *s, u8 proc,
++                                    void *rep, ssize_t replen,
++                                    int retval)
++{
++    struct mrpc_hdr *hdr;
++    int reply_len, ret = 0;
++    ssize_t size, max_size;
++    int errcode;
++
++    BUG_ON(!s);
++
++    max_size = s->mrpc->txch_cfg.memBuff.size;
++    size = sizeof(*hdr) + replen;
++    if (size > max_size) {
++        pr_err("server %s(%d) message too big", s->name, s->id);
++        return server_send_error(s, proc, MRPC_ERR_MSG_TOO_BIG);
++    }
++
++    hdr = kzalloc(size + sizeof(hwMbox_opcodeMessage_t), GFP_KERNEL);
++    if (!hdr) {
++        pr_err("memory allocation failed (%d bytes)",
++               size + sizeof(hwMbox_opcodeMessage_t));
++        return server_send_error(s, proc, -ENOMEM);
++    }
++
++    hdr->signature = htonl(0x4d525043); /* MRPC in ASCII */
++    hdr->msg_type = MRPC_REPLY_MSG;
++    hdr->id = htonl(s->id);
++    hdr->proc = proc;
++    hdr->ret = htonl(retval);
++    hdr->h_replen = htonl(replen);
++    memcpy(hdr->h_rep, rep, replen);
++    mutex_lock(&s->lock);
++    ret = hwMbox_sendOpcode(s->mrpc->other_cpu, s->mrpc->tag, (Uint8 *)hdr,
++                            size + sizeof(hwMbox_opcodeMessage_t),
++                            size, &reply_len);
++    mutex_unlock(&s->lock);
++    if (ret) {
++        pr_err("hw_mbox error %d", ret);
++        if (reply_len > 0) {
++            errcode = ((hwMbox_opcodeMessage_t *)hdr)->msgData.msgStatus.status;
++            pr_err("hw_mbox errcode=%d", errcode);
++            server_send_error(s, proc, errcode);
++        }
++    }
++
++    kfree(hdr);
++    return ret;
++}
++
++/**
++ * mrpc_server_worker
++ * worker function for server remote procedure calls
++ *
++ * @param w      work structure containing the proc id, argument and argument length
++ */
++static void mrpc_server_worker(struct work_struct *w)
++{
++    struct mrpc_server_work *work = container_of(w, struct mrpc_server_work,
++                                                 work);
++    struct mrpc_server *s = work->server;
++    proc_t cb = s->procs[work->proc].p_func;
++    int ret;
++
++    DBG("S: %s(%d) worker: calling proc %d", s->name, s->id, work->proc);
++
++    ret = cb(work->arg, work->arg_len, work->rep, work->rep_len);
++
++    server_send_reply(s, work->proc, work->rep, work->rep_len, ret);
++
++    kfree(work->arg);
++    kfree(work->rep);
++    kfree(work);
++}
++
++/**
++ * server_handle_call
++ * dispatch mrpc call requests on the server side to server workers
++ *
++ * @param hdr    mrpc_hdr of the incoming request
++ *
++ * @return 0 for success, error code otherwise
++ */
++static int server_handle_call(struct mrpc_hdr *hdr)
++{
++    struct mrpc_private *mrpc = this;
++    struct mrpc_server_work *work;
++    struct mrpc_server *p, *server = NULL;
++    struct mrpc_procinfo procinfo;
++    int err = 0;
++
++    BUG_ON(!hdr);
++
++    mutex_lock(&mrpc->lock);
++    list_for_each_entry(p, &mrpc->servers, list)
++        if (p->id == ntohl(hdr->id))
++            server = p;
++    mutex_unlock(&mrpc->lock);
++
++    if (!server) {
++        pr_err("invalid server");
++        err = MRPC_ERR_SERVER_NOT_READY;
++        goto out_err;
++    }
++
++    if (hdr->proc > server->num_procs - 1) {
++        pr_err("invalid proc");
++        err = MRPC_ERR_INVALID_PROC;
++        goto out_err;
++    }
++
++    procinfo = server->procs[hdr->proc];
++    if (procinfo.p_arglen != ntohl(hdr->h_arglen) &&
++        procinfo.p_arglen != -1) {
++        pr_err("invalid proc arglen");
++        err = MRPC_ERR_ARGLEN_MISMATCH;
++        goto out_err;
++    }
++
++    if (procinfo.p_replen != ntohl(hdr->h_replen) &&
++        procinfo.p_replen != -1) {
++        pr_err("invalid proc replen");
++        err = MRPC_ERR_REPLEN_MISMATCH;
++        goto out_err;
++    }
++
++    work = kzalloc(sizeof(*work), GFP_KERNEL);
++    if (!work) {
++        pr_err("memory allocation failed");
++        err = -ENOMEM;
++        goto out_err;
++    }
++
++    work->server = server;
++    work->proc = hdr->proc;
++    work->arg_len = ntohl(hdr->h_arglen);
++    work->arg = kzalloc(work->arg_len, GFP_KERNEL);
++    if (!work->arg) {
++        pr_err("memory allocation failed");
++        err = -ENOMEM;
++        goto free_work;
++    }
++    memcpy(work->arg, hdr->h_arg, work->arg_len);
++    work->rep_len = ntohl(hdr->h_replen);
++    work->rep = kzalloc(work->rep_len, GFP_KERNEL);
++    if (!work->rep) {
++        pr_err("memory allocation failed");
++        err = -ENOMEM;
++        goto free_arg;
++    }
++
++    INIT_WORK(&work->work, mrpc_server_worker);
++    queue_work(server->wq, &work->work);
++    DBG("call message queued");
++    return 0;
++
++free_arg:
++    kfree(work->arg);
++free_work:
++    kfree(work);
++out_err:
++    return err;
++}
++
++/**
++ * client_handle_reply
++ * parse the reply on client's side and wake up waiting client.
++ *
++ * @param hdr    mrpc_hdr containing the server reply
++ *
++ * @return 0 for succes, error code otherwise
++ */
++static int client_handle_reply(struct mrpc_hdr *hdr)
++{
++    struct mrpc_client *p, *client = NULL;
++    struct mrpc_private *mrpc = this;
++    struct mrpc_hdr *rep;
++    ssize_t replen, size = sizeof(*hdr);
++
++    BUG_ON(!hdr);
++    replen = ntohl(hdr->h_replen);
++
++    mutex_lock(&mrpc->lock);
++    list_for_each_entry(p, &mrpc->clients, list)
++        if (p->id == ntohl(hdr->id))
++            client = p;
++    mutex_unlock(&mrpc->lock);
++
++    if (!client) {
++        pr_err("invalid client");
++        return MRPC_ERR_INVALID_CLIENT;
++    }
++
++    BUG_ON(client->rep);
++    if (hdr->msg_type == MRPC_REPLY_MSG)
++        size += replen;
++
++    rep = kzalloc(size, GFP_KERNEL);
++    if (!rep) {
++        pr_err("memory allocation failed");
++        return -ENOMEM;
++    }
++
++    copy_header(rep, hdr);
++    if (hdr->msg_type == MRPC_REPLY_MSG)
++        memcpy(rep->h_rep, hdr->h_rep, replen);
++
++    spin_lock(&client->rep_lock);
++    client->rep = rep;
++    spin_unlock(&client->rep_lock);
++    wake_up(&client->wait);
++
++    DBG("message reply receive success");
++    return 0;
++}
++
++/**
++ * hw_mailbox_callback
++ * callback function registered by the mrpc driver to the hw mailbox,
++ * dispatches all server replies and client calls.
++ *
++ * @param commander this cpu
++ * @param dataBuf   pointer to the data buffer
++ * @param dataLen   data buffer length (bytes)
++ * @param token     unused
++ *
++ * @return 0 for success, error code otherwise
++ */
++static int hw_mbox_callback(hw_mbox_Masters_e commander, Uint8 *dataBuf,
++                            Uint32 dataLen, Uint32 *token)
++{
++    struct mrpc_private *mrpc = this;
++    struct mrpc_hdr *hdr = (struct mrpc_hdr *)dataBuf;
++    ssize_t datalen = dataLen - sizeof(*hdr);
++    int err = 0;
++
++    DBG("dataBuf=%p, dataLen=%d, datalen=%d, token=%p",
++        dataBuf, dataLen, datalen, token);
++
++    err = validate_header(hdr);
++    if (err)
++        goto out_err;
++
++    switch (hdr->msg_type) {
++    case MRPC_REPLY_MSG:
++    case MRPC_ERROR_MSG:
++        err = client_handle_reply(hdr);
++        break;
++    case MRPC_CALL_MSG:
++        err = server_handle_call(hdr);
++        break;
++    default: BUG();
++    }
++
++    if (err) {
++        err = htonl(err);
++        goto out_err;
++    }
++
++    hwMbox_sendAckOpcode(mrpc->other_cpu);
++    return 0;
++
++out_err:
++    hwMbox_sendReplyOpcode(mrpc->other_cpu, (Uint8 *)&err, sizeof(err));
++    return 0;
++}
++
++/* simple client sanity checks */
++static inline int validate_client(struct mrpc_client *client)
++{
++    struct mrpc_private *mrpc = this;
++    struct mrpc_client *p;
++
++    if (!client) {
++        pr_err("invalid client pointer");
++        return MRPC_ERR_INVALID_CLIENT;
++    }
++
++    mutex_lock(&mrpc->lock);
++    list_for_each_entry(p, &mrpc->clients, list)
++        if (p == client) {
++            mutex_unlock(&mrpc->lock);
++            DBG("client %s id %d is valid", client->name, client->id);
++            return 0;
++        }
++
++    mutex_unlock(&mrpc->lock);
++    pr_err("invalid client %p", client);
++    return MRPC_ERR_INVALID_CLIENT;
++}
++
++/* mrpc call API function - see linux/mrpc.h */
++int mrpc_call(struct mrpc_client *c, __u8 proc, void *arg,
++              ssize_t arg_len, void *rep, ssize_t rep_len,
++              unsigned long timeout, int *errcode)
++{
++    struct mrpc_hdr *hdr;
++    ssize_t size, max_size, reply_len;
++    int ret = 0;
++
++    if (!errcode)
++        return -EINVAL;
++
++    *errcode = 0;
++    ret = validate_client(c);
++    if (ret)
++        return ret;
++
++    /* build mrpc header + data */
++    size = arg_len + sizeof(*hdr);
++    max_size = c->mrpc->txch_cfg.memBuff.size;
++    if (size + sizeof(hwMbox_opcodeMessage_t) > max_size) {
++        pr_err("message too long: client %s(%d) arg_len = %d",
++               c->name, c->id, arg_len);
++        return MRPC_ERR_MSG_TOO_BIG;
++    }
++
++    hdr = kzalloc(size + sizeof(hwMbox_opcodeMessage_t), GFP_KERNEL);
++    if (!hdr) {
++        pr_err("memory allocation failed (header_len(%d)+arg_len(%d)=%d bytes",
++               sizeof(*hdr), arg_len, sizeof(*hdr) + arg_len);
++        return -ENOMEM;
++    }
++
++    hdr->signature = htonl(0x4d525043); /* MRPC in ASCII */
++    hdr->msg_type = MRPC_CALL_MSG;
++    hdr->id = htonl(c->id);
++    hdr->proc = proc;
++    hdr->h_arglen = htonl(arg_len);
++    hdr->h_replen = htonl(rep_len);
++    memcpy(hdr->h_arg, arg, arg_len);
++
++    mutex_lock(&c->lock);
++    BUG_ON(c->rep);
++    ret = hwMbox_sendOpcode(c->mrpc->other_cpu, c->mrpc->tag, (Uint8 *)hdr,
++                            size + sizeof(hwMbox_opcodeMessage_t),
++                            size, &reply_len);
++    if (ret) {
++        pr_err("hwMbox_sendOpcode returned error, ret=%d", ret);
++        if (reply_len > 0) {
++            *errcode = ((hwMbox_opcodeMessage_t *)hdr)->msgData.msgStatus.status;
++            pr_err("hw_mbox return error %d", *errcode);
++            ret = MRPC_ERR_HWMBOX_ERROR;
++        }
++        goto out_err;
++    }
++
++    if (reply_len > 0) {
++        pr_err("server error");
++        ret = MRPC_ERR_SERVER_ERROR;
++        *errcode = ntohl(*(int *)hdr);
++        goto out_err;
++    }
++
++    timeout = timeout ? timeout : c->timeout;
++    ret = wait_event_timeout(c->wait, c->rep,
++                             msecs_to_jiffies(timeout));
++    if (ret == 0) {
++        pr_err("client %s(id%d) timeout waiting for proc %d", c->name, c->id, proc);
++        ret = -ETIMEDOUT;
++        goto out_err;
++    }
++
++    BUG_ON(!c->rep);
++    BUG_ON(c->rep->id != c->id);
++    BUG_ON(c->rep->proc != proc);
++
++    /* parse reply */
++    switch (c->rep->msg_type) {
++    case MRPC_ERROR_MSG:
++        ret = MRPC_ERR_SERVER_ERROR;
++        *errcode = c->rep->h_errcode;
++        break;
++    case MRPC_REPLY_MSG:
++        ret = c->rep->ret;
++        BUG_ON(c->rep->h_replen != rep_len);
++        memcpy(rep, c->rep->h_rep, rep_len);
++        break;
++    default:
++        pr_err("%s(%d): unknown msg_type=%d", c->name, c->id, c->rep->msg_type);
++        dump_header(c->rep, false);
++        BUG();
++    }
++
++    kfree(c->rep);
++    c->rep = NULL;
++out_err:
++    mutex_unlock(&c->lock);
++    kfree(hdr);
++    DBG("client %s(%d) call proc %d done (ret=%d, errcode=%d)",
++        c->name, c->id, proc, ret, *errcode);
++    return ret;
++}
++EXPORT_SYMBOL(mrpc_call);
++
++static void client_release(struct kobject *kobj)
++{
++    struct mrpc_client *c = to_mrpc_client(kobj);
++    kfree(c);
++}
++
++ssize_t client_timeout_store(struct kobject *kobj, struct kobj_attribute *attr,
++                             const char *buf, size_t count)
++{
++    struct mrpc_client *client = to_mrpc_client(kobj);
++    unsigned long val;
++
++    BUG_ON(!client);
++
++    if (kstrtoul(buf, 10, &val))
++        return -EINVAL;
++    client->timeout = val;
++
++    return count;
++}
++
++ssize_t client_timeout_show(struct kobject *kobj, struct kobj_attribute *attr,
++                            char *buf)
++{
++    struct mrpc_client *client = to_mrpc_client(kobj);
++
++    BUG_ON(!client);
++
++    return scnprintf(buf, PAGE_SIZE, "%lu[ms]\n", client->timeout);
++}
++
++static struct kobj_attribute client_timeout_attr =
++    __ATTR(timeout, S_IWUSR|S_IRUGO, client_timeout_show, client_timeout_store);
++
++static struct attribute *client_default_attrs[] = {
++    &client_timeout_attr.attr,
++	NULL,
++};
++
++static struct kobj_type client_ktype = {
++	.sysfs_ops = &kobj_sysfs_ops,
++	.release = client_release,
++	.default_attrs = client_default_attrs,
++};
++
++/* mrpc client registration API function - see linux/mrpc.h */
++struct mrpc_client *mrpc_client_register(unsigned int id, const char *name)
++{
++    struct mrpc_private *mrpc = this;
++    struct mrpc_client *client;
++    int ret;
++
++    if (!mrpc) {
++        pr_err("mrpc driver not initialized");
++        return NULL;
++    }
++
++    mutex_lock(&mrpc->lock);
++    list_for_each_entry(client, &mrpc->clients, list)
++        if (client->id == id) {
++            pr_err("client %s (id=%d) already registered", name, id);
++            goto out_unlock;
++        }
++
++    client = kzalloc(sizeof(*client), GFP_KERNEL);
++    if (!client) {
++        pr_err("memory allocation failed");
++        goto out_unlock;
++    }
++
++    mutex_init(&client->lock);
++    spin_lock_init(&client->rep_lock);
++    init_waitqueue_head(&client->wait);
++    client->mrpc = mrpc;
++    client->id = id;
++    client->timeout = DEFAULT_CLIENT_WAIT_TIMEOUT_MS;
++    strlcpy(client->name, name, MAX_NAME_SIZE);
++
++    client->kobj.kset = mrpc->clients_kset;
++    ret = kobject_init_and_add(&client->kobj, &client_ktype, NULL, "%s", name);
++    if (ret) {
++        pr_err("kobject_init_and_add failed with ret=%d", ret);
++        kobject_put(&client->kobj);
++        goto out_kfree;
++    }
++    kobject_uevent(&client->kobj, KOBJ_ADD);
++    list_add(&client->list, &mrpc->clients);
++    mutex_unlock(&mrpc->lock);
++
++    pr_info("client %s registered with id %d", name, id);
++    return client;
++
++out_kfree:
++    kfree(client);
++out_unlock:
++    mutex_unlock(&mrpc->lock);
++
++    pr_err("failed to register client %s (id %d)", name, id);
++    return NULL;
++}
++EXPORT_SYMBOL(mrpc_client_register);
++
++/* mrpc client unregisteration API function - see linux/mrpc.h */
++int mrpc_client_unregister(struct mrpc_client *client)
++{
++    struct mrpc_private *mrpc = this;
++    struct mrpc_client *p;
++
++    if (!mrpc)
++        return -ENODEV;
++    if (!client)
++        return -EINVAL;
++
++    mutex_lock(&mrpc->lock);
++    list_for_each_entry(p, &mrpc->clients, list)
++        if (p == client) {
++            pr_err("client %s(%d) unregistered", p->name, p->id);
++            list_del(&p->list);
++            mutex_unlock(&mrpc->lock);
++            wake_up_interruptible(&p->wait);
++            kobject_put(&p->kobj);
++            return 0;
++        }
++    mutex_unlock(&mrpc->lock);
++
++    pr_err("ERROR - client not found");
++    return -ENODEV;
++}
++EXPORT_SYMBOL(mrpc_client_unregister);
++
++static void server_release(struct kobject *kobj)
++{
++    struct mrpc_server *s = to_mrpc_server(kobj);
++    kfree(s);
++}
++
++static ssize_t server_procs_show(struct kobject *kobj,
++                                 struct kobj_attribute *attr, char *buf)
++{
++    struct mrpc_server *server = to_mrpc_server(kobj);
++    ssize_t len;
++    int i;
++
++    if (!server)
++        return -ENODEV;
++
++    len = scnprintf(buf, PAGE_SIZE, "%s procs:\n", server->name);
++
++    mutex_lock(&server->lock);
++    len += scnprintf(buf+len, PAGE_SIZE - len,
++                     "id   name   arg_len   rep_len   ptr\n");
++    for (i = 0; i < server->num_procs; i++) {
++        len += scnprintf(buf+len, PAGE_SIZE - len,
++                         "%d   %s   %d   %d   %p\n",
++                         server->procs[i].procid,
++                         server->procs[i].p_name,
++                         server->procs[i].p_arglen,
++                         server->procs[i].p_replen,
++                         server->procs[i].p_func);
++    }
++    mutex_unlock(&server->lock);
++    return len;
++}
++
++static struct kobj_attribute server_procs_attr =
++    __ATTR(procs, S_IRUGO, server_procs_show, NULL);
++
++static struct attribute *server_default_attrs[] = {
++    &server_procs_attr.attr,
++	NULL,
++};
++
++static struct kobj_type server_ktype = {
++	.sysfs_ops = &kobj_sysfs_ops,
++	.release = server_release,
++	.default_attrs = server_default_attrs,
++};
++
++/* mrpc server registration API function - <linux/mrpc.h */
++struct mrpc_server *mrpc_server_register(unsigned int id, const char *name,
++                                         struct mrpc_procinfo *procs,
++                                         u32 num_procs)
++{
++    struct mrpc_private *mrpc = this;
++    struct mrpc_server *server;
++    char worker_name[30];
++    ssize_t max_arglen, max_replen, hdrlen;
++    int i, ret;
++
++    if (!mrpc) {
++        pr_err("mrpc driver not initialized");
++        return NULL;
++    }
++
++    hdrlen = sizeof(struct mrpc_hdr) + sizeof(hwMbox_opcodeMessage_t);
++    max_arglen = mrpc->rxch_cfg.memBuff.size - hdrlen;
++    max_replen = mrpc->txch_cfg.memBuff.size - hdrlen;
++
++    /* verify procs */
++    for (i = 0; i < num_procs; i++) {
++        if (procs[i].p_arglen > max_arglen) {
++            pr_warning("WARNING: %s: proc %d (%s) arglen(%d) too big (max %d)",
++                   name, i, procs[i].p_name, procs[i].p_arglen, max_arglen);
++        }
++        if (procs[i].p_replen > max_replen) {
++            pr_warning("WARNING: %s: proc %d (%s) replen(%d) too big (max %d)",
++                   name, i, procs[i].p_name, procs[i].p_replen, max_replen);
++        }
++    }
++
++    mutex_lock(&mrpc->lock);
++    list_for_each_entry(server, &mrpc->servers, list)
++        if (server->id == id) {
++            pr_err("server %s (id=%d) already registered", name, id);
++            goto out_unlock;
++        }
++
++    server = kzalloc(sizeof(*server), GFP_KERNEL);
++    if (!server) {
++        pr_err("memory allocation failed");
++        goto out_unlock;
++    }
++
++    mutex_init(&server->lock);
++    server->mrpc = mrpc;
++    snprintf(worker_name, 30, "%s:%d mrpc server worker", name, id);
++    server->wq = create_singlethread_workqueue(worker_name);
++    if (!server->wq) {
++        pr_err("create workqueue failed");
++        goto out_kfree;
++    }
++
++    server->id = id;
++    server->procs = procs;
++    server->num_procs = num_procs;
++    strlcpy(server->name, name, MAX_NAME_SIZE);
++
++    server->kobj.kset = mrpc->servers_kset;
++    ret = kobject_init_and_add(&server->kobj, &server_ktype, NULL, "%s", name);
++    if (ret) {
++        pr_err("kobject_init_and_add failed with ret=%d", ret);
++        kobject_put(&server->kobj);
++        goto out_workqueue;
++    }
++    kobject_uevent(&server->kobj, KOBJ_ADD);
++    list_add(&server->list, &mrpc->servers);
++    mutex_unlock(&mrpc->lock);
++
++    pr_info("server %s registered with id %d", name, id);
++    return server;
++
++out_workqueue:
++    flush_workqueue(server->wq);
++    destroy_workqueue(server->wq);
++out_kfree:
++    kfree(server);
++out_unlock:
++    mutex_unlock(&mrpc->lock);
++
++    pr_err("failed to register server %s (id %d)", name, id);
++    return NULL;
++}
++EXPORT_SYMBOL(mrpc_server_register);
++
++/* mrpc server unregistration API function - <linux/mrpc.h */
++int mrpc_server_unregister(struct mrpc_server *server)
++{
++    struct mrpc_private *mrpc = this;
++    struct mrpc_server *p;
++
++    if (!mrpc)
++        return -ENODEV;
++    if (!server)
++        return -EINVAL;
++
++    mutex_lock(&mrpc->lock);
++    list_for_each_entry(p, &mrpc->servers, list)
++        if (p == server) {
++            pr_info("server %s(%d) unregistered", p->name, p->id);
++            list_del(&p->list);
++            mutex_unlock(&mrpc->lock);
++            flush_workqueue(p->wq);
++            destroy_workqueue(p->wq);
++            kobject_put(&p->kobj);
++            return 0;
++        }
++    mutex_unlock(&mrpc->lock);
++
++    pr_err("ERROR - server not found");
++    return -ENODEV;
++}
++EXPORT_SYMBOL(mrpc_server_unregister);
++
++static ssize_t status_show(struct device *dev,
++                           struct device_attribute *attr, char *buf)
++{
++    struct mrpc_private *mrpc = dev_get_drvdata(dev);
++    struct mrpc_client *client;
++    struct mrpc_server *server;
++    ssize_t len;
++
++    if (!mrpc)
++        return -EINVAL;
++
++    len = scnprintf(buf, PAGE_SIZE, "mrpc driver status:\n");
++    len += scnprintf(buf + len, PAGE_SIZE - len, "cpu: %s\n"
++                                                 "tag: 0x%x\n"
++                                                 "max_tx_msg_sz: %d[bytes]\n"
++                                                 "max_rx_msg_sz: %d[bytes]\n",
++                     mrpc->this_cpu == HW_MBOX_MASTER_NP_CPU ? "NP-CPU" : "APP-CPU",
++                     mrpc->tag,
++                     mrpc->txch_cfg.memBuff.size,
++                     mrpc->rxch_cfg.memBuff.size);
++
++    mutex_lock(&mrpc->lock);
++
++    len += scnprintf(buf+len, PAGE_SIZE - len, "client   id\n");
++    list_for_each_entry(client, &mrpc->clients, list)
++        len += scnprintf(buf+len, PAGE_SIZE - len, "%s   %d\n",
++                         client->name, client->id);
++
++    len += scnprintf(buf+len, PAGE_SIZE - len, "server   id\n");
++    list_for_each_entry(server, &mrpc->servers, list)
++        len += scnprintf(buf+len, PAGE_SIZE - len, "%s   %d\n",
++                         server->name, server->id);
++
++    mutex_unlock(&mrpc->lock);
++
++    return len;
++}
++
++static DEVICE_ATTR(status, S_IRUGO, status_show, NULL);
++
++static struct attribute *mrpc_attrs[] = {
++    &dev_attr_status.attr,
++    NULL
++};
++static struct attribute_group mrpc_attrs_group = {
++    .attrs = mrpc_attrs,
++};
++
++/**
++ * mrpc_probe
++ * initialize internal database, register to hw_mailbox driver
++ *
++ * @param pdev   platform device pointer
++ *
++ * @return 0 for success, error code otherwise
++ */
++static int mrpc_probe(struct platform_device *pdev)
++{
++    struct mrpc_private *priv;
++    int ret;
++
++    priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++    if (!priv) {
++        pr_err("memory allocation failed");
++        return -ENOMEM;
++    }
++
++    INIT_LIST_HEAD(&priv->clients);
++    INIT_LIST_HEAD(&priv->servers);
++    mutex_init(&priv->lock);
++    dev_set_drvdata(&pdev->dev, priv);
++    priv->pdev = pdev;
++    ret = sysfs_create_group(&priv->pdev->dev.kobj, &mrpc_attrs_group);
++    if (ret) {
++        pr_err("sysfs_create_group failed (ret=%d)", ret);
++        return ret;
++    }
++
++    priv->clients_kset = kset_create_and_add("clients", NULL, &priv->pdev->dev.kobj);
++    if (!priv->clients_kset) {
++        pr_err("memory allocation failed");
++        goto out_remove_group;
++    }
++
++    priv->servers_kset = kset_create_and_add("servers", NULL, &priv->pdev->dev.kobj);
++    if (!priv->servers_kset) {
++        pr_err("memory allocation failed");
++        goto out_kset_clients;
++    }
++
++    if (hwMbox_isReady() < 0) {
++        pr_err("HW Mailbox driver not ready");
++        ret = -ENODEV;
++        goto out_kset_servers;
++    }
++
++    priv->tag = NPCPU_APPCPU_HW_MBOX_TAG_MRPC;
++    priv->this_cpu = MRPC_HW_MBOX_THIS;
++    priv->other_cpu = MRPC_HW_MBOX_OTHER;
++
++    hwMbox_getChannelConfig(priv->other_cpu, hw_mbox_opcode, False,
++                            &priv->txch_cfg);
++    hwMbox_getChannelConfig(priv->other_cpu, hw_mbox_opcode, True,
++                            &priv->rxch_cfg);
++
++    ret = hwMbox_registerRecvOpcode(priv->other_cpu, hw_mbox_callback, priv->tag,
++                                    (unsigned int)priv);
++    if (ret) {
++        pr_err("Failed to register hwMbox_registerRecvOpcode fails");
++        ret = -EPERM;
++        goto out_kset_servers;
++    }
++
++    this = priv;
++
++    return 0;
++
++out_kset_servers:
++    kset_unregister(priv->servers_kset);
++out_kset_clients:
++    kset_unregister(priv->clients_kset);
++out_remove_group:
++    sysfs_remove_group(&priv->pdev->dev.kobj, &mrpc_attrs_group);
++    return ret;
++}
++
++/**
++ * mrpc_remove
++ * remove the mrpc_driver
++ *
++ * @param pdev   platform device pointer
++ *
++ * @return always succeeds
++ */
++static int mrpc_remove(struct platform_device *pdev)
++{
++    struct mrpc_private *priv = platform_get_drvdata(pdev);
++
++     /*TODO call unregister hwMbox RecvOpcode (not existant at the moment) */
++    kset_unregister(priv->servers_kset);
++    kset_unregister(priv->clients_kset);
++    sysfs_remove_group(&priv->pdev->dev.kobj, &mrpc_attrs_group);
++    dev_set_drvdata(&pdev->dev, NULL);
++    this = NULL;
++
++    pr_info("mrpc remove done.");
++    return 0;
++}
++
++static struct platform_driver mrpc_driver = {
++    .driver = {
++        .name   = "mrpc",
++    },
++    .probe = mrpc_probe,
++    .remove = mrpc_remove,
++};
++
++static struct platform_device *mrpc_device;
++
++static int __init mrpc_init(void)
++{
++    int ret;
++
++    ret = platform_driver_register(&mrpc_driver);
++    if (ret < 0) {
++        pr_err("Failed to register mrpc platform driver: %d\n", ret);
++        return ret;
++    }
++
++    mrpc_device = platform_device_register_simple("mrpc", -1, NULL, 0);
++    if (IS_ERR(mrpc_device)) {
++        pr_err("Failed to register mrpc platform device\n");
++        platform_driver_unregister(&mrpc_driver);
++        return PTR_ERR(mrpc_device);
++    }
++
++    pr_info("mrpc init done.");
++    return 0;
++}
++
++static void __exit mrpc_exit(void)
++{
++    platform_device_unregister(mrpc_device);
++    platform_driver_unregister(&mrpc_driver);
++    pr_info("mrpc exit done.");
++}
++
++/******************************************************/
++/**    Module Declarations                           **/
++/******************************************************/
++module_init(mrpc_init);
++module_exit(mrpc_exit);
++
++MODULE_AUTHOR("Intel Corporation");
++MODULE_AUTHOR("Tomer Eliyahu tomer.b.eliyahu@intel.com");
++MODULE_DESCRIPTION("RPC over HW Mailbox Driver");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("1.0");
+--- /dev/null
++++ b/drivers/mrpc/core/puma7_npcpu_appcpu_defs.h
+@@ -0,0 +1,92 @@
++/*
++ *
++ * puma7_npcpu_appcpu_defs.h
++ * Description:
++ * Definitions that should be shared between NP-CPU and APP-CPU.
++ 
++  This file is provided under a dual BSD/GPLv2 license.  When using or 
++  redistributing this file, you may do so under either license.
++
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2015 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify 
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but 
++  WITHOUT ANY WARRANTY; without even the implied warranty of 
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU 
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License 
++  along with this program; if not, write to the Free Software 
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution 
++  in the file called LICENSE.GPL.
++
++
++  Contact Information:
++  Intel Corporation
++  2200 Mission College Blvd.
++  Santa Clara, CA  97052
++
++  BSD LICENSE 
++
++  Copyright(c) 2015 Intel Corporation. All rights reserved.
++
++  Redistribution and use in source and binary forms, with or without 
++  modification, are permitted provided that the following conditions 
++  are met:
++
++    * Redistributions of source code must retain the above copyright 
++      notice, this list of conditions and the following disclaimer.
++
++    * Redistributions in binary form must reproduce the above copyright 
++      notice, this list of conditions and the following disclaimer in 
++      the documentation and/or other materials provided with the 
++      distribution.
++
++    * Neither the name of Intel Corporation nor the names of its 
++      contributors may be used to endorse or promote products derived 
++      from this software without specific prior written permission.
++
++  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
++  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
++  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
++  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
++  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
++  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT 
++  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, 
++  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY 
++  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT 
++  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE 
++  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++
++#ifndef _PUMA7_NPCPU_APPCPU_DEFS_H_
++#define _PUMA7_NPCPU_APPCPU_DEFS_H_
++
++/*! \enum npcpu_appcpu_hw_mbox_tags_e
++    \brief Enumerate all HW_MBOX TAG values shared between NP-CPU and APP-CPU.
++*/
++typedef enum npcpu_appcpu_hw_mbox_tags
++{
++    NPCPU_APPCPU_HW_MBOX_TAG_INVALID = -1,
++    NPCPU_APPCPU_HW_MBOX_TAG_BOOT,
++    NPCPU_APPCPU_HW_MBOX_TAG_PM,
++    NPCPU_APPCPU_HW_MBOX_TAG_CM,
++    NPCPU_APPCPU_HW_MBOX_TAG_RPC,
++    NPCPU_APPCPU_HW_MBOX_TAG_MUX,
++    NPCPU_APPCPU_HW_MBOX_TAG_VLAN,
++    NPCPU_APPCPU_HW_MBOX_TAG_PP,
++    NPCPU_APPCPU_HW_MBOX_TAG_NETDEV,
++    NPCPU_APPCPU_HW_MBOX_TAG_CPPI41_MBX,
++    NPCPU_APPCPU_HW_MBOX_TAG_DATAPIPE_MBX,
++    NPCPU_APPCPU_HW_MBOX_TAG_MRPC,
++    NPCPU_APPCPU_HW_LAST_ENTRY
++} npcpu_appcpu_hw_mbox_tags_e;
++
++#endif /* _PUMA7_NPCPU_APPCPU_DEFS_H_ */
+--- /dev/null
++++ b/drivers/mrpc/examples/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_MRPC_CLIENT_EXAMPLE) += client_example.o
++obj-$(CONFIG_MRPC_SERVER_EXAMPLE) += server_example.o
+--- /dev/null
++++ b/drivers/mrpc/examples/client_example.c
+@@ -0,0 +1,441 @@
++/*
++ *
++ * client_example.c
++ * Description:
++ * MRPC (RPC over HW Mailbox) example client
++ * 
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ":%s:%d " fmt "\n", __func__, __LINE__
++
++/************************************************/
++/**                    Includes                 */
++/************************************************/
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/kernel.h>
++#include <linux/byteorder/generic.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
++#include <linux/random.h>
++#include <linux/mrpc.h>
++#include "mrpc_examples.h"
++
++#define MAX_NAME_SIZE   50
++
++#ifdef DEBUG
++#define DBG(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
++#else
++#define DBG(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
++#endif
++
++struct client {
++    struct list_head list;
++    char name[MAX_NAME_SIZE];
++    struct mrpc_client *mrpc;
++};
++
++struct clients_database {
++    struct list_head clients;
++    struct mutex lock;
++    struct kobject *kobj;
++};
++
++typedef int (*client_func_t)(struct client *c, __u8 proc_id);
++
++static struct clients_database db;
++static unsigned int num_clients = 1;
++
++/**
++ * demo_proc_0 - client side call for proc id 0
++ *  
++ * This example shows how to call an mrpc procedure
++ * with no arguments and no reply.
++ * 
++ * @param c      client pointer
++ * @param procid proc id
++ * 
++ * @return 0 for success, -1 otherwise
++ */
++static int demo_proc_0(struct client *c, __u8 procid)
++{
++    int ret, errcode = 0;
++
++    if (!c)
++        return -ENODEV;
++
++    DBG("%s: call id=%d (no arg, no reply)", c->name, procid);
++    ret = mrpc_call(c->mrpc, procid, NULL, 0, NULL, 0, 0, &errcode);
++    if (ret || errcode) {
++        pr_err("%s: ERROR: ret=%d, errcode=%d", c->name, ret, errcode);
++        return -1;
++    }
++
++    DBG("%s: SUCCESS", c->name);
++
++    return 0;
++}
++
++/**
++ * demo_proc_1 - client side call for proc id 1 
++ *  
++ * This example shows how to call an mrpc procedure with an 
++ * argument and a reply. Both the argument and the reply are 
++ * unsigned int random generated numbers. The reply argument is 
++ * generated at the server side. 
++ * 
++ * @param c      client pointer
++ * @param procid proc id
++ * 
++ * @return 0 for success, -1 otherwise
++ */
++static int demo_proc_1(struct client *c, __u8 procid)
++{
++    unsigned int rand, arg, rep;
++    int ret, errcode = 0;
++
++    if (!c)
++        return -ENODEV;
++
++    rand = get_random_int();
++    arg = htonl(rand);
++    DBG("%s: call id=%d with arg=%u", c->name, procid, rand);
++    ret = mrpc_call(c->mrpc, procid, &arg, sizeof(unsigned int),
++                    &rep, sizeof(unsigned int), 0, &errcode);
++    if (ret || errcode) {
++        pr_err("%s: ERROR: ret=%d, errcode=%d", c->name, ret, errcode);
++        return -1;
++    }
++
++    DBG("%s: SUCCESS - reply=%u", c->name, ntohl(rep));
++
++    return 0;
++}
++
++/**
++ * demo_proc_2 - client side call for proc id 2
++ * 
++ * This example shows how to call an mrpc procedure with an
++ * argument and a reply.
++ * Both the argument and the reply are structures defined in the common
++ * mrpc_examples.h header file.
++ * 
++ * @param c      client pointer
++ * @param procid proc id
++ * 
++ * @return 0 for success, -1 otherwise
++ */
++static int demo_proc_2(struct client *c, __u8 procid)
++{
++    struct demo2_arg_struct arg;
++    struct demo2_rep_struct rep;
++    int ret, errcode = 0;
++
++    if (!c)
++        return -ENODEV;
++
++    arg.a = htonl(get_random_int());
++    strncpy(arg.str1, "abcdefghijklmnopqrstuvwxyz", sizeof("abcdefghijklmnopqrstuvwxyz"));
++    strncpy(arg.str2, "1234567890", sizeof("1234567890"));
++    arg.x = htonl(get_random_int());
++
++    DBG("%s: call id=%d:  arg.a=%d, arg.str1=%s, arg.str2=%s, arg.x=%u",
++            c->name, procid, ntohl(arg.a), arg.str1, arg.str2, ntohl(arg.x));
++    ret = mrpc_call(c->mrpc, procid, &arg, sizeof(arg),
++                    &rep, sizeof(rep), 0, &errcode);
++    if (ret || errcode) {
++        pr_err("%s: ERROR: ret=%d, errcode=%d", c->name, ret, errcode);
++        return -1;
++    }
++
++    DBG("%s: SUCCESS: rep.b=%u, rep.str1=%s, rep.str2=%s, rep.y=%d",
++            c->name, ntohl(rep.b), rep.str1, rep.str2, ntohs(rep.y));
++
++    return 0;
++}
++
++/**
++ * demo_proc_3 - client side call for proc id 3
++ * 
++ * This example is identical to the demo_proc_0 example, e.g. no
++ * argument and no reply, but the server will simulate an error causing
++ * the call to return the error code.
++ * 
++ * @param c      client pointer
++ * @param procid proc id
++ * 
++ * @return 0 for success, -1 otherwise
++ */
++static int demo_proc_3(struct client *c, __u8 procid)
++{
++    int ret, errcode = 0;
++
++    DBG("%s: call id=%d", c->name, procid);
++    ret = mrpc_call(c->mrpc, procid, NULL, 0, NULL, 0, 0, &errcode);
++    if (ret || errcode) {
++        DBG("%s: ERROR: ret=%d, errcode=%d", c->name, ret, errcode); /* simulated error */
++        return -1;
++    }
++
++    DBG("%s: SUCCESS", c->name);
++
++    return 0;
++}
++
++/**
++ * demo_proc_4 - client side call for proc id 4
++ * 
++ * This example shows the client side of an MRPC proc with
++ * "dynamic" reply:
++ * The client sends a random number betweem 1 to 10 as the argument.
++ * The server receives this number and sends a #arg numver
++ * of integers as a reply, hence the "dynamic".
++ * 
++ * Note - The registered proc replen member at the server side
++ * MUST be -1.
++ * 
++ * @param c      client pointer
++ * @param procid proc id
++ * 
++ * @return 0 for success, -1 otherwise
++ */
++static int demo_proc_4(struct client *c, __u8 procid)
++{
++    int arg, ret, errcode = 0;
++    int i, rep[10] = {0};
++
++    arg = htonl(get_random_int() % 10);
++    DBG("%s: call id=%d, arg=%d", c->name, procid, ntohl(arg));
++    ret = mrpc_call(c->mrpc, procid, &arg, sizeof(int), rep, sizeof(rep), 0, &errcode);
++    if (ret || errcode) {
++        pr_err("%s: ERROR: ret=%d, errcode=%d", c->name, ret, errcode);
++        return -1;
++    }
++
++    for (i = 0; i < ntohl(arg); i++)
++        DBG("%s: rep[%d]=%d", c->name, i, rep[i]);
++    DBG("%s: SUCCESS", c->name);
++
++    return 0;
++}
++
++static client_func_t example_client_functions[] = {
++    demo_proc_0,
++    demo_proc_1,
++    demo_proc_2,
++    demo_proc_3,
++    demo_proc_4,
++};
++
++/**
++ * client_call
++ * 
++ * Initiate an mrpc_call to proc <num> for all registered clients.
++ * 
++ * Usage:
++ * echo <num> > /sys/mrpc_client_example/call
++ * 
++ * @param kobj
++ * @param attr
++ * @param buf
++ * @param n
++ * 
++ * @return 0 for successs, error code otherwise
++ */
++static ssize_t client_call(struct kobject *kobj,
++                           struct kobj_attribute *attr,
++                           const char *buf, size_t n)
++{
++    struct client *c;
++    client_func_t func;
++    unsigned long val;
++
++    if (kstrtoul(buf, 10, &val))
++        return -EINVAL;
++
++    if (val > ARRAY_SIZE(example_client_functions))
++        return -EFAULT;
++
++    list_for_each_entry(c, &db.clients, list) {
++        func = example_client_functions[val];
++        func(c, (__u8)val);
++    }
++
++    return n;
++}
++
++/**
++ * client_call_all
++ * 
++ * Initiate <num> repititions of mrpc calls to all procs for
++ * all registered clients.
++ * 
++ * Usage:
++ * echo <num> > /sys/mrpc_client_example/call_all
++ * 
++ * @param kobj
++ * @param attr
++ * @param buf
++ * @param n
++ * 
++ * @return 0 for success, error code otherwise
++ */
++static ssize_t client_call_all(struct kobject *kobj,
++                               struct kobj_attribute *attr,
++                               const char *buf, size_t n)
++{
++    struct client *c;
++    client_func_t func;
++    unsigned long val;
++    int ret, i, j;
++
++    if (kstrtoul(buf, 10, &val))
++        return -EINVAL;
++
++    pr_info("calling all procs (%u repetitions)...", val);
++
++    for (j = 0; j < val; j++) {
++        pr_info("%d iteration:", j);
++        list_for_each_entry(c, &db.clients, list)
++            for (i = 0; i < ARRAY_SIZE(example_client_functions); i++) {
++                func = example_client_functions[i];
++                func(c, (__u8)i);
++            }
++    }
++
++    return n;
++}
++
++static struct kobj_attribute call_attribute =
++    __ATTR(call, S_IWUGO, NULL, client_call);
++static struct kobj_attribute call_all_attribute =
++    __ATTR(call_all, S_IWUGO, NULL, client_call_all);
++
++static struct attribute *client_attrs[] = {
++    &call_attribute.attr,
++    &call_all_attribute.attr,
++    NULL
++};
++
++static struct attribute_group client_attrs_group = {
++    .attrs = client_attrs,
++};
++
++/**
++ * client_example_init
++ * 
++ * Initialize the client example driver
++ * 
++ * @return 0 for success, error code otherwise
++ */
++static int __init client_example_init(void)
++{
++    struct client *c, *tmp;
++    int i, ret;
++
++    mutex_init(&db.lock);
++    INIT_LIST_HEAD(&db.clients);
++    for (i = 0; i < num_clients; i++) {
++        c = kzalloc(sizeof(*c), GFP_KERNEL);
++        if (!c) {
++            pr_err("memory allocation failed");
++            ret = -ENOMEM;
++            goto out_mrpc_unreg;
++        }
++        snprintf(c->name, MAX_NAME_SIZE, "demo-client%d", i);
++        list_add(&c->list, &db.clients);
++        c->mrpc = mrpc_client_register(i, c->name);
++        if (!c->mrpc) {
++            pr_err("failed to register %s", c->name);
++            ret = -EACCES;
++            goto out_mrpc_unreg;
++        }
++    }
++
++    db.kobj = kobject_create_and_add("mrpc_client_example", NULL);
++    if (!db.kobj) {
++        ret = -ENOMEM;
++        goto out_mrpc_unreg;
++    }
++
++    ret = sysfs_create_group(db.kobj, &client_attrs_group);
++    if (ret) {
++        pr_err("sysfs_create_group failed (ret=%d)", ret);
++        goto out_kobject_put;
++    }
++
++    return 0;
++
++out_kobject_put:
++    kobject_put(db.kobj);
++out_mrpc_unreg:
++    list_for_each_entry_safe(c, tmp, &db.clients, list) {
++        mrpc_client_unregister(c->mrpc);
++        list_del(&c->list);
++        kfree(c);
++    }
++
++    return ret;
++}
++
++/**
++ * client_example_exit
++ * 
++ * Remove the client example driver
++ * 
++ * @return 0 for success, error code otherwise
++ */
++static void __exit client_example_exit(void)
++{
++    struct client *c, *tmp;
++
++    sysfs_remove_group(db.kobj, &client_attrs_group);
++    kobject_put(db.kobj);
++    list_for_each_entry_safe(c, tmp, &db.clients, list) {
++        mrpc_client_unregister(c->mrpc);
++        list_del(&c->list);
++        kfree(c);
++    }
++}
++
++/******************************************************/
++/**    Module Declarations                           **/
++/******************************************************/
++module_init(client_example_init);
++module_exit(client_example_exit);
++module_param(num_clients, uint, 0644);
++MODULE_PARM_DESC(num_clients, "number of clients");
++
++MODULE_AUTHOR("Intel Corporation");
++MODULE_AUTHOR("Tomer Eliyahu tomer.b.eliyahu@intel.com");
++MODULE_DESCRIPTION("RPC over Mailbox Client example");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("1.0");
+--- /dev/null
++++ b/drivers/mrpc/examples/mrpc_examples.h
+@@ -0,0 +1,98 @@
++/*
++ *
++ * mrpc_examples.h
++ * Description:
++ * MRPC examples header file
++ *
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++#ifndef __HW_MRPC_EXAMPLES_H__
++#define __HW_MRPC_EXAMPLES_H__
++
++/**
++ * example macro to define a procedure
++ */
++#define PROC(proc, func)                              \
++[proc] = {                                            \
++        .procid   = proc,                             \
++		.p_func	  = func,   						  \
++        .p_arglen = proc##_ARG_LEN,                   \
++        .p_replen = proc##_REP_LEN,                   \
++        .p_name   = #func,                            \
++}
++
++/**
++ * demo procedures enumeration
++ */
++enum {
++    DEMO_PROC_0 = 0,
++    DEMO_PROC_1,
++    DEMO_PROC_2,
++    DEMO_PROC_3,
++    DEMO_PROC_4
++};
++
++/**
++ * demo2 procedure argument structure
++ */
++struct demo2_arg_struct {
++    char str1[30];
++    int a;
++    struct {
++        unsigned long x;
++        char str2[10];
++    };
++};
++
++/**
++ * demo2 procedure reply structure
++ */
++struct demo2_rep_struct {
++    unsigned int b;
++    char str1[30];
++    struct {
++        short y;
++        char str2[26];
++    };
++};
++
++/**
++ * demo procedures arguments and reply length definitions
++ */
++#define DEMO_PROC_0_ARG_LEN 0
++#define DEMO_PROC_0_REP_LEN 0
++#define DEMO_PROC_1_ARG_LEN sizeof(unsigned int)
++#define DEMO_PROC_1_REP_LEN sizeof(unsigned int)
++#define DEMO_PROC_2_ARG_LEN sizeof(struct demo2_arg_struct)
++#define DEMO_PROC_2_REP_LEN sizeof(struct demo2_rep_struct)
++#define DEMO_PROC_3_ARG_LEN 0
++#define DEMO_PROC_3_REP_LEN 0
++#define DEMO_PROC_4_ARG_LEN sizeof(unsigned int)
++#define DEMO_PROC_4_REP_LEN -1
++
++#endif
+--- /dev/null
++++ b/drivers/mrpc/examples/server_example.c
+@@ -0,0 +1,313 @@
++/*
++ *
++ * server_example.c
++ * Description:
++ * MRPC (RPC over HW Mailbox) example server
++ *
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ":%s:%d " fmt "\n", __func__, __LINE__
++
++/************************************************/
++/**                    Includes                 */
++/************************************************/
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/kernel.h>
++#include <linux/byteorder/generic.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
++#include <linux/random.h>
++#include <linux/mrpc.h>
++#include "mrpc_examples.h"
++
++#define MAX_NAME_SIZE   50
++
++#ifdef DEBUG
++#define DBG(fmt, ...) pr_err(fmt, ##__VA_ARGS__)
++#else
++#define DBG(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
++#endif
++
++/**
++ * demo_proc_0 - server side implementation of proc id 0
++ * 
++ * This is the server side procedure which is called when
++ * the MRPC client calls proc id 0.
++ * 
++ * @param arg    argument pointer, should be NULL
++ * @param arglen argument length, should be 0
++ * @param rep    reply pointer, should be NULL
++ * @param replen reply length, should be 0
++ * 
++ * @return always succeeds
++ */
++static int demo_proc_0(void *arg, ssize_t arglen, void *rep, ssize_t replen)
++{
++    DBG("SUCCESS");
++    return 0;
++}
++
++/**
++ * demo_proc_1 - server side implementation of proc id 1
++ * 
++ * This is the server side procedure which is called when
++ * the MRPC client calls proc id 1.
++ * It prints the received argument number and sends a random unsigned
++ * integer reply.
++ * 
++ * @param arg    argument pointer
++ * @param arglen argument length
++ * @param rep    reply pointer
++ * @param replen reply length
++ * 
++ * @return always succeeds
++ */
++static int demo_proc_1(void *arg, ssize_t arglen, void *rep, ssize_t replen)
++{
++    unsigned int *p_arg = arg;
++    unsigned int *p_rep = rep;
++
++    *p_rep = htonl(get_random_int());
++
++    DBG("SUCCESS: arg=%u, arglen=%d, sending unsigned int random reply=%u",
++           ntohl(*p_arg), arglen, ntohl(*p_rep));
++
++    return 0;
++}
++
++/**
++ * demo_proc_2 - server side implementation of proc id 2
++ * 
++ * This is the server side procedure which is called when
++ * the MRPC client calls proc id 2.
++ * 
++ * It prints the argument structure members and sends a reply
++ * structure with random integer and a string.
++ * 
++ * @param arg    argument pointer
++ * @param arglen argument length
++ * @param rep    reply pointer
++ * @param replen reply length
++ * 
++ * @return always succeeds
++ */
++static int demo_proc_2(void *arg, ssize_t arglen, void *rep, ssize_t replen)
++{
++    struct demo2_arg_struct *p_arg = arg;
++    struct demo2_rep_struct *p_rep = rep;
++
++    p_rep->b = htonl(get_random_int());
++    strncpy(p_rep->str1, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", sizeof("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
++    strncpy(p_rep->str2, "0987654321", sizeof("0987654321"));
++    p_rep->y = htons(get_random_int());
++
++    DBG("SUCCESS: arg->a=%d, arg->str1=%s, arg->str2=%s, arg->x=%u\n"
++           "         rep->b=%u, rep->str1=%s, rep->str2=%s, rep->y=%d",
++           ntohl(p_arg->a), p_arg->str1, p_arg->str2, ntohl(p_arg->x),
++           ntohl(p_rep->b), p_rep->str1, p_rep->str2, ntohs(p_rep->y));
++
++    return 0;
++}
++
++/**
++ * demo_proc_3 - server side implementation of proc id 3
++ * 
++ * This is the server side procedure which is called when
++ * the MRPC client calls proc id 3.
++ * It simulates a "device not found" error.
++ * 
++ * @param arg    argument pointer
++ * @param arglen argument length
++ * @param rep    reply pointer
++ * @param replen reply length
++ * 
++ * @return always fails with -ENODEV
++ */
++static int demo_proc_3(void *arg, ssize_t arglen, void *rep, ssize_t replen)
++{
++    DBG("SIMULATE ERROR - no device");
++    return -ENODEV;
++}
++
++/**
++ * demo_proc_4 - server side implementation of proc id 4
++ * 
++ * This is the server side procedure which is called when
++ * the MRPC client calls proc id 4.
++ * It recieves a number and sends back this number of integers
++ * from a local integer array.
++ * 
++ * @param arg    argument pointer
++ * @param arglen argument length
++ * @param rep    reply pointer
++ * @param replen reply length
++ * 
++ * @return always succeeds
++ */
++static int demo_proc_4(void *arg, ssize_t arglen, void *rep, ssize_t replen)
++{
++    static int data[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
++    unsigned int *p_arg = arg;
++    int *p_rep = rep;
++    int i, num = ntohl(*p_arg);
++
++    for (i = 0; i < num; i++) {
++        p_rep[i] = htonl(data[i]);
++    }
++
++    DBG("SUCCESS: Sent back %d elements", num);
++    return 0;
++}
++
++static struct mrpc_procinfo example_server_procs[] = {
++    PROC(DEMO_PROC_0, demo_proc_0),
++    PROC(DEMO_PROC_1, demo_proc_1),
++    PROC(DEMO_PROC_2, demo_proc_2),
++    PROC(DEMO_PROC_3, demo_proc_3),
++    PROC(DEMO_PROC_4, demo_proc_4),
++};
++
++struct server {
++    struct list_head list;
++    char name[MAX_NAME_SIZE];
++    struct mrpc_server *mrpc;
++};
++
++struct servers_database {
++    struct list_head servers;
++    struct mutex lock;
++    struct kobject *kobj;
++};
++
++static struct servers_database db;
++static unsigned int num_servers = 1;
++
++static struct attribute *server_attrs[] = {
++    NULL,
++};
++
++static struct attribute_group server_attrs_group = {
++    .attrs = server_attrs,
++};
++
++/**
++ * server_example_init
++ * 
++ * Initialize the server example driver
++ * 
++ * @return 0 for success, error code otherwise
++ */
++static int __init server_example_init(void)
++{
++    struct server *s, *tmp;
++    int i, ret;
++
++    mutex_init(&db.lock);
++    INIT_LIST_HEAD(&db.servers);
++    for (i = 0; i < num_servers; i++) {
++        s = kzalloc(sizeof(*s), GFP_KERNEL);
++        if (!s) {
++            pr_err("memory allocation failed");
++            ret = -ENOMEM;
++            goto out_mrpc_unreg;
++        }
++        snprintf(s->name, MAX_NAME_SIZE, "demo-server%d", i);
++        list_add(&s->list, &db.servers);
++        s->mrpc = mrpc_server_register(i, s->name,
++                                    example_server_procs,
++                                    ARRAY_SIZE(example_server_procs));
++        if (!s->mrpc) {
++            pr_err("failed to register %s", s->name);
++            ret = -EACCES;
++            goto out_mrpc_unreg;
++        }
++    }
++
++    db.kobj = kobject_create_and_add("mrpc_server_example", NULL);
++    if (!db.kobj) {
++        ret = -ENOMEM;
++        goto out_mrpc_unreg;
++    }
++
++    ret = sysfs_create_group(db.kobj, &server_attrs_group);
++    if (ret) {
++        pr_err("sysfs_create_group failed (ret=%d)", ret);
++        goto out_kobject_put;
++    }
++
++    return 0;
++
++out_kobject_put:
++    kobject_put(db.kobj);
++out_mrpc_unreg:
++    list_for_each_entry_safe(s, tmp, &db.servers, list) {
++        mrpc_server_unregister(s->mrpc);
++        list_del(&s->list);
++        kfree(s);
++    }
++
++    return ret;
++}
++
++/**
++ * server_example_exit
++ * 
++ * Remove the server example driver
++ * 
++ * @return 0 for success, error code otherwise
++ */
++static void __exit server_example_exit(void)
++{
++    struct server *s, *tmp;
++
++    sysfs_remove_group(db.kobj, &server_attrs_group);
++    kobject_put(db.kobj);
++    list_for_each_entry_safe(s, tmp, &db.servers, list) {
++        mrpc_server_unregister(s->mrpc);
++        list_del(&s->list);
++        kfree(s);
++    }
++}
++
++/******************************************************/
++/**    Module Declarations                           **/
++/******************************************************/
++module_init(server_example_init);
++module_exit(server_example_exit);
++module_param(num_servers, uint, 0644);
++MODULE_PARM_DESC(num_servers, "number of servers");
++
++MODULE_AUTHOR("Intel Corporation");
++MODULE_AUTHOR("Tomer Eliyahu tomer.b.eliyahu@intel.com");
++MODULE_DESCRIPTION("RPC over Mailbox Server example");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("1.0");
+--- a/include/linux/hw_mbox_defs.h
++++ b/include/linux/hw_mbox_defs.h
+@@ -835,10 +835,10 @@ typedef Uint8 __hwMbox_opcodeMessageSize
+     ENTRY(    4  , HW_MBOX_MASTER_PHY_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 608       )    \
+     ENTRY(    5  , HW_MBOX_MASTER_MOCA_C               , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
+     ENTRY(    6  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_BBU_C                , hw_mbox_opcode           , 8         )    \
+-    ENTRY(    7  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_APP_CPU              , hw_mbox_opcode           , 64        )    \
++    ENTRY(    7  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_APP_CPU              , hw_mbox_opcode           , 256       )    \
+     ENTRY(    8  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_PHY_CPU              , hw_mbox_opcode           , 8         )    \
+     ENTRY(    9  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_opcode           , 8         )    \
+-    ENTRY(   10  , HW_MBOX_MASTER_APP_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_opcode           , 128       )    \
++    ENTRY(   10  , HW_MBOX_MASTER_APP_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_opcode           , 256       )    \
+     ENTRY(   11  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_RCE                  , hw_mbox_command          , 0         )    \
+     ENTRY(   12  , HW_MBOX_MASTER_RCE                  , HW_MBOX_MASTER_NP_CPU               , hw_mbox_command          , 0         )    \
+     ENTRY(   13  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_command          , 64        )    \
+--- /dev/null
++++ b/include/linux/mrpc.h
+@@ -0,0 +1,153 @@
++/*
++ *
++ * mrpc.h
++ * Description:
++ * RPC over mailbox driver API
++ *
++ *
++ * GPL LICENSE SUMMARY
++ *
++ *  Copyright(c) 2016 Intel Corporation.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of version 2 of the GNU General Public License as
++ *  published by the Free Software Foundation.
++ *
++ *  This program is distributed in the hope that it will be useful, but
++ *  WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  General Public License for more details.
++ *
++ *
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ *  The full GNU General Public License is included in this distribution
++ *  in the file called LICENSE.GPL.
++ *
++ *  Contact Information:
++ *  Intel Corporation
++ *  2200 Mission College Blvd.
++ *  Santa Clara, CA  97052
++ */
++
++#ifndef __HW_MRPC_H__
++#define __HW_MRPC_H__
++
++/* error codes */
++enum {
++    MRPC_SUCCESS = 0,           /* success */
++    MRPC_ERR_INVALID_SIGNATURE,
++    MRPC_ERR_INVALID_HEADER,
++    MRPC_ERR_HWMBOX_NOT_READY,  /* hw mailbox driver not ready */
++    MRPC_ERR_HWMBOX_ERROR,      /* hw mailbox error */
++    MRPC_ERR_SERVER_NOT_READY,  /* remote server not registered */
++    MRPC_ERR_INVALID_PROC,      /* invalid server proc  */
++    MRPC_ERR_SERVER_ERROR,      /* remote server error */
++    MRPC_ERR_INVALID_CLIENT,    /* invalid client */
++    MRPC_ERR_INVALID_SERVER,    /* invalid server */
++    MRPC_ERR_GARBAGE_ARGS,      /* server can't decode supplied arguments */
++    MRPC_ERR_ARGLEN_MISMATCH,   /* server arglen not matches received arglen */
++    MRPC_ERR_REPLEN_MISMATCH,   /* server replen not matches received replen */
++    MRPC_ERR_MSG_TOO_BIG,       /* message too big */
++    MRPC_ERR_UNKOWN             /* unknown error */
++};
++
++typedef int (*proc_t)(void *arg, ssize_t arg_len, void *rep, ssize_t rep_len);
++
++/**
++ * mrpc_procinfo structure, registered by the server to
++ * the mrpc driver during initialization
++ */
++struct mrpc_procinfo {
++    __u8 procid;	        /* proc number */
++    proc_t p_func;          /* proc function */
++    ssize_t p_arglen;	/* argument hdr length (u32) */
++    ssize_t p_replen;	/* reply hdr length (u32) */
++    const char *p_name;		/* name of procedure */
++};
++
++/* reserved IDs */
++enum {
++    MRPC_RESERVED_ID_PP_CONTROL = 0,
++    MRPC_RESERVED_ID_PP_DEBUG,
++    MRPC_RESERVED_ID_NETEVENTS,
++    MRPC_RESERVED_ID_NETHOOKS,
++    MRPC_RESERVED_ID_LAST,
++};
++
++#define ID_VALID(id) ((id) > MRPC_RESERVED_ID_LAST)
++
++struct mrpc_client;
++struct mrpc_server;
++
++/************************************************/
++/**                 API                         */
++/************************************************/
++
++/**
++ * mrpc_client_register
++ * client registration function
++ *
++ * @param id     client's unique ID
++ * @param name   Client's name
++ *
++ * @return client handle for success, NULL otherwise
++ */
++
++struct mrpc_client *mrpc_client_register(unsigned int id, const char *name);
++/**
++ * mrpc_server_register
++ * server's registration function
++ *
++ * @param id        server's uniqueu ID
++ * @param name      server's name
++ * @param procs     server's procs array
++ * @param num_procs number of procs
++ *
++ * @return server handle for success, NULL otherwise
++ */
++struct mrpc_server *mrpc_server_register(unsigned int id, const char *name,
++                                         struct mrpc_procinfo *procs,
++                                         u32 num_procs);
++/**
++ * mrpc_client_unregister
++ * Client unregistration function
++ *
++ * @param client client handle
++ *
++ * @return 0 for success, error code otherwise
++ */
++int mrpc_client_unregister(struct mrpc_client *client);
++
++/**
++ * mrpc_server_unregister
++ *
++ * @param server server handle
++ *
++ * @return 0 for success, error code otherwise
++ */
++
++int mrpc_server_unregister(struct mrpc_server *server);
++
++/**
++ * mrpc_call
++ * Blocking function call issued by a client to run a
++ * remote procedure on the server.
++ *
++ * @param client  client handle
++ * @param proc    remote procedure id
++ * @param arg     remote procedure argument pointer (network byte order)
++ * @param arg_len remote procedure argument length (bytes)
++ * @param rep     remote procedure reply pointer
++ * @param rep_len remote procedure reply length (bytes)
++ * @param timeout milliseconds to wait for reply (0 for default)
++ * @param errcode additional error code information
++ *
++ * @return 0 for success, mrpc error code otherwise
++ */
++int mrpc_call(struct mrpc_client *client, __u8 proc, void *arg,
++                      ssize_t arg_len, void *rep, ssize_t rep_len,
++                      unsigned long timeout, int *errcode);
++
++#endif /* __HW_MRPC_H__ */
+--- a/lib/kobject.c
++++ b/lib/kobject.c
+@@ -725,6 +725,7 @@ const struct sysfs_ops kobj_sysfs_ops =
+ 	.show	= kobj_attr_show,
+ 	.store	= kobj_attr_store,
+ };
++EXPORT_SYMBOL_GPL(kobj_sysfs_ops);  /* Intel: backport from Kernel 3.14 */
+ 
+ /**
+  * kset_register - initialize and add a kset.

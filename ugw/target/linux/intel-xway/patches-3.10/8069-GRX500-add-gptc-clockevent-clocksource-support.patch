@@ -1,0 +1,402 @@
+# HG changeset patch
+# Parent 40b9a229433a4713716aa8958a1a9e75018e5b33
+
+diff --git a/arch/mips/include/asm/mach-lantiq/grx500/lantiq_gptc.h b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_gptc.h
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/include/asm/mach-lantiq/grx500/lantiq_gptc.h
+@@ -0,0 +1,58 @@
++
++/* Base address of GPTC0 module */
++#define GPTC0_BASE_ADDRESS 0x16b00000
++#define GPTC1_BASE_ADDRESS 0x16300000
++
++#define GPTC_TIMER_FREQ 200000000
++#define GPTC1_IRQ_BASE 168
++
++/* ID byte of the core */
++#define GPTU_CLKSRC_MAGIC	0x59
++/* clock control register */
++#define GPTU_CLKSRC_CLC	0x00
++/* id register */
++#define GPTU_CLKSRC_ID		0x08
++/* interrupt node enable */
++#define GPTU_CLKSRC_IRNEN	0xf4
++/* interrupt control register */
++#define GPTU_CLKSRC_IRCR	0xf8
++/* interrupt capture register */
++#define GPTU_CLKSRC_IRNCR	0xfc
++#if 1
++/* there are 3 identical blocks of 2 timers. calculate register offsets */
++#define GPTU_CLKSRC_SHIFT(x)	(x % 2 ? 4 : 0)
++#define GPTU_CLKSRC_BASE(x)	(((x >> 1) * 0x20) + 0x10)
++/* timer control register */
++#define GPTU_CLKSRC_CON(x)	(GPTU_CLKSRC_BASE(x) + GPTU_CLKSRC_SHIFT(x) + 0x00)
++/* timer auto reload register */
++#define GPTU_CLKSRC_RUN(x)	(GPTU_CLKSRC_BASE(x) + GPTU_CLKSRC_SHIFT(x) + 0x08)
++/* timer manual reload register */
++#define GPTU_CLKSRC_RLD(x)	(GPTU_CLKSRC_BASE(x) + GPTU_CLKSRC_SHIFT(x) + 0x10)
++/* timer count register */
++#define GPTU_CLKSRC_CNT(x)	(GPTU_CLKSRC_BASE(x) + GPTU_CLKSRC_SHIFT(x) + 0x18)
++
++#endif
++
++/* GPTU_CON(x) */
++#define CON_CLKSRC_DIR		BIT(1)
++#define CON_CLKSRC_CNT		BIT(2)
++#define CON_CLKSRC_STP		BIT(3)
++#define CON_CLKSRC_EXT		BIT(4)
++#define CON_CLKSRC_EDGE_ANY	(BIT(7) | BIT(6))
++#define CON_CLKSRC_SYNC	BIT(8)
++#define CON_CLKSRC_CLK_INT	BIT(10)
++#define CON_CLKSRC_CLK_EXT	BIT(9)
++
++/* GPTU_RUN(x) */
++#define RUN_CLKSRC_SEN		BIT(0)
++#define RUN_CLKSRC_RL		BIT(2)
++#define RUN_CLKSRC_STOP    BIT(1)
++/* set clock to runmode */
++#define CLC_CLKSRC_RMC		BIT(8)
++#define CLC_CLKSRC_SMC     BIT(16)
++
++/* bring core out of suspend */
++#define CLC_SUSPEND	BIT(4)
++/* the disable bit */
++#define CLC_DISABLE	BIT(0)
++int __init gptc_clocksource_init(void);
+diff --git a/arch/mips/kernel/cevt-gptc.c b/arch/mips/kernel/cevt-gptc.c
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/kernel/cevt-gptc.c
+@@ -0,0 +1,242 @@
++#include <linux/clk.h>
++#include <linux/interrupt.h>
++#include <linux/clockchips.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/slab.h>
++#include <linux/clk-provider.h>
++#include <asm/time.h>
++#include <lantiq_gptc.h>
++
++#define to_gptc_clkevent(x) \
++		container_of(x, struct gptc_clockevent, ce)
++spinlock_t cevt_gptc_lock;
++
++static void __iomem *gptc0_baseaddr;
++static void __iomem *gptc1_baseaddr;
++static u32 gptc_timer[NR_CPUS] = {0, 0, 2, 4};
++static u32 gptc_irq[NR_CPUS] = {168, 126, 170, 172};
++
++/**
++ * struct gptc_timer - This definition defines local timer structure
++ *
++ * @base_addr:	Base address of timer
++ * @clk:	Associated clock source
++ * @clk_rate_change_nb	Notifier block for clock rate changes
++ */
++struct gptc_timer {
++	void __iomem *base_addr;
++	int timer;
++};
++
++struct gptc_clockevent {
++	struct gptc_timer gptc;
++	struct clock_event_device ce;
++};
++
++/**
++ * gptc_set_interval - Set the timer interval value
++ *
++ * @timer:	Pointer to the timer instance
++ * @cycles:	Timer interval ticks
++ **/
++static void gptc_set_interval(struct gptc_timer *timer,
++					unsigned long cycles)
++{
++	__raw_writel(RUN_CLKSRC_STOP, timer->base_addr +  GPTU_CLKSRC_RUN(timer->timer));
++	__raw_writel(cycles, timer->base_addr +  GPTU_CLKSRC_RLD(timer->timer));
++	__raw_writel(RUN_CLKSRC_SEN | RUN_CLKSRC_RL, timer->base_addr +  GPTU_CLKSRC_RUN(timer->timer));
++}
++
++/**
++ * gptc_clock_event_interrupt - Clock event timer interrupt handler
++ *
++ * @irq:	IRQ number of the Timer
++ * @dev_id:	void pointer to the gptc_timer instance
++ *
++ * returns: Always IRQ_HANDLED - success
++ **/
++static irqreturn_t gptc_clock_event_interrupt(int irq, void *dev_id)
++{
++	struct gptc_clockevent *gptce = dev_id;
++	struct gptc_timer *timer = &gptce->gptc;
++
++	/*spin_lock(&cevt_gptc_lock);*/
++	__raw_writel(BIT(timer->timer), timer->base_addr + GPTU_CLKSRC_IRNCR);
++	/*spin_unlock(&cevt_gptc_lock);*/
++	gptce->ce.event_handler(&gptce->ce);
++	return IRQ_HANDLED;
++}
++
++
++/**
++ * gptc_set_next_event - Sets the time interval for next event
++ *
++ * @cycles:	Timer interval ticks
++ * @evt:	Address of clock event instance
++ *
++ * returns: Always 0 - success
++ **/
++static int gptc_set_next_event(unsigned long cycles,
++					struct clock_event_device *evt)
++{
++	struct gptc_clockevent *gptce = to_gptc_clkevent(evt);
++	struct gptc_timer *timer = &gptce->gptc;
++	gptc_set_interval(timer, cycles);
++	return 0;
++}
++
++/**
++ * gptc_set_mode - Sets the mode of timer
++ *
++ * @mode:	Mode to be set
++ * @evt:	Address of clock event instance
++ **/
++static void gptc_set_mode(enum clock_event_mode mode,
++					struct clock_event_device *evt)
++{
++	struct gptc_clockevent *gptce = to_gptc_clkevent(evt);
++	struct gptc_timer *timer = &gptce->gptc;
++	u32 reg;
++
++	switch (mode) {
++	case CLOCK_EVT_MODE_PERIODIC:
++		break;
++	case CLOCK_EVT_MODE_ONESHOT:
++		/* Make it 32-bit timer using EXT bit */
++		reg = __raw_readl(timer->base_addr + GPTU_CLKSRC_CON(timer->timer));
++		reg |= (CON_CLKSRC_EXT | CON_CLKSRC_STP);
++		__raw_writel(reg, timer->base_addr + GPTU_CLKSRC_CON(timer->timer));
++	break;
++	case CLOCK_EVT_MODE_UNUSED:
++	case CLOCK_EVT_MODE_SHUTDOWN:
++		__raw_writel(RUN_CLKSRC_STOP, timer->base_addr +  GPTU_CLKSRC_RUN(timer->timer));
++		__raw_writel(0, timer->base_addr +  GPTU_CLKSRC_RLD(timer->timer));
++		while ((__raw_readl(timer->base_addr + GPTU_CLKSRC_CON(timer->timer)) & 1) == 1) {
++		}
++		break;
++	case CLOCK_EVT_MODE_RESUME:
++		__raw_writel(RUN_CLKSRC_SEN, timer->base_addr +  GPTU_CLKSRC_RUN(timer->timer));
++		break;
++	}
++}
++static DEFINE_PER_CPU(struct gptc_clockevent, gptc_ce);
++static DEFINE_PER_CPU(struct irqaction, gptc_clockevent_irqaction);
++static DEFINE_PER_CPU(char [32], gptc_clockevent_name);
++
++static void gptc_setup_clockevent(void);
++static void __init gptc_setup_clockevent()
++{
++	u32 reg;
++	unsigned int cpu = smp_processor_id();
++	unsigned int irq; 
++	unsigned int timer;
++	struct gptc_clockevent *gptcce = &per_cpu(gptc_ce, cpu);
++	unsigned char *name = per_cpu(gptc_clockevent_name, cpu);
++	unsigned long sys_flag;
++	struct irqaction *action = &per_cpu(gptc_clockevent_irqaction, cpu);
++	/*struct cpumask cpumask;*/
++	int err;
++
++	BUG_ON(cpu > 3);
++
++	timer = gptc_timer[cpu];
++	irq = gptc_irq[cpu];
++
++	sprintf(name, "gptc_clockevent_%d", cpu);
++	/* Special case where voice fw is not running on VPE1 */
++	if (cpu == 1)
++		gptcce->gptc.base_addr = (void *) gptc0_baseaddr; 
++	else
++		gptcce->gptc.base_addr = (void *) gptc1_baseaddr; 
++	gptcce->ce.name = name;
++	gptcce->ce.features = CLOCK_EVT_FEAT_ONESHOT;
++	clockevent_set_clock(&gptcce->ce, GPTC_TIMER_FREQ);
++	gptcce->ce.set_next_event = gptc_set_next_event;
++	gptcce->ce.set_mode = gptc_set_mode;
++	gptcce->ce.rating = 400;
++	gptcce->ce.irq = irq;
++	gptcce->ce.cpumask = cpumask_of(cpu);
++	gptcce->ce.max_delta_ns	= clockevent_delta2ns(0xffffffff, &gptcce->ce);
++	gptcce->ce.min_delta_ns	= clockevent_delta2ns(0x1, &gptcce->ce);
++	gptcce->gptc.timer = timer;
++	clockevents_register_device(&gptcce->ce);
++
++	/* set up the interrupts here */
++	action->handler = gptc_clock_event_interrupt;
++	action->flags	= IRQF_PERCPU | IRQF_TIMER;
++	action->name	= name;
++	action->dev_id	= gptcce;
++
++	setup_irq(irq, action);
++
++	/*cpumask.bits[0] = (0x1 << cpu);*/
++	/*pr_info("setting the affinity of irq: %d to %x\n", irq, (unsigned int)(cpumask.bits[0]));*/
++	err = irq_set_affinity(irq, cpumask_of(cpu));
++	/*err = irq_set_affinity(irq, &cpumask);*/
++
++	if (err < 0)
++		pr_err("couldn't set the affinity for the irq: %d\n", irq);
++
++	/* Enable the interrupt at the source */
++	spin_lock_irqsave(&cevt_gptc_lock, sys_flag);
++	reg = __raw_readl(gptcce->gptc.base_addr + GPTU_CLKSRC_IRNEN);
++	reg |= BIT(timer);
++	__raw_writel(reg, gptcce->gptc.base_addr + GPTU_CLKSRC_IRNEN);
++	spin_unlock_irqrestore(&cevt_gptc_lock, sys_flag);
++
++	pr_info ("clock event init done !\n");
++}
++
++/**
++ * gptc_timer_init - Initialize the timer
++ *
++ * Initializes the timer hardware and register the clock source and clock event
++ * timers with Linux kernel timer framework
++ */
++int __cpuinit gptc_clockevent_init()
++{
++	spin_lock_init(&cevt_gptc_lock);
++
++	gptc_setup_clockevent();
++	return 0;
++}
++
++int __cpuinit gptc_module_init()
++{
++	struct clk *clk;
++
++	/* Enable the GPTC1 module in CGU */
++	clk = clk_get_sys("16300000.gptu", NULL);
++	if (IS_ERR(clk)) {
++		pr_err("ERROR: timer input clock not found\n");
++		BUG();
++	}
++	clk_enable(clk);
++
++	/* Enable the GPTC1 module */
++	gptc1_baseaddr = (void __iomem *) (IO_BASE | GPTC1_BASE_ADDRESS);
++
++	__raw_writel(0x00, gptc1_baseaddr + GPTU_CLKSRC_IRNEN);
++	__raw_writel(0xff, gptc1_baseaddr + GPTU_CLKSRC_IRNCR);
++	__raw_writel(CLC_CLKSRC_SMC|CLC_CLKSRC_RMC, gptc1_baseaddr + GPTU_CLKSRC_CLC);
++
++
++	/* Enable the GPTC0 module in CGU */
++	clk = clk_get_sys("16b00000.gptu", NULL);
++	if (IS_ERR(clk)) {
++		pr_err("ERROR: timer input clock not found\n");
++		BUG();
++	}
++	clk_enable(clk);
++
++	/* Enable the GPTC0 module */
++	gptc0_baseaddr = (void __iomem *) (IO_BASE | GPTC0_BASE_ADDRESS);
++	__raw_writel(0x00, gptc0_baseaddr + GPTU_CLKSRC_IRNEN);
++	__raw_writel(0xff, gptc0_baseaddr + GPTU_CLKSRC_IRNCR);
++	__raw_writel(CLC_CLKSRC_SMC|CLC_CLKSRC_RMC, gptc0_baseaddr + GPTU_CLKSRC_CLC);
++
++	return 0;
++}
+diff --git a/arch/mips/kernel/csrc-gptc.c b/arch/mips/kernel/csrc-gptc.c
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/kernel/csrc-gptc.c
+@@ -0,0 +1,84 @@
++#include <linux/init.h>
++#include <linux/clocksource.h>
++#include <linux/time.h>
++#include <linux/clk.h>
++#include <lantiq_gptc.h>
++
++#define GPTC_CLKSRC_TIMER3_A 4
++
++#define to_gptc_timer_clksrc(x) \
++		container_of(x, struct gptc_clocksource, cs)
++/**
++ * struct gptu_timer - This definition defines local timer structure
++ *
++ * @base_addr:	Base address of timer
++ * @clk:	Associated clock source
++ * @clk_rate_change_nb	Notifier block for clock rate changes
++ */
++struct gptc_timer {
++	void __iomem *base_addr;
++	int timer;
++};
++
++struct gptc_clocksource {
++	struct gptc_timer	gptc;
++	struct clocksource	cs;
++};
++
++static struct gptc_clocksource gptc_clksrc;
++/**
++
++ *
++ * returns: Current timer counter register value
++ **/
++static cycle_t gptc_clocksource_read(struct clocksource *cs)
++{
++	struct gptc_timer *timer = &to_gptc_timer_clksrc(cs)->gptc;
++/*	pr_info("reading 0x%x\r\n", __raw_readl(timer->base_addr +
++                              GPTU_CLKSRC_CNT(0)));*/
++	return (cycle_t)__raw_readl(timer->base_addr + GPTU_CLKSRC_CNT(timer->timer));
++}
++
++static void __init gptu_setup_clocksource(u32 freq, void __iomem *base)
++{
++	int err;
++	u32 reg;
++
++	gptc_clksrc.gptc.base_addr = base;
++	gptc_clksrc.gptc.timer = GPTC_CLKSRC_TIMER3_A;
++	gptc_clksrc.cs.name = "gptc-timer";
++	gptc_clksrc.cs.rating = 200;
++	gptc_clksrc.cs.read = gptc_clocksource_read;
++	gptc_clksrc.cs.mask = CLOCKSOURCE_MASK(32);
++	gptc_clksrc.cs.flags = CLOCK_SOURCE_IS_CONTINUOUS;
++	/*
++	 * Setup the clock source counter to be an incrementing counter
++	 * with no interrupt and it rolls over at 0xFFFFFFFF. Let it start running now.
++	 */
++	pr_debug("%s  0x%x\r\n", __func__,(unsigned int) base+ GPTU_CLKSRC_IRNEN);
++	reg = __raw_readl( base + GPTU_CLKSRC_CON(GPTC_CLKSRC_TIMER3_A));
++	reg |= CON_CLKSRC_DIR | CON_CLKSRC_EXT;
++	__raw_writel(reg, base + GPTU_CLKSRC_CON(GPTC_CLKSRC_TIMER3_A));
++	
++	__raw_writel(0, base + GPTU_CLKSRC_RLD(GPTC_CLKSRC_TIMER3_A));
++	__raw_writel(RUN_CLKSRC_SEN | RUN_CLKSRC_RL, base + GPTU_CLKSRC_RUN(GPTC_CLKSRC_TIMER3_A));
++
++	/*wait for status bit*/
++	while ((__raw_readl( base + GPTU_CLKSRC_CON(GPTC_CLKSRC_TIMER3_A)) & 1) == 0) {
++	}
++
++	err = clocksource_register_hz(&gptc_clksrc.cs, freq);
++	if (WARN_ON(err)) {
++		return;
++	}
++	pr_info("%s: done ! \n", __func__);
++}
++
++int __init gptc_clocksource_init()
++{
++	void __iomem *gptc0_baseaddr;
++
++	gptc0_baseaddr = (void __iomem *) (IO_BASE | GPTC0_BASE_ADDRESS);
++	gptu_setup_clocksource(GPTC_TIMER_FREQ, gptc0_baseaddr);
++	return 0;
++}

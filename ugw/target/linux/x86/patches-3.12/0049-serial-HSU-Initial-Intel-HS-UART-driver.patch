@@ -1,0 +1,5218 @@
+From 4058fea4589afa0c09f5335e099df97f7e56635f Mon Sep 17 00:00:00 2001
+From: Huiquan Zhong <huiquan.zhong@intel.com>
+Date: Mon, 9 Mar 2015 22:26:50 +0800
+Subject: [PATCH 049/441] serial: HSU: Initial Intel HS-UART driver
+
+Based on kernel serial mfd.c driver, renamed mfd* to hsu*, split
+mfd.c file to hsu_core.c hsu_dma.c hsu_plat.c hsu_pci.c hsu.h in
+drivers/tty/serial/hsu/ folder.
+
+This HSU driver support Intel UART and Designware HS-UART IP.
+And support both ACPI and PCI device enumeration.
+
+Enhance HSU feature to support Runtime PM, wake peer mechanism.
+
+DMA burst size should be set to 8 for large uart data transaction.
+
+Report CTS asserted for auto flow that software not get involved
+with UART hardware can manage flow control automatically.
+
+This patch enables Cherryview HS-UART Driver, default use DMA mode.
+
+Change-Id: I5eb4cedf700754d568b66ec65ede8cbd965a165b
+Tracked-On: https://jira01.devtools.intel.com/browse/IMINAN-26377
+Signed-off-by: Huiquan Zhong <huiquan.zhong@intel.com>
+Reviewed-on: https://android.intel.com:443/339931
+(cherry picked from commit 8bbc8d47548d98d5edbf69bfa2809a33f9e692da)
+
+Signed-off-by: Brett T. Warden <brett.t.warden@intel.com>
+---
+ drivers/tty/serial/Kconfig        |   11 +-
+ drivers/tty/serial/Makefile       |    2 +-
+ drivers/tty/serial/hsu/Kconfig    |   28 +
+ drivers/tty/serial/hsu/Makefile   |    6 +
+ drivers/tty/serial/hsu/hsu.h      |  279 ++++++
+ drivers/tty/serial/hsu/hsu_core.c | 1969 +++++++++++++++++++++++++++++++++++++
+ drivers/tty/serial/hsu/hsu_dma.c  |  614 ++++++++++++
+ drivers/tty/serial/hsu/hsu_pci.c  |  286 ++++++
+ drivers/tty/serial/hsu/hsu_plat.c |  290 ++++++
+ drivers/tty/serial/mfd.c          | 1507 ----------------------------
+ include/linux/serial_hsu.h        |   50 +
+ include/linux/serial_mfd.h        |   47 -
+ include/uapi/linux/serial_core.h  |    4 +-
+ 13 files changed, 3526 insertions(+), 1567 deletions(-)
+ create mode 100644 drivers/tty/serial/hsu/Kconfig
+ create mode 100644 drivers/tty/serial/hsu/Makefile
+ create mode 100644 drivers/tty/serial/hsu/hsu.h
+ create mode 100644 drivers/tty/serial/hsu/hsu_core.c
+ create mode 100644 drivers/tty/serial/hsu/hsu_dma.c
+ create mode 100644 drivers/tty/serial/hsu/hsu_pci.c
+ create mode 100644 drivers/tty/serial/hsu/hsu_plat.c
+ delete mode 100644 drivers/tty/serial/mfd.c
+ create mode 100644 include/linux/serial_hsu.h
+ delete mode 100644 include/linux/serial_mfd.h
+
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -8,6 +8,7 @@ menu "Serial drivers"
+ 	depends on HAS_IOMEM
+ 
+ source "drivers/tty/serial/8250/Kconfig"
++source "drivers/tty/serial/hsu/Kconfig"
+ 
+ comment "Non-8250 serial port support"
+ 
+@@ -454,16 +455,6 @@ config SERIAL_MRST_MAX3110
+ 	  the Intel Moorestown platform. On other systems use the max3100
+ 	  driver.
+ 
+-config SERIAL_MFD_HSU
+-	tristate "Medfield High Speed UART support"
+-	depends on PCI
+-	select SERIAL_CORE
+-
+-config SERIAL_MFD_HSU_CONSOLE
+-	boolean "Medfile HSU serial console support"
+-	depends on SERIAL_MFD_HSU=y
+-	select SERIAL_CORE_CONSOLE
+-
+ config SERIAL_BFIN
+ 	tristate "Blackfin serial port support"
+ 	depends on BLACKFIN
+--- a/drivers/tty/serial/Makefile
++++ b/drivers/tty/serial/Makefile
+@@ -17,6 +17,7 @@ obj-$(CONFIG_SERIAL_SUNSAB) += sunsab.o
+ # Now bring in any enabled 8250/16450/16550 type drivers.
+ obj-$(CONFIG_SERIAL_8250) += 8250/
+ 
++obj-$(CONFIG_SERIAL_HSU) += hsu/
+ obj-$(CONFIG_SERIAL_AMBA_PL010) += amba-pl010.o
+ obj-$(CONFIG_SERIAL_AMBA_PL011) += amba-pl011.o
+ obj-$(CONFIG_SERIAL_CLPS711X) += clps711x.o
+@@ -74,7 +75,6 @@ obj-$(CONFIG_SERIAL_GRLIB_GAISLER_APBUAR
+ obj-$(CONFIG_SERIAL_ALTERA_JTAGUART) += altera_jtaguart.o
+ obj-$(CONFIG_SERIAL_VT8500) += vt8500_serial.o
+ obj-$(CONFIG_SERIAL_MRST_MAX3110)	+= mrst_max3110.o
+-obj-$(CONFIG_SERIAL_MFD_HSU)	+= mfd.o
+ obj-$(CONFIG_SERIAL_IFX6X60)  	+= ifx6x60.o
+ obj-$(CONFIG_SERIAL_PCH_UART)	+= pch_uart.o
+ obj-$(CONFIG_SERIAL_MSM_SMD)	+= msm_smd_tty.o
+--- /dev/null
++++ b/drivers/tty/serial/hsu/Kconfig
+@@ -0,0 +1,28 @@
++#
++# The Intel High Speed UART serial drivers.
++#
++
++config SERIAL_HSU
++	tristate "Intel High Speed UART support"
++	depends on PCI
++	select SERIAL_CORE
++	---help---
++	  This is the High Speed UART protocol driver for Intel Mid UART Controller
++	  and Synopsys Designware APB UART.
++
++	  Support Intel Cherrytrail platform and old Mid platform.
++
++	  To compile this driver as a module, choose M here.
++
++
++config SERIAL_HSU_CONSOLE
++	bool "Console on Intel HSU serial port"
++	depends on SERIAL_HSU=y
++	select SERIAL_CORE_CONSOLE
++	---help---
++	  If you say Y here, it will be possible to use a serial port as the
++	  system console (the system console is the device which receives all
++	  kernel messages and warnings and which allows logins in single user
++	  mode). This could be useful if some terminal or printer is connected
++	  to that serial port.
++
+--- /dev/null
++++ b/drivers/tty/serial/hsu/Makefile
+@@ -0,0 +1,6 @@
++#
++# Makefile for the hsu serial device drivers.
++#
++
++obj-$(CONFIG_SERIAL_HSU)	+= hsu.o
++hsu-y				:= hsu_core.o hsu_dma.o hsu_pci.o hsu_plat.o
+--- /dev/null
++++ b/drivers/tty/serial/hsu/hsu.h
+@@ -0,0 +1,279 @@
++/*
++ * hsu.h: Intel High Speed UART Header File
++ *
++ * (C) Copyright 2014 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#ifndef _HSU_H
++#define _HSU_H
++
++#include <linux/serial_core.h>
++#include <linux/serial_reg.h>
++#include <linux/serial_hsu.h>
++#include <linux/intel_mid_dma.h>
++#include <linux/intel_mid_pm.h>
++#include <linux/dma-direction.h>
++#include <linux/pm_qos.h>
++
++#define HSU_PORT_MAX		8
++#define HSU_DMA_BUF_SIZE	2048
++#define HSU_Q_MAX		4096
++#define HSU_CL_BUF_LEN		(1 << CONFIG_LOG_BUF_SHIFT)
++#define HSU_DMA_BSR		32
++#define HSU_DMA_MOTSR		4
++#define HSU_PIO_LINE_STS	0x06
++#define HSU_PIO_RX_AVB		0x04
++#define HSU_PIO_RX_TMO		0x0C
++#define HSU_PIO_TX_REQ		0x02
++#define HSU_PIO_NO_INT		0x01
++#define HSU_PIO_BUSY_DET	0x07
++
++#define HSU_IIR_INT_MASK	0x0F
++
++#define UART_DW_USR		0x1f	/* UART Status Regiser */
++#define UART_DW_USR_RFNE	BIT(3)	/* Receive FIFO Not Empty */
++
++enum {
++	hsu_intel,
++	hsu_dw,
++};
++
++struct uart_hsu_port;
++
++struct hsu_port_cfg {
++	int hw_ip;
++	int idle;
++	int hw_context_save;
++	int hw_ctrl_cts;
++	struct device *dev;
++	int (*hw_suspend)(struct uart_hsu_port *up);
++	int (*hw_resume)(struct uart_hsu_port *up);
++	unsigned int (*get_uartclk)(struct uart_hsu_port *up);
++	void (*wake_peer)(struct device *tty);
++	void (*set_clk)(unsigned int m, unsigned int n,
++			void __iomem *addr);
++	void (*hw_reset)(void __iomem *addr);
++};
++
++enum {
++	flag_console = 0,
++	flag_reopen,
++	flag_suspend,
++	flag_active,
++	flag_tx_on,
++	flag_rx_on,
++	flag_rx_pending,
++	flag_startup,
++	flag_cmd_on,
++	flag_cmd_off,
++};
++
++enum {
++	qcmd_overflow = 0,
++	qcmd_get_msr,
++	qcmd_set_mcr,
++	qcmd_set_ier,
++	qcmd_start_rx,
++	qcmd_stop_rx,
++	qcmd_start_tx,
++	qcmd_stop_tx,
++	qcmd_cl,
++	qcmd_port_irq,
++	qcmd_dma_irq,
++	qcmd_cmd_off,
++	qcmd_max,
++};
++
++enum {
++	context_save,
++	context_load,
++};
++
++struct hsu_dma_buffer {
++	u8		*buf;
++	dma_addr_t	dma_addr;
++	u32		dma_size;
++	u32		ofs;
++};
++
++struct hsu_dma_chan {
++	u32	id;
++	enum dma_data_direction	dirt;
++	struct uart_hsu_port	*uport;
++	void __iomem		*reg;
++	u32	cr;
++	u32	dcr;
++	u32	sar;
++	u32	tsr;
++};
++
++struct dw_dma_priv {
++	struct uart_hsu_port	*up;
++
++	struct dma_chan		*txchan;
++	struct dma_chan		*rxchan;
++
++	struct dma_slave_config	rxconf;
++	struct dma_slave_config	txconf;
++
++	dma_cookie_t		rx_cookie;
++	dma_cookie_t		tx_cookie;
++};
++
++struct hsu_dma_ops {
++	int (*init)(struct uart_hsu_port *up);
++	int (*exit)(struct uart_hsu_port *up);
++	int (*suspend)(struct uart_hsu_port *up);
++	int (*resume)(struct uart_hsu_port *up);
++	void (*start_tx)(struct uart_hsu_port *up);
++	void (*stop_tx)(struct uart_hsu_port *up);
++	void (*start_rx)(struct uart_hsu_port *up);
++	void (*stop_rx)(struct uart_hsu_port *up);
++	/* op will be context_save or context_load */
++	void (*context_op)(struct uart_hsu_port *up, int op);
++};
++
++struct uart_hsu_port {
++	struct uart_port        port;
++	struct mutex		q_mutex;
++	int			q_start;
++	struct workqueue_struct *workqueue;
++	struct work_struct	work;
++	struct tasklet_struct	tasklet;
++	struct circ_buf		qcirc;
++	int			qbuf[HSU_Q_MAX];
++	struct circ_buf		cl_circ;
++	spinlock_t		cl_lock;
++
++	/* Intel HSU or Designware HSU */
++	int			hw_type;
++
++	unsigned char           msr;
++	unsigned char           ier;
++	unsigned char           lcr;
++	unsigned char           mcr;
++	unsigned char           lsr;
++	unsigned char           dll;
++	unsigned char           dlm;
++	unsigned char		fcr;
++	/* intel_hsu's clk param */
++	unsigned int		mul;
++	unsigned int		div;
++	unsigned int		ps;
++
++	/* Buffered value due to runtime PM and sharing IRQ */
++	unsigned char		iir;
++
++	/* dw_hsu's clk param */
++	unsigned int		m;
++	unsigned int		n;
++
++	unsigned int            lsr_break_flag;
++	char			name[24];
++	int			index;
++	struct device		*dev;
++
++	unsigned int		tx_addr;
++	struct hsu_dma_chan	*txc;
++	struct hsu_dma_chan	*rxc;
++	struct hsu_dma_buffer	txbuf;
++	struct hsu_dma_buffer	rxbuf;
++
++	unsigned char		rxc_chcr_save;
++
++	unsigned long		flags;
++
++	unsigned int		qcmd_num;
++	unsigned int		qcmd_done;
++	unsigned int		port_irq_num;
++	unsigned int		port_irq_cmddone;
++	unsigned int		port_irq_pio_no_irq_pend;
++	unsigned int		port_irq_pio_tx_req;
++	unsigned int		port_irq_pio_rx_avb;
++	unsigned int		port_irq_pio_line_sts;
++	unsigned int		port_irq_pio_rx_timeout;
++	unsigned int		dma_irq_num;
++	unsigned int		dma_irq_cmddone;
++	unsigned int		dma_rx_irq_cmddone;
++	unsigned int		dma_rx_tmt_irq_cmddone;
++	unsigned int		tasklet_done;
++	unsigned int		workq_done;
++	unsigned int		in_workq;
++	unsigned int		in_tasklet;
++
++	int			use_dma;	/* flag for DMA/PIO */
++	unsigned int		dma_irq;
++	unsigned int		port_dma_sts;
++
++	void			*dma_priv;
++	struct hsu_dma_ops	*dma_ops;
++	int			dma_inited;
++	int			prev_mcr;
++	struct hsu_port_cfg	*port_cfg;
++};
++
++struct hsu_port {
++	int dma_irq;
++	int port_num;
++	int irq_port_and_dma;
++	void __iomem	*reg;
++	struct uart_hsu_port	port[HSU_PORT_MAX];
++	struct hsu_dma_chan	chans[HSU_PORT_MAX * 2];
++	spinlock_t		dma_lock;
++	struct dentry *debugfs;
++};
++
++#define chan_readl(chan, offset)	readl(chan->reg + offset)
++#define chan_writel(chan, offset, val)	writel(val, chan->reg + offset)
++
++#define hsu_readl(obj, offset)		readl(obj->reg + offset)
++#define hsu_writel(obj, offset, val)	writel(val, obj->reg + offset)
++
++static inline unsigned int serial_in(struct uart_hsu_port *up, int offset)
++{
++	unsigned int val;
++
++	if (offset > UART_MSR || up->hw_type == hsu_dw) {
++		val = readl(up->port.membase + (offset << 2));
++		if (offset == UART_MSR && up->prev_mcr & UART_MCR_AFE) {
++			val |= UART_MSR_CTS;
++			val &= ~UART_MSR_DCTS;
++		}
++	} else
++		val = (unsigned int)readb(up->port.membase + offset);
++
++	return val;
++}
++
++static inline void serial_out(struct uart_hsu_port *up, int offset, int value)
++{
++	if (offset > UART_MSR || up->hw_type == hsu_dw) {
++		offset <<= 2;
++		writel(value, up->port.membase + offset);
++	} else {
++		unsigned char val = value & 0xff;
++		writeb(val, up->port.membase + offset);
++	}
++}
++void serial_sched_cmd(struct uart_hsu_port *up, char cmd);
++extern struct hsu_dma_ops dw_dma_ops;
++extern struct hsu_dma_ops intel_hsu_dma_ops;
++
++struct uart_hsu_port *serial_hsu_port_setup(struct device *pdev, int port,
++	resource_size_t start, resource_size_t len,
++	int irq, struct hsu_port_cfg *cfg);
++void serial_hsu_port_free(struct uart_hsu_port *up);
++void serial_hsu_port_shutdown(struct uart_hsu_port *up);
++int serial_hsu_dma_setup(struct device *pdev, resource_size_t start,
++	resource_size_t len, unsigned int irq);
++void serial_hsu_dma_free(void);
++int serial_hsu_do_suspend(struct uart_hsu_port *up);
++int serial_hsu_do_resume(struct uart_hsu_port *up);
++int serial_hsu_do_runtime_idle(struct uart_hsu_port *up);
++
++#endif
+--- /dev/null
++++ b/drivers/tty/serial/hsu/hsu_core.c
+@@ -0,0 +1,1969 @@
++/*
++ * hsu_core.c: driver core for Intel High Speed UART device
++ *
++ * Refer pxa.c, 8250.c and some other drivers in drivers/serial/
++ *
++ * (C) Copyright 2010-2014 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/console.h>
++#include <linux/sysrq.h>
++#include <linux/slab.h>
++#include <linux/circ_buf.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/tty.h>
++#include <linux/tty_flip.h>
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/debugfs.h>
++#include <linux/pm_runtime.h>
++#include <linux/irq.h>
++
++#include "hsu.h"
++
++static int hsu_dma_enable = 0xff;
++module_param(hsu_dma_enable, int, 0);
++MODULE_PARM_DESC(hsu_dma_enable,
++		 "It is a bitmap to set working mode, if bit[x] is 1, then port[x] will work in DMA mode, otherwise in PIO mode.");
++
++static struct hsu_port hsu;
++static struct hsu_port *phsu = &hsu;
++static struct uart_driver serial_hsu_reg;
++
++static void serial_hsu_command(struct uart_hsu_port *up);
++
++static inline int check_qcmd(struct uart_hsu_port *up, char *cmd)
++{
++	struct circ_buf *circ = &up->qcirc;
++	char *buf;
++
++	buf = circ->buf + circ->tail;
++	*cmd = *buf;
++	return CIRC_CNT(circ->head, circ->tail, HSU_Q_MAX);
++}
++
++static inline void insert_qcmd(struct uart_hsu_port *up, char cmd)
++{
++	struct circ_buf *circ = &up->qcirc;
++	char *buf;
++	char last_cmd;
++
++	if (check_qcmd(up, &last_cmd) && last_cmd == cmd &&
++		cmd != qcmd_port_irq && cmd != qcmd_dma_irq)
++		return;
++	up->qcmd_num++;
++	buf = circ->buf + circ->head;
++	if (CIRC_SPACE(circ->head, circ->tail, HSU_Q_MAX) < 1)
++		*buf = qcmd_overflow;
++	else {
++		*buf = cmd;
++		circ->head++;
++		if (circ->head == HSU_Q_MAX)
++			circ->head = 0;
++	}
++}
++
++static inline int get_qcmd(struct uart_hsu_port *up, char *cmd)
++{
++	struct circ_buf *circ = &up->qcirc;
++	char *buf;
++
++	if (!CIRC_CNT(circ->head, circ->tail, HSU_Q_MAX))
++		return 0;
++	buf = circ->buf + circ->tail;
++	*cmd = *buf;
++	circ->tail++;
++	if (circ->tail == HSU_Q_MAX)
++		circ->tail = 0;
++	up->qcmd_done++;
++	return 1;
++}
++
++static inline void cl_put_char(struct uart_hsu_port *up, char c)
++{
++	struct circ_buf *circ = &up->cl_circ;
++	char *buf;
++	unsigned long flags;
++
++	spin_lock_irqsave(&up->cl_lock, flags);
++	buf = circ->buf + circ->head;
++	if (CIRC_SPACE(circ->head, circ->tail, HSU_CL_BUF_LEN) > 1) {
++		*buf = c;
++		circ->head++;
++		if (circ->head == HSU_CL_BUF_LEN)
++			circ->head = 0;
++	}
++	spin_unlock_irqrestore(&up->cl_lock, flags);
++}
++
++static inline int cl_get_char(struct uart_hsu_port *up, char *c)
++{
++	struct circ_buf *circ = &up->cl_circ;
++	char *buf;
++	unsigned long flags;
++
++	spin_lock_irqsave(&up->cl_lock, flags);
++	if (!CIRC_CNT(circ->head, circ->tail, HSU_CL_BUF_LEN)) {
++		spin_unlock_irqrestore(&up->cl_lock, flags);
++		return 0;
++	}
++	buf = circ->buf + circ->tail;
++	*c = *buf;
++	circ->tail++;
++	if (circ->tail == HSU_CL_BUF_LEN)
++		circ->tail = 0;
++	spin_unlock_irqrestore(&up->cl_lock, flags);
++	return 1;
++}
++
++
++
++void serial_sched_cmd(struct uart_hsu_port *up, char cmd)
++{
++	pm_runtime_get(up->dev);
++	insert_qcmd(up, cmd);
++	if (test_bit(flag_cmd_on, &up->flags)) {
++		if (up->use_dma)
++			tasklet_schedule(&up->tasklet);
++		else
++			queue_work(up->workqueue, &up->work);
++	}
++	pm_runtime_put(up->dev);
++}
++
++static inline void serial_sched_sync(struct uart_hsu_port *up)
++{
++	mutex_lock(&up->q_mutex);
++	if (up->q_start > 0) {
++		if (up->use_dma) {
++			tasklet_disable(&up->tasklet);
++			serial_hsu_command(up);
++			tasklet_enable(&up->tasklet);
++		} else {
++			flush_workqueue(up->workqueue);
++		}
++	}
++	mutex_unlock(&up->q_mutex);
++}
++
++static inline void serial_sched_start(struct uart_hsu_port *up)
++{
++	unsigned long flags;
++
++	mutex_lock(&up->q_mutex);
++	up->q_start++;
++	if (up->q_start == 1) {
++		clear_bit(flag_cmd_off, &up->flags);
++		spin_lock_irqsave(&up->port.lock, flags);
++		set_bit(flag_cmd_on, &up->flags);
++		spin_unlock_irqrestore(&up->port.lock, flags);
++		if (up->use_dma)
++			tasklet_schedule(&up->tasklet);
++		else
++			queue_work(up->workqueue, &up->work);
++	}
++	mutex_unlock(&up->q_mutex);
++}
++
++static inline void serial_sched_stop(struct uart_hsu_port *up)
++{
++	unsigned long flags;
++
++	mutex_lock(&up->q_mutex);
++	up->q_start--;
++	if (up->q_start == 0) {
++		spin_lock_irqsave(&up->port.lock, flags);
++		clear_bit(flag_cmd_on, &up->flags);
++		insert_qcmd(up, qcmd_cmd_off);
++		spin_unlock_irqrestore(&up->port.lock, flags);
++		if (up->use_dma) {
++			tasklet_schedule(&up->tasklet);
++			while (!test_bit(flag_cmd_off, &up->flags))
++				cpu_relax();
++		} else {
++			queue_work(up->workqueue, &up->work);
++			flush_workqueue(up->workqueue);
++		}
++	}
++	mutex_unlock(&up->q_mutex);
++}
++
++#ifdef CONFIG_DEBUG_FS
++
++#define HSU_DBGFS_BUFSIZE	8192
++
++static int hsu_show_regs_open(struct inode *inode, struct file *file)
++{
++	file->private_data = inode->i_private;
++	return 0;
++}
++
++static ssize_t port_show_regs(struct file *file, char __user *user_buf,
++				size_t count, loff_t *ppos)
++{
++	struct uart_hsu_port *up = file->private_data;
++	char *buf;
++	u32 len = 0;
++	ssize_t ret;
++
++	buf = kzalloc(HSU_DBGFS_BUFSIZE, GFP_KERNEL);
++	if (!buf)
++		return 0;
++
++	pm_runtime_get_sync(up->dev);
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"HSU port[%d] regs:\n", up->index);
++
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"=================================\n");
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"IER: \t\t0x%08x\n", serial_in(up, UART_IER));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"IIR: \t\t0x%08x\n", serial_in(up, UART_IIR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"LCR: \t\t0x%08x\n", serial_in(up, UART_LCR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"MCR: \t\t0x%08x\n", serial_in(up, UART_MCR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"LSR: \t\t0x%08x\n", serial_in(up, UART_LSR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"MSR: \t\t0x%08x\n", serial_in(up, UART_MSR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"FOR: \t\t0x%08x\n", serial_in(up, UART_FOR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"PS: \t\t0x%08x\n", serial_in(up, UART_PS));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"MUL: \t\t0x%08x\n", serial_in(up, UART_MUL));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"DIV: \t\t0x%08x\n", serial_in(up, UART_DIV));
++	pm_runtime_put(up->dev);
++
++	if (len > HSU_DBGFS_BUFSIZE)
++		len = HSU_DBGFS_BUFSIZE;
++
++	ret =  simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	kfree(buf);
++	return ret;
++}
++
++static ssize_t dma_show_regs(struct file *file, char __user *user_buf,
++				size_t count, loff_t *ppos)
++{
++	struct hsu_dma_chan *chan = file->private_data;
++	char *buf;
++	u32 len = 0;
++	ssize_t ret;
++
++	buf = kzalloc(HSU_DBGFS_BUFSIZE, GFP_KERNEL);
++	if (!buf)
++		return 0;
++
++	pm_runtime_get_sync(chan->uport->dev);
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"HSU DMA channel [%d] regs:\n", chan->id);
++
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"=================================\n");
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"CR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_CR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"DCR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_DCR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"BSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_BSR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"MOTSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_MOTSR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D0SAR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D0TSR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D1SAR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D1TSR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D2SAR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D2TSR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D3SAR));
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D3TSR));
++	pm_runtime_put(chan->uport->dev);
++
++	if (len > HSU_DBGFS_BUFSIZE)
++		len = HSU_DBGFS_BUFSIZE;
++
++	ret =  simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	kfree(buf);
++	return ret;
++}
++
++static ssize_t hsu_dump_show(struct file *file, char __user *user_buf,
++				size_t count, loff_t *ppos)
++{
++	struct uart_hsu_port *up;
++	struct hsu_port_cfg *cfg;
++	char *buf;
++	char cmd;
++	int i;
++	u32 len = 0;
++	ssize_t ret;
++	struct irq_desc *port_irqdesc;
++	struct circ_buf *xmit;
++
++	buf = kzalloc(HSU_DBGFS_BUFSIZE, GFP_KERNEL);
++	if (!buf)
++		return 0;
++
++	len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++		"HSU status dump:\n");
++	for (i = 0; i < phsu->port_num; i++) {
++		up = phsu->port + i;
++		cfg = up->port_cfg;
++		port_irqdesc = irq_to_desc(up->port.irq);
++		xmit = &up->port.state->xmit;
++
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"HSU port[%d] %s:\n", up->index, up->name);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"xmit empty[%d] xmit pending[%d]\n",
++			uart_circ_empty(xmit),
++			(int)uart_circ_chars_pending(xmit));
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tsuspend idle: %d\n", cfg->idle);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tuse_dma: %s\n",
++			up->use_dma ? "yes" : "no");
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tflag_console: %s\n",
++			test_bit(flag_console, &up->flags) ? "yes" : "no");
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tflag_suspend: %s\n",
++			test_bit(flag_suspend, &up->flags) ? "yes" : "no");
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tflag_active: %s\n",
++			test_bit(flag_active, &up->flags) ? "yes" : "no");
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tflag_startup: %s\n",
++			test_bit(flag_startup, &up->flags) ? "yes" : "no");
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tqcmd q_start: %d\n", up->q_start);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tqcmd total count: %d\n", up->qcmd_num);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tqcmd done count: %d\n", up->qcmd_done);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq count: %d\n", up->port_irq_num);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq cmddone: %d\n", up->port_irq_cmddone);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq no irq pending: %d\n",
++			up->port_irq_pio_no_irq_pend);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq pio line status: %d\n",
++			up->port_irq_pio_line_sts);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq pio rx available: %d\n",
++			up->port_irq_pio_rx_avb);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq pio rx fifo timeout: %d\n",
++			up->port_irq_pio_rx_timeout);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq pio tx request: %d\n",
++			up->port_irq_pio_tx_req);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tdma irq count: %d\n", up->dma_irq_num);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tdma irq cmddone: %d\n", up->dma_irq_cmddone);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport&dma rx irq cmddone: %d\n",
++			up->dma_rx_irq_cmddone);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport&dma rx timeout irq cmddone: %d\n",
++			up->dma_rx_tmt_irq_cmddone);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\ttasklet done: %d\n", up->tasklet_done);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tworkq done: %d\n", up->workq_done);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tqcmd pending count: %d\n", check_qcmd(up, &cmd));
++		if (check_qcmd(up, &cmd))
++			len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++				"\tqcmd pending next: %d\n", cmd);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tin tasklet: %d\n", up->in_tasklet);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tin workq: %d\n", up->in_workq);
++		len += snprintf(buf + len, HSU_DBGFS_BUFSIZE - len,
++			"\tport irq (>0: disable): %d\n",
++			port_irqdesc ? port_irqdesc->depth : 0);
++	}
++	if (len > HSU_DBGFS_BUFSIZE)
++		len = HSU_DBGFS_BUFSIZE;
++
++	ret =  simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	kfree(buf);
++	return ret;
++}
++
++
++static const struct file_operations port_regs_ops = {
++	.owner		= THIS_MODULE,
++	.open		= hsu_show_regs_open,
++	.read		= port_show_regs,
++	.llseek		= default_llseek,
++};
++
++static const struct file_operations dma_regs_ops = {
++	.owner		= THIS_MODULE,
++	.open		= hsu_show_regs_open,
++	.read		= dma_show_regs,
++	.llseek		= default_llseek,
++};
++
++static const struct file_operations hsu_dump_ops = {
++	.owner		= THIS_MODULE,
++	.read		= hsu_dump_show,
++	.llseek		= default_llseek,
++};
++
++static int hsu_debugfs_init(struct hsu_port *hsu)
++{
++	int i;
++	char name[32];
++
++	hsu->debugfs = debugfs_create_dir("hsu", NULL);
++	if (!hsu->debugfs)
++		return -ENOMEM;
++
++	for (i = 0; i < 3; i++) {
++		snprintf(name, sizeof(name), "port_%d_regs", i);
++		debugfs_create_file(name, S_IRUSR,
++			hsu->debugfs, (void *)(&hsu->port[i]), &port_regs_ops);
++	}
++
++	for (i = 0; i < 6; i++) {
++		snprintf(name, sizeof(name), "dma_chan_%d_regs", i);
++		debugfs_create_file(name, S_IRUSR,
++			hsu->debugfs, (void *)&hsu->chans[i], &dma_regs_ops);
++	}
++
++	snprintf(name, sizeof(name), "dump_status");
++	debugfs_create_file(name, S_IRUSR,
++		hsu->debugfs, NULL, &hsu_dump_ops);
++
++	return 0;
++}
++
++static void hsu_debugfs_remove(struct hsu_port *hsu)
++{
++	debugfs_remove_recursive(hsu->debugfs);
++}
++
++#else
++static inline int hsu_debugfs_init(struct hsu_port *hsu)
++{
++	return 0;
++}
++
++static inline void hsu_debugfs_remove(struct hsu_port *hsu)
++{
++}
++#endif /* CONFIG_DEBUG_FS */
++
++static void serial_hsu_enable_ms(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	up->ier |= UART_IER_MSI;
++	serial_sched_cmd(up, qcmd_set_ier);
++}
++
++/* Protected by spin_lock_irqsave(port->lock) */
++static void serial_hsu_start_tx(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	serial_sched_cmd(up, qcmd_start_tx);
++}
++
++static void serial_hsu_stop_tx(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	serial_sched_cmd(up, qcmd_stop_tx);
++}
++
++/* This is always called in spinlock protected mode, so
++ * modify timeout timer is safe here */
++void intel_dma_do_rx(struct uart_hsu_port *up, u32 int_sts)
++{
++	struct hsu_dma_buffer *dbuf = &up->rxbuf;
++	struct hsu_dma_chan *chan = up->rxc;
++	struct uart_port *port = &up->port;
++	struct tty_struct *tty;
++	struct tty_port *tport = &port->state->port;
++	int count;
++
++	tty = tty_port_tty_get(&up->port.state->port);
++	if (!tty)
++		return;
++
++	/*
++	 * First need to know how many is already transferred,
++	 * then check if its a timeout DMA irq, and return
++	 * the trail bytes out, push them up and reenable the
++	 * channel
++	 */
++
++	/* Timeout IRQ, need wait some time, see Errata 2 */
++	if (int_sts & 0xf00) {
++		up->dma_rx_tmt_irq_cmddone++;
++		udelay(2);
++	} else
++		up->dma_rx_irq_cmddone++;
++
++	/* Stop the channel */
++	chan_writel(chan, HSU_CH_CR, 0x0);
++
++	count = chan_readl(chan, HSU_CH_D0SAR) - dbuf->dma_addr;
++	if (!count) {
++		/* Restart the channel before we leave */
++		chan_writel(chan, HSU_CH_CR, 0x3);
++		tty_kref_put(tty);
++		return;
++	}
++
++	dma_sync_single_for_cpu(port->dev, dbuf->dma_addr,
++			dbuf->dma_size, DMA_FROM_DEVICE);
++
++	/*
++	 * Head will only wrap around when we recycle
++	 * the DMA buffer, and when that happens, we
++	 * explicitly set tail to 0. So head will
++	 * always be greater than tail.
++	 */
++	tty_insert_flip_string(tport, dbuf->buf, count);
++	port->icount.rx += count;
++
++	dma_sync_single_for_device(up->port.dev, dbuf->dma_addr,
++			dbuf->dma_size, DMA_FROM_DEVICE);
++
++	/* Reprogram the channel */
++	chan_writel(chan, HSU_CH_D0SAR, dbuf->dma_addr);
++	chan_writel(chan, HSU_CH_D0TSR, dbuf->dma_size);
++	chan_writel(chan, HSU_CH_DCR, 0x1
++			| (0x1 << 8)
++			| (0x1 << 16)
++			| (0x1 << 24) /* timeout bit, see HSU Errata 1 */
++			);
++	tty_flip_buffer_push(tport);
++
++	chan_writel(chan, HSU_CH_CR, 0x3);
++	tty_kref_put(tty);
++
++}
++
++static void serial_hsu_stop_rx(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	serial_sched_cmd(up, qcmd_stop_rx);
++}
++
++static inline void receive_chars(struct uart_hsu_port *up, int *status)
++{
++	struct tty_struct *tty = up->port.state->port.tty;
++	struct tty_port *tport = &up->port.state->port;
++	unsigned int ch, flag;
++	unsigned int max_count = 256;
++
++	if (!tty)
++		return;
++
++	do {
++		ch = serial_in(up, UART_RX);
++		flag = TTY_NORMAL;
++		up->port.icount.rx++;
++
++		if (unlikely(*status & (UART_LSR_BI | UART_LSR_PE |
++				       UART_LSR_FE | UART_LSR_OE))) {
++
++			dev_warn(up->dev,
++				"We really rush into ERR/BI case status = 0x%02x\n",
++				*status);
++			/* For statistics only */
++			if (*status & UART_LSR_BI) {
++				*status &= ~(UART_LSR_FE | UART_LSR_PE);
++				up->port.icount.brk++;
++				/*
++				 * We do the SysRQ and SAK checking
++				 * here because otherwise the break
++				 * may get masked by ignore_status_mask
++				 * or read_status_mask.
++				 */
++				if (uart_handle_break(&up->port))
++					goto ignore_char;
++			} else if (*status & UART_LSR_PE)
++				up->port.icount.parity++;
++			else if (*status & UART_LSR_FE)
++				up->port.icount.frame++;
++			if (*status & UART_LSR_OE)
++				up->port.icount.overrun++;
++
++			/* Mask off conditions which should be ignored. */
++			*status &= up->port.read_status_mask;
++
++#ifdef CONFIG_SERIAL_HSU_CONSOLE
++			if (up->port.cons &&
++				up->port.cons->index == up->port.line) {
++				/* Recover the break flag from console xmit */
++				*status |= up->lsr_break_flag;
++				up->lsr_break_flag = 0;
++			}
++#endif
++			if (*status & UART_LSR_BI)
++				flag = TTY_BREAK;
++			else if (*status & UART_LSR_PE)
++				flag = TTY_PARITY;
++			else if (*status & UART_LSR_FE)
++				flag = TTY_FRAME;
++		}
++
++		if (uart_handle_sysrq_char(&up->port, ch))
++			goto ignore_char;
++
++		uart_insert_char(&up->port, *status, UART_LSR_OE, ch, flag);
++ignore_char:
++		*status = serial_in(up, UART_LSR);
++	} while ((*status & UART_LSR_DR) && max_count--);
++
++	tty_flip_buffer_push(tport);
++}
++
++static void transmit_chars(struct uart_hsu_port *up)
++{
++	struct circ_buf *xmit = &up->port.state->xmit;
++	unsigned long flags;
++	int count;
++
++	spin_lock_irqsave(&up->port.lock, flags);
++	if (up->port.x_char) {
++		serial_out(up, UART_TX, up->port.x_char);
++		up->port.icount.tx++;
++		up->port.x_char = 0;
++		goto out;
++	}
++	if (uart_circ_empty(xmit) || uart_tx_stopped(&up->port)) {
++		serial_hsu_stop_tx(&up->port);
++		goto out;
++	}
++
++	/* The IRQ is for TX FIFO half-empty */
++	count = up->port.fifosize / 2;
++
++	do {
++		if (uart_tx_stopped(&up->port)) {
++			serial_hsu_stop_tx(&up->port);
++			break;
++		}
++		serial_out(up, UART_TX, xmit->buf[xmit->tail]);
++		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
++
++		up->port.icount.tx++;
++		if (uart_circ_empty(xmit))
++			break;
++	} while (--count > 0);
++
++	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
++		uart_write_wakeup(&up->port);
++
++	if (uart_circ_empty(xmit))
++		serial_hsu_stop_tx(&up->port);
++
++out:
++	spin_unlock_irqrestore(&up->port.lock, flags);
++}
++
++static void check_modem_status(struct uart_hsu_port *up)
++{
++	int status;
++	int delta_msr = 0;
++
++	status = serial_in(up, UART_MSR);
++
++	if ((status & UART_MSR_ANY_DELTA)) {
++		if (status & UART_MSR_TERI)
++			up->port.icount.rng++;
++		if (status & UART_MSR_DDSR)
++			up->port.icount.dsr++;
++		/* We may only get DDCD when HW init and reset */
++		if (status & UART_MSR_DDCD)
++			uart_handle_dcd_change(&up->port,
++					status & UART_MSR_DCD);
++		if (status & UART_MSR_DCTS)
++			uart_handle_cts_change(&up->port,
++					status & UART_MSR_CTS);
++		delta_msr = 1;
++	}
++
++	if (delta_msr)
++		wake_up_interruptible(&up->port.state->port.delta_msr_wait);
++}
++
++static void hsu_dma_chan_handler(struct hsu_port *hsu, int index)
++{
++	unsigned long flags;
++	struct uart_hsu_port *up = hsu->chans[index * 2].uport;
++	struct hsu_dma_chan *txc = up->txc;
++	struct hsu_dma_chan *rxc = up->rxc;
++
++	up->dma_irq_num++;
++	if (unlikely(!up->use_dma
++		|| !test_bit(flag_startup, &up->flags))) {
++		chan_readl(txc, HSU_CH_SR);
++		chan_readl(rxc, HSU_CH_SR);
++		return;
++	}
++	disable_irq_nosync(up->dma_irq);
++	spin_lock_irqsave(&up->port.lock, flags);
++	serial_sched_cmd(up, qcmd_dma_irq);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++}
++
++/*
++ * This handles the interrupt from one port.
++ */
++static irqreturn_t hsu_port_irq(int irq, void *dev_id)
++{
++	struct uart_hsu_port *up = dev_id;
++	unsigned long flags;
++	u8 lsr;
++
++	up->port_irq_num++;
++
++	if (up->hw_type == hsu_dw) {
++		if (unlikely(test_bit(flag_suspend, &up->flags)))
++			return IRQ_NONE;
++
++		/* This IRQ may be shared with other HW */
++		up->iir = serial_in(up, UART_IIR) & HSU_IIR_INT_MASK;
++		if (unlikely(up->iir == HSU_PIO_NO_INT))
++			return IRQ_NONE;
++	}
++
++	/* DesignWare HW's DMA mode still needs the port irq */
++	if (up->use_dma && up->hw_type == hsu_intel) {
++		lsr = serial_in(up, UART_LSR);
++		spin_lock_irqsave(&up->port.lock, flags);
++		check_modem_status(up);
++		spin_unlock_irqrestore(&up->port.lock, flags);
++		if (unlikely(lsr & (UART_LSR_BI | UART_LSR_PE |
++				UART_LSR_FE | UART_LSR_OE)))
++			dev_warn(up->dev,
++				"Got LSR irq(0x%02x) while using DMA", lsr);
++		return IRQ_HANDLED;
++	}
++
++	disable_irq_nosync(up->port.irq);
++	spin_lock_irqsave(&up->port.lock, flags);
++	serial_sched_cmd(up, qcmd_port_irq);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t hsu_dma_irq(int irq, void *dev_id)
++{
++	struct uart_hsu_port *up;
++	unsigned long flags;
++	unsigned int dmairq;
++	int i;
++
++	spin_lock_irqsave(&phsu->dma_lock, flags);
++	dmairq = hsu_readl(phsu, HSU_GBL_DMAISR);
++	for (i = 0; i < 3; i++)
++		if (dmairq & (3 << (i * 2))) {
++			up = phsu->chans[i * 2].uport;
++			up->port_dma_sts = dmairq;
++			hsu_dma_chan_handler(phsu, i);
++		}
++	spin_unlock_irqrestore(&phsu->dma_lock, flags);
++
++	return IRQ_HANDLED;
++}
++
++static unsigned int serial_hsu_tx_empty(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++	int ret = 1;
++
++	pm_runtime_get_sync(up->dev);
++	serial_sched_stop(up);
++
++	if (up->use_dma && test_bit(flag_tx_on, &up->flags))
++		ret = 0;
++	ret = ret &&
++		(serial_in(up, UART_LSR) & UART_LSR_TEMT ? TIOCSER_TEMT : 0);
++	serial_sched_start(up);
++	pm_runtime_put(up->dev);
++	return ret;
++}
++
++static unsigned int serial_hsu_get_mctrl(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++	unsigned char status = up->msr;
++	unsigned int ret = 0;
++
++	if (status & UART_MSR_DCD)
++		ret |= TIOCM_CAR;
++	if (status & UART_MSR_RI)
++		ret |= TIOCM_RNG;
++	if (status & UART_MSR_DSR)
++		ret |= TIOCM_DSR;
++	if (status & UART_MSR_CTS)
++		ret |= TIOCM_CTS;
++	return ret;
++}
++
++static void set_mctrl(struct uart_hsu_port *up, unsigned int mctrl)
++{
++	up->mcr &= ~(UART_MCR_RTS | UART_MCR_DTR | UART_MCR_OUT1 |
++		     UART_MCR_OUT2 | UART_MCR_LOOP);
++	if (mctrl & TIOCM_RTS)
++		up->mcr |= UART_MCR_RTS;
++	if (mctrl & TIOCM_DTR)
++		up->mcr |= UART_MCR_DTR;
++	if (mctrl & TIOCM_OUT1)
++		up->mcr |= UART_MCR_OUT1;
++	if (mctrl & TIOCM_OUT2)
++		up->mcr |= UART_MCR_OUT2;
++	if (mctrl & TIOCM_LOOP)
++		up->mcr |= UART_MCR_LOOP;
++	serial_out(up, UART_MCR, up->mcr);
++	udelay(100);
++}
++
++static void serial_hsu_set_mctrl(struct uart_port *port, unsigned int mctrl)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	up->mcr &= ~(UART_MCR_RTS | UART_MCR_DTR | UART_MCR_OUT1 |
++		     UART_MCR_OUT2 | UART_MCR_LOOP);
++	if (mctrl & TIOCM_RTS)
++		up->mcr |= UART_MCR_RTS;
++	if (mctrl & TIOCM_DTR)
++		up->mcr |= UART_MCR_DTR;
++	if (mctrl & TIOCM_OUT1)
++		up->mcr |= UART_MCR_OUT1;
++	if (mctrl & TIOCM_OUT2)
++		up->mcr |= UART_MCR_OUT2;
++	if (mctrl & TIOCM_LOOP)
++		up->mcr |= UART_MCR_LOOP;
++	serial_sched_cmd(up, qcmd_set_mcr);
++}
++
++static void serial_hsu_break_ctl(struct uart_port *port, int break_state)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	pm_runtime_get_sync(up->dev);
++	serial_sched_stop(up);
++	if (break_state == -1)
++		up->lcr |= UART_LCR_SBC;
++	else
++		up->lcr &= ~UART_LCR_SBC;
++	serial_out(up, UART_LCR, up->lcr);
++	serial_sched_start(up);
++	pm_runtime_put(up->dev);
++}
++
++/*
++ * What special to do:
++ * 1. chose the 64B fifo mode
++ * 2. start dma or pio depends on configuration
++ * 3. we only allocate dma memory when needed
++ */
++static int serial_hsu_startup(struct uart_port *port)
++{
++	static int console_first_init = 1;
++	int ret = 0;
++	unsigned long flags;
++	static DEFINE_MUTEX(lock);
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++	struct hsu_port_cfg *cfg = up->port_cfg;
++
++	mutex_lock(&lock);
++
++	pm_runtime_get_sync(up->dev);
++
++	/* HW start it */
++	if (cfg->hw_reset)
++		cfg->hw_reset(up->port.membase);
++
++	if (console_first_init && test_bit(flag_console, &up->flags)) {
++		serial_sched_stop(up);
++		console_first_init = 0;
++	}
++	clear_bit(flag_reopen, &up->flags);
++	serial_sched_start(up);
++	serial_sched_stop(up);
++
++	/*
++	 * Clear the FIFO buffers and disable them.
++	 * (they will be reenabled in set_termios())
++	 */
++	serial_out(up, UART_FCR, UART_FCR_ENABLE_FIFO);
++	serial_out(up, UART_FCR, UART_FCR_ENABLE_FIFO |
++			UART_FCR_CLEAR_RCVR |
++			UART_FCR_CLEAR_XMIT);
++	serial_out(up, UART_FCR, 0);
++
++	/* Clear the interrupt registers. */
++	(void) serial_in(up, UART_LSR);
++	(void) serial_in(up, UART_RX);
++	(void) serial_in(up, UART_IIR);
++	(void) serial_in(up, UART_MSR);
++
++	/* Now, initialize the UART, default is 8n1 */
++	serial_out(up, UART_LCR, UART_LCR_WLEN8);
++	up->port.mctrl |= TIOCM_OUT2;
++	set_mctrl(up, up->port.mctrl);
++
++	/* DMA init */
++	if (up->use_dma) {
++		ret = up->dma_ops->init ? up->dma_ops->init(up) : -ENODEV;
++		if (ret) {
++			dev_warn(up->dev, "Fail to init DMA, will use PIO\n");
++			up->use_dma = 0;
++		}
++	}
++
++	/*
++	 * Finally, enable interrupts.  Note: Modem status
++	 * interrupts are set via set_termios(), which will
++	 *  be occurring imminently
++	 * anyway, so we don't enable them here.
++	 */
++	/* bit 4 for DW is reserved, but SEG need it to be set */
++	if (!up->use_dma || up->hw_type == hsu_dw)
++		up->ier = UART_IER_RLSI | UART_IER_RDI | UART_IER_RTOIE;
++	else
++		up->ier = 0;
++	serial_out(up, UART_IER, up->ier);
++
++	/* And clear the interrupt registers again for luck. */
++	(void) serial_in(up, UART_LSR);
++	(void) serial_in(up, UART_RX);
++	(void) serial_in(up, UART_IIR);
++	(void) serial_in(up, UART_MSR);
++
++	set_bit(flag_startup, &up->flags);
++	serial_sched_start(up);
++	spin_lock_irqsave(&up->port.lock, flags);
++	serial_sched_cmd(up, qcmd_get_msr);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++	serial_sched_sync(up);
++	pm_runtime_put(up->dev);
++	mutex_unlock(&lock);
++
++	return ret;
++}
++
++static void serial_hsu_shutdown(struct uart_port *port)
++{
++	static DEFINE_MUTEX(lock);
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	mutex_lock(&lock);
++	pm_runtime_get_sync(up->dev);
++	serial_sched_stop(up);
++	clear_bit(flag_startup, &up->flags);
++
++	/* Disable interrupts from this port */
++	up->ier = 0;
++	serial_out(up, UART_IER, 0);
++
++	clear_bit(flag_tx_on, &up->flags);
++
++	up->port.mctrl &= ~TIOCM_OUT2;
++	set_mctrl(up, up->port.mctrl);
++
++	/* Disable break condition and FIFOs */
++	serial_out(up, UART_LCR,
++			serial_in(up, UART_LCR) & ~UART_LCR_SBC);
++	serial_out(up, UART_FCR, UART_FCR_ENABLE_FIFO |
++			UART_FCR_CLEAR_RCVR |
++			UART_FCR_CLEAR_XMIT);
++	serial_out(up, UART_FCR, 0);
++
++	/* Free allocated dma buffer */
++	if (up->use_dma)
++		up->dma_ops->exit(up);
++
++	pm_runtime_put_sync(up->dev);
++	mutex_unlock(&lock);
++}
++
++static void
++serial_hsu_set_termios(struct uart_port *port, struct ktermios *termios,
++		       struct ktermios *old)
++{
++	struct uart_hsu_port *up =
++			container_of(port, struct uart_hsu_port, port);
++	struct hsu_port_cfg *cfg = up->port_cfg;
++	unsigned char cval, fcr = 0;
++	unsigned long flags;
++	unsigned int baud, quot;
++	u32 ps = 0, mul = 0, m = 0, n = 0;
++
++	switch (termios->c_cflag & CSIZE) {
++	case CS5:
++		cval = UART_LCR_WLEN5;
++		break;
++	case CS6:
++		cval = UART_LCR_WLEN6;
++		break;
++	case CS7:
++		cval = UART_LCR_WLEN7;
++		break;
++	default:
++	case CS8:
++		cval = UART_LCR_WLEN8;
++		break;
++	}
++
++	/* CMSPAR isn't supported by this driver */
++	termios->c_cflag &= ~CMSPAR;
++
++	if (termios->c_cflag & CSTOPB)
++		cval |= UART_LCR_STOP;
++	if (termios->c_cflag & PARENB)
++		cval |= UART_LCR_PARITY;
++	if (!(termios->c_cflag & PARODD))
++		cval |= UART_LCR_EPAR;
++
++	baud = uart_get_baud_rate(port, termios, old, 0, 4000000);
++
++	if (up->hw_type == hsu_intel) {
++		/*
++		 * If base clk is 50Mhz, and the baud rate come from:
++		 *	baud = 50M * MUL / (DIV * PS * DLAB)
++		 *
++		 * For those basic low baud rate we can get the direct
++		 * scalar from 2746800, like 115200 = 2746800/24. For those
++		 * higher baud rate, we handle them case by case, mainly by
++		 * adjusting the MUL/PS registers, and DIV register is kept
++		 * as default value 0x3d09 to make things simple
++		 */
++
++		quot = 1;
++		ps = 0x10;
++		mul = 0x3600;
++		switch (baud) {
++		case 3500000:
++			mul = 0x3345;
++			ps = 0xC;
++			break;
++		case 1843200:
++			mul = 0x2400;
++			break;
++		case 3000000:
++		case 2500000:
++		case 2000000:
++		case 1500000:
++		case 1000000:
++		case 500000:
++			/*
++			 * mul/ps/quot = 0x9C4/0x10/0x1 will make a 500000 bps
++			 */
++			mul = baud / 500000 * 0x9C4;
++			break;
++		default:
++			/*
++			 * Use uart_get_divisor to get quot for other baud rates
++			 */
++			quot = 0;
++		}
++
++		if (!quot)
++			quot = uart_get_divisor(port, baud);
++
++		if ((up->port.uartclk / quot) < (2400 * 16))
++			fcr = UART_FCR_ENABLE_FIFO | UART_FCR_HSU_64_1B;
++		else if ((up->port.uartclk / quot) < (230400 * 16))
++			fcr = UART_FCR_ENABLE_FIFO | UART_FCR_HSU_64_16B;
++		else
++			fcr = UART_FCR_ENABLE_FIFO | UART_FCR_HSU_64_32B;
++
++		fcr |= UART_FCR_HSU_64B_FIFO;
++	} else {
++		/*
++		* For baud rates 0.5M, 1M, 1.5M, 2M, 2.5M, 3M, 3.5M and 4M the
++		* dividers must be adjusted.
++		*
++		* uartclk = (m / n) * 100 MHz, where m <= n
++		*/
++		switch (baud) {
++		case 500000:
++		case 1000000:
++		case 2000000:
++		case 4000000:
++			m = 64;
++			n = 100;
++			up->port.uartclk = 64000000;
++			break;
++		case 3500000:
++			m = 56;
++			n = 100;
++			up->port.uartclk = 56000000;
++			break;
++		case 1500000:
++		case 3000000:
++			m = 48;
++			n = 100;
++			up->port.uartclk = 48000000;
++			break;
++		case 2500000:
++			m = 40;
++			n = 100;
++			up->port.uartclk = 40000000;
++			break;
++		default:
++			m = 6912;
++			n = 15625;
++			up->port.uartclk = 44236800;
++		}
++
++		quot = uart_get_divisor(port, baud);
++
++		fcr = UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_10 |
++			UART_FCR_T_TRIG_11;
++		if (baud < 2400) {
++			fcr &= ~UART_FCR_TRIGGER_MASK;
++			fcr |= UART_FCR_TRIGGER_1;
++		}
++	}
++
++	pm_runtime_get_sync(up->dev);
++	serial_sched_stop(up);
++	/*
++	 * Ok, we're now changing the port state.  Do it with
++	 * interrupts disabled.
++	 */
++	spin_lock_irqsave(&up->port.lock, flags);
++
++	/* Update the per-port timeout */
++	uart_update_timeout(port, termios->c_cflag, baud);
++
++	up->port.read_status_mask = UART_LSR_OE | UART_LSR_THRE | UART_LSR_DR;
++	if (termios->c_iflag & INPCK)
++		up->port.read_status_mask |= UART_LSR_FE | UART_LSR_PE;
++	if (termios->c_iflag & (IGNBRK | BRKINT | PARMRK))
++		up->port.read_status_mask |= UART_LSR_BI;
++
++	/* Characters to ignore */
++	up->port.ignore_status_mask = 0;
++	if (termios->c_iflag & IGNPAR)
++		up->port.ignore_status_mask |= UART_LSR_PE | UART_LSR_FE;
++	if (termios->c_iflag & IGNBRK) {
++		up->port.ignore_status_mask |= UART_LSR_BI;
++		/*
++		 * If we're ignoring parity and break indicators,
++		 * ignore overruns too (for real raw support).
++		 */
++		if (termios->c_iflag & IGNPAR)
++			up->port.ignore_status_mask |= UART_LSR_OE;
++	}
++
++	/* Ignore all characters if CREAD is not set */
++	if ((termios->c_cflag & CREAD) == 0)
++		up->port.ignore_status_mask |= UART_LSR_DR;
++
++	/*
++	 * CTS flow control flag and modem status interrupts, disable
++	 * MSI by default
++	 */
++	up->ier &= ~UART_IER_MSI;
++
++	serial_out(up, UART_IER, up->ier);
++
++	if (termios->c_cflag & CRTSCTS) {
++		up->mcr |= UART_MCR_AFE | UART_MCR_RTS;
++		up->prev_mcr = up->mcr;
++	} else
++		up->mcr &= ~UART_MCR_AFE;
++
++	up->dll	= quot & 0xff;
++	up->dlm	= quot >> 8;
++	up->fcr	= fcr;
++	up->lcr = cval;					/* Save LCR */
++
++	serial_out(up, UART_LCR, cval | UART_LCR_DLAB);	/* set DLAB */
++	serial_out(up, UART_DLL, up->dll);		/* LS of divisor */
++	serial_out(up, UART_DLM, up->dlm);		/* MS of divisor */
++	serial_out(up, UART_LCR, cval);			/* reset DLAB */
++
++	if (up->hw_type == hsu_intel) {
++		up->mul	= mul;
++		up->ps	= ps;
++		serial_out(up, UART_MUL, up->mul);	/* set MUL */
++		serial_out(up, UART_PS, up->ps);	/* set PS */
++	} else {
++		if (m != up->m || n != up->n) {
++			if (cfg->set_clk)
++				cfg->set_clk(m, n, up->port.membase);
++			up->m = m;
++			up->n = n;
++		}
++	}
++
++	serial_out(up, UART_FCR, fcr);
++	set_mctrl(up, up->port.mctrl);
++	serial_sched_cmd(up, qcmd_get_msr);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++	serial_sched_start(up);
++	serial_sched_sync(up);
++	pm_runtime_put(up->dev);
++}
++
++static void
++serial_hsu_pm(struct uart_port *port, unsigned int state,
++	      unsigned int oldstate)
++{
++}
++
++static void serial_hsu_release_port(struct uart_port *port)
++{
++}
++
++static int serial_hsu_request_port(struct uart_port *port)
++{
++	return 0;
++}
++
++static void serial_hsu_config_port(struct uart_port *port, int flags)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++	up->port.type = PORT_HSU;
++}
++
++static int
++serial_hsu_verify_port(struct uart_port *port, struct serial_struct *ser)
++{
++	/* We don't want the core code to modify any port params */
++	return -EINVAL;
++}
++
++static const char *
++serial_hsu_type(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++	return up->name;
++}
++
++struct device *intel_mid_hsu_set_wake_peer(int port,
++			void (*wake_peer)(struct device *))
++{
++	struct uart_hsu_port *up = phsu->port + port;
++	struct hsu_port_cfg *cfg = up->port_cfg;
++
++	cfg->wake_peer = wake_peer;
++	return cfg->dev;
++}
++EXPORT_SYMBOL(intel_mid_hsu_set_wake_peer);
++
++static void serial_hsu_wake_peer(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++			container_of(port, struct uart_hsu_port, port);
++	struct hsu_port_cfg *cfg = up->port_cfg;
++
++	if (cfg->wake_peer)
++		cfg->wake_peer(cfg->dev);
++}
++
++#define BOTH_EMPTY (UART_LSR_TEMT | UART_LSR_THRE)
++/* Wait for transmitter & holding register to empty */
++static inline int wait_for_xmitr(struct uart_hsu_port *up)
++{
++	unsigned int status, tmout = 10000;
++
++	while (--tmout) {
++		status = serial_in(up, UART_LSR);
++		if (status & UART_LSR_BI)
++			up->lsr_break_flag = UART_LSR_BI;
++		udelay(1);
++		if (status & BOTH_EMPTY)
++			break;
++	}
++	if (tmout == 0)
++		return 0;
++
++	if (up->port.flags & UPF_CONS_FLOW) {
++		tmout = 10000;
++		while (--tmout &&
++		       ((serial_in(up, UART_MSR) & UART_MSR_CTS) == 0))
++			udelay(1);
++		if (tmout == 0)
++			return 0;
++	}
++	return 1;
++}
++
++#ifdef CONFIG_CONSOLE_POLL
++static int serial_hsu_get_poll_char(struct uart_port *port)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++	u8 lsr;
++
++	lsr = serial_in(up, UART_LSR);
++	if (!(lsr & UART_LSR_DR))
++		return NO_POLL_CHAR;
++	return serial_in(up, UART_RX);
++}
++
++static void serial_hsu_put_poll_char(struct uart_port *port,
++			unsigned char c)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++
++	serial_out(up, UART_IER, 0);
++	while (!wait_for_xmitr(up))
++		cpu_relax();
++	serial_out(up, UART_TX, c);
++	while (!wait_for_xmitr(up))
++		cpu_relax();
++	serial_out(up, UART_IER, up->ier);
++}
++#endif
++
++#ifdef CONFIG_SERIAL_HSU_CONSOLE
++static void serial_hsu_console_putchar(struct uart_port *port, int ch)
++{
++	struct uart_hsu_port *up =
++		container_of(port, struct uart_hsu_port, port);
++	cl_put_char(up, ch);
++}
++
++/*
++ * Print a string to the serial port trying not to disturb
++ * any possible real use of the port...
++ *
++ *	The console_lock must be held when we get here.
++ */
++static void
++serial_hsu_console_write(struct console *co, const char *s, unsigned int count)
++{
++	struct uart_hsu_port *up = phsu->port + co->index;
++	unsigned long flags;
++
++	uart_console_write(&up->port, s, count, serial_hsu_console_putchar);
++	spin_lock_irqsave(&up->cl_lock, flags);
++	serial_sched_cmd(up, qcmd_cl);
++	spin_unlock_irqrestore(&up->cl_lock, flags);
++}
++
++static struct console serial_hsu_console;
++
++static int __init
++serial_hsu_console_setup(struct console *co, char *options)
++{
++	struct uart_hsu_port *up = phsu->port + co->index;
++	int baud = 115200;
++	int bits = 8;
++	int parity = 'n';
++	int flow = 'n';
++	unsigned long flags;
++
++	if (co->index < 0 || co->index >= HSU_PORT_MAX)
++		return -ENODEV;
++
++	if (options)
++		uart_parse_options(options, &baud, &parity, &bits, &flow);
++
++	pm_runtime_get_sync(up->dev);
++	set_bit(flag_console, &up->flags);
++	set_bit(flag_startup, &up->flags);
++	serial_sched_start(up);
++	spin_lock_irqsave(&up->port.lock, flags);
++	serial_sched_cmd(up, qcmd_get_msr);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++	serial_sched_sync(up);
++	pm_runtime_put(up->dev);
++	up->cl_circ.buf = kzalloc(HSU_CL_BUF_LEN, GFP_KERNEL);
++	if (up->cl_circ.buf == NULL)
++		return -ENOMEM;
++	return uart_set_options(&up->port, co, baud, parity, bits, flow);
++}
++
++static struct console serial_hsu_console = {
++	.name		= "ttyHSU",
++	.write		= serial_hsu_console_write,
++	.device		= uart_console_device,
++	.setup		= serial_hsu_console_setup,
++	.flags		= CON_PRINTBUFFER,
++	.index		= -1,
++	.data		= &serial_hsu_reg,
++};
++
++#define SERIAL_HSU_CONSOLE	(&serial_hsu_console)
++#else
++#define SERIAL_HSU_CONSOLE	NULL
++#endif
++
++struct uart_ops serial_hsu_pops = {
++	.tx_empty	= serial_hsu_tx_empty,
++	.set_mctrl	= serial_hsu_set_mctrl,
++	.get_mctrl	= serial_hsu_get_mctrl,
++	.stop_tx	= serial_hsu_stop_tx,
++	.start_tx	= serial_hsu_start_tx,
++	.stop_rx	= serial_hsu_stop_rx,
++	.enable_ms	= serial_hsu_enable_ms,
++	.break_ctl	= serial_hsu_break_ctl,
++	.startup	= serial_hsu_startup,
++	.shutdown	= serial_hsu_shutdown,
++	.set_termios	= serial_hsu_set_termios,
++	.pm		= serial_hsu_pm,
++	.type		= serial_hsu_type,
++	.release_port	= serial_hsu_release_port,
++	.request_port	= serial_hsu_request_port,
++	.config_port	= serial_hsu_config_port,
++	.verify_port	= serial_hsu_verify_port,
++	.wake_peer	= serial_hsu_wake_peer,
++#ifdef CONFIG_CONSOLE_POLL
++	.poll_get_char = serial_hsu_get_poll_char,
++	.poll_put_char = serial_hsu_put_poll_char,
++#endif
++};
++
++static struct uart_driver serial_hsu_reg = {
++	.owner		= THIS_MODULE,
++	.driver_name	= "HSU serial",
++	.dev_name	= "ttyHSU",
++	.major		= TTY_MAJOR,
++	.minor		= 128,
++	.nr		= HSU_PORT_MAX,
++};
++
++#if defined(CONFIG_PM) || defined(CONFIG_PM_RUNTIME)
++static void hsu_regs_context(struct uart_hsu_port *up, int op)
++{
++	struct hsu_port_cfg *cfg = up->port_cfg;
++
++	if (op == context_load) {
++		usleep_range(10, 100);
++
++		serial_out(up, UART_LCR, up->lcr);
++		serial_out(up, UART_LCR, up->lcr | UART_LCR_DLAB);
++		serial_out(up, UART_DLL, up->dll);
++		serial_out(up, UART_DLM, up->dlm);
++		serial_out(up, UART_LCR, up->lcr);
++
++		if (up->hw_type == hsu_intel) {
++			serial_out(up, UART_MUL, up->mul);
++			serial_out(up, UART_DIV, up->div);
++			serial_out(up, UART_PS, up->ps);
++		} else {
++			if (cfg->set_clk)
++				cfg->set_clk(up->m, up->n, up->port.membase);
++		}
++
++		serial_out(up, UART_MCR, up->mcr);
++		serial_out(up, UART_FCR, up->fcr);
++		serial_out(up, UART_IER, up->ier);
++	}
++
++	if (up->use_dma && up->dma_ops->context_op)
++		up->dma_ops->context_op(up, op);
++}
++
++int serial_hsu_do_suspend(struct uart_hsu_port *up)
++{
++	struct hsu_port_cfg *cfg = up->port_cfg;
++	struct uart_port *uport = &up->port;
++	struct tty_port *tport = &uport->state->port;
++	struct tty_struct *tty = tport->tty;
++	struct circ_buf *xmit = &up->port.state->xmit;
++	char cmd;
++	unsigned long flags;
++
++	/* Should check the RX FIFO is not empty */
++	if (test_bit(flag_startup, &up->flags) && (up->hw_type == hsu_dw)
++			&& serial_in(up, UART_DW_USR) & UART_DW_USR_RFNE)
++			goto busy;
++
++	disable_irq(up->port.irq);
++	disable_irq(up->dma_irq);
++
++	serial_sched_stop(up);
++	set_bit(flag_suspend, &up->flags);
++
++	if (test_bit(flag_startup, &up->flags) && check_qcmd(up, &cmd)) {
++		dev_info(up->dev, "ignore suspend cmd: %d\n", cmd);
++		goto err;
++	}
++
++	if (test_bit(flag_tx_on, &up->flags)) {
++		dev_info(up->dev, "ignore suspend for tx on\n");
++		dev_info(up->dev,
++			"xmit pending:%d, stopped:%d, hw_stopped:%d, MSR:%x\n",
++			(int)uart_circ_chars_pending(xmit), tty->stopped,
++			tty->hw_stopped, serial_in(up, UART_MSR));
++		goto err;
++	}
++
++	if (test_bit(flag_startup, &up->flags) && !uart_circ_empty(xmit) &&
++		!uart_tx_stopped(&up->port)) {
++		dev_info(up->dev, "ignore suspend for xmit\n");
++		dev_info(up->dev,
++			"xmit pending:%d, stopped:%d, hw_stopped:%d, MSR:%x\n",
++			(int)uart_circ_chars_pending(xmit),
++			tty->stopped,
++			tty->hw_stopped,
++			serial_in(up, UART_MSR));
++		goto err;
++	}
++
++	if (up->use_dma && up->dma_ops->suspend(up))
++		goto err;
++
++	if (cfg->hw_suspend)
++		cfg->hw_suspend(up);
++
++	if (cfg->hw_context_save)
++		hsu_regs_context(up, context_save);
++
++	enable_irq(up->dma_irq);
++	if (up->hw_type == hsu_dw)
++		enable_irq(up->port.irq);
++
++	return 0;
++err:
++	clear_bit(flag_suspend, &up->flags);
++	enable_irq(up->port.irq);
++	enable_irq(up->dma_irq);
++	serial_sched_start(up);
++	spin_lock_irqsave(&up->port.lock, flags);
++	serial_sched_cmd(up, qcmd_get_msr);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++	serial_sched_sync(up);
++busy:
++	pm_schedule_suspend(up->dev, cfg->idle);
++	return -EBUSY;
++}
++EXPORT_SYMBOL(serial_hsu_do_suspend);
++
++int serial_hsu_do_resume(struct uart_hsu_port *up)
++{
++	struct hsu_port_cfg *cfg = up->port_cfg;
++	unsigned long flags;
++
++	if (!test_and_clear_bit(flag_suspend, &up->flags))
++		return 0;
++
++	if (up->hw_type == hsu_dw)
++		disable_irq(up->port.irq);
++
++	if (cfg->hw_context_save)
++		hsu_regs_context(up, context_load);
++	if (cfg->hw_resume)
++		cfg->hw_resume(up);
++	if (up->use_dma)
++		up->dma_ops->resume(up);
++
++	enable_irq(up->port.irq);
++
++	serial_sched_start(up);
++	spin_lock_irqsave(&up->port.lock, flags);
++	serial_sched_cmd(up, qcmd_get_msr);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++	serial_sched_sync(up);
++	return 0;
++}
++EXPORT_SYMBOL(serial_hsu_do_resume);
++#endif
++
++#ifdef CONFIG_PM_RUNTIME
++int serial_hsu_do_runtime_idle(struct uart_hsu_port *up)
++{
++	struct hsu_port_cfg *cfg = up->port_cfg;
++
++	if (!test_and_clear_bit(flag_active, &up->flags))
++		pm_schedule_suspend(up->dev, 20);
++	else
++		pm_schedule_suspend(up->dev, cfg->idle);
++
++	return -EBUSY;
++}
++EXPORT_SYMBOL(serial_hsu_do_runtime_idle);
++#endif
++
++static void serial_hsu_command(struct uart_hsu_port *up)
++{
++	char cmd, c;
++	unsigned long flags;
++	unsigned int iir, lsr;
++	int status;
++	struct hsu_dma_chan *txc = up->txc;
++	struct hsu_dma_chan *rxc = up->rxc;
++
++	if (unlikely(test_bit(flag_cmd_off, &up->flags)))
++		return;
++
++	if (unlikely(test_bit(flag_suspend, &up->flags))) {
++		dev_err(up->dev,
++			"Error to handle cmd while port is suspended\n");
++		if (check_qcmd(up, &cmd))
++			dev_err(up->dev, "Command pending: %d\n", cmd);
++		return;
++	}
++	set_bit(flag_active, &up->flags);
++	spin_lock_irqsave(&up->port.lock, flags);
++	while (get_qcmd(up, &cmd)) {
++		spin_unlock_irqrestore(&up->port.lock, flags);
++		switch (cmd) {
++		case qcmd_overflow:
++			dev_err(up->dev, "queue overflow!!\n");
++			break;
++		case qcmd_set_mcr:
++			serial_out(up, UART_MCR, up->mcr);
++			break;
++		case qcmd_set_ier:
++			serial_out(up, UART_IER, up->ier);
++			break;
++		case qcmd_start_rx:
++			/* use for DW DMA RX only */
++			if (test_and_clear_bit(flag_rx_pending, &up->flags)) {
++				if (up->use_dma)
++					up->dma_ops->start_rx(up);
++			}
++			break;
++		case qcmd_stop_rx:
++			if (!up->use_dma || up->hw_type == hsu_dw) {
++				up->ier &= ~UART_IER_RLSI;
++				up->port.read_status_mask &= ~UART_LSR_DR;
++				serial_out(up, UART_IER, up->ier);
++			}
++
++			if (up->use_dma)
++				up->dma_ops->stop_rx(up);
++			break;
++		case qcmd_start_tx:
++			if (up->use_dma) {
++				if (!test_bit(flag_tx_on, &up->flags))
++					up->dma_ops->start_tx(up);
++			} else if (!(up->ier & UART_IER_THRI)) {
++				up->ier |= UART_IER_THRI;
++				serial_out(up, UART_IER, up->ier);
++			}
++			break;
++		case qcmd_stop_tx:
++			if (up->use_dma) {
++				spin_lock_irqsave(&up->port.lock, flags);
++				up->dma_ops->stop_tx(up);
++				clear_bit(flag_tx_on, &up->flags);
++				spin_unlock_irqrestore(&up->port.lock, flags);
++			} else if (up->ier & UART_IER_THRI) {
++				up->ier &= ~UART_IER_THRI;
++				serial_out(up, UART_IER, up->ier);
++			}
++			break;
++		case qcmd_cl:
++			serial_out(up, UART_IER, 0);
++			while (cl_get_char(up, &c)) {
++				while (!wait_for_xmitr(up))
++					schedule();
++				serial_out(up, UART_TX, c);
++			}
++			serial_out(up, UART_IER, up->ier);
++			break;
++		case qcmd_port_irq:
++			up->port_irq_cmddone++;
++
++			/* if use shared IRQ and need more care */
++			if (up->hw_type == hsu_intel) {
++				iir = serial_in(up, UART_IIR);
++			} else {
++				if (up->iir == HSU_PIO_NO_INT)
++					up->iir = serial_in(up, UART_IIR)
++							& HSU_IIR_INT_MASK;
++				iir = up->iir;
++				up->iir = HSU_PIO_NO_INT;
++			}
++
++			iir &= HSU_IIR_INT_MASK;
++
++			if (iir == UART_IIR_NO_INT) {
++				enable_irq(up->port.irq);
++				up->port_irq_pio_no_irq_pend++;
++				break;
++			}
++
++			if (iir == HSU_PIO_LINE_STS)
++				up->port_irq_pio_line_sts++;
++			if (iir == HSU_PIO_RX_AVB)
++				up->port_irq_pio_rx_avb++;
++			if (iir == HSU_PIO_RX_TMO)
++				up->port_irq_pio_rx_timeout++;
++			if (iir == HSU_PIO_TX_REQ)
++				up->port_irq_pio_tx_req++;
++
++			lsr = serial_in(up, UART_LSR);
++
++			/* We need to judge it's timeout or data available */
++			if (lsr & UART_LSR_DR) {
++				if (!up->use_dma) {
++					receive_chars(up, &lsr);
++				} else if (up->hw_type == hsu_dw) {
++					if (iir == HSU_PIO_RX_TMO) {
++						/*
++						 * RX timeout IRQ, the DMA
++						 * channel may be stalled
++						 */
++						up->dma_ops->stop_rx(up);
++						receive_chars(up, &lsr);
++					} else
++						up->dma_ops->start_rx(up);
++				}
++			}
++
++			/* lsr will be renewed during the receive_chars */
++			if (!up->use_dma && (lsr & UART_LSR_THRE))
++				transmit_chars(up);
++
++			spin_lock_irqsave(&up->port.lock, flags);
++			enable_irq(up->port.irq);
++			spin_unlock_irqrestore(&up->port.lock, flags);
++			break;
++		case qcmd_dma_irq:
++			/* Only hsu_intel has this irq */
++			up->dma_irq_cmddone++;
++			if (up->port_dma_sts & (1 << txc->id)) {
++				status = chan_readl(txc, HSU_CH_SR);
++				up->dma_ops->start_tx(up);
++			}
++
++			if (up->port_dma_sts & (1 << rxc->id)) {
++				status = chan_readl(rxc, HSU_CH_SR);
++				intel_dma_do_rx(up, status);
++			}
++			enable_irq(up->dma_irq);
++			break;
++		case qcmd_cmd_off:
++			set_bit(flag_cmd_off, &up->flags);
++			break;
++		case qcmd_get_msr:
++			break;
++		default:
++			dev_err(up->dev, "invalid command!!\n");
++			break;
++		}
++		spin_lock_irqsave(&up->port.lock, flags);
++		if (unlikely(test_bit(flag_cmd_off, &up->flags)))
++			break;
++	}
++	up->msr = serial_in(up, UART_MSR);
++	check_modem_status(up);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++}
++
++static void serial_hsu_tasklet(unsigned long data)
++{
++	struct uart_hsu_port *up = (struct uart_hsu_port *)data;
++
++	up->in_tasklet = 1;
++	serial_hsu_command(up);
++	up->tasklet_done++;
++	up->in_tasklet = 0;
++}
++
++static void serial_hsu_work(struct work_struct *work)
++{
++	struct uart_hsu_port *uport =
++		container_of(work, struct uart_hsu_port, work);
++
++	uport->in_workq = 1;
++	serial_hsu_command(uport);
++	uport->workq_done++;
++	uport->in_workq = 0;
++}
++
++static int serial_port_setup(struct uart_hsu_port *up, int index)
++{
++	int ret;
++
++	up->port.line = index;
++	snprintf(up->name, sizeof(up->name) - 1, "hsu_port%d", index);
++	up->index = index;
++
++	if ((hsu_dma_enable & (1 << index)) && up->dma_ops)
++		up->use_dma = 1;
++	else
++		up->use_dma = 0;
++
++	mutex_init(&up->q_mutex);
++	tasklet_init(&up->tasklet, serial_hsu_tasklet,
++				(unsigned long)up);
++	up->workqueue =
++		create_singlethread_workqueue(up->name);
++	INIT_WORK(&up->work, serial_hsu_work);
++	up->qcirc.buf = (char *)up->qbuf;
++	spin_lock_init(&up->cl_lock);
++	set_bit(flag_cmd_off, &up->flags);
++	uart_add_one_port(&serial_hsu_reg, &up->port);
++
++	up->dma_irq = phsu->dma_irq;
++	ret = request_irq(up->port.irq, hsu_port_irq, IRQF_SHARED,
++			up->name, up);
++	if (ret) {
++		dev_err(up->dev, "can not get port IRQ\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++struct uart_hsu_port *serial_hsu_port_setup(struct device *pdev, int index,
++	resource_size_t start, resource_size_t len,
++	int irq, struct hsu_port_cfg *cfg)
++{
++	struct uart_hsu_port *up;
++
++	pr_info("Found a %s HSU\n", cfg->hw_ip ? "Designware" : "Intel");
++
++	up = phsu->port + index;
++	up->port_cfg = cfg;
++
++	up->dev = pdev;
++	up->port.type = PORT_HSU;
++	up->port.iotype = UPIO_MEM;
++	up->port.mapbase = start;
++	up->port.membase = ioremap_nocache(up->port.mapbase, len);
++	up->port.fifosize = 64;
++	up->port.ops = &serial_hsu_pops;
++	up->port.flags = UPF_IOREMAP;
++	up->hw_type = cfg->hw_ip;
++	if (cfg->get_uartclk)
++		up->port.uartclk = cfg->get_uartclk(up);
++	else	/* set the scalable maxim support rate to 2746800 bps */
++		up->port.uartclk = 115200 * 24 * 16;
++
++	up->port.irq = irq;
++	up->port.dev = pdev;
++
++	if (up->hw_type == hsu_intel) {
++		up->txc = &phsu->chans[index * 2];
++		up->rxc = &phsu->chans[index * 2 + 1];
++		up->dma_ops = &intel_hsu_dma_ops;
++	} else
++		up->dma_ops = &dw_dma_ops;
++
++	serial_port_setup(up, index);
++
++	phsu->port_num++;
++
++	return up;
++}
++EXPORT_SYMBOL(serial_hsu_port_setup);
++
++void serial_hsu_port_free(struct uart_hsu_port *up)
++{
++	uart_remove_one_port(&serial_hsu_reg, &up->port);
++	free_irq(up->port.irq, up);
++}
++EXPORT_SYMBOL(serial_hsu_port_free);
++
++void serial_hsu_port_shutdown(struct uart_hsu_port *up)
++{
++	uart_suspend_port(&serial_hsu_reg, &up->port);
++}
++EXPORT_SYMBOL(serial_hsu_port_shutdown);
++
++int serial_hsu_dma_setup(struct device *pdev,
++	resource_size_t start, resource_size_t len, unsigned int irq)
++{
++	struct hsu_dma_chan *dchan;
++	int i, ret;
++
++	phsu->reg = ioremap_nocache(start, len);
++	dchan = phsu->chans;
++	for (i = 0; i < 6; i++) {
++		dchan->id = i;
++		dchan->dirt = (i & 0x1) ? DMA_FROM_DEVICE :
++			DMA_TO_DEVICE;
++		dchan->uport = &phsu->port[i/2];
++		dchan->reg = phsu->reg + HSU_DMA_CHANS_REG_OFFSET +
++			i * HSU_DMA_CHANS_REG_LENGTH;
++
++		dchan++;
++	}
++
++	phsu->dma_irq = irq;
++	ret = request_irq(irq, hsu_dma_irq, 0, "hsu dma", phsu);
++	if (ret) {
++		dev_err(pdev, "can not get dma IRQ\n");
++		goto err;
++	}
++
++	dev_set_drvdata(pdev, phsu);
++
++	return 0;
++err:
++	iounmap(phsu->reg);
++	return ret;
++}
++EXPORT_SYMBOL(serial_hsu_dma_setup);
++
++void serial_hsu_dma_free(void)
++{
++	free_irq(phsu->dma_irq, phsu);
++}
++EXPORT_SYMBOL(serial_hsu_dma_free);
++
++static int __init hsu_init(void)
++{
++	int ret;
++
++	ret = uart_register_driver(&serial_hsu_reg);
++	if (ret)
++		return ret;
++
++	spin_lock_init(&phsu->dma_lock);
++	return hsu_debugfs_init(phsu);
++}
++
++static void __exit hsu_exit(void)
++{
++	uart_unregister_driver(&serial_hsu_reg);
++	hsu_debugfs_remove(phsu);
++}
++
++module_init(hsu_init);
++module_exit(hsu_exit);
++
++MODULE_AUTHOR("Yang Bin <bin.yang@intel.com>");
++MODULE_LICENSE("GPL v2");
+--- /dev/null
++++ b/drivers/tty/serial/hsu/hsu_dma.c
+@@ -0,0 +1,614 @@
++/*
++ * hsu_dma.c: driver for Intel High Speed UART device
++ *
++ * (C) Copyright 2014 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/console.h>
++#include <linux/sysrq.h>
++#include <linux/slab.h>
++#include <linux/circ_buf.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/tty.h>
++#include <linux/tty_flip.h>
++#include <linux/dma-mapping.h>
++#include <linux/pci.h>
++#include <linux/io.h>
++#include <linux/debugfs.h>
++#include <linux/pm_runtime.h>
++#include <linux/irq.h>
++#include <linux/acpi.h>
++
++#include "hsu.h"
++
++/* Designware DMA ops */
++static int dw_dma_init(struct uart_hsu_port *up)
++{
++	struct dw_dma_priv *dw_dma;
++	struct hsu_dma_buffer *dbuf;
++	dma_cap_mask_t mask;
++
++	dw_dma = kzalloc(sizeof(*dw_dma), GFP_KERNEL);
++	if (!dw_dma) {
++		pr_warn("DW HSU: Can't alloc memory for dw_dm_priv\n");
++		return -1;
++	}
++
++	up->dma_priv = dw_dma;
++
++	/* Default slave configuration parameters */
++	dw_dma->rxconf.direction	= DMA_DEV_TO_MEM;
++	dw_dma->rxconf.src_addr_width	= DMA_SLAVE_BUSWIDTH_1_BYTE;
++	dw_dma->rxconf.src_addr		= up->port.mapbase + UART_RX;
++	dw_dma->rxconf.src_maxburst	= 8;
++	dw_dma->rxconf.dst_maxburst	= 8;
++
++	dw_dma->txconf.direction	= DMA_MEM_TO_DEV;
++	dw_dma->txconf.dst_addr_width	= DMA_SLAVE_BUSWIDTH_1_BYTE;
++	dw_dma->txconf.dst_addr		= up->port.mapbase + UART_TX;
++	dw_dma->txconf.src_maxburst	= 8;
++	dw_dma->txconf.dst_maxburst	= 8;
++
++	dma_cap_zero(mask);
++	dma_cap_set(DMA_SLAVE, mask);
++
++	/* Get a channel for RX */
++	dw_dma->rxchan = dma_request_slave_channel_compat(mask,
++						       NULL, NULL,
++						       up->port.dev, "rx");
++	if (!dw_dma->rxchan)
++		return -ENODEV;
++
++	dmaengine_slave_config(dw_dma->rxchan, &dw_dma->rxconf);
++
++	/* Get a channel for TX */
++	dw_dma->txchan = dma_request_slave_channel_compat(mask,
++						       NULL, NULL,
++						       up->port.dev, "tx");
++	if (!dw_dma->txchan) {
++		dma_release_channel(dw_dma->rxchan);
++		return -ENODEV;
++	}
++
++	dmaengine_slave_config(dw_dma->txchan, &dw_dma->txconf);
++
++	/* RX buffer */
++	dbuf = &up->rxbuf;
++	if (!dbuf->dma_size)
++		dbuf->dma_size = PAGE_SIZE;
++
++	dbuf->buf = dma_alloc_coherent(dw_dma->rxchan->device->dev,
++			dbuf->dma_size, &dbuf->dma_addr, GFP_KERNEL);
++	if (!dbuf->buf) {
++		dma_release_channel(dw_dma->rxchan);
++		dma_release_channel(dw_dma->txchan);
++		return -ENOMEM;
++	}
++
++	/* TX buffer */
++	dbuf = &up->txbuf;
++	dbuf->dma_addr = dma_map_single(dw_dma->txchan->device->dev,
++					up->port.state->xmit.buf,
++					UART_XMIT_SIZE,
++					DMA_TO_DEVICE);
++
++	dw_dma->up = up;
++	up->dma_inited = 1;
++
++	dev_dbg_ratelimited(up->port.dev, "got both dma channels\n");
++	return 0;
++}
++
++static int dw_dma_suspend(struct uart_hsu_port *up)
++{
++	struct dw_dma_priv *dw_dma = up->dma_priv;
++	struct dma_chan *txchan;
++	struct dma_chan *rxchan;
++
++	if (!up->dma_inited)
++		return 0;
++
++	txchan = dw_dma->txchan;
++	rxchan = dw_dma->rxchan;
++
++	if (test_bit(flag_rx_on, &up->flags) ||
++		test_bit(flag_rx_pending, &up->flags)) {
++		dev_warn(up->dev, "ignore suspend for rx dma is running\n");
++		return -EBUSY;
++	}
++
++	dmaengine_pause(dw_dma->txchan);
++	dmaengine_pause(dw_dma->rxchan);
++
++	return 0;
++}
++
++static int dw_dma_resume(struct uart_hsu_port *up)
++{
++	struct dw_dma_priv *dw_dma = up->dma_priv;
++
++	if (!up->dma_inited)
++		return 0;
++
++	dmaengine_resume(dw_dma->txchan);
++	dmaengine_resume(dw_dma->rxchan);
++
++	return 0;
++}
++
++
++static int dw_dma_exit(struct uart_hsu_port *up)
++{
++	struct dw_dma_priv *dw_dma = up->dma_priv;
++	struct hsu_dma_buffer *dbuf;
++
++	if (!dw_dma)
++		return -1;
++
++	/* Release RX resources */
++	dbuf = &up->rxbuf;
++	dmaengine_terminate_all(dw_dma->rxchan);
++	dma_free_coherent(dw_dma->rxchan->device->dev, dbuf->dma_size,
++				dbuf->buf, dbuf->dma_addr);
++	dma_release_channel(dw_dma->rxchan);
++	dw_dma->rxchan = NULL;
++
++	/* Release TX resources */
++	dbuf = &up->txbuf;
++	dmaengine_terminate_all(dw_dma->txchan);
++	dma_unmap_single(dw_dma->txchan->device->dev, dbuf->dma_addr,
++			 UART_XMIT_SIZE, DMA_TO_DEVICE);
++	dma_release_channel(dw_dma->txchan);
++	dw_dma->txchan = NULL;
++
++	dev_dbg_ratelimited(up->port.dev, "dma channels released\n");
++
++	up->dma_inited = 0;
++	up->dma_priv = NULL;
++	return 0;
++}
++
++static void dw_dma_tx_done(void *arg)
++{
++	struct dw_dma_priv *dw_dma = arg;
++	struct uart_hsu_port *up = dw_dma->up;
++	struct circ_buf *xmit = &up->port.state->xmit;
++	struct hsu_dma_buffer *dbuf = &up->txbuf;
++	unsigned long flags;
++
++	dma_sync_single_for_cpu(dw_dma->txchan->device->dev, dbuf->dma_addr,
++				dbuf->dma_size, DMA_TO_DEVICE);
++
++	xmit->tail += dbuf->dma_size;
++	xmit->tail &= UART_XMIT_SIZE - 1;
++	up->port.icount.tx += dbuf->dma_size;
++
++	clear_bit(flag_tx_on, &up->flags);
++
++	if (!uart_circ_empty(xmit) && !uart_tx_stopped(&up->port)) {
++		spin_lock_irqsave(&up->port.lock, flags);
++		serial_sched_cmd(up, qcmd_start_tx);
++		spin_unlock_irqrestore(&up->port.lock, flags);
++	}
++
++	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
++		uart_write_wakeup(&up->port);
++}
++
++static void dw_dma_start_tx(struct uart_hsu_port *up)
++{
++	struct dw_dma_priv *dw_dma = up->dma_priv;
++	struct dma_async_tx_descriptor *desc = NULL;
++	struct circ_buf *xmit = &up->port.state->xmit;
++	struct hsu_dma_buffer *dbuf = &up->txbuf;
++
++	if (uart_circ_empty(xmit) || uart_tx_stopped(&up->port)) {
++		if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
++			uart_write_wakeup(&up->port);
++		return;
++	}
++
++	set_bit(flag_tx_on, &up->flags);
++
++	dbuf->dma_size = CIRC_CNT_TO_END(xmit->head, xmit->tail,
++						UART_XMIT_SIZE);
++
++	desc = dmaengine_prep_slave_single(dw_dma->txchan,
++					   dbuf->dma_addr + xmit->tail,
++					   dbuf->dma_size, DMA_MEM_TO_DEV,
++					   DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
++	if (!desc)
++		return;
++
++	desc->callback = dw_dma_tx_done;
++	desc->callback_param = dw_dma;
++
++	dw_dma->tx_cookie = dmaengine_submit(desc);
++
++	dma_sync_single_for_device(dw_dma->txchan->device->dev, dbuf->dma_addr,
++				   dbuf->dma_size, DMA_TO_DEVICE);
++
++	dma_async_issue_pending(dw_dma->txchan);
++}
++
++static void dw_dma_stop_tx(struct uart_hsu_port *up)
++{
++	struct dw_dma_priv *dw_dma = up->dma_priv;
++
++	if (!test_bit(flag_tx_on, &up->flags))
++		return;
++
++	dmaengine_terminate_all(dw_dma->txchan);
++}
++
++static void dw_dma_rx_done(void *arg)
++{
++	struct dw_dma_priv *dw_dma = arg;
++	struct uart_hsu_port *up = dw_dma->up;
++	struct tty_port *tty_port = &up->port.state->port;
++	struct hsu_dma_buffer *dbuf = &up->rxbuf;
++	struct dma_tx_state	state;
++	int count;
++	unsigned long flags;
++
++	dma_sync_single_for_cpu(dw_dma->rxchan->device->dev, dbuf->dma_addr,
++				dbuf->dma_size, DMA_FROM_DEVICE);
++
++	dmaengine_tx_status(dw_dma->rxchan, dw_dma->rx_cookie, &state);
++	dmaengine_terminate_all(dw_dma->rxchan);
++
++	count = dbuf->dma_size - state.residue;
++
++	tty_insert_flip_string(tty_port, dbuf->buf, count);
++	up->port.icount.rx += count;
++
++	tty_flip_buffer_push(tty_port);
++
++	clear_bit(flag_rx_on, &up->flags);
++
++	spin_lock_irqsave(&up->port.lock, flags);
++	if (test_bit(flag_rx_pending, &up->flags))
++		serial_sched_cmd(up, qcmd_start_rx);
++	spin_unlock_irqrestore(&up->port.lock, flags);
++}
++
++
++static void dw_dma_start_rx(struct uart_hsu_port *up)
++{
++	struct dma_async_tx_descriptor *desc = NULL;
++	struct dw_dma_priv *dw_dma = up->dma_priv;
++	struct hsu_dma_buffer *dbuf = &up->rxbuf;
++	struct dma_tx_state state;
++	int dma_status;
++
++	if (test_and_set_bit(flag_rx_on, &up->flags)) {
++		set_bit(flag_rx_pending, &up->flags);
++		return;
++	}
++
++	dma_status = dmaengine_tx_status(dw_dma->rxchan,
++					dw_dma->rx_cookie, &state);
++	if (dma_status)
++		return;
++
++	desc = dmaengine_prep_slave_single(dw_dma->rxchan, dbuf->dma_addr,
++					   dbuf->dma_size, DMA_DEV_TO_MEM,
++					   DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
++	if (!desc)
++		return;
++
++	desc->callback = dw_dma_rx_done;
++	desc->callback_param = dw_dma;
++
++	dw_dma->rx_cookie = dmaengine_submit(desc);
++
++	dma_sync_single_for_device(dw_dma->rxchan->device->dev, dbuf->dma_addr,
++				   dbuf->dma_size, DMA_FROM_DEVICE);
++
++	dma_async_issue_pending(dw_dma->rxchan);
++}
++
++static void dw_dma_stop_rx(struct uart_hsu_port *up)
++{
++	struct dw_dma_priv *dw_dma = up->dma_priv;
++	struct dma_tx_state	state;
++	struct tty_port *tty_port = &up->port.state->port;
++	struct hsu_dma_buffer *dbuf = &up->rxbuf;
++	int count;
++
++	if (!test_bit(flag_rx_on, &up->flags)) {
++		clear_bit(flag_rx_pending, &up->flags);
++		return;
++	}
++
++	dmaengine_pause(dw_dma->rxchan);
++
++	dma_sync_single_for_cpu(dw_dma->rxchan->device->dev, dbuf->dma_addr,
++				dbuf->dma_size, DMA_FROM_DEVICE);
++
++	dmaengine_tx_status(dw_dma->rxchan, dw_dma->rx_cookie, &state);
++	dmaengine_terminate_all(dw_dma->rxchan);
++
++	count = dbuf->dma_size - state.residue;
++	if (!count)
++		goto exit;
++
++	tty_insert_flip_string(tty_port, dbuf->buf, count);
++	up->port.icount.rx += count;
++
++	tty_flip_buffer_push(tty_port);
++
++exit:
++	clear_bit(flag_rx_on, &up->flags);
++	clear_bit(flag_rx_pending, &up->flags);
++}
++
++struct hsu_dma_ops dw_dma_ops = {
++	.init =		dw_dma_init,
++	.exit =		dw_dma_exit,
++	.suspend =	dw_dma_suspend,
++	.resume	=	dw_dma_resume,
++	.start_tx =	dw_dma_start_tx,
++	.stop_tx =	dw_dma_stop_tx,
++	.start_rx =	dw_dma_start_rx,
++	.stop_rx =	dw_dma_stop_rx,
++};
++
++/* Intel DMA ops */
++
++/* The buffer is already cache coherent */
++void hsu_dma_start_rx_chan(struct hsu_dma_chan *rxc,
++			struct hsu_dma_buffer *dbuf)
++{
++	dbuf->ofs = 0;
++
++	chan_writel(rxc, HSU_CH_BSR, HSU_DMA_BSR);
++	chan_writel(rxc, HSU_CH_MOTSR, HSU_DMA_MOTSR);
++
++	chan_writel(rxc, HSU_CH_D0SAR, dbuf->dma_addr);
++	chan_writel(rxc, HSU_CH_D0TSR, dbuf->dma_size);
++	chan_writel(rxc, HSU_CH_DCR, 0x1 | (0x1 << 8)
++					 | (0x1 << 16)
++					 | (0x1 << 24)	/* timeout, Errata 1 */
++					 );
++	chan_writel(rxc, HSU_CH_CR, 0x3);
++}
++
++static int intel_dma_init(struct uart_hsu_port *up)
++{
++	struct hsu_dma_buffer *dbuf;
++	struct circ_buf *xmit = &up->port.state->xmit;
++
++	clear_bit(flag_tx_on, &up->flags);
++
++	/* 1. Allocate the RX buffer */
++	dbuf = &up->rxbuf;
++	dbuf->buf = kzalloc(HSU_DMA_BUF_SIZE, GFP_KERNEL);
++	if (!dbuf->buf) {
++		up->use_dma = 0;
++		dev_err(up->dev, "allocate DMA buffer failed!!\n");
++		return -ENOMEM;
++	}
++
++	dbuf->dma_addr = dma_map_single(up->dev,
++			dbuf->buf,
++			HSU_DMA_BUF_SIZE,
++			DMA_FROM_DEVICE);
++	dbuf->dma_size = HSU_DMA_BUF_SIZE;
++
++	/* 2. prepare teh TX buffer */
++	dbuf = &up->txbuf;
++	dbuf->buf = xmit->buf;
++	dbuf->dma_addr = dma_map_single(up->dev,
++			dbuf->buf,
++			UART_XMIT_SIZE,
++			DMA_TO_DEVICE);
++	dbuf->dma_size = UART_XMIT_SIZE;
++	dbuf->ofs = 0;
++
++	/* This should not be changed all around */
++	chan_writel(up->txc, HSU_CH_BSR, HSU_DMA_BSR);
++	chan_writel(up->txc, HSU_CH_MOTSR, HSU_DMA_MOTSR);
++
++	/* Start the RX channel right now */
++	hsu_dma_start_rx_chan(up->rxc, &up->rxbuf);
++
++	up->dma_inited = 1;
++	return 0;
++}
++
++static int intel_dma_exit(struct uart_hsu_port *up)
++{
++	struct hsu_dma_buffer *dbuf;
++	struct uart_port *port = &up->port;
++
++	chan_writel(up->txc, HSU_CH_CR, 0x0);
++	clear_bit(flag_tx_on, &up->flags);
++	chan_writel(up->rxc, HSU_CH_CR, 0x2);
++
++	/* Free and unmap rx dma buffer */
++	dbuf = &up->rxbuf;
++	dma_unmap_single(port->dev,
++			dbuf->dma_addr,
++			dbuf->dma_size,
++			DMA_FROM_DEVICE);
++	kfree(dbuf->buf);
++
++	/* Next unmap tx dma buffer*/
++	dbuf = &up->txbuf;
++	dma_unmap_single(port->dev,
++			dbuf->dma_addr,
++			dbuf->dma_size,
++			DMA_TO_DEVICE);
++
++	up->dma_inited = 0;
++	return 0;
++}
++
++
++static void intel_dma_start_tx(struct uart_hsu_port *up)
++{
++	struct circ_buf *xmit = &up->port.state->xmit;
++	struct hsu_dma_buffer *dbuf = &up->txbuf;
++	unsigned long flags;
++	int count;
++
++	spin_lock_irqsave(&up->port.lock, flags);
++	chan_writel(up->txc, HSU_CH_CR, 0x0);
++	while (chan_readl(up->txc, HSU_CH_CR))
++		cpu_relax();
++	clear_bit(flag_tx_on, &up->flags);
++	if (dbuf->ofs) {
++		u32 real = chan_readl(up->txc, HSU_CH_D0SAR) - up->tx_addr;
++
++		/* we found in flow control case, TX irq came without sending
++		 * all TX buffer
++		 */
++		if (real < dbuf->ofs)
++			dbuf->ofs = real; /* adjust to real chars sent */
++
++		/* Update the circ buf info */
++		xmit->tail += dbuf->ofs;
++		xmit->tail &= UART_XMIT_SIZE - 1;
++
++		up->port.icount.tx += dbuf->ofs;
++		dbuf->ofs = 0;
++	}
++
++	if (!uart_circ_empty(xmit) && !uart_tx_stopped(&up->port)) {
++		set_bit(flag_tx_on, &up->flags);
++		dma_sync_single_for_device(up->port.dev,
++					   dbuf->dma_addr,
++					   dbuf->dma_size,
++					   DMA_TO_DEVICE);
++
++		count = CIRC_CNT_TO_END(xmit->head, xmit->tail, UART_XMIT_SIZE);
++		dbuf->ofs = count;
++
++		/* Reprogram the channel */
++		up->tx_addr = dbuf->dma_addr + xmit->tail;
++		chan_writel(up->txc, HSU_CH_D0SAR, up->tx_addr);
++		chan_writel(up->txc, HSU_CH_D0TSR, count);
++
++		/* Reenable the channel */
++		chan_writel(up->txc, HSU_CH_DCR, 0x1
++						 | (0x1 << 8)
++						 | (0x1 << 16));
++		chan_writel(up->txc, HSU_CH_CR, 0x1);
++	}
++
++	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
++		uart_write_wakeup(&up->port);
++
++	spin_unlock_irqrestore(&up->port.lock, flags);
++	return;
++}
++
++static void intel_dma_stop_tx(struct uart_hsu_port *up)
++{
++	chan_writel(up->txc, HSU_CH_CR, 0x0);
++	return;
++}
++
++static void intel_dma_start_rx(struct uart_hsu_port *up)
++{
++	return;
++}
++
++static void intel_dma_stop_rx(struct uart_hsu_port *up)
++{
++	chan_writel(up->rxc, HSU_CH_CR, 0x2);
++	return;
++}
++
++static void intel_dma_context_op(struct uart_hsu_port *up, int op)
++{
++	if (op == context_save) {
++		up->txc->cr  = chan_readl(up->txc, HSU_CH_CR);
++		up->txc->dcr = chan_readl(up->txc, HSU_CH_DCR);
++		up->txc->sar = chan_readl(up->txc, HSU_CH_D0SAR);
++		up->txc->tsr = chan_readl(up->txc, HSU_CH_D0TSR);
++
++		up->rxc->cr  = chan_readl(up->rxc, HSU_CH_CR);
++		up->rxc->dcr = chan_readl(up->rxc, HSU_CH_DCR);
++		up->rxc->sar = chan_readl(up->rxc, HSU_CH_D0SAR);
++		up->rxc->tsr = chan_readl(up->rxc, HSU_CH_D0TSR);
++	} else {
++		chan_writel(up->txc, HSU_CH_DCR, up->txc->dcr);
++		chan_writel(up->txc, HSU_CH_D0SAR, up->txc->sar);
++		chan_writel(up->txc, HSU_CH_D0TSR, up->txc->tsr);
++		chan_writel(up->txc, HSU_CH_BSR, HSU_DMA_BSR);
++		chan_writel(up->txc, HSU_CH_MOTSR, HSU_DMA_MOTSR);
++
++		chan_writel(up->rxc, HSU_CH_DCR, up->rxc->dcr);
++		chan_writel(up->rxc, HSU_CH_D0SAR, up->rxc->sar);
++		chan_writel(up->rxc, HSU_CH_D0TSR, up->rxc->tsr);
++		chan_writel(up->rxc, HSU_CH_BSR, HSU_DMA_BSR);
++		chan_writel(up->rxc, HSU_CH_MOTSR, HSU_DMA_MOTSR);
++	}
++}
++
++
++static int intel_dma_resume(struct uart_hsu_port *up)
++{
++	chan_writel(up->rxc, HSU_CH_CR, up->rxc_chcr_save);
++	return 0;
++}
++
++static int intel_dma_suspend(struct uart_hsu_port *up)
++{
++	int loop = 100000;
++	struct hsu_dma_chan *chan = up->rxc;
++
++	up->rxc_chcr_save = chan_readl(up->rxc, HSU_CH_CR);
++
++	if (test_bit(flag_startup, &up->flags)
++			&& serial_in(up, UART_FOR) & 0x7F) {
++		dev_err(up->dev, "ignore suspend for rx fifo\n");
++		return -1;
++	}
++
++	if (chan_readl(up->txc, HSU_CH_CR)) {
++		dev_info(up->dev, "ignore suspend for tx dma\n");
++		return -1;
++	}
++
++	chan_writel(up->rxc, HSU_CH_CR, 0x2);
++	while (--loop) {
++		if (chan_readl(up->rxc, HSU_CH_CR) == 0x2)
++			break;
++		cpu_relax();
++	}
++
++	if (!loop) {
++		dev_err(up->dev, "Can't stop rx dma\n");
++		return -1;
++	}
++
++	if (chan_readl(chan, HSU_CH_D0SAR) - up->rxbuf.dma_addr) {
++		dev_err(up->dev, "ignore suspend for dma pointer\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++struct hsu_dma_ops intel_hsu_dma_ops = {
++	.init =		intel_dma_init,
++	.exit =		intel_dma_exit,
++	.suspend =	intel_dma_suspend,
++	.resume	=	intel_dma_resume,
++	.start_tx =	intel_dma_start_tx,
++	.stop_tx =	intel_dma_stop_tx,
++	.start_rx =	intel_dma_start_rx,
++	.stop_rx =	intel_dma_stop_rx,
++	.context_op =	intel_dma_context_op,
++};
+--- /dev/null
++++ b/drivers/tty/serial/hsu/hsu_pci.c
+@@ -0,0 +1,286 @@
++/*
++ * hsu_pci.c: driver for Intel High Speed UART device
++ *
++ * Refer pxa.c, 8250.c and some other drivers in drivers/serial/
++ *
++ * (C) Copyright 2010 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/pci.h>
++#include <linux/io.h>
++#include <linux/pm_runtime.h>
++
++#include "hsu.h"
++
++#ifdef CONFIG_PM
++static int serial_hsu_pci_suspend(struct device *dev)
++{
++	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
++	struct uart_hsu_port *up = pci_get_drvdata(pdev);
++	int ret = 0;
++
++	if (up)
++		ret = serial_hsu_do_suspend(up);
++
++	return ret;
++}
++
++static int serial_hsu_pci_resume(struct device *dev)
++{
++	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
++	struct uart_hsu_port *up = pci_get_drvdata(pdev);
++	int ret = 0;
++
++	if (up)
++		ret = serial_hsu_do_resume(up);
++
++	return ret;
++}
++#else
++#define serial_hsu_pci_suspend	NULL
++#define serial_hsu_pci_resume	NULL
++#endif
++
++#ifdef CONFIG_PM_RUNTIME
++static int serial_hsu_pci_runtime_idle(struct device *dev)
++{
++	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
++	struct uart_hsu_port *up = pci_get_drvdata(pdev);
++
++	return serial_hsu_do_runtime_idle(up);
++}
++
++static int serial_hsu_pci_runtime_suspend(struct device *dev)
++{
++	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
++	struct uart_hsu_port *up = pci_get_drvdata(pdev);
++	int ret = 0;
++
++	ret = serial_hsu_do_suspend(up);
++	return ret;
++}
++
++static int serial_hsu_pci_runtime_resume(struct device *dev)
++{
++	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
++	struct uart_hsu_port *up = pci_get_drvdata(pdev);
++	int ret = 0;
++
++	ret = serial_hsu_do_resume(up);
++	return ret;
++}
++#else
++#define serial_hsu_pci_runtime_idle		NULL
++#define serial_hsu_pci_runtime_suspend	NULL
++#define serial_hsu_pci_runtime_resume	NULL
++#endif
++
++static const struct dev_pm_ops serial_hsu_pci_pm_ops = {
++
++	SET_SYSTEM_SLEEP_PM_OPS(serial_hsu_pci_suspend,
++				serial_hsu_pci_resume)
++	SET_RUNTIME_PM_OPS(serial_hsu_pci_runtime_suspend,
++				serial_hsu_pci_runtime_resume,
++				serial_hsu_pci_runtime_idle)
++};
++
++enum hsu_pci_id_t {
++	medfield_hsu,
++};
++
++static struct hsu_port_cfg hsu_pci_cfgs[] = {
++	[medfield_hsu] = {
++		.hw_ip = hsu_intel,
++	},
++};
++
++static const struct pci_device_id hsuart_port_pci_ids[] = {
++	{ PCI_VDEVICE(INTEL, 0x081B), medfield_hsu },
++	{ PCI_VDEVICE(INTEL, 0x081C), medfield_hsu },
++	{ PCI_VDEVICE(INTEL, 0x081D), medfield_hsu },
++	{},
++};
++MODULE_DEVICE_TABLE(pci, hsuart_port_pci_ids);
++
++static const struct pci_device_id hsuart_dma_pci_ids[] = {
++	{ PCI_VDEVICE(INTEL, 0x081E), 0 },
++	{},
++};
++MODULE_DEVICE_TABLE(pci, hsuart_dma_pci_ids);
++
++static int serial_hsu_pci_port_probe(struct pci_dev *pdev,
++				const struct pci_device_id *ent)
++{
++	struct uart_hsu_port *up;
++	int ret, index;
++	resource_size_t start, len;
++	struct hsu_port_cfg *hsu_cfg;
++
++	start = pci_resource_start(pdev, 0);
++	len = pci_resource_len(pdev, 0);
++
++	if (ent->driver_data >= ARRAY_SIZE(hsu_pci_cfgs)) {
++		dev_err(&pdev->dev, "%s: invalid driver data %ld\n", __func__,
++			ent->driver_data);
++		return -EINVAL;
++	}
++
++	dev_info(&pdev->dev,
++		"FUNC: %d driver: %ld addr:%lx len:%lx\n",
++		PCI_FUNC(pdev->devfn), ent->driver_data,
++		(ulong) start, (ulong) len);
++
++	switch (pdev->device) {
++	case 0x081B:
++		index = 0;
++		break;
++	case 0x081C:
++		index = 1;
++		break;
++	case 0x081D:
++		index = 2;
++		break;
++	default:
++		dev_err(&pdev->dev, "HSU: out of index!");
++		return -ENODEV;
++	}
++
++	ret = pci_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	ret = pci_request_region(pdev, 0, "hsu");
++	if (ret)
++		goto err;
++
++	hsu_cfg = &hsu_pci_cfgs[ent->driver_data];
++
++	up = serial_hsu_port_setup(&pdev->dev, index, start, len,
++			pdev->irq, hsu_cfg);
++	if (IS_ERR(up))
++		goto err;
++
++	pci_set_drvdata(pdev, up);
++
++	pm_runtime_put_noidle(&pdev->dev);
++	pm_runtime_allow(&pdev->dev);
++	return 0;
++err:
++	pci_disable_device(pdev);
++	return ret;
++}
++
++static void serial_hsu_pci_port_remove(struct pci_dev *pdev)
++{
++	struct uart_hsu_port *up = pci_get_drvdata(pdev);
++
++	pm_runtime_forbid(&pdev->dev);
++	pm_runtime_get_noresume(&pdev->dev);
++	serial_hsu_port_free(up);
++	pci_set_drvdata(pdev, NULL);
++	pci_disable_device(pdev);
++}
++
++static void serial_hsu_pci_port_shutdown(struct pci_dev *pdev)
++{
++	struct uart_hsu_port *up = pci_get_drvdata(pdev);
++
++	if (!up)
++		return;
++
++	serial_hsu_port_shutdown(up);
++}
++
++static struct pci_driver hsu_port_pci_driver = {
++	.name =		"HSU serial",
++	.id_table =	hsuart_port_pci_ids,
++	.probe =	serial_hsu_pci_port_probe,
++	.remove =	serial_hsu_pci_port_remove,
++	.shutdown =	serial_hsu_pci_port_shutdown,
++/* Disable PM only when kgdb(poll mode uart) is enabled */
++#if defined(CONFIG_PM) && !defined(CONFIG_CONSOLE_POLL)
++	.driver = {
++		.pm = &serial_hsu_pci_pm_ops,
++	},
++#endif
++};
++
++static int serial_hsu_pci_dma_probe(struct pci_dev *pdev,
++				const struct pci_device_id *ent)
++{
++	int ret;
++	resource_size_t start, len;
++
++	start = pci_resource_start(pdev, 0);
++	len = pci_resource_len(pdev, 0);
++
++	dev_info(&pdev->dev,
++		"FUNC: %d driver: %ld addr:%lx len:%lx\n",
++		PCI_FUNC(pdev->devfn), ent->driver_data,
++		(ulong) pci_resource_start(pdev, 0),
++		(ulong) pci_resource_len(pdev, 0));
++
++	ret = pci_enable_device(pdev);
++	if (ret)
++		return ret;
++
++	ret = pci_request_region(pdev, 0, "hsu dma");
++	if (ret)
++		goto err;
++
++	ret = serial_hsu_dma_setup(&pdev->dev, start, len, pdev->irq);
++	if (ret)
++		goto err;
++
++	return 0;
++err:
++	pci_disable_device(pdev);
++	return ret;
++}
++
++static void serial_hsu_pci_dma_remove(struct pci_dev *pdev)
++{
++	serial_hsu_dma_free();
++	pci_disable_device(pdev);
++	pci_unregister_driver(&hsu_port_pci_driver);
++}
++
++static struct pci_driver hsu_dma_pci_driver = {
++	.name =		"HSU DMA",
++	.id_table =	hsuart_dma_pci_ids,
++	.probe =	serial_hsu_pci_dma_probe,
++	.remove =	serial_hsu_pci_dma_remove,
++};
++
++static int __init hsu_pci_init(void)
++{
++	int ret;
++
++	ret = pci_register_driver(&hsu_dma_pci_driver);
++	if (!ret) {
++		ret = pci_register_driver(&hsu_port_pci_driver);
++		if (ret)
++			pci_unregister_driver(&hsu_dma_pci_driver);
++	}
++
++	return ret;
++}
++
++static void __exit hsu_pci_exit(void)
++{
++	pci_unregister_driver(&hsu_port_pci_driver);
++	pci_unregister_driver(&hsu_dma_pci_driver);
++}
++
++module_init(hsu_pci_init);
++module_exit(hsu_pci_exit);
++
++MODULE_AUTHOR("Yang Bin <bin.yang@intel.com>");
++MODULE_LICENSE("GPL v2");
+--- /dev/null
++++ b/drivers/tty/serial/hsu/hsu_plat.c
+@@ -0,0 +1,290 @@
++/*
++ * hsu_plat.c: driver for Intel High Speed UART device
++ *
++ * (C) Copyright 2013 Intel Corporation
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; version 2
++ * of the License.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/platform_device.h>
++#include <linux/io.h>
++#include <linux/pm_runtime.h>
++#include <linux/acpi.h>
++#include <linux/clk.h>
++
++#include "hsu.h"
++
++#define CHT_HSU_CLOCK	0x0800
++#define CHT_HSU_RESET	0x0804
++#define CHT_GENERAL_REG 0x0808
++#define CHT_HSU_OVF_IRQ	0x0820	/* Overflow interrupt related */
++
++#define CHT_GENERAL_DIS_RTS_N_OVERRIDE (1 << 3)
++enum {
++	hsu_chv_0,
++	hsu_chv_1,
++};
++
++void cht_hsu_reset(void __iomem *addr)
++{
++	writel(0, addr + CHT_HSU_RESET);
++	writel(3, addr + CHT_HSU_RESET);
++
++	/* Disable the tx overflow IRQ */
++	writel(2, addr + CHT_HSU_OVF_IRQ);
++}
++
++void cht_hsu_set_clk(unsigned int m, unsigned int n,
++				void __iomem *addr)
++{
++	unsigned int param, update_bit;
++
++	update_bit = 1 << 31;
++	param = (m << 1) | (n << 16) | 0x1;
++
++	writel(param, addr + CHT_HSU_CLOCK);
++	writel((param | update_bit), addr + CHT_HSU_CLOCK);
++	writel(param, addr + CHT_HSU_CLOCK);
++}
++
++unsigned int cht_hsu_get_uartclk(struct uart_hsu_port *up)
++{
++	struct clk *clk;
++	unsigned int uartclk = 0;
++
++	clk = devm_clk_get(up->dev, NULL);
++	if (!IS_ERR(clk)) {
++		clk_prepare_enable(clk);
++		uartclk = clk_get_rate(clk);
++	}
++
++	return uartclk;
++}
++
++static struct hsu_port_cfg hsu_port_cfgs[] = {
++	[hsu_chv_0] = {
++		.hw_ip = hsu_dw,
++		.idle = 100,
++		.hw_reset = cht_hsu_reset,
++		.get_uartclk = cht_hsu_get_uartclk,
++		.set_clk = cht_hsu_set_clk,
++		.hw_context_save = 1,
++	},
++	[hsu_chv_1] = {
++		.hw_ip = hsu_dw,
++		.idle = 100,
++		.hw_reset = cht_hsu_reset,
++		.get_uartclk = cht_hsu_get_uartclk,
++		.set_clk = cht_hsu_set_clk,
++		.hw_context_save = 1,
++	},
++};
++
++#ifdef CONFIG_ACPI
++static const struct acpi_device_id hsu_acpi_ids[] = {
++	{ "8086228A", hsu_chv_0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(acpi, hsu_acpi_ids);
++#endif
++
++#ifdef CONFIG_PM
++static int serial_hsu_plat_suspend(struct device *dev)
++{
++	struct uart_hsu_port *up = dev_get_drvdata(dev);
++	int ret = 0;
++
++	if (up)
++		ret = serial_hsu_do_suspend(up);
++
++	return ret;
++}
++
++static int serial_hsu_plat_resume(struct device *dev)
++{
++	struct uart_hsu_port *up = dev_get_drvdata(dev);
++	int ret = 0;
++
++	if (up)
++		ret = serial_hsu_do_resume(up);
++
++	return ret;
++}
++#else
++#define serial_hsu_plat_suspend	NULL
++#define serial_hsu_plat_resume	NULL
++#endif
++
++#ifdef CONFIG_PM_RUNTIME
++static int serial_hsu_plat_runtime_idle(struct device *dev)
++{
++	struct uart_hsu_port *up = dev_get_drvdata(dev);
++
++	return serial_hsu_do_runtime_idle(up);
++}
++
++static int serial_hsu_plat_runtime_suspend(struct device *dev)
++{
++	struct uart_hsu_port *up = dev_get_drvdata(dev);
++	int ret = 0;
++
++	ret = serial_hsu_do_suspend(up);
++	return ret;
++}
++
++static int serial_hsu_plat_runtime_resume(struct device *dev)
++{
++	struct uart_hsu_port *up = dev_get_drvdata(dev);
++	int ret = 0;
++
++	ret = serial_hsu_do_resume(up);
++	return ret;
++}
++#else
++#define serial_hsu_plat_runtime_idle	NULL
++#define serial_hsu_plat_runtime_suspend	NULL
++#define serial_hsu_plat_runtime_resume	NULL
++#endif
++
++static const struct dev_pm_ops serial_hsu_plat_pm_ops = {
++
++	SET_SYSTEM_SLEEP_PM_OPS(serial_hsu_plat_suspend,
++				serial_hsu_plat_resume)
++	SET_RUNTIME_PM_OPS(serial_hsu_plat_runtime_suspend,
++				serial_hsu_plat_runtime_resume,
++				serial_hsu_plat_runtime_idle)
++};
++
++static int serial_hsu_plat_port_probe(struct platform_device *pdev)
++{
++	const struct acpi_device_id *id;
++	struct acpi_device *adev;
++	struct uart_hsu_port *up;
++	int port = pdev->id, irq;
++	struct resource *mem, *ioarea;
++	resource_size_t start, len;
++	struct hsu_port_cfg *cfg = NULL;
++
++#ifdef CONFIG_ACPI
++	if (!ACPI_HANDLE(&pdev->dev) ||
++	    acpi_bus_get_device(ACPI_HANDLE(&pdev->dev), &adev))
++		return -ENODEV;
++
++	id = acpi_match_device(pdev->dev.driver->acpi_match_table, &pdev->dev);
++	if (!id)
++		return -ENODEV;
++
++	if (kstrtoint(adev->pnp.unique_id, 0, &port))
++		return -ENODEV;
++	port--;
++
++	cfg = &hsu_port_cfgs[id->driver_data + port];
++	cfg->dev = &pdev->dev;
++#endif
++
++	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!mem) {
++		dev_err(&pdev->dev, "no mem resource?\n");
++		return -EINVAL;
++	}
++	start = mem->start;
++	len = resource_size(mem);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		dev_err(&pdev->dev, "no irq resource?\n");
++		return -ENXIO;
++	}
++
++	ioarea = request_mem_region(mem->start, resource_size(mem),
++			pdev->name);
++	if (!ioarea) {
++		dev_err(&pdev->dev, "HSU region already claimed\n");
++		return -EBUSY;
++	}
++
++	up = serial_hsu_port_setup(&pdev->dev, port, start, len,
++			irq, cfg);
++	if (IS_ERR(up)) {
++		release_mem_region(mem->start, resource_size(mem));
++		dev_err(&pdev->dev, "failed to setup HSU\n");
++		return -EINVAL;
++	}
++
++	platform_set_drvdata(pdev, up);
++
++	if (!pdev->dev.dma_mask) {
++		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
++		pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
++	}
++	dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
++
++	pm_runtime_set_active(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
++	pm_runtime_allow(&pdev->dev);
++
++	return 0;
++}
++
++static int serial_hsu_plat_port_remove(struct platform_device *pdev)
++{
++	struct uart_hsu_port *up = platform_get_drvdata(pdev);
++	struct resource *mem;
++
++	pm_runtime_forbid(&pdev->dev);
++	serial_hsu_port_free(up);
++	platform_set_drvdata(pdev, NULL);
++	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (mem)
++		release_mem_region(mem->start, resource_size(mem));
++
++	return 0;
++}
++
++static void serial_hsu_plat_port_shutdown(struct platform_device *pdev)
++{
++	struct uart_hsu_port *up = platform_get_drvdata(pdev);
++
++	if (!up)
++		return;
++
++	serial_hsu_port_shutdown(up);
++}
++
++static struct platform_driver hsu_plat_driver = {
++	.probe		= serial_hsu_plat_port_probe,
++	.remove		= serial_hsu_plat_port_remove,
++	.shutdown	= serial_hsu_plat_port_shutdown,
++	.driver		= {
++		.name	= "HSU serial",
++		.owner	= THIS_MODULE,
++/* Disable PM only when kgdb(poll mode uart) is enabled */
++#if defined(CONFIG_PM) && !defined(CONFIG_CONSOLE_POLL)
++		.pm     = &serial_hsu_plat_pm_ops,
++#endif
++#ifdef CONFIG_ACPI
++		.acpi_match_table = ACPI_PTR(hsu_acpi_ids),
++#endif
++	},
++};
++
++static int __init hsu_plat_init(void)
++{
++	return platform_driver_register(&hsu_plat_driver);
++}
++
++static void __exit hsu_plat_exit(void)
++{
++	platform_driver_unregister(&hsu_plat_driver);
++}
++
++module_init(hsu_plat_init);
++module_exit(hsu_plat_exit);
++
++MODULE_AUTHOR("Jason Chen <jason.cj.chen@intel.com>");
++MODULE_LICENSE("GPL v2");
+--- a/drivers/tty/serial/mfd.c
++++ /dev/null
+@@ -1,1507 +0,0 @@
+-/*
+- * mfd.c: driver for High Speed UART device of Intel Medfield platform
+- *
+- * Refer pxa.c, 8250.c and some other drivers in drivers/serial/
+- *
+- * (C) Copyright 2010 Intel Corporation
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License
+- * as published by the Free Software Foundation; version 2
+- * of the License.
+- */
+-
+-/* Notes:
+- * 1. DMA channel allocation: 0/1 channel are assigned to port 0,
+- *    2/3 chan to port 1, 4/5 chan to port 3. Even number chans
+- *    are used for RX, odd chans for TX
+- *
+- * 2. The RI/DSR/DCD/DTR are not pinned out, DCD & DSR are always
+- *    asserted, only when the HW is reset the DDCD and DDSR will
+- *    be triggered
+- */
+-
+-#if defined(CONFIG_SERIAL_MFD_HSU_CONSOLE) && defined(CONFIG_MAGIC_SYSRQ)
+-#define SUPPORT_SYSRQ
+-#endif
+-
+-#include <linux/module.h>
+-#include <linux/init.h>
+-#include <linux/console.h>
+-#include <linux/sysrq.h>
+-#include <linux/slab.h>
+-#include <linux/serial_reg.h>
+-#include <linux/circ_buf.h>
+-#include <linux/delay.h>
+-#include <linux/interrupt.h>
+-#include <linux/tty.h>
+-#include <linux/tty_flip.h>
+-#include <linux/serial_core.h>
+-#include <linux/serial_mfd.h>
+-#include <linux/dma-mapping.h>
+-#include <linux/pci.h>
+-#include <linux/nmi.h>
+-#include <linux/io.h>
+-#include <linux/debugfs.h>
+-#include <linux/pm_runtime.h>
+-
+-#define HSU_DMA_BUF_SIZE	2048
+-
+-#define chan_readl(chan, offset)	readl(chan->reg + offset)
+-#define chan_writel(chan, offset, val)	writel(val, chan->reg + offset)
+-
+-#define mfd_readl(obj, offset)		readl(obj->reg + offset)
+-#define mfd_writel(obj, offset, val)	writel(val, obj->reg + offset)
+-
+-static int hsu_dma_enable;
+-module_param(hsu_dma_enable, int, 0);
+-MODULE_PARM_DESC(hsu_dma_enable,
+-		 "It is a bitmap to set working mode, if bit[x] is 1, then port[x] will work in DMA mode, otherwise in PIO mode.");
+-
+-struct hsu_dma_buffer {
+-	u8		*buf;
+-	dma_addr_t	dma_addr;
+-	u32		dma_size;
+-	u32		ofs;
+-};
+-
+-struct hsu_dma_chan {
+-	u32	id;
+-	enum dma_data_direction	dirt;
+-	struct uart_hsu_port	*uport;
+-	void __iomem		*reg;
+-};
+-
+-struct uart_hsu_port {
+-	struct uart_port        port;
+-	unsigned char           ier;
+-	unsigned char           lcr;
+-	unsigned char           mcr;
+-	unsigned int            lsr_break_flag;
+-	char			name[12];
+-	int			index;
+-	struct device		*dev;
+-
+-	struct hsu_dma_chan	*txc;
+-	struct hsu_dma_chan	*rxc;
+-	struct hsu_dma_buffer	txbuf;
+-	struct hsu_dma_buffer	rxbuf;
+-	int			use_dma;	/* flag for DMA/PIO */
+-	int			running;
+-	int			dma_tx_on;
+-};
+-
+-/* Top level data structure of HSU */
+-struct hsu_port {
+-	void __iomem	*reg;
+-	unsigned long	paddr;
+-	unsigned long	iolen;
+-	u32		irq;
+-
+-	struct uart_hsu_port	port[3];
+-	struct hsu_dma_chan	chans[10];
+-
+-	struct dentry *debugfs;
+-};
+-
+-static inline unsigned int serial_in(struct uart_hsu_port *up, int offset)
+-{
+-	unsigned int val;
+-
+-	if (offset > UART_MSR) {
+-		offset <<= 2;
+-		val = readl(up->port.membase + offset);
+-	} else
+-		val = (unsigned int)readb(up->port.membase + offset);
+-
+-	return val;
+-}
+-
+-static inline void serial_out(struct uart_hsu_port *up, int offset, int value)
+-{
+-	if (offset > UART_MSR) {
+-		offset <<= 2;
+-		writel(value, up->port.membase + offset);
+-	} else {
+-		unsigned char val = value & 0xff;
+-		writeb(val, up->port.membase + offset);
+-	}
+-}
+-
+-#ifdef CONFIG_DEBUG_FS
+-
+-#define HSU_REGS_BUFSIZE	1024
+-
+-
+-static ssize_t port_show_regs(struct file *file, char __user *user_buf,
+-				size_t count, loff_t *ppos)
+-{
+-	struct uart_hsu_port *up = file->private_data;
+-	char *buf;
+-	u32 len = 0;
+-	ssize_t ret;
+-
+-	buf = kzalloc(HSU_REGS_BUFSIZE, GFP_KERNEL);
+-	if (!buf)
+-		return 0;
+-
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"MFD HSU port[%d] regs:\n", up->index);
+-
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"=================================\n");
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"IER: \t\t0x%08x\n", serial_in(up, UART_IER));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"IIR: \t\t0x%08x\n", serial_in(up, UART_IIR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"LCR: \t\t0x%08x\n", serial_in(up, UART_LCR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"MCR: \t\t0x%08x\n", serial_in(up, UART_MCR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"LSR: \t\t0x%08x\n", serial_in(up, UART_LSR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"MSR: \t\t0x%08x\n", serial_in(up, UART_MSR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"FOR: \t\t0x%08x\n", serial_in(up, UART_FOR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"PS: \t\t0x%08x\n", serial_in(up, UART_PS));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"MUL: \t\t0x%08x\n", serial_in(up, UART_MUL));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"DIV: \t\t0x%08x\n", serial_in(up, UART_DIV));
+-
+-	if (len > HSU_REGS_BUFSIZE)
+-		len = HSU_REGS_BUFSIZE;
+-
+-	ret =  simple_read_from_buffer(user_buf, count, ppos, buf, len);
+-	kfree(buf);
+-	return ret;
+-}
+-
+-static ssize_t dma_show_regs(struct file *file, char __user *user_buf,
+-				size_t count, loff_t *ppos)
+-{
+-	struct hsu_dma_chan *chan = file->private_data;
+-	char *buf;
+-	u32 len = 0;
+-	ssize_t ret;
+-
+-	buf = kzalloc(HSU_REGS_BUFSIZE, GFP_KERNEL);
+-	if (!buf)
+-		return 0;
+-
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"MFD HSU DMA channel [%d] regs:\n", chan->id);
+-
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"=================================\n");
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"CR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_CR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"DCR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_DCR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"BSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_BSR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"MOTSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_MOTSR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D0SAR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D0TSR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D1SAR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D1TSR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D2SAR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D2TSR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0SAR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D3SAR));
+-	len += snprintf(buf + len, HSU_REGS_BUFSIZE - len,
+-			"D0TSR: \t\t0x%08x\n", chan_readl(chan, HSU_CH_D3TSR));
+-
+-	if (len > HSU_REGS_BUFSIZE)
+-		len = HSU_REGS_BUFSIZE;
+-
+-	ret =  simple_read_from_buffer(user_buf, count, ppos, buf, len);
+-	kfree(buf);
+-	return ret;
+-}
+-
+-static const struct file_operations port_regs_ops = {
+-	.owner		= THIS_MODULE,
+-	.open		= simple_open,
+-	.read		= port_show_regs,
+-	.llseek		= default_llseek,
+-};
+-
+-static const struct file_operations dma_regs_ops = {
+-	.owner		= THIS_MODULE,
+-	.open		= simple_open,
+-	.read		= dma_show_regs,
+-	.llseek		= default_llseek,
+-};
+-
+-static int hsu_debugfs_init(struct hsu_port *hsu)
+-{
+-	int i;
+-	char name[32];
+-
+-	hsu->debugfs = debugfs_create_dir("hsu", NULL);
+-	if (!hsu->debugfs)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < 3; i++) {
+-		snprintf(name, sizeof(name), "port_%d_regs", i);
+-		debugfs_create_file(name, S_IFREG | S_IRUGO,
+-			hsu->debugfs, (void *)(&hsu->port[i]), &port_regs_ops);
+-	}
+-
+-	for (i = 0; i < 6; i++) {
+-		snprintf(name, sizeof(name), "dma_chan_%d_regs", i);
+-		debugfs_create_file(name, S_IFREG | S_IRUGO,
+-			hsu->debugfs, (void *)&hsu->chans[i], &dma_regs_ops);
+-	}
+-
+-	return 0;
+-}
+-
+-static void hsu_debugfs_remove(struct hsu_port *hsu)
+-{
+-	if (hsu->debugfs)
+-		debugfs_remove_recursive(hsu->debugfs);
+-}
+-
+-#else
+-static inline int hsu_debugfs_init(struct hsu_port *hsu)
+-{
+-	return 0;
+-}
+-
+-static inline void hsu_debugfs_remove(struct hsu_port *hsu)
+-{
+-}
+-#endif /* CONFIG_DEBUG_FS */
+-
+-static void serial_hsu_enable_ms(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-
+-	up->ier |= UART_IER_MSI;
+-	serial_out(up, UART_IER, up->ier);
+-}
+-
+-void hsu_dma_tx(struct uart_hsu_port *up)
+-{
+-	struct circ_buf *xmit = &up->port.state->xmit;
+-	struct hsu_dma_buffer *dbuf = &up->txbuf;
+-	int count;
+-
+-	/* test_and_set_bit may be better, but anyway it's in lock protected mode */
+-	if (up->dma_tx_on)
+-		return;
+-
+-	/* Update the circ buf info */
+-	xmit->tail += dbuf->ofs;
+-	xmit->tail &= UART_XMIT_SIZE - 1;
+-
+-	up->port.icount.tx += dbuf->ofs;
+-	dbuf->ofs = 0;
+-
+-	/* Disable the channel */
+-	chan_writel(up->txc, HSU_CH_CR, 0x0);
+-
+-	if (!uart_circ_empty(xmit) && !uart_tx_stopped(&up->port)) {
+-		dma_sync_single_for_device(up->port.dev,
+-					   dbuf->dma_addr,
+-					   dbuf->dma_size,
+-					   DMA_TO_DEVICE);
+-
+-		count = CIRC_CNT_TO_END(xmit->head, xmit->tail, UART_XMIT_SIZE);
+-		dbuf->ofs = count;
+-
+-		/* Reprogram the channel */
+-		chan_writel(up->txc, HSU_CH_D0SAR, dbuf->dma_addr + xmit->tail);
+-		chan_writel(up->txc, HSU_CH_D0TSR, count);
+-
+-		/* Reenable the channel */
+-		chan_writel(up->txc, HSU_CH_DCR, 0x1
+-						 | (0x1 << 8)
+-						 | (0x1 << 16)
+-						 | (0x1 << 24));
+-		up->dma_tx_on = 1;
+-		chan_writel(up->txc, HSU_CH_CR, 0x1);
+-	}
+-
+-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+-		uart_write_wakeup(&up->port);
+-}
+-
+-/* The buffer is already cache coherent */
+-void hsu_dma_start_rx_chan(struct hsu_dma_chan *rxc, struct hsu_dma_buffer *dbuf)
+-{
+-	dbuf->ofs = 0;
+-
+-	chan_writel(rxc, HSU_CH_BSR, 32);
+-	chan_writel(rxc, HSU_CH_MOTSR, 4);
+-
+-	chan_writel(rxc, HSU_CH_D0SAR, dbuf->dma_addr);
+-	chan_writel(rxc, HSU_CH_D0TSR, dbuf->dma_size);
+-	chan_writel(rxc, HSU_CH_DCR, 0x1 | (0x1 << 8)
+-					 | (0x1 << 16)
+-					 | (0x1 << 24)	/* timeout bit, see HSU Errata 1 */
+-					 );
+-	chan_writel(rxc, HSU_CH_CR, 0x3);
+-}
+-
+-/* Protected by spin_lock_irqsave(port->lock) */
+-static void serial_hsu_start_tx(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-
+-	if (up->use_dma) {
+-		hsu_dma_tx(up);
+-	} else if (!(up->ier & UART_IER_THRI)) {
+-		up->ier |= UART_IER_THRI;
+-		serial_out(up, UART_IER, up->ier);
+-	}
+-}
+-
+-static void serial_hsu_stop_tx(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	struct hsu_dma_chan *txc = up->txc;
+-
+-	if (up->use_dma)
+-		chan_writel(txc, HSU_CH_CR, 0x0);
+-	else if (up->ier & UART_IER_THRI) {
+-		up->ier &= ~UART_IER_THRI;
+-		serial_out(up, UART_IER, up->ier);
+-	}
+-}
+-
+-/* This is always called in spinlock protected mode, so
+- * modify timeout timer is safe here */
+-void hsu_dma_rx(struct uart_hsu_port *up, u32 int_sts, unsigned long *flags)
+-{
+-	struct hsu_dma_buffer *dbuf = &up->rxbuf;
+-	struct hsu_dma_chan *chan = up->rxc;
+-	struct uart_port *port = &up->port;
+-	struct tty_port *tport = &port->state->port;
+-	int count;
+-
+-	/*
+-	 * First need to know how many is already transferred,
+-	 * then check if its a timeout DMA irq, and return
+-	 * the trail bytes out, push them up and reenable the
+-	 * channel
+-	 */
+-
+-	/* Timeout IRQ, need wait some time, see Errata 2 */
+-	if (int_sts & 0xf00)
+-		udelay(2);
+-
+-	/* Stop the channel */
+-	chan_writel(chan, HSU_CH_CR, 0x0);
+-
+-	count = chan_readl(chan, HSU_CH_D0SAR) - dbuf->dma_addr;
+-	if (!count) {
+-		/* Restart the channel before we leave */
+-		chan_writel(chan, HSU_CH_CR, 0x3);
+-		return;
+-	}
+-
+-	dma_sync_single_for_cpu(port->dev, dbuf->dma_addr,
+-			dbuf->dma_size, DMA_FROM_DEVICE);
+-
+-	/*
+-	 * Head will only wrap around when we recycle
+-	 * the DMA buffer, and when that happens, we
+-	 * explicitly set tail to 0. So head will
+-	 * always be greater than tail.
+-	 */
+-	tty_insert_flip_string(tport, dbuf->buf, count);
+-	port->icount.rx += count;
+-
+-	dma_sync_single_for_device(up->port.dev, dbuf->dma_addr,
+-			dbuf->dma_size, DMA_FROM_DEVICE);
+-
+-	/* Reprogram the channel */
+-	chan_writel(chan, HSU_CH_D0SAR, dbuf->dma_addr);
+-	chan_writel(chan, HSU_CH_D0TSR, dbuf->dma_size);
+-	chan_writel(chan, HSU_CH_DCR, 0x1
+-					 | (0x1 << 8)
+-					 | (0x1 << 16)
+-					 | (0x1 << 24)	/* timeout bit, see HSU Errata 1 */
+-					 );
+-	spin_unlock_irqrestore(&up->port.lock, *flags);
+-	tty_flip_buffer_push(tport);
+-	spin_lock_irqsave(&up->port.lock, *flags);
+-
+-	chan_writel(chan, HSU_CH_CR, 0x3);
+-
+-}
+-
+-static void serial_hsu_stop_rx(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	struct hsu_dma_chan *chan = up->rxc;
+-
+-	if (up->use_dma)
+-		chan_writel(chan, HSU_CH_CR, 0x2);
+-	else {
+-		up->ier &= ~UART_IER_RLSI;
+-		up->port.read_status_mask &= ~UART_LSR_DR;
+-		serial_out(up, UART_IER, up->ier);
+-	}
+-}
+-
+-static inline void receive_chars(struct uart_hsu_port *up, int *status,
+-		unsigned long *flags)
+-{
+-	unsigned int ch, flag;
+-	unsigned int max_count = 256;
+-
+-	do {
+-		ch = serial_in(up, UART_RX);
+-		flag = TTY_NORMAL;
+-		up->port.icount.rx++;
+-
+-		if (unlikely(*status & (UART_LSR_BI | UART_LSR_PE |
+-				       UART_LSR_FE | UART_LSR_OE))) {
+-
+-			dev_warn(up->dev, "We really rush into ERR/BI case"
+-				"status = 0x%02x", *status);
+-			/* For statistics only */
+-			if (*status & UART_LSR_BI) {
+-				*status &= ~(UART_LSR_FE | UART_LSR_PE);
+-				up->port.icount.brk++;
+-				/*
+-				 * We do the SysRQ and SAK checking
+-				 * here because otherwise the break
+-				 * may get masked by ignore_status_mask
+-				 * or read_status_mask.
+-				 */
+-				if (uart_handle_break(&up->port))
+-					goto ignore_char;
+-			} else if (*status & UART_LSR_PE)
+-				up->port.icount.parity++;
+-			else if (*status & UART_LSR_FE)
+-				up->port.icount.frame++;
+-			if (*status & UART_LSR_OE)
+-				up->port.icount.overrun++;
+-
+-			/* Mask off conditions which should be ignored. */
+-			*status &= up->port.read_status_mask;
+-
+-#ifdef CONFIG_SERIAL_MFD_HSU_CONSOLE
+-			if (up->port.cons &&
+-				up->port.cons->index == up->port.line) {
+-				/* Recover the break flag from console xmit */
+-				*status |= up->lsr_break_flag;
+-				up->lsr_break_flag = 0;
+-			}
+-#endif
+-			if (*status & UART_LSR_BI) {
+-				flag = TTY_BREAK;
+-			} else if (*status & UART_LSR_PE)
+-				flag = TTY_PARITY;
+-			else if (*status & UART_LSR_FE)
+-				flag = TTY_FRAME;
+-		}
+-
+-		if (uart_handle_sysrq_char(&up->port, ch))
+-			goto ignore_char;
+-
+-		uart_insert_char(&up->port, *status, UART_LSR_OE, ch, flag);
+-	ignore_char:
+-		*status = serial_in(up, UART_LSR);
+-	} while ((*status & UART_LSR_DR) && max_count--);
+-
+-	spin_unlock_irqrestore(&up->port.lock, *flags);
+-	tty_flip_buffer_push(&up->port.state->port);
+-	spin_lock_irqsave(&up->port.lock, *flags);
+-}
+-
+-static void transmit_chars(struct uart_hsu_port *up)
+-{
+-	struct circ_buf *xmit = &up->port.state->xmit;
+-	int count;
+-
+-	if (up->port.x_char) {
+-		serial_out(up, UART_TX, up->port.x_char);
+-		up->port.icount.tx++;
+-		up->port.x_char = 0;
+-		return;
+-	}
+-	if (uart_circ_empty(xmit) || uart_tx_stopped(&up->port)) {
+-		serial_hsu_stop_tx(&up->port);
+-		return;
+-	}
+-
+-	/* The IRQ is for TX FIFO half-empty */
+-	count = up->port.fifosize / 2;
+-
+-	do {
+-		serial_out(up, UART_TX, xmit->buf[xmit->tail]);
+-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+-
+-		up->port.icount.tx++;
+-		if (uart_circ_empty(xmit))
+-			break;
+-	} while (--count > 0);
+-
+-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+-		uart_write_wakeup(&up->port);
+-
+-	if (uart_circ_empty(xmit))
+-		serial_hsu_stop_tx(&up->port);
+-}
+-
+-static inline void check_modem_status(struct uart_hsu_port *up)
+-{
+-	int status;
+-
+-	status = serial_in(up, UART_MSR);
+-
+-	if ((status & UART_MSR_ANY_DELTA) == 0)
+-		return;
+-
+-	if (status & UART_MSR_TERI)
+-		up->port.icount.rng++;
+-	if (status & UART_MSR_DDSR)
+-		up->port.icount.dsr++;
+-	/* We may only get DDCD when HW init and reset */
+-	if (status & UART_MSR_DDCD)
+-		uart_handle_dcd_change(&up->port, status & UART_MSR_DCD);
+-	/* Will start/stop_tx accordingly */
+-	if (status & UART_MSR_DCTS)
+-		uart_handle_cts_change(&up->port, status & UART_MSR_CTS);
+-
+-	wake_up_interruptible(&up->port.state->port.delta_msr_wait);
+-}
+-
+-/*
+- * This handles the interrupt from one port.
+- */
+-static irqreturn_t port_irq(int irq, void *dev_id)
+-{
+-	struct uart_hsu_port *up = dev_id;
+-	unsigned int iir, lsr;
+-	unsigned long flags;
+-
+-	if (unlikely(!up->running))
+-		return IRQ_NONE;
+-
+-	spin_lock_irqsave(&up->port.lock, flags);
+-	if (up->use_dma) {
+-		lsr = serial_in(up, UART_LSR);
+-		if (unlikely(lsr & (UART_LSR_BI | UART_LSR_PE |
+-				       UART_LSR_FE | UART_LSR_OE)))
+-			dev_warn(up->dev,
+-				"Got lsr irq while using DMA, lsr = 0x%2x\n",
+-				lsr);
+-		check_modem_status(up);
+-		spin_unlock_irqrestore(&up->port.lock, flags);
+-		return IRQ_HANDLED;
+-	}
+-
+-	iir = serial_in(up, UART_IIR);
+-	if (iir & UART_IIR_NO_INT) {
+-		spin_unlock_irqrestore(&up->port.lock, flags);
+-		return IRQ_NONE;
+-	}
+-
+-	lsr = serial_in(up, UART_LSR);
+-	if (lsr & UART_LSR_DR)
+-		receive_chars(up, &lsr, &flags);
+-	check_modem_status(up);
+-
+-	/* lsr will be renewed during the receive_chars */
+-	if (lsr & UART_LSR_THRE)
+-		transmit_chars(up);
+-
+-	spin_unlock_irqrestore(&up->port.lock, flags);
+-	return IRQ_HANDLED;
+-}
+-
+-static inline void dma_chan_irq(struct hsu_dma_chan *chan)
+-{
+-	struct uart_hsu_port *up = chan->uport;
+-	unsigned long flags;
+-	u32 int_sts;
+-
+-	spin_lock_irqsave(&up->port.lock, flags);
+-
+-	if (!up->use_dma || !up->running)
+-		goto exit;
+-
+-	/*
+-	 * No matter what situation, need read clear the IRQ status
+-	 * There is a bug, see Errata 5, HSD 2900918
+-	 */
+-	int_sts = chan_readl(chan, HSU_CH_SR);
+-
+-	/* Rx channel */
+-	if (chan->dirt == DMA_FROM_DEVICE)
+-		hsu_dma_rx(up, int_sts, &flags);
+-
+-	/* Tx channel */
+-	if (chan->dirt == DMA_TO_DEVICE) {
+-		chan_writel(chan, HSU_CH_CR, 0x0);
+-		up->dma_tx_on = 0;
+-		hsu_dma_tx(up);
+-	}
+-
+-exit:
+-	spin_unlock_irqrestore(&up->port.lock, flags);
+-	return;
+-}
+-
+-static irqreturn_t dma_irq(int irq, void *dev_id)
+-{
+-	struct hsu_port *hsu = dev_id;
+-	u32 int_sts, i;
+-
+-	int_sts = mfd_readl(hsu, HSU_GBL_DMAISR);
+-
+-	/* Currently we only have 6 channels may be used */
+-	for (i = 0; i < 6; i++) {
+-		if (int_sts & 0x1)
+-			dma_chan_irq(&hsu->chans[i]);
+-		int_sts >>= 1;
+-	}
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static unsigned int serial_hsu_tx_empty(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	unsigned long flags;
+-	unsigned int ret;
+-
+-	spin_lock_irqsave(&up->port.lock, flags);
+-	ret = serial_in(up, UART_LSR) & UART_LSR_TEMT ? TIOCSER_TEMT : 0;
+-	spin_unlock_irqrestore(&up->port.lock, flags);
+-
+-	return ret;
+-}
+-
+-static unsigned int serial_hsu_get_mctrl(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	unsigned char status;
+-	unsigned int ret;
+-
+-	status = serial_in(up, UART_MSR);
+-
+-	ret = 0;
+-	if (status & UART_MSR_DCD)
+-		ret |= TIOCM_CAR;
+-	if (status & UART_MSR_RI)
+-		ret |= TIOCM_RNG;
+-	if (status & UART_MSR_DSR)
+-		ret |= TIOCM_DSR;
+-	if (status & UART_MSR_CTS)
+-		ret |= TIOCM_CTS;
+-	return ret;
+-}
+-
+-static void serial_hsu_set_mctrl(struct uart_port *port, unsigned int mctrl)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	unsigned char mcr = 0;
+-
+-	if (mctrl & TIOCM_RTS)
+-		mcr |= UART_MCR_RTS;
+-	if (mctrl & TIOCM_DTR)
+-		mcr |= UART_MCR_DTR;
+-	if (mctrl & TIOCM_OUT1)
+-		mcr |= UART_MCR_OUT1;
+-	if (mctrl & TIOCM_OUT2)
+-		mcr |= UART_MCR_OUT2;
+-	if (mctrl & TIOCM_LOOP)
+-		mcr |= UART_MCR_LOOP;
+-
+-	mcr |= up->mcr;
+-
+-	serial_out(up, UART_MCR, mcr);
+-}
+-
+-static void serial_hsu_break_ctl(struct uart_port *port, int break_state)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&up->port.lock, flags);
+-	if (break_state == -1)
+-		up->lcr |= UART_LCR_SBC;
+-	else
+-		up->lcr &= ~UART_LCR_SBC;
+-	serial_out(up, UART_LCR, up->lcr);
+-	spin_unlock_irqrestore(&up->port.lock, flags);
+-}
+-
+-/*
+- * What special to do:
+- * 1. chose the 64B fifo mode
+- * 2. start dma or pio depends on configuration
+- * 3. we only allocate dma memory when needed
+- */
+-static int serial_hsu_startup(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	unsigned long flags;
+-
+-	pm_runtime_get_sync(up->dev);
+-
+-	/*
+-	 * Clear the FIFO buffers and disable them.
+-	 * (they will be reenabled in set_termios())
+-	 */
+-	serial_out(up, UART_FCR, UART_FCR_ENABLE_FIFO);
+-	serial_out(up, UART_FCR, UART_FCR_ENABLE_FIFO |
+-			UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT);
+-	serial_out(up, UART_FCR, 0);
+-
+-	/* Clear the interrupt registers. */
+-	(void) serial_in(up, UART_LSR);
+-	(void) serial_in(up, UART_RX);
+-	(void) serial_in(up, UART_IIR);
+-	(void) serial_in(up, UART_MSR);
+-
+-	/* Now, initialize the UART, default is 8n1 */
+-	serial_out(up, UART_LCR, UART_LCR_WLEN8);
+-
+-	spin_lock_irqsave(&up->port.lock, flags);
+-
+-	up->port.mctrl |= TIOCM_OUT2;
+-	serial_hsu_set_mctrl(&up->port, up->port.mctrl);
+-
+-	/*
+-	 * Finally, enable interrupts.  Note: Modem status interrupts
+-	 * are set via set_termios(), which will be occurring imminently
+-	 * anyway, so we don't enable them here.
+-	 */
+-	if (!up->use_dma)
+-		up->ier = UART_IER_RLSI | UART_IER_RDI | UART_IER_RTOIE;
+-	else
+-		up->ier = 0;
+-	serial_out(up, UART_IER, up->ier);
+-
+-	spin_unlock_irqrestore(&up->port.lock, flags);
+-
+-	/* DMA init */
+-	if (up->use_dma) {
+-		struct hsu_dma_buffer *dbuf;
+-		struct circ_buf *xmit = &port->state->xmit;
+-
+-		up->dma_tx_on = 0;
+-
+-		/* First allocate the RX buffer */
+-		dbuf = &up->rxbuf;
+-		dbuf->buf = kzalloc(HSU_DMA_BUF_SIZE, GFP_KERNEL);
+-		if (!dbuf->buf) {
+-			up->use_dma = 0;
+-			goto exit;
+-		}
+-		dbuf->dma_addr = dma_map_single(port->dev,
+-						dbuf->buf,
+-						HSU_DMA_BUF_SIZE,
+-						DMA_FROM_DEVICE);
+-		dbuf->dma_size = HSU_DMA_BUF_SIZE;
+-
+-		/* Start the RX channel right now */
+-		hsu_dma_start_rx_chan(up->rxc, dbuf);
+-
+-		/* Next init the TX DMA */
+-		dbuf = &up->txbuf;
+-		dbuf->buf = xmit->buf;
+-		dbuf->dma_addr = dma_map_single(port->dev,
+-					       dbuf->buf,
+-					       UART_XMIT_SIZE,
+-					       DMA_TO_DEVICE);
+-		dbuf->dma_size = UART_XMIT_SIZE;
+-
+-		/* This should not be changed all around */
+-		chan_writel(up->txc, HSU_CH_BSR, 32);
+-		chan_writel(up->txc, HSU_CH_MOTSR, 4);
+-		dbuf->ofs = 0;
+-	}
+-
+-exit:
+-	 /* And clear the interrupt registers again for luck. */
+-	(void) serial_in(up, UART_LSR);
+-	(void) serial_in(up, UART_RX);
+-	(void) serial_in(up, UART_IIR);
+-	(void) serial_in(up, UART_MSR);
+-
+-	up->running = 1;
+-	return 0;
+-}
+-
+-static void serial_hsu_shutdown(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	unsigned long flags;
+-
+-	/* Disable interrupts from this port */
+-	up->ier = 0;
+-	serial_out(up, UART_IER, 0);
+-	up->running = 0;
+-
+-	spin_lock_irqsave(&up->port.lock, flags);
+-	up->port.mctrl &= ~TIOCM_OUT2;
+-	serial_hsu_set_mctrl(&up->port, up->port.mctrl);
+-	spin_unlock_irqrestore(&up->port.lock, flags);
+-
+-	/* Disable break condition and FIFOs */
+-	serial_out(up, UART_LCR, serial_in(up, UART_LCR) & ~UART_LCR_SBC);
+-	serial_out(up, UART_FCR, UART_FCR_ENABLE_FIFO |
+-				  UART_FCR_CLEAR_RCVR |
+-				  UART_FCR_CLEAR_XMIT);
+-	serial_out(up, UART_FCR, 0);
+-
+-	pm_runtime_put(up->dev);
+-}
+-
+-static void
+-serial_hsu_set_termios(struct uart_port *port, struct ktermios *termios,
+-		       struct ktermios *old)
+-{
+-	struct uart_hsu_port *up =
+-			container_of(port, struct uart_hsu_port, port);
+-	unsigned char cval, fcr = 0;
+-	unsigned long flags;
+-	unsigned int baud, quot;
+-	u32 ps, mul;
+-
+-	switch (termios->c_cflag & CSIZE) {
+-	case CS5:
+-		cval = UART_LCR_WLEN5;
+-		break;
+-	case CS6:
+-		cval = UART_LCR_WLEN6;
+-		break;
+-	case CS7:
+-		cval = UART_LCR_WLEN7;
+-		break;
+-	default:
+-	case CS8:
+-		cval = UART_LCR_WLEN8;
+-		break;
+-	}
+-
+-	/* CMSPAR isn't supported by this driver */
+-	termios->c_cflag &= ~CMSPAR;
+-
+-	if (termios->c_cflag & CSTOPB)
+-		cval |= UART_LCR_STOP;
+-	if (termios->c_cflag & PARENB)
+-		cval |= UART_LCR_PARITY;
+-	if (!(termios->c_cflag & PARODD))
+-		cval |= UART_LCR_EPAR;
+-
+-	/*
+-	 * The base clk is 50Mhz, and the baud rate come from:
+-	 *	baud = 50M * MUL / (DIV * PS * DLAB)
+-	 *
+-	 * For those basic low baud rate we can get the direct
+-	 * scalar from 2746800, like 115200 = 2746800/24. For those
+-	 * higher baud rate, we handle them case by case, mainly by
+-	 * adjusting the MUL/PS registers, and DIV register is kept
+-	 * as default value 0x3d09 to make things simple
+-	 */
+-	baud = uart_get_baud_rate(port, termios, old, 0, 4000000);
+-
+-	quot = 1;
+-	ps = 0x10;
+-	mul = 0x3600;
+-	switch (baud) {
+-	case 3500000:
+-		mul = 0x3345;
+-		ps = 0xC;
+-		break;
+-	case 1843200:
+-		mul = 0x2400;
+-		break;
+-	case 3000000:
+-	case 2500000:
+-	case 2000000:
+-	case 1500000:
+-	case 1000000:
+-	case 500000:
+-		/* mul/ps/quot = 0x9C4/0x10/0x1 will make a 500000 bps */
+-		mul = baud / 500000 * 0x9C4;
+-		break;
+-	default:
+-		/* Use uart_get_divisor to get quot for other baud rates */
+-		quot = 0;
+-	}
+-
+-	if (!quot)
+-		quot = uart_get_divisor(port, baud);
+-
+-	if ((up->port.uartclk / quot) < (2400 * 16))
+-		fcr = UART_FCR_ENABLE_FIFO | UART_FCR_HSU_64_1B;
+-	else if ((up->port.uartclk / quot) < (230400 * 16))
+-		fcr = UART_FCR_ENABLE_FIFO | UART_FCR_HSU_64_16B;
+-	else
+-		fcr = UART_FCR_ENABLE_FIFO | UART_FCR_HSU_64_32B;
+-
+-	fcr |= UART_FCR_HSU_64B_FIFO;
+-
+-	/*
+-	 * Ok, we're now changing the port state.  Do it with
+-	 * interrupts disabled.
+-	 */
+-	spin_lock_irqsave(&up->port.lock, flags);
+-
+-	/* Update the per-port timeout */
+-	uart_update_timeout(port, termios->c_cflag, baud);
+-
+-	up->port.read_status_mask = UART_LSR_OE | UART_LSR_THRE | UART_LSR_DR;
+-	if (termios->c_iflag & INPCK)
+-		up->port.read_status_mask |= UART_LSR_FE | UART_LSR_PE;
+-	if (termios->c_iflag & (IGNBRK | BRKINT | PARMRK))
+-		up->port.read_status_mask |= UART_LSR_BI;
+-
+-	/* Characters to ignore */
+-	up->port.ignore_status_mask = 0;
+-	if (termios->c_iflag & IGNPAR)
+-		up->port.ignore_status_mask |= UART_LSR_PE | UART_LSR_FE;
+-	if (termios->c_iflag & IGNBRK) {
+-		up->port.ignore_status_mask |= UART_LSR_BI;
+-		/*
+-		 * If we're ignoring parity and break indicators,
+-		 * ignore overruns too (for real raw support).
+-		 */
+-		if (termios->c_iflag & IGNPAR)
+-			up->port.ignore_status_mask |= UART_LSR_OE;
+-	}
+-
+-	/* Ignore all characters if CREAD is not set */
+-	if ((termios->c_cflag & CREAD) == 0)
+-		up->port.ignore_status_mask |= UART_LSR_DR;
+-
+-	/*
+-	 * CTS flow control flag and modem status interrupts, disable
+-	 * MSI by default
+-	 */
+-	up->ier &= ~UART_IER_MSI;
+-	if (UART_ENABLE_MS(&up->port, termios->c_cflag))
+-		up->ier |= UART_IER_MSI;
+-
+-	serial_out(up, UART_IER, up->ier);
+-
+-	if (termios->c_cflag & CRTSCTS)
+-		up->mcr |= UART_MCR_AFE | UART_MCR_RTS;
+-	else
+-		up->mcr &= ~UART_MCR_AFE;
+-
+-	serial_out(up, UART_LCR, cval | UART_LCR_DLAB);	/* set DLAB */
+-	serial_out(up, UART_DLL, quot & 0xff);		/* LS of divisor */
+-	serial_out(up, UART_DLM, quot >> 8);		/* MS of divisor */
+-	serial_out(up, UART_LCR, cval);			/* reset DLAB */
+-	serial_out(up, UART_MUL, mul);			/* set MUL */
+-	serial_out(up, UART_PS, ps);			/* set PS */
+-	up->lcr = cval;					/* Save LCR */
+-	serial_hsu_set_mctrl(&up->port, up->port.mctrl);
+-	serial_out(up, UART_FCR, fcr);
+-	spin_unlock_irqrestore(&up->port.lock, flags);
+-}
+-
+-static void
+-serial_hsu_pm(struct uart_port *port, unsigned int state,
+-	      unsigned int oldstate)
+-{
+-}
+-
+-static void serial_hsu_release_port(struct uart_port *port)
+-{
+-}
+-
+-static int serial_hsu_request_port(struct uart_port *port)
+-{
+-	return 0;
+-}
+-
+-static void serial_hsu_config_port(struct uart_port *port, int flags)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	up->port.type = PORT_MFD;
+-}
+-
+-static int
+-serial_hsu_verify_port(struct uart_port *port, struct serial_struct *ser)
+-{
+-	/* We don't want the core code to modify any port params */
+-	return -EINVAL;
+-}
+-
+-static const char *
+-serial_hsu_type(struct uart_port *port)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-	return up->name;
+-}
+-
+-/* Mainly for uart console use */
+-static struct uart_hsu_port *serial_hsu_ports[3];
+-static struct uart_driver serial_hsu_reg;
+-
+-#ifdef CONFIG_SERIAL_MFD_HSU_CONSOLE
+-
+-#define BOTH_EMPTY (UART_LSR_TEMT | UART_LSR_THRE)
+-
+-/* Wait for transmitter & holding register to empty */
+-static inline void wait_for_xmitr(struct uart_hsu_port *up)
+-{
+-	unsigned int status, tmout = 1000;
+-
+-	/* Wait up to 1ms for the character to be sent. */
+-	do {
+-		status = serial_in(up, UART_LSR);
+-
+-		if (status & UART_LSR_BI)
+-			up->lsr_break_flag = UART_LSR_BI;
+-
+-		if (--tmout == 0)
+-			break;
+-		udelay(1);
+-	} while (!(status & BOTH_EMPTY));
+-
+-	/* Wait up to 1s for flow control if necessary */
+-	if (up->port.flags & UPF_CONS_FLOW) {
+-		tmout = 1000000;
+-		while (--tmout &&
+-		       ((serial_in(up, UART_MSR) & UART_MSR_CTS) == 0))
+-			udelay(1);
+-	}
+-}
+-
+-static void serial_hsu_console_putchar(struct uart_port *port, int ch)
+-{
+-	struct uart_hsu_port *up =
+-		container_of(port, struct uart_hsu_port, port);
+-
+-	wait_for_xmitr(up);
+-	serial_out(up, UART_TX, ch);
+-}
+-
+-/*
+- * Print a string to the serial port trying not to disturb
+- * any possible real use of the port...
+- *
+- *	The console_lock must be held when we get here.
+- */
+-static void
+-serial_hsu_console_write(struct console *co, const char *s, unsigned int count)
+-{
+-	struct uart_hsu_port *up = serial_hsu_ports[co->index];
+-	unsigned long flags;
+-	unsigned int ier;
+-	int locked = 1;
+-
+-	touch_nmi_watchdog();
+-
+-	local_irq_save(flags);
+-	if (up->port.sysrq)
+-		locked = 0;
+-	else if (oops_in_progress) {
+-		locked = spin_trylock(&up->port.lock);
+-	} else
+-		spin_lock(&up->port.lock);
+-
+-	/* First save the IER then disable the interrupts */
+-	ier = serial_in(up, UART_IER);
+-	serial_out(up, UART_IER, 0);
+-
+-	uart_console_write(&up->port, s, count, serial_hsu_console_putchar);
+-
+-	/*
+-	 * Finally, wait for transmitter to become empty
+-	 * and restore the IER
+-	 */
+-	wait_for_xmitr(up);
+-	serial_out(up, UART_IER, ier);
+-
+-	if (locked)
+-		spin_unlock(&up->port.lock);
+-	local_irq_restore(flags);
+-}
+-
+-static struct console serial_hsu_console;
+-
+-static int __init
+-serial_hsu_console_setup(struct console *co, char *options)
+-{
+-	struct uart_hsu_port *up;
+-	int baud = 115200;
+-	int bits = 8;
+-	int parity = 'n';
+-	int flow = 'n';
+-
+-	if (co->index == -1 || co->index >= serial_hsu_reg.nr)
+-		co->index = 0;
+-	up = serial_hsu_ports[co->index];
+-	if (!up)
+-		return -ENODEV;
+-
+-	if (options)
+-		uart_parse_options(options, &baud, &parity, &bits, &flow);
+-
+-	return uart_set_options(&up->port, co, baud, parity, bits, flow);
+-}
+-
+-static struct console serial_hsu_console = {
+-	.name		= "ttyMFD",
+-	.write		= serial_hsu_console_write,
+-	.device		= uart_console_device,
+-	.setup		= serial_hsu_console_setup,
+-	.flags		= CON_PRINTBUFFER,
+-	.index		= -1,
+-	.data		= &serial_hsu_reg,
+-};
+-
+-#define SERIAL_HSU_CONSOLE	(&serial_hsu_console)
+-#else
+-#define SERIAL_HSU_CONSOLE	NULL
+-#endif
+-
+-struct uart_ops serial_hsu_pops = {
+-	.tx_empty	= serial_hsu_tx_empty,
+-	.set_mctrl	= serial_hsu_set_mctrl,
+-	.get_mctrl	= serial_hsu_get_mctrl,
+-	.stop_tx	= serial_hsu_stop_tx,
+-	.start_tx	= serial_hsu_start_tx,
+-	.stop_rx	= serial_hsu_stop_rx,
+-	.enable_ms	= serial_hsu_enable_ms,
+-	.break_ctl	= serial_hsu_break_ctl,
+-	.startup	= serial_hsu_startup,
+-	.shutdown	= serial_hsu_shutdown,
+-	.set_termios	= serial_hsu_set_termios,
+-	.pm		= serial_hsu_pm,
+-	.type		= serial_hsu_type,
+-	.release_port	= serial_hsu_release_port,
+-	.request_port	= serial_hsu_request_port,
+-	.config_port	= serial_hsu_config_port,
+-	.verify_port	= serial_hsu_verify_port,
+-};
+-
+-static struct uart_driver serial_hsu_reg = {
+-	.owner		= THIS_MODULE,
+-	.driver_name	= "MFD serial",
+-	.dev_name	= "ttyMFD",
+-	.major		= TTY_MAJOR,
+-	.minor		= 128,
+-	.nr		= 3,
+-	.cons		= SERIAL_HSU_CONSOLE,
+-};
+-
+-#ifdef CONFIG_PM
+-static int serial_hsu_suspend(struct pci_dev *pdev, pm_message_t state)
+-{
+-	void *priv = pci_get_drvdata(pdev);
+-	struct uart_hsu_port *up;
+-
+-	/* Make sure this is not the internal dma controller */
+-	if (priv && (pdev->device != 0x081E)) {
+-		up = priv;
+-		uart_suspend_port(&serial_hsu_reg, &up->port);
+-	}
+-
+-	pci_save_state(pdev);
+-	pci_set_power_state(pdev, pci_choose_state(pdev, state));
+-        return 0;
+-}
+-
+-static int serial_hsu_resume(struct pci_dev *pdev)
+-{
+-	void *priv = pci_get_drvdata(pdev);
+-	struct uart_hsu_port *up;
+-	int ret;
+-
+-	pci_set_power_state(pdev, PCI_D0);
+-	pci_restore_state(pdev);
+-
+-	ret = pci_enable_device(pdev);
+-	if (ret)
+-		dev_warn(&pdev->dev,
+-			"HSU: can't re-enable device, try to continue\n");
+-
+-	if (priv && (pdev->device != 0x081E)) {
+-		up = priv;
+-		uart_resume_port(&serial_hsu_reg, &up->port);
+-	}
+-	return 0;
+-}
+-#else
+-#define serial_hsu_suspend	NULL
+-#define serial_hsu_resume	NULL
+-#endif
+-
+-#ifdef CONFIG_PM_RUNTIME
+-static int serial_hsu_runtime_idle(struct device *dev)
+-{
+-	pm_schedule_suspend(dev, 500);
+-	return -EBUSY;
+-}
+-
+-static int serial_hsu_runtime_suspend(struct device *dev)
+-{
+-	return 0;
+-}
+-
+-static int serial_hsu_runtime_resume(struct device *dev)
+-{
+-	return 0;
+-}
+-#else
+-#define serial_hsu_runtime_idle		NULL
+-#define serial_hsu_runtime_suspend	NULL
+-#define serial_hsu_runtime_resume	NULL
+-#endif
+-
+-static const struct dev_pm_ops serial_hsu_pm_ops = {
+-	.runtime_suspend = serial_hsu_runtime_suspend,
+-	.runtime_resume = serial_hsu_runtime_resume,
+-	.runtime_idle = serial_hsu_runtime_idle,
+-};
+-
+-/* temp global pointer before we settle down on using one or four PCI dev */
+-static struct hsu_port *phsu;
+-
+-static int serial_hsu_probe(struct pci_dev *pdev,
+-				const struct pci_device_id *ent)
+-{
+-	struct uart_hsu_port *uport;
+-	int index, ret;
+-
+-	printk(KERN_INFO "HSU: found PCI Serial controller(ID: %04x:%04x)\n",
+-		pdev->vendor, pdev->device);
+-
+-	switch (pdev->device) {
+-	case 0x081B:
+-		index = 0;
+-		break;
+-	case 0x081C:
+-		index = 1;
+-		break;
+-	case 0x081D:
+-		index = 2;
+-		break;
+-	case 0x081E:
+-		/* internal DMA controller */
+-		index = 3;
+-		break;
+-	default:
+-		dev_err(&pdev->dev, "HSU: out of index!");
+-		return -ENODEV;
+-	}
+-
+-	ret = pci_enable_device(pdev);
+-	if (ret)
+-		return ret;
+-
+-	if (index == 3) {
+-		/* DMA controller */
+-		ret = request_irq(pdev->irq, dma_irq, 0, "hsu_dma", phsu);
+-		if (ret) {
+-			dev_err(&pdev->dev, "can not get IRQ\n");
+-			goto err_disable;
+-		}
+-		pci_set_drvdata(pdev, phsu);
+-	} else {
+-		/* UART port 0~2 */
+-		uport = &phsu->port[index];
+-		uport->port.irq = pdev->irq;
+-		uport->port.dev = &pdev->dev;
+-		uport->dev = &pdev->dev;
+-
+-		ret = request_irq(pdev->irq, port_irq, 0, uport->name, uport);
+-		if (ret) {
+-			dev_err(&pdev->dev, "can not get IRQ\n");
+-			goto err_disable;
+-		}
+-		uart_add_one_port(&serial_hsu_reg, &uport->port);
+-
+-		pci_set_drvdata(pdev, uport);
+-	}
+-
+-	pm_runtime_put_noidle(&pdev->dev);
+-	pm_runtime_allow(&pdev->dev);
+-
+-	return 0;
+-
+-err_disable:
+-	pci_disable_device(pdev);
+-	return ret;
+-}
+-
+-static void hsu_global_init(void)
+-{
+-	struct hsu_port *hsu;
+-	struct uart_hsu_port *uport;
+-	struct hsu_dma_chan *dchan;
+-	int i, ret;
+-
+-	hsu = kzalloc(sizeof(struct hsu_port), GFP_KERNEL);
+-	if (!hsu)
+-		return;
+-
+-	/* Get basic io resource and map it */
+-	hsu->paddr = 0xffa28000;
+-	hsu->iolen = 0x1000;
+-
+-	if (!(request_mem_region(hsu->paddr, hsu->iolen, "HSU global")))
+-		pr_warning("HSU: error in request mem region\n");
+-
+-	hsu->reg = ioremap_nocache((unsigned long)hsu->paddr, hsu->iolen);
+-	if (!hsu->reg) {
+-		pr_err("HSU: error in ioremap\n");
+-		ret = -ENOMEM;
+-		goto err_free_region;
+-	}
+-
+-	/* Initialise the 3 UART ports */
+-	uport = hsu->port;
+-	for (i = 0; i < 3; i++) {
+-		uport->port.type = PORT_MFD;
+-		uport->port.iotype = UPIO_MEM;
+-		uport->port.mapbase = (resource_size_t)hsu->paddr
+-					+ HSU_PORT_REG_OFFSET
+-					+ i * HSU_PORT_REG_LENGTH;
+-		uport->port.membase = hsu->reg + HSU_PORT_REG_OFFSET
+-					+ i * HSU_PORT_REG_LENGTH;
+-
+-		sprintf(uport->name, "hsu_port%d", i);
+-		uport->port.fifosize = 64;
+-		uport->port.ops = &serial_hsu_pops;
+-		uport->port.line = i;
+-		uport->port.flags = UPF_IOREMAP;
+-		/* set the scalable maxim support rate to 2746800 bps */
+-		uport->port.uartclk = 115200 * 24 * 16;
+-
+-		uport->running = 0;
+-		uport->txc = &hsu->chans[i * 2];
+-		uport->rxc = &hsu->chans[i * 2 + 1];
+-
+-		serial_hsu_ports[i] = uport;
+-		uport->index = i;
+-
+-		if (hsu_dma_enable & (1<<i))
+-			uport->use_dma = 1;
+-		else
+-			uport->use_dma = 0;
+-
+-		uport++;
+-	}
+-
+-	/* Initialise 6 dma channels */
+-	dchan = hsu->chans;
+-	for (i = 0; i < 6; i++) {
+-		dchan->id = i;
+-		dchan->dirt = (i & 0x1) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+-		dchan->uport = &hsu->port[i/2];
+-		dchan->reg = hsu->reg + HSU_DMA_CHANS_REG_OFFSET +
+-				i * HSU_DMA_CHANS_REG_LENGTH;
+-
+-		dchan++;
+-	}
+-
+-	phsu = hsu;
+-	hsu_debugfs_init(hsu);
+-	return;
+-
+-err_free_region:
+-	release_mem_region(hsu->paddr, hsu->iolen);
+-	kfree(hsu);
+-	return;
+-}
+-
+-static void serial_hsu_remove(struct pci_dev *pdev)
+-{
+-	void *priv = pci_get_drvdata(pdev);
+-	struct uart_hsu_port *up;
+-
+-	if (!priv)
+-		return;
+-
+-	pm_runtime_forbid(&pdev->dev);
+-	pm_runtime_get_noresume(&pdev->dev);
+-
+-	/* For port 0/1/2, priv is the address of uart_hsu_port */
+-	if (pdev->device != 0x081E) {
+-		up = priv;
+-		uart_remove_one_port(&serial_hsu_reg, &up->port);
+-	}
+-
+-	pci_set_drvdata(pdev, NULL);
+-	free_irq(pdev->irq, priv);
+-	pci_disable_device(pdev);
+-}
+-
+-/* First 3 are UART ports, and the 4th is the DMA */
+-static const struct pci_device_id pci_ids[] = {
+-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x081B) },
+-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x081C) },
+-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x081D) },
+-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, 0x081E) },
+-	{},
+-};
+-
+-static struct pci_driver hsu_pci_driver = {
+-	.name =		"HSU serial",
+-	.id_table =	pci_ids,
+-	.probe =	serial_hsu_probe,
+-	.remove =	serial_hsu_remove,
+-	.suspend =	serial_hsu_suspend,
+-	.resume	=	serial_hsu_resume,
+-	.driver = {
+-		.pm = &serial_hsu_pm_ops,
+-	},
+-};
+-
+-static int __init hsu_pci_init(void)
+-{
+-	int ret;
+-
+-	hsu_global_init();
+-
+-	ret = uart_register_driver(&serial_hsu_reg);
+-	if (ret)
+-		return ret;
+-
+-	return pci_register_driver(&hsu_pci_driver);
+-}
+-
+-static void __exit hsu_pci_exit(void)
+-{
+-	pci_unregister_driver(&hsu_pci_driver);
+-	uart_unregister_driver(&serial_hsu_reg);
+-
+-	hsu_debugfs_remove(phsu);
+-
+-	kfree(phsu);
+-}
+-
+-module_init(hsu_pci_init);
+-module_exit(hsu_pci_exit);
+-
+-MODULE_LICENSE("GPL v2");
+-MODULE_ALIAS("platform:medfield-hsu");
+--- /dev/null
++++ b/include/linux/serial_hsu.h
+@@ -0,0 +1,50 @@
++#ifndef _SERIAL_HSU_H_
++#define _SERIAL_HSU_H_
++
++/* HW register offset definition */
++#define UART_FOR	0x08
++#define UART_PS		0x0C
++#define UART_MUL	0x0D
++#define UART_DIV	0x0E
++
++#define HSU_GBL_IEN	0x0
++#define HSU_GBL_IST	0x4
++
++#define HSU_GBL_INT_BIT_PORT0	0x0
++#define HSU_GBL_INT_BIT_PORT1	0x1
++#define HSU_GBL_INT_BIT_PORT2	0x2
++#define HSU_GBL_INT_BIT_IRI	0x3
++#define HSU_GBL_INT_BIT_HDLC	0x4
++#define HSU_GBL_INT_BIT_DMA	0x5
++
++#define HSU_GBL_ISR	0x8
++#define HSU_GBL_DMASR	0x400
++#define HSU_GBL_DMAISR	0x404
++
++#define HSU_PORT_REG_OFFSET	0x80
++#define HSU_PORT0_REG_OFFSET	0x80
++#define HSU_PORT1_REG_OFFSET	0x100
++#define HSU_PORT2_REG_OFFSET	0x180
++#define HSU_PORT_REG_LENGTH	0x80
++
++#define HSU_DMA_CHANS_REG_OFFSET	0x500
++#define HSU_DMA_CHANS_REG_LENGTH	0x40
++
++#define HSU_CH_SR		0x0	/* channel status reg */
++#define HSU_CH_CR		0x4	/* control reg */
++#define HSU_CH_DCR		0x8	/* descriptor control reg */
++#define HSU_CH_BSR		0x10	/* max fifo buffer size reg */
++#define HSU_CH_MOTSR		0x14	/* minimum ocp transfer size */
++#define HSU_CH_D0SAR		0x20	/* desc 0 start addr */
++#define HSU_CH_D0TSR		0x24	/* desc 0 transfer size */
++#define HSU_CH_D1SAR		0x28
++#define HSU_CH_D1TSR		0x2C
++#define HSU_CH_D2SAR		0x30
++#define HSU_CH_D2TSR		0x34
++#define HSU_CH_D3SAR		0x38
++#define HSU_CH_D3TSR		0x3C
++
++struct device *intel_mid_hsu_set_wake_peer(int port,
++			void (*wake_peer)(struct device *));
++
++#endif
+--- a/include/linux/serial_mfd.h
++++ /dev/null
+@@ -1,47 +0,0 @@
+-#ifndef _SERIAL_MFD_H_
+-#define _SERIAL_MFD_H_
+-
+-/* HW register offset definition */
+-#define UART_FOR	0x08
+-#define UART_PS		0x0C
+-#define UART_MUL	0x0D
+-#define UART_DIV	0x0E
+-
+-#define HSU_GBL_IEN	0x0
+-#define HSU_GBL_IST	0x4
+-
+-#define HSU_GBL_INT_BIT_PORT0	0x0
+-#define HSU_GBL_INT_BIT_PORT1	0x1
+-#define HSU_GBL_INT_BIT_PORT2	0x2
+-#define HSU_GBL_INT_BIT_IRI	0x3
+-#define HSU_GBL_INT_BIT_HDLC	0x4
+-#define HSU_GBL_INT_BIT_DMA	0x5
+-
+-#define HSU_GBL_ISR	0x8
+-#define HSU_GBL_DMASR	0x400
+-#define HSU_GBL_DMAISR	0x404
+-
+-#define HSU_PORT_REG_OFFSET	0x80
+-#define HSU_PORT0_REG_OFFSET	0x80
+-#define HSU_PORT1_REG_OFFSET	0x100
+-#define HSU_PORT2_REG_OFFSET	0x180
+-#define HSU_PORT_REG_LENGTH	0x80
+-
+-#define HSU_DMA_CHANS_REG_OFFSET	0x500
+-#define HSU_DMA_CHANS_REG_LENGTH	0x40
+-
+-#define HSU_CH_SR		0x0	/* channel status reg */
+-#define HSU_CH_CR		0x4	/* control reg */
+-#define HSU_CH_DCR		0x8	/* descriptor control reg */
+-#define HSU_CH_BSR		0x10	/* max fifo buffer size reg */
+-#define HSU_CH_MOTSR		0x14	/* minimum ocp transfer size */
+-#define HSU_CH_D0SAR		0x20	/* desc 0 start addr */
+-#define HSU_CH_D0TSR		0x24	/* desc 0 transfer size */
+-#define HSU_CH_D1SAR		0x28
+-#define HSU_CH_D1TSR		0x2C
+-#define HSU_CH_D2SAR		0x30
+-#define HSU_CH_D2TSR		0x34
+-#define HSU_CH_D3SAR		0x38
+-#define HSU_CH_D3TSR		0x3C
+-
+-#endif
+--- a/include/uapi/linux/serial_core.h
++++ b/include/uapi/linux/serial_core.h
+@@ -202,8 +202,8 @@
+ /* MAX310X */
+ #define PORT_MAX310X	94
+ 
+-/* High Speed UART for Medfield */
+-#define PORT_MFD	95
++/* Intel High Speed UART */
++#define PORT_HSU	95
+ 
+ /* TI OMAP-UART */
+ #define PORT_OMAP	96

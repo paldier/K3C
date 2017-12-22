@@ -1,0 +1,192 @@
+From bfad951ae81ff41fff2cf12c9907e42f35592e95 Mon Sep 17 00:00:00 2001
+From: Tomas Winkler <tomas.winkler@intel.com>
+Date: Mon, 17 Feb 2014 15:13:25 +0200
+Subject: [PATCH 311/441] mei: don't of list_for_each_entry_safe when not
+ deleting
+
+We can use simply list_for_each_entry if there is no
+entry removal
+
+Change-Id: I2974be2d16b477b588104e1f15417e2b33a74db3
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a5de9859c32a5303e480df6f86882f45f8793a4b)
+
+Signed-off-by: Nagaraj S <sivasankaranx.nagaraj@intel.com>
+---
+ drivers/misc/mei/amthif.c    | 12 +++++-------
+ drivers/misc/mei/bus.c       |  4 ++--
+ drivers/misc/mei/client.c    | 23 +++++++++++------------
+ drivers/misc/mei/hbm.c       |  9 ++++-----
+ drivers/misc/mei/interrupt.c | 13 ++++++-------
+ 5 files changed, 28 insertions(+), 33 deletions(-)
+
+--- a/drivers/misc/mei/amthif.c
++++ b/drivers/misc/mei/amthif.c
+@@ -133,14 +133,12 @@ int mei_amthif_host_init(struct mei_devi
+ struct mei_cl_cb *mei_amthif_find_read_list_entry(struct mei_device *dev,
+ 						struct file *file)
+ {
+-	struct mei_cl_cb *pos = NULL;
+-	struct mei_cl_cb *next = NULL;
++	struct mei_cl_cb *cb;
+ 
+-	list_for_each_entry_safe(pos, next,
+-				&dev->amthif_rd_complete_list.list, list) {
+-		if (pos->cl && pos->cl == &dev->iamthif_cl &&
+-			pos->file_object == file)
+-			return pos;
++	list_for_each_entry(cb, &dev->amthif_rd_complete_list.list, list) {
++		if (cb->cl && cb->cl == &dev->iamthif_cl &&
++			cb->file_object == file)
++			return cb;
+ 	}
+ 	return NULL;
+ }
+--- a/drivers/misc/mei/bus.c
++++ b/drivers/misc/mei/bus.c
+@@ -145,9 +145,9 @@ static struct device_type mei_cl_device_
+ static struct mei_cl *mei_bus_find_mei_cl_by_uuid(struct mei_device *dev,
+ 						uuid_le uuid)
+ {
+-	struct mei_cl *cl, *next;
++	struct mei_cl *cl;
+ 
+-	list_for_each_entry_safe(cl, next, &dev->device_list, device_link) {
++	list_for_each_entry(cl, &dev->device_list, device_link) {
+ 		if (!uuid_le_cmp(uuid, cl->device_uuid))
+ 			return cl;
+ 	}
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -297,10 +297,9 @@ struct mei_cl *mei_cl_allocate(struct me
+ struct mei_cl_cb *mei_cl_find_read_cb(struct mei_cl *cl)
+ {
+ 	struct mei_device *dev = cl->dev;
+-	struct mei_cl_cb *cb = NULL;
+-	struct mei_cl_cb *next = NULL;
++	struct mei_cl_cb *cb;
+ 
+-	list_for_each_entry_safe(cb, next, &dev->read_list.list, list)
++	list_for_each_entry(cb, &dev->read_list.list, list)
+ 		if (mei_cl_cmp_id(cl, cb->cl))
+ 			return cb;
+ 	return NULL;
+@@ -505,17 +504,17 @@ free:
+ bool mei_cl_is_other_connecting(struct mei_cl *cl)
+ {
+ 	struct mei_device *dev;
+-	struct mei_cl *pos;
+-	struct mei_cl *next;
++	struct mei_cl *ocl; /* the other client */
+ 
+ 	if (WARN_ON(!cl || !cl->dev))
+ 		return false;
+ 
+ 	dev = cl->dev;
+ 
+-	list_for_each_entry_safe(pos, next, &dev->file_list, link) {
+-		if ((pos->state == MEI_FILE_CONNECTING) &&
+-		    (pos != cl) && cl->me_client_id == pos->me_client_id)
++	list_for_each_entry(ocl, &dev->file_list, link) {
++		if (ocl->state == MEI_FILE_CONNECTING &&
++		    ocl != cl &&
++		    cl->me_client_id == ocl->me_client_id)
+ 			return true;
+ 
+ 	}
+@@ -951,9 +950,9 @@ void mei_cl_complete(struct mei_cl *cl,
+ 
+ void mei_cl_all_disconnect(struct mei_device *dev)
+ {
+-	struct mei_cl *cl, *next;
++	struct mei_cl *cl;
+ 
+-	list_for_each_entry_safe(cl, next, &dev->file_list, link) {
++	list_for_each_entry(cl, &dev->file_list, link) {
+ 		cl->state = MEI_FILE_DISCONNECTED;
+ 		cl->mei_flow_ctrl_creds = 0;
+ 		cl->timer_count = 0;
+@@ -968,8 +967,8 @@ void mei_cl_all_disconnect(struct mei_de
+  */
+ void mei_cl_all_wakeup(struct mei_device *dev)
+ {
+-	struct mei_cl *cl, *next;
+-	list_for_each_entry_safe(cl, next, &dev->file_list, link) {
++	struct mei_cl *cl;
++	list_for_each_entry(cl, &dev->file_list, link) {
+ 		if (waitqueue_active(&cl->rx_wait)) {
+ 			cl_dbg(dev, cl, "Waking up reading client!\n");
+ 			wake_up_interruptible(&cl->rx_wait);
+--- a/drivers/misc/mei/hbm.c
++++ b/drivers/misc/mei/hbm.c
+@@ -380,8 +380,7 @@ static int mei_hbm_add_single_flow_creds
+ static void mei_hbm_cl_flow_control_res(struct mei_device *dev,
+ 		struct hbm_flow_control *flow_control)
+ {
+-	struct mei_cl *cl = NULL;
+-	struct mei_cl *next = NULL;
++	struct mei_cl *cl;
+ 
+ 	if (!flow_control->host_addr) {
+ 		/* single receive buffer */
+@@ -390,7 +389,7 @@ static void mei_hbm_cl_flow_control_res(
+ 	}
+ 
+ 	/* normal connection */
+-	list_for_each_entry_safe(cl, next, &dev->file_list, link) {
++	list_for_each_entry(cl, &dev->file_list, link) {
+ 		if (mei_hbm_cl_addr_equal(cl, flow_control)) {
+ 			cl->mei_flow_ctrl_creds++;
+ 			dev_dbg(&dev->pdev->dev, "flow ctrl msg for host %d ME %d.\n",
+@@ -557,10 +556,10 @@ static void mei_hbm_cl_connect_res(struc
+ static int mei_hbm_fw_disconnect_req(struct mei_device *dev,
+ 		struct hbm_client_connect_request *disconnect_req)
+ {
+-	struct mei_cl *cl, *next;
++	struct mei_cl *cl;
+ 	struct mei_cl_cb *cb;
+ 
+-	list_for_each_entry_safe(cl, next, &dev->file_list, link) {
++	list_for_each_entry(cl, &dev->file_list, link) {
+ 		if (mei_hbm_cl_addr_equal(cl, disconnect_req)) {
+ 			dev_dbg(&dev->pdev->dev, "disconnect request host client %d ME client %d.\n",
+ 					disconnect_req->host_addr,
+--- a/drivers/misc/mei/interrupt.c
++++ b/drivers/misc/mei/interrupt.c
+@@ -573,8 +573,7 @@ EXPORT_SYMBOL_GPL(mei_irq_write_handler)
+ void mei_timer(struct work_struct *work)
+ {
+ 	unsigned long timeout;
+-	struct mei_cl *cl_pos = NULL;
+-	struct mei_cl *cl_next = NULL;
++	struct mei_cl *cl;
+ 	struct mei_cl_cb  *cb_pos = NULL;
+ 	struct mei_cl_cb  *cb_next = NULL;
+ 
+@@ -602,9 +601,9 @@ void mei_timer(struct work_struct *work)
+ 		goto out;
+ 
+ 	/*** connect/disconnect timeouts ***/
+-	list_for_each_entry_safe(cl_pos, cl_next, &dev->file_list, link) {
+-		if (cl_pos->timer_count) {
+-			if (--cl_pos->timer_count == 0) {
++	list_for_each_entry(cl, &dev->file_list, link) {
++		if (cl->timer_count) {
++			if (--cl->timer_count == 0) {
+ 				dev_err(&dev->pdev->dev, "timer: connect/disconnect timeout.\n");
+ 				mei_reset(dev);
+ 				goto out;
+@@ -654,10 +653,10 @@ void mei_timer(struct work_struct *work)
+ 			list_for_each_entry_safe(cb_pos, cb_next,
+ 				&dev->amthif_rd_complete_list.list, list) {
+ 
+-				cl_pos = cb_pos->file_object->private_data;
++				cl = cb_pos->file_object->private_data;
+ 
+ 				/* Finding the AMTHI entry. */
+-				if (cl_pos == &dev->iamthif_cl)
++				if (cl == &dev->iamthif_cl)
+ 					list_del(&cb_pos->list);
+ 			}
+ 			mei_io_cb_free(dev->iamthif_current_cb);

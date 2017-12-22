@@ -1,0 +1,563 @@
+--- wide-dhcpv6-20080615/common.c	2011-08-19 11:19:55.896753773 +0530
++++ wide-dhcpv6-20080615_aug18_working/common.c	2011-08-17 16:03:20.958939350 +0530
+@@ -627,7 +627,15 @@
+ 	struct dhcp6_event *ev;
+ {
+ 	struct dhcp6_serverinfo *sp, *sp_next;
+-
++#ifdef RECONFIGURE_CLIENT
++	struct dhcp6_if *ifp = ev->ifp;
++	if(ifp != NULL && ev->sub_state == DHCP6S_RECONF &&
++	(ifp->reconfig_flag & DHCPIFF_RECONF_PROCESSING == DHCPIFF_RECONF_PROCESSING)) {
++		dprintf(LOG_DEBUG, FNAME, "reseting  reconfig flag on %s",
++			ev->ifp->ifname);
++		ifp->reconfig_flag &= (~DHCPIFF_RECONF_PROCESSING);
++	}
++#endif
+ 	dprintf(LOG_DEBUG, FNAME, "removing an event on %s, state=%s",
+ 	    ev->ifp->ifname, dhcp6_event_statestr(ev));
+ 
+@@ -1968,8 +1976,26 @@
+ 				    optinfo->delayedauth_offset,
+ 				    optinfo->delayedauth_realmlen);
+ 				break;
+-#ifdef notyet
++#ifdef RECONFIGURE_CLIENT
+ 			case DHCP6_AUTHPROTO_RECONFIG:
++				if (authinfolen == 0) {
++					optinfo->authflags |=
++					    DHCP6OPT_AUTHFLAG_NOINFO;
++					break;
++				}
++				/* XXX: should we reject an empty realm? */
++				if (authinfolen <  17) {
++					goto malformed;
++				}
++
++				optinfo->reconfigauth_type = *cp++;
++				optinfo->reconfigauth_offset = cp - bp;
++				memcpy(optinfo->reconfigauth_val, cp, 16);
++				cp += 16;
++				dprintf(LOG_DEBUG, "", "  reconfigauth_type : %x, "
++				    "offset=%d",
++				    optinfo->reconfigauth_type,
++				    optinfo->reconfigauth_offset);
+ 				break;
+ #endif
+ 			default:
+@@ -2147,6 +2173,15 @@
+ 			dhcp6_clear_list(&sublist);
+ 
+ 			break;
++#ifdef	RECONFIGURE_CLIENT
++			case DH6OPT_RECONF_MSG:
++				if (optlen != 1)
++					goto malformed;
++				optinfo->reconf_msg = (int) *cp;
++				dprintf(LOG_DEBUG, "", "  Reconf Msg: %d",
++				    optinfo->reconf_msg);
++			break;
++#endif
+ 		default:
+ 			/* no option specific behavior */
+ 			dprintf(LOG_INFO, FNAME,
+@@ -2779,7 +2814,11 @@
+ 		}
+ 	}
+ 
+-	if (optinfo->authproto != DHCP6_AUTHPROTO_UNDEF) {
++	if (optinfo->authproto != DHCP6_AUTHPROTO_UNDEF 
++#ifdef RECONFIGURE_CLIENT
++		&& optinfo->authproto != DHCP6_AUTHPROTO_RECONFIG
++#endif
++		) {
+ 		struct dhcp6opt_auth *auth;
+ 		int authlen;
+ 		char *authinfo;
+@@ -2792,7 +2831,7 @@
+ 				authlen += optinfo->delayedauth_realmlen +
+ 				    sizeof(optinfo->delayedauth_keyid) + 16;
+ 				break;
+-#ifdef notyet
++#ifdef RECONFIGURE_CLIENT
+ 			case DHCP6_AUTHPROTO_RECONFIG:
+ 				/* type + key-or-HAMC */
+ 				authlen += 17;
+@@ -2846,7 +2885,7 @@
+ 				    optinfo->delayedauth_keyid,
+ 				    optinfo->delayedauth_offset); 
+ 				break;
+-#ifdef notyet
++#ifdef notyet /* Required for server */
+ 			case DHCP6_AUTHPROTO_RECONFIG:
+ #endif
+ 			default:
+--- wide-dhcpv6-20080615/config.h	2011-08-19 11:19:55.867752637 +0530
++++ wide-dhcpv6-20080615_aug18_working/config.h	2011-08-17 12:55:09.755753563 +0530
+@@ -100,6 +100,12 @@
+ 	/* the followings are valid only if authproto is not UNDEF */
+ 	int authalgorithm;	/* algorithm */
+ 	int authrdm;		/* replay attack detection method */
++#ifdef RECONFIGURE_CLIENT
++	int reconfig_flag;	/* client only,if set client is processing reconf msg */
++	char reconfig_key[16];  /* stores latest reconfigure key to validate reconf msg from server */
++#define DHCPIFF_RECONF_PROCESSING 0x1
++#define DHCPIFF_RECONF_UNDEF 0
++#endif
+ };
+ 
+ /* run-time authentication parameters */
+@@ -143,9 +149,16 @@
+ 	struct authparam *authparam;
+ 
+ 	TAILQ_HEAD(, dhcp6_eventdata) data_list;
+-};
++#ifdef RECONFIGURE_CLIENT
++	int sub_state;
++#endif
+ 
++};
++#ifdef RECONFIGURE_CLIENT
++typedef enum { DHCP6_EVDATA_IAPD, DHCP6_EVDATA_IANA, DHCP6_EVDATA_ORO } dhcp6_eventdata_t;
++#else
+ typedef enum { DHCP6_EVDATA_IAPD, DHCP6_EVDATA_IANA } dhcp6_eventdata_t;
++#endif
+ 
+ struct dhcp6_eventdata {
+ 	TAILQ_ENTRY(dhcp6_eventdata) link;
+@@ -174,7 +187,11 @@
+ 
+ /* client status code */
+ enum {DHCP6S_INIT, DHCP6S_SOLICIT, DHCP6S_INFOREQ, DHCP6S_REQUEST,
+-      DHCP6S_RENEW, DHCP6S_REBIND, DHCP6S_RELEASE, DHCP6S_IDLE};
++      DHCP6S_RENEW, DHCP6S_REBIND, DHCP6S_RELEASE, DHCP6S_IDLE
++#ifdef RECONFIGURE_CLIENT
++      ,DHCP6S_RECONF
++#endif
++};
+ 
+ struct prefix_ifconf {
+ 	TAILQ_ENTRY(prefix_ifconf) link;
+--- wide-dhcpv6-20080615/dhcp6c.c	2011-08-19 11:19:55.891753635 +0530
++++ wide-dhcpv6-20080615_aug18_working/dhcp6c.c	2011-08-18 14:43:19.063753883 +0530
+@@ -136,7 +136,11 @@
+ static int client6_recvadvert __P((struct dhcp6_if *, struct dhcp6 *,
+ 				   ssize_t, struct dhcp6_optinfo *));
+ static int client6_recvreply __P((struct dhcp6_if *, struct dhcp6 *,
++				   ssize_t, struct dhcp6_optinfo *));
++#ifdef RECONFIGURE_CLIENT
++static int client6_recvreconf __P((struct dhcp6_if *, struct dhcp6 *,
+ 				  ssize_t, struct dhcp6_optinfo *));
++#endif
+ static void client6_signal __P((int));
+ static struct dhcp6_event *find_event_withid __P((struct dhcp6_if *,
+ 						  u_int32_t));
+@@ -1154,7 +1158,11 @@
+ {
+ 	struct dhcp6_list *ial;
+ 
+-	if (evd->type != DHCP6_EVDATA_IAPD && evd->type != DHCP6_EVDATA_IANA) {
++	if (evd->type != DHCP6_EVDATA_IAPD && 
++#ifdef RECONFIGURE_CLIENT
++		evd->type != DHCP6_EVDATA_ORO &&
++#endif
++			evd->type != DHCP6_EVDATA_IANA) {
+ 		dprintf(LOG_ERR, FNAME, "assumption failure %d", evd->type);
+ 		exit(1);
+ 	}
+@@ -1275,6 +1283,10 @@
+ 	case DHCP6S_REQUEST:
+ 	case DHCP6S_RENEW:
+ 	case DHCP6S_RELEASE:
++#ifdef RECONFIGURE_CLIENT
++	case DHCP6S_INFOREQ:
++		if(ev->state != DHCP6S_INFOREQ || (ev->sub_state == DHCP6S_RECONF))
++#endif
+ 		if (duidcpy(&optinfo.serverID, &ev->serverid)) {
+ 			dprintf(LOG_ERR, FNAME, "failed to copy server ID");
+ 			goto end;
+@@ -1328,6 +1340,9 @@
+ 
+ 	/* option request options */
+ 	if (ev->state != DHCP6S_RELEASE &&
++#ifdef RECONFIGURE_CLIENT
++		(ev->sub_state != DHCP6S_RECONF || ev->state == DHCP6S_INFOREQ) &&
++#endif
+ 	    dhcp6_copy_list(&optinfo.reqopt_list, &ifp->reqopt_list)) {
+ 		dprintf(LOG_ERR, FNAME, "failed to copy requested options");
+ 		goto end;
+@@ -1353,6 +1368,17 @@
+ 				goto end;
+ 			}
+ 			break;
++#ifdef RECONFIGURE_CLIENT
++		case DHCP6_EVDATA_ORO: 
++			if(ev->sub_state == DHCP6S_RECONF) {
++	    			if(dhcp6_copy_list(&optinfo.reqopt_list, 
++					(struct dhcp6_list *)evd->data)) {
++						dprintf(LOG_NOTICE, FNAME,
++				    		   "failed to add  ORO for reconf renew");
++				}
++			}
++			break;
++#endif
+ 		default:
+ 			dprintf(LOG_ERR, FNAME, "unexpected event data (%d)",
+ 			    evd->type);
+@@ -1543,6 +1569,15 @@
+ 	case DH6_REPLY:
+ 		(void)client6_recvreply(ifp, dh6, len, &optinfo);
+ 		break;
++#ifdef	RECONFIGURE_CLIENT
++	case DH6_RECONFIGURE:
++		/* willbe used in process_auth() */
++		if(ifp->authproto == DHCP6_AUTHPROTO_RECONFIG) {
++			memcpy(optinfo.reconfig_key, ifp->reconfig_key, sizeof(optinfo.reconfig_key)); 
++		}
++		(void)client6_recvreconf(ifp, dh6, len, &optinfo);
++		break;
++#endif
+ 	default:
+ 		dprintf(LOG_INFO, FNAME, "received an unexpected message (%s) "
+ 		    "from %s", dhcp6msgstr(dh6->dh6_msgtype),
+@@ -1772,6 +1807,215 @@
+ 	return (NULL);
+ }
+ 
++#ifdef RECONFIGURE_CLIENT
++static int
++client6_process_reconf(ifp, dh6, len, optinfo, state)
++	struct dhcp6_if *ifp;
++	struct dhcp6 *dh6;
++	ssize_t len;
++	struct dhcp6_optinfo *optinfo;
++	int state;
++{
++	struct dhcp6_listval *lv;
++	struct dhcp6_event *ev = NULL;
++	struct ia_conf *iac;
++	struct dhcp6_eventdata *evd = NULL;
++	struct dhcp6_list *ial = NULL;
++	struct dhcp6_ia iaparam;
++		struct dhcp6_listval *v;
++
++	/* validation test */
++	if ((ifp->reconfig_flag & DHCPIFF_RECONF_PROCESSING) == DHCPIFF_RECONF_PROCESSING) { 
++		dprintf(LOG_DEBUG, FNAME, "Client already processing a reconf request, So dropping Received Reconfigure msg");
++		return -1;
++	} 
++
++
++	/* A reconfigure message must contain a Server ID option */
++	if (optinfo->serverID.duid_len == 0) {
++		dprintf(LOG_INFO, FNAME, "no server ID option");
++		return (-1);
++	}
++
++	/*
++	 * DUID in the Client ID option (which must be contained for our
++	 * client implementation) must match ours.
++	 */
++	if (optinfo->clientID.duid_len == 0) {
++		dprintf(LOG_INFO, FNAME, "no client ID option");
++		return (-1);
++	}
++	if (duidcmp(&optinfo->clientID, &client_duid)) {
++		dprintf(LOG_INFO, FNAME, "client DUID mismatch");
++		return (-1);
++	}
++
++
++	if ((ev = dhcp6_create_event(ifp, state)) == NULL) {
++		dprintf(LOG_NOTICE, FNAME, "failed to create a new event");
++		goto fail;
++	}
++	TAILQ_INSERT_TAIL(&ifp->event_list, ev, link);
++	ev->sub_state = DHCP6S_RECONF;
++
++
++
++	if ((ev->timer = dhcp6_add_timer(client6_timo, ev)) == NULL) {
++		dprintf(LOG_NOTICE, FNAME,
++		    "failed to create a new event timer");
++		goto fail;
++	}
++
++	if (duidcpy(&ev->serverid, &optinfo->serverID)) {
++		dprintf(LOG_NOTICE, FNAME, "failed to copy server ID");
++		goto fail;
++	}
++
++	if ((ev->authparam = new_authparam(ifp->authproto, ifp->authalgorithm, ifp->authrdm)) == NULL) {
++                dprintf(LOG_WARNING, FNAME, "failed to allocate " "authentication parameters");
++		goto fail;
++        }
++
++	if (process_auth(ev->authparam, dh6, len, optinfo)) {
++		dprintf(LOG_INFO, FNAME, "failed to process authentication of reconf msg");
++		dhcp6_remove_event(ev);
++		return (-1);
++	}
++
++	if(state == DHCP6S_RENEW) {
++		ial = NULL;
++		evd = NULL;
++
++		if ((ial = malloc(sizeof(*ial))) == NULL)
++			goto fail;
++		TAILQ_INIT(ial);
++		if (dhcp6_copy_list(ial, &optinfo->reqopt_list) != 0) {
++			dprintf(LOG_NOTICE, FNAME, "Unable to copy ORO option from optinfo->reqopt_list -reconf");
++			goto fail;
++		}
++		if ((evd = malloc(sizeof(*evd))) == NULL)
++			goto fail;
++		memset(evd, 0, sizeof(*evd));
++		evd->type = DHCP6_EVDATA_ORO;
++		evd->data = ial;
++		evd->event = ev;
++		evd->destructor = destruct_iadata;
++		TAILQ_INSERT_TAIL(&ev->data_list, evd, link);
++
++
++		ial = NULL;
++		evd = NULL;
++		memset(&iaparam, 0, sizeof(iaparam));
++		if ((v = dhcp6_find_listval(&optinfo->iapd_list, DHCP6_LISTVAL_IAPD, &iaparam, 0)) != NULL) {
++
++			if ((ial = malloc(sizeof(*ial))) == NULL)
++				goto fail;
++
++			TAILQ_INIT(ial);
++			if (dhcp6_add_listval(ial, DHCP6_LISTVAL_IAPD,
++			    &iaparam, &v->sublist) == NULL) {
++				goto fail;
++			}
++
++			if ((evd = malloc(sizeof(*evd))) == NULL)
++				goto fail;
++			memset(evd, 0, sizeof(*evd));
++			evd->type = DHCP6_EVDATA_IAPD;
++			evd->data = ial;
++			evd->event = ev;
++			evd->destructor = destruct_iadata;
++			TAILQ_INSERT_TAIL(&ev->data_list, evd, link);
++		}
++
++		ial = NULL;
++		evd = NULL;
++		memset(&iaparam, 0, sizeof(iaparam));
++		if ((v = dhcp6_find_listval(&optinfo->iana_list, DHCP6_LISTVAL_IANA, &iaparam, 0)) != NULL) {
++
++			if ((ial = malloc(sizeof(*ial))) == NULL)
++				goto fail;
++
++			TAILQ_INIT(ial);
++			if (dhcp6_add_listval(ial, DHCP6_LISTVAL_IANA,
++			    &iaparam, &v->sublist) == NULL) {
++				goto fail;
++			}
++
++			if ((evd = malloc(sizeof(*evd))) == NULL)
++				goto fail;
++			memset(evd, 0, sizeof(*evd));
++			evd->type = DHCP6_EVDATA_IANA;
++			evd->data = ial;
++			evd->event = ev;
++			evd->destructor = destruct_iadata;
++			TAILQ_INSERT_TAIL(&ev->data_list, evd, link);
++		}
++	}
++
++	ev->timeouts = 0;
++	dhcp6_set_timeoparam(ev);
++	dhcp6_reset_timer(ev);
++
++	ifp->reconfig_flag |= DHCPIFF_RECONF_PROCESSING;
++
++	client6_send(ev);
++
++	return (0);
++
++  fail:
++	if (evd)
++                free(evd);
++        if (ial)
++                free(ial);
++	if (ev)
++		dhcp6_remove_event(ev);
++	return (-1);
++
++}
++
++static int
++client6_recvreconf(ifp, dh6, len, optinfo)
++	struct dhcp6_if *ifp;
++	struct dhcp6 *dh6;
++	ssize_t len;
++	struct dhcp6_optinfo *optinfo;
++{
++	switch (optinfo->reconf_msg) {
++		case 5:		/* RENEW */
++			dprintf(LOG_DEBUG, FNAME, "Received Reconfigure RENEW msg");
++			client6_process_reconf(ifp, dh6, len, optinfo, DHCP6S_RENEW);
++			break;
++		case 11:	/* Information-request */
++			dprintf(LOG_DEBUG, FNAME, "Received Reconfigure INFORMATION msg");
++			client6_process_reconf(ifp, dh6, len, optinfo, DHCP6S_INFOREQ);
++			break;
++		default:
++			dprintf(LOG_DEBUG, FNAME, "Unknown reconfigure msg type");
++			break;
++	}
++}
++static int
++client6_keep_reconf_key(ifp, optinfo)
++	struct dhcp6_if *ifp;
++	struct dhcp6_optinfo *optinfo;
++{
++	if((ifp->authproto == DHCP6_AUTHPROTO_UNDEF ||
++		ifp->authproto == DHCP6_AUTHPROTO_RECONFIG) && 
++		optinfo->authproto == DHCP6_AUTHPROTO_RECONFIG) {
++		ifp->authproto = DHCP6_AUTHPROTO_RECONFIG;
++		ifp->authalgorithm = optinfo->authalgorithm;
++		ifp->authrdm = optinfo->authrdm;
++		if(optinfo->reconfigauth_type == 0x1) { 	/*Reconfigure Key value (used in Reply message).*/
++			memcpy(ifp->reconfig_key, optinfo->reconfigauth_val, sizeof(ifp->reconfig_key));
++			dprintf(LOG_DEBUG, FNAME, "reconfigure key stored");
++			return 0;
++		}
++	}
++	return -1;
++
++}
++#endif
++
+ static int
+ client6_recvreply(ifp, dh6, len, optinfo)
+ 	struct dhcp6_if *ifp;
+@@ -1826,6 +2070,9 @@
+ 		dprintf(LOG_INFO, FNAME, "failed to process authentication");
+ 		return (-1);
+ 	}
++#ifdef RECONFIGURE_CLIENT
++	client6_keep_reconf_key(ifp, optinfo);
++#endif
+ 
+ 	/*
+ 	 * If the client included a Rapid Commit option in the Solicit message,
+@@ -2066,8 +2313,13 @@
+ 	struct dhcp6_optinfo *optinfo;
+ {
+ 	struct keyinfo *key = NULL;
++#ifdef RECONFIGURE_CLIENT
++	struct keyinfo rkey;
++		if(authparam == NULL) {
++			return -1;
++		}
++#endif
+ 	int authenticated = 0;
+-
+ 	switch (optinfo->authproto) {
+ 	case DHCP6_AUTHPROTO_UNDEF:
+ 		/* server did not provide authentication option */
+@@ -2095,6 +2347,7 @@
+ 		 * Replay protection.  If we do not know the previous RD value,
+ 		 * we accept the message anyway (XXX).
+ 		 */
++
+ 		if ((authparam->flags & AUTHPARAM_FLAGS_NOPREVRD)) {
+ 			dprintf(LOG_WARNING, FNAME, "previous RD value is "
+ 			    "unknown (accept it)");
+@@ -2158,6 +2411,47 @@
+ 		}
+ 
+ 		break;
++#ifdef RECONFIGURE_CLIENT
++	case DHCP6_AUTHPROTO_RECONFIG: /* Only applicable for reconf msg */
++		if(optinfo->reconf_msg == 0) {
++			return 0;
++		}
++		
++		if ((optinfo->authflags & DHCP6OPT_AUTHFLAG_NOINFO)) {
++			dprintf(LOG_INFO, FNAME, "server did not include "
++			    "authentication information");
++			break;
++		}
++
++		if (optinfo->authalgorithm != DHCP6_AUTHALG_HMACMD5) {
++			dprintf(LOG_INFO, FNAME, "unknown authentication "
++			    "algorithm (%d)", optinfo->authalgorithm);
++			break;
++		}
++
++		if (optinfo->authrdm != DHCP6_AUTHRDM_MONOCOUNTER) {
++			dprintf(LOG_INFO, FNAME,"unknown RDM (%d)",
++			    optinfo->authrdm);
++			break;
++		}
++
++		/* validate MAC */
++		rkey.secret = optinfo->reconfig_key;
++		rkey.secretlen = sizeof(optinfo->reconfig_key);
++		if (dhcp6_verify_mac((char *)dh6, len, optinfo->authproto,
++		    optinfo->authalgorithm,
++		    optinfo->reconfigauth_offset + sizeof(*dh6), &rkey) == 0) {
++			dprintf(LOG_DEBUG, FNAME, "message authentication "
++			    "validated");
++			authenticated = 1;
++		} else {
++			dprintf(LOG_INFO, FNAME, "invalid message "
++			    "authentication");
++		}
++
++		break;
++#endif
++
+ 	default:
+ 		dprintf(LOG_INFO, FNAME, "server sent unsupported "
+ 		    "authentication protocol (%d)", optinfo->authproto);
+@@ -2252,6 +2546,10 @@
+ 		    optinfo->delayedauth_realmlen);
+ 
+ 		break;
++#ifdef RECONFIGURE_CLIENT
++	case DHCP6_AUTHPROTO_RECONFIG:
++		return 0; /* Reconfig key auth */
++#endif
+ 	default:
+ 		dprintf(LOG_ERR, FNAME, "unsupported authentication protocol "
+ 		    "%d", authparam->authproto);
+--- wide-dhcpv6-20080615/dhcp6c_ia.c	2011-08-19 11:19:55.873753244 +0530
++++ wide-dhcpv6-20080615_aug18_working/dhcp6c_ia.c	2011-08-16 19:52:21.578753615 +0530
+@@ -616,6 +616,8 @@
+ 		dprintf(LOG_NOTICE, FNAME, "failed to create a new event");
+ 		goto fail;
+ 	}
++
++	//TAILQ_INIT(&ev->data_list);
+ 	TAILQ_INSERT_TAIL(&ia->ifp->event_list, ev, link);
+ 
+ 	if ((ev->timer = dhcp6_add_timer(client6_timo, ev)) == NULL) {
+--- wide-dhcpv6-20080615/dhcp6.h	2011-08-19 11:19:55.846753700 +0530
++++ wide-dhcpv6-20080615_aug18_working/dhcp6.h	2011-08-17 13:50:17.639249648 +0530
+@@ -236,6 +236,10 @@
+ #define reconfigauth_type authinfo.aiu_reconfig.type
+ #define reconfigauth_offset authinfo.aiu_reconfig.offset
+ #define reconfigauth_val authinfo.aiu_reconfig.val
++#ifdef	RECONFIGURE_CLIENT
++	int reconf_msg;
++	char reconfig_key[16]; /* receieved in last reply msg */
++#endif
+ };
+ 
+ /* DHCP6 base packet format */
+--- wide-dhcpv6-20080615/Makefile.in	2011-08-19 11:19:55.899754100 +0530
++++ wide-dhcpv6-20080615_aug18_working/Makefile.in	2011-08-16 19:52:21.580753527 +0530
+@@ -37,7 +37,7 @@
+ group= @group@
+ 
+ CFLAGS=	@CFLAGS@ @DEFS@ -DDHCP6_TAHI_FIX -DADDR_PREFIX_SUPPORT \
+-	-DADDR_OVERRIDE_HOST_CONF -DUPDATE_PD_IN_RADVD -DENABLE_IPV6NM \
++	-DADDR_OVERRIDE_HOST_CONF -DUPDATE_PD_IN_RADVD -DENABLE_IPV6NM -DRECONFIGURE_CLIENT \
+ 	-DSYSCONFDIR=\"${sysconfdir}\" \

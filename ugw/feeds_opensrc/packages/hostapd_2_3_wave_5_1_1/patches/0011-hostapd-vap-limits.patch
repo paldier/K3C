@@ -1,0 +1,194 @@
+From db46f73f7edb5d2119f45e4ba3de836cec4857e3 Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Mon, 5 Sep 2016 16:21:20 +0300
+Subject: [PATCH 11/69] hostapd: vap limits
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ hostapd/config_file.c | 17 +++++++++++++++++
+ src/ap/ap_config.c    | 20 +++++++++++++++++++-
+ src/ap/ap_config.h    |  2 ++
+ src/ap/sta_info.c     | 50 ++++++++++++++++++++++++++++++++++++++++++++++----
+ 4 files changed, 84 insertions(+), 5 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 6dc7e8c..5b85608 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2109,6 +2109,15 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		wpa_printf(MSG_DEBUG, "eapol_version=%d", bss->eapol_version);
++  } else if (os_strcmp(buf, "ap_max_num_sta") == 0) {
++    conf->ap_max_num_sta = atoi(pos);
++    if (conf->ap_max_num_sta < 0 || conf->ap_max_num_sta > MAX_STA_COUNT) {
++      wpa_printf(MSG_ERROR, "Line %d: Invalid "
++          "ap_max_num_sta=%d; allowed range "
++          "0..%d", line, conf->ap_max_num_sta,
++          MAX_STA_COUNT);
++      return 1;
++    }
+ #ifdef EAP_SERVER
+ 	} else if (os_strcmp(buf, "eap_authenticator") == 0) {
+ 		bss->eap_server = atoi(pos);
+@@ -2427,6 +2436,14 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 				   line, bss->max_num_sta, MAX_STA_COUNT);
+ 			return 1;
+ 		}
++	} else if (os_strcmp(buf, "num_res_sta") == 0) {
++    bss->num_res_sta = atoi(pos);
++    if (bss->num_res_sta < 0) {
++      wpa_printf(MSG_ERROR, "Line %d: Invalid "
++          "num_res_sta=%d; allowed range "
++          "0..max_num_sta", line, bss->num_res_sta);
++      return 1;
++    }
+ 	} else if (os_strcmp(buf, "wpa") == 0) {
+ 		bss->wpa = atoi(pos);
+ 	} else if (os_strcmp(buf, "wpa_group_rekey") == 0) {
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 2345dd9..d3eac7a 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -61,6 +61,7 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	bss->rsn_pairwise = 0;
+ 
+ 	bss->max_num_sta = MAX_STA_COUNT;
++	bss->num_res_sta = 0;
+ 
+ 	bss->dtim_period = 2;
+ 
+@@ -160,6 +161,7 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->send_probe_response = 1;
+ 	/* Set to invalid value means do not add Power Constraint IE */
+ 	conf->local_pwr_constraint = -1;
++  conf->ap_max_num_sta = MAX_STA_COUNT;
+ 
+ 	conf->wmm_ac_params[0] = ac_be;
+ 	conf->wmm_ac_params[1] = ac_bk;
+@@ -915,7 +917,8 @@ static int hostapd_config_check_cw(struct hostapd_config *conf, int queue)
+ 
+ int hostapd_config_check(struct hostapd_config *conf, int full_config)
+ {
+-	size_t i;
++	int i;
++	int ap_max_num_sta;
+ 
+ 	if (full_config && conf->ieee80211d &&
+ 	    (!conf->country[0] || !conf->country[1])) {
+@@ -952,6 +955,21 @@ int hostapd_config_check(struct hostapd_config *conf, int full_config)
+ 			return -1;
+ 	}
+ 
++	ap_max_num_sta = conf->ap_max_num_sta;
++	for (i = 0; i < conf->num_bss; i++) {
++		if (conf->bss[i]->max_num_sta > conf->ap_max_num_sta) {
++			wpa_printf(MSG_ERROR, "max_num_sta (%d) for BSS#%d is greater than "
++				   "ap_max_num_sta (%d) for radio.", conf->bss[i]->max_num_sta, i, conf->ap_max_num_sta);
++			return -1;
++		}
++		ap_max_num_sta -= conf->bss[i]->num_res_sta;
++	}
++	
++	if (ap_max_num_sta < 0) {
++		wpa_printf(MSG_ERROR, "Summ of num_res_sta for all BSS is greater than ap_max_num_sta (%d) ",
++			   conf->ap_max_num_sta);
++		return -1;
++	}
+ 	return 0;
+ }
+ 
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 0ae9a6e..07021ae 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -240,6 +240,7 @@ struct hostapd_bss_config {
+ 	unsigned int logger_stdout; /* module bitfield */
+ 
+ 	int max_num_sta; /* maximum number of STAs in station table */
++	int num_res_sta; /* number of reserved STAs in the BSS */
+ 
+ 	int dtim_period;
+ 	int bss_load_update_period;
+@@ -606,6 +607,7 @@ struct hostapd_config {
+ 	u8 send_probe_response;
+ 	u8 channel;
+ 	u8 acs;
++	int ap_max_num_sta;  /*maximum number of stations per-radio */
+ 	struct wpa_freq_range_list acs_ch_list;
+ 	enum hostapd_hw_mode hw_mode; /* HOSTAPD_MODE_IEEE80211A, .. */
+ 	enum {
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index a39140f..f2f2f89 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -618,20 +618,62 @@ void ap_sta_session_warning_timeout(struct hostapd_data *hapd,
+ 			       hapd, sta);
+ }
+ 
++static int num_sta_get_total(struct hostapd_data *hapd)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	size_t i;
++	int num_of_sta;
++
++	for (i = 0, num_of_sta = 0; i < iface->num_bss; i++) {
++		struct hostapd_data *bss = iface->bss[i];
++		num_of_sta += bss->num_sta;
++	}
++	return num_of_sta;
++}
++
++static int num_res_sta_get_total(struct hostapd_data *hapd)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	size_t i;
++	int num_res_sta;
++
++	for (i = 0, num_res_sta = 0; i < iface->num_bss; i++) {
++		struct hostapd_data *bss = iface->bss[i];
++		num_res_sta += bss->conf->num_res_sta;
++	}
++	return num_res_sta;
++}
+ 
+ struct sta_info * ap_sta_add(struct hostapd_data *hapd, const u8 *addr)
+ {
+ 	struct sta_info *sta;
++	int num_sta_total = num_sta_get_total(hapd);
++	int num_res_sta_total = num_res_sta_get_total(hapd);
+ 
+ 	sta = ap_get_sta(hapd, addr);
+ 	if (sta)
+ 		return sta;
+ 
+ 	wpa_printf(MSG_DEBUG, "  New STA");
+-	if (hapd->num_sta >= hapd->conf->max_num_sta) {
+-		/* FIX: might try to remove some old STAs first? */
+-		wpa_printf(MSG_DEBUG, "no more room for new STAs (%d/%d)",
+-			   hapd->num_sta, hapd->conf->max_num_sta);
++
++	if (hapd->conf->num_res_sta) { /* Number of reserved STAs is set for this BSS */
++		if (hapd->num_sta >= hapd->conf->max_num_sta) {
++			/* FIX: might try to remove some old STAs first? */
++			wpa_printf(MSG_ERROR, "no more room for new STAs (%d/%d)",
++				   hapd->num_sta, hapd->conf->max_num_sta);
++			return NULL;
++		}
++	} else { /* Number of reserved STAs is not set for this BSS */
++		if (hapd->num_sta >= (hapd->conf->max_num_sta - num_res_sta_total)) {
++			wpa_printf(MSG_ERROR, "no more room for new STAs, "
++				   "reserved STAs limit is reached for BSS(%d/%d)",
++				   hapd->num_sta, hapd->conf->max_num_sta - num_res_sta_total);
++			return NULL;
++		}
++	}
++	if (num_sta_total >= hapd->iconf->ap_max_num_sta) {
++		wpa_printf(MSG_ERROR, "no more room for new STAs, Radio limit reached (%d/%d)",
++			   num_sta_total, hapd->iconf->ap_max_num_sta);
+ 		return NULL;
+ 	}
+ 
+-- 
+1.8.3.4
+

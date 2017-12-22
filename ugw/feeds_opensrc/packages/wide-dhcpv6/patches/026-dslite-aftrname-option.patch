@@ -1,0 +1,342 @@
+Index: wide-dhcpv6-20080615/cfparse.y
+===================================================================
+--- wide-dhcpv6-20080615.orig/cfparse.y	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/cfparse.y	2011-12-28 16:47:33.360961659 +0530
+@@ -91,6 +91,7 @@
+ struct cf_list *cf_nis_list, *cf_nis_name_list;
+ struct cf_list *cf_nisp_list, *cf_nisp_name_list;
+ struct cf_list *cf_bcmcs_list, *cf_bcmcs_name_list;
++struct cf_list *cf_aftr_name_list;
+ long long cf_refreshtime = -1;
+ 
+ extern int yylex __P((void));
+@@ -122,6 +123,7 @@
+ 
+ %token NUMBER SLASH EOS BCL ECL STRING QSTRING PREFIX INFINITY
+ %token COMMA
++%token AFTR_NAME 
+ 
+ %union {
+ 	long long num;
+@@ -342,6 +344,21 @@
+ 				yywarn("multiple refresh times (ignored)");
+ 			}
+ 		}
++	|	OPTION AFTR_NAME QSTRING EOS
++		{
++			struct cf_list *l;
++
++			MAKE_CFLIST(l, CFLISTENT_GENERIC, $3, NULL);
++
++			if (cf_aftr_name_list == NULL) {
++				cf_aftr_name_list = l;
++				cf_aftr_name_list->tail = l;
++				cf_aftr_name_list->next = NULL;
++			} else {
++				cf_aftr_name_list->tail->next = l;
++				cf_aftr_name_list->tail = l->tail;
++			}
++		}
+ 	;
+ 
+ ia_statement:
+@@ -744,6 +761,14 @@
+ 			/* currently no value */
+ 			$$ = l;
+ 		}
++	|	AFTR_NAME
++		{
++			struct cf_list *l;
++
++			MAKE_CFLIST(l, DHCPOPT_AFTRNAME, NULL, NULL);
++			/* currently no value */
++			$$ = l;
++		}
+ 	;
+ 
+ rangeparam:
+@@ -1367,6 +1392,8 @@
+ 	cf_bcmcs_list = NULL;
+ 	cleanup_cflist(cf_bcmcs_name_list);
+ 	cf_bcmcs_name_list = NULL;
++	cleanup_cflist(cf_aftr_name_list);
++	cf_aftr_name_list = NULL;
+ }
+ 
+ static void
+Index: wide-dhcpv6-20080615/cftoken.l
+===================================================================
+--- wide-dhcpv6-20080615.orig/cftoken.l	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/cftoken.l	2011-12-28 16:24:16.311961681 +0530
+@@ -210,6 +210,7 @@
+ 	/* provided for a backward compatibility to WIDE-DHCPv6 before Oct 1 2006 */
+ <S_CNF>nis-server-domain-name { DECHO; return (NIS_NAME); }
+ <S_CNF>nisp-server-domain-name { DECHO; return (NISP_NAME); }	
++<S_CNF>dslite-aftr-name { DECHO; return (AFTR_NAME); }
+ 
+ 	/* generic options */
+ <S_CNF>information-only { DECHO; return (INFO_ONLY); }
+Index: wide-dhcpv6-20080615/common.c
+===================================================================
+--- wide-dhcpv6-20080615.orig/common.c	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/common.c	2011-12-29 16:55:18.061964898 +0530
+@@ -1726,6 +1726,7 @@
+ 	TAILQ_INIT(&optinfo->nispname_list);
+ 	TAILQ_INIT(&optinfo->bcmcs_list);
+ 	TAILQ_INIT(&optinfo->bcmcsname_list);
++	TAILQ_INIT(&optinfo->aftrname_list);
+ 
+ 	optinfo->authproto = DHCP6_AUTHPROTO_UNDEF;
+ 	optinfo->authalgorithm = DHCP6_AUTHALG_UNDEF;
+@@ -1763,6 +1764,7 @@
+ 	dhcp6_clear_list(&optinfo->nispname_list);
+ 	dhcp6_clear_list(&optinfo->bcmcs_list);
+ 	dhcp6_clear_list(&optinfo->bcmcsname_list);
++	 dhcp6_clear_list(&optinfo->aftrname_list);
+ 
+ 	if (optinfo->relaymsg_msg != NULL)
+ 		free(optinfo->relaymsg_msg);
+@@ -1817,6 +1819,9 @@
+ 		goto fail;
+ 	if (dhcp6_copy_list(&dst->bcmcsname_list, &src->bcmcsname_list))
+ 		goto fail;
++        if (dhcp6_copy_list(&dst->aftrname_list, &src->aftrname_list))
++                goto fail;
++
+ 	dst->elapsed_time = src->elapsed_time;
+ 	dst->refreshtime = src->refreshtime;
+ 	dst->pref = src->pref;
+@@ -2187,6 +2192,11 @@
+ 			    &optinfo->ntp_list) == -1)
+ 				goto fail;
+ 			break;
++		case DH6OPT_AFTR_NAME:
++			if (dhcp6_get_domain(optlen, cp, opt,
++			    &optinfo->aftrname_list) == -1)
++				goto fail;
++			break;
+ 		case DH6OPT_IA_PD:
+ 			if (optlen + sizeof(struct dhcp6opt) <
+ 			    sizeof(optia))
+@@ -2882,6 +2892,10 @@
+ 	    &p, optep, &len) != 0)
+ 		goto fail;
+ 
++	if (dhcp6_set_domain(DH6OPT_AFTR_NAME, &optinfo->aftrname_list,
++	    &p, optep, &len) != 0)
++		goto fail;
++
+ 	for (op = TAILQ_FIRST(&optinfo->iapd_list); op;
+ 	    op = TAILQ_NEXT(op, link)) {
+ 		int optlen;
+@@ -3530,6 +3544,8 @@
+ 		return ("subscriber ID");
+ 	case DH6OPT_CLIENT_FQDN:
+ 		return ("client FQDN");
++	case DH6OPT_AFTR_NAME:
++		return ("AFTR NAME");
+ 	default:
+ 		snprintf(genstr, sizeof(genstr), "opt_%d", type);
+ 		return (genstr);
+Index: wide-dhcpv6-20080615/config.c
+===================================================================
+--- wide-dhcpv6-20080615.orig/config.c	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/config.c	2011-12-30 11:21:12.900963695 +0530
+@@ -64,7 +64,7 @@
+ 
+ struct prefix_ifconf *prefix_ifconflist;
+ struct dhcp6_list siplist, sipnamelist, dnslist, dnsnamelist, ntplist;
+-struct dhcp6_list nislist, nisnamelist;
++struct dhcp6_list nislist, nisnamelist, aftrnamelist;
+ struct dhcp6_list nisplist, nispnamelist;
+ struct dhcp6_list bcmcslist, bcmcsnamelist;
+ long long optrefreshtime;
+@@ -75,7 +75,7 @@
+ static struct keyinfo *key_list, *key_list0;
+ static struct authinfo *auth_list, *auth_list0;
+ static struct dhcp6_list siplist0, sipnamelist0, dnslist0, dnsnamelist0, ntplist0;
+-static struct dhcp6_list nislist0, nisnamelist0;
++static struct dhcp6_list nislist0, nisnamelist0, aftrnamelist0;
+ static struct dhcp6_list nisplist0, nispnamelist0;
+ static struct dhcp6_list bcmcslist0, bcmcsnamelist0;
+ static long long optrefreshtime0 = -1;
+@@ -117,7 +117,7 @@
+ 
+ extern struct cf_list *cf_dns_list, *cf_dns_name_list, *cf_ntp_list;
+ extern struct cf_list *cf_sip_list, *cf_sip_name_list;
+-extern struct cf_list *cf_nis_list, *cf_nis_name_list;
++extern struct cf_list *cf_nis_list, *cf_nis_name_list, *cf_aftr_name_list;
+ extern struct cf_list *cf_nisp_list, *cf_nisp_name_list;
+ extern struct cf_list *cf_bcmcs_list, *cf_bcmcs_name_list;
+ extern long long cf_refreshtime;
+@@ -1022,6 +1022,10 @@
+ 	if (configure_domain(cf_bcmcs_name_list, &bcmcsnamelist0, "BCMCS") < 0)
+ 		goto bad;
+ 
++	/* AFTR name */
++	if (configure_domain(cf_aftr_name_list, &aftrnamelist0, "AFTR") < 0)
++		goto bad;
++
+ 	/* Lifetime for stateless options */
+ 	if (cf_refreshtime >= 0) {
+ 		optrefreshtime0 = cf_refreshtime;
+@@ -1296,6 +1300,8 @@
+ 	TAILQ_INIT(&dnsnamelist0);
+ 	dhcp6_clear_list(&ntplist0);
+ 	TAILQ_INIT(&ntplist0);
++        dhcp6_clear_list(&aftrnamelist0);
++        TAILQ_INIT(&aftrnamelist0);
+ 	optrefreshtime0 = -1;
+ 	clear_poolconf(pool_conflist0);
+ }
+@@ -1420,6 +1426,10 @@
+ 	dhcp6_clear_list(&bcmcsnamelist);
+ 	dhcp6_move_list(&bcmcsnamelist, &bcmcsnamelist0);
+ 
++        /* commit AFTR names */
++        dhcp6_clear_list(&aftrnamelist);
++        dhcp6_move_list(&aftrnamelist, &aftrnamelist0);
++
+ 	/* commit information refresh time */
+ 	optrefreshtime = optrefreshtime0;
+ 	/* commit pool configuration */
+@@ -1660,6 +1670,7 @@
+ 		case DHCPOPT_BCMCS:
+ 		case DHCPOPT_BCMCSNAME:
+ 		case DHCPOPT_REFRESHTIME:
++		case DHCPOPT_AFTRNAME:
+ 			switch (cfl->type) {
+ 			case DHCPOPT_SIP:
+ 				opttype = DH6OPT_SIP_SERVER_A;
+@@ -1697,6 +1708,9 @@
+ 			case DHCPOPT_REFRESHTIME:
+ 				opttype = DH6OPT_REFRESHTIME;
+ 				break;
++			case DHCPOPT_AFTRNAME:
++				opttype = DH6OPT_AFTR_NAME;
++				break;
+ 			}
+ 			switch(opcode) {
+ 			case DHCPOPTCODE_REQUEST:
+Index: wide-dhcpv6-20080615/config.h
+===================================================================
+--- wide-dhcpv6-20080615.orig/config.h	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/config.h	2011-12-28 16:48:19.009961616 +0530
+@@ -318,7 +318,8 @@
+        IACONF_PIF, IACONF_PREFIX, IACONF_ADDR,
+        DHCPOPT_SIP, DHCPOPT_SIPNAME,
+        AUTHPARAM_PROTO, AUTHPARAM_ALG, AUTHPARAM_RDM, AUTHPARAM_KEY,
+-       KEYPARAM_REALM, KEYPARAM_KEYID, KEYPARAM_SECRET, KEYPARAM_EXPIRE };
++       KEYPARAM_REALM, KEYPARAM_KEYID, KEYPARAM_SECRET, KEYPARAM_EXPIRE,
++       DHCPOPT_AFTRNAME };
+ 
+ typedef enum {DHCP6_MODE_SERVER, DHCP6_MODE_CLIENT, DHCP6_MODE_RELAY }
+ dhcp6_mode_t;
+Index: wide-dhcpv6-20080615/dhcp6.h
+===================================================================
+--- wide-dhcpv6-20080615.orig/dhcp6.h	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6.h	2011-12-29 16:50:49.482963994 +0530
+@@ -241,6 +241,7 @@
+ 	char reconfig_key[16]; /* receieved in last reply msg */
+ #endif
+ 	int reconfigaccept;
++	struct dhcp6_list aftrname_list; /* AFTR DOMAIN list */
+ };
+ 
+ /* DHCP6 base packet format */
+@@ -319,6 +320,7 @@
+ #define DH6OPT_REMOTE_ID 37
+ #define DH6OPT_SUBSCRIBER_ID 38
+ #define DH6OPT_CLIENT_FQDN 39
++#define DH6OPT_AFTR_NAME 64
+ 
+ /* The followings are KAME specific. */
+ 
+Index: wide-dhcpv6-20080615/dhcp6c.c
+===================================================================
+--- wide-dhcpv6-20080615.orig/dhcp6c.c	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6c.c	2011-12-29 17:05:05.232961813 +0530
+@@ -2397,6 +2397,17 @@
+ 		}
+ 	}
+ 
++        if (!TAILQ_EMPTY(&optinfo->aftrname_list)) {
++                struct dhcp6_listval *d;
++                int i = 0;
++
++                for (d = TAILQ_FIRST(&optinfo->aftrname_list); d;
++                     d = TAILQ_NEXT(d, link), i++) {
++                        info_printf("Dslite AFTR list[%d] %s",
++                            i, d->val_vbuf.dv_buf);
++                }
++        }
++
+ 	/*
+ 	 * Call the configuration script, if specified, to handle various
+ 	 * configuration parameters.
+Index: wide-dhcpv6-20080615/dhcp6c_script.c
+===================================================================
+--- wide-dhcpv6-20080615.orig/dhcp6c_script.c	2011-12-28 16:16:52.000000000 +0530
++++ wide-dhcpv6-20080615/dhcp6c_script.c	2011-12-29 17:27:55.747961753 +0530
+@@ -71,6 +71,7 @@
+ static char nispname_str[] = "new_nisp_name";
+ static char bcmcsserver_str[] = "new_bcmcs_servers";
+ static char bcmcsname_str[] = "new_bcmcs_name";
++static char aftrname_str[] = "new_aftr_name";
+ 
+ int
+ client6_script(scriptpath, state, optinfo, ifname)
+@@ -83,7 +84,7 @@
+ 	int sipservers, sipnamelen;
+ 	int nisservers, nisnamelen;
+ 	int nispservers, nispnamelen;
+-	int bcmcsservers, bcmcsnamelen;
++	int bcmcsservers, bcmcsnamelen, aftrnamelen;
+ 	char **envp, *s;
+ 	char reason[] = "REASON=NBI";
+ 	struct dhcp6_listval *v;
+@@ -105,6 +106,7 @@
+ 	nispnamelen = 0;
+ 	bcmcsservers = 0;
+ 	bcmcsnamelen = 0;
++	aftrnamelen = 0;
+ 	envc = 2;     /* we at least include the reason and the terminator */
+ 
+ 	/* count the number of variables */
+@@ -155,6 +157,13 @@
+ 	}
+ 	envc += bcmcsnamelen ? 1 : 0;
+ 
++        for (v = TAILQ_FIRST(&optinfo->aftrname_list); v;
++            v = TAILQ_NEXT(v, link)) {
++                aftrnamelen += v->val_vbuf.dv_len;
++        }
++        envc += aftrnamelen ? 1 : 0;
++
++
+ 	/* allocate an environments array */
+ 	if ((envp = malloc(sizeof (char *) * envc)) == NULL) {
+ 		dprintf(LOG_NOTICE, FNAME,
+@@ -380,6 +389,22 @@
+ 			strlcat(s, " ", elen);
+ 		}
+ 	}
++        if (aftrnamelen) {
++                elen = sizeof (aftrname_str) + aftrnamelen + 1;
++                if ((s = envp[i++] = malloc(elen)) == NULL) {
++                        dprintf(LOG_NOTICE, FNAME,
++                            "failed to allocate strings for DNS name");
++                        ret = -1;
++                        goto clean;
++                }
++                memset(s, 0, elen);
++                snprintf(s, elen, "%s=", aftrname_str);
++                for (v = TAILQ_FIRST(&optinfo->aftrname_list); v;
++                    v = TAILQ_NEXT(v, link)) {
++                        strlcat(s, v->val_vbuf.dv_buf, elen);
++                        strlcat(s, " ", elen);
++                }
++        }
+ 
+ 	/* launch the script */
+ 	pid = fork();

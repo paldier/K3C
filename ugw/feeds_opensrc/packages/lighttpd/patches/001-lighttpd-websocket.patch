@@ -1,0 +1,218 @@
+diff -ur lighttpd1.4.orig/configure.ac lighttpd1.4.patched/configure.ac
+--- lighttpd1.4.orig/configure.ac	2013-11-21 18:15:54.000000000 +0900
++++ lighttpd1.4.patched/configure.ac	2013-11-21 18:15:54.000000000 +0900
+@@ -604,6 +604,32 @@
+ LIGHTTPD_VERSION_ID=`echo $PACKAGE_VERSION | $AWK -F '.' '{print "(" $1 " << 16 | " $2 " << 8 | " $3 ")"}'`
+ AC_DEFINE_UNQUOTED([LIGHTTPD_VERSION_ID], [$LIGHTTPD_VERSION_ID], [lighttpd-version-id])
+ 
++dnl check for websocket support
++AC_C_BIGENDIAN
++if test "x$ac_cv_c_bigendian" = "xyes"; then
++    WEBSOCKET_CFLAGS="-DWORDS_BIGENDIAN"
++fi
++AC_MSG_CHECKING(whether --with-websocket option specified)
++AC_ARG_WITH([websocket],
++            AC_HELP_STRING([--with-websocket@<:@=all/rfc-6455/ietf-00@:>@],
++                           [support WebSocket version@<:@default=no@:>@]),
++            [ with_websocket=$withval ], [ with_websocket=no ])
++AC_MSG_RESULT(${with_websocket})
++if test "x${with_websocket}" = "xyes" -o \
++        "x${with_websocket}" = "xall" -o "x${with_websocket}" = "xALL" ; then
++    with_websocket=all
++    WEBSOCKET_CFLAGS="$WEBSOCKET_CFLAGS -D_MOD_WEBSOCKET_SPEC_IETF_00_ -D_MOD_WEBSOCKET_SPEC_RFC_6455_"
++elif test "x${with_websocket}" = "xrfc-6455" -o "x${with_websocket}" = "xRFC-6455" ; then
++    WEBSOCKET_CFLAGS="$WEBSOCKET_CFLAGS -D_MOD_WEBSOCKET_SPEC_RFC_6455_"
++elif test "x${with_websocket}" = "xietf-00" -o "x${with_websocket}" = "xIETF-00" ; then
++    WEBSOCKET_CFLAGS="$WEBSOCKET_CFLAGS -D_MOD_WEBSOCKET_SPEC_IETF_00_"
++elif test "x${with_websocket}" != "xno" ; then
++    AC_MSG_ERROR([websocket option is invalid. plz specify all, ietf-00, rfc-6455])
++fi
++AC_SUBST(with_websocket)
++AC_SUBST(WEBSOCKET_CFLAGS)
++AM_CONDITIONAL(WITH_WEBSOCKET, test x$with_websocket != xno)
++
+ AC_CONFIG_FILES([Makefile src/Makefile
+ 		 doc/config/conf.d/Makefile \
+ 		 doc/config/vhosts.d/Makefile \
+@@ -735,6 +761,13 @@
+ 	disable_feature="$disable_feature $features"
+ fi
+ 
++dnl websocket
++plugins="mod_websocket"
++if test "x${with_websocket}" != "xno"; then
++	do_build="$do_build $plugins(${with_websocket})"
++else
++	no_build="$no_build $plugins"
++fi
+ 
+ dnl output
+ 
+Only in lighttpd1.4.patched: configure.ac.orig
+diff -ur lighttpd1.4.orig/src/Makefile.am lighttpd1.4.patched/src/Makefile.am
+--- lighttpd1.4.orig/src/Makefile.am	2013-11-21 18:15:54.000000000 +0900
++++ lighttpd1.4.patched/src/Makefile.am	2013-11-21 18:15:54.000000000 +0900
+@@ -265,6 +265,14 @@
+ mod_accesslog_la_LDFLAGS = -module -export-dynamic -avoid-version -no-undefined
+ mod_accesslog_la_LIBADD = $(common_libadd)
+ 
++if WITH_WEBSOCKET
++lib_LTLIBRARIES += mod_websocket.la
++
++mod_websocket_la_SOURCES = mod_websocket_base64.h mod_websocket_base64.c mod_websocket_sha1.h mod_websocket_sha1.c mod_websocket_socket.h mod_websocket_socket.c mod_websocket_handshake.c mod_websocket_frame.c mod_websocket.h mod_websocket.c 
++mod_websocket_la_CFLAGS = $(AM_CFLAGS) $(WEBSOCKET_CFLAGS)
++mod_websocket_la_LDFLAGS = -module -export-dynamic -avoid-version -no-undefined
++mod_websocket_la_LIBADD = $(PCRE_LIB) $(common_libadd)
++endif
+ 
+ hdr = server.h buffer.h network.h log.h keyvalue.h \
+       response.h request.h fastcgi.h chunk.h \
+Only in lighttpd1.4.patched/src: Makefile.am.orig
+diff -ur lighttpd1.4.orig/src/base.h lighttpd1.4.patched/src/base.h
+--- lighttpd1.4.orig/src/base.h	2013-11-21 18:15:54.000000000 +0900
++++ lighttpd1.4.patched/src/base.h	2013-11-21 18:15:54.000000000 +0900
+@@ -336,7 +336,8 @@
+ 	CON_STATE_WRITE,
+ 	CON_STATE_RESPONSE_END,
+ 	CON_STATE_ERROR,
+-	CON_STATE_CLOSE
++	CON_STATE_CLOSE,
++	CON_STATE_READ_CONTINUOUS
+ } connection_state_t;
+ 
+ typedef enum { COND_RESULT_UNSET, COND_RESULT_FALSE, COND_RESULT_TRUE } cond_result_t;
+Only in lighttpd1.4.patched/src: base.h.orig
+diff -ur lighttpd1.4.orig/src/connections-glue.c lighttpd1.4.patched/src/connections-glue.c
+--- lighttpd1.4.orig/src/connections-glue.c	2013-11-21 18:15:54.000000000 +0900
++++ lighttpd1.4.patched/src/connections-glue.c	2013-11-21 18:15:54.000000000 +0900
+@@ -14,6 +14,7 @@
+ 	case CON_STATE_REQUEST_END: return "req-end";
+ 	case CON_STATE_RESPONSE_START: return "resp-start";
+ 	case CON_STATE_RESPONSE_END: return "resp-end";
++	case CON_STATE_READ_CONTINUOUS: return "read-continuous";
+ 	default: return "(unknown)";
+ 	}
+ }
+@@ -31,6 +32,7 @@
+ 	case CON_STATE_REQUEST_END: return "Q";
+ 	case CON_STATE_RESPONSE_START: return "s";
+ 	case CON_STATE_RESPONSE_END: return "S";
++	case CON_STATE_READ_CONTINUOUS: return "F";
+ 	default: return "x";
+ 	}
+ }
+diff -ur lighttpd1.4.orig/src/connections.c lighttpd1.4.patched/src/connections.c
+--- lighttpd1.4.orig/src/connections.c	2013-11-21 18:15:54.000000000 +0900
++++ lighttpd1.4.patched/src/connections.c	2013-11-21 18:15:54.000000000 +0900
+@@ -1172,6 +1172,8 @@
+ 		}
+ 
+ 		break;
++	case CON_STATE_READ_CONTINUOUS:
++		break;
+ 	default: break;
+ 	}
+ 
+@@ -1246,7 +1248,8 @@
+ 	}
+ 
+ 	if (con->state == CON_STATE_READ ||
+-	    con->state == CON_STATE_READ_POST) {
++	    con->state == CON_STATE_READ_POST ||
++	    con->state == CON_STATE_READ_CONTINUOUS) {
+ 		connection_handle_read_state(srv, con);
+ 	}
+ 
+@@ -1508,6 +1511,9 @@
+ 				done = -1;
+ 			case HANDLER_WAIT_FOR_EVENT:
+ 				/* come back here */
++				if (con->state == CON_STATE_READ_CONTINUOUS) {
++					break;
++				}
+ 				connection_set_state(srv, con, CON_STATE_HANDLE_REQUEST);
+ 
+ 				break;
+@@ -1647,12 +1653,16 @@
+ 			break;
+ 		case CON_STATE_READ_POST:
+ 		case CON_STATE_READ:
++		case CON_STATE_READ_CONTINUOUS:
+ 			if (srv->srvconf.log_state_handling) {
+ 				log_error_write(srv, __FILE__, __LINE__, "sds",
+ 						"state for fd", con->fd, connection_get_state(con->state));
+ 			}
+ 
+ 			connection_handle_read_state(srv, con);
++			if (con->state == CON_STATE_READ_CONTINUOUS) {
++				plugins_call_read_continuous(srv, con);
++			}
+ 			break;
+ 		case CON_STATE_WRITE:
+ 			if (srv->srvconf.log_state_handling) {
+@@ -1814,6 +1824,9 @@
+ 			fdevent_event_del(srv->ev, &(con->fde_ndx), con->fd);
+ 		}
+ 		break;
++	case CON_STATE_READ_CONTINUOUS:
++		/* leave up to plugins */
++		break;
+ 	default:
+ 		fdevent_event_del(srv->ev, &(con->fde_ndx), con->fd);
+ 		break;
+Only in lighttpd1.4.patched/src: connections.c.orig
+diff -ur lighttpd1.4.orig/src/plugin.c lighttpd1.4.patched/src/plugin.c
+--- lighttpd1.4.orig/src/plugin.c	2013-11-21 18:15:54.000000000 +0900
++++ lighttpd1.4.patched/src/plugin.c	2013-11-21 18:15:54.000000000 +0900
+@@ -44,6 +44,7 @@
+ 		PLUGIN_FUNC_INIT,
+ 		PLUGIN_FUNC_CLEANUP,
+ 		PLUGIN_FUNC_SET_DEFAULTS,
++		PLUGIN_FUNC_READ_CONTINUOUS,
+ 
+ 		PLUGIN_FUNC_SIZEOF
+ } plugin_t;
+@@ -274,6 +275,7 @@
+ PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_DOCROOT, handle_docroot)
+ PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_PHYSICAL, handle_physical)
+ PLUGIN_TO_SLOT(PLUGIN_FUNC_CONNECTION_RESET, connection_reset)
++PLUGIN_TO_SLOT(PLUGIN_FUNC_READ_CONTINUOUS, read_continuous)
+ 
+ #undef PLUGIN_TO_SLOT
+ 
+@@ -403,6 +405,7 @@
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_DOCROOT, handle_docroot);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_HANDLE_PHYSICAL, handle_physical);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_CONNECTION_RESET, connection_reset);
++		PLUGIN_TO_SLOT(PLUGIN_FUNC_READ_CONTINUOUS, read_continuous);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_CLEANUP, cleanup);
+ 		PLUGIN_TO_SLOT(PLUGIN_FUNC_SET_DEFAULTS, set_defaults);
+ #undef PLUGIN_TO_SLOT
+diff -ur lighttpd1.4.orig/src/plugin.h lighttpd1.4.patched/src/plugin.h
+--- lighttpd1.4.orig/src/plugin.h	2013-11-21 18:15:54.000000000 +0900
++++ lighttpd1.4.patched/src/plugin.h	2013-11-21 18:15:54.000000000 +0900
+@@ -23,6 +23,7 @@
+ #define PHYSICALPATH_FUNC  CONNECTION_FUNC
+ #define REQUESTDONE_FUNC   CONNECTION_FUNC
+ #define URIHANDLER_FUNC    CONNECTION_FUNC
++#define READ_CONT_FUNC     CONNECTION_FUNC
+ 
+ #define PLUGIN_DATA        size_t id
+ 
+@@ -55,6 +56,7 @@
+ 											    */
+ 	handler_t (* handle_subrequest)      (server *srv, connection *con, void *p_d);    /* */
+ 	handler_t (* connection_reset)       (server *srv, connection *con, void *p_d);    /* */
++	handler_t (* read_continuous)        (server *srv, connection *con, void *p_d);    /* */
+ 	void *data;
+ 
+ 	/* dlopen handle */
+@@ -74,6 +76,7 @@
+ handler_t plugins_call_handle_connection_close(server *srv, connection *con);
+ handler_t plugins_call_handle_joblist(server *srv, connection *con);
+ handler_t plugins_call_connection_reset(server *srv, connection *con);
++handler_t plugins_call_read_continuous(server *srv, connection *con);
+ 
+ handler_t plugins_call_handle_trigger(server *srv);
+ handler_t plugins_call_handle_sighup(server *srv);
+

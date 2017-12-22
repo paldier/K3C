@@ -1,0 +1,5416 @@
+diff -Naur linux-atm-2.5.0/build.sh open_linux_atm/build.sh
+--- linux-atm-2.5.0/build.sh	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/build.sh	2009-11-11 18:14:19.998479000 +0530
+@@ -0,0 +1,92 @@
++#!/bin/sh
++
++APPS_NAME="linux-atm-2.5.0"
++
++if [ -e sysconfig.sh ]; then
++	. sysconfig.sh
++	. config.sh
++	. model_config.sh
++else
++        echo "Application "$APPS_NAME" not configured"
++        exit 0
++fi                                                                                                                                       
++
++display_info "----------------------------------------------------------------------"
++display_info "----------------------- build $APPS_NAME ------------------------"
++display_info "----------------------------------------------------------------------"
++
++parse_args $@
++
++if [ $BUILD_CLEAN -eq 1 ]; then
++	rm -rf .config_ok
++	make -s distclean
++	rm -f missing mkinstalldirs ylwrap depcomp install_sh
++	rm -f config.cache
++	rm -f aclocal.m4
++	rm -f config.h.in
++	rm -f configure
++	rm -f ltmain.sh
++	rm -rf autom4te.cache/
++	find . -name Makefile.in | xargs rm -rf
++	[ ! $BUILD_CONFIGURE -eq 1 ] && exit 0
++fi
++
++if [ "$1" = "config_only" -a ! -f .config_ok -o $BUILD_CONFIGURE -eq 1 ]; then
++	if [ -f $HOSTUTILS_PATH/../share/libtool/ltmain.sh ]; then
++		cp $HOSTUTILS_PATH/../share/libtool/ltmain.sh .
++	else
++		cp ltmain.sh.org ltmain.sh
++	fi
++
++	# NOTE!! aclocal need equal or newer than 1.6 version
++	aclocal
++
++	autoheader
++	autoconf
++	# NOTE!! automake need equal or newer than 1.6 version
++	automake --foreign --add-missing
++
++
++	AR=${IFX_AR} AS=${IFX_AS} LD=${IFX_LD} NM=${IFX_NM} CC=${IFX_CC} BUILDCC=${IFX_HOSTCC} CXX=${IFX_CXX} RANLIB=${IFX_RANLIB} OBJCOPY=${IFX_OBJCOPY} OBJDUMP=${IFX_OBJDUMP} IFX_LDFLAGS='${IFX_LDFLAGS} -nostdlib' IFX_CFLAGS=${IFX_CFLAGS} TARGET=${TARGET} BUILD=${BUILD} HOST=${HOST} CFLAGS="${IFX_CFLAGS}" ./configure --target=${TARGET} --host=${HOST} --build=${BUILD} --prefix=/usr --with-kernel-headers=${PWD}/kernel --enable-ifx-opt --program-transform-name=""
++
++	ifx_error_check $? 
++	echo -n > .config_ok
++fi
++
++if [ "$1" = "config_only" ] ;then
++	exit 0
++fi
++
++make -s -C src/lib install DESTDIR=${BUILD_ROOTFS_DIR} libdir=/lib IFX_CFLAGS="${IFX_CFLAGS}" IFX_LDFLAGS="${IFX_LDFLAGS}"
++ifx_error_check $? 
++
++if [ A"$CONFIG_FEATURE_RFC2684 (br2684ctl-20040226-1)" == "A1" ]; then
++	make -s -C src/br2684 install DESTDIR=${BUILD_ROOTFS_DIR} libdir=/lib IFX_CFLAGS="${IFX_CFLAGS}" IFX_LDFLAGS="${IFX_LDFLAGS}"
++fi
++
++if [ A"$CONFIG_FEATURE_CLIP" == "A1" ]; then
++	make -s -C src/arpd  DESTDIR=${BUILD_ROOTFS_DIR} IFX_CFLAGS="${IFX_CFLAGS}" IFX_LDFLAGS="${IFX_LDFLAGS}"
++	ifx_error_check $? 
++
++	make -s -C src/maint atmaddr IFX_CFLAGS="${IFX_CFLAGS}" IFX_LDFLAGS="${IFX_LDFLAGS}"
++	ifx_error_check $? 
++
++	${IFX_STRIP} src/arpd/.libs/atmarpd
++	ifx_error_check $? 
++
++	cp -f src/arpd/.libs/atmarpd ${BUILD_ROOTFS_DIR}/usr/sbin/
++	ifx_error_check $? 
++
++	${IFX_STRIP} src/arpd/.libs/atmarp
++	ifx_error_check $? 
++
++	cp -f src/arpd/.libs/atmarp ${BUILD_ROOTFS_DIR}/usr/sbin/
++	ifx_error_check $? 
++
++	${IFX_STRIP} src/maint/.libs/atmaddr
++	ifx_error_check $? 
++
++	cp -f src/maint/.libs/atmaddr ${BUILD_ROOTFS_DIR}/usr/sbin/
++	ifx_error_check $? 
++fi
++
+diff -Naur linux-atm-2.5.0/ifx_make.mk open_linux_atm/ifx_make.mk
+--- linux-atm-2.5.0/ifx_make.mk	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/ifx_make.mk	2009-11-11 18:14:21.725331000 +0530
+@@ -0,0 +1,103 @@
++include .app_configured
++
++ifeq ($(MAKE_USED),1)
++include $(INCLUDE_DIR)/Rules.mk
++include $(INCLUDE_DIR)/Makefile.common
++
++APPS_NAME=linux_atm
++APP_TYPE=OPEN
++APP_VERSION=2.5.0-IFX
++CONFIG_FULL_PACKAGE=y
++IFX_APIS_DIR:=$(USER_IFXSOURCE_DIR)/IFXAPIs/
++IFX_CFLAGS      +=-I$(IFX_APIS_DIR)/include/
++
++all:configure compile install
++
++define menuconfig
++
++config FEATURE_LINUX_ATM
++	bool 'linux-atm'
++	help
++	  linux-atm
++	
++config FEATURE_CONFIG_FEATURE_CLIP
++	bool 'CLIP'
++	depends on FEATURE_LINUX_ATM
++	help
++	  clip
++
++endef
++
++define configure
++	cp -f $(HOSTUTILS_PATH)/../share/libtool/ltmain.sh .
++
++	aclocal
++	autoheader
++	autoconf
++	automake --foreign --add-missing
++
++	$(BUILD_FLAGS) IFX_CFLAGS="$(IFX_CFLAGS)" IFX_LDFLAGS="$(IFX_LDFLAGS)" \
++	./configure --target=$(TARGET) --host=$(HOST) --build=$(BUILD) \
++	--prefix=/usr --with-kernel-headers=$(KERNEL_SOURCE_DIR)/ \
++	--enable-ifx-opt --program-transform-name=""
++endef
++
++define compile
++	$(MAKE) $(BUILD_FLAGS) IFX_CFLAGS="$(IFX_CFLAGS)" IFX_LDFLAGS="$(IFX_LDFLAGS)" \
++	-C src/lib/ DESTDIR=$(BUILD_ROOTFS_DIR) libdir=/lib
++	if [ A$(CONFIG_FEATURE_RFC2684) = Ay ];then \
++		$(MAKE) $(BUILD_FLAGS) IFX_CFLAGS="$(IFX_CFLAGS)" IFX_LDFLAGS="$(IFX_LDFLAGS)" \
++		-C src/br2684 DESTDIR=$(BUILD_ROOTFS_DIR) libdir=/lib; \
++	fi
++	if [ A$(CONFIG_FEATURE_CONFIG_FEATURE_CLIP) = Ay ];then \
++		$(MAKE) $(BUILD_FLAGS) IFX_CFLAGS="$(IFX_CFLAGS)" IFX_LDFLAGS="$(IFX_LDFLAGS)" \
++		-C src/arpd  DESTDIR=$(BUILD_ROOTFS_DIR); \
++		$(MAKE) $(BUILD_FLAGS) IFX_CFLAGS="$(IFX_CFLAGS)" IFX_LDFLAGS="$(IFX_LDFLAGS)" \
++		-C src/maint atmaddr; \
++		$(IFX_STRIP) src/arpd/.libs/atmarpd; \
++		$(IFX_STRIP) src/arpd/.libs/atmarp; \
++		$(IFX_STRIP) src/maint/.libs/atmaddr; \
++	fi
++endef
++
++define install
++	$(MAKE) $(BUILD_FLAGS) IFX_CFLAGS="$(IFX_CFLAGS)" IFX_LDFLAGS="$(IFX_LDFLAGS)" \
++	-C src/lib/ DESTDIR=$(BUILD_ROOTFS_DIR) libdir=/lib install
++	if [ A$(CONFIG_FEATURE_CONFIG_FEATURE_CLIP) = Ay ];then \
++		cp -f src/arpd/.libs/atmarpd $(BUILD_ROOTFS_DIR)/usr/sbin/; \
++		cp -f src/arpd/.libs/atmarp $(BUILD_ROOTFS_DIR)/usr/sbin/; \
++		cp -f src/maint/.libs/atmaddr $(BUILD_ROOTFS_DIR)/usr/sbin/; \
++	fi
++endef
++
++define clean
++	if [ -e Makefile ];then \
++		$(MAKE) clean; \
++	fi
++endef
++
++define distclean
++	if [ -e Makefile ];then \
++		rm -rf .config_ok; \
++		$(MAKE) distclean; \
++		rm -f missing mkinstalldirs ylwrap depcomp install_sh; \
++		rm -f config.cache; \
++		rm -f aclocal.m4; \
++		rm -f config.h.in; \
++		rm -f configure; \
++		rm -f ltmain.sh; \
++		rm -rf autom4te.cache/; \
++		rm -rf config.guess config.sub install-sh; \
++		find . -name Makefile.in | xargs rm -rf; \
++	fi
++endef
++
++$(eval $(call define_eval_application))
++else
++export MAKE_USED=1
++all configure %:
++	@$(MAKE) -s -C $(BUILD_TOOLS_DIR) make_installed
++	@$(BUILD_TOOLS_DIR)/tmp/bin/make -f ifx_make.mk $@
++
++.PHONY:configure
++endif
+diff -Naur linux-atm-2.5.0/src/arpd/Makefile-0.79 open_linux_atm/src/arpd/Makefile-0.79
+--- linux-atm-2.5.0/src/arpd/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/arpd/Makefile-0.79	2009-11-11 18:14:20.029484000 +0530
+@@ -0,0 +1,16 @@
++LIBS=-latmd
++LIBDEPS=../lib/libatmd.a
++#LIBS=-lfl # lex may want  -ll  here
++#INCLUDES=
++OBJS=atmarpd.o arp.o io.o itf.o table.o
++BOOTPGMS=atmarp atmarpd
++MAN8=atmarp.8 atmarpd.8
++SYSHDR=atmarp.h atmarpd.h
++
++include ../Rules.make
++
++atmarp:			atmarp.o
++			$(CC) $(LDFLAGS) -o atmarp atmarp.o $(LIBS) $(LDLIBS)
++
++atmarpd:		$(OBJS)
++			$(CC) $(LDFLAGS) -o atmarpd $(OBJS) $(LIBS) $(LDLIBS)
+diff -Naur linux-atm-2.5.0/src/config/init-redhat/Makefile.am open_linux_atm/src/config/init-redhat/Makefile.am
+--- linux-atm-2.5.0/src/config/init-redhat/Makefile.am	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/config/init-redhat/Makefile.am	2009-11-11 18:14:20.089485000 +0530
+@@ -0,0 +1,2 @@
++EXTRA_DIST = atm atm-sysconfig ifcfg-lec0 README
++
+diff -Naur linux-atm-2.5.0/src/debug/Makefile-0.79 open_linux_atm/src/debug/Makefile-0.79
+--- linux-atm-2.5.0/src/debug/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/debug/Makefile-0.79	2009-11-11 18:14:20.111480000 +0530
+@@ -0,0 +1,10 @@
++PGMS=delay svctor # ed encopy endump zndump znth
++# Remove the # for more hardware-specific debugging programs.
++# I'll need those only if you're fiddling with the guts of drivers.
++
++MAN8=
++
++include ../Rules.make
++
++zndump.o:	zndump.c
++		$(CC) -c $(CFLAGS) -w -O zndump.c
+diff -Naur linux-atm-2.5.0/src/extra/ANS/Makefile.am open_linux_atm/src/extra/ANS/Makefile.am
+--- linux-atm-2.5.0/src/extra/ANS/Makefile.am	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/ANS/Makefile.am	2009-11-11 18:14:20.179478000 +0530
+@@ -0,0 +1,3 @@
++EXTRA_DIST = 127.0.0 atm-reverse e164_cc pdf2e164_cc.pl resolv.conf 192.168.27
++		bind-498-REL.patch hosts2ans.pl README atm named.conf README.DNS
++
+diff -Naur linux-atm-2.5.0/src/extra/drivers/Makefile.am open_linux_atm/src/extra/drivers/Makefile.am
+--- linux-atm-2.5.0/src/extra/drivers/Makefile.am	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/Makefile.am	2009-11-11 18:14:20.208491000 +0530
+@@ -0,0 +1,2 @@
++EXTRA_DIST = atm_he.h he.c hediag.c he.h he.patch-2.2 he.patch-2.4 README.he
++
+diff -Naur linux-atm-2.5.0/src/extra/drivers/README.he open_linux_atm/src/extra/drivers/README.he
+--- linux-atm-2.5.0/src/extra/drivers/README.he	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/README.he	2009-11-11 18:14:20.211475000 +0530
+@@ -0,0 +1,90 @@
++Description
++===========
++
++This is a Linux ATM driver for the FORE Systems ForeRunnerHE adapters.
++It supports both the 155 and 622 flavors of the card.  The driver was
++primarily developed on a powerpc (604e@200MHz) but it has been ported
++and tested on an i386 (2 i686@800Mhz).
++
++This is the sixth public release of the driver.   Its mainly to provide
++interrupt sharing fixes and updates for the latest 2.4 kernels.
++
++Current features:
++
++	. interrupt sharing
++	. hardware traffic shaping
++	. cbr
++	. tasklet support
++	. uses new pci loadable module scheme
++	. 64bit PCI bus operation tested
++	. SMP tested
++	. 2.2 kernel support
++
++Feedback (including fixes or suggestions) is welcome. 
++Contact chas@cmf.nrl.navy.mil.
++
++History
++=======
++
++This driver has been an informal project for Eric Kinzie,
++ekinzie@cmf.nrl.navy.mil, and I.  It represents most of our spare time
++during the month of March, 2000.  It started last November when we wanted a
++cheap oc-12c capable router.  I wrote the skeleton in about a week but had
++to put it aside until recently.  Most of the brain damage in the driver
++can be attributed directly to me and my lack of understanding regarding
++linux internals.  Eric has the i386 with the 622 board (and a slightly
++out of date linux device driver book).
++
++Requirements
++============
++
++ATM 0.59 - ATM 0.78
++
++Installation
++============
++
++copy atm_he.h to /usr/src/linux/include/linux:
++
++	% cp atm_he.h /usr/src/linux/include/linux
++
++copy he.c and he.h to /usr/src/linux/drivers/atm:
++
++	% cp he.c he.h /usr/src/linux/drivers/atm
++
++apply the patches:
++
++	% cd /usr/src/inux/drivers/atm
++
++	[2.2 KERNELS ONLY]
++	% patch < he.patch-2.2
++
++	[2.4 KERNELS ONLY]
++	% patch < he.patch-2.4
++
++reconfigure your kernel and select the 'FORE HE' driver in the Network
++Device/ATM Adapters menu and rebuild your kernel:
++
++	% cd /usr/src/linux
++	% make menuconfig (enable the HE card in the Networking/ATM menu)
++	% make dep
++	% make (or 'make modules' if you building as a module)
++
++boot your new kernel or insmod the driver.
++
++Miscellaneous
++=============
++
++hediag.c is a utility to dump the various registers on the adapter.
++Its handy for debugging the driver.
++
++BUGS
++====
++
++. aal0 receive only (atmdump works though)
++
++. the driver seems to use a fair amount of memory.  this can be a problem
++  for smaller memory (<64M) machines.  there should possibly be a small
++  memory config.
++
++--chas
++chas@cmf.nrl.navy.mil
+diff -Naur linux-atm-2.5.0/src/extra/drivers/atm_he.h open_linux_atm/src/extra/drivers/atm_he.h
+--- linux-atm-2.5.0/src/extra/drivers/atm_he.h	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/atm_he.h	2009-11-11 18:14:20.212475000 +0530
+@@ -0,0 +1,20 @@
++/* atm_he.h */
++
++#ifndef LINUX_ATM_HE_H
++#define LINUX_ATM_HE_H
++
++#include <linux/atmioc.h>
++
++#define HE_GET_REG	_IOW('a', ATMIOC_SARPRV, struct atmif_sioc)
++
++#define HE_REGTYPE_PCI	1
++#define HE_REGTYPE_RCM	2
++#define HE_REGTYPE_TCM	3
++#define HE_REGTYPE_MBOX	4
++
++struct he_ioctl_reg {
++	unsigned addr, val;
++	char type;
++};
++
++#endif /* LINUX_ATM_HE_H */
+diff -Naur linux-atm-2.5.0/src/extra/drivers/he.c open_linux_atm/src/extra/drivers/he.c
+--- linux-atm-2.5.0/src/extra/drivers/he.c	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/he.c	2009-11-11 18:14:20.215483000 +0530
+@@ -0,0 +1,2922 @@
++/* $Id: he.c,v 1.1.2.1 2001/10/15 23:19:43 paulsch Exp $ */
++
++/*
++
++  he.c
++
++  ForeRunnerHE ATM Adapter driver for ATM on Linux
++  Copyright (C) 1999-2001  Naval Research Laboratory
++
++  This library is free software; you can redistribute it and/or
++  modify it under the terms of the GNU Lesser General Public
++  License as published by the Free Software Foundation; either
++  version 2.1 of the License, or (at your option) any later version.
++
++  This library is distributed in the hope that it will be useful,
++  but WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  Lesser General Public License for more details.
++
++  You should have received a copy of the GNU Lesser General Public
++  License along with this library; if not, write to the Free Software
++  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++
++*/
++
++/*
++
++  he.c
++
++  ForeRunnerHE ATM Adapter driver for ATM on Linux
++  Copyright (C) 1999-2001  Naval Research Laboratory
++
++  Permission to use, copy, modify and distribute this software and its
++  documentation is hereby granted, provided that both the copyright
++  notice and this permission notice appear in all copies of the software,
++  derivative works or modified versions, and any portions thereof, and
++  that both notices appear in supporting documentation.
++
++  NRL ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS" CONDITION AND
++  DISCLAIMS ANY LIABILITY OF ANY KIND FOR ANY DAMAGES WHATSOEVER
++  RESULTING FROM THE USE OF THIS SOFTWARE.
++
++  This driver was written using the "Programmer's Reference Manual for
++  ForeRunnerHE(tm)", MANU0361-01 - Rev. A, 08/21/98.
++
++  AUTHORS:
++	chas williams <chas@cmf.nrl.navy.mil>
++	eric kinzie <ekinzie@cmf.nrl.navy.mil>
++
++  NOTES:
++	4096 supported 'connections'
++	group 0 is used for all traffic
++	interrupt queue 0 is used for all interrupts
++	aal0 support for receive only
++
++ */
++
++#include <linux/config.h>
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/kernel.h>
++#include <linux/skbuff.h>
++#include <linux/pci.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/string.h>
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/sched.h>
++#include <linux/timer.h>
++#include <linux/interrupt.h>
++#include <asm/io.h>
++#include <asm/byteorder.h>
++#include <asm/uaccess.h>
++
++#include <linux/atmdev.h>
++#include <linux/atm.h>
++#include <linux/sonet.h>
++#ifndef ATM_OC12_PCR
++#define ATM_OC12_PCR (622080000/1080*1040/8/53)
++#endif
++
++#define USE_TASKLET
++
++/* 2.2 kernel support */
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,43)
++#define dev_kfree_skb_irq(skb)		dev_kfree_skb(skb)
++#define dev_kfree_skb_any(skb)		dev_kfree_skb(skb)
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,2,18)
++#define set_current_state(x)		current->state = (x);
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,43)
++#undef USE_TASKLET
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,43)
++#define pci_map_single(dev, addr, size, dir)	virt_to_bus(addr)
++#define pci_unmap_single(dev, addr, size, dir)
++#define pci_dma_sync_single(dev, addr, size, dir)
++#define pci_set_dma_mask(dev, mask)			0
++#endif
++
++
++#include "he.h"
++
++#ifdef USE_SUNI
++#include "suni.h"
++#endif /* USE_SUNI */
++
++#include <linux/atm_he.h>
++
++#define hprintk(fmt,args...)	printk(DEV_LABEL "%d: " fmt, he_dev->number, args)
++#define hprintk1(fmt)		printk(DEV_LABEL "%d: " fmt, he_dev->number)
++
++#undef DEBUG
++#ifdef DEBUG
++#define HPRINTK(fmt,args...)	hprintk(fmt,args)
++#define HPRINTK1(fmt)		hprintk1(fmt)
++#else
++#define HPRINTK(fmt,args...)
++#define HPRINTK1(fmt,args...)
++#endif /* DEBUG */
++
++
++/* version definition */
++
++char kernel_version[] = UTS_RELEASE;
++
++/* defines */
++#define ALIGN_ADDRESS(addr, alignment) \
++	((((unsigned long) (addr)) + (((unsigned long) (alignment)) - 1)) & ~(((unsigned long) (alignment)) - 1))
++
++/* declarations */
++
++static int he_open(struct atm_vcc *vcc, short vpi, int vci);
++static void he_close(struct atm_vcc *vcc);
++static int he_send(struct atm_vcc *vcc, struct sk_buff *skb);
++static int he_sg_send(struct atm_vcc *vcc, unsigned long start, unsigned long size);
++static int he_ioctl(struct atm_dev *dev, unsigned int cmd, void *arg);
++static void he_irq_handler(int irq, void *dev_id, struct pt_regs *regs);
++static void he_tasklet(unsigned long data);
++static int he_proc_read(struct atm_dev *dev,loff_t *pos,char *page);
++static int he_start(struct atm_dev *dev);
++static void he_stop(struct he_dev *dev);
++static void he_phy_put(struct atm_dev *, unsigned char, unsigned long);
++static unsigned char he_phy_get(struct atm_dev *, unsigned long);
++
++static u8 read_prom_byte(struct he_dev *he_dev, int addr);
++
++/* globals */
++
++struct he_dev *he_devs = NULL;
++static short disable64 = -1;
++
++static struct atmdev_ops he_ops =
++{
++   open:	he_open,
++   close:	he_close,	
++   ioctl:	he_ioctl,	
++   send:	he_send,
++   sg_send:	he_sg_send,	
++   phy_put:	he_phy_put,
++   phy_get:	he_phy_get,
++   proc_read:	he_proc_read,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,4,1)
++   owner:	THIS_MODULE
++#endif
++};
++
++/* see the comments in he.h about global_lock */
++
++#ifdef CONFIG_SMP
++#define he_spin_lock(lock, flags)	spin_lock_irqsave(lock, flags)
++#define he_spin_unlock(lock, flags)	spin_unlock_irqrestore(lock, flags)
++#else
++#define he_spin_lock(lock, flags)	flags = 0
++#define he_spin_unlock(lock, flags)	flags = 0
++#endif
++
++
++#define he_writel(dev, val, reg)	writel(val, (dev)->membase + (reg))
++#define he_readl(dev, reg)		readl((dev)->membase + (reg))
++
++/* section 2.12 connection memory access */
++
++static __inline__ void
++he_writel_internal(struct he_dev *he_dev, unsigned val, unsigned addr,
++								unsigned flags)
++{
++	he_writel(he_dev, val, CON_DAT);
++	he_writel(he_dev, flags | CON_CTL_WRITE | CON_CTL_ADDR(addr) | CON_CTL_BUSY, CON_CTL);
++	while(he_readl(he_dev, CON_CTL) & CON_CTL_BUSY);
++}
++
++#define he_writel_rcm(dev, val, reg) 				\
++			he_writel_internal(dev, val, reg, CON_CTL_RCM)
++
++#define he_writel_tcm(dev, val, reg) 				\
++			he_writel_internal(dev, val, reg, CON_CTL_TCM)
++
++#define he_writel_mbox(dev, val, reg) 				\
++			he_writel_internal(dev, val, reg, CON_CTL_MBOX)
++
++static __inline__ unsigned
++he_readl_internal(struct he_dev *he_dev, unsigned addr, unsigned flags)
++{
++	he_writel(he_dev, flags | CON_CTL_READ | CON_CTL_ADDR(addr) | CON_CTL_BUSY, CON_CTL);
++	while(he_readl(he_dev, CON_CTL) & CON_CTL_BUSY);
++	return he_readl(he_dev, CON_DAT);
++}
++
++#define he_readl_rcm(dev, reg) \
++			he_readl_internal(dev, reg, CON_CTL_RCM)
++
++#define he_readl_tcm(dev, reg) \
++			he_readl_internal(dev, reg, CON_CTL_TCM)
++
++#define he_readl_mbox(dev, reg) \
++			he_readl_internal(dev, reg, CON_CTL_MBOX)
++
++
++/* figure 2.2 connection id */
++
++#define he_mkcid(dev, vpi, vci)		(((vpi<<(dev)->vcibits) | vci) & 0x1fff)
++
++/* 2.5.1 per connection transmit state registers */
++
++#define he_writel_tsr0(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 0)
++#define he_readl_tsr0(dev, cid) \
++		he_readl_tcm(dev, CONFIG_TSRA | (cid<<3) | 0)
++
++#define he_writel_tsr1(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 1)
++
++#define he_writel_tsr2(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 2)
++
++#define he_writel_tsr3(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 3)
++
++#define he_writel_tsr4(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 4)
++
++	/* from page 2-20
++	 *
++	 * NOTE While the transmit connection is active, bits 23 through 0
++	 *      of this register must not be written by the host.  Byte
++	 *      enables should be used during normal operation when writing
++	 *      the most significant byte.
++	 */
++
++#define he_writel_tsr4_upper(dev, val, cid) \
++		he_writel_internal(dev, val, CONFIG_TSRA | (cid<<3) | 4, \
++							CON_CTL_TCM \
++							| CON_BYTE_DISABLE_2 \
++							| CON_BYTE_DISABLE_1 \
++							| CON_BYTE_DISABLE_0)
++
++#define he_readl_tsr4(dev, cid) \
++		he_readl_tcm(dev, CONFIG_TSRA | (cid<<3) | 4)
++
++#define he_writel_tsr5(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 5)
++
++#define he_writel_tsr6(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 6)
++
++#define he_writel_tsr7(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRA | (cid<<3) | 7)
++
++
++#define he_writel_tsr8(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRB | (cid<<1) | 0)
++
++#define he_writel_tsr9(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRB | (cid<<1) | 1)
++
++
++#define he_writel_tsr10(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRC | (cid<<2) | 0)
++
++#define he_writel_tsr11(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRC | (cid<<2) | 1)
++
++#define he_writel_tsr12(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRC | (cid<<2) | 2)
++
++#define he_writel_tsr13(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRC | (cid<<2) | 3)
++
++
++#define he_writel_tsr14(dev, val, cid) \
++		he_writel_tcm(dev, val, CONFIG_TSRD | cid)
++
++#define he_writel_tsr14_upper(dev, val, cid) \
++		he_writel_internal(dev, val, CONFIG_TSRD | cid, \
++							CON_CTL_TCM \
++							| CON_BYTE_DISABLE_2 \
++							| CON_BYTE_DISABLE_1 \
++							| CON_BYTE_DISABLE_0)
++
++/* 2.7.1 per connection receive state registers */
++
++#define he_writel_rsr0(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 0)
++#define he_readl_rsr0(dev, cid) \
++		he_readl_rcm(dev, 0x00000 | (cid<<3) | 0)
++
++#define he_writel_rsr1(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 1)
++
++#define he_writel_rsr2(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 2)
++
++#define he_writel_rsr3(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 3)
++
++#define he_writel_rsr4(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 4)
++
++#define he_writel_rsr5(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 5)
++
++#define he_writel_rsr6(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 6)
++
++#define he_writel_rsr7(dev, val, cid) \
++		he_writel_rcm(dev, val, 0x00000 | (cid<<3) | 7)
++
++static int __devinit
++he_init_one(struct pci_dev *pci_dev, const struct pci_device_id *pci_ent)
++{
++	struct atm_dev *atm_dev;
++	struct he_dev *he_dev;
++
++#if LINUX_VERSION_CODE > KERNEL_VERSION(2,3,43)
++	if (pci_enable_device(pci_dev)) return -EIO;
++#endif
++	if (pci_set_dma_mask(pci_dev, HE_DMA_MASK) != 0) return -EIO;
++
++	atm_dev = atm_dev_register(DEV_LABEL, &he_ops, -1, 0);
++	if (!atm_dev) return -ENODEV;
++	pci_dev->driver_data = atm_dev;
++
++	he_dev = (struct he_dev *) kmalloc(sizeof(struct he_dev),
++							GFP_KERNEL);
++	if (!he_dev) return -ENOMEM;
++	memset(he_dev, 0, sizeof(struct he_dev));
++
++	he_dev->pci_dev = pci_dev;
++	he_dev->atm_dev = atm_dev;
++	he_dev->atm_dev->dev_data = he_dev;
++	HE_DEV(atm_dev) = he_dev;
++	he_dev->number = atm_dev->number;	/* was devs */
++	if (he_start(atm_dev)) {
++		atm_dev_deregister(atm_dev);
++		he_stop(he_dev);
++		kfree(he_dev);
++		return -ENODEV;
++	}
++	he_dev->next = NULL;
++	if (he_devs) he_dev->next = he_devs;
++	he_devs = he_dev;
++
++	return 0;
++}
++
++static void __devexit
++he_remove_one (struct pci_dev *pci_dev)
++{
++	struct atm_dev *atm_dev;
++	struct he_dev *he_dev;
++
++	atm_dev = pci_dev->driver_data;
++	he_dev = HE_DEV(atm_dev);
++
++	/* need to remove from he_devs */
++
++	atm_dev_deregister(atm_dev);
++	he_stop(he_dev);
++	kfree(he_dev);
++
++	pci_dev->driver_data = NULL;
++}
++
++
++static unsigned
++rate_to_atmf(unsigned rate)		/* cps to atm forum format */
++{
++#define NONZERO (1<<14)
++
++        unsigned exp = 0;
++
++        if (rate == 0) return(0);
++
++        rate <<= 9;
++        while (rate > 0x3ff)
++        {
++                ++exp;
++                rate >>= 1;
++        }
++
++        return (NONZERO | (exp << 9) | (rate & 0x1ff));
++}
++
++static void __init
++he_init_rx_lbfp0(struct he_dev *he_dev)
++{
++        unsigned i, lbm_offset, lbufd_index, lbuf_addr, lbuf_count;
++        unsigned lbufs_per_row = he_dev->cells_per_row / he_dev->cells_per_lbuf;
++        unsigned lbuf_bufsize = he_dev->cells_per_lbuf * ATM_CELL_PAYLOAD;
++        unsigned row_offset = he_dev->r0_startrow * he_dev->bytes_per_row;
++        
++	lbufd_index = 0;
++        lbm_offset = he_readl(he_dev, RCMLBM_BA);
++
++	he_writel(he_dev, lbufd_index, RLBF0_H);
++
++        for (i = 0, lbuf_count = 0; i < he_dev->r0_numbuffs; ++i)
++        {
++		lbufd_index += 2;
++                lbuf_addr = (row_offset + (lbuf_count * lbuf_bufsize)) / 32;
++
++		he_writel_rcm(he_dev, lbuf_addr, lbm_offset);
++		he_writel_rcm(he_dev, lbufd_index, lbm_offset + 1);
++
++                if (++lbuf_count == lbufs_per_row)
++                {
++                        lbuf_count = 0;
++                        row_offset += he_dev->bytes_per_row;
++                }
++		lbm_offset += 4;
++        }
++                
++        he_writel(he_dev, lbufd_index - 2, RLBF0_T);
++	he_writel(he_dev, he_dev->r0_numbuffs, RLBF0_C);
++}
++
++static void __init
++he_init_rx_lbfp1(struct he_dev *he_dev)
++{
++        unsigned i, lbm_offset, lbufd_index, lbuf_addr, lbuf_count;
++        unsigned lbufs_per_row = he_dev->cells_per_row / he_dev->cells_per_lbuf;
++        unsigned lbuf_bufsize = he_dev->cells_per_lbuf * ATM_CELL_PAYLOAD;
++        unsigned row_offset = he_dev->r1_startrow * he_dev->bytes_per_row;
++        
++	lbufd_index = 1;
++        lbm_offset = he_readl(he_dev, RCMLBM_BA) + (2 * lbufd_index);
++
++	he_writel(he_dev, lbufd_index, RLBF1_H);
++
++        for (i = 0, lbuf_count = 0; i < he_dev->r1_numbuffs; ++i)
++        {
++		lbufd_index += 2;
++                lbuf_addr = (row_offset + (lbuf_count * lbuf_bufsize)) / 32;
++
++		he_writel_rcm(he_dev, lbuf_addr, lbm_offset);
++		he_writel_rcm(he_dev, lbufd_index, lbm_offset + 1);
++
++                if (++lbuf_count == lbufs_per_row)
++                {
++                        lbuf_count = 0;
++                        row_offset += he_dev->bytes_per_row;
++                }
++		lbm_offset += 4;
++        }
++                
++        he_writel(he_dev, lbufd_index - 2, RLBF1_T);
++	he_writel(he_dev, he_dev->r1_numbuffs, RLBF1_C);
++}
++
++static void __init
++he_init_tx_lbfp(struct he_dev *he_dev)
++{
++        unsigned i, lbm_offset, lbufd_index, lbuf_addr, lbuf_count;
++        unsigned lbufs_per_row = he_dev->cells_per_row / he_dev->cells_per_lbuf;
++        unsigned lbuf_bufsize = he_dev->cells_per_lbuf * ATM_CELL_PAYLOAD;
++        unsigned row_offset = he_dev->tx_startrow * he_dev->bytes_per_row;
++        
++	lbufd_index = he_dev->r0_numbuffs + he_dev->r1_numbuffs;
++        lbm_offset = he_readl(he_dev, RCMLBM_BA) + (2 * lbufd_index);
++
++	he_writel(he_dev, lbufd_index, TLBF_H);
++
++        for (i = 0, lbuf_count = 0; i < he_dev->tx_numbuffs; ++i)
++        {
++		lbufd_index += 1;
++                lbuf_addr = (row_offset + (lbuf_count * lbuf_bufsize)) / 32;
++
++		he_writel_rcm(he_dev, lbuf_addr, lbm_offset);
++		he_writel_rcm(he_dev, lbufd_index, lbm_offset + 1);
++
++                if (++lbuf_count == lbufs_per_row)
++                {
++                        lbuf_count = 0;
++                        row_offset += he_dev->bytes_per_row;
++                }
++		lbm_offset += 2;
++        }
++                
++        he_writel(he_dev, lbufd_index - 1, TLBF_T);
++}
++
++static int __init
++he_init_tpdrq(struct he_dev *he_dev)
++{
++	he_dev->tpdrq_p = kmalloc((CONFIG_TPDRQ_SIZE * sizeof(struct he_tpdrq))
++				+ TPDRQ_ALIGNMENT, GFP_DMA);
++	if (he_dev->tpdrq_p == NULL) 
++	{
++		hprintk1("failed to alloc tpdrq\n");
++		return -ENOMEM;
++	}
++	he_dev->tpdrq_base = (struct he_tpdrq *)
++			ALIGN_ADDRESS(he_dev->tpdrq_p, TPDRQ_ALIGNMENT);
++	memset(he_dev->tpdrq_base, 0,
++				CONFIG_TPDRQ_SIZE * sizeof(struct he_tpdrq));
++
++	he_dev->tpdrq_tail = he_dev->tpdrq_base;
++	he_dev->tpdrq_head = he_dev->tpdrq_base;
++
++	he_writel(he_dev, virt_to_bus(he_dev->tpdrq_base), TPDRQ_B_H);
++	he_writel(he_dev, 0, TPDRQ_T);	
++	he_writel(he_dev, CONFIG_TPDRQ_SIZE - 1, TPDRQ_S);
++
++	return 0;
++}
++
++static void __init
++he_init_cs_block(struct he_dev *he_dev)
++{
++	unsigned clock, rate, delta;
++	int reg;
++
++	/* 5.1.7 cs block initialization */
++
++	for(reg = 0; reg < 0x20; ++reg)
++		he_writel_mbox(he_dev, 0x0, CS_STTIM0 + reg);
++
++	/* rate grid timer reload values */
++
++	clock = he_is622(he_dev) ? 66667000 : 50000000;
++	rate = he_dev->atm_dev->link_rate;
++	delta = rate / 16 / 2;
++
++	for(reg = 0; reg < 0x10; ++reg)
++	{
++		/* 2.4 internal transmit function
++		 *
++	 	 * we initialize the first row in the rate grid.
++		 * values are period (in clock cycles) of timer
++		 */
++		unsigned period = clock / rate;
++
++		he_writel_mbox(he_dev, period, CS_TGRLD0 + reg);
++		rate -= delta;
++	}
++
++	if (he_is622(he_dev))
++	{
++		/* table 5.2 (4 cells per lbuf) */
++		he_writel_mbox(he_dev, 0x000800fa, CS_ERTHR0);
++		he_writel_mbox(he_dev, 0x000c33cb, CS_ERTHR1);
++		he_writel_mbox(he_dev, 0x0010101b, CS_ERTHR2);
++		he_writel_mbox(he_dev, 0x00181dac, CS_ERTHR3);
++		he_writel_mbox(he_dev, 0x00280600, CS_ERTHR4);
++
++		/* table 5.3, 5.4, 5.5, 5.6, 5.7 */
++		he_writel_mbox(he_dev, 0x023de8b3, CS_ERCTL0);
++		he_writel_mbox(he_dev, 0x1801, CS_ERCTL1);
++		he_writel_mbox(he_dev, 0x68b3, CS_ERCTL2);
++		he_writel_mbox(he_dev, 0x1280, CS_ERSTAT0);
++		he_writel_mbox(he_dev, 0x68b3, CS_ERSTAT1);
++		he_writel_mbox(he_dev, 0x14585, CS_RTFWR);
++
++		he_writel_mbox(he_dev, 0x4680, CS_RTATR);
++
++		/* table 5.8 */
++		he_writel_mbox(he_dev, 0x00159ece, CS_TFBSET);
++		he_writel_mbox(he_dev, 0x68b3, CS_WCRMAX);
++		he_writel_mbox(he_dev, 0x5eb3, CS_WCRMIN);
++		he_writel_mbox(he_dev, 0xe8b3, CS_WCRINC);
++		he_writel_mbox(he_dev, 0xdeb3, CS_WCRDEC);
++		he_writel_mbox(he_dev, 0x68b3, CS_WCRCEIL);
++
++		/* table 5.9 */
++		he_writel_mbox(he_dev, 0x5, CS_OTPPER);
++		he_writel_mbox(he_dev, 0x14, CS_OTWPER);
++	}
++	else
++	{
++		/* table 5.1 (4 cells per lbuf) */
++		he_writel_mbox(he_dev, 0x000400ea, CS_ERTHR0);
++		he_writel_mbox(he_dev, 0x00063388, CS_ERTHR1);
++		he_writel_mbox(he_dev, 0x00081018, CS_ERTHR2);
++		he_writel_mbox(he_dev, 0x000c1dac, CS_ERTHR3);
++		he_writel_mbox(he_dev, 0x0014051a, CS_ERTHR4);
++
++		/* table 5.3, 5.4, 5.5, 5.6, 5.7 */
++		he_writel_mbox(he_dev, 0x0235e4b1, CS_ERCTL0);
++		he_writel_mbox(he_dev, 0x4701, CS_ERCTL1);
++		he_writel_mbox(he_dev, 0x64b1, CS_ERCTL2);
++		he_writel_mbox(he_dev, 0x1280, CS_ERSTAT0);
++		he_writel_mbox(he_dev, 0x64b1, CS_ERSTAT1);
++		he_writel_mbox(he_dev, 0xf424, CS_RTFWR);
++
++		he_writel_mbox(he_dev, 0x4680, CS_RTATR);
++
++		/* table 5.8 */
++		he_writel_mbox(he_dev, 0x000563b7, CS_TFBSET);
++		he_writel_mbox(he_dev, 0x64b1, CS_WCRMAX);
++		he_writel_mbox(he_dev, 0x5ab1, CS_WCRMIN);
++		he_writel_mbox(he_dev, 0xe4b1, CS_WCRINC);
++		he_writel_mbox(he_dev, 0xdab1, CS_WCRDEC);
++		he_writel_mbox(he_dev, 0x64b1, CS_WCRCEIL);
++
++		/* table 5.9 */
++		he_writel_mbox(he_dev, 0x6, CS_OTPPER);
++		he_writel_mbox(he_dev, 0x1e, CS_OTWPER);
++
++	}
++
++	he_writel_mbox(he_dev, 0x8, CS_OTTLIM);
++
++	for(reg = 0; reg < 0x8; ++reg)
++		he_writel_mbox(he_dev, 0x0, CS_HGRRT0 + reg);
++
++}
++
++static void __init
++he_init_cs_block_rcm(struct he_dev *he_dev)
++{
++	unsigned rategrid[16][16];
++	unsigned rate, delta;
++	int i, j, reg;
++
++	unsigned rate_atmf, exp, man;
++	unsigned long long rate_cps;
++
++	/* initialize rate grid group table */
++
++	for (reg = 0x0; reg < 0xff; ++reg)
++		he_writel_rcm(he_dev, 0x0, CONFIG_RCMABR + reg);
++
++	/* initialize rate controller groups */
++
++	for (reg = 0x100; reg < 0x1ff; ++reg)
++		he_writel_rcm(he_dev, 0x0, CONFIG_RCMABR + reg);
++	
++	/* initialize tNrm lookup table */
++
++	/* the manual makes reference to a routine in a sample driver
++	   for proper configuration; fortunately, we only need this
++	   in order to support abr connection */
++	
++	/* initialize rate to group table */
++
++	rate = he_dev->atm_dev->link_rate;
++	delta = rate / 32;
++
++	/*
++	 * 2.4 transmit internal functions
++	 * 
++	 * we construct a copy of the rate grid used by the scheduler
++	 * in order to construct the rate to group table below
++	 */
++
++	for (j = 0; j < 16; j++)
++	{
++		rategrid[0][j] = rate;
++		rate -= delta;
++	}
++
++	for (i = 1; i < 16; i++)
++		for (j = 0; j < 16; j++)
++			if (i > 14)
++				rategrid[i][j] = rategrid[i - 1][j] / 4;
++			else
++				rategrid[i][j] = rategrid[i - 1][j] / 2;
++
++	/*
++	 * 2.4 transmit internal function
++	 *
++	 * this table maps the upper 5 bits of exponent and mantissa
++	 * of the atm forum representation of the rate into an index
++	 * on rate grid  
++	 */
++
++	rate_atmf = 0;
++	while (rate_atmf < 0x400)
++	{
++		man = (rate_atmf & 0x1f) << 4;
++		exp = rate_atmf >> 5;
++
++		/* 
++			instead of '/ 512', use '>> 9' to prevent a call
++			to divdu3 on x86 platforms
++		*/
++		rate_cps = (unsigned long long) (1 << exp) * (man + 512) >> 9;
++
++		if (rate_cps < 10) rate_cps = 10;
++				/* 2.2.1 minimum payload rate is 10 cps */
++
++		for (i = 255; i > 0; i--)
++			if (rategrid[i/16][i%16] >= rate_cps) break;
++				/* pick nearest rate instead? */
++
++		/*
++		 * each table entry is 16 bits (rate grid index, 8 bits,
++		 * and possibly a buffer limit, 8 bits)
++		 * there are two table entries in each 32-bit register
++		 */
++
++		reg = (reg<<16) | ((i<<8) | 0x04 /* ??? */);
++
++#define RTGTBL_OFFSET 0x400
++	  
++		if (rate_atmf & 0x1)
++			he_writel_rcm(he_dev, reg,
++				CONFIG_RCMABR + RTGTBL_OFFSET + (rate_atmf>>1));
++
++		++rate_atmf;
++	}
++}
++
++
++static int __init
++he_init_group(struct he_dev *he_dev, int group)
++{
++	int i;
++	struct he_buff *hbuf;
++
++
++	/* small buffer pool */
++
++#ifdef rbps_support
++	he_dev->rbps_p = kmalloc((CONFIG_RBPS_SIZE * sizeof(struct he_rbp))
++				+ RBPS_ALIGNMENT, GFP_DMA);
++	if (he_dev->rbps_p == NULL)
++	{
++		hprintk1("failed to alloc rbps\n");
++		return -ENOMEM;
++	}
++	he_dev->rbps_base = (struct he_rbp *)
++				ALIGN_ADDRESS(he_dev->rbps_p, RBPS_ALIGNMENT);
++	memset(he_dev->rbps_base, 0, CONFIG_RBPS_SIZE * sizeof(struct he_rbp));
++
++	for (i = 0; i < CONFIG_RBPS_SIZE; ++i)
++	{
++		void *data;
++
++		data = kmalloc(CONFIG_RBPS_BUFSIZE + sizeof(struct he_buff)
++						+ HBUF_ALIGNMENT, GFP_DMA);
++		if (data == NULL)
++		{
++			hprintk1("failed to alloc rbps entry\n");
++			return -ENOMEM;
++		}
++		hbuf = (struct he_buff *)
++				ALIGN_ADDRESS(data + CONFIG_RBPS_BUFSIZE,
++								HBUF_ALIGNMENT);
++		hbuf->len = CONFIG_RBPS_BUFSIZE;
++		hbuf->loaned = 1;
++		hbuf->data = data;
++
++		he_dev->rbps_base[i].virt = virt_to_bus(hbuf);
++		he_dev->rbps_base[i].phys = virt_to_bus(hbuf->data);
++	}
++	hbuf->loaned = 0;
++
++	he_dev->rbps_tail = &he_dev->rbps_base[CONFIG_RBPS_SIZE-1];
++
++	he_writel(he_dev, virt_to_bus(he_dev->rbps_base),
++						G0_RBPS_S + (group * 32));
++	he_writel(he_dev, RBPS_MASK(he_dev->rbps_tail),
++						G0_RBPS_T + (group * 32));
++	he_writel(he_dev, CONFIG_RBPS_BUFSIZE/4,
++						G0_RBPS_BS + (group * 32));
++	he_writel(he_dev,
++			RBP_THRESH(CONFIG_RBPS_THRESH) |
++			RBP_QSIZE(CONFIG_RBPS_SIZE-1) |
++			RBP_INT_ENB,
++						G0_RBPS_QI + (group * 32));
++#else
++	he_writel(he_dev, 0x0, G0_RBPS_S + (group * 32));
++	he_writel(he_dev, 0x0, G0_RBPS_T + (group * 32));
++	he_writel(he_dev, 0x0, G0_RBPS_QI + (group * 32));
++	he_writel(he_dev, RBP_THRESH(0x1) | RBP_QSIZE(0x0),
++						G0_RBPS_BS + (group * 32));
++
++#endif
++
++	/* large buffer pool */
++
++	he_dev->rbpl_p = kmalloc((CONFIG_RBPL_SIZE * sizeof(struct he_rbp))
++				+ RBPL_ALIGNMENT, GFP_DMA);
++	if (he_dev->rbpl_p == NULL)
++	{
++		hprintk1("failed to alloc rbpl\n");
++		return -ENOMEM;
++	}
++	he_dev->rbpl_base = (struct he_rbp *)
++				ALIGN_ADDRESS(he_dev->rbpl_p, RBPL_ALIGNMENT);
++	memset(he_dev->rbpl_base, 0, CONFIG_RBPL_SIZE * sizeof(struct he_rbp));
++
++	for (i = 0; i < CONFIG_RBPL_SIZE; ++i)
++	{
++		void *base;
++
++		base = kmalloc(sizeof(struct he_buff) + HBUF_ALIGNMENT,
++								GFP_KERNEL);
++		if (base == NULL)
++		{
++			hprintk1("failed to alloc rbpl entry\n");
++			return -ENOMEM;
++		}
++		hbuf = (struct he_buff *) ALIGN_ADDRESS(base, HBUF_ALIGNMENT);
++		hbuf->base = base;
++
++		hbuf->data = kmalloc(CONFIG_RBPL_BUFSIZE, GFP_DMA);
++		if (hbuf->data == NULL)
++		{
++			hprintk1("failed to alloc rbpl buffer\n");
++			return -ENOMEM;
++		}
++		hbuf->len = CONFIG_RBPL_BUFSIZE;
++		hbuf->loaned = 1;
++
++		he_dev->rbpl_base[i].virt = virt_to_bus(hbuf);
++		hbuf->mapping = pci_map_single(he_dev->pci_dev, hbuf->data,
++						hbuf->len, PCI_DMA_FROMDEVICE);
++		he_dev->rbpl_base[i].phys = hbuf->mapping;
++	}
++	hbuf->loaned = 0;
++
++	he_dev->rbpl_tail = &he_dev->rbpl_base[CONFIG_RBPL_SIZE-1];
++
++	he_writel(he_dev, virt_to_bus(he_dev->rbpl_base),
++						G0_RBPL_S + (group * 32));
++	he_writel(he_dev, RBPL_MASK(he_dev->rbpl_tail),
++						G0_RBPL_T + (group * 32));
++	he_writel(he_dev, CONFIG_RBPL_BUFSIZE/4,
++						G0_RBPL_BS + (group * 32));
++	he_writel(he_dev,
++			RBP_THRESH(CONFIG_RBPL_THRESH) |
++			RBP_QSIZE(CONFIG_RBPL_SIZE-1) |
++			RBP_INT_ENB,
++						G0_RBPL_QI + (group * 32));
++
++	/* rx buffer ready queue */
++
++	he_dev->rbrq_p = (struct he_rbrq *) kmalloc(CONFIG_RBRQ_SIZE *
++			sizeof(struct he_rbrq) + RBRQ_ALIGNMENT, GFP_DMA);
++	if (he_dev->rbrq_p == NULL)
++	{
++		hprintk1("failed to allocate rbrq\n");
++		return -ENOMEM;
++	}
++	he_dev->rbrq_base = (struct he_rbrq *)
++				ALIGN_ADDRESS(he_dev->rbrq_p, RBRQ_ALIGNMENT);
++	memset(he_dev->rbrq_base, 0, CONFIG_RBRQ_SIZE * sizeof(struct he_rbrq));
++
++	he_dev->rbrq_head = he_dev->rbrq_base;
++	he_writel(he_dev, virt_to_bus(he_dev->rbrq_base), G0_RBRQ_ST + (group * 16));
++	he_writel(he_dev, 0, G0_RBRQ_H + (group * 16));
++	he_writel(he_dev,
++		RBRQ_THRESH(CONFIG_RBRQ_THRESH) | RBRQ_SIZE(CONFIG_RBRQ_SIZE-1),
++						G0_RBRQ_Q + (group * 16));
++#ifdef notdef
++	he_writel(he_dev, RBRQ_TIME(10) | RBRQ_COUNT(5),
++						G0_RBRQ_I + (group * 16));
++#else
++	he_writel(he_dev, RBRQ_TIME(0) | RBRQ_COUNT(1),
++						G0_RBRQ_I + (group * 16));
++#endif
++
++
++	/* tx buffer ready queue */
++
++	he_dev->tbrq_p = kmalloc(CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq)
++				+ TBRQ_ALIGNMENT, GFP_DMA);
++	if (he_dev->tbrq_p == NULL)
++	{
++		hprintk1("failed to allocate tbrq\n");
++		return -ENOMEM;
++	}
++	he_dev->tbrq_base = (struct he_tbrq *)
++				ALIGN_ADDRESS(he_dev->tbrq_p, TBRQ_ALIGNMENT);
++	memset(he_dev->tbrq_base, 0, CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq));
++
++	he_dev->tbrq_head = he_dev->tbrq_base;
++
++	he_writel(he_dev, virt_to_bus(he_dev->tbrq_base),
++						G0_TBRQ_B_T + (group * 16));
++	he_writel(he_dev, 0, G0_TBRQ_H + (group * 16));
++	he_writel(he_dev, CONFIG_TBRQ_SIZE - 1, G0_TBRQ_S + (group * 16));
++	he_writel(he_dev, CONFIG_TBRQ_THRESH, G0_TBRQ_THRESH + (group * 16));
++
++	return 0;
++}
++
++static int __init
++he_init_irq(struct he_dev *he_dev)
++{
++	int i;
++
++	/* 2.9.3.5  tail offset for each interrupt queue is located after the
++		    end of the interrupt queue */
++
++	he_dev->irq_p = kmalloc((CONFIG_IRQ_SIZE * sizeof(struct he_irq))
++				+ sizeof(unsigned) + IRQ_ALIGNMENT, GFP_DMA);
++	if (he_dev->irq_p == NULL)
++	{
++		hprintk1("failed to allocate irq\n");
++		return -ENOMEM;
++	}
++	he_dev->irq_base = (struct he_irq *)
++				ALIGN_ADDRESS(he_dev->irq_p, IRQ_ALIGNMENT);
++	he_dev->irq_tailoffset = (unsigned *)
++					&he_dev->irq_base[CONFIG_IRQ_SIZE];
++	*he_dev->irq_tailoffset = 0;
++	he_dev->irq_head = he_dev->irq_base;
++	he_dev->irq_tail = he_dev->irq_base;
++
++	for(i=0; i < CONFIG_IRQ_SIZE; ++i)
++		he_dev->irq_base[i].isw = ITYPE_INVALID;
++
++	he_writel(he_dev, virt_to_bus(he_dev->irq_base), IRQ0_BASE);
++	he_writel(he_dev,
++		IRQ_SIZE(CONFIG_IRQ_SIZE) | IRQ_THRESH(CONFIG_IRQ_THRESH),
++								IRQ0_HEAD);
++	he_writel(he_dev, IRQ_INT_A | IRQ_TYPE_LINE, IRQ0_CNTL);
++	he_writel(he_dev, 0x0, IRQ0_DATA);
++
++	he_writel(he_dev, 0x0, IRQ1_BASE);
++	he_writel(he_dev, 0x0, IRQ1_HEAD);
++	he_writel(he_dev, 0x0, IRQ1_CNTL);
++	he_writel(he_dev, 0x0, IRQ1_DATA);
++
++	he_writel(he_dev, 0x0, IRQ2_BASE);
++	he_writel(he_dev, 0x0, IRQ2_HEAD);
++	he_writel(he_dev, 0x0, IRQ2_CNTL);
++	he_writel(he_dev, 0x0, IRQ2_DATA);
++
++	he_writel(he_dev, 0x0, IRQ3_BASE);
++	he_writel(he_dev, 0x0, IRQ3_HEAD);
++	he_writel(he_dev, 0x0, IRQ3_CNTL);
++	he_writel(he_dev, 0x0, IRQ3_DATA);
++
++	/* 2.9.3.2 interrupt queue mapping registers */
++
++	he_writel(he_dev, 0x0, GRP_10_MAP);
++	he_writel(he_dev, 0x0, GRP_32_MAP);
++	he_writel(he_dev, 0x0, GRP_54_MAP);
++	he_writel(he_dev, 0x0, GRP_76_MAP);
++
++	if (request_irq(he_dev->pci_dev->irq, he_irq_handler, SA_INTERRUPT|SA_SHIRQ, DEV_LABEL, he_dev))
++	{
++		hprintk("irq %d already in use\n", he_dev->pci_dev->irq);
++		return -EINVAL;
++        }   
++
++	he_dev->irq = he_dev->pci_dev->irq;
++
++	return 0;
++}
++
++static int __init
++he_start(struct atm_dev *dev)
++{
++        struct he_dev *he_dev;
++        struct pci_dev *pci_dev;
++
++	u16 command;
++	u32 gen_cntl_0, host_cntl, lb_swap;
++	
++	unsigned err;
++	unsigned int status, reg;
++	int i, group;
++
++        he_dev = HE_DEV(dev);
++        pci_dev = he_dev->pci_dev;
++
++#if LINUX_VERSION_CODE > KERNEL_VERSION(2,3,3)
++	he_dev->membase = pci_dev->resource[0].start;
++#else
++	he_dev->membase = pci_dev->base_address[0] & PCI_BASE_ADDRESS_MEM_MASK;
++#endif
++	HPRINTK("membase = 0x%x  irq = %d.\n", he_dev->membase, pci_dev->irq);
++
++	/*
++	 * pci bus controller initialization 
++	 */
++
++	/* 4.3 pci bus controller-specific initialization */
++	if (pci_read_config_dword(pci_dev, GEN_CNTL_0, &gen_cntl_0) != 0)
++	{
++		hprintk1("can't read GEN_CNTL_0\n");
++		return -EINVAL;
++	}
++	gen_cntl_0 |= (MRL_ENB | MRM_ENB | IGNORE_TIMEOUT);
++	if (pci_write_config_dword(pci_dev, GEN_CNTL_0, gen_cntl_0) != 0)
++	{
++		hprintk1("can't write GEN_CNTL_0.\n");
++		return -EINVAL;
++	}
++
++	if (pci_read_config_word(pci_dev, PCI_COMMAND, &command) != 0)
++	{
++		hprintk1("can't read PCI_COMMAND.\n");
++		return -EINVAL;
++	}
++
++	command |= (PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER | PCI_COMMAND_INVALIDATE);
++	if (pci_write_config_word(pci_dev, PCI_COMMAND, command) != 0)
++	{
++		hprintk1("can't enable memory.\n");
++		return -EINVAL;
++	}
++
++	if (!(he_dev->membase = (unsigned long) ioremap(he_dev->membase, HE_REGMAP_SIZE))) {
++		hprintk1("can't set up page mapping\n");
++		return -EINVAL;
++	}
++	      
++	/* 4.4 card reset */
++	he_writel(he_dev, 0x0, RESET_CNTL);
++	he_writel(he_dev, 0xff, RESET_CNTL);
++
++	udelay(16*1000);	/* 16 ms */
++	status = he_readl(he_dev, RESET_CNTL);
++	if ((status & BOARD_RST_STATUS) == 0)
++	{
++		hprintk1("reset failed\n");
++		return -EINVAL;
++	}
++
++	/* 4.5 set bus width */
++	host_cntl = he_readl(he_dev, HOST_CNTL);
++	if (host_cntl & PCI_BUS_SIZE64)
++		gen_cntl_0 |= ENBL_64;
++	else
++		gen_cntl_0 &= ~ENBL_64;
++
++	if (disable64 == 1)
++	{
++		hprintk1("disabling 64-bit pci bus transfers\n");
++		gen_cntl_0 &= ~ENBL_64;
++	}
++
++	if (gen_cntl_0 & ENBL_64) hprintk1("64-bit transfers enabled\n");
++
++	pci_write_config_dword(pci_dev, GEN_CNTL_0, gen_cntl_0);
++
++	/* 4.7 read prom contents */
++	for(i=0; i<PROD_ID_LEN; ++i)
++		he_dev->prod_id[i] = read_prom_byte(he_dev, PROD_ID + i);
++
++	he_dev->media = read_prom_byte(he_dev, MEDIA);
++
++	for(i=0; i<6; ++i)
++		dev->esi[i] = read_prom_byte(he_dev, MAC_ADDR + i);
++
++	hprintk("%s%s, %x:%x:%x:%x:%x:%x\n",
++				he_dev->prod_id,
++					he_dev->media & 0x40 ? "SM" : "MM",
++						dev->esi[0],
++						dev->esi[1],
++						dev->esi[2],
++						dev->esi[3],
++						dev->esi[4],
++						dev->esi[5]);
++	he_dev->atm_dev->link_rate = he_is622(he_dev) ?
++						ATM_OC12_PCR : ATM_OC3_PCR;
++
++	/* 4.6 set host endianess */
++	lb_swap = he_readl(he_dev, LB_SWAP);
++	if (he_is622(he_dev))
++		lb_swap &= ~XFER_SIZE;		/* 4 cells */
++	else
++		lb_swap |= XFER_SIZE;		/* 8 cells */
++#ifdef __BIG_ENDIAN
++	lb_swap |= DESC_WR_SWAP | INTR_SWAP | BIG_ENDIAN_HOST;
++#else
++	lb_swap &= ~(DESC_WR_SWAP | INTR_SWAP | BIG_ENDIAN_HOST |
++			DATA_WR_SWAP | DATA_RD_SWAP | DESC_RD_SWAP);
++#endif /* __BIG_ENDIAN */
++	he_writel(he_dev, lb_swap, LB_SWAP);
++
++	/* 4.8 sdram controller initialization */
++	he_writel(he_dev, he_is622(he_dev) ? LB_64_ENB : 0x0, SDRAM_CTL);
++
++	/* 4.9 initialize rnum value */
++	lb_swap |= SWAP_RNUM_MAX(0xf);
++	he_writel(he_dev, lb_swap, LB_SWAP);
++
++	/* 4.10 initialize the interrupt queues */
++	if ((err = he_init_irq(he_dev)) != 0) return err;
++
++#ifdef USE_TASKLET
++	tasklet_init(&he_dev->tasklet, he_tasklet, (unsigned long) he_dev);
++#endif
++	spin_lock_init(&he_dev->global_lock);
++	spin_lock_init(&he_dev->tpdrq_lock);
++
++	/*
++	 * atm network controller initialization
++	 */
++
++	/* 5.1.1 generic configuration state */
++
++	/*
++	 *		local (cell) buffer memory map
++	 *                    
++	 *             HE155                          HE622
++	 *                                                      
++	 *        0 ____________1023 bytes  0 _______________________2047 bytes
++	 *         |            |            |                   |   |
++	 *         |  utility   |            |        rx0        |   |
++	 *        5|____________|         255|___________________| u |
++	 *        6|            |         256|                   | t |
++	 *         |            |            |                   | i |
++	 *         |    rx0     |     row    |        tx         | l |
++	 *         |            |            |                   | i |
++	 *         |            |         767|___________________| t |
++	 *      517|____________|         768|                   | y |
++	 * row  518|            |            |        rx1        |   |
++	 *         |            |        1023|___________________|___|
++	 *         |            |
++	 *         |    tx      |
++	 *         |            |
++	 *         |            |
++	 *     1535|____________|
++	 *     1536|            |
++	 *         |    rx1     |
++	 *     2047|____________|
++	 *
++	 */
++
++	he_dev->vcibits = CONFIG_VCIBITS;	/* 4096 connections */
++	he_dev->vpibits = CONFIG_VPIBITS;
++
++	if (he_is622(he_dev))
++	{
++		he_dev->cells_per_row = 40;
++		he_dev->bytes_per_row = 2048;
++		he_dev->r0_numrows = 256;
++		he_dev->tx_numrows = 512;
++		he_dev->r1_numrows = 256;
++		he_dev->r0_startrow = 0;
++		he_dev->tx_startrow = 256;
++		he_dev->r1_startrow = 768;
++	}
++	else
++	{
++		he_dev->cells_per_row = 20;
++		he_dev->bytes_per_row = 1024;
++		he_dev->r0_numrows = 512;
++		he_dev->tx_numrows = 1018;
++		he_dev->r1_numrows = 512;
++		he_dev->r0_startrow = 6;
++		he_dev->tx_startrow = 518;
++		he_dev->r1_startrow = 1536;
++	}
++
++	he_dev->cells_per_lbuf = 4;
++	he_dev->buffer_limit = 4;
++	he_dev->r0_numbuffs = he_dev->r0_numrows *
++				he_dev->cells_per_row / he_dev->cells_per_lbuf;
++	if (he_dev->r0_numbuffs > 2560) he_dev->r0_numbuffs = 2560;
++
++	he_dev->r1_numbuffs = he_dev->r1_numrows *
++				he_dev->cells_per_row / he_dev->cells_per_lbuf;
++	if (he_dev->r1_numbuffs > 2560) he_dev->r1_numbuffs = 2560;
++
++	he_dev->tx_numbuffs = he_dev->tx_numrows *
++				he_dev->cells_per_row / he_dev->cells_per_lbuf;
++	if (he_dev->tx_numbuffs > 5120) he_dev->tx_numbuffs = 5120;
++
++	/* 5.1.2 configure hardware dependent registers */
++
++	he_writel(he_dev, 
++		SLICE_X(0x2) | ARB_RNUM_MAX(0xf) | TH_PRTY(0x3) |
++		RH_PRTY(0x3) | TL_PRTY(0x2) | RL_PRTY(0x1) |
++		(he_is622(he_dev) ? BUS_MULTI(0x28) : BUS_MULTI(0x46)) |
++		(he_is622(he_dev) ? NET_PREF(0x50) : NET_PREF(0x8c)),
++								LBARB);
++
++	he_writel(he_dev, BANK_ON |
++		(he_is622(he_dev) ? (REF_RATE(0x384) | WIDE_DATA) : REF_RATE(0x150)),
++								SDRAMCON);
++
++	he_writel(he_dev,
++		(he_is622(he_dev) ? RM_BANK_WAIT(1) : RM_BANK_WAIT(0)) |
++						RM_RW_WAIT(1), RCMCONFIG);
++	he_writel(he_dev,
++		(he_is622(he_dev) ? TM_BANK_WAIT(2) : TM_BANK_WAIT(1)) |
++						TM_RW_WAIT(1), TCMCONFIG);
++
++	he_writel(he_dev, he_dev->cells_per_lbuf * ATM_CELL_PAYLOAD, LB_CONFIG);
++
++	he_writel(he_dev, 
++		(he_is622(he_dev) ? UT_RD_DELAY(8) : UT_RD_DELAY(0)) |
++		(he_is622(he_dev) ? RC_UT_MODE(0) : RC_UT_MODE(1)) |
++		RX_VALVP(he_dev->vpibits) |
++		RX_VALVC(he_dev->vcibits),			 RC_CONFIG);
++
++	he_writel(he_dev, DRF_THRESH(0x20) |
++		(he_is622(he_dev) ? TX_UT_MODE(0) : TX_UT_MODE(1)) |
++		TX_VCI_MASK(he_dev->vcibits) |
++		LBFREE_CNT(he_dev->tx_numbuffs), 		TX_CONFIG);
++
++	he_writel(he_dev, 0x0, TXAAL5_PROTO);
++
++	he_writel(he_dev, PHY_INT_ENB |
++			he_is622(he_dev) ? PTMR_PRE(0x41) : PTMR_PRE(0x31),
++								RH_CONFIG);
++
++	/* 5.1.3 initialize connection memory */
++
++	for(i=0; i < TCM_MEM_SIZE; ++i)
++		he_writel_tcm(he_dev, 0, i);
++
++	for(i=0; i < RCM_MEM_SIZE; ++i)
++		he_writel_rcm(he_dev, 0, i);
++
++
++	/*
++	 *	transmit connection memory map
++	 *
++	 *                  tx memory
++	 *          0x0 ___________________
++	 *             |                   |
++	 *             |                   |
++	 *             |       TSRa        |
++	 *             |                   |
++	 *             |                   |
++	 *       0x8000|___________________|
++	 *             |                   |
++	 *             |       TSRb        |
++	 *       0xc000|___________________|
++	 *             |                   |
++	 *             |       TSRc        |
++	 *       0xe000|___________________|
++	 *             |       TSRd        |
++	 *       0xf000|___________________|
++	 *             |       tmABR       |
++	 *      0x10000|___________________|
++	 *             |                   |
++	 *             |       tmTPD       |
++	 *             |___________________|
++	 *             |                   |
++	 *                      ....
++	 *      0x1ffff|___________________|
++	 *
++	 *
++	 */
++
++	he_writel(he_dev, CONFIG_TSRB, TSRB_BA);
++	he_writel(he_dev, CONFIG_TSRC, TSRC_BA);
++	he_writel(he_dev, CONFIG_TSRD, TSRD_BA);
++	he_writel(he_dev, 0x0f000, TMABR_BA);
++	he_writel(he_dev, 0x10000, TPD_BA);
++
++
++	/*
++	 *	receive connection memory map
++	 *
++	 *          0x0 ___________________
++	 *             |                   |
++	 *             |                   |
++	 *             |       RSRa        |
++	 *             |                   |
++	 *             |                   |
++	 *       0x8000|___________________|
++	 *             |                   |
++	 *             |             rx0/1 |
++	 *             |       LBM         |   link lists of local
++	 *             |             tx    |   buffer memory 
++	 *             |                   |
++	 *       0xd000|___________________|
++	 *             |                   |
++	 *             |      rmABR        |
++	 *       0xe000|___________________|
++	 *             |                   |
++	 *             |       RSRb        |
++	 *             |___________________|
++	 *             |                   |
++	 *                      ....
++	 *       0xffff|___________________|
++	 */
++
++	he_writel(he_dev, 0x08000, RCMLBM_BA);
++	he_writel(he_dev, 0x0e000, RCMRSRB_BA);
++	he_writel(he_dev, 0x0d800, RCMABR_BA);
++
++	/* 5.1.4 initialize local buffer free pools linked lists */
++
++	he_init_rx_lbfp0(he_dev);
++	he_init_rx_lbfp1(he_dev);
++
++	he_writel(he_dev, 0x0, RLBC_H);
++	he_writel(he_dev, 0x0, RLBC_T);
++	he_writel(he_dev, 0x0, RLBC_H2);
++
++	he_writel(he_dev, 512, RXTHRSH);	/* 10% of r0+r1 buffers */
++	he_writel(he_dev, 256, LITHRSH); 	/* 5% of r0+r1 buffers */
++
++	he_init_tx_lbfp(he_dev);
++
++	he_writel(he_dev, he_is622(he_dev) ? 0x104780 : 0x800, UBUFF_BA);
++
++	/* 5.1.5 initialize intermediate receive queues */
++
++	if (he_is622(he_dev))
++	{
++		he_writel(he_dev, 0x000f, G0_INMQ_S);
++		he_writel(he_dev, 0x200f, G0_INMQ_L);
++
++		he_writel(he_dev, 0x001f, G1_INMQ_S);
++		he_writel(he_dev, 0x201f, G1_INMQ_L);
++
++		he_writel(he_dev, 0x002f, G2_INMQ_S);
++		he_writel(he_dev, 0x202f, G2_INMQ_L);
++
++		he_writel(he_dev, 0x003f, G3_INMQ_S);
++		he_writel(he_dev, 0x203f, G3_INMQ_L);
++
++		he_writel(he_dev, 0x004f, G4_INMQ_S);
++		he_writel(he_dev, 0x204f, G4_INMQ_L);
++
++		he_writel(he_dev, 0x005f, G5_INMQ_S);
++		he_writel(he_dev, 0x205f, G5_INMQ_L);
++
++		he_writel(he_dev, 0x006f, G6_INMQ_S);
++		he_writel(he_dev, 0x206f, G6_INMQ_L);
++
++		he_writel(he_dev, 0x007f, G7_INMQ_S);
++		he_writel(he_dev, 0x207f, G7_INMQ_L);
++	}
++	else
++	{
++		he_writel(he_dev, 0x0000, G0_INMQ_S);
++		he_writel(he_dev, 0x0008, G0_INMQ_L);
++
++		he_writel(he_dev, 0x0001, G1_INMQ_S);
++		he_writel(he_dev, 0x0009, G1_INMQ_L);
++
++		he_writel(he_dev, 0x0002, G2_INMQ_S);
++		he_writel(he_dev, 0x000a, G2_INMQ_L);
++
++		he_writel(he_dev, 0x0003, G3_INMQ_S);
++		he_writel(he_dev, 0x000b, G3_INMQ_L);
++
++		he_writel(he_dev, 0x0004, G4_INMQ_S);
++		he_writel(he_dev, 0x000c, G4_INMQ_L);
++
++		he_writel(he_dev, 0x0005, G5_INMQ_S);
++		he_writel(he_dev, 0x000d, G5_INMQ_L);
++
++		he_writel(he_dev, 0x0006, G6_INMQ_S);
++		he_writel(he_dev, 0x000e, G6_INMQ_L);
++
++		he_writel(he_dev, 0x0007, G7_INMQ_S);
++		he_writel(he_dev, 0x000f, G7_INMQ_L);
++	}
++
++	/* 5.1.6 application tunable parameters */
++
++	he_writel(he_dev, 0x0, MCC);
++	he_writel(he_dev, 0x0, OEC);
++	he_writel(he_dev, 0x0, DCC);
++	he_writel(he_dev, 0x0, CEC);
++	
++	/* 5.1.7 cs block initialization */
++
++	he_init_cs_block(he_dev);
++
++	/* 5.1.8 cs block connection memory initialization */
++	
++	he_init_cs_block_rcm(he_dev);
++
++	/* 5.1.10 initialize host structures */
++
++	he_init_tpdrq(he_dev);
++
++	if (he_init_group(he_dev, 0) != 0)
++		return -ENOMEM;
++
++	for (group = 1; group < HE_NUM_GROUPS; ++group)
++	{
++		he_writel(he_dev, 0x0, G0_RBPS_S + (group * 32));
++		he_writel(he_dev, 0x0, G0_RBPS_T + (group * 32));
++		he_writel(he_dev, 0x0, G0_RBPS_QI + (group * 32));
++		he_writel(he_dev, RBP_THRESH(0x1) | RBP_QSIZE(0x0),
++						G0_RBPS_BS + (group * 32));
++
++		he_writel(he_dev, 0x0, G0_RBPL_S + (group * 32));
++		he_writel(he_dev, 0x0, G0_RBPL_T + (group * 32));
++		he_writel(he_dev, RBP_THRESH(0x1) | RBP_QSIZE(0x0),
++						G0_RBPL_QI + (group * 32));
++		he_writel(he_dev, 0x0, G0_RBPL_BS + (group * 32));
++
++		he_writel(he_dev, 0x0, G0_RBRQ_ST + (group * 16));
++		he_writel(he_dev, 0x0, G0_RBRQ_H + (group * 16));
++		he_writel(he_dev, RBRQ_THRESH(0x1) | RBRQ_SIZE(0x0),
++						G0_RBRQ_Q + (group * 16));
++		he_writel(he_dev, 0x0, G0_RBRQ_I + (group * 16));
++
++		he_writel(he_dev, 0x0, G0_TBRQ_B_T + (group * 16));
++		he_writel(he_dev, 0x0, G0_TBRQ_H + (group * 16));
++		he_writel(he_dev, TBRQ_THRESH(0x1),
++						G0_TBRQ_THRESH + (group * 16));
++		he_writel(he_dev, 0x0, G0_TBRQ_S + (group * 16));
++	}
++
++	/* host status page */
++
++	he_dev->hsp_p = kmalloc(sizeof(struct he_hsp) + HSP_ALIGNMENT, GFP_DMA);
++	if (he_dev->hsp_p == NULL)
++	{
++		hprintk1("failed to allocate host status page\n");
++		return -ENOMEM;
++	}
++	he_dev->hsp = (struct he_hsp *)
++				ALIGN_ADDRESS(he_dev->hsp_p, HSP_ALIGNMENT);
++	memset(he_dev->hsp, 0, sizeof(struct he_hsp));
++	he_writel(he_dev, virt_to_bus(he_dev->hsp), HSP_BA);
++
++	/* initialize framer */
++
++#ifdef USE_SUNI
++	suni_init(he_dev->atm_dev);
++	if (he_dev->atm_dev->phy && he_dev->atm_dev->phy->start)
++		he_dev->atm_dev->phy->start(he_dev->atm_dev);
++#endif /* USE_SUNI */
++
++	/* 4.11 enable pci bus controller state machines */
++	host_cntl |= (OUTFF_ENB | CMDFF_ENB |
++				QUICK_RD_RETRY | QUICK_WR_RETRY | PERR_INT_ENB);
++	he_writel(he_dev, host_cntl, HOST_CNTL);
++
++	gen_cntl_0 |= INT_PROC_ENBL|INIT_ENB;
++	pci_write_config_dword(pci_dev, GEN_CNTL_0, gen_cntl_0);
++
++
++	/* 5.1.12 enable transmit and receive */
++
++	reg = he_readl_mbox(he_dev, CS_ERCTL0);
++	reg |= TX_ENABLE|ER_ENABLE;
++	he_writel_mbox(he_dev, reg, CS_ERCTL0);
++
++	reg = he_readl(he_dev, RC_CONFIG);
++	reg |= RX_ENABLE;
++	he_writel(he_dev, reg, RC_CONFIG);
++
++
++	he_dev->he_vcc_table = kmalloc(sizeof(struct he_vcc_table) * 
++			(2 << (he_dev->vcibits + he_dev->vpibits)), GFP_KERNEL);
++	if (he_dev->he_vcc_table == NULL)
++	{
++		hprintk1("failed to alloc he_vcc_table\n");
++		return -ENOMEM;
++	}
++	memset(he_dev->he_vcc_table, 0, sizeof(struct he_vcc_table) *
++				(2 << (he_dev->vcibits + he_dev->vpibits)));
++
++	for (i = 0; i < HE_NUM_CS_STPER; ++i)
++	{
++		he_dev->cs_stper[i].inuse = 0;
++		he_dev->cs_stper[i].pcr = -1;
++	}
++	he_dev->total_bw = 0;
++
++
++	/* atm linux initialization */
++
++	he_dev->atm_dev->ci_range.vpi_bits = he_dev->vpibits;
++	he_dev->atm_dev->ci_range.vci_bits = he_dev->vcibits;
++
++	he_dev->irq_peak = 0;
++	he_dev->rbrq_peak = 0;
++        he_dev->rbpl_peak = 0;
++        he_dev->tbrq_peak = 0;
++
++	hprintk1("hell bent for leather!\n");
++
++	return 0;
++}
++
++static void
++he_stop(struct he_dev *he_dev)
++{
++	u16 command;
++	u32 gen_cntl_0, reg;
++	struct pci_dev *pci_dev;
++	int i;
++
++	pci_dev = he_dev->pci_dev;
++
++	/* disable interrupts */
++
++	if (he_dev->membase)
++	{
++		pci_read_config_dword(pci_dev, GEN_CNTL_0, &gen_cntl_0);
++		gen_cntl_0 &= ~(INT_PROC_ENBL | INIT_ENB);
++		pci_write_config_dword(pci_dev, GEN_CNTL_0, gen_cntl_0);
++
++#ifdef USE_TASKLET
++		tasklet_disable(&he_dev->tasklet);
++#endif
++
++		/* disable recv and transmit */
++
++		reg = he_readl_mbox(he_dev, CS_ERCTL0);
++		reg |= ~(TX_ENABLE|ER_ENABLE);
++		he_writel_mbox(he_dev, reg, CS_ERCTL0);
++
++		reg = he_readl(he_dev, RC_CONFIG);
++		reg |= ~(RX_ENABLE);
++		he_writel(he_dev, reg, RC_CONFIG);
++	}
++
++	if (he_dev->irq)
++		free_irq(he_dev->irq, he_dev);
++
++	if (he_dev->irq_p)
++		kfree(he_dev->irq_p);
++
++	if (he_dev->hsp_p)
++		kfree(he_dev->hsp_p);
++
++	if (he_dev->rbpl_p)
++	{
++		for (i=0; i<CONFIG_RBPL_SIZE; ++i)
++		{
++			struct he_buff *hbuf = bus_to_virt(he_dev->rbpl_base[i].virt);
++
++			pci_unmap_single(he_dev->pci_dev, hbuf->mapping, hbuf->len, PCI_DMA_FROMDEVICE);
++			if (hbuf->data) kfree(hbuf->data);
++			if (hbuf->base) kfree(hbuf->base);
++		}
++		kfree(he_dev->rbpl_p);
++	}
++
++#ifdef rbps_support
++	if (he_dev->rbps_p)
++	{
++		for (i=0; i<CONFIG_RBPS_SIZE; ++i)
++			kfree(he_dev->rbps_base[i].hbuf->data);
++		kfree(he_dev->rbps_p);
++	}
++#endif
++
++	if (he_dev->rbrq_p)
++		kfree(he_dev->rbrq_p);
++
++	if (he_dev->tbrq_p)
++		kfree(he_dev->tbrq_p);
++
++	if (he_dev->tpdrq_p)
++		kfree(he_dev->tpdrq_p);
++
++	if (he_dev->he_vcc_table)
++		kfree(he_dev->he_vcc_table);
++
++	if (he_dev->pci_dev)
++	{
++		pci_read_config_word(he_dev->pci_dev, PCI_COMMAND, &command);
++		command &= ~(PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
++		pci_write_config_word(he_dev->pci_dev, PCI_COMMAND, command);
++	}
++	
++	if (he_dev->membase) iounmap((void *) he_dev->membase);
++}
++
++static __inline__ struct he_tpd *
++he_alloc_tpd(void)
++{
++	void *tpd_base;
++	struct he_tpd *tpd;
++
++	tpd_base = kmalloc(sizeof(struct he_tpd) + TPD_ALIGNMENT,
++						GFP_ATOMIC | GFP_DMA);
++	if (tpd_base == NULL)
++		return NULL;
++
++	tpd = (struct he_tpd *) ALIGN_ADDRESS(tpd_base, TPD_ALIGNMENT);
++	memset(tpd, 0, sizeof(struct he_tpd));
++	tpd->base = tpd_base;
++	tpd->status = BUF_ADDR(virt_to_bus(tpd));
++
++	return tpd;
++}
++
++
++#define AAL5_LEN(buf,len) 						\
++			((((unsigned char *)(buf))[(len)-6]<<8) |	\
++				(((unsigned char *)(buf))[(len)-5]))
++
++static int
++he_service_rbrq(struct he_dev *he_dev, int group)
++{
++	struct he_rbrq *rbrq_tail = (struct he_rbrq *)
++				((unsigned long)he_dev->rbrq_base |
++					he_dev->hsp->group[group].rbrq_tail);
++	struct he_buff *hbuf;
++	unsigned cid;
++	unsigned buf_len;
++	struct sk_buff *skb;
++	struct atm_vcc *vcc;
++	struct he_vcc *he_vcc;
++	struct iovec *iov;
++	int pdus_assembled = 0;
++	int updated = 0;
++
++	while (he_dev->rbrq_head != rbrq_tail)
++	{
++		++updated;
++
++		HPRINTK("%p rbrq%d 0x%x len=%d cid=0x%x %s%s%s%s%s%s\n",
++			he_dev->rbrq_head, group,
++			RBRQ_ADDR(he_dev->rbrq_head),
++			RBRQ_BUFLEN(he_dev->rbrq_head),
++			RBRQ_CID(he_dev->rbrq_head),
++			RBRQ_CRC_ERR(he_dev->rbrq_head) ? " CRC_ERR" : "",
++			RBRQ_LEN_ERR(he_dev->rbrq_head) ? " LEN_ERR" : "",
++			RBRQ_END_PDU(he_dev->rbrq_head) ? " END_PDU" : "",
++			RBRQ_AAL5_PROT(he_dev->rbrq_head) ? " AAL5_PROT" : "",
++			RBRQ_CON_CLOSED(he_dev->rbrq_head) ? " CON_CLOSED" : "",
++			RBRQ_HBUF_ERR(he_dev->rbrq_head) ? " HBUF_ERR" : "");
++
++		hbuf = (struct he_buff *)
++				bus_to_virt(RBRQ_ADDR(he_dev->rbrq_head));
++		buf_len = RBRQ_BUFLEN(he_dev->rbrq_head) * 4;
++		cid = RBRQ_CID(he_dev->rbrq_head);
++
++		vcc = HE_LOOKUP_VCC(he_dev, cid);
++		if (vcc == NULL)
++		{
++			hprintk("vcc == NULL  (cid 0x%x)\n", cid);
++			if (!RBRQ_HBUF_ERR(he_dev->rbrq_head)) hbuf->loaned = 0;
++			goto next_rbrq_entry;
++		}
++
++		he_vcc = HE_VCC(vcc);
++		if (vcc == NULL)
++		{
++			hprintk("he_vcc == NULL  (cid 0x%x)\n", cid);
++			if (!RBRQ_HBUF_ERR(he_dev->rbrq_head)) hbuf->loaned = 0;
++			goto next_rbrq_entry;
++		}
++
++		if (RBRQ_HBUF_ERR(he_dev->rbrq_head))
++		{
++			hprintk("HBUF_ERR!  (cid 0x%x)\n", cid);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++				++vcc->stats->rx_drop;
++#else
++				atomic_inc(&vcc->stats->rx_drop);
++#endif
++			goto return_host_buffers;
++		}
++
++		he_vcc->iov_tail->iov_base = hbuf;
++		he_vcc->iov_tail->iov_len = buf_len;
++		he_vcc->pdu_len += buf_len;
++		++he_vcc->iov_tail;
++
++		if (RBRQ_CON_CLOSED(he_dev->rbrq_head))
++		{
++			HPRINTK("wake_up rx_waitq  (cid 0x%x)\n", cid);
++			wake_up(&he_vcc->rx_waitq);
++			goto return_host_buffers;
++		}
++
++#ifdef notdef
++		if (he_vcc->iov_tail - he_vcc->iov_head > 32)
++		{
++			hprintk("iovec full!  cid 0x%x\n", cid);
++			goto return_host_buffers;
++		}
++#endif
++		if (!RBRQ_END_PDU(he_dev->rbrq_head)) goto next_rbrq_entry;
++
++		if (RBRQ_LEN_ERR(he_dev->rbrq_head)
++				|| RBRQ_CRC_ERR(he_dev->rbrq_head))
++		{
++			HPRINTK("%s%s (%d.%d)\n",
++				RBRQ_CRC_ERR(he_dev->rbrq_head)
++							? "CRC_ERR " : "",
++				RBRQ_LEN_ERR(he_dev->rbrq_head)
++							? "LEN_ERR" : "",
++							vcc->vpi, vcc->vci);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++			++vcc->stats->rx_err;
++#else
++			atomic_inc(&vcc->stats->rx_err);
++#endif
++			goto return_host_buffers;
++		}
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,3,15)
++		skb = atm_alloc_charge(vcc, he_vcc->pdu_len,
++							GFP_ATOMIC);
++#else
++
++		if (!atm_charge(vcc, atm_pdu2truesize(he_vcc->pdu_len)))
++			skb = NULL;
++		else
++		{
++			skb = alloc_skb(he_vcc->pdu_len, GFP_ATOMIC);
++			if (!skb) atm_return(vcc,
++				atm_pdu2truesize(he_vcc->pdu_len));
++		}
++#endif
++		if (!skb)
++		{
++			hprintk("charge failed (%d.%d)\n",
++						vcc->vpi, vcc->vci);
++			goto return_host_buffers;
++		}
++
++		skb->stamp = xtime;
++
++		for(iov = he_vcc->iov_head;
++				iov < he_vcc->iov_tail; ++iov)
++		{
++			struct he_buff *hbuf = iov->iov_base;
++
++			pci_dma_sync_single(he_dev->pci_dev,
++				hbuf->mapping, hbuf->len, PCI_DMA_FROMDEVICE);
++
++			memcpy(skb_put(skb, iov->iov_len),
++					hbuf->data, iov->iov_len);
++		}
++
++		switch(vcc->qos.aal)
++		{
++			case ATM_AAL0:
++				/* 2.10.1.5 raw cell receive */
++				skb->len = ATM_AAL0_SDU;
++				break;
++			case ATM_AAL5:
++				/* 2.10.1.2 aal5 receive
++				 *
++				 * the aal5 trailer could be split
++				 * across two buffers
++				 */
++
++				skb->len = AAL5_LEN(skb->data, he_vcc->pdu_len);
++#ifdef notdef
++				skb->ip_summed = CHECKSUM_UNNECESSARY;
++#endif
++				break;
++		}
++
++#ifdef notdef
++		if (skb->len > vcc->qos.rxtp.max_sdu)
++			hprintk("pdu_len (%d) > vcc->qos.rxtp.max_sdu (%d)!  cid 0x%x\n", skb->len, vcc->qos.rxtp.max_sdu, cid);
++#endif
++
++		ATM_SKB(skb)->iovcnt = 0;
++		ATM_SKB(skb)->vcc = vcc;
++		vcc->push(vcc, skb);
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++		++vcc->stats->rx;
++#else
++		atomic_inc(&vcc->stats->rx);
++#endif
++
++return_host_buffers:
++		++pdus_assembled;
++
++		for(iov = he_vcc->iov_head;
++				iov < he_vcc->iov_tail; ++iov)
++		{
++			struct he_buff *hbuf = iov->iov_base;
++			hbuf->loaned = 0;
++		}
++
++		he_vcc->iov_tail = he_vcc->iov_head;
++		he_vcc->pdu_len = 0;
++
++next_rbrq_entry:
++		he_dev->rbrq_head = (struct he_rbrq *)
++				((unsigned long) he_dev->rbrq_base |
++					RBRQ_MASK(++he_dev->rbrq_head));
++
++	}
++
++	if (updated)
++	{
++		if (updated > he_dev->rbrq_peak) he_dev->rbrq_peak = updated;
++
++		he_writel(he_dev, RBRQ_MASK(he_dev->rbrq_head),
++						G0_RBRQ_H + (group * 16));
++	}
++
++	return pdus_assembled;
++}
++
++static void
++he_service_tbrq(struct he_dev *he_dev, int group)
++{
++	struct he_tbrq *tbrq_tail = (struct he_tbrq *)
++				((unsigned long)he_dev->tbrq_base |
++					he_dev->hsp->group[group].tbrq_tail);
++	struct he_tpd *tpd;
++	int updated = 0;
++
++	/* 2.1.6 transmit buffer return queue */
++
++	while (he_dev->tbrq_head != tbrq_tail)
++	{
++		++updated;
++
++		HPRINTK("tbrq%d 0x%x%s%s\n",
++			group,
++			TBRQ_TPD(he_dev->tbrq_head), 
++			TBRQ_EOS(he_dev->tbrq_head) ? " EOS" : "",
++			TBRQ_MULTIPLE(he_dev->tbrq_head) ? " MULTIPLE" : "");
++
++		tpd = (struct he_tpd *) bus_to_virt(TBRQ_TPD(he_dev->tbrq_head));
++		if (TBRQ_EOS(he_dev->tbrq_head))
++		{
++			HPRINTK("wake_up(tx_waitq) cid 0x%x\n",
++				he_mkcid(he_dev, tpd->vcc->vpi, tpd->vcc->vci));
++			if (tpd->vcc)
++				wake_up(&HE_VCC(tpd->vcc)->tx_waitq);
++
++			goto next_tbrq_entry;
++		}
++
++		if (tpd->skb)	/* && !TBRQ_MULTIPLE(he_dev->tbrq_head) */
++		{
++			pci_unmap_single(he_dev->pci_dev, tpd->address1, tpd->skb->len, PCI_DMA_TODEVICE);
++			if (tpd->vcc && tpd->vcc->pop)
++				tpd->vcc->pop(tpd->vcc, tpd->skb);
++			else
++				dev_kfree_skb_any(tpd->skb);
++		}
++
++
++next_tbrq_entry:
++		kfree(tpd->base);
++
++		he_dev->tbrq_head = (struct he_tbrq *)
++				((unsigned long) he_dev->tbrq_base |
++					TBRQ_MASK(++he_dev->tbrq_head));
++	}
++
++	if (updated)
++	{
++		if (updated > he_dev->tbrq_peak) he_dev->tbrq_peak = updated;
++
++		he_writel(he_dev, TBRQ_MASK(he_dev->tbrq_head),
++						G0_TBRQ_H + (group * 16));
++	}
++}
++
++
++static void
++he_service_rbpl(struct he_dev *he_dev, int group)
++{
++	struct he_rbp *new_tail = he_dev->rbpl_tail;
++	struct he_rbp *rbpl_head;
++	struct he_buff *hbuf = (struct he_buff *) bus_to_virt(new_tail->virt);
++	int moved = 0;
++
++	rbpl_head = bus_to_virt(he_readl(he_dev, G0_RBPL_S));
++
++	while(hbuf->loaned == 0)
++	{
++		new_tail = (struct he_rbp *)
++					((unsigned long)he_dev->rbpl_base |
++							RBPL_MASK(++new_tail));
++
++		/* table 3.42 -- rbpl_tail should never be set to rbpl_head */
++		if (new_tail == rbpl_head) break;
++
++		hbuf->loaned = 1;
++		he_dev->rbpl_tail = new_tail;
++		hbuf = (struct he_buff *) bus_to_virt(new_tail->virt);
++
++		++moved;
++
++	}
++
++	if (moved)
++	{
++		he_writel(he_dev, RBPL_MASK(he_dev->rbpl_tail), G0_RBPL_T);
++	}
++}
++
++#ifdef rbps_support
++static void
++he_service_rbps(struct he_dev *he_dev, int group)
++{
++	struct he_rbp *new_tail = he_dev->rbps_tail;
++	struct he_rbp *rbps_head;
++	struct he_buff *hbuf = (struct he_buff *) bus_to_virt(new_tail->virt);
++	int moved = 0;
++
++	rbps_head = bus_to_virt(he_readl(he_dev, G0_RBPS_S));
++
++	while(hbuf->loaned == 0)
++	{
++		new_tail = (struct he_rbp *)
++					((unsigned long)he_dev->rbps_base |
++							RBPS_MASK(++new_tail));
++
++		/* table 3.42 -- rbps_tail should never be set to rbps_head */
++		if (new_tail == rbps_head) break;
++
++		hbuf->loaned = 1;
++		he_dev->rbps_tail = new_tail;
++		hbuf = (struct he_buff *) bus_to_virt(new_tail->virt);
++
++		++moved;
++
++	}
++
++	if (moved)
++	{
++		he_writel(he_dev, RBPS_MASK(he_dev->rbps_tail), G0_RBPS_T);
++	}
++}
++#endif
++
++static void
++he_tasklet(unsigned long data)
++{
++#ifdef USE_TASKLET
++	unsigned long flags;
++#endif
++	struct he_dev *he_dev = (struct he_dev *) data;
++	unsigned group, type;
++	int updated = 0;
++
++	HPRINTK("tasklet (0x%lx)\n", data);
++#ifdef USE_TASKLET
++	he_spin_lock(&he_dev->global_lock, flags);
++#endif
++
++	while(he_dev->irq_head != he_dev->irq_tail)
++	{
++		++updated;
++
++		type = ITYPE_TYPE(he_dev->irq_head->isw);
++		group = ITYPE_GROUP(he_dev->irq_head->isw);
++
++		switch (type)
++		{
++			case ITYPE_RBRQ_THRESH:
++				hprintk("rbrq%d threshold\n", group);
++			case ITYPE_RBRQ_TIMER:
++				if (he_service_rbrq(he_dev, group))
++				{
++					he_service_rbpl(he_dev, group);
++#ifdef rbps_support
++					he_service_rbps(he_dev, group);
++#endif
++				}
++				break;
++			case ITYPE_TBRQ_THRESH:
++				hprintk("tbrq%d threshold\n", group);
++			case ITYPE_TPD_COMPLETE:
++				he_service_tbrq(he_dev, group);
++				break;
++			case ITYPE_RBPL_THRESH:
++				he_service_rbpl(he_dev, group);
++				break;
++			case ITYPE_RBPS_THRESH:
++#ifdef rbps_support
++				he_service_rbps(he_dev, group);
++#endif
++				break;
++			case ITYPE_PHY:
++				hprintk1("phy interrupt\n");
++				break;
++			case ITYPE_OTHER:
++				switch (type|group)
++				{
++					case ITYPE_PARITY:
++						hprintk1("parity error\n");
++						break;
++					case ITYPE_ABORT:
++						hprintk("abort 0x%x\n",
++						  he_readl(he_dev, ABORT_ADDR));
++						break;
++				}
++				break;
++			default:
++				if (he_dev->irq_head->isw == ITYPE_INVALID)
++				{
++					/* see 8.1.1 -- check all queues */
++
++					HPRINTK("isw not updated 0x%x\n",
++						he_dev->irq_head->isw);
++
++					he_service_rbrq(he_dev, 0);
++					he_service_rbpl(he_dev, 0);
++#ifdef rbps_support
++					he_service_rbps(he_dev, 0);
++#endif
++					he_service_tbrq(he_dev, 0);
++				}
++				else
++					hprintk("bad isw = 0x%x?\n",
++						he_dev->irq_head->isw);
++		}
++
++		he_dev->irq_head->isw = ITYPE_INVALID;
++
++		he_dev->irq_head = (struct he_irq *) NEXT_ENTRY(he_dev->irq_base, he_dev->irq_head, IRQ_MASK);
++	}
++
++	if (updated)
++	{
++		if (updated > he_dev->irq_peak) he_dev->irq_peak = updated;
++
++		he_writel(he_dev,
++			IRQ_SIZE(CONFIG_IRQ_SIZE) |
++			IRQ_THRESH(CONFIG_IRQ_THRESH) |
++			IRQ_TAIL(he_dev->irq_tail), IRQ0_HEAD);
++		(void) he_readl(he_dev, INT_FIFO); /* 8.1.2 controller errata */
++	}
++#ifdef USE_TASKLET
++	he_spin_unlock(&he_dev->global_lock, flags);
++#endif
++}
++
++static void
++he_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
++{
++	unsigned long flags;
++	struct he_dev *he_dev = (struct he_dev * )dev_id;
++
++	if (he_dev == NULL) return;
++
++	he_spin_lock(&he_dev->global_lock, flags);
++
++	he_dev->irq_tail = (struct he_irq *) (((unsigned long)he_dev->irq_base) |
++						(*he_dev->irq_tailoffset << 2));
++
++	if (he_dev->irq_tail == he_dev->irq_head)
++	{
++		HPRINTK1("tailoffset not updated?\n");
++		he_dev->irq_tail = (struct he_irq *) ((unsigned long)he_dev->irq_base |
++			((he_readl(he_dev, IRQ0_BASE) & IRQ_MASK) << 2));
++		(void) he_readl(he_dev, INT_FIFO);	/* 8.1.2 controller errata */
++	}
++
++#ifdef notdef
++	if (he_dev->irq_head == he_dev->irq_tail /* && !IRQ_PENDING */)
++		hprintk1("spurious interrupt?\n");
++#endif
++
++	if (he_dev->irq_head != he_dev->irq_tail)
++	{
++#ifdef USE_TASKLET
++		tasklet_schedule(&he_dev->tasklet);
++#else
++		he_tasklet((unsigned long) he_dev);
++#endif
++		he_writel(he_dev, INT_CLEAR_A, INT_FIFO);
++							/* clear interrupt */
++	}
++
++	he_spin_unlock(&he_dev->global_lock, flags);
++}
++
++static int
++he_open(struct atm_vcc *vcc, short vpi, int vci)
++{
++	struct he_dev *he_dev = HE_DEV(vcc->dev);
++	struct he_vcc *he_vcc;
++	int err = 0;
++	unsigned cid, rsr0, rsr1, rsr4, tsr0, period, reg, clock;
++	unsigned long flags;
++
++	if ((err = atm_find_ci(vcc, &vpi, &vci)))
++	{
++		hprintk("atm_find_ci err = %d\n", err);
++		return err;
++	}
++	if (vci == ATM_VCI_UNSPEC || vpi == ATM_VPI_UNSPEC) return 0;
++	vcc->vpi = vpi;
++	vcc->vci = vci;
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,1)
++	vcc->flags |= ATM_VF_ADDR;
++#else
++	set_bit(ATM_VF_ADDR, &vcc->flags);
++#endif
++
++	cid = he_mkcid(he_dev, vpi, vci);
++
++	he_vcc = (struct he_vcc *) kmalloc(sizeof(struct he_vcc), GFP_KERNEL);
++	if (he_vcc == NULL)
++	{
++		hprintk1("unable to allocate he_vcc during open\n");
++		return -ENOMEM;
++	}
++
++	he_vcc->iov_tail = he_vcc->iov_head;
++	he_vcc->pdu_len = 0;
++	he_vcc->rc_index = -1;
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,1)
++	init_waitqueue(&he_vcc->rx_waitq);
++	init_waitqueue(&he_vcc->tx_waitq);
++#else
++	init_waitqueue_head(&he_vcc->rx_waitq);
++	init_waitqueue_head(&he_vcc->tx_waitq);
++#endif
++
++	HE_VCC(vcc) = he_vcc;
++
++	if (vcc->qos.txtp.traffic_class != ATM_NONE)
++	{
++		int pcr_goal;
++
++                pcr_goal = atm_pcr_goal(&vcc->qos.txtp);
++                if (pcr_goal == 0)
++                        pcr_goal = he_dev->atm_dev->link_rate;
++                if (pcr_goal < 0)	/* means round down, technically */
++                        pcr_goal = -pcr_goal;
++
++		HPRINTK("open tx cid 0x%x pcr_goal %d\n", cid, pcr_goal);
++
++		/* no transmit support for AAL0 -- FIXME */
++
++		if (vcc->qos.aal != ATM_AAL5)
++		{
++			err = -EINVAL;
++			goto open_failed;
++		}
++
++		he_spin_lock(&he_dev->global_lock, flags);
++		tsr0 = he_readl_tsr0(he_dev, cid);
++		he_spin_unlock(&he_dev->global_lock, flags);
++
++		if (TSR0_CONN_STATE(tsr0) != 0)
++		{
++			hprintk("cid 0x%x not idle (tsr0 = 0x%x)\n", cid, tsr0);
++			err = -EBUSY;
++			goto open_failed;
++		}
++
++		switch(vcc->qos.txtp.traffic_class)
++		{
++			case ATM_UBR:
++				/* 2.3.3.1 open connection ubr */
++
++				tsr0 = TSR0_UBR | TSR0_GROUP(0) | TSR0_AAL5 |
++					TSR0_USE_WMIN | TSR0_UPDATE_GER;
++				break;
++
++			case ATM_CBR:
++				/* 2.3.3.2 open connection cbr */
++
++				clock = he_is622(he_dev) ? 66667000 : 50000000;
++				period = clock / pcr_goal;
++				
++				/* find an unused cs_stper register */
++
++				for(reg = 0; reg < HE_NUM_CS_STPER; ++reg)
++					if (he_dev->cs_stper[reg].inuse == 0 || 
++						he_dev->cs_stper[reg].pcr == pcr_goal)
++					break;
++
++				if (reg == HE_NUM_CS_STPER)
++				{
++					err = -EBUSY;
++					goto open_failed;
++				}
++
++				/* 8.2.3 cbr scheduler wrap problem */
++				if ((he_dev->total_bw + pcr_goal)
++					> (he_dev->atm_dev->link_rate * 10 / 9))
++				{
++					err = -EBUSY;
++					goto open_failed;
++				}
++				he_dev->total_bw += pcr_goal;
++
++				he_vcc->rc_index = reg;
++				++he_dev->cs_stper[reg].inuse;
++				he_dev->cs_stper[reg].pcr = pcr_goal;
++
++				HPRINTK("rc_index = %d period = %d\n",
++								reg, period);
++
++				he_spin_lock(&he_dev->global_lock, flags);
++				he_writel_mbox(he_dev, rate_to_atmf(period/2),
++							CS_STPER0 + reg);
++				he_spin_unlock(&he_dev->global_lock, flags);
++
++				tsr0 = TSR0_CBR | TSR0_GROUP(0) | TSR0_AAL5 |
++							TSR0_RC_INDEX(reg);
++
++				break;
++			default:
++				err = -EINVAL;
++				goto open_failed;
++		}
++
++		he_spin_lock(&he_dev->global_lock, flags);
++
++		he_writel_tsr1(he_dev, TSR1_MCR(rate_to_atmf(0)) |
++					TSR1_PCR(rate_to_atmf(pcr_goal)), cid);
++		he_writel_tsr2(he_dev, TSR2_ACR(rate_to_atmf(pcr_goal)), cid);
++		he_writel_tsr3(he_dev, 0x0, cid);
++		he_writel_tsr5(he_dev, 0x0, cid);
++		he_writel_tsr6(he_dev, 0x0, cid);
++		he_writel_tsr7(he_dev, 0x0, cid);
++		he_writel_tsr8(he_dev, 0x0, cid);
++		he_writel_tsr10(he_dev, 0x0, cid);
++		he_writel_tsr11(he_dev, 0x0, cid);
++		he_writel_tsr12(he_dev, 0x0, cid);
++		he_writel_tsr13(he_dev, 0x0, cid);
++		he_writel_tsr14(he_dev, 0x0, cid);
++		he_writel_tsr4(he_dev, TSR4_AAL5 | 1, cid);
++		he_writel_tsr9(he_dev, TSR9_OPEN_CONN, cid);
++		he_writel_tsr0(he_dev, tsr0, cid);
++
++		he_spin_unlock(&he_dev->global_lock, flags);
++	}
++
++	if (vcc->qos.rxtp.traffic_class != ATM_NONE)
++	{
++		unsigned aal;
++
++		HPRINTK("open rx cid 0x%x (rx_waitq %p)\n", cid,
++		 				&HE_VCC(vcc)->rx_waitq);
++
++		switch (vcc->qos.aal)
++		{
++			case ATM_AAL5:
++				aal = RSR0_AAL5;
++				break;
++			case ATM_AAL0:
++				aal = RSR0_RAWCELL;
++				break;
++			default:
++				err = -EINVAL;
++				goto open_failed;
++		}
++
++		he_spin_lock(&he_dev->global_lock, flags);
++
++		rsr0 = he_readl_rsr0(he_dev, cid);
++		if (rsr0 & RSR0_OPEN_CONN)
++		{
++			he_spin_unlock(&he_dev->global_lock, flags);
++
++			hprintk("cid 0x%x not idle (rsr0 = 0x%x)\n", cid, rsr0);
++			err = -EBUSY;
++			goto open_failed;
++		}
++
++#ifdef notdef
++		rsr1 = RSR1_GROUP(0);
++		rsr4 = RSR4_GROUP(0);
++#else
++		rsr1 = RSR1_GROUP(0)|RSR1_RBPL_ONLY;
++		rsr4 = RSR4_GROUP(0)|RSR4_RBPL_ONLY;
++#endif
++		rsr0 = vcc->qos.rxtp.traffic_class == ATM_UBR ? 
++				(RSR0_EPD_ENABLE|RSR0_PPD_ENABLE) : 0;
++
++		he_writel_rsr1(he_dev, rsr1, cid);
++		he_writel_rsr4(he_dev, rsr4, cid);
++		he_writel_rsr0(he_dev,
++			rsr0 | RSR0_START_PDU | RSR0_OPEN_CONN | aal, cid);
++
++		he_spin_unlock(&he_dev->global_lock, flags);
++
++		HE_LOOKUP_VCC(he_dev, cid) = vcc;
++	}
++
++open_failed:
++
++	if (err)
++	{
++		HE_LOOKUP_VCC(he_dev, cid) = NULL;
++		if (he_vcc) kfree(he_vcc);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,1)
++		vcc->flags &= ~ATM_VF_ADDR;
++#else
++		clear_bit(ATM_VF_ADDR, &vcc->flags);
++#endif
++	}
++	else
++	{
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,1)
++		vcc->flags |= ATM_VF_READY;
++#else
++		set_bit(ATM_VF_READY, &vcc->flags);
++#endif
++	}
++
++	return err;
++}
++
++static __inline__ void
++he_enqueue_tpd(struct he_dev *he_dev, struct he_tpd *tpd, unsigned cid)
++{
++	unsigned long flags;
++	struct he_tpdrq *new_tail;
++
++	HPRINTK("tpdrq %p cid 0x%x -> tpdrq_tail %p\n",
++					tpd, cid, he_dev->tpdrq_tail);
++
++	spin_lock_irqsave(&he_dev->tpdrq_lock, flags);
++
++	/* 2.1.5 transmit packet descriptor ready queue */
++
++	he_dev->tpdrq_tail->tpd = virt_to_bus(tpd);
++	he_dev->tpdrq_tail->cid = cid;
++	wmb();
++
++	new_tail = (struct he_tpdrq *) ((unsigned long) he_dev->tpdrq_base |
++					RBRQ_MASK(++he_dev->tpdrq_tail));
++
++	/*
++	 * check to see if we are about to set the tail == head
++	 * if true, update the head pointer from the adapter
++	 * to see if this is really the case (reading the queue
++	 * head for every transmit would be unnecessarily slow)
++	 */
++
++	if (new_tail == he_dev->tpdrq_head)
++	{
++		he_dev->tpdrq_head = (struct he_tpdrq *)
++			(((unsigned long)he_dev->tpdrq_base) |
++				TPDRQ_MASK(he_readl(he_dev, TPDRQ_B_H)));
++
++		if (new_tail == he_dev->tpdrq_head)
++		{
++			hprintk("tpdrq full (cid 0x%x)\n", cid);
++			/*
++			 * FIXME
++			 * push tpd onto a transmit backlog queue
++			 * after service_tbrq, service the backlog
++			 * for now, we just drop the pdu
++			 */
++			if (tpd->vcc->pop)
++				tpd->vcc->pop(tpd->vcc, tpd->skb);
++			else
++				dev_kfree_skb_any(tpd->skb);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++			++tpd->vcc->stats->tx_err;
++#else
++			atomic_inc(&tpd->vcc->stats->tx_err);
++#endif
++			kfree(tpd->base);
++			spin_unlock_irqrestore(&he_dev->tpdrq_lock, flags);
++			return;
++		}
++	}
++	he_dev->tpdrq_tail = new_tail;
++
++	he_writel(he_dev, TPDRQ_MASK(he_dev->tpdrq_tail), TPDRQ_T);
++	spin_unlock_irqrestore(&he_dev->tpdrq_lock, flags);
++}
++
++
++static void
++he_close(struct atm_vcc *vcc)
++{
++	unsigned long flags;
++#if LINUX_VERSION_CODE > KERNEL_VERSION(2,3,1)
++	DECLARE_WAITQUEUE(wait, current);
++#else
++	struct wait_queue wait = { current, NULL };
++#endif
++	struct he_dev *he_dev = HE_DEV(vcc->dev);
++	struct he_tpd *tpd;
++	unsigned cid, retry;
++	struct he_vcc *he_vcc = HE_VCC(vcc);
++	int tx_inuse;
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,1)
++	vcc->flags &= ~ATM_VF_READY;
++#else
++	clear_bit(ATM_VF_READY, &vcc->flags);
++#endif
++	cid = he_mkcid(he_dev, vcc->vpi, vcc->vci);
++
++	he_spin_lock(&he_dev->global_lock, flags);
++
++	if (vcc->qos.txtp.traffic_class != ATM_NONE)
++	{
++		volatile unsigned tsr4, tsr0;
++		int timeout;
++
++		HPRINTK("close tx cid 0x%x\n", cid);
++
++		/* 2.3.1.1 generic close operations with flush */
++
++		he_writel_tsr4_upper(he_dev, TSR4_FLUSH_CONN, cid);
++					/* also clears TSR4_SESSION_ENDED */
++
++		switch(vcc->qos.txtp.traffic_class)
++		{
++			case ATM_UBR:
++				he_writel_tsr1(he_dev, 
++					TSR1_MCR(rate_to_atmf(200000))
++					| TSR1_PCR(rate_to_atmf(he_dev->atm_dev->link_rate)),
++									cid);
++				break;
++			case ATM_CBR:
++				he_writel_tsr14_upper(he_dev, TSR14_DELETE, cid);
++				break;
++		}
++
++		/* wait for last outstanding tpd to be returned? */
++
++		retry = 0;
++		while ((tx_inuse = atomic_read(&vcc->tx_inuse)) > 0)
++		{
++			++retry;
++			if ((retry % 10) == 0)
++				hprintk("close tx cid 0x%x tx_inuse = %d)\n", cid, tx_inuse);
++			HPRINTK("vcc->tx_inuse = %d\n", tx_inuse);
++
++			if (retry == 1)
++			{
++				he_spin_unlock(&he_dev->global_lock, flags);
++				udelay(100);
++				he_spin_lock(&he_dev->global_lock, flags);
++			}
++			else
++			{
++				set_current_state(TASK_UNINTERRUPTIBLE);
++				he_spin_unlock(&he_dev->global_lock, flags);
++				(void) schedule_timeout(5);
++				he_spin_lock(&he_dev->global_lock, flags);
++				set_current_state(TASK_RUNNING);
++			}
++		}
++
++		tpd = he_alloc_tpd();
++		if (tpd == NULL)
++		{
++			hprintk("close tx he_alloc_tpd failed cid 0x%x\n", cid);
++			goto close_tx_incomplete;
++		}
++		tpd->status |= TPD_EOS | TPD_INT;
++		wmb();
++		tpd->vcc = vcc;
++
++		add_wait_queue(&he_vcc->tx_waitq, &wait);
++		set_current_state(TASK_UNINTERRUPTIBLE);
++		he_enqueue_tpd(he_dev, tpd, cid);
++		he_spin_unlock(&he_dev->global_lock, flags);
++		timeout = schedule_timeout(5*HZ);
++		he_spin_lock(&he_dev->global_lock, flags);
++		remove_wait_queue(&he_vcc->tx_waitq, &wait);
++		set_current_state(TASK_RUNNING);
++
++		if (timeout == 0)
++		{
++			hprintk("close tx timeout cid 0x%x\n", cid);
++			goto close_tx_incomplete;
++		}
++
++		while (!((tsr4 = he_readl_tsr4(he_dev, cid))
++							& TSR4_SESSION_ENDED))
++		{
++			HPRINTK("close tx cid 0x%x !TSR4_SESSION_ENDED (tsr4 = 0x%x)\n", cid, tsr4);
++			udelay(100);
++		}
++
++		while (TSR0_CONN_STATE(tsr0 = he_readl_tsr0(he_dev, cid)) != 0)
++		{
++			HPRINTK("close tx cid 0x%x TSR0_CONN_STATE != 0 (tsr0 = 0x%x)\n", cid, tsr0);
++			udelay(100);
++		}
++
++close_tx_incomplete:
++
++		if (vcc->qos.txtp.traffic_class == ATM_CBR)
++		{
++			int reg = he_vcc->rc_index;
++
++			HPRINTK("cs_stper reg = %d\n", reg);
++
++			if (he_dev->cs_stper[reg].inuse == 0)
++				hprintk("cs_stper[%d].inuse = 0!\n", reg);
++			else
++				--he_dev->cs_stper[reg].inuse;
++
++			he_dev->total_bw -= he_dev->cs_stper[reg].pcr;
++		}
++
++		HPRINTK("close tx cid 0x%x complete\n", cid);
++	}
++
++	if (vcc->qos.rxtp.traffic_class != ATM_NONE)
++	{
++		int timeout;
++
++		HPRINTK("close rx cid 0x%x\n", cid);
++
++		/* 2.7.2.2 close receive operation */
++
++		/* wait for previous close (if any) to finish */
++
++		while(he_readl(he_dev, RCC_STAT) & RCC_BUSY)
++		{
++			HPRINTK("close cid 0x%x RCC_BUSY\n", cid);
++			udelay(100);
++		}
++
++		add_wait_queue(&he_vcc->rx_waitq, &wait);
++		set_current_state(TASK_UNINTERRUPTIBLE);
++
++		he_writel_rsr0(he_dev, RSR0_CLOSE_CONN, cid);
++		he_writel_mbox(he_dev, cid, RXCON_CLOSE);
++
++		he_spin_unlock(&he_dev->global_lock, flags);
++		timeout = schedule_timeout(5*HZ);
++		he_spin_lock(&he_dev->global_lock, flags);
++		remove_wait_queue(&he_vcc->rx_waitq, &wait);
++		set_current_state(TASK_RUNNING);
++
++		if (timeout == 0)
++			hprintk("rx close timeout (cid 0x%x)\n", cid);
++
++		HE_LOOKUP_VCC(he_dev, cid) = NULL;
++		kfree(he_vcc);
++
++		HPRINTK("close rx cid 0x%x complete\n", cid);
++	}
++
++	he_spin_unlock(&he_dev->global_lock, flags);
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,1)
++	vcc->flags &= ~ATM_VF_ADDR;
++#else
++	clear_bit(ATM_VF_ADDR, &vcc->flags);
++#endif
++}
++
++static int
++he_sg_send(struct atm_vcc *vcc, unsigned long start, unsigned long size)
++{
++	return 0;
++}
++
++static int
++he_send(struct atm_vcc *vcc, struct sk_buff *skb)
++{
++	unsigned long flags;
++	struct he_dev *he_dev = HE_DEV(vcc->dev);
++	unsigned cid;
++	struct he_tpd *tpd;
++
++#define HE_TPD_BUFSIZE 0xffff
++
++	HPRINTK("send %d.%d\n", vcc->vpi, vcc->vci);
++
++	if (skb->len > HE_TPD_BUFSIZE )
++	{
++		hprintk("buffer too large (%d bytes)\n", skb->len );
++		if (vcc->pop)
++			vcc->pop(vcc, skb);
++		else
++			dev_kfree_skb_any(skb);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++		++vcc->stats->tx_err;
++#else
++		atomic_inc(&vcc->stats->tx_err);
++#endif
++		return -EINVAL;
++	}
++
++	if (ATM_SKB(skb)->iovcnt != 0)
++	{
++		/* we should be able to support iovcnt <= 3 easily but... */
++		hprintk1("scatter/gather not supported.");
++		if (vcc->pop)
++			vcc->pop(vcc, skb);
++		else
++			dev_kfree_skb_any(skb);
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++		++vcc->stats->tx_err;
++#else
++		atomic_inc(&vcc->stats->tx_err);
++#endif
++		return -EINVAL;
++	}
++
++	tpd = he_alloc_tpd();
++	if (tpd == NULL)
++	{
++		if (vcc->pop)
++			vcc->pop(vcc, skb);
++		else
++			dev_kfree_skb_any(skb);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++		++vcc->stats->tx_err;
++#else
++		atomic_inc(&vcc->stats->tx_err);
++#endif
++		return -ENOMEM;
++	}
++
++	tpd->status |= TPD_USERCELL | TPD_INT;
++	tpd->address1 = pci_map_single(he_dev->pci_dev, skb->data, skb->len, PCI_DMA_TODEVICE);
++	tpd->length1 = skb->len | TPD_LST;
++	wmb();
++	tpd->vcc = vcc;
++	tpd->skb = skb;
++	ATM_SKB(skb)->vcc = vcc;
++
++	cid = he_mkcid(he_dev, vcc->vpi, vcc->vci);
++
++	he_spin_lock(&he_dev->global_lock, flags);
++	he_enqueue_tpd(he_dev, tpd, cid);
++	he_spin_unlock(&he_dev->global_lock, flags);
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,99)
++	++vcc->stats->tx;
++#else
++	atomic_inc(&vcc->stats->tx);
++#endif
++
++	return 0;
++}
++
++static int
++he_ioctl(struct atm_dev *atm_dev, unsigned int cmd, void *arg)
++{
++	struct he_dev *he_dev = HE_DEV(atm_dev);
++	struct he_ioctl_reg reg;
++
++	switch (cmd)
++	{
++		case HE_GET_REG:
++			if (!capable(CAP_NET_ADMIN)) return -EPERM;
++
++			copy_from_user(&reg, (struct he_ioctl_reg *) arg,
++						sizeof(struct he_ioctl_reg));
++			switch (reg.type)
++			{
++				case HE_REGTYPE_PCI:
++					if (reg.addr < RESET_CNTL || reg.addr > 0x80c00)
++						return -EINVAL;
++					reg.val = he_readl(he_dev, reg.addr);
++					break;
++				case HE_REGTYPE_RCM:
++					reg.val =
++						he_readl_rcm(he_dev, reg.addr);
++					break;
++				case HE_REGTYPE_TCM:
++					reg.val =
++						he_readl_tcm(he_dev, reg.addr);
++					break;
++				case HE_REGTYPE_MBOX:
++					reg.val =
++						he_readl_mbox(he_dev, reg.addr);
++					break;
++				default:
++					return -EINVAL;
++			}
++			copy_to_user((struct he_ioctl_reg *) arg, &reg,
++						sizeof(struct he_ioctl_reg));
++			break;
++		default:
++#ifdef USE_SUNI
++			if (atm_dev->phy && atm_dev->phy->ioctl)
++				return atm_dev->phy->ioctl(atm_dev, cmd, arg);
++			else
++#endif /* USE_SUNI */
++				return -EINVAL;
++	}
++
++	return 0;
++}
++
++static void
++he_phy_put(struct atm_dev *atm_dev, unsigned char val, unsigned long addr)
++{
++	struct he_dev *he_dev = HE_DEV(atm_dev);
++	unsigned long flags;
++
++	he_spin_lock(&he_dev->global_lock, flags);
++        he_writel(he_dev, val, FRAMER + addr);
++	he_spin_unlock(&he_dev->global_lock, flags);
++}
++ 
++        
++static unsigned char
++he_phy_get(struct atm_dev *atm_dev, unsigned long addr)
++{ 
++	struct he_dev *he_dev = HE_DEV(atm_dev);
++	unsigned long reg, flags;
++
++	he_spin_lock(&he_dev->global_lock, flags);
++        reg = he_readl(he_dev, FRAMER + addr);
++	he_spin_unlock(&he_dev->global_lock, flags);
++	return reg;
++}
++
++static int
++he_proc_read(struct atm_dev *dev, loff_t *pos, char *page)
++{
++	unsigned long flags;
++	struct he_dev *he_dev = HE_DEV(dev);
++	int left, i;
++#ifdef notdef
++	struct he_rbrq *rbrq_tail;
++	struct he_tpdrq *tpdrq_head;
++        int rbpl_head, rbpl_tail;
++#endif
++	static long mcc = 0, oec = 0, dcc = 0, cec = 0;
++
++
++	left = *pos;
++	if (!left--)
++		return sprintf(page, "%s%s\n\n",
++			he_dev->prod_id, he_dev->media & 0x40 ? "SM" : "MM");
++
++	if (!left--)
++		return sprintf(page, "Mismatched Cells  VPI/VCI Not Open  Dropped Cells  RCM Dropped Cells\n");
++
++	he_spin_lock(&he_dev->global_lock, flags);
++	mcc += he_readl(he_dev, MCC);
++	oec += he_readl(he_dev, OEC);
++	dcc += he_readl(he_dev, DCC);
++	cec += he_readl(he_dev, CEC);
++	he_spin_unlock(&he_dev->global_lock, flags);
++
++	if (!left--)
++		return sprintf(page, "%16ld  %16ld  %13ld  %17ld\n\n", 
++							mcc, oec, dcc, cec);
++
++	if (!left--)
++		return sprintf(page, "irq_size = %d  inuse = ?  peak = %d\n",
++				CONFIG_IRQ_SIZE, he_dev->irq_peak);
++
++	if (!left--)
++		return sprintf(page, "tpdrq_size = %d  inuse = ?\n",
++						CONFIG_TPDRQ_SIZE);
++
++	if (!left--)
++		return sprintf(page, "rbrq_size = %d  inuse = ?  peak = %d\n",
++				CONFIG_RBRQ_SIZE, he_dev->rbrq_peak);
++
++	if (!left--)
++		return sprintf(page, "tbrq_size = %d  peak = %d\n",
++					CONFIG_TBRQ_SIZE, he_dev->tbrq_peak);
++
++
++#ifdef notdef
++        rbpl_head = RBPL_MASK(he_readl(he_dev, G0_RBPL_S));
++        rbpl_tail = RBPL_MASK(he_readl(he_dev, G0_RBPL_T));
++
++	inuse = rbpl_head - rbpl_tail;
++	if (inuse < 0) inuse += CONFIG_RBPL_SIZE * sizeof(struct he_rbp);
++	inuse /= sizeof(struct he_rbp);
++
++	if (!left--)
++		return sprintf(page, "rbpl_size = %d  inuse = %d\n\n",
++						CONFIG_RBPL_SIZE, inuse);
++#endif
++
++	if (!left--)
++		return sprintf(page, "rate controller periods (cbr)\n                 pcr  #vc\n");
++
++	for (i = 0; i < HE_NUM_CS_STPER; ++i)
++		if (!left--)
++			return sprintf(page, "cs_stper%-2d  %8ld  %3d\n", i,
++						he_dev->cs_stper[i].pcr,
++						he_dev->cs_stper[i].inuse);
++
++	if (!left--)
++		return sprintf(page, "total bw (cbr): %d  (limit %d)\n",
++			he_dev->total_bw, he_dev->atm_dev->link_rate * 10 / 9);
++
++	return 0;
++}
++
++/* eeprom routines  -- see 4.7 */
++
++u8
++read_prom_byte(struct he_dev *he_dev, int addr)
++{
++	u32 val = 0, tmp_read = 0;
++	int i, j = 0;
++	u8 byte_read = 0;
++
++	val = readl(he_dev->membase + HOST_CNTL);
++	val &= 0xFFFFE0FF;
++       
++	/* Turn on write enable */
++	val |= 0x800;
++	writel(val, he_dev->membase + HOST_CNTL);
++       
++	/* Send READ instruction */
++	for (i=0; i<sizeof(readtab)/sizeof(readtab[0]); i++) {
++		writel(val | readtab[i], he_dev->membase + HOST_CNTL);
++		udelay(EEPROM_DELAY);
++	}
++       
++        /* Next, we need to send the byte address to read from */
++	for (i=7; i>=0; i--) {
++		writel(val | clocktab[j++] | (((addr >> i) & 1) << 9),
++			he_dev->membase + HOST_CNTL);
++		udelay(EEPROM_DELAY);
++		writel(val | clocktab[j++] | (((addr >> i) & 1) << 9),
++			he_dev->membase + HOST_CNTL);
++		udelay(EEPROM_DELAY);
++	}
++       
++	j=0;
++
++	val &= 0xFFFFF7FF;      /* Turn off write enable */
++	writel(val, he_dev->membase + HOST_CNTL);
++       
++	/* Now, we can read data from the EEPROM by clocking it in */
++	for (i=7; i>=0; i--) {
++		writel(val | clocktab[j++], he_dev->membase + HOST_CNTL);
++	        udelay(EEPROM_DELAY);
++	        tmp_read = readl(he_dev->membase + HOST_CNTL);
++	        byte_read |= (unsigned char)
++	                        ((tmp_read & ID_DOUT)
++	                         >> ID_DOFFSET << i);
++		writel(val | clocktab[j++],
++		he_dev->membase + HOST_CNTL);
++		udelay(EEPROM_DELAY);
++	}
++       
++	writel(val | clocktab[j++], he_dev->membase + HOST_CNTL);
++	udelay(EEPROM_DELAY);
++
++        return (byte_read);
++}
++
++MODULE_AUTHOR("chas williams <chas@cmf.nrl.navy.mil>");
++MODULE_DESCRIPTION("ForeRunnerHE ATM Adapter driver");
++MODULE_PARM(disable64, "h");
++MODULE_PARM_DESC(disable64, "disable 64-bit pci bus transfers");
++
++#if LINUX_VERSION_CODE > KERNEL_VERSION(2,3,1)
++static struct pci_device_id he_pci_tbl[] __devinitdata = {
++	{ PCI_VENDOR_ID_FORE, PCI_DEVICE_ID_FORE_HE, PCI_ANY_ID, PCI_ANY_ID,
++	  0, 0, 0 },
++        { 0, }
++};
++
++static struct pci_driver he_driver = {
++	name:		"he",
++	probe:		he_init_one,
++	remove:		he_remove_one,
++	id_table:	he_pci_tbl,
++};
++
++static int __init he_init(void)
++{
++        return pci_module_init(&he_driver);
++}
++
++static void __exit he_cleanup(void)
++{
++        pci_unregister_driver(&he_driver);
++}
++
++module_init(he_init);
++module_exit(he_cleanup);
++#else
++static int __init
++he_init()
++{
++	if (!pci_present())
++		return -EIO;
++
++	pci_dev = NULL;
++	while ((pci_dev = pci_find_device(PCI_VENDOR_ID_FORE,
++					PCI_DEVICE_ID_FORE_HE, pci_dev)) != NULL)
++		if (he_init_one(pci_dev, NULL) == 0)
++			++ndevs;
++
++	return (ndevs ? 0 : -ENODEV);
++}
++
++static void __devexit
++he_cleanup(void)
++{
++	while (he_devs)
++	{
++		atm_dev_deregister(he_devs->atm_dev);
++		he_stop(he_devs);
++		kfree(he_devs);
++
++		he_devs = he_devs->next;
++	}
++
++}
++
++int init_module(void)
++{
++	return he_init();
++}
++
++void cleanup_module(void)
++{
++	he_cleanup();
++}
++#endif
+diff -Naur linux-atm-2.5.0/src/extra/drivers/he.h open_linux_atm/src/extra/drivers/he.h
+--- linux-atm-2.5.0/src/extra/drivers/he.h	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/he.h	2009-11-11 18:14:20.218465000 +0530
+@@ -0,0 +1,901 @@
++/* $Id: he.h,v 1.1.2.1 2001/10/15 23:19:43 paulsch Exp $ */
++
++/*
++
++  he.h
++
++  ForeRunnerHE ATM Adapter driver for ATM on Linux
++  Copyright (C) 1999-2001  Naval Research Laboratory
++
++  This library is free software; you can redistribute it and/or
++  modify it under the terms of the GNU Lesser General Public
++  License as published by the Free Software Foundation; either
++  version 2.1 of the License, or (at your option) any later version.
++
++  This library is distributed in the hope that it will be useful,
++  but WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  Lesser General Public License for more details.
++
++  You should have received a copy of the GNU Lesser General Public
++  License along with this library; if not, write to the Free Software
++  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++
++*/
++
++/*
++
++  he.h
++
++  ForeRunnerHE ATM Adapter driver for ATM on Linux
++  Copyright (C) 1999-2000  Naval Research Laboratory
++
++  Permission to use, copy, modify and distribute this software and its
++  documentation is hereby granted, provided that both the copyright
++  notice and this permission notice appear in all copies of the software,
++  derivative works or modified versions, and any portions thereof, and
++  that both notices appear in supporting documentation.
++
++  NRL ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS" CONDITION AND
++  DISCLAIMS ANY LIABILITY OF ANY KIND FOR ANY DAMAGES WHATSOEVER
++  RESULTING FROM THE USE OF THIS SOFTWARE.
++
++ */
++
++#ifndef _HE_H_
++#define _HE_H_
++
++#define DEV_LABEL       "he"
++
++#define CONFIG_VCIBITS		12
++#define CONFIG_VPIBITS		0
++
++#define CONFIG_IRQ_SIZE		128
++#define CONFIG_IRQ_THRESH	(CONFIG_IRQ_SIZE/2)
++
++#define CONFIG_TPDRQ_SIZE	512
++#define TPDRQ_MASK(x)		(((unsigned long)(x))&((CONFIG_TPDRQ_SIZE<<3)-1))
++
++#define CONFIG_RBRQ_SIZE	512
++#define CONFIG_RBRQ_THRESH	400
++#define RBRQ_MASK(x)		(((unsigned long)(x))&((CONFIG_RBRQ_SIZE<<3)-1))
++
++#define CONFIG_TBRQ_SIZE	512
++#define CONFIG_TBRQ_THRESH	400
++#define TBRQ_MASK(x)		(((unsigned long)(x))&((CONFIG_TBRQ_SIZE<<2)-1))
++
++#define CONFIG_RBPL_SIZE	512
++#define CONFIG_RBPL_THRESH	64
++#define CONFIG_RBPL_BUFSIZE	4096
++#define RBPL_MASK(x)		(((unsigned long)(x))&((CONFIG_RBPL_SIZE<<3)-1))
++
++#ifdef rbps_support
++#define CONFIG_RBPS_SIZE	512
++#define CONFIG_RBPS_THRESH	64
++#define CONFIG_RBPS_BUFSIZE	128
++#define RBPS_MASK(x)		(((unsigned long)(x))&((CONFIG_RBPS_SIZE<<3)-1))
++#endif
++
++/* these values are configurable but must be set in accordance with
++   page FIXME */
++
++#define CONFIG_RSRA		0x00000
++#define CONFIG_RCMLBM		0x08000
++#define CONFIG_RCMABR		0x0d800
++#define CONFIG_RSRB		0x0e000
++
++#define CONFIG_TSRA		0x00000
++#define CONFIG_TSRB		0x08000
++#define CONFIG_TSRC		0x0c000
++#define CONFIG_TSRD		0x0e000
++
++/* 2.9.3.3 interrupt encodings */
++
++struct he_irq {
++	volatile u32 isw;
++};
++
++#define IRQ_ALIGNMENT		0x1000
++
++#define NEXT_ENTRY(base, tail, mask) \
++				(((unsigned long)base)|(((unsigned long)(tail+1))&mask))
++
++#define ITYPE_INVALID		0xffffffff
++#define ITYPE_TBRQ_THRESH	(0<<3)
++#define ITYPE_TPD_COMPLETE	(1<<3)
++#define ITYPE_RBPS_THRESH	(2<<3)
++#define ITYPE_RBPL_THRESH	(3<<3)
++#define ITYPE_RBRQ_THRESH	(4<<3)
++#define ITYPE_RBRQ_TIMER	(5<<3)
++#define ITYPE_PHY		(6<<3)
++#define ITYPE_OTHER		0x80
++#define ITYPE_PARITY		0x81
++#define ITYPE_ABORT		0x82
++
++#define ITYPE_GROUP(x)		(x & 0x7)
++#define ITYPE_TYPE(x)		(x & 0xf8)
++
++#define HE_NUM_GROUPS 8
++
++struct he_tpd {
++
++	/* read by the adapter */
++
++	volatile u32 status;
++	volatile u32 reserved;
++
++	volatile u32 address1, length1;
++	volatile u32 address2, length2;
++	volatile u32 address3, length3;
++
++	/* linux-atm extensions */
++
++	struct sk_buff *skb;
++	struct atm_vcc *vcc;
++
++	void *base;
++};
++
++#define TPD_ALIGNMENT	64
++
++#define BUF_ADDR(x)	(x & 0xffffffc0)
++
++
++/* table 2.3 transmit buffer return elements */
++
++struct he_tbrq {
++	volatile u32 tbre;
++};
++
++#define TBRQ_ALIGNMENT	CONFIG_TBRQ_SIZE
++
++#define TBRQ_TPD(tbrq)		((tbrq)->tbre & 0xffffffc0)
++#define TBRQ_EOS(tbrq)		((tbrq)->tbre & (1<<3))
++#define TBRQ_MULTIPLE(tbrq)	((tbrq)->tbre & (1))
++
++/* table 2.21 receive buffer return qeueu element field organization */
++
++struct he_rbrq {
++	volatile u32 addr;
++	volatile u32 cidlen;
++};
++
++#define RBRQ_ALIGNMENT	CONFIG_RBRQ_SIZE
++
++#define RBRQ_ADDR(rbrq)		((rbrq)->addr & 0xffffffc0)
++#define RBRQ_CRC_ERR(rbrq)	((rbrq)->addr & (1<<5))
++#define RBRQ_LEN_ERR(rbrq)	((rbrq)->addr & (1<<4))
++#define RBRQ_END_PDU(rbrq)	((rbrq)->addr & (1<<3))
++#define RBRQ_AAL5_PROT(rbrq)	((rbrq)->addr & (1<<2))
++#define RBRQ_CON_CLOSED(rbrq)	((rbrq)->addr & (1<<1))
++#define RBRQ_HBUF_ERR(rbrq)	((rbrq)->addr & 1)
++#define RBRQ_CID(rbrq)		(((rbrq)->cidlen >> 16) & 0x1fff)
++#define RBRQ_BUFLEN(rbrq)	((rbrq)->cidlen & 0xffff)
++
++/* figure 2.3 transmit packet descriptor ready queue */
++
++struct he_tpdrq {
++	volatile u32 tpd;
++	volatile u32 cid;
++};
++
++#define TPDRQ_ALIGNMENT CONFIG_TPDRQ_SIZE
++
++/* table 2.30 host status page detail */
++
++#define HSP_ALIGNMENT	0x400		/* must align on 1k boundary */
++
++struct he_hsp {
++	struct he_hsp_entry {
++		volatile u32 tbrq_tail; 
++		volatile u32 reserved1[15];
++		volatile u32 rbrq_tail; 
++		volatile u32 reserved2[15];
++	} group[HE_NUM_GROUPS];
++};
++
++#define HBUF_ALIGNMENT	 64
++
++struct he_buff {
++	int loaned;
++	int len;
++	void *data;
++	dma_addr_t mapping;
++
++	void *base;
++};
++
++/* figure 2.9 receive buffer pools */
++
++struct he_rbp {
++	volatile u32 phys;		/* virt_to_bus(hbuf->data) */
++	volatile u32 virt;		/* virt_to_bus(hbuf) */
++};
++
++/* NOTE: it is suggested that virt be the virtual address of the host
++   buffer.  on a 64-bit machine, this does not work.  in our driver,
++   virt points to bus address (which is hopefully 32 bit) of the he_buff.
++   in the future, this may need to change.
++*/
++
++
++#define RBPL_ALIGNMENT CONFIG_RBPL_SIZE
++#define RBPS_ALIGNMENT CONFIG_RBPS_SIZE
++
++#ifdef notyet
++struct he_group {
++	u32 rpbs_size, rpbs_qsize;
++	struct he_rbp rbps_ba;
++
++	u32 rpbl_size, rpbl_qsize;
++	struct he_rpb_entry *rbpl_ba;
++};
++#endif
++
++#define HE_LOOKUP_VCC(dev, cid) ((dev)->he_vcc_table[(cid)].vcc)
++
++struct he_vcc_table 
++{
++	struct atm_vcc *vcc;
++};
++
++struct he_cs_stper
++{
++	long pcr;
++	int inuse;
++};
++
++#define HE_NUM_CS_STPER		16
++
++struct he_dev {
++	unsigned int number;
++	unsigned int irq;
++	unsigned long membase;
++
++	char prod_id[30];
++	char mac_addr[6];
++	int media;			/*  
++					 *  0x26 = HE155 MM 
++					 *  0x27 = HE622 MM 
++					 *  0x46 = HE155 SM 
++					 *  0x47 = HE622 SM 
++					 */
++
++
++	unsigned int vcibits, vpibits;
++	unsigned int cells_per_row;
++	unsigned int bytes_per_row;
++	unsigned int cells_per_lbuf;
++	unsigned int r0_numrows, r0_startrow, r0_numbuffs;
++	unsigned int r1_numrows, r1_startrow, r1_numbuffs;
++	unsigned int tx_numrows, tx_startrow, tx_numbuffs;
++	unsigned int buffer_limit;
++
++	struct he_vcc_table *he_vcc_table;
++
++#ifdef notyet
++	struct he_group group[HE_NUM_GROUPS];
++#endif
++	struct he_cs_stper cs_stper[HE_NUM_CS_STPER];
++	unsigned total_bw;
++
++	void *irq_p;
++	struct he_irq *irq_base, *irq_head, *irq_tail;
++	volatile unsigned *irq_tailoffset;
++	int irq_peak;
++
++#ifdef USE_TASKLET
++	struct tasklet_struct tasklet;
++#endif
++
++	void *tpdrq_p;
++	struct he_tpdrq *tpdrq_base, *tpdrq_tail, *tpdrq_head;
++
++	spinlock_t tpdrq_lock;		/* serialize access to tpdrq */
++	spinlock_t global_lock;		/* 8.1.5 pci transaction ordering
++					  error problem */
++
++	void *rbrq_p;
++	struct he_rbrq *rbrq_base, *rbrq_head;
++	int rbrq_peak;
++
++	void *rbpl_p;
++	struct he_rbp *rbpl_base, *rbpl_tail;
++	int rbpl_peak;
++
++#ifdef rbps_support
++	void *rbps_p;
++	struct he_rbp *rbps_base, *rbps_tail;
++	int rbps_peak;
++#endif
++
++	void *tbrq_p;
++	struct he_tbrq *tbrq_base, *tbrq_head;
++	int tbrq_peak;
++
++	void *hsp_p;
++	struct he_hsp *hsp;
++
++	struct pci_dev *pci_dev;
++	struct atm_dev *atm_dev;
++	struct he_dev *next;
++};
++
++struct he_vcc
++{
++	struct iovec iov_head[32];
++	struct iovec *iov_tail;
++	int pdu_len;
++
++	int rc_index;
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,3,1)
++	struct wait_queue *rx_waitq;
++	atruct wait_queue *tx_waitq;
++#else
++	wait_queue_head_t rx_waitq;
++	wait_queue_head_t tx_waitq;
++#endif
++};
++
++#define HE_VCC(vcc)	((struct he_vcc *)(vcc->dev_data))
++
++#define PCI_VENDOR_ID_FORE	0x1127
++#define PCI_DEVICE_ID_FORE_HE	0x400
++
++#define HE_DMA_MASK		0xffffffff
++
++#define GEN_CNTL_0				0x40
++#define  INT_PROC_ENBL		(1<<25)
++#define  SLAVE_ENDIAN_MODE	(1<<16)
++#define  MRL_ENB		(1<<5)
++#define  MRM_ENB		(1<<4)
++#define  INIT_ENB		(1<<2)
++#define  IGNORE_TIMEOUT		(1<<1)
++#define  ENBL_64		(1<<0)
++
++#define MIN_PCI_LATENCY		32	/* errata 8.1.3 */
++
++#define HE_DEV(dev) ((struct he_dev *) (dev)->dev_data)
++
++#define he_is622(dev)	((dev)->media & 0x1)
++
++#define HE_REGMAP_SIZE	0x100000
++
++#define RESET_CNTL	0x80000
++#define  BOARD_RST_STATUS	(1<<6)
++
++#define HOST_CNTL	0x80004
++#define  PCI_BUS_SIZE64			(1<<27)
++#define  DESC_RD_STATIC_64		(1<<26)
++#define  DATA_RD_STATIC_64		(1<<25)
++#define  DATA_WR_STATIC_64		(1<<24)
++#define  ID_CS				(1<<12)
++#define  ID_WREN			(1<<11)
++#define  ID_DOUT			(1<<10)
++#define   ID_DOFFSET			10
++#define  ID_DIN				(1<<9)
++#define  ID_CLOCK			(1<<8)
++#define  QUICK_RD_RETRY			(1<<7)
++#define  QUICK_WR_RETRY			(1<<6)
++#define  OUTFF_ENB			(1<<5)
++#define  CMDFF_ENB			(1<<4)
++#define  PERR_INT_ENB			(1<<2)
++#define  IGNORE_INTR			(1<<0)
++
++#define LB_SWAP		0x80008
++#define  SWAP_RNUM_MAX(x)	(x<<27)
++#define  DATA_WR_SWAP		(1<<20)
++#define  DESC_RD_SWAP		(1<<19)
++#define  DATA_RD_SWAP		(1<<18)
++#define  INTR_SWAP		(1<<17)
++#define  DESC_WR_SWAP		(1<<16)
++#define  SDRAM_INIT		(1<<15)
++#define  BIG_ENDIAN_HOST	(1<<14)
++#define  XFER_SIZE		(1<<7)
++
++#define LB_MEM_ADDR	0x8000c
++#define LB_MEM_DATA	0x80010
++
++#define LB_MEM_ACCESS	0x80014
++#define  LB_MEM_HNDSHK		(1<<30)
++#define  LM_MEM_WRITE		(0x7)
++#define  LM_MEM_READ		(0x3)
++
++#define SDRAM_CTL	0x80018
++#define  LB_64_ENB		(1<<3)
++#define  LB_TWR			(1<<2)
++#define  LB_TRP			(1<<1)
++#define  LB_TRAS		(1<<0)
++
++#define INT_FIFO	0x8001c
++#define  INT_MASK_D		(1<<15)
++#define  INT_MASK_C		(1<<14)
++#define  INT_MASK_B		(1<<13)
++#define  INT_MASK_A		(1<<12)
++#define  INT_CLEAR_D		(1<<11)
++#define  INT_CLEAR_C		(1<<10)
++#define  INT_CLEAR_B		(1<<9)
++#define  INT_CLEAR_A		(1<<8)
++
++#define ABORT_ADDR	0x80020
++
++#define IRQ0_BASE	0x80080
++#define  IRQ_BASE(x)		(x<<12)
++#define  IRQ_MASK		((CONFIG_IRQ_SIZE<<2)-1)	/* was 0x3ff */
++#define  IRQ_TAIL(x)		(((unsigned long)(x)) & IRQ_MASK)
++#define IRQ0_HEAD	0x80084
++#define  IRQ_SIZE(x)		(x<<22)
++#define  IRQ_THRESH(x)		(x<<12)
++#define  IRQ_HEAD(x)		(x<<2)
++/* #define  IRQ_PENDING		(1) 		conflict with linux/irq.h */
++#define IRQ0_CNTL	0x80088
++#define  IRQ_ADDRSEL(x)		(x<<2)
++#define  IRQ_INT_A		(0<<2)
++#define  IRQ_INT_B		(1<<2)
++#define  IRQ_INT_C		(2<<2)
++#define  IRQ_INT_D		(3<<2)
++#define  IRQ_TYPE_ADDR		0x1
++#define  IRQ_TYPE_LINE		0x0
++#define IRQ0_DATA	0x8008c
++
++#define IRQ1_BASE	0x80090
++#define IRQ1_HEAD	0x80094
++#define IRQ1_CNTL	0x80098
++#define IRQ1_DATA	0x8009c
++
++#define IRQ2_BASE	0x800a0
++#define IRQ2_HEAD	0x800a4
++#define IRQ2_CNTL	0x800a8
++#define IRQ2_DATA	0x800ac
++
++#define IRQ3_BASE	0x800b0
++#define IRQ3_HEAD	0x800b4
++#define IRQ3_CNTL	0x800b8
++#define IRQ3_DATA	0x800bc
++
++#define GRP_10_MAP	0x800c0
++#define GRP_32_MAP	0x800c4
++#define GRP_54_MAP	0x800c8
++#define GRP_76_MAP	0x800cc
++
++#define	G0_RBPS_S	0x80400
++#define G0_RBPS_T	0x80404
++#define  RBP_TAIL(x)		((x)<<3)
++#define  RBP_MASK(x)		((x)|0x1fff)
++#define G0_RBPS_QI	0x80408
++#define  RBP_QSIZE(x)		((x)<<14)
++#define  RBP_INT_ENB		(1<<13)
++#define  RBP_THRESH(x)		(x)
++#define G0_RBPS_BS	0x8040c
++#define G0_RBPL_S	0x80410
++#define G0_RBPL_T	0x80414
++#define G0_RBPL_QI	0x80418 
++#define G0_RBPL_BS	0x8041c
++
++#define	G1_RBPS_S	0x80420
++#define G1_RBPS_T	0x80424
++#define G1_RBPS_QI	0x80428
++#define G1_RBPS_BS	0x8042c
++#define G1_RBPL_S	0x80430
++#define G1_RBPL_T	0x80434
++#define G1_RBPL_QI	0x80438
++#define G1_RBPL_BS	0x8043c
++
++#define	G2_RBPS_S	0x80440
++#define G2_RBPS_T	0x80444
++#define G2_RBPS_QI	0x80448
++#define G2_RBPS_BS	0x8044c
++#define G2_RBPL_S	0x80450
++#define G2_RBPL_T	0x80454
++#define G2_RBPL_QI	0x80458
++#define G2_RBPL_BS	0x8045c
++
++#define	G3_RBPS_S	0x80460
++#define G3_RBPS_T	0x80464
++#define G3_RBPS_QI	0x80468
++#define G3_RBPS_BS	0x8046c
++#define G3_RBPL_S	0x80470
++#define G3_RBPL_T	0x80474
++#define G3_RBPL_QI	0x80478
++#define G3_RBPL_BS	0x8047c
++
++#define	G4_RBPS_S	0x80480
++#define G4_RBPS_T	0x80484
++#define G4_RBPS_QI	0x80488
++#define G4_RBPS_BS	0x8048c
++#define G4_RBPL_S	0x80490
++#define G4_RBPL_T	0x80494
++#define G4_RBPL_QI	0x80498
++#define G4_RBPL_BS	0x8049c
++
++#define	G5_RBPS_S	0x804a0
++#define G5_RBPS_T	0x804a4
++#define G5_RBPS_QI	0x804a8
++#define G5_RBPS_BS	0x804ac
++#define G5_RBPL_S	0x804b0
++#define G5_RBPL_T	0x804b4
++#define G5_RBPL_QI	0x804b8
++#define G5_RBPL_BS	0x804bc
++
++#define	G6_RBPS_S	0x804c0
++#define G6_RBPS_T	0x804c4
++#define G6_RBPS_QI	0x804c8
++#define G6_RBPS_BS	0x804cc
++#define G6_RBPL_S	0x804d0
++#define G6_RBPL_T	0x804d4
++#define G6_RBPL_QI	0x804d8
++#define G6_RBPL_BS	0x804dc
++
++#define	G7_RBPS_S	0x804e0
++#define G7_RBPS_T	0x804e4
++#define G7_RBPS_QI	0x804e8
++#define G7_RBPS_BS	0x804ec
++
++#define G7_RBPL_S	0x804f0
++#define G7_RBPL_T	0x804f4
++#define G7_RBPL_QI	0x804f8
++#define G7_RBPL_BS	0x804fc
++
++#define G0_RBRQ_ST	0x80500
++#define G0_RBRQ_H	0x80504
++#define G0_RBRQ_Q	0x80508
++#define  RBRQ_THRESH(x)		((x)<<13)
++#define  RBRQ_SIZE(x)		(x)
++#define G0_RBRQ_I	0x8050c
++#define  RBRQ_TIME(x)		((x)<<8)
++#define  RBRQ_COUNT(x)		(x)
++
++/* fill in 1 ... 7 later */
++
++#define G0_TBRQ_B_T	0x80600
++#define G0_TBRQ_H	0x80604
++#define G0_TBRQ_S	0x80608
++#define G0_TBRQ_THRESH	0x8060c
++#define  TBRQ_THRESH(x)		(x)
++
++/* fill in 1 ... 7 later */
++
++#define RH_CONFIG	0x805c0
++#define  PHY_INT_ENB	(1<<10)
++#define  OAM_GID(x)	(x<<7)
++#define  PTMR_PRE(x)	(x)
++
++#define G0_INMQ_S	0x80580
++#define G0_INMQ_L	0x80584
++#define G1_INMQ_S	0x80588
++#define G1_INMQ_L	0x8058c
++#define G2_INMQ_S	0x80590
++#define G2_INMQ_L	0x80594
++#define G3_INMQ_S	0x80598
++#define G3_INMQ_L	0x8059c
++#define G4_INMQ_S	0x805a0
++#define G4_INMQ_L	0x805a4
++#define G5_INMQ_S	0x805a8
++#define G5_INMQ_L	0x805ac
++#define G6_INMQ_S	0x805b0
++#define G6_INMQ_L	0x805b4
++#define G7_INMQ_S	0x805b8
++#define G7_INMQ_L	0x805bc
++
++#define TPDRQ_B_H	0x80680
++#define TPDRQ_T		0x80684
++#define TPDRQ_S		0x80688
++
++#define UBUFF_BA	0x8068c
++
++#define RLBF0_H		0x806c0
++#define RLBF0_T		0x806c4
++#define RLBF1_H		0x806c8
++#define RLBF1_T		0x806cc
++#define RLBC_H		0x806d0
++#define RLBC_T		0x806d4
++#define RLBC_H2		0x806d8
++#define TLBF_H		0x806e0
++#define TLBF_T		0x806e4
++#define RLBF0_C		0x806e8
++#define RLBF1_C		0x806ec
++#define RXTHRSH		0x806f0
++#define LITHRSH		0x806f4
++
++#define LBARB		0x80700
++#define  SLICE_X(x)		 (x<<28)
++#define  ARB_RNUM_MAX(x)	 (x<<23)
++#define  TH_PRTY(x)		 (x<<21)
++#define  RH_PRTY(x)		 (x<<19)
++#define  TL_PRTY(x)		 (x<<17)
++#define  RL_PRTY(x)		 (x<<15)
++#define  BUS_MULTI(x)		 (x<<8)
++#define  NET_PREF(x)		 (x)
++
++#define SDRAMCON	0x80704
++#define	 BANK_ON		(1<<14)
++#define	 WIDE_DATA		(1<<13)
++#define	 TWR_WAIT		(1<<12)
++#define	 TRP_WAIT		(1<<11)
++#define	 TRAS_WAIT		(1<<10)
++#define	 REF_RATE(x)		(x)
++
++#define LBSTAT		0x80708
++
++#define RCC_STAT	0x8070c
++#define  RCC_BUSY		(1)
++
++#define TCMCONFIG	0x80740
++#define  TM_DESL2		(1<<10)
++#define	 TM_BANK_WAIT(x)	(x<<6)
++#define	 TM_ADD_BANK4(x)	(x<<4)
++#define  TM_PAR_CHECK(x)	(x<<3)
++#define  TM_RW_WAIT(x)		(x<<2)
++#define  TM_SRAM_TYPE(x)	(x)
++
++#define TSRB_BA		0x80744	
++#define TSRC_BA		0x80748	
++#define TMABR_BA	0x8074c	
++#define TPD_BA		0x80750	
++#define TSRD_BA		0x80758	
++
++#define TX_CONFIG	0x80760
++#define  DRF_THRESH(x)		(x<<22)
++#define  TX_UT_MODE(x)		(x<<21)
++#define  TX_VCI_MASK(x)		(x<<17)
++#define  LBFREE_CNT(x)		(x)
++
++#define TXAAL5_PROTO	0x80764
++#define  CPCS_UU(x)		(x<<8)
++#define  CPI(x)			(x)
++
++#define RCMCONFIG	0x80780
++#define  RM_DESL2(x)		(x<<10)
++#define  RM_BANK_WAIT(x)	(x<<6)
++#define  RM_ADD_BANK(x)		(x<<4)
++#define  RM_PAR_CHECK(x)	(x<<3)
++#define  RM_RW_WAIT(x)		(x<<2)
++#define  RM_SRAM_TYPE(x)	(x)
++
++#define RCMRSRB_BA	0x80784
++#define RCMLBM_BA	0x80788
++#define RCMABR_BA	0x8078c
++
++#define RC_CONFIG	0x807c0
++#define  UT_RD_DELAY(x)		(x<<11)
++#define  WRAP_MODE(x)		(x<<10)
++#define  RC_UT_MODE(x)		(x<<9)
++#define  RX_ENABLE		(1<<8)
++#define  RX_VALVP(x)		(x<<4)
++#define  RX_VALVC(x)		(x)
++
++#define MCC		0x807c4
++#define OEC		0x807c8
++#define DCC		0x807cc
++#define CEC		0x807d0
++
++#define HSP_BA		0x807f0
++
++#define LB_CONFIG	0x807f4
++#define  LB_SIZE(x)		(x)
++
++#define CON_DAT		0x807f8
++#define CON_CTL		0x807fc
++#define  CON_CTL_MBOX		(2<<30)
++#define  CON_CTL_TCM		(1<<30)
++#define  CON_CTL_RCM		(0<<30)
++#define  CON_CTL_WRITE		(1<<29)
++#define  CON_CTL_READ		(0<<29)
++#define  CON_CTL_BUSY		(1<<28)
++#define  CON_BYTE_DISABLE_3	(1<<22)		/* 24..31 */
++#define  CON_BYTE_DISABLE_2	(1<<21)		/* 16..23 */
++#define  CON_BYTE_DISABLE_1	(1<<20)		/* 8..15 */
++#define  CON_BYTE_DISABLE_0	(1<<19)		/* 0..7 */
++#define  CON_CTL_ADDR(x)	(x)
++
++#define FRAMER		0x80800
++
++/* 3.3 network controller (internal) mailbox registers */
++
++#define CS_STPER0	0x0
++	/* ... */
++#define CS_STPER31	0x01f
++
++#define CS_STTIM0	0x020
++	/* ... */
++#define CS_STTIM31	0x03f
++
++#define CS_TGRLD0	0x040
++	/* ... */
++#define CS_TGRLD15	0x04f
++
++#define CS_ERTHR0	0x050
++#define CS_ERTHR1	0x051
++#define CS_ERTHR2	0x052
++#define CS_ERTHR3	0x053
++#define CS_ERTHR4	0x054
++#define CS_ERCTL0	0x055
++#define  TX_ENABLE		(1<<28)
++#define  ER_ENABLE		(1<<27)
++#define CS_ERCTL1	0x056
++#define CS_ERCTL2	0x057
++#define CS_ERSTAT0	0x058
++#define CS_ERSTAT1	0x059
++
++#define CS_RTCCT	0x060
++#define CS_RTFWC	0x061
++#define CS_RTFWR	0x062
++#define CS_RTFTC	0x063
++#define CS_RTATR	0x064
++
++#define CS_TFBSET	0x070
++#define CS_TFBADD	0x071
++#define CS_TFBSUB	0x072
++#define CS_WCRMAX	0x073
++#define CS_WCRMIN	0x074
++#define CS_WCRINC	0x075
++#define CS_WCRDEC	0x076
++#define CS_WCRCEIL	0x077
++#define CS_BWDCNT	0x078
++
++#define CS_OTPPER	0x080
++#define CS_OTWPER	0x081
++#define CS_OTTLIM	0x082
++#define CS_OTTCNT	0x083
++
++#define CS_HGRRT0	0x090
++	/* ... */
++#define CS_HGRRT7	0x097
++
++#define CS_ORPTRS	0x0a0
++
++#define RXCON_CLOSE	0x100
++
++
++#define RCM_MEM_SIZE	0x10000		/* 1M of 32-bit registers */
++#define TCM_MEM_SIZE	0x20000		/* 2M of 32-bit registers */
++
++/* 2.5 transmit connection memory registers */
++
++#define TSR0_CONN_STATE(x)	((x>>28) & 0x7)
++#define TSR0_USE_WMIN		(1<<23)
++#define TSR0_GROUP(x)		((x & 0x7)<<18)
++#define TSR0_ABR		(2<<16)
++#define TSR0_UBR		(1<<16)
++#define TSR0_CBR		(0<<16)
++#define TSR0_PROT		(1<<15)
++#define TSR0_AAL0_SDU		(2<<12)
++#define TSR0_AAL0		(1<<12)
++#define TSR0_AAL5		(0<<12)
++#define TSR0_HALT_ER		(1<<11)
++#define TSR0_MARK_CI		(1<<10)
++#define TSR0_MARK_ER		(1<<9)
++#define TSR0_UPDATE_GER		(1<<8)
++#define TSR0_RC_INDEX(x)	(x & 0x1F)
++
++#define TSR1_PCR(x)		((x & 0x7FFF)<<16)
++#define TSR1_MCR(x)		(x & 0x7FFF)
++
++#define TSR2_ACR(x)		((x & 0x7FFF)<<16)
++
++#define TSR3_NRM_CNT(x)		((x & 0xFF)<<24)
++#define TSR3_CRM_CNT(x)		(x & 0xFFFF)
++
++#define TSR4_FLUSH_CONN		(1<<31)
++#define TSR4_SESSION_ENDED	(1<<30)
++#define TSR4_CRC10		(1<<28)
++#define TSR4_NULL_CRC10		(1<<27)
++#define TSR4_PROT		(1<<26)
++#define TSR4_AAL0_SDU		(2<<23)
++#define TSR4_AAL0		(1<<23)
++#define TSR4_AAL5		(0<<23)
++
++#define TSR9_OPEN_CONN		(1<<20)
++
++#define TSR11_ICR(x)		((x & 0x7FFF)<<16)
++#define TSR11_TRM(x)		((x & 0x7)<<13)
++#define TSR11_NRM(x)		((x & 0x7)<<10)
++#define TSR11_ADTF(x)		(x & 0x3FF)
++
++#define TSR13_RDF(x)		((x & 0xF)<<23)
++#define TSR13_RIF(x)		((x & 0xF)<<19)
++#define TSR13_CDF(x)		((x & 0x7)<<16)
++#define TSR13_CRM(x)		(x & 0xFFFF)
++
++#define TSR14_DELETE		(1<<31)
++#define TSR14_ABR_CLOSE		(1<<16)
++
++/* 2.7.1 per connection receieve state registers */
++
++#define RSR0_START_PDU	(1<<10)
++#define RSR0_OPEN_CONN	(1<<6)
++#define RSR0_CLOSE_CONN	(0<<6)
++#define RSR0_PPD_ENABLE	(1<<5)
++#define RSR0_EPD_ENABLE	(1<<4)
++#define RSR0_TCP_CKSUM	(1<<3)
++#define RSR0_AAL5		(0)
++#define RSR0_AAL0		(1)
++#define RSR0_AAL0_SDU		(2)
++#define RSR0_RAWCELL		(3)
++#define RSR0_RAWCELL_CRC10	(4)
++
++#define RSR1_AQI_ENABLE	(1<<20)
++#define RSR1_RBPL_ONLY	(1<<19)
++#define RSR1_GROUP(x)	((x)<<16)
++
++#define RSR4_AQI_ENABLE (1<<30)
++#define RSR4_GROUP(x)	((x)<<27)
++#define RSR4_RBPL_ONLY	(1<<26)
++
++/* 2.1.4 transmit packet descriptor */
++
++#define	TPD_USERCELL		0x0
++#define	TPD_SEGMENT_OAMF5	0x4
++#define	TPD_END2END_OAMF5	0x5
++#define	TPD_RMCELL		0x6
++#define TPD_CELLTYPE(x)		(x<<3)
++#define TPD_EOS			(1<<2)
++#define TPD_CLP			(1<<1)
++#define TPD_INT			(1)
++#define TPD_LST		(1<<31)
++
++/* table 4.3 serial eeprom information */
++
++#define PROD_ID		0x08	/* char[] */
++#define  PROD_ID_LEN	30
++#define HW_REV		0x26	/* char[] */
++#define M_SN		0x3a	/* integer */
++#define MEDIA		0x3e	/* integer */
++#define  HE155MM	0x26
++#define  HE155SM	0x27
++#define  HE622MM	0x46
++#define  HE622SM	0x47
++#define MAC_ADDR	0x42	/* char[] */
++
++#define CS_LOW		0x0
++#define CS_HIGH		ID_CS /* HOST_CNTL_ID_PROM_SEL */
++#define CLK_LOW		0x0
++#define CLK_HIGH	ID_CLOCK /* HOST_CNTL_ID_PROM_CLOCK */
++#define SI_HIGH		ID_DIN /* HOST_CNTL_ID_PROM_DATA_IN */
++#define EEPROM_DELAY	400 /* microseconds */
++
++/* Read from EEPROM = 0000 0011b */
++unsigned int readtab[] = {
++	CS_HIGH | CLK_HIGH,
++	CS_LOW | CLK_LOW,
++	CLK_HIGH,               /* 0 */
++	CLK_LOW,
++	CLK_HIGH,               /* 0 */
++	CLK_LOW,
++	CLK_HIGH,               /* 0 */
++	CLK_LOW,
++	CLK_HIGH,               /* 0 */
++	CLK_LOW,
++	CLK_HIGH,               /* 0 */
++	CLK_LOW,
++	CLK_HIGH,               /* 0 */
++	CLK_LOW | SI_HIGH,
++	CLK_HIGH | SI_HIGH,     /* 1 */
++	CLK_LOW | SI_HIGH,
++	CLK_HIGH | SI_HIGH      /* 1 */
++};     
++ 
++/* Clock to read from/write to the EEPROM */
++unsigned int clocktab[] = {
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW,
++	CLK_HIGH,
++	CLK_LOW
++};     
++
++
++#endif /* _HE_H_ */
+diff -Naur linux-atm-2.5.0/src/extra/drivers/he.patch-2.2 open_linux_atm/src/extra/drivers/he.patch-2.2
+--- linux-atm-2.5.0/src/extra/drivers/he.patch-2.2	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/he.patch-2.2	2009-11-11 18:14:20.235453000 +0530
+@@ -0,0 +1,49 @@
++--- Config.in.000	Thu Feb 17 17:32:10 2000
+++++ Config.in	Thu Feb 17 17:33:17 2000
++@@ -42,4 +42,5 @@
++   if [ "$CONFIG_ATM_HORIZON" != "n" ]; then
++     bool '  Enable debugging messages' CONFIG_ATM_HORIZON_DEBUG
++   fi
+++  tristate 'FORE HE' CONFIG_ATM_HE y
++ fi
++--- Makefile.000	Thu Feb 17 17:33:22 2000
+++++ Makefile	Fri Mar 10 16:10:13 2000
++@@ -66,6 +66,16 @@
++   endif
++ endif
++ 
+++ifeq ($(CONFIG_ATM_HE),y)
+++O_OBJS += he.o
+++OX_OBJS += suni.o
+++else
+++  ifeq ($(CONFIG_ATM_HE),m)
+++  M_OBJS += he.o
+++  MX_OBJS += suni.o
+++  endif
+++endif
+++
++ ifeq ($(CONFIG_ATM_TCP),y)
++ O_OBJS += atmtcp.o
++ else
++--- atmdev_init.c.000	Thu Feb 17 17:34:08 2000
+++++ atmdev_init.c	Thu Feb 17 17:34:38 2000
++@@ -28,6 +28,9 @@
++ #ifdef CONFIG_ATM_HORIZON
++ extern int hrz_detect(void);
++ #endif
+++#ifdef CONFIG_ATM_HE
+++extern int he_detect(void);
+++#endif
++ 
++ 
++ __initfunc(int atmdev_init(void))
++@@ -55,6 +58,9 @@
++ #endif
++ #ifdef CONFIG_ATM_HORIZON
++ 	devs += hrz_detect();
+++#endif
+++#ifdef CONFIG_ATM_HE
+++	devs += he_detect();
++ #endif
++ 	return devs;
++ }
+diff -Naur linux-atm-2.5.0/src/extra/drivers/he.patch-2.4 open_linux_atm/src/extra/drivers/he.patch-2.4
+--- linux-atm-2.5.0/src/extra/drivers/he.patch-2.4	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/he.patch-2.4	2009-11-11 18:14:20.238446000 +0530
+@@ -0,0 +1,19 @@
++--- Makefile~	Sat Apr  7 14:25:21 2001
+++++ Makefile	Sat Apr  7 14:25:15 2001
++@@ -23,6 +23,7 @@
++ 
++ obj-$(CONFIG_ATM_HORIZON) += horizon.o
++ obj-$(CONFIG_ATM_AMBASSADOR) += ambassador.o
+++obj-$(CONFIG_ATM_HE) += he.o
++ obj-$(CONFIG_ATM_TCP) += atmtcp.o
++ obj-$(CONFIG_ATM_IA) += iphase.o suni.o
++ 
++--- Config.in~	Wed Feb 21 22:24:57 2001
+++++ Config.in	Fri Mar 23 08:52:02 2001
++@@ -84,5 +84,6 @@
++       define_tristate CONFIG_ATM_FORE200E m
++     fi
++   fi
+++  tristate 'FORE HE' CONFIG_ATM_HE y
++ fi
++ endmenu
+diff -Naur linux-atm-2.5.0/src/extra/drivers/hediag.c open_linux_atm/src/extra/drivers/hediag.c
+--- linux-atm-2.5.0/src/extra/drivers/hediag.c	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/drivers/hediag.c	2009-11-11 18:14:20.240446000 +0530
+@@ -0,0 +1,197 @@
++#include <stdio.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <atm.h>
++#include <linux/atmdev.h>
++#include <linux/sonet.h>
++#include <linux/atm_he.h>
++
++struct reg_table {
++	unsigned addr;
++	char *name;
++};
++
++struct reg_table pci_regs[] =
++{
++	{ 0x80000, "reset_cntl" },
++	{ 0x80004, "host_cntl" },
++	{ 0x80008, "lb_swap" },
++	{ 0x8000c, "lb_mem_addr" },
++	{ 0x80010, "lb_mem_data" },
++	{ 0x80014, "lb_mem_access" },
++	{ 0x80018, "sdram_ctl" },
++	{ 0x8001c, "int_fifo" },
++	{ 0x80020, "abort_addr" },
++
++	{ 0x80080, "irq0_base" },
++	{ 0x80084, "irq0_head" },
++	{ 0x80088, "irq0_cntl" },
++	{ 0x8008c, "irq0_data" },
++	/* fill in 1-4 later */
++	{ 0x800c0, "grp_10_map" },
++	{ 0x800c4, "grp_32_map" },
++	{ 0x800c8, "grp_54_map" },
++	{ 0x800cc, "grp_76_map" },
++
++	{ 0x80400, "g0_rbps_s" },
++	{ 0x80404, "g0_rbps_t" },
++	{ 0x80408, "g0_rbps_qi" },
++	{ 0x8040c, "g0_rbps_bs" },
++	{ 0x80410, "g0_rbpl_s" },
++	{ 0x80414, "g0_rbpl_t" },
++	{ 0x80418, "g0_rbpl_qi" },
++	{ 0x8041c, "g0_rbpl_bs" },
++	/* fill in 1-7 later */
++
++	{ 0x80580, "g0_inmq_s" },
++	{ 0x80584, "g0_inmq_l" },
++	{ 0x80588, "g1_inmq_s" },
++	{ 0x8058c, "g1_inmq_l" },
++	{ 0x80590, "g2_inmq_s" },
++	{ 0x80594, "g2_inmq_l" },
++	{ 0x80598, "g3_inmq_s" },
++	{ 0x8059c, "g3_inmq_l" },
++	{ 0x805a0, "g4_inmq_s" },
++	{ 0x805a4, "g4_inmq_l" },
++	{ 0x805a8, "g5_inmq_s" },
++	{ 0x805ac, "g5_inmq_l" },
++	{ 0x805b0, "g6_inmq_s" },
++	{ 0x805b4, "g6_inmq_l" },
++	{ 0x805b8, "g7_inmq_s" },
++	{ 0x805bc, "g7_inmq_l" },
++
++	{ 0x80680, "tpdrq_b_h" },
++	{ 0x80684, "tpdrq_t" },
++	{ 0x80688, "tpdrq_s" },
++
++	{ 0x8068c, "ubuff_ba" },
++
++	{ 0x806c0, "rlbf0_h" },
++	{ 0x806c4, "rlbf0_t" },
++	{ 0x806c8, "rlbf1_h" },
++	{ 0x806cc, "rlbf1_t" },
++	{ 0x806d0, "rlbc_h" },
++	{ 0x806d4, "rlbc_t" },
++	{ 0x806d8, "rlbc_h2" },
++	{ 0x806e0, "tlbf_h" },
++	{ 0x806e4, "tlbf_t" },
++	{ 0x806e8, "rlbf0_c" },
++	{ 0x806ec, "rlbf1_c" },
++
++	{ 0x806f0, "rxthrsh" },
++	{ 0x806f4, "lithrsh" },
++
++	{ 0x80700, "lbarb" },
++	{ 0x80704, "sdramcon" },
++	{ 0x80708, "lbstat" },
++	{ 0x8070c, "rcc_stat" },
++
++	{ 0x80740, "tcmconfig" },
++	{ 0x80744, "tsrb_ba" },
++	{ 0x80748, "tsrc_ba" },
++	{ 0x8074c, "tmabr_ba" },
++	{ 0x80750, "tpd_ba" },
++	{ 0x80758, "tsrd_ba" },
++
++	{ 0x80760, "tx_config" },
++	{ 0x80764, "txaal5_proto" },
++
++	{ 0x80780, "rcmconfig" },
++	{ 0x80784, "rsrb_ba" },
++	{ 0x80788, "rcmlbm_ba" },
++	{ 0x8078c, "rcmabr_ba" },
++
++	{ 0x807c0, "rc_config" },
++
++	{ 0x807c4, "mcc" },
++	{ 0x807c8, "oec" },
++	{ 0x807cc, "dcc" },
++	{ 0x807d0, "cec" },
++
++	{ 0x807f4, "lb_config" },
++
++	{ 0x807f0, "hsp_ba" },
++
++	{ 0x807f8, "con_dat" },
++	{ 0x807fc, "con_ctl" },
++
++	{ 0x00000, NULL }
++};
++
++char *
++reg_name(unsigned addr)
++{
++	struct reg_table *regp = pci_regs;
++
++	while ( regp->name != NULL )
++	{
++		if (regp->addr == addr) return regp->name;
++		regp++;
++	}
++
++	return NULL;
++}
++
++int
++main(int argc,char **argv)
++{
++	int s;
++	struct atmif_sioc sioc;
++	struct he_ioctl_reg req;
++
++	if (argc < 3)
++	{
++		fprintf(stderr,"usage: hediag itf [cmd]\n");
++		fprintf(stderr,"\t\treadpci address\n");
++		fprintf(stderr,"\t\treadrcm address\n");
++		fprintf(stderr,"\t\treadtcm address\n");
++		fprintf(stderr,"\t\treadmbox address\n");
++		exit(1);
++	}
++
++	if (strcmp(argv[2], "readpci") == 0)
++	{
++		req.addr = strtol(argv[3], NULL, 0);
++		req.type = HE_REGTYPE_PCI;
++	}
++	else if (strcmp(argv[2], "readrcm") == 0)
++	{
++		req.addr = strtol(argv[3], NULL, 0);
++		req.type = HE_REGTYPE_RCM;
++	}
++	else if (strcmp(argv[2], "readtcm") == 0)
++	{
++		req.addr = strtol(argv[3], NULL, 0);
++		req.type = HE_REGTYPE_TCM;
++	}
++	else if (strcmp(argv[2], "readmbox") == 0)
++	{
++		req.addr = strtol(argv[3], NULL, 0);
++		req.type = HE_REGTYPE_MBOX;
++	}
++	
++
++	if ((s = socket(PF_ATMPVC, SOCK_DGRAM, ATM_AAL5)) < 0)
++	{
++		perror("socket");
++		exit(1);
++	}
++
++        sioc.number = atoi(argv[1]);
++        sioc.arg = &req;
++        sioc.length = sizeof(req);
++
++	if (ioctl(s, HE_GET_REG, &sioc) < 0)
++	{
++		perror("ioctl HE_GET_REG");
++		exit(1);
++	}
++
++	if (reg_name(req.addr))
++		printf("%s = 0x%x\n", reg_name(req.addr), req.val);
++	else
++		printf("0x%x = 0x%x\n", req.addr, req.val);
++
++	exit(0);
++}
+diff -Naur linux-atm-2.5.0/src/extra/oam.patch open_linux_atm/src/extra/oam.patch
+--- linux-atm-2.5.0/src/extra/oam.patch	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/extra/oam.patch	2009-11-11 18:14:20.265421000 +0530
+@@ -0,0 +1,462 @@
++# This is a BitKeeper generated patch for the following project:
++# Project Name: Linux kernel tree
++# This patch format is intended for GNU patch command version 2.5 or higher.
++# This patch includes the following deltas:
++#	           ChangeSet	1.1345  -> 1.1346 
++#	    net/atm/Makefile	1.6     -> 1.7    
++#	       net/Config.in	1.14    -> 1.15   
++#	       net/atm/raw.c	1.3     -> 1.4    
++#	    net/atm/common.c	1.29    -> 1.30   
++#	               (new)	        -> 1.1     include/linux/atmoam.h
++#	               (new)	        -> 1.1     net/atm/oam.c  
++#
++# The following is the BitKeeper ChangeSet Log
++# --------------------------------------------
++# 04/02/21	chas@relax.cmf.nrl.navy.mil	1.1346
++# [ATM]: OAM support from Jorge Boncompte [DTI2] <jorge@dti2.net>
++# --------------------------------------------
++#
++diff -Nru a/include/linux/atmoam.h b/include/linux/atmoam.h
++--- /dev/null	Wed Dec 31 16:00:00 1969
+++++ b/include/linux/atmoam.h	Sat Feb 21 09:13:01 2004
++@@ -0,0 +1,77 @@
+++/*
+++ * atmoam.h - ATM OAM protocol and kernel-daemon interface definitions
+++ *
+++ * Written 2003 by Jorge Boncompte, DTI2
+++*/
+++
+++#ifndef _LINUX_ATMOAM_H
+++#define _LINUX_ATMOAM_H
+++
+++#ifdef __KERNEL__
+++#include <linux/types.h>
+++#endif
+++#include <linux/atmapi.h>
+++#include <linux/atmioc.h>
+++
+++#define ATMOAMD_CTRL	_IO('a', ATMIOC_SPECIAL+4)	/* become atmoamd ctrl sock */
+++
+++#define POLYNOMIAL 0x633
+++
+++/* OAM Cell Types */
+++#define ATM_OAM_T_FAULT		1
+++#define ATM_OAM_T_PERF		2
+++#define ATM_OAM_T_ACTDEACT	8
+++
+++/* OAM Cell Functions */
+++#define ATM_OAM_F_AIS		0
+++#define ATM_OAM_F_FERF		1
+++#define ATM_OAM_F_CONT		4
+++#define ATM_OAM_F_LOOP		8
+++
+++#define OAM_TYPE_SHIFT		4
+++#define OAM_FUNC_MASK		0x0000000f
+++
+++#define OAM_TYPE(X)		(X[0] >> OAM_TYPE_SHIFT)
+++#define OAM_FUNC(X)		(X[0] & OAM_FUNC_MASK)
+++#define ATM_CELL_PTI(X)		((X & ATM_HDR_PTI_MASK) >> ATM_HDR_PTI_SHIFT)
+++ 
+++struct oamcell {
+++	unsigned char	hdr[ATM_AAL0_SDU - ATM_CELL_PAYLOAD]; /* AAL0 Cell Header */
+++	unsigned char	payload[ATM_CELL_PAYLOAD];
+++};
+++
+++struct atmoam_ctrl {
+++	atm_kptr_t	vcc;			/* Vcc Kernel Pointer */
+++	int		number;			/* Device index */
+++	short		pti;			/* Payload Type Identifier */
+++	short		vpi;			/* VPI number */
+++	int 		vci;			/* VCI number */
+++	struct oamcell cell;
+++};
+++
+++#ifdef __KERNEL__
+++struct atm_oam_ops {
+++	int (*toatmoamd)(struct atm_vcc *vcc, void *oamcell);
+++	int (*init)(struct atm_vcc *vcc);
+++	struct module *owner;
+++};
+++
+++void atm_oam_ops_set(struct atm_oam_ops *);
+++int try_atm_oam_ops(void);
+++
+++extern struct atm_oam_ops *atm_oam_ops;
+++#endif
+++
+++struct oampayload {
+++	u_int8_t	FunctNType;
+++
+++	u_int8_t 	LoopBackInd:8;
+++	u_int8_t 	CorrelationTag[4];
+++	u_int8_t 	LocationID[16];
+++	u_int8_t	SourceID[16];
+++	u_int8_t	Unused[8];
+++
+++	u_int8_t	OAMCRC10[2];
+++};
+++
+++#endif
++diff -Nru a/net/Config.in b/net/Config.in
++--- a/net/Config.in	Sat Feb 21 09:13:01 2004
+++++ b/net/Config.in	Sat Feb 21 09:13:01 2004
++@@ -50,6 +50,7 @@
++       if [ "$CONFIG_ATM_BR2684" != "n" ]; then
++             bool '    Per-VC IP filter kludge' CONFIG_ATM_BR2684_IPFILTER
++       fi
+++      dep_tristate '  OAM protocol support' CONFIG_ATM_OAM $CONFIG_ATM
++    fi
++ fi
++ tristate '802.1Q VLAN Support' CONFIG_VLAN_8021Q
++diff -Nru a/net/atm/Makefile b/net/atm/Makefile
++--- a/net/atm/Makefile	Sat Feb 21 09:13:01 2004
+++++ b/net/atm/Makefile	Sat Feb 21 09:13:01 2004
++@@ -46,6 +46,7 @@
++ obj-$(CONFIG_ATM_LANE) += lec.o
++ obj-$(CONFIG_ATM_MPOA) += mpoa.o
++ obj-$(CONFIG_PPPOATM) += pppoatm.o
+++obj-$(CONFIG_ATM_OAM) += oam.o
++ 
++ include $(TOPDIR)/Rules.make
++ 
++diff -Nru a/net/atm/common.c b/net/atm/common.c
++--- a/net/atm/common.c	Sat Feb 21 09:13:01 2004
+++++ b/net/atm/common.c	Sat Feb 21 09:13:01 2004
++@@ -129,6 +129,36 @@
++ #endif
++ #endif
++ 
+++#if defined(CONFIG_ATM_OAM) || defined(CONFIG_ATM_OAM_MODULE)
+++#include <linux/atmoam.h>
+++struct atm_oam_ops *atm_oam_ops;
+++static DECLARE_MUTEX(atm_oam_ops_mutex);
+++
+++void atm_oam_ops_set(struct atm_oam_ops *hook)
+++{
+++	down(&atm_oam_ops_mutex);
+++	atm_oam_ops = hook;
+++	up(&atm_oam_ops_mutex);
+++}
+++
+++int try_atm_oam_ops(void)
+++{
+++	down(&atm_oam_ops_mutex);
+++	if (atm_oam_ops && try_inc_mod_count(atm_oam_ops->owner)) {
+++		up(&atm_oam_ops_mutex);
+++		return 1;
+++	}
+++	up(&atm_oam_ops_mutex);
+++	return 0;
+++}
+++
+++#ifdef CONFIG_ATM_OAM_MODULE
+++EXPORT_SYMBOL(atm_oam_ops);
+++EXPORT_SYMBOL(try_atm_oam_ops);
+++EXPORT_SYMBOL(atm_oam_ops_set);
+++#endif
+++#endif
+++
++ #if defined(CONFIG_PPPOATM) || defined(CONFIG_PPPOATM_MODULE)
++ static DECLARE_MUTEX(pppoatm_ioctl_mutex);
++ 
++@@ -782,6 +812,26 @@
++ 				error = atm_clip_ops->clip_encap(vcc, arg);
++ 				if (atm_clip_ops->owner)
++ 					__MOD_DEC_USE_COUNT(atm_clip_ops->owner);
+++			} else
+++				error = -ENOSYS;
+++			goto done;
+++#endif
+++#if defined(CONFIG_ATM_OAM) || defined(CONFIG_ATM_OAM_MODULE)
+++		case ATMOAMD_CTRL:
+++			if (!capable(CAP_NET_ADMIN)) {
+++				error = -EPERM;
+++				goto done;
+++			}
+++#if defined(CONFIG_ATM_OAM_MODULE)
+++			if (!atm_oam_ops)
+++				request_module("oam");
+++#endif
+++			if (try_atm_oam_ops()) {
+++				error = atm_oam_ops->init(vcc);
+++				if (atm_oam_ops->owner)
+++					__MOD_DEC_USE_COUNT(atm_oam_ops->owner);
+++				if (!error)
+++					sock->state = SS_CONNECTED;
++ 			} else
++ 				error = -ENOSYS;
++ 			goto done;
++diff -Nru a/net/atm/oam.c b/net/atm/oam.c
++--- /dev/null	Wed Dec 31 16:00:00 1969
+++++ b/net/atm/oam.c	Sat Feb 21 09:13:01 2004
++@@ -0,0 +1,223 @@
+++/*
+++ *		net/atm/oam.c - Kernel support for an userspace OAM daemon. 
+++ *
+++ *		Author: Jorge Boncompte, DTI-2
+++ *
+++ *		Based on the code of the linux ATM stack.
+++ *
+++ */
+++
+++#include <linux/module.h>
+++#include <linux/errno.h>
+++#include <linux/sched.h>
+++#include <linux/kernel.h>
+++#include <linux/skbuff.h>
+++#include <linux/mm.h>
+++#include <linux/atm.h>
+++#include <linux/atmdev.h>
+++#include <linux/atmoam.h>
+++
+++#include "common.h"
+++#include "protocols.h"
+++
+++struct atm_vcc *atmoamd = NULL;
+++
+++#if 0
+++#define DPRINTK(format,args...) printk(KERN_DEBUG format,##args)
+++#else
+++#define DPRINTK(format,args...)
+++#endif
+++
+++static struct atm_vcc *vcc_find_byvpivci(struct atm_dev *dev, short vpi, int vci)
+++{
+++	struct sock *s;
+++	struct atm_vcc *walk;
+++
+++	read_lock(&vcc_sklist_lock);
+++        for (s = vcc_sklist; s; s = s->next) {
+++                walk = s->protinfo.af_atm;
+++		if (test_bit(ATM_VF_ADDR, &walk->flags) &&
+++		    walk->vpi == vpi &&
+++		    walk->vci == vci) {
+++			sock_hold(s);
+++			read_unlock(&vcc_sklist_lock);
+++			return walk;
+++		}
+++	}
+++
+++	read_unlock(&vcc_sklist_lock);
+++	return NULL;
+++}
+++
+++static int oam_to_atmoamd(struct atm_vcc *vcc, void *oamcell)
+++{
+++	struct atmoam_ctrl	*oamctrl;
+++	struct sk_buff	*skb;
+++	unsigned char	*cell;
+++
+++	DPRINTK("to_atmoamd\n");
+++
+++	cell = (unsigned char *) oamcell;
+++	
+++	if (!atmoamd)
+++		return -EUNATCH;
+++
+++	skb = alloc_skb(sizeof(struct atmoam_ctrl), GFP_ATOMIC);
+++	
+++	if (!skb)
+++		return -ENOMEM;
+++
+++	oamctrl = (struct atmoam_ctrl *) skb_put(skb, sizeof(struct atmoam_ctrl));
+++
+++	*(struct atm_vcc **) &oamctrl->vcc = vcc;
+++	oamctrl->number = vcc->dev->number;
+++	oamctrl->pti = ATM_CELL_PTI(cell[3]);
+++	oamctrl->vpi = vcc->vpi;
+++	oamctrl->vci = vcc->vci;
+++	memcpy(&oamctrl->cell, cell, ATM_AAL0_SDU);
+++
+++	DPRINTK("to_atmoamd: Intf %d PTI %d vc %d/%d Vcc 0x%p\n",
+++		oamctrl->number, oamctrl->pti, oamctrl->vpi, oamctrl->vci,
+++		*(struct atm_vcc **)&oamctrl->vcc);
+++
+++/*	skb->stamp = xtime;
+++
+++        if (!atm_charge(atmoamd, skb->truesize)) {
+++    		dev_kfree_skb_any(skb);
+++    		return -1;
+++        }
+++        ATM_SKB(skb)->vcc = atmoamd;
+++*/
+++	atm_force_charge(atmoamd, skb->truesize);
+++	skb_queue_tail(&atmoamd->sk->receive_queue, skb);
+++	wake_up(&atmoamd->sleep);
+++
+++	return 0;
+++}
+++
+++static int oam_from_atmoamd(struct atm_vcc *oamvcc, struct sk_buff *skb)
+++{
+++	struct atm_vcc *vcc;
+++	struct atm_dev *dev;
+++	struct atmoam_ctrl *oamctrl = (struct atmoam_ctrl *) skb->data;
+++	int result = 0;
+++
+++	DPRINTK("from_atmoamd\n");
+++
+++	/* FIXME: Check message length?  Is the below line correct? */
+++	atomic_sub(skb->truesize, &oamvcc->sk->wmem_alloc);
+++
+++	DPRINTK("from_atmoamd: Intf %d PTI %d vc %d/%d Vcc 0x%p\n",
+++		oamctrl->number, oamctrl->pti, oamctrl->vpi, oamctrl->vci,
+++		*(struct atm_vcc **)&oamctrl->vcc);
+++
+++	dev = atm_dev_lookup(oamctrl->number);
+++	if (!dev) {
+++		result = -ENODEV;
+++		goto err;
+++	}
+++
+++	vcc = *(struct atm_vcc **) &oamctrl->vcc;
+++    
+++	/* This is a new outgoing cell, not a reply */
+++	if (vcc == 0) {
+++		if ((vcc = vcc_find_byvpivci(dev, oamctrl->vpi, oamctrl->vci)) == NULL) {
+++			DPRINTK("Vcc %d/%d not in device %d list\n",
+++			    oamctrl->vpi, oamctrl->vci, oamctrl->number);
+++			result = -EUNATCH;
+++			goto err_put;
+++		}
+++	}
+++	
+++	if (vcc->dev->ops->send_oam)
+++		result = vcc->dev->ops->send_oam(vcc, &oamctrl->cell, 0);
+++	else {
+++		if (net_ratelimit())
+++			printk(KERN_INFO "%s%d: Driver does not support sending OAM cells\n",
+++			    dev->type, dev->number);
+++		result = -ENOSYS;
+++	}
+++	sock_put(vcc->sk);
+++
+++err_put:
+++	atm_dev_put(dev);
+++err:
+++	if (result) /* Should we release the skb if there is no error? */
+++	    kfree_skb(skb);
+++	return result;
+++}
+++
+++
+++static void oam_close_atmoamd(struct atm_vcc *vcc)
+++{
+++	DPRINTK("atmoamd_close\n");
+++	atmoamd = NULL; /* assumed to be atomic */
+++	barrier();
+++	if (skb_peek(&vcc->sk->receive_queue))
+++		printk(KERN_ERR "atmoamd_close: closing with requests pending\n");
+++	skb_queue_purge(&vcc->sk->receive_queue);
+++	DPRINTK("(done)\n");
+++	MOD_DEC_USE_COUNT;
+++}
+++
+++
+++static struct atmdev_ops atmoamd_dev_ops = {
+++	.close = oam_close_atmoamd,
+++	.send = oam_from_atmoamd,
+++};
+++
+++
+++static struct atm_dev atmoamd_dev = {
+++	.ops = &atmoamd_dev_ops,	/* device operations */
+++	.type = "oamd",		/* device type */
+++	.number = 989,		/* dummy device number */
+++};
+++
+++
+++int atm_init_atmoam(struct atm_vcc *vcc)
+++{
+++	DPRINTK("atm_init_atmoam\n");
+++
+++        if (atmoamd)
+++		return -EADDRINUSE;
+++
+++	atmoamd = vcc;
+++        set_bit(ATM_VF_META, &vcc->flags);
+++	set_bit(ATM_VF_READY, &vcc->flags);
+++
+++	/* allow replies and avoid getting closed if signaling dies */
+++	vcc->dev = &atmoamd_dev;
+++	vcc_insert_socket(vcc->sk);
+++	vcc->push = NULL;
+++	vcc->pop = NULL; /* crash */
+++        vcc->push_oam = NULL; /* crash */
+++
+++	MOD_INC_USE_COUNT;
+++        return 0;
+++}
+++
+++static struct atm_oam_ops __atm_oam_ops = {
+++	.toatmoamd = oam_to_atmoamd,
+++	.init = atm_init_atmoam,
+++	.owner = THIS_MODULE
+++};
+++
+++static int __init atm_oam_init(void)
+++{
+++	atm_oam_ops_set(&__atm_oam_ops);
+++	printk(KERN_INFO "ATM: OAM kernel module support loaded.\n");
+++        return 0;
+++}
+++
+++static void __exit atm_oam_exit(void)
+++{
+++	atm_oam_ops_set(NULL);
+++	printk(KERN_INFO "ATM: OAM kernel module support removed.\n");
+++}
+++
+++module_init(atm_oam_init);
+++module_exit(atm_oam_exit);
+++
+++MODULE_AUTHOR("Jorge Boncompte - DTI2");
+++MODULE_DESCRIPTION("OAM support for ATM");
+++MODULE_LICENSE("GPL");
++diff -Nru a/net/atm/raw.c b/net/atm/raw.c
++--- a/net/atm/raw.c	Sat Feb 21 09:13:01 2004
+++++ b/net/atm/raw.c	Sat Feb 21 09:13:01 2004
++@@ -10,6 +10,9 @@
++ #include <linux/skbuff.h>
++ #include <linux/mm.h>
++ 
+++#if defined(CONFIG_ATM_OAM) || defined(CONFIG_ATM_OAM_MODULE)
+++#include <linux/atmoam.h>
+++#endif
++ #include "common.h"
++ #include "protocols.h"
++ 
++@@ -21,6 +24,24 @@
++ #endif
++ 
++ 
+++int atm_push_oam(struct atm_vcc *vcc, void *oamcell)
+++{
+++	int result = 0;
+++	
+++	DPRINTK("atm_push_oam\n");
+++
+++#if defined(CONFIG_ATM_OAM) || defined(CONFIG_ATM_OAM_MODULE)
+++	if (try_atm_oam_ops()) {
+++		result = atm_oam_ops->toatmoamd(vcc, (unsigned char *) oamcell);
+++		if (atm_oam_ops->owner)
+++			__MOD_DEC_USE_COUNT(atm_oam_ops->owner);
+++	} else
+++		result = -ENOSYS;
+++#endif
+++	return result;
+++}
+++
+++
++ /*
++  * SKB == NULL indicates that the link is being closed
++  */
++@@ -84,7 +105,7 @@
++ {
++ 	vcc->push = atm_push_raw;
++ 	vcc->pop = atm_pop_raw;
++-	vcc->push_oam = NULL;
+++	vcc->push_oam = atm_push_oam;
++ 	vcc->send = vcc->dev->ops->send;
++ 	return 0;
++ }
+diff -Naur linux-atm-2.5.0/src/ilmid/Makefile-0.79 open_linux_atm/src/ilmid/Makefile-0.79
+--- linux-atm-2.5.0/src/ilmid/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/ilmid/Makefile-0.79	2009-11-11 18:14:20.425404000 +0530
+@@ -0,0 +1,25 @@
++LIBS = -L../lib -latmd -latm -Lasn1 -lasn1
++LIBDEPS=../lib/libatmd.a ../lib/libatm.a
++INCLUDES = -I../lib -Iasn1
++SRCS = rfc1157_snmp.c rfc1155_smi.c util.c io.c message.c \
++       atmf_uni.c mib.c sysgroup.c ilmid.c
++OBJS = $(SRCS:%.c=%.o)
++BOOTPGMS=ilmid
++
++CLEAN = clean_ilmid
++include ../Rules.make
++CFLAGS = $(CFLAGS_NOWARN) $(CFLAGS_OPT) $(CFLAGS_PRIVATE) $(STANDARDS)
++
++default: all
++ 
++do_all: ilmid
++ 
++asn1/libasn1.a: 
++	@cd asn1; make
++ 
++ilmid: asn1/libasn1.a $(OBJS)
++	$(CC) $(OBJS) $(LIBS) -o ilmid
++
++clean_ilmid:
++	@cd asn1; make clean
++	rm -rf ilmid $(OBJS) *~
+diff -Naur linux-atm-2.5.0/src/ilmid/asn1/Makefile-0.79 open_linux_atm/src/ilmid/asn1/Makefile-0.79
+--- linux-atm-2.5.0/src/ilmid/asn1/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/ilmid/asn1/Makefile-0.79	2009-11-11 18:14:20.281404000 +0530
+@@ -0,0 +1,29 @@
++CC = cc
++CFLAGS = -O
++LIBS = 
++SRCS = asn_len.c asn_tag.c asn_int.c asn_octs.c asn_bits.c str_stk.c \
++       asn_oid.c asn_null.c asn_list.c nibble_alloc.c print.c \
++
++OBJS = $(SRCS:%.c=%.o)
++
++default: all
++ 
++all: libasn1.a
++ 
++.c.o:
++	$(CC) $(CFLAGS) -c $<
++ 
++libasn1.a: $(OBJS)
++	ar cr libasn1.a $(OBJS)
++
++depend:
++#	makedepend $(INCLUDES) $(SRCS)
++	$(CPP) -M $(SRCS) >.tmpdepend
++	mv .tmpdepend .depend
++
++clean:
++	rm -rf libasn1.a $(OBJS)
++
++ifeq (.depend,$(wildcard .depend))
++include .depend
++endif
+diff -Naur linux-atm-2.5.0/src/include/stdint.h open_linux_atm/src/include/stdint.h
+--- linux-atm-2.5.0/src/include/stdint.h	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/include/stdint.h	2009-11-11 18:14:20.542410000 +0530
+@@ -0,0 +1,31 @@
++/* stdint.h - provides uintXX_t until glibc does */
++
++#ifndef _STDINT_H
++
++#include <features.h>
++
++#if __GLIBC__ >= 2 && __GLIBC_MINOR__ >= 1
++
++#include "/usr/include/stdint.h"
++
++#elif __GLIBC__ >= 2
++
++/* Works for i386 and Alpha */
++
++typedef unsigned char uint8_t;
++typedef unsigned short uint16_t;
++typedef unsigned int uint32_t;
++
++#else
++
++#ifndef _LINUX_TYPES_H
++#include <linux/types.h>
++#endif
++
++#endif
++
++#ifndef _STDINT_H
++#define _STDINT_H
++#endif
++
++#endif
+diff -Naur linux-atm-2.5.0/src/lane/Makefile-0.79 open_linux_atm/src/lane/Makefile-0.79
+--- linux-atm-2.5.0/src/lane/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/lane/Makefile-0.79	2009-11-11 18:14:20.569414000 +0530
+@@ -0,0 +1,48 @@
++#
++# Makefile
++# $Id: Makefile-0.79,v 1.2 2001/10/09 22:33:06 paulsch Exp $
++
++#
++# Compilation options
++#
++
++CFLAGS = -ansi -pedantic -Wall -Wshadow -Wpointer-arith -Wcast-qual -Wcast-align -Waggregate-return -Wstrict-prototypes -Wmissing-prototypes -Wnested-externs
++
++#
++#
++# The rules
++#
++#
++SYSPGMS =	les bus lecs
++MAN8 =		les.8 lecs.8 bus.8
++LESBUSOBJS =	mem.o load.o units.o load_lex.o timers.o dump.o atm.o \
++		events.o lane.o
++LESOBJS =	$(LESBUSOBJS) packet.o connect.o db.o
++BUSOBJS =       $(LESBUSOBJS) connect_bus.o
++LECSOBJS =	lecs_db.o lecs_load.o lecs.o ldb.o mem_lecs.o atm_lecs.o
++OBJS =		$(LESOBJS) $(BUSOBJS) $(LECSOBJS)
++
++CLEAN = clean_lane
++include ../Rules.make
++
++load_lex.c : load_lex.l
++	$(LEX) -oload_lex.c load_lex.l
++
++lecs_db.c: lecs_db.l
++	$(LEX) -olecs_db.c lecs_db.l 
++
++les:	$(LESOBJS)
++	@echo "Linking $@"
++	@$(CC) $(LDFLAGS) -o $@ $(LESOBJS)
++
++bus:	$(BUSOBJS)
++	@echo "Linking $@"
++	@$(CC) $(LDFLAGS) -o $@ $(BUSOBJS)
++
++lecs:	$(LECSOBJS)
++	@echo "Linking $@"
++	$(CC) $(LDFLAGS) -o $@ $(LECSOBJS) $(LDLIBS)
++
++clean_lane:
++	rm -f $(SYSPGMS) *.o *.d *~ .*~ core *.bak *.tar* *.errs load_lex.c \
++	lecs_db.c *~
+diff -Naur linux-atm-2.5.0/src/led/Makefile-0.79 open_linux_atm/src/led/Makefile-0.79
+--- linux-atm-2.5.0/src/led/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/led/Makefile-0.79	2009-11-11 18:14:20.746407000 +0530
+@@ -0,0 +1,10 @@
++LIBS=-latm -latmd
++OBJS=join.o conn.o main.o address.o frames.o display.o kernel.o
++BOOTPGMS=zeppelin
++MAN8=zeppelin.8
++CFLAGS_PRIVATE=
++
++include ../Rules.make
++
++zeppelin:$(OBJS)
++	$(CC) $(LDFLAGS) -o $(BOOTPGMS) $(OBJS) $(LIBD) $(LDLIBS) $(LIBS)
+diff -Naur linux-atm-2.5.0/src/lib/Makefile-0.79 open_linux_atm/src/lib/Makefile-0.79
+--- linux-atm-2.5.0/src/lib/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/lib/Makefile-0.79	2009-11-11 18:14:20.812406000 +0530
+@@ -0,0 +1,29 @@
++ATM_OBJS=text2atm.o atm2text.o atmequal.o sdu2cell.o text2qos.o qos2text.o \
++  qosequal.o sap2text.o text2sap.o sapequal.o misc.o
++ifeq (/usr/lib/libresolv.a,$(wildcard /usr/lib/libresolv.a))
++ATM_OBJS += ans_l.o
++else
++ATM_OBJS += ans.o
++endif
++ATMD_OBJS=common.o diag.o kptr.o text2ip.o timer.o unix.o
++PGMS=#test
++GENLIBS=libatm.a libatmd.a
++SYSHDR=atm.h atmd.h atmsap.h
++OPTSYSHDR=stdint.h
++
++do_all:			libatm.a libatmd.a
++
++include ../Rules.make
++
++../lib/libatm.a:	libatm.a
++
++libatm.a:		$(ATM_OBJS)
++			ar rcs libatm.a $(ATM_OBJS)
++
++../lib/libatmd.a:	libatmd.a
++
++libatmd.a:		$(ATMD_OBJS)
++			ar rcs libatmd.a $(ATMD_OBJS)
++
++ans_l.o:		ans.o
++			ld -r -o ans_l.o ans.o -L/usr/lib -lresolv
+diff -Naur linux-atm-2.5.0/src/maint/Makefile-0.79 open_linux_atm/src/maint/Makefile-0.79
+--- linux-atm-2.5.0/src/maint/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/maint/Makefile-0.79	2009-11-11 18:14:20.898416000 +0530
+@@ -0,0 +1,12 @@
++LDLIBS=-latmd
++INCLUDES=-I../qgen -I../saal
++BOOTPGMS=atmaddr esi
++SYSPGMS=atmloop atmtcp enitune zntune # nstune
++USRPGMS=atmdiag atmdump sonetdiag saaldump
++MAN8=atmaddr.8 atmdiag.8 atmdump.8 atmloop.8 atmtcp.8 esi.8
++
++include ../Rules.make
++
++saaldump:	saaldump.o
++		$(CC) $(LDFLAGS) -o saaldump saaldump.o ../qgen/qd.dump.o \
++		  -L../saal -lsaal -L../lib -latm -latmd
+diff -Naur linux-atm-2.5.0/src/man/Makefile-0.79 open_linux_atm/src/man/Makefile-0.79
+--- linux-atm-2.5.0/src/man/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/man/Makefile-0.79	2009-11-11 18:14:20.967406000 +0530
+@@ -0,0 +1,9 @@
++MAN7=qos.7 sap.7
++
++DEPEND = depend_man
++include ../Rules.make
++
++all:
++
++depend_man:
++	@
+diff -Naur linux-atm-2.5.0/src/mpoad/Makefile-0.79 open_linux_atm/src/mpoad/Makefile-0.79
+--- linux-atm-2.5.0/src/mpoad/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/mpoad/Makefile-0.79	2009-11-11 18:14:20.979414000 +0530
+@@ -0,0 +1,13 @@
++LIBS=-latm
++OBJS=get_vars.o io.o k_interf.o main.o p_factory.o  p_recogn.o id_list.o tag_list.o poll2select.o lecs.o
++BOOTPGMS=mpcd
++MAN8= mpcd.8
++# MPOA specific flags
++# -DDBROKEN_POLL use select() instead of poll()
++# -DMPOA_1_1     use proposed MPOA 1.1 features
++CFLAGS_PRIVATE=-DBROKEN_POLL
++
++include ../Rules.make
++
++mpcd:		$(OBJS)
++		$(CC) $(LDFLAGS) -o mpcd $(OBJS) $(LIBD) $(LDLIBS)
+diff -Naur linux-atm-2.5.0/src/qgen/Makefile-0.79 open_linux_atm/src/qgen/Makefile-0.79
+--- linux-atm-2.5.0/src/qgen/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/qgen/Makefile-0.79	2009-11-11 18:14:21.188419000 +0530
+@@ -0,0 +1,59 @@
++LIBS=-lfl # lex may want  -ll  here
++OBJS=common.o file.o first.o lex.yy.o qgen.o second.o third.o y.tab.o
++TRASH=q.out.h q.out.c q.test.c qd.out.h qd.out.c qd.test.c qd.dump.c default.nl
++# q40.out.h q40.out.c q40.test.c
++PGMS=qgen q.out.o qd.dump.o q.dump #qtest
++# q40.out.o
++NLS=atm_ai_msg atm_ai_ie atm_loc atm_cv atm_pu atm_na atm_cond atm_ie atm_msg \
++  atm_np atm_ton atm_sat atm_prs atm_scrn atm_vpa atm_poe q2931_cs atm_td \
++  atm_bc atm_tc atm_stc atm_upcc q2931_proto atm_flag atm_aalp atm_fd atm_tag \
++  atm_l2 atm_l3 atm_tt atm_mc atm_hl atm_imd atm_tdl atm_tni atm_nip atm_shi \
++  atm_oci atm_unfm atm_ofi atm_irs atm_it atm_lit atm_lsi atm_tcs atm_css \
++  atm_eqo atm_eqp atm_aap atm_asp atm_tor
++SYMFILES=uni.h $(shell perl incl.pl $(CFLAGS) linux/atmsap.h)
++
++NOLIBATMDEP=yes
++include ../Rules.make
++
++qgen:				$(OBJS)
++				$(CC) $(LDFLAGS) -o qgen $(OBJS) $(LIBS)
++
++q.out.h q.out.c q.test.c:	qgen msg.fmt default.nl
++				$(CC) $(STANDARDS) -E - <msg.fmt | ./qgen
++
++#q40.out.o:			q40.out.c q40.out.h qlib.c qlib.h
++#				$(CC) $(CFLAGS) -DUNI40 -c q40.out.c
++#
++#q40.out.h q40.out.c q40.test.c:	qgen uni40 default.nl
++#				$(CC) $(STANDARDS) -E - <uni40 | \
++#				  PREFIX=q40 ./qgen
++
++qd.out.h qd.out.c qd.dump.c:	qgen msg.fmt default.nl
++				$(CC) $(STANDARDS) -E - <msg.fmt | ./qgen -D
++
++lex.yy.c:			ql.l qgen.h y.tab.h
++				$(LEX) ql.l
++ 
++y.tab.c y.tab.h:		ql.y qgen.h
++				$(YACC) -d ql.y
++
++default.nl:			mknl.pl $(SYMFILES)
++				cat $(SYMFILES) | \
++				  perl mknl.pl $(NLS) >default.nl || \
++				  { rm -f default.nl; echo 1; }
++
++q.out.o:			q.out.c q.out.h qlib.c qlib.h
++				$(CC) $(CFLAGS) -c $(STANDARDS) q.out.c
++
++q.test:				q.test.c qtest.c
++				$(CC) $(CFLAGS) -o q.test $(STANDARDS) q.test.c
++
++q.dump:				qd.dump.c q.out.h qd.out.c qlib.h qlib.c
++				$(CC) $(CFLAGS) -DSTANDALONE -o q.dump \
++				  $(STANDARDS) qd.dump.c common.o
++
++qd.dump.o:			qd.dump.c qd.out.c qlib.h qlib.c
++				$(CC) $(CFLAGS) -c $(STANDARDS) qd.dump.c
++
++qtest:				q.test
++				./q.test
+diff -Naur linux-atm-2.5.0/src/saal/Makefile-0.79 open_linux_atm/src/saal/Makefile-0.79
+--- linux-atm-2.5.0/src/saal/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/saal/Makefile-0.79	2009-11-11 18:14:21.282329000 +0530
+@@ -0,0 +1,11 @@
++LIBS=
++OBJS=pdu.o saal.o sscf.o sscop.o queue.o
++
++do_all:				libsaal.a
++
++include ../Rules.make
++
++../saal/libsaal.a:		libsaal.a
++
++libsaal.a:			$(OBJS)
++				ar rcs libsaal.a $(OBJS)
+diff -Naur linux-atm-2.5.0/src/sigd/Makefile-0.79 open_linux_atm/src/sigd/Makefile-0.79
+--- linux-atm-2.5.0/src/sigd/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/sigd/Makefile-0.79	2009-11-11 18:14:21.338335000 +0530
+@@ -0,0 +1,39 @@
++LIBS=-L../saal -lsaal -latmd -lfl # lex may want  -ll  here
++LIBDEPS=../saal/libsaal.a ../lib/libatmd.a
++INCLUDES=-I../qgen -I../saal -I.
++OBJS=atmsigd.o io.o kernel.o mess.o proto.o uni.o sap.o timeout.o trace.o \
++  policy.o lex.yy.o y.tab.o
++EXTOBJS=../qgen/q.out.o ../qgen/qd.dump.o
++BOOTPGMS=atmsigd
++TRASH=mess.c
++TRASH_SPOTLESS=q.out.h
++MAN4=atmsigd.conf.4
++MAN8=atmsigd.8
++
++include ../Rules.make
++CFLAGS_NOWARN += $(STANDARDS)
++
++atmsigd:		$(OBJS) $(EXTOBJS)
++			$(CC) $(LDFLAGS) -o atmsigd $(OBJS) $(EXTOBJS) \
++			  $(LDLIBS) $(LIBS)
++
++lex.yy.c:		cfg.l y.tab.h ../lib/atm.h
++			$(LEX) cfg.l
++
++y.tab.c y.tab.h:	cfg.y ../lib/atmd.h proto.h io.h
++			$(YACC) -d cfg.y
++
++mess.c:			../qgen/uni.h mkmess.pl
++			perl ./mkmess.pl <../qgen/uni.h >mess.c
++
++#
++# The following hack makes sure that "make depend" finds q.out.h and is
++# happy with it. Once qgen has been built, there will be ../qgen/q.out.h,
++# which is first in the include file search path and therefore gets
++# included. An second "make depend" will also use the right file.
++#
++
++$(DEPEND):		fake_q.out.h
++
++fake_q.out.h:
++			echo "! This must not compile" >q.out.h
+diff -Naur linux-atm-2.5.0/src/switch/Makefile-0.79 open_linux_atm/src/switch/Makefile-0.79
+--- linux-atm-2.5.0/src/switch/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/switch/Makefile-0.79	2009-11-11 18:14:21.512334000 +0530
+@@ -0,0 +1,20 @@
++LDLIBS=-latmd
++LIBDEPS=../lib/libatmd.a
++SW_OBJS=control.o dispatch.o proto.o relay.o route.o sig.o lex.yy.o y.tab.o
++SUBDIRS=debug tcp
++PGMS=swc
++
++all:
++
++do_all:			libsw.a
++
++include ../Rules.make
++
++lex.yy.c:		cfg.l y.tab.h ../lib/atm.h
++			$(LEX) cfg.l
++
++y.tab.c y.tab.h:	cfg.y ../lib/atmd.h route.h sig.h
++			$(YACC) -d cfg.y
++
++libsw.a:		$(SW_OBJS)
++			ar rcs libsw.a $(SW_OBJS)
+diff -Naur linux-atm-2.5.0/src/switch/debug/Makefile-0.79 open_linux_atm/src/switch/debug/Makefile-0.79
+--- linux-atm-2.5.0/src/switch/debug/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/switch/debug/Makefile-0.79	2009-11-11 18:14:21.500343000 +0530
+@@ -0,0 +1,10 @@
++LIBS=-lsw -latmd -L..
++LIBDEPS=../../lib/libatmd.a ../libsw.a
++INCLUDES=-I../../qgen
++OBJS=debug.o
++PGMS=sw_debug
++
++include ../Rules.make
++
++sw_debug:	$(OBJS)
++		$(CC) $(LDFLAGS) -o sw_debug $(OBJS) $(LIBS) $(LDLIBS)
+diff -Naur linux-atm-2.5.0/src/switch/tcp/Makefile-0.79 open_linux_atm/src/switch/tcp/Makefile-0.79
+--- linux-atm-2.5.0/src/switch/tcp/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/switch/tcp/Makefile-0.79	2009-11-11 18:14:21.528339000 +0530
+@@ -0,0 +1,10 @@
++LIBS=-lsw -latmd -L..
++LIBDEPS=../../lib/libatmd.a ../libsw.a
++INCLUDES=-I../../qgen
++OBJS=tcpsw.o
++PGMS=sw_tcp
++
++include ../Rules.make
++
++sw_tcp:		$(OBJS)
++		$(CC) $(LDFLAGS) -o sw_tcp $(OBJS) $(LIBS) $(LDLIBS)
+diff -Naur linux-atm-2.5.0/src/test/Makefile-0.79 open_linux_atm/src/test/Makefile-0.79
+--- linux-atm-2.5.0/src/test/Makefile-0.79	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/src/test/Makefile-0.79	2009-11-11 18:14:21.619329000 +0530
+@@ -0,0 +1,43 @@
++ISP_OBJS=isp.o lex.yy.o y.tab.o
++USRPGMS=aread awrite ttcp_atm
++PGMS=align aping br bw isp window
++MAN1=
++TRASH=errnos.inc
++
++include ../Rules.make
++
++ttcp_atm.o:		ttcp.c ttcp.o
++			gcc -c -w -O2 -o ttcp_atm.o ttcp.c -I../lib
++
++ttcp.o:			# dummy
++			touch ttcp.o
++
++isp:			$(ISP_OBJS) ../lib/libatm.a ../lib/libatmd.a
++			$(CC) $(LDFLAGS) -o isp $(ISP_OBJS) $(LDLIBS) -latmd \
++			  -lfl
++
++lex.yy.c:		ispl.l y.tab.h
++			$(LEX) ispl.l
++
++y.tab.c y.tab.h:	ispl.y isp.h ../lib/atm.h
++			$(YACC) -d ispl.y
++
++isp.o:			errnos.inc
++
++errnos.inc:		mkerrnos.pl
++			perl ./mkerrnos.pl </usr/include/asm/errno.h \
++			  >errnos.inc || { rm -f errnos.inc; exit 1; }
++
++#
++# During "make depend", we need to have something that keeps the #include from
++# failing. The "touch" at the end makes sure that errnos.inc gets rebuilt in
++# time. The sleep 1 makes sure that mkerrnos.pl is really more recent than
++# errnos.inc
++#
++
++$(DEPEND):		fake_errnos.inc
++
++fake_errnos.inc:
++			echo "! This must not compile" >errnos.inc
++			sleep 1
++			touch mkerrnos.pl
+diff -Naur linux-atm-2.5.0/version.h open_linux_atm/version.h
+--- linux-atm-2.5.0/version.h	1970-01-01 05:30:00.000000000 +0530
++++ open_linux_atm/version.h	2009-11-11 18:14:21.723333000 +0530
+@@ -0,0 +1,2 @@
++#define APP_NAME        "LINUX_ATM"
++#define APP_VER         "2.5.0"

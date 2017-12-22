@@ -1,0 +1,4559 @@
+# HG changeset patch
+# Parent aea6aa973e4dfba95d4f08e7b9226164847e3492
+
+diff --git a/arch/mips/cpu/grx500/Makefile b/arch/mips/cpu/grx500/Makefile
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/Makefile
+@@ -0,0 +1,50 @@
++#
++# (C) Copyright 2003-2006
++# Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++#
++# See file CREDITS for list of people who contributed to this
++# project.
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License as
++# published by the Free Software Foundation; either version 2 of
++# the License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++# MA 02111-1307 USA
++#
++
++include $(TOPDIR)/config.mk
++
++LIB	= $(obj)lib$(CPU).a
++
++START	= start.o
++SOBJS-y	=  lowlevel_init.o init_cache.o \
++           init_vpe1.o init_exception.o  
++COBJS-y	= cpu.o clock.o interrupts.o cache.o interaptiv.o ibl.o 
++
++
++SRCS	:= $(START:.o=.S) $(SOBJS-y:.o=.S) $(COBJS-y:.o=.c)
++OBJS	:= $(addprefix $(obj),$(SOBJS-y) $(COBJS-y))
++START	:= $(addprefix $(obj),$(START))
++
++all:	$(obj).depend $(START) $(LIB)
++
++$(LIB):	$(OBJS)
++	$(AR) $(ARFLAGS) $@ $(OBJS)
++
++#########################################################################
++
++# defines $(obj).depend target
++include $(SRCTREE)/rules.mk
++
++sinclude $(obj).depend
++
++#########################################################################
+diff --git a/arch/mips/cpu/grx500/cache.c b/arch/mips/cpu/grx500/cache.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/cache.c
+@@ -0,0 +1,316 @@
++/*
++ * (C) Copyright 2003
++ * Wolfgang Denk, DENX Software Engineering, <wd@denx.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++#include <asm/addrspace.h>
++#include <asm/yamon.h>
++#include <asm/types.h>
++#include <asm/mipsregs.h>
++#include <asm/cacheops.h>
++#include <asm/cpu.h>
++
++typedef unsigned long ulong;
++
++#define cache_op(op,addr)						\
++	__asm__ __volatile__(						\
++	"	.set	push					\n"	\
++	"	.set	noreorder				\n"	\
++	"	.set	mips3\n\t				\n"	\
++	"	cache	%0, %1					\n"	\
++	"	.set	pop					\n"	\
++	:								\
++	: "i" (op), "R" (*(unsigned char *)(addr)))
++
++u32 get_cpu_id()
++{  
++   u32 config = read_c0_prid();
++   return ((config>>8) & 0xff);
++
++}
++
++u32 icache_lines()
++{
++   /* I-cache lines
++    * Calculated as associativity * sets per way
++	*/
++
++   u32 config,associativity,sets;
++   config = read_c0_config1();
++   associativity = 1+ ((config & M_Config1IA) >> S_Config1IA);
++   sets = (1<<((config & M_Config1IS) >> S_Config1IS)) * 64;
++   return (associativity * sets);
++}
++
++u32 icache_line_size()
++{
++    u32 config, line_size;
++    config=read_c0_config1();
++    line_size= 0x02 <<((config & M_Config1IL) >> (S_Config1IL));
++    return line_size;
++}
++									  
++
++u32 dcache_lines()
++{
++   /* I-cache lines
++    * Calculated as associativity * sets per way
++	*/
++
++   u32 config,associativity,sets;
++   config = read_c0_config1();
++   associativity = 1+ ((config & M_Config1DA) >> S_Config1DA);
++   sets = (1<<((config & M_Config1DS) >> S_Config1DS)) * 64;
++   return (associativity * sets);
++}
++
++u32 dcache_line_size()
++{
++    u32 config, line_size;
++    config=read_c0_config1();
++    line_size= 0x02 <<((config & M_Config1DL) >> (S_Config1DL));
++    return line_size;
++}
++										  
++u32 scache_lines() 
++{
++    u32 config, config2, associativity, sets, tmp;
++	u32 cpu_id = get_cpu_id();
++
++    if (cpu_id == CPU_4KEC)
++        return 0;
++ 
++	/* check the existance of config2 */
++    config = read_c0_config1();
++    if (!(config & MIPS_CONF_M)) 
++        return 0;
++
++    config2 = read_c0_config2();
++    /* check if L2 cache is activated */
++    if (!(config2 & (1 << 12)))
++        return 0;
++
++    tmp = (config2 >> 8) & 0x0f;
++    if (0 <= tmp && tmp <= 9)
++        sets = 64 << tmp;
++    else
++        return 0;
++
++    tmp = (config2 >> 0) & 0x0f;
++    if (0 <= tmp && tmp <= 7)
++        associativity = tmp + 1;
++    else
++        return 0;
++
++     return associativity * sets;
++    
++}
++
++u32 scache_linesize()
++{
++    u32 config, config2, linesize;
++	u32 cpu_id = get_cpu_id();
++	u32 tmp;
++
++    if (cpu_id == CPU_4KEC)
++        return 0;
++
++	/* check the existance of config2 reg */ 
++    config = read_c0_config1();
++    if (!(config & MIPS_CONF_M)) 
++        return 0;
++
++    config2 = read_c0_config2();
++    tmp = (config2 >> 4) & 0x0f;
++    if (0 < tmp && tmp <= 7)
++        linesize = 2 << tmp;
++    else 
++        return 0;
++    
++    return linesize; 
++}
++
++
++void init_icache()
++{
++    u32 lsize = icache_line_size();
++    u32 start_addr  = KSEG0;
++	u32 aend  = KSEG0  + (icache_lines()*lsize);
++	u32 cpu_id = get_cpu_id();    
++    u32 addr;
++ 
++	write_c0_taglo(0); 
++	//write_c0_taghi(0); /*not applicable to 4kec, 24kec and 34kc, will add if it is needed in the future*/
++    for(addr=start_addr;addr<aend; addr+=lsize){
++        cache_op(Index_Store_Tag_I, addr);
++	}
++}
++
++
++void lock_icache()
++{
++    u32 lsize = icache_line_size();
++    u32 start_addr  = 0x9fc00000;
++    u32 aend  = 0x9fc00000 + (icache_lines()*lsize);
++    u32 cpu_id = get_cpu_id();
++    u32 addr;
++
++    for(addr=start_addr;addr<=aend; addr+=lsize){
++	       cache_op(ICACHE_ADDR_FETCH_LOCK, addr);
++      }
++}
++
++void init_dcache()
++{
++     u32 lsize = dcache_line_size();
++	 u32 start_addr  = 0x9fc00000;
++	 u32 aend  = 0x9fc00000 + (dcache_lines()*lsize);
++	 u32 cpu_id = get_cpu_id();
++	 u32 addr;
++
++     write_c0_dtaglo(0);
++    //write_c0_taghi(0); /*not applicable to 4kec, 24kec and 34kc, will add if it is needed in the future*/
++    for(addr=start_addr;addr<aend; addr+=lsize){
++        cache_op(Index_Store_Tag_D, addr);
++     }
++}
++
++void lock_dcache()
++{
++    u32 lsize = dcache_line_size();
++    u32 start_addr  = 0x9fc00000;
++    u32 aend  = 0x9fc00000 + (dcache_lines()*lsize);
++    u32 cpu_id = get_cpu_id();
++    u32 addr;
++
++    for(addr=start_addr;addr<=aend; addr+=lsize){
++    	cache_op(DCACHE_ADDR_FETCH_LOCK, addr);
++	}
++}
++								 
++void init_scache()
++{
++	u32 cpu_id = get_cpu_id();    
++    u32 lsize = scache_linesize();
++    u32 start_addr = 0x80000000;
++    u32 aend = 0x80000000 + (scache_lines() * lsize);
++	u32 addr;
++
++    if (cpu_id == CPU_4KEC)
++        return;
++
++    write_c0_staglo(0);
++    for (addr = start_addr; addr < aend; addr += lsize)
++        cache_op(Index_Store_Tag_SD, addr);
++
++}
++
++void flush_cache(ulong start_addr, ulong size)
++{
++	unsigned long lsize = dcache_line_size();
++	unsigned long addr = start_addr & ~(lsize - 1);
++	unsigned long aend = (start_addr + size - 1) & ~(lsize - 1);
++	u32 cpu_id = get_cpu_id();    
++
++	while (1) {
++		if (cpu_id == CPU_INTERAPTIV) 
++			cache_op(Hit_Writeback_Inv_SD, addr);
++		cache_op(Hit_Writeback_Inv_D, addr);
++		cache_op(Hit_Invalidate_I, addr);
++		if (addr == aend)
++			break;
++		addr += lsize;
++	}
++}
++
++void flush_dcache_range(ulong start_addr, ulong stop)
++{
++	unsigned long lsize = dcache_line_size();
++	unsigned long addr = start_addr & ~(lsize - 1);
++	unsigned long aend = (stop - 1) & ~(lsize - 1);
++
++	while (1) {
++		cache_op(Hit_Writeback_Inv_D, addr);
++		if (addr == aend)
++			break;
++		addr += lsize;
++	}
++}
++
++void flush_scache_range(ulong start_addr, ulong stop)
++{
++	unsigned long lsize = scache_linesize();
++	unsigned long addr = start_addr & ~(lsize - 1);
++	unsigned long aend = (stop - 1) & ~(lsize - 1);
++	u32 cpu_id = get_cpu_id();    
++
++	if (cpu_id == CPU_4KEC)
++		return;
++
++	while (1) {
++		cache_op(Hit_Writeback_Inv_SD, addr);
++		if (addr == aend)
++			break;
++		addr += lsize;
++	}
++}
++
++void invalidate_dcache_range(ulong start_addr, ulong stop)
++{
++	unsigned long lsize = dcache_line_size();
++	unsigned long addr = start_addr & ~(lsize - 1);
++	unsigned long aend = (stop - 1) & ~(lsize - 1);
++
++	while (1) {
++		cache_op(Hit_Invalidate_D, addr);
++		if (addr == aend)
++			break;
++		addr += lsize;
++	}
++}
++
++void invalidate_scache_range(ulong start_addr, ulong stop)
++{
++	unsigned long lsize = scache_linesize();
++	unsigned long addr = start_addr & ~(lsize - 1);
++	unsigned long aend = (stop - 1) & ~(lsize - 1);
++	u32 cpu_id = get_cpu_id();    
++	
++	if (cpu_id == CPU_4KEC)
++		return;
++
++	while (1) {
++		cache_op(Hit_Invalidate_SD, addr);
++		if (addr == aend)
++			break;
++		addr += lsize;
++	}
++}
++
++void write_one_tlb(int index, u32 pagemask, u32 hi, u32 low0, u32 low1)
++{
++	write_c0_entrylo0(low0);
++	write_c0_pagemask(pagemask);
++	write_c0_entrylo1(low1);
++	write_c0_entryhi(hi);
++	write_c0_index(index);
++	tlb_write_indexed();
++}
++
+diff --git a/arch/mips/cpu/grx500/clock.c b/arch/mips/cpu/grx500/clock.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/clock.c
+@@ -0,0 +1,109 @@
++/*
++ * (C) Copyright 2003
++ * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++#include <config.h>
++#include <common.h>
++
++#define CPU_CLK_MST_SEL_2GHZ    0x20000000
++#define CLOCK_200M      200000000
++#define CLOCK_2000M     2000000000UL
++#define CLOCK_2400M     2400000000UL
++#define PLL0B_CFG1_CLK4 0xF000
++#define PLL0A_CFG1_CLK4 0xF000
++#define PLL0A_CFG1_CLK3 0x0F00
++#define PLL0B_CFG1_CLK3 0x0F00
++
++
++uint get_sys_clk(void)
++{
++    return 0;
++}
++
++
++uint get_cpu_clk(void)
++{
++       unsigned long pllclk;
++       u32 val;
++       u32 clk4_div;
++
++       val = REG32(CGU_PLL0A_CFG1);
++
++        if (val & CPU_CLK_MST_SEL_2GHZ) {
++                pllclk = CLOCK_2000M;
++                clk4_div = (REG32(CGU_PLL0B_CFG1) & PLL0B_CFG1_CLK4)>>12;
++        } else {
++                pllclk = CLOCK_2400M;
++                clk4_div = (REG32(CGU_PLL0A_CFG1) & PLL0A_CFG1_CLK4)>>12;
++        }
++
++        return (unsigned long)(pllclk / (clk4_div + 1));
++
++}
++
++
++unsigned int get_ddr_clk(void)
++{
++      
++       unsigned long pllclk;
++       u32 val=400000000;
++       u32 clk3_div;
++        
++#if 1       
++       pllclk = CLOCK_2000M;
++       clk3_div = (REG32(CGU_PLL0B_CFG1) & PLL0B_CFG1_CLK3)>>8;
++       /*fix me, should add more options*/
++       switch(clk3_div){
++          case 2:
++              val = (pllclk/3)<<1;
++              break;
++          case 3:
++              val = (pllclk/4)<<1;
++              break;
++          case 4:
++              val = (pllclk/5)<<1;
++              break;
++          case 5:
++              val = (pllclk/6)<<1; 
++              break;
++          case 6:
++              val = (pllclk/8)<<1;
++              break;
++          case 7:
++              val = (pllclk/10)<<1;
++              break;
++          case 8:
++              val = (pllclk/12)<<1;
++              break;
++
++       }
++#endif
++       return val;
++}
++
++
++unsigned int get_fpi_clk()
++{
++    //return 16000000/4;   // HAPS 800MHz CPU Actual Frequency is 16MHz;
++    return   CLOCK_200M;
++}
++
++
+diff --git a/arch/mips/cpu/grx500/cpu.c b/arch/mips/cpu/grx500/cpu.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/cpu.c
+@@ -0,0 +1,34 @@
++/*
++ * (C) Copyright 2003
++ * Wolfgang Denk, DENX Software Engineering, <wd@denx.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <common.h>
++#include <command.h>
++#include <asm/mipsregs.h>
++#include <asm/grx500.h>
++
++int do_reset(cmd_tbl_t *cmdtp, int flag, int argc, char *argv[])
++{
++       REG32(0xb6000010) |= 0x40000000;
++       return 0;
++}
++
+diff --git a/arch/mips/cpu/grx500/ibl.c b/arch/mips/cpu/grx500/ibl.c
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/ibl.c
+@@ -0,0 +1,265 @@
++#include <common.h>
++#include <asm/boot.h>
++#include <config.h>
++#include <asm/mt.h> 
++#include <asm/mipsregs.h>
++#include <asm/mipsmtregs.h>
++#include <asm/cps.h>
++#include <asm/ltq_vmb.h>
++
++
++#define asc_puts serial_puts
++#define asc_putc serial_putc
++
++#ifdef CONFIG_BOOT_FROM_NAND
++#define CONFIG_TEXT_BASE_ADDR	CONFIG_NAND_SPL_TEXT_BASE
++#elif CONFIG_BOOT_FROM_SPI
++#define CONFIG_TEXT_BASE_ADDR	CONFIG_SFDDR_TEXT_BASE
++#endif
++
++void print_u8(u8 data)
++{
++   char string[3]={0,0,0};
++   char ascii[16] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
++
++   string[0]=ascii[(data&0xf0)>>4];
++   string[1]=ascii[data&0xf];
++
++   asc_puts(string);
++}
++
++void print_u32(u32 data)
++{
++   print_u8( (u8) (data>>24)&0xff);
++   print_u8( (u8) (data>>16)&0xff);
++   print_u8( (u8) (data>>8)&0xff);
++   print_u8( (u8) (data>>0)&0xff);
++}
++
++void set_tc_policy(int tc_num, int group)
++{
++    write_c0_mvpcontrol((read_c0_mvpcontrol() & ~MVPCONTROL_EVP) | MVPCONTROL_VPC);
++    settc(tc_num);
++    write_tc_c0_tcschedule(read_tc_c0_tcschedule()| (group & 0x3));
++    write_c0_mvpcontrol((read_c0_mvpcontrol() & ~MVPCONTROL_VPC) | MVPCONTROL_EVP);
++    return;
++}
++
++static u32 tc_getinfo(int8_t cpu, TC_launch_t tc_launch[]) {
++	u32 tcmask = 0 , i = 0;
++
++	tcmask = tcmask | (0x1 << (cpu % 2));
++
++	for (i=0; i < MAX_TCS; i++) {
++		if ((tc_launch[i].tc_num > 0) && (tc_launch[i].tc_num < MAX_TC)){
++			tcmask = tcmask | (0x1 << tc_launch[i].tc_num);
++                        set_tc_policy(tc_launch[i].tc_num, tc_launch[i].mt_group);
++                }
++	}
++
++	return(tcmask);
++}
++
++static u32 Rx_Tx_IPI(int8_t cpu) {
++	switch(cpu) {
++		case 1:
++			return ((VMB_CPU_IPI1 << 16) | FW_VMB_IPI1);
++		case 2:
++			return ((VMB_CPU_IPI2 << 16) | FW_VMB_IPI2);
++		case 3:
++			return ((VMB_CPU_IPI3 << 16) | FW_VMB_IPI3);
++		default:
++			break;
++	}
++	return 0;
++}
++
++/*
++   This function is needed to trigger GIC IPI Interrupt .
++*/
++
++static void gic_trigger(int8_t cpu) {
++        switch(cpu) {
++                case 1:
++                        gic_send_ipi(FW_VMB_IPI1);
++                        break;
++                case 2:
++                        gic_send_ipi(FW_VMB_IPI2);
++                        break;
++                case 3:
++                        gic_send_ipi(FW_VMB_IPI3);
++                        break;
++                default:
++                        break;
++        }
++
++        return;
++}
++
++static void gic_clear(int8_t cpu) {
++	switch (cpu) {
++	case 1:
++		gic_clear_ipi(VMB_CPU_IPI1);
++		break;
++	case 2:
++		gic_clear_ipi(VMB_CPU_IPI2);
++		break;
++	case 3:
++		gic_clear_ipi(VMB_CPU_IPI3);
++		break;
++	default:
++		break;	
++	}
++}
++
++#if 1
++/* API to get the memory in DDR for strutures VMB_fw_msg_t/FW_vmb_msg_t */
++void *VMB_get_msg_addr (int cpu, int direction) {
++
++        void *msg_t =  (void *)(CPU_LAUNCH);
++
++        /* VMB --> FW : VMB_fw_msg_t structure */
++        if (direction == 0)
++                msg_t = msg_t + (vmb_msg_size * cpu) + sizeof(FW_vmb_msg_t);
++        else
++                msg_t = msg_t + (vmb_msg_size * cpu);
++
++        return (msg_t);
++}
++#else
++/* API to get the memory in DDR for strutures VMB_fw_msg_t/FW_vmb_msg_t */
++void *VMB_get_msg_addr (int cpu, int direction) {
++
++        void *msg_t =  (void *)(CPU_LAUNCH);
++
++        /* VMB --> FW : VMB_fw_msg_t structure */
++        if (direction == 0)
++                msg_t = msg_t + (vmb_msg_size * cpu) ;
++        else
++                msg_t = msg_t + (vmb_msg_size * cpu) + sizeof(VMB_fw_msg_t);
++
++        return (msg_t);
++}
++#endif
++
++void vpe_launch(int cpu, int c_id, int vpe_id, CPU_launch_t cpu_launch, TC_launch_t tc_launch[])
++{
++	u32  vmbfw = 0, addr = 0, fwvmb = 0, RxTx = 0, tcinfo = 0;
++	u32 ibl_loadaddr = CONFIG_TEXT_BASE_ADDR;
++
++	vmbfw = ((unsigned long)(VMB_get_msg_addr(cpu, 0)) & 0xffff);
++	tcinfo = tc_getinfo(cpu, tc_launch);
++
++
++      __write_32bit_c0_register($11, 0, (__read_32bit_c0_register($9, 0) + 1000));
++        asm volatile ("ehb");
++
++	/* a2 */
++	fwvmb = ((unsigned long)(VMB_get_msg_addr(cpu, 1)) & 0xffff);
++	addr = (fwvmb << 16) | vmbfw;
++	//asc_puts("\naddr "); print_u32(addr); 
++
++       asm volatile ("lw $6, %0" : : "m" ((unsigned long)addr));
++       asm volatile ("ehb");
++
++	/* a3 */
++	RxTx = Rx_Tx_IPI(cpu);
++       asm volatile ("lw $7, %0" : : "m" ((unsigned long)RxTx));
++       asm volatile ("ehb");
++	//asc_puts("\nRxTx "); print_u32(RxTx);
++
++	   /* s1 */
++       tcinfo = ((tcinfo << 16) | (unsigned long)cpu_launch.yield_res); 
++       asm volatile ("lw $17, %0" : : "m" (tcinfo));
++       asm volatile ("ehb");
++	  //asc_puts("\ntcinfo "); print_u32(tcinfo);
++
++        /* a0 */
++       asm volatile ("lw $4, %0" : : "m" ((unsigned long)cpu_launch.a0));
++       asm volatile ("ehb");
++
++        /* a1 */
++       asm volatile ("lw $5, %0" : : "m" ((unsigned long)cpu_launch.priv_info));
++       asm volatile ("ehb");
++
++	/* s0 */
++       asm volatile ("lw $16, %0" : : "m" ((unsigned long)ibl_loadaddr));
++       asm volatile ("ehb");
++
++       asm volatile ("lw $28, %0" : : "m" ((unsigned long)cpu_launch.gp));
++       asm volatile ("ehb");
++
++       asm volatile ("lw $t9, %0" : : "m" ((unsigned long)cpu_launch.start_addr));
++       asm volatile ("ehb");
++
++      asm volatile ("lw $29, %0" : : "m" ((unsigned long)cpu_launch.sp));
++       asm volatile ("ehb");
++
++       asm volatile ("ei");
++       asm volatile ("ehb");
++
++       asm volatile ("jr $t9");
++
++}
++
++
++/* Boot routine for Core 0/1, Vpe 0/1 */
++void ibl(u32 cpu_num, u32 core_num, u32 vpe_num)
++{
++        u32 msk,pnd;
++        int i;
++       FW_vmb_msg_t *fw_vmb;
++
++       //asc_puts("\nGRX500 cpu "); print_u8(cpu_num);asc_puts("\n");
++
++       fw_vmb = (FW_vmb_msg_t *)VMB_get_msg_addr(cpu_num, 1);
++
++       fw_vmb->status = (unsigned int)IBL_IN_WAIT;
++       fw_vmb->priv_info = (unsigned int)0;
++
++       /* TODO : Generate an IPI to Core0/VPE0 to update VMB as IBL_IN_WAIT */
++		gic_trigger(cpu_num);
++
++      //asc_puts("\nFW_VMB cpu "); print_u8((unsigned long)fw_vmb);
++
++    
++	asm volatile ("ei");  
++        asm volatile ("ehb") ;
++	REG32(CPUMSG) += 1;
++
++       while (1) {
++
++               r4k_wait_irqoff();
++
++		VMB_fw_msg_t *vmb_t, l_vmb_t;
++		int v_id, c_id;
++
++		asc_puts("\nOutside WAIT got IPI interrupt to launch from cpu "); print_u8(cpu_num);
++		asc_puts("\n");
++		REG32(INTMSG + cpu_num*4) = 0;
++		
++		/* gets the DDR address of the structure to this CPU*/
++		c_id = which_core(cpu_num);
++		v_id = vpe_in_core(cpu_num);
++		
++		vmb_t = (VMB_fw_msg_t *)VMB_get_msg_addr(cpu_num, 0);
++		memcpy(&l_vmb_t, vmb_t, sizeof(VMB_fw_msg_t));
++
++		asc_puts("\n MSG_ID = "); print_u8(l_vmb_t.msg_id);
++	
++		/* Clear IPI Interupts */
++		gic_clear(cpu_num);
++	
++		if (l_vmb_t.msg_id == VMB_CPU_START) {
++			// memset(vmb_t, 0, sizeof(VMB_fw_msg_t)); // commented as per MPEFW
++			vpe_launch(cpu_num, c_id, v_id, l_vmb_t.cpu_launch, l_vmb_t.tc_launch);
++		}
++       }
++	return;
++}
++
++
++
++
++
++
+diff --git a/arch/mips/cpu/grx500/init_cache.S b/arch/mips/cpu/grx500/init_cache.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_cache.S
+@@ -0,0 +1,289 @@
++/*
++Copyright (c) MIPS Technologies, Inc.  All rights reserved.  Unpublished
++rights reserved
++under the copyright laws of the United States of America and other countries.
++
++Redistribution and use in source and binary forms, with or without
++modification,
++are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its contributors
++   may be used to endorse or promote products derived from this software
++without
++   specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++
++/**************************************************************************************
++* init_icache invalidates all Instruction cache entries
++**************************************************************************************/
++
++LEAF(sys_init_icache)
++
++	// Can be skipped if using magic simulation cache flush
++
++	// Determine how big the I$ is
++	mfc0	v0, CP0_CONFIG, 1				
++
++	// I$ Line Size
++	ext	    v1, v0, MIPS_CONF1_IL_SHIFT, 3		// extract IL (16B/4KEc, 32B/InterAptiv)
++
++	// Skip ahead if No I$
++	beq	    v1, zero, done_icache
++	nop
++
++	li	    a2, 2
++	sllv    v1, a2, v1					// Now have true I$ line size in bytes (v1=32B/set) 
++
++	ext	    a0, v0,  MIPS_CONF1_IS_SHIFT , 3		// extract IS
++	li	    a2, 64
++	sllv    a0, a2, a0					// I$ Sets per way (512sets/way/4KEc, 256sets/way/InterAptiv)
++
++	// Config1IA == I$ Assoc - 1
++	ext	    a1, v0, MIPS_CONF1_IA_SHIFT, 3		// extract IA
++	add	    a1, 1					// a1 = 4 ways	
++
++	mul	    a0, a0, a1					// Total number of sets (2048sets/4KEc, 1024sets/InterAptiv)
++	lui	    a2, 0x8000					// 0x9fc0 Get a KSeg0 address for cacheops
++
++	// Clear TagLo/TagHi registers
++	mtc0    zero, CP0_TAGLO				// write C0_ITagLo $28,0
++
++	// For 4Kec
++	mtc0    zero, CP0_TAGHI
++
++	move    a3, a0						
++
++next_icache_tag:
++	cache   0x8, 0(a2)					// ICIndexStTag
++	add	    a3, -1						// Decrement set counter
++	bne     a3, zero, next_icache_tag
++	add     a2, v1						// Get next line address
++
++done_icache:
++
++    jr      ra
++    nop
++END(sys_init_icache)
++
++/**************************************************************************************
++* init_icache invalidates all Instruction cache entries
++**************************************************************************************/
++LEAF(sys_init_dcache)
++
++	mfc0	v0, CP0_CONFIG, 1				// read C0_Config1
++
++	// Isolate D$ Line Size
++	ext	    v1, v0,  MIPS_CONF1_DL_SHIFT, 3		// extract DL
++
++	// Skip ahead if No D$
++	beq	    v1, zero, done_dcache
++	nop
++
++	li	    a2, 2
++	sllv	v1, a2, v1					// Now have true D$ line size in bytes (16B/set/4KEc, 32B/set/InterAptiv)
++
++	ext	    a0, v0, MIPS_CONF1_DS_SHIFT, 3		// extract DS
++	li	    a2, 64
++	sllv	a0, a2, a0					// D$ Sets per way (512sets/way/4KEc, 256sets/way/InterAptiv)
++
++	ext	    a1, v0,  MIPS_CONF1_DA_SHIFT, 3		// extract DA
++	add	    a1, 1						// a1 = 4 ways
++
++	mul	    a0, a0, a1					// Get total number of sets (2048sets/4KEc, 1024sets/InterAptiv)
++
++	// Clear TagLo/TagHi registers
++	// Clear TagLo/TagHi registers
++	mtc0	zero, CP0_TAGLO				// write C0_TagLo 
++
++	// For 4Kec
++	mtc0    zero, CP0_TAGHI
++	
++	mtc0	zero, CP0_TAGLO, 2			// write C0_DTagLo
++	mtc0	zero, CP0_TAGHI, 2			// write C0_DTagHi
++	
++//DCIndexStTag	
++	lui     a2, 0x8000		    		// 9fc0 Get a KSeg0 address for cacheops
++	move	a3, a0						
++1:
++	// Index Store Tag Cache Op
++	// Will invalidate the tag entry, clear the lock bit, and clear the LRF bit
++
++        cache	    0x9, 0(a2)					// DCIndexStTag=0x9
++	add	    a3, -1			    		// Decrement set counter
++
++	bne	    a3, zero, 1b
++	add	    a2, v1		    			// Get next line address
++	
++done_dcache:
++    jr      ra
++    nop
++END(sys_init_dcache)
++
++/**************************************************************************************
++* fetch and lock 16KB dcache lines 
++**************************************************************************************/
++LEAF(init_dcache_lock)
++
++	mfc0	v0, CP0_CONFIG, 1				// read C0_Config1
++
++	// Isolate D$ Line Size
++	ext	    v1, v0,  MIPS_CONF1_DL_SHIFT, 3		// extract DL
++
++	// Skip ahead if No D$
++	beq	    v1, zero, done_dcache
++	nop
++
++	li	    a2, 2
++	sllv	v1, a2, v1					// Now have true D$ line size in bytes (16B/4KEc, 32B/InterAptiv)
++
++	ext	    a0, v0, MIPS_CONF1_DS_SHIFT, 3		// extract DS
++	li	    a2, 64
++	sllv	a0, a2, a0					// D$ Sets per way (512sets/way/4KEc, 256sets/way/InterAptiv)
++
++	ext	    a1, v0, MIPS_CONF1_DA_SHIFT, 3		// extract DA
++	add	    a1, 1						// (4ways/4KEc, 8ways/InterAptiv
++
++	mul	    a0, a0, a1					// Get total number of sets (2048sets/4KEc, 1024sets/InterAptiv)
++
++	
++//DCAddrFetchLock for first 8KBytes	
++	lui	    a2, 0x9fc0		    		// 9fc0 Get a KSeg0 address for cacheops
++	move	a3, a0						
++	
++	li		a0, 2
++	srlv	a3, a3, a0					// a3/=4, 8KByte 
++	
++1:
++	// Index Store Tag Cache Op
++	// Will invalidate the tag entry, clear the lock bit, and clear the LRF bit
++
++        cache	0x1d, 0(a2)					// DCAddrFetchLock=0x1d
++	add	    a3, -1			    		// Decrement set counter
++
++	bne	    a3, zero, 1b
++	add	    a2, v1		    			// Get next line address
++
++done_dcache_lock:
++    jr      ra
++    nop
++END(init_dcache_lock)
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(disable_L23)
++    beqz    r11_is_cps, done_disable_L23	# no cps skips
++    nop
++
++	bnez    r8_core_num, done_disable_L23	# Only done from core 0.
++
++    // Use CCA Override disable the L2 cache
++    // NOTE: If you have a L3 cache you must add code here
++    // to disable it or initialize it if it can't be disabled.
++    // Disable the L2 cache using CCA override by writing a 0x50 to
++    // the GCR Base register. 0x50 enables the CCA override bit and sets
++    // the CCA to uncached.
++
++	lw	    a0, 0x0008(r22_gcr_addr)  	// Read GCR_BASE
++    li      a3, 0x50                  	// Enable CCA and set to uncached
++    ins     a0, a3, 0, 8    			// Insert bits
++    sw      a0, 0x0008(r22_gcr_addr)  	// Write GCR_BASE
++
++done_disable_L23:
++    jr      ra
++    nop
++END(disable_L23)
++
++/**************************************************************************************
++* Initialize the L2 and L3 caches
++**************************************************************************************/
++LEAF(init_L23)
++    beqz    r11_is_cps, done_cach_init	// no cps skips
++    nop
++
++	bnez    r8_core_num, done_cach_init	// Only done from core 0.
++
++	// L2 Cache initialization routine
++	// Check L2 cache size
++	mfc0	v0, CP0_CONFIG, 2				// Read C0_Config2
++	// Isolate L2$ Line Size
++	ext	    v1, v0, 4, 4				// extract L2 line size
++	li	    a2, 2
++	sllv	v1, a2, v1					// Now have true L2$ line size in bytes (32B/InterAptiv)
++
++	// Isolate L2 Sets per Way (cache lines per way)
++	ext	    a3, v0, 8, 4				// extrace sets per way encoding
++	li	    a2, 64
++	sllv	a3, a2, a3					// L2$ Sets per way (1024 sets/way)
++
++	// Isolate L2 Associativity (number of ways)
++	// L2$ Assoc (-1)
++	ext	    a1, v0, 0, 4				// extract ways encoding
++	add	    a1, 1						// Decode L2 number of ways (8 ways)
++
++	mul	    a3, a3, a1					// Get total number of sets (8196 sets)
++	lui	    a2, 0x8000					// Get a KSeg0 address for cacheops
++
++	// Clear L23TagLo/L23TagHi registers these are used to set the cache tag
++	mtc0	zero, CP0_TAGLO, 4
++	
++	// L2$ Index Store Tag Cache Op
++	// Will invalidate the tag entry, clear the lock bit, and clear the LRF bit
++next_L2cache_tag:
++	cache	0xb, 0(a2)					// Write Tag using index store tag
++	add	    a3, -1						// Decrement set counter
++
++	bne	    a3, zero, next_L2cache_tag 	// Done yet?
++	add	    a2, v1						// Get next line address (each tag covers one line)
++
++done_l2cache:
++    // disable CCA Override to enable L2 cache
++	lw	    a0, 0x0008(r22_gcr_addr)  	// GCR_BASE
++    ins     a0, zero, 0, 8            	// CCA Override disabled
++    sw      a0, 0x0008(r22_gcr_addr)  	// GCR_BASE
++
++done_cach_init:
++    jr      ra
++    nop
++END(init_L23)
++
++LEAF(change_k0_cca)
++	// NOTE! This code must be executed in KSEG1 (not KSGE0 uncached)
++    // Set CCA for kseg0 to cacheable
++	mfc0	v0, CP0_CONFIG				// read C0_Config
++	beqz    r11_is_cps, set_kseg0_cca
++	li	    v1, 3						// CCA for non coherent core
++	li	    v1, 5						// CCA for coherent cores
++
++set_kseg0_cca:
++
++    ins	    v0, v1, 0, 3				// insert K0
++    mtc0	v0, CP0_CONFIG				// write C0_Config
++    jr.hb      ra
++    nop
++
++END(change_k0_cca)
+diff --git a/arch/mips/cpu/grx500/init_caches2.S b/arch/mips/cpu/grx500/init_caches2.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_caches2.S
+@@ -0,0 +1,255 @@
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++
++/**************************************************************************************
++* init_icache invalidates all Instruction cache entries
++**************************************************************************************/
++
++LEAF(sys_init_icache)
++
++	// Can be skipped if using magic simulation cache flush
++
++	// Determine how big the I$ is
++	mfc0	v0, CP0_CONFIG, 1				
++
++	// I$ Line Size
++	ext	    v1, v0, MIPS_CONF1_IL_SHIFT, 3		// extract IL (16B/4KEc, 32B/InterAptiv)
++
++	// Skip ahead if No I$
++	beq	    v1, zero, done_icache
++	nop
++
++	li	    a2, 2
++	sllv    v1, a2, v1					// Now have true I$ line size in bytes (v1=32B/set) 
++
++	ext	    a0, v0,  MIPS_CONF1_IS_SHIFT , 3		// extract IS
++	li	    a2, 64
++	sllv    a0, a2, a0					// I$ Sets per way (512sets/way/4KEc, 256sets/way/InterAptiv)
++
++	// Config1IA == I$ Assoc - 1
++	ext	    a1, v0, MIPS_CONF1_IA_SHIFT, 3		// extract IA
++	add	    a1, 1					// a1 = 4 ways	
++
++	mul	    a0, a0, a1					// Total number of sets (2048sets/4KEc, 1024sets/InterAptiv)
++	lui	    a2, 0x8000					// 0x9fc0 Get a KSeg0 address for cacheops
++
++	// Clear TagLo/TagHi registers
++	mtc0    zero, CP0_TAGLO				// write C0_ITagLo $28,0
++
++	// For 4Kec
++	mtc0    zero, CP0_TAGHI
++
++	move    a3, a0						
++
++next_icache_tag:
++	cache   0x8, 0(a2)					// ICIndexStTag
++	add	    a3, -1						// Decrement set counter
++	bne     a3, zero, next_icache_tag
++	add     a2, v1						// Get next line address
++
++done_icache:
++
++    jr      ra
++    nop
++END(sys_init_icache)
++
++/**************************************************************************************
++* init_icache invalidates all Instruction cache entries
++**************************************************************************************/
++LEAF(sys_init_dcache)
++
++	mfc0	v0, CP0_CONFIG, 1				// read C0_Config1
++
++	// Isolate D$ Line Size
++	ext	    v1, v0,  MIPS_CONF1_DL_SHIFT, 3		// extract DL
++
++	// Skip ahead if No D$
++	beq	    v1, zero, done_dcache
++	nop
++
++	li	    a2, 2
++	sllv	v1, a2, v1					// Now have true D$ line size in bytes (16B/set/4KEc, 32B/set/InterAptiv)
++
++	ext	    a0, v0, MIPS_CONF1_DS_SHIFT, 3		// extract DS
++	li	    a2, 64
++	sllv	a0, a2, a0					// D$ Sets per way (512sets/way/4KEc, 256sets/way/InterAptiv)
++
++	ext	    a1, v0,  MIPS_CONF1_DA_SHIFT, 3		// extract DA
++	add	    a1, 1						// a1 = 4 ways
++
++	mul	    a0, a0, a1					// Get total number of sets (2048sets/4KEc, 1024sets/InterAptiv)
++
++	// Clear TagLo/TagHi registers
++	// Clear TagLo/TagHi registers
++	mtc0	zero, CP0_TAGLO				// write C0_TagLo 
++
++	// For 4Kec
++	mtc0    zero, CP0_TAGHI
++	
++	mtc0	zero, CP0_TAGLO, 2			// write C0_DTagLo
++	mtc0	zero, CP0_TAGHI, 2			// write C0_DTagHi
++	
++//DCIndexStTag	
++	lui     a2, 0x8000		    		// 9fc0 Get a KSeg0 address for cacheops
++	move	a3, a0						
++1:
++	// Index Store Tag Cache Op
++	// Will invalidate the tag entry, clear the lock bit, and clear the LRF bit
++
++        cache	    0x9, 0(a2)					// DCIndexStTag=0x9
++	add	    a3, -1			    		// Decrement set counter
++
++	bne	    a3, zero, 1b
++	add	    a2, v1		    			// Get next line address
++	
++done_dcache:
++    jr      ra
++    nop
++END(sys_init_dcache)
++
++/**************************************************************************************
++* fetch and lock 16KB dcache lines 
++**************************************************************************************/
++LEAF(init_dcache_lock)
++
++	mfc0	v0, CP0_CONFIG, 1				// read C0_Config1
++
++	// Isolate D$ Line Size
++	ext	    v1, v0,  MIPS_CONF1_DL_SHIFT, 3		// extract DL
++
++	// Skip ahead if No D$
++	beq	    v1, zero, done_dcache
++	nop
++
++	li	    a2, 2
++	sllv	v1, a2, v1					// Now have true D$ line size in bytes (16B/4KEc, 32B/InterAptiv)
++
++	ext	    a0, v0, MIPS_CONF1_DS_SHIFT, 3		// extract DS
++	li	    a2, 64
++	sllv	a0, a2, a0					// D$ Sets per way (512sets/way/4KEc, 256sets/way/InterAptiv)
++
++	ext	    a1, v0, MIPS_CONF1_DA_SHIFT, 3		// extract DA
++	add	    a1, 1						// (4ways/4KEc, 8ways/InterAptiv
++
++	mul	    a0, a0, a1					// Get total number of sets (2048sets/4KEc, 1024sets/InterAptiv)
++
++	
++//DCAddrFetchLock for first 8KBytes	
++	lui	    a2, 0x9fc0		    		// 9fc0 Get a KSeg0 address for cacheops
++	move	a3, a0						
++	
++	li		a0, 2
++	srlv	a3, a3, a0					// a3/=4, 8KByte 
++	
++1:
++	// Index Store Tag Cache Op
++	// Will invalidate the tag entry, clear the lock bit, and clear the LRF bit
++
++        cache	0x1d, 0(a2)					// DCAddrFetchLock=0x1d
++	add	    a3, -1			    		// Decrement set counter
++
++	bne	    a3, zero, 1b
++	add	    a2, v1		    			// Get next line address
++
++done_dcache_lock:
++    jr      ra
++    nop
++END(init_dcache_lock)
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(disable_L23)
++    beqz    r11_is_cps, done_disable_L23	# no cps skips
++    nop
++
++	bnez    r8_core_num, done_disable_L23	# Only done from core 0.
++
++    // Use CCA Override disable the L2 cache
++    // NOTE: If you have a L3 cache you must add code here
++    // to disable it or initialize it if it can't be disabled.
++    // Disable the L2 cache using CCA override by writing a 0x50 to
++    // the GCR Base register. 0x50 enables the CCA override bit and sets
++    // the CCA to uncached.
++
++	lw	    a0, 0x0008(r22_gcr_addr)  	// Read GCR_BASE
++    li      a3, 0x50                  	// Enable CCA and set to uncached
++    ins     a0, a3, 0, 8    			// Insert bits
++    sw      a0, 0x0008(r22_gcr_addr)  	// Write GCR_BASE
++
++done_disable_L23:
++    jr      ra
++    nop
++END(disable_L23)
++
++/**************************************************************************************
++* Initialize the L2 and L3 caches
++**************************************************************************************/
++LEAF(init_L23)
++    beqz    r11_is_cps, done_cach_init	// no cps skips
++    nop
++
++	bnez    r8_core_num, done_cach_init	// Only done from core 0.
++
++	// L2 Cache initialization routine
++	// Check L2 cache size
++	mfc0	v0, CP0_CONFIG, 2				// Read C0_Config2
++	// Isolate L2$ Line Size
++	ext	    v1, v0, 4, 4				// extract L2 line size
++	li	    a2, 2
++	sllv	v1, a2, v1					// Now have true L2$ line size in bytes (32B/InterAptiv)
++
++	// Isolate L2 Sets per Way (cache lines per way)
++	ext	    a3, v0, 8, 4				// extrace sets per way encoding
++	li	    a2, 64
++	sllv	a3, a2, a3					// L2$ Sets per way (1024 sets/way)
++
++	// Isolate L2 Associativity (number of ways)
++	// L2$ Assoc (-1)
++	ext	    a1, v0, 0, 4				// extract ways encoding
++	add	    a1, 1						// Decode L2 number of ways (8 ways)
++
++	mul	    a3, a3, a1					// Get total number of sets (8196 sets)
++	lui	    a2, 0x8000					// Get a KSeg0 address for cacheops
++
++	// Clear L23TagLo/L23TagHi registers these are used to set the cache tag
++	mtc0	zero, CP0_TAGLO, 4
++	
++	// L2$ Index Store Tag Cache Op
++	// Will invalidate the tag entry, clear the lock bit, and clear the LRF bit
++next_L2cache_tag:
++	cache	0xb, 0(a2)					// Write Tag using index store tag
++	add	    a3, -1						// Decrement set counter
++
++	bne	    a3, zero, next_L2cache_tag 	// Done yet?
++	add	    a2, v1						// Get next line address (each tag covers one line)
++
++done_l2cache:
++    // disable CCA Override to enable L2 cache
++	lw	    a0, 0x0008(r22_gcr_addr)  	// GCR_BASE
++    ins     a0, zero, 0, 8            	// CCA Override disabled
++    sw      a0, 0x0008(r22_gcr_addr)  	// GCR_BASE
++
++done_cach_init:
++    jr      ra
++    nop
++END(init_L23)
++
++LEAF(change_k0_cca)
++	// NOTE! This code must be executed in KSEG1 (not KSGE0 uncached)
++    // Set CCA for kseg0 to cacheable
++	mfc0	v0, CP0_CONFIG				// read C0_Config
++	beqz    r11_is_cps, set_kseg0_cca
++	li	    v1, 3						// CCA for non coherent core
++	li	    v1, 5						// CCA for coherent cores
++
++set_kseg0_cca:
++
++    ins	    v0, v1, 0, 3				// insert K0
++    mtc0	v0, CP0_CONFIG				// write C0_Config
++    jr.hb      ra
++    nop
++
++END(change_k0_cca)
+diff --git a/arch/mips/cpu/grx500/init_cm.S b/arch/mips/cpu/grx500/init_cm.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_cm.S
+@@ -0,0 +1,40 @@
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/cps.h>
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_cm)
++
++
++	// Allow each core access to the CM registers (they should only access their local registers.)
++	li	    a0, 2							// Start building mask for cores in this cps.
++    sll     a0, a0, r19_more_cores
++    addiu   a0, -1							// Complete mask.
++	sw	    a0, GCR_ACCESS(r22_gcr_addr)	// GCR_ACCESS
++
++    // Check to see if this CPS implements an IOCU.
++    lw      a0, GCR_CONFIG(r22_gcr_addr)	// Load GCR_CONFIG
++    ext	    a0, a0, NUMIOCU, NUMIOCU_S		// Extract NUMIOCU.
++    beqz    a0, done_cm_init
++    lui	    a0, 0xffff
++
++	// Disable the CM regions if there is an IOCU.
++	sw	    a0, GCR_REG0_BASE(r22_gcr_addr)	// GCR_REG0_BASE
++	sw	    a0, GCR_REG0_MASK(r22_gcr_addr)	// GCR_REG0_MASK
++	sw	    a0, GCR_REG1_BASE(r22_gcr_addr)	// GCR_REG1_BASE
++	sw	    a0, GCR_REG1_MASK(r22_gcr_addr)	// GCR_REG1_MASK
++	sw	    a0, GCR_REG2_BASE(r22_gcr_addr)	// GCR_REG2_BASE
++	sw	    a0, GCR_REG2_MASK(r22_gcr_addr)	// GCR_REG2_MASK
++	sw	    a0, GCR_REG3_BASE(r22_gcr_addr)	// GCR_REG3_BASE
++	sw	    a0, GCR_REG3_MASK(r22_gcr_addr)	// GCR_REG3_MASK
++	sw	    a0, GCR_REG4_BASE(r22_gcr_addr)	// GCR_REG4_BASE
++	sw	    a0, GCR_REG4_MASK(r22_gcr_addr)	// GCR_REG4_MASK
++	sw	    a0, GCR_REG5_BASE(r22_gcr_addr)	// GCR_REG5_BASE
++	sw	    a0, GCR_REG5_MASK(r22_gcr_addr)	// GCR_REG5_MASK
++done_cm_init:
++	jr      ra
++	nop
++END(init_cm)
+diff --git a/arch/mips/cpu/grx500/init_cp0.S b/arch/mips/cpu/grx500/init_cp0.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_cp0.S
+@@ -0,0 +1,73 @@
++#include <asm/boot.h>
++#include <config.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++#include <asm/addrspace.h>
++
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_cp0)
++
++        // Initialize Status
++	li	v1, 0x00400404		// (M_StatusBEV=1 | M_StatusIM | M_StatusERL) - Compatibility Int Mode
++	mtc0	v1, CP0_STATUS		// write C0_Status $12
++
++	// Initialize Watch registers if implemented.
++	mfc0	v0, CP0_CONFIG,1		// read C0_Config1
++	ext     v1, v0, 3, 1		// extract bit 3 WR (Watch registers implemented)
++	beq 	v1, zero, done_wr
++	li    	v1, 0x7				// (M_WatchHiI | M_WatchHiR | M_WatchHiW)
++
++	// Clear Watch Status bits and disable watch exceptions
++	mtc0	v1, CP0_WATCHHI		// write C0_WatchHi0
++	mfc0	v0, CP0_WATCHHI		// read C0_WatchHi0
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO	// write C0_WatchLo0
++
++	mtc0	v1, CP0_WATCHHI, 1	// write C0_WatchHi1
++	mfc0	v0, CP0_WATCHHI, 1	// read C0_WatchHi1
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 1	// write C0_WatchLo1
++
++	mtc0	v1, CP0_WATCHHI, 2	// write C0_WatchHi2
++	mfc0	v0, CP0_WATCHHI, 2	// read C0_WatchHi2
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 2	// write C0_WatchLo2
++
++	mtc0	v1, CP0_WATCHHI, 3	// write C0_WatchHi3
++	mfc0	v0, CP0_WATCHHI, 3	// read C0_WatchHi3
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 3	// write C0_WatchLo3
++
++	mtc0	v1, CP0_WATCHHI, 4	// write C0_WatchHi4
++	mfc0	v0, CP0_WATCHHI, 4	// read C0_WatchHi4
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 4	// write C0_WatchLo4
++
++	mtc0	v1, CP0_WATCHHI, 5	// write C0_WatchHi5
++	mfc0	v0, CP0_WATCHHI, 5	// read C0_WatchHi5
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 5	// write C0_WatchLo5
++
++	mtc0	v1, CP0_WATCHHI, 6	// write C0_WatchHi6
++	mfc0	v0, CP0_WATCHHI, 6	// read C0_WatchHi6
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 6	// write C0_WatchLo6
++
++	mtc0	v1, CP0_WATCHHI, 7	// write C0_WatchHi7
++	mtc0	zero, CP0_WATCHLO, 7	// write C0_WatchLo7
++
++done_wr:
++
++	// Clear WP bit to avoid watch exception upon user code entry, IV, and software interrupts.
++	mtc0	zero, CP0_CAUSE		// write C0_Cause: Init AFTER init of CP0 WatchHi/Lo registers.
++
++	// Clear timer interrupt. (Count was cleared at the reset vector to allow timing boot.)
++	mtc0	zero, CP0_COMPARE	// write C0_Compare
++
++    jr      ra
++	nop
++END(init_cp0)
+diff --git a/arch/mips/cpu/grx500/init_cpc.S b/arch/mips/cpu/grx500/init_cpc.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_cpc.S
+@@ -0,0 +1,16 @@
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/cps.h>
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_cpc)
++    li      a0, CPC_P_BASE_ADDR				
++    sw      a0, GCR_CPC_BASE(r22_gcr_addr)		
++    li      r30_cpc_addr, CPC_BASE_ADDR		
++    jr      ra
++    nop
++END(init_cpc)
+diff --git a/arch/mips/cpu/grx500/init_exception.S b/arch/mips/cpu/grx500/init_exception.S
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_exception.S
+@@ -0,0 +1,77 @@
++/*
++Copyright (c) MIPS Technologies, Inc.  All rights reserved.  Unpublished
++rights reserved
++under the copyright laws of the United States of America and other countries.
++
++Redistribution and use in source and binary forms, with or without
++modification,
++are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its contributors
++   may be used to endorse or promote products derived from this software
++without
++   specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#include <asm/boot.h>
++#include <config.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++
++
++#define C0_CAUSE_IV_BIT 0x1<<23
++#define C0_STATUS_IM_MSK 0xff<<8
++#define C0_STATUS_BEV_BIT 0x1<<22
++#define C0_STATUS_IE_BIT 0x1
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++/**********************************************************************************************/
++LEAF(init_exception)
++        /* CAUSE register */
++        li      k0, C0_CAUSE_IV_BIT
++        mtc0    k0, CP0_CAUSE
++
++        li      v0, 0x0
++
++        li      v1, 8
++        beq     r23_cpu_num, v0, 1f
++        nop       
++ 
++        beqz    r23_cpu_num, 1f
++        nop         
++
++#ifdef CONFIG_BOOT_FROM_NAND
++        li      v0, CONFIG_NAND_SPL_TEXT_BASE
++#else
++        li      v0, CONFIG_SFDDR_TEXT_BASE
++#endif
++        li      v1, (0x3ffff<<12)
++        and     v0, v1
++        mtc0    v0, CP0_EBASE
++
++        li      v0, 0x00000401     
++1:
++        mtc0    v0, CP0_STATUS
++        jr     ra
++        nop
++END(init_exception)
+diff --git a/arch/mips/cpu/grx500/init_gic.S b/arch/mips/cpu/grx500/init_gic.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_gic.S
+@@ -0,0 +1,54 @@
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/cps.h>
++
++	.set	noreorder           
++	.set	noat                
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_gic)
++
++    beqz    r11_is_cps, done_gic				// Skip if non-CPS.
++    nop
++
++    bnez    r23_cpu_num, done_gic				// Only core0 vpe0 inits shared portion.
++    nop
++
++//Only cpu0 = core0+vpe0 to reach here
++/*set GIC base address and enable it*/
++
++    li      a1, GCR_CONFIG_ADDR + GCR_GIC_BASE  	// Locate and enable GIC
++    li      a0, GIC_P_BASE_ADDR | 1 			// Physical address + enable bit
++    sw      a0, 0(a1)				        // a0 = 0x12320001
++
++
++/*initialize IPI for VPE1/core0, VPE0/core1, VPE1/core1*/
++    li      a1, GIC_BASE_ADDR		// GIC_BASE_ADDR = 0xb2320000
++    // IPI interrupts 20, 21 85  
++    li      a0, 0x00300000
++    sw      a0, GIC_SH_RMASK31_0(a1)	// (disable     56..59)
++    sw      a0, GIC_SH_POL31_0(a1)		// (high/rise   56..59)
++    sw      a0, GIC_SH_TRIG31_0(a1)	// (edge        56..59)
++    sw      a0, GIC_SH_SMASK31_00(a1)	// (enable      56..59)
++
++    li      a0, 0x00200000
++    sw      a0, GIC_SH_RMASK95_64(a1)	// (disable     56..59)
++    sw      a0, GIC_SH_POL95_64(a1)		// (high/rise   56..59)
++    sw      a0, GIC_SH_TRIG95_64(a1)	// (edge        56..59)
++    sw      a0, GIC_SH_SMASK95_64(a1)	// (enable      56..59)
++     
++ 
++    li      a0, 1              // set bit 0 for CORE0 or for MT vpe0
++    sll     a0, a0, 1          // set bit 1 for CORE1 or for MT vpe1
++    sw      a0, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 20) (a1)
++    sll     a0, a0, 1          // set bit 2 for CORE2 or for MT vpe2
++    sw      a0, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 21) (a1)
++    sll     a0, a0, 1          // set bit 3 for CORE3 or for MT vpe3
++    sw      a0, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 85) (a1)
++
++done_gic:
++    jr      ra
++    nop
++
++END(init_gic)
+diff --git a/arch/mips/cpu/grx500/init_vpe1.S b/arch/mips/cpu/grx500/init_vpe1.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/init_vpe1.S
+@@ -0,0 +1,241 @@
++/*
++Copyright (c) MIPS Technologies, Inc.  All rights reserved.  Unpublished
++rights reserved
++under the copyright laws of the United States of America and other countries.
++
++Redistribution and use in source and binary forms, with or without
++modification,
++are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its contributors
++   may be used to endorse or promote products derived from this software
++without
++   specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++
++#define C0_MVPCTL $0, 1
++#define C0_MVPCONF0 $0, 2
++#define C0_VPECTL $1, 1
++#define C0_VPECONF0 $1, 2
++#define C0_TCSTATUS $2, 1
++#define C0_TCBIND $2, 2
++#define C0_TCRESTART $2, 3
++#define C0_TCHALT $2, 4
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_vpe1)
++
++   // Each vpe will need to set up additional TC bound to it. (No rebinding.)
++
++	// This is executing on TC0 bound to VPE0.  Therefore VPEConf0.MVP is set.
++	// Enter config mode
++	mfc0	v0, C0_MVPCTL	// read C0_MVPCtl
++	or		v0, (1 << 1)		// set VPC
++	mtc0	v0, C0_MVPCTL	// write C0_MVPCtl
++	ehb
++
++#define a0_NTCS	a0
++#define a2_NVPES	a2
++#define a3_TC	a3
++
++	// Get number of a3_TC's and VPE's
++	mfc0	v0, C0_MVPCONF0	// read C0_MVPCONF0
++	ext		a0_NTCS, v0, 0, 8	// extract PTC
++	ext		a2_NVPES, v0, 10, 4	// extract PVPE
++
++	// Initialise a3_TC's/VPE's
++	move	a3_TC, zero
++nexttc:
++	// Select TCn
++	mfc0	v0, C0_VPECTL	// read C0_VPECTL
++	ins		v0, a3_TC, 0, 8		// insert TargTC
++	mtc0	v0, C0_VPECTL	// write C0_VPECTL
++	ehb
++
++	// Bind a3_TC to next VPE
++	beqz	a3_TC, nextvpe	// Don't rebind TC0
++	nop
++
++	// Halt a3_TC being configured
++	li		v0, 1			    // set Halt bit
++	mttc0	v0, C0_TCHALT	// write C0_TCHALT
++	ehb
++
++	move    v1, a3_TC
++	# Bind TC to a VPE
++	mftc0   v0, C0_TCBIND	// Read C0_TCBind
++	ins     v0, v1, 0, 4	// change S_TCBindCurVPE
++	mttc0   v0, C0_TCBIND	// write C0_TCBind
++
++	// This code checks to see if the a3_TC mumber is
++	// less than the VPE number. This ensures
++	// in a system with more than 1 VPE and TCs each
++	// VPE will have at least one a3_TC bound to it
++	// and any TCs left over will be bound to the last a3_TC
++	slt		v1, a2_NVPES, a3_TC
++	bnez	v1, 2f			// Bind spare a3_TC's to VPElast
++	move	v1, a2_NVPES
++
++	// Set XTC for active a3_TC's
++	mftc0	v0, C0_VPECONF0	// read C0_VPECONF0
++	ins		v0, a3_TC, 21, 8 // insert XTC
++	mttc0	v0, C0_VPECONF0	// write C0_VPECONF0
++
++	move	v1, a3_TC
++2:
++	// Bind a3_TC to a VPE
++	mftc0	v0, C0_TCBIND	// read C0_TCBIND
++	ins		v0, v1, 0, 4	// insert VPE
++	mttc0	v0, C0_TCBIND	// write C0_TCBIND
++
++	// Set up TCStatus register:
++	// Disable Coprocessor Usable bits
++	// Disable MDMX/DSP ASE
++	// Clear Dirty a3_TC
++	// not dynamically allocatable
++	// not allocated
++	// Kernel mode
++	// interrupt exempt
++	// ASID 0
++	li		v0, (1 << 10)	// set IXMT
++	mttc0	v0, C0_TCSTATUS	// write C0_TCSTATUS
++
++	// Initialize the a3_TC's register file
++	li v0, 0xdeadbeef
++	mttgpr	v0, $1
++	mttgpr	v0, $2
++	mttgpr	v0, $3
++	mttgpr	v0, $4
++	mttgpr	v0, $5
++	mttgpr	v0, $6
++	mttgpr	v0, $7
++	mttgpr	v0, $8
++	mttgpr	v0, $9
++	mttgpr	v0, $10
++	mttgpr	v0, $11
++	mttgpr	v0, $12
++	mttgpr	v0, $13
++	mttgpr	v0, $14
++	mttgpr	v0, $15
++	mttgpr	v0, $16
++	mttgpr	v0, $17
++	mttgpr	v0, $18
++	mttgpr	v0, $19
++	mttgpr	v0, $20
++	mttgpr	v0, $21
++	mttgpr	v0, $22
++	mttgpr	v0, $23
++	mttgpr	v0, $24
++	mttgpr	v0, $25
++	mttgpr	v0, $26
++	mttgpr	v0, $27
++	mttgpr	v0, $28
++	mttgpr	v0, $29
++	mttgpr	v0, $30
++	mttgpr	v0, $31
++
++nextvpe:
++	slt		v1, a2_NVPES, a3_TC
++	bnez	v1, donevpe		// No more VPE's
++	nop
++
++	// Disable multi-threading with a3_TC's
++	mftc0	v0, C0_VPECTL	// read C0_VPECTL
++	ins		v0, zero, 15, 1	// clear TE
++	mttc0	v0, C0_VPECTL	// write C0_VPECTL
++
++	beqz	a3_TC, 1f
++	nop
++
++	// For VPE1..n
++	// Clear VPA and set master VPE
++	mftc0	v0, C0_VPECONF0	// read C0_VPECONF0
++	ins		v0, zero, 0, 1	// insert VPA
++	or		v0, (1 << 1)	// set MVP
++	mttc0	v0, C0_VPECONF0	// write C0_VPECONF0
++
++	mfc0	v0, CP0_STATUS	// read CP0_STATUS
++	mttc0	v0, CP0_STATUS	// write CP0_Status
++
++	li		v0, 0x12345678
++	mttc0	v0, CP0_EPC		// write C0_EPC
++
++	mttc0	zero, CP0_CAUSE	// write C0_CAUSE
++
++	mfc0	v0, CP0_CONFIG	// read C0_CONFIG
++	mttc0	v0, CP0_CONFIG	// write C0_CONFIG
++
++	mftc0	v0, CP0_EBASE	// read C0_EBASE
++	ext		v0, v0, 0, 10	// extract CPUNum
++	mttgpr	v0, r23_cpu_num
++
++	// vpe1 of each core can execute cached as it's L1 I$ has already been initialized.
++    // and the L2$ has been initialized or "disabled" via CCA override.
++	la		a1, __reset_vector
++//TRI 1-1-2014
++//Temporary comment out until cache issue is fixed	
++//	ins     a1, zero, 29, 1 // Convert to cached kseg0 address in case we linked to kseg1.
++	mttc0   a1, C0_TCRESTART // write C0_TCRESTART
++
++	// Yes.. this is undoing all of the work done above... :)
++	mftc0	v0, C0_TCSTATUS	// read C0_TCSTATUS
++	ins	    v0, zero, 10, 1	// insert IXMT
++	ori	    v0, (1 << 13)	// set A
++	mttc0	v0, C0_TCSTATUS	// write C0_TCSTATUS
++
++	mttc0	zero, C0_TCHALT	// write C0_TCHALT
++
++	mftc0	v0, C0_VPECONF0	// read C0_VPECONF0
++	ori	    v0, 1		    // set VPA
++	mttc0	v0, C0_VPECONF0	// write C0_VPECONF0
++1:
++
++donevpe:
++	addu	a3_TC, 1
++	sltu	v1, a0_NTCS, a3_TC
++	beqz	v1, nexttc
++	nop
++
++	// Exit config mode
++	mfc0	v0, C0_MVPCTL	// read C0_MVPCtl
++    ori     v0, 1           // set EVP will enable execution by vpe1
++	ins	    v0, zero, 1, 1	// insert VPC
++	mtc0	v0, C0_MVPCTL	// write C0_MVPCtl
++	ehb
++
++#undef a0_NTCS
++#undef a2_NVPES
++#undef a3_TC
++
++done_init_vpe1:
++
++    jr   ra
++    nop
++END(init_vpe1)
++
+diff --git a/arch/mips/cpu/grx500/interaptiv.c b/arch/mips/cpu/grx500/interaptiv.c
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/interaptiv.c
+@@ -0,0 +1,217 @@
++#include <common.h>
++
++u32 permission_wr(u32 addr, u32 val){
++    REG32(addr) = val;
++   
++    return 0;
++}
++
++void set_permission(void)
++{
++	  int i;
++		i = 0;
++    i += permission_wr(0xb3f81458, 0x1f); 	//ssb6:ln60
++    i += permission_wr(0xb3f81450, 0x1f); 
++    i += permission_wr(0xb3f80858, 0x7f); 	//ssb6:ddr,memmax ,vector 0, 0x7f
++    i += permission_wr(0xb3f80850, 0x7f);    
++    i += permission_wr(0xb3f80878, 0x7f); 	//ssb6:ddr,memmax ,vector 1 
++    i += permission_wr(0xb3f80870, 0x7f);    
++    i += permission_wr(0xb3f80898, 0x7f); 	//ssb6:ddr,memmax ,vector 2
++    i += permission_wr(0xb3f80890, 0x7f);    
++    i += permission_wr(0xb3f808b8, 0x7f); 	//ssb6:ddr,memmax ,vector 3
++    i += permission_wr(0xb3f808b0, 0x7f);    
++    i += permission_wr(0xb3f808d8, 0x7f); 	//ssb6:ddr,memmax ,vector 4
++    i += permission_wr(0xb3f808d0, 0x7f);    
++    i += permission_wr(0xb3f808f8, 0x7f); 	//ssb6:ddr,memmax ,vector 5
++    i += permission_wr(0xb3f808f0, 0x7f);    
++    i += permission_wr(0xb3f80918, 0x7f); 	//ssb6:ddr,memmax ,vector 6
++    i += permission_wr(0xb3f80910, 0x7f);    
++    i += permission_wr(0xb3f80938, 0x7f); 	//ssb6:ddr,memmax ,vector 7
++    i += permission_wr(0xb3f80930, 0x7f);    
++    i += permission_wr(0xb3f80c58, 0x1f); 	//ssb6:ddr,upctl 
++    i += permission_wr(0xb3f80c50, 0x1f);
++    i += permission_wr(0xb3f81058, 0x1f); 	//ssb6:ddr,phy
++    i += permission_wr(0xb3f81050, 0x1f);
++    i += permission_wr(0xb3f80458, 0x3); 	//ssb6:iocu (2-bit)
++    i += permission_wr(0xb3f80450, 0x3);
++  
++
++/* SSX0 FOR OTHER MASTER TO ACCESS BOOTROM, OTP, SSBRAM */	
++	i = 0;
++    i += permission_wr(0xbff82858, 0x1f); 	//ss0:ln01
++    i += permission_wr(0xbff82850, 0x1f); 
++    i += permission_wr(0xbff82C58, 0x1f); 	//ss0:ln02
++    i += permission_wr(0xbff82C50, 0x1f); 
++    i += permission_wr(0xbff83058, 0x1f); 	//ss0:ln03
++    i += permission_wr(0xbff83050, 0x1f); 
++    i += permission_wr(0xbff83458, 0x1f); 	//ss0:ex04
++    i += permission_wr(0xbff83450, 0x1f); 
++    i += permission_wr(0xbff83858, 0x1f); 	//ss0:ex05
++    i += permission_wr(0xbff83850, 0x1f); 
++    i += permission_wr(0xbff80858, 0x1f); 	//ss0:rom
++    i += permission_wr(0xbff80850, 0x1f); 
++    i += permission_wr(0xbff80c58, 0x1f); 	//ss0:otp
++    i += permission_wr(0xbff80c50, 0x1f); 
++    i += permission_wr(0xbff80458, 0x1f); 	//ss0:ssb, region 0
++    i += permission_wr(0xbff80450, 0x1f); 
++    i += permission_wr(0xbff80478, 0x01);   //ss0:ssb, region 1 (1, from S1.3)
++    i += permission_wr(0xbff80470, 0x01);
++    i += permission_wr(0xbff80498, 0x01);   //ss0:ssb, region 2 (1, from S1.3)
++    i += permission_wr(0xbff80490, 0x01);
++    i += permission_wr(0xbff804b8, 0x01);   //ss0:ssb, region 3 (1, from S1.3)
++    i += permission_wr(0xbff804b0, 0x01);
++    i += permission_wr(0xbff81058, 0x1f);   //ssx0, cbm1
++    i += permission_wr(0xbff81050, 0x1f);
++    i += permission_wr(0xbff81458, 0x1f);   //ssx0, cbm2
++    i += permission_wr(0xbff81450, 0x1f);
++    i += permission_wr(0xbff82058, 0x1f);   //ssx0, dma3
++    i += permission_wr(0xbff82050, 0x1f);
++    i += permission_wr(0xbff82458, 0x1f);   //ssx0, dma4
++    i += permission_wr(0xbff82450, 0x1f);
++    i += permission_wr(0xbff81858, 0x1f);   //ssx0, eip97 (only 4kec should access)
++    i += permission_wr(0xbff81850, 0x1f);
++    i += permission_wr(0xbff81C58, 0x1f);   //ssx0, eip123 (only 4kec should access)
++    i += permission_wr(0xbff81C50, 0x1f);
++
++
++	
++/* SSX4 - FOR OTHER MASTER TO ACCESS PERIPHERALS */
++	i = 0;
++    i += permission_wr(0xb7f82058, 0x1f); 	//ssb4:asc0
++    i += permission_wr(0xb7f82050, 0x1f); 
++    i += permission_wr(0xb7f82458, 0x1f); 	//ssb4:asc1
++    i += permission_wr(0xb7f82450, 0x1f); 
++    i += permission_wr(0xb7f81858, 0x1f); 	//ssb4:ledc
++    i += permission_wr(0xb7f81850, 0x1f);
++    i += permission_wr(0xb7f81458, 0x1f); 	//ssb4:gpio (0x1 for only 4KEc)
++	i += permission_wr(0xb7f81450, 0x1f);
++	i += permission_wr(0xb7f81C58, 0x1f); 	//ssb4:i2c
++	i += permission_wr(0xb7f81C50, 0x1f);
++	i += permission_wr(0xb7f83858, 0x1f); 	//ssb4:ebu
++	i += permission_wr(0xb7f83850, 0x1f);
++	i += permission_wr(0xb7f82858, 0x1f); 	//ssb4:gptc0
++	i += permission_wr(0xb7f82850, 0x1f);
++	i += permission_wr(0xb7f83C58, 0x1f); 	//ssb4:gptc1
++	i += permission_wr(0xb7f83C50, 0x1f);
++	i += permission_wr(0xb7f84058, 0x1f); 	//ssb4:gptc2
++	i += permission_wr(0xb7f84050, 0x1f);
++	i += permission_wr(0xb7f80458, 0x1f);	//ssx4, cgu
++	i += permission_wr(0xb7f80450, 0x1f);
++	i += permission_wr(0xb7f80858, 0x1f);	//ssx4, rcu
++	i += permission_wr(0xb7f80850, 0x1f);
++	i += permission_wr(0xb7f80C58, 0x1f);	//ssx4, pmu
++	i += permission_wr(0xb7f80C50, 0x1f);
++	i += permission_wr(0xb7f81058, 0x1f);	//ssx4, pcm
++	i += permission_wr(0xb7f81050, 0x1f);
++	i += permission_wr(0xb7f82C58, 0x1f);	//ssx4, spi0
++	i += permission_wr(0xb7f82C50, 0x1f);
++	i += permission_wr(0xb7f83058, 0x1f);	//ssx4, spi1
++	i += permission_wr(0xb7f83050, 0x1f);
++	i += permission_wr(0xb7f83458, 0x1f);	//ssx4, dma0
++	i += permission_wr(0xb7f83450, 0x1f);
++	
++
++/* SSX1 */
++        i = 0;
++    i += permission_wr(0xbdf80058, 0x1f);       //ssx1, reg1-r0 (only 4kec should access reg1-r0)
++    i += permission_wr(0xbdf80050, 0x1f);
++        i += permission_wr(0xbdf80078, 0x1f);   //ssx1, reg1-r1 (only 4kec should access reg1-r1)
++        i += permission_wr(0xbdf80070, 0x1f);
++    i += permission_wr(0xbdf80c58, 0x1f);       //ssx1:gswipl_pm
++    i += permission_wr(0xbdf80c50, 0x1f);
++    i += permission_wr(0xbdf80458, 0x1f);       //ssx1:dm2r, Vector 0
++    i += permission_wr(0xbdf80450, 0x1f);
++    i += permission_wr(0xbdf80858, 0x1f);       //ssx1:dm2t, Vector 0
++    i += permission_wr(0xbdf80850, 0x1f);
++    i += permission_wr(0xbdf81058, 0x1);        //ssx1:ln10, 1 bit for all
++    i += permission_wr(0xbdf81050, 0x1);
++
++/*ssx2*/
++#if 1
++        i += permission_wr(0xbbf80058, 0x1f);   //ssx2, reg2-r0 (only 4kec should access reg2-r0)
++        i += permission_wr(0xbbf80050, 0x1f);
++        i += permission_wr(0xbbf80078, 0x1f);   //ssx2, reg2-r1 (only 4kec should access reg2-r1)
++        i += permission_wr(0xbbf80070, 0x1f);
++        i += permission_wr(0xbbf81C58, 0x1f);   //ssx2, gswip-r
++        i += permission_wr(0xbbf81C50, 0x1f);
++        i += permission_wr(0xbbf81858, 0x1f);   //ssx2, dma1tx
++        i += permission_wr(0xbbf81850, 0x1f);
++        i += permission_wr(0xbbf81458, 0x1f);   //ssx2, dma1rx
++        i += permission_wr(0xbbf81450, 0x1f);
++        i += permission_wr(0xbbf80458, 0x1f);   //ssx2, usb0
++        i += permission_wr(0xbbf80450, 0x1f);
++        i += permission_wr(0xbbf80858, 0x1f);   //ssx2, usb0c
++        i += permission_wr(0xbbf80850, 0x1f);
++        i += permission_wr(0xbbf80C58, 0x1f);   //ssx2, usb1
++        i += permission_wr(0xbbf80C50, 0x1f);
++        i += permission_wr(0xbbf81058, 0x1f);   //ssx2, usb1c
++        i += permission_wr(0xbbf81050, 0x1f);
++        i += permission_wr(0xbbf82058, 0x1);    //ssx2, ln20, 1 bit for all
++        i += permission_wr(0xbbf82050, 0x1);
++#endif
++
++/*ssx3*/
++#if 1
++        i += permission_wr(0xb9f80058, 0x1f);   //ssx3, reg3-r0 (only 4kec should access reg3-r0)
++        i += permission_wr(0xb9f80050, 0x1f);
++        i += permission_wr(0xb9f80078, 0x1f);   //ssx3, reg3-r1 (only 4kec should access reg3-r1)
++        i += permission_wr(0xb9f80070, 0x1f);
++        i += permission_wr(0xb9f81458, 0x1f);   //ssx3, pcie1
++        i += permission_wr(0xb9f81450, 0x1f);
++        i += permission_wr(0xb9f81858, 0x1f);   //ssx3, pcie1a
++        i += permission_wr(0xb9f81850, 0x1f);
++        i += permission_wr(0xb9f81C58, 0x1f);   //ssx3, pcie1c
++        i += permission_wr(0xb9f81C50, 0x1f);
++        i += permission_wr(0xb9f82058, 0x1f);   //ssx3, msi1
++        i += permission_wr(0xb9f82050, 0x1f);
++        i += permission_wr(0xb9f82458, 0x1f);   //ssx3, pcie2
++        i += permission_wr(0xb9f82450, 0x1f);
++        i += permission_wr(0xb9f82858, 0x1f);   //ssx3, pcie2a
++        i += permission_wr(0xb9f82850, 0x1f);
++        i += permission_wr(0xb9f82C58, 0x1f);   //ssx3, pcie2c
++        i += permission_wr(0xb9f82C50, 0x1f);
++        i += permission_wr(0xb9f83058, 0x1f);   //ssx3, msi2
++        i += permission_wr(0xb9f83050, 0x1f);
++        i += permission_wr(0xb9f80458, 0x1f);   //ssx3, pcie3
++        i += permission_wr(0xb9f80450, 0x1f);
++        i += permission_wr(0xb9f80858, 0x1f);   //ssx3, pcie3a
++        i += permission_wr(0xb9f80850, 0x1f);
++        i += permission_wr(0xb9f80C58, 0x1f);   //ssx3, pcie3c
++        i += permission_wr(0xb9f80C50, 0x1f);
++        i += permission_wr(0xb9f81058, 0x1f);   //ssx3, msi3
++        i += permission_wr(0xb9f81050, 0x1f);
++        i += permission_wr(0xb9f83458, 0x1);    //ssx3, ln30, 1 bit for all
++        i += permission_wr(0xb9f83450, 0x1);
++#endif	
++}
++
++
++void start_interaptiv(u32 addr)
++{
++   u32 i;
++   
++   set_permission();
++
++
++    /* wait until reset finished */
++   i = REG32(0xb6000014) & REG32(0xb6000024);      // Dummy command for Read Only Reset Register
++   if ((REG32(0xb6000014) & 4) == 0){                      // Read status if InterAptiv Cluster in reset?
++          REG32(0xb6000010) = 0x00000004;                 // If not in reset, reset it
++          while ((REG32(0xb6000014) & 8) == 0);   // Wait until InterAptiv Cluster back in reset
++   }
++
++   REG32(0xb608004c) |= 0x01;                                                       
++   REG32(0xb608005c) |= 0xdfffff;
++
++   
++   REG32(0xbf2001e0) = addr; // pointer to interaptiv normal entry program
++   REG32(0xbf2001f4) = 0x56701dcb; // RVEC_INSTALLED
++
++   REG32(0xbf2001e4) = addr; // pointer to interaptiv nmi handling program
++   REG32(0xbf2001f8) = 0x45601CBA; // NVEC_INSTALLED
++
++
++   REG32(0xb6000010) = 0x00000008;  // Bring InterAptiv Cluster out of reset
++
++   return;
++}
+diff --git a/arch/mips/cpu/grx500/interrupts.c b/arch/mips/cpu/grx500/interrupts.c
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/interrupts.c
+@@ -0,0 +1,33 @@
++/*
++ * (C) Copyright 2003
++ * Wolfgang Denk, DENX Software Engineering, <wd@denx.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <common.h>
++
++void enable_interrupts(void)
++{
++}
++
++int disable_interrupts(void)
++{
++	return 0;
++}
+diff --git a/arch/mips/cpu/grx500/join_domain.S b/arch/mips/cpu/grx500/join_domain.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/join_domain.S
+@@ -0,0 +1,50 @@
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/cps.h>
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(join_domain)
++
++
++	// Enable coherence and allow interventions from all other cores.
++	// (Write access enabled via GCR_ACCESS by core 0.)
++	// r22_gcr_addr = 0xbfbf8000
++	// CORE_LOCAL_CONTROL_BLOCK = 0x2000
++	// GCR_CL_COHERENCE = 0x008
++	// GCR_CL_OTHER = 0x018
++
++	// Next command, 0x0f for 1004K, 0x03 for GRX500(2 cores) and 0x33 for GRX500(2x cores + 2x iocu)
++
++
++	li	    a0, 0x33					   // Set Coherent domain enable for all cores
++	sw	    a0, (CORE_LOCAL_CONTROL_BLOCK | GCR_CL_COHERENCE)(r22_gcr_addr)	// GCR_CL_COHERENCE
++	ehb
++
++	// Cores other than core 0 can relinquish write access to CM regs here.
++
++    move    a3, zero
++	li	 	t0, CORE_ON
++
++next_coherent_core:
++    sll     a0, a3, 16
++    sw      a0, (CORE_LOCAL_CONTROL_BLOCK | GCR_CL_OTHER)(r22_gcr_addr) 	// GCR_CL_OTHER[CoreNum]
++
++busy_wait_coherent_core:
++    lw      a0, (CORE_OTHER_CONTROL_BLOCK | GCR_CO_COHERENCE)(r22_gcr_addr) // GCR_CO_COHERENCE
++    beqz    a0, busy_wait_coherent_core   									// Busy wait on cores joining.
++    nop
++
++//  bne     a3, r19_more_cores, next_coherent_core
++    addiu   a3, 1
++
++    bne     a3, t0, next_coherent_core
++	nop
++
++done_join_domain:
++	jr      ra
++	nop
++END(join_domain)
+diff --git a/arch/mips/cpu/grx500/lowlevel_init.S b/arch/mips/cpu/grx500/lowlevel_init.S
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/lowlevel_init.S
+@@ -0,0 +1,408 @@
++/*
++Copyright (c) MIPS Technologies, Inc.  All rights reserved.  Unpublished
++rights reserved
++under the copyright laws of the United States of America and other countries.
++
++Redistribution and use in source and binary forms, with or without
++modification,
++are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this
++   list of conditions and the following disclaimer.
++
++2. Redistributions in binary form must reproduce the above copyright notice,
++   this list of conditions and the following disclaimer in the documentation
++   and/or other materials provided with the distribution.
++
++3. Neither the name of the copyright holder nor the names of its contributors
++   may be used to endorse or promote products derived from this software
++without
++   specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++AND
++ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++*/
++
++#include <asm/boot.h>
++#include <config.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++#include <asm/addrspace.h>
++#include <asm/cps.h>
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_cp0)
++
++        // Initialize Status
++	li	v1, 0x00400404		// (M_StatusBEV=1 | M_StatusIM | M_StatusERL) - Compatibility Int Mode
++	mtc0	v1, CP0_STATUS		// write C0_Status $12
++
++	// Initialize Watch registers if implemented.
++	mfc0	v0, CP0_CONFIG,1		// read C0_Config1
++	ext     v1, v0, 3, 1		// extract bit 3 WR (Watch registers implemented)
++	beq 	v1, zero, done_wr
++	li    	v1, 0x7				// (M_WatchHiI | M_WatchHiR | M_WatchHiW)
++
++	// Clear Watch Status bits and disable watch exceptions
++	mtc0	v1, CP0_WATCHHI		// write C0_WatchHi0
++	mfc0	v0, CP0_WATCHHI		// read C0_WatchHi0
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO	// write C0_WatchLo0
++
++	mtc0	v1, CP0_WATCHHI, 1	// write C0_WatchHi1
++	mfc0	v0, CP0_WATCHHI, 1	// read C0_WatchHi1
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 1	// write C0_WatchLo1
++
++	mtc0	v1, CP0_WATCHHI, 2	// write C0_WatchHi2
++	mfc0	v0, CP0_WATCHHI, 2	// read C0_WatchHi2
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 2	// write C0_WatchLo2
++
++	mtc0	v1, CP0_WATCHHI, 3	// write C0_WatchHi3
++	mfc0	v0, CP0_WATCHHI, 3	// read C0_WatchHi3
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 3	// write C0_WatchLo3
++
++	mtc0	v1, CP0_WATCHHI, 4	// write C0_WatchHi4
++	mfc0	v0, CP0_WATCHHI, 4	// read C0_WatchHi4
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 4	// write C0_WatchLo4
++
++	mtc0	v1, CP0_WATCHHI, 5	// write C0_WatchHi5
++	mfc0	v0, CP0_WATCHHI, 5	// read C0_WatchHi5
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 5	// write C0_WatchLo5
++
++	mtc0	v1, CP0_WATCHHI, 6	// write C0_WatchHi6
++	mfc0	v0, CP0_WATCHHI, 6	// read C0_WatchHi6
++	beq 	v0, zero, done_wr
++	mtc0	zero, CP0_WATCHLO, 6	// write C0_WatchLo6
++
++	mtc0	v1, CP0_WATCHHI, 7	// write C0_WatchHi7
++	mtc0	zero, CP0_WATCHLO, 7	// write C0_WatchLo7
++
++done_wr:
++
++	// Clear WP bit to avoid watch exception upon user code entry, IV, and software interrupts.
++	mtc0	zero, CP0_CAUSE		// write C0_Cause: Init AFTER init of CP0 WatchHi/Lo registers.
++
++	// Clear timer interrupt. (Count was cleared at the reset vector to allow timing boot.)
++	mtc0	zero, CP0_COMPARE	// write C0_Compare
++
++    jr      ra
++	nop
++END(init_cp0)
++
++LEAF(init_gic)
++
++    beqz    r11_is_cps, done_gic				// Skip if non-CPS.
++    nop
++
++    bnez    r23_cpu_num, done_gic				// Only core0 vpe0 inits shared portion.
++    nop
++
++//Only cpu0 = core0+vpe0 to reach here
++/*set GIC base address and enable it*/
++
++    li      a1, GCR_CONFIG_ADDR + GCR_GIC_BASE  	// Locate and enable GIC
++    li      a0, GIC_P_BASE_ADDR | 1 			// Physical address + enable bit
++    sw      a0, 0(a1)				        // a0 = 0x12320001
++
++
++/*initialize IPI for VPE1/core0, VPE0/core1, VPE1/core1*/
++    li      a1, GIC_BASE_ADDR		// GIC_BASE_ADDR = 0xb2320000
++    // IPI interrupts 20, 21 85  
++    li      a0, 0x00300000
++    sw      a0, GIC_SH_RMASK31_0(a1)	// (disable     56..59)
++    sw      a0, GIC_SH_POL31_0(a1)		// (high/rise   56..59)
++    sw      a0, GIC_SH_TRIG31_0(a1)	// (edge        56..59)
++    sw      a0, GIC_SH_SMASK31_00(a1)	// (enable      56..59)
++
++    li      a0, 0x00200000
++    sw      a0, GIC_SH_RMASK95_64(a1)	// (disable     56..59)
++    sw      a0, GIC_SH_POL95_64(a1)		// (high/rise   56..59)
++    sw      a0, GIC_SH_TRIG95_64(a1)	// (edge        56..59)
++    sw      a0, GIC_SH_SMASK95_64(a1)	// (enable      56..59)
++     
++ 
++    li      a0, 1              // set bit 0 for CORE0 or for MT vpe0
++    sll     a0, a0, 1          // set bit 1 for CORE1 or for MT vpe1
++    sw      a0, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 20) (a1)
++    sll     a0, a0, 1          // set bit 2 for CORE2 or for MT vpe2
++    sw      a0, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 21) (a1)
++    sll     a0, a0, 1          // set bit 3 for CORE3 or for MT vpe3
++    sw      a0, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 85) (a1)
++
++done_gic:
++    jr      ra
++    nop
++
++END(init_gic)
++
++/* Reconfigure IPI interrupts when VPE re-enters IBL after FW exits */
++LEAF(ipi_reconfig)
++    beqz    r11_is_cps, ipi_done		/* Skip if non-CPS */
++    nop
++
++    beqz    r9_vpe_num, ipi_done		/* If VPE0, return */
++    nop
++
++	li		a0,	GCR_CONFIG_ADDR + GCR_GIC_BASE
++    li      a1, GIC_P_BASE_ADDR | 1 	/* Physical address + enable bit */
++    sw      a1, 0(a0)
++
++    li      a0, GIC_BASE_ADDR
++
++	li		t0, 1
++	bne		r23_cpu_num, t0, vpe2			/* Check if VPE1 */
++	nop
++
++	li		a1,	0x00100000				/* IPI 20 */
++	lw		a2,	(GIC_SH_MASK31_00)(a0)	/* Load MASK reg val */
++	and		a3, a2, a1 					/* Check bit enabled */ 
++	bnez	a3, ipi_done				/* If enabled, we are done */
++	nop		
++	
++    sw      a1, GIC_SH_RMASK31_0(a0)	/* disable */
++    sw      a1, GIC_SH_SMASK31_00(a0)	/* enable */
++	
++    li      a1, 2              /* set bit 1 for CORE1 or for MT vpe1 */
++    sw      a1, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 20) (a0)
++	b		ipi_done
++	nop
++
++vpe2:
++	li		t0, 2
++	bne		r23_cpu_num, t0, vpe3			/* check if VPE2 */
++	nop
++
++	li		a1, 0x00200000				/* IPI 21 */
++	lw		a2,	(GIC_SH_MASK31_00)(a0)	/* Load MASK reg */
++	and     a3, a2, a1					/* Check bit enabled */
++	bnez	a3, ipi_done				/* If enabled, we are done */
++	nop
++	
++	sw      a1, GIC_SH_RMASK31_0(a0)	/* disable */
++    sw      a1, GIC_SH_SMASK31_00(a0)	/* enable */
++	
++    li      a1, 4              			/* set bit 2 for CORE2 or for MT vpe2 */
++    sw      a1, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 21) (a0)
++	b		ipi_done
++	nop
++
++vpe3:
++    li      a1, 0x00200000				/* IPI 85 */
++	lw		a2, (GIC_SH_MASK95_64)(a0)	/* Load MASK reg */
++	and		a3, a2, a1					/* Check bit enabled */
++	bnez	a3, ipi_done				/* If enabled, we are done */
++	nop
++		
++    sw      a1, GIC_SH_RMASK95_64(a0)	/* disable */
++    sw      a1, GIC_SH_SMASK95_64(a0)	/* enable */
++    
++	li      a1, 8              			/* set bit 3 for CORE3 or for MT vpe0 */
++    sw      a1, GIC_SH_MAP0_VPE31_0 + (GIC_SH_MAP_SPACER * 85)(a0)
++
++ipi_done:
++	jr	ra
++	nop	
++		
++END(ipi_reconfig)
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_cm)
++
++
++	// Allow each core access to the CM registers (they should only access their local registers.)
++	li	    a0, 2							// Start building mask for cores in this cps.
++    sll     a0, a0, r19_more_cores
++    addiu   a0, -1							// Complete mask.
++	sw	    a0, GCR_ACCESS(r22_gcr_addr)	// GCR_ACCESS
++
++    // Check to see if this CPS implements an IOCU.
++    lw      a0, GCR_CONFIG(r22_gcr_addr)	// Load GCR_CONFIG
++    ext	    a0, a0, NUMIOCU, NUMIOCU_S		// Extract NUMIOCU.
++    beqz    a0, done_cm_init
++    lui	    a0, 0xffff
++
++	// Disable the CM regions if there is an IOCU.
++	sw	    a0, GCR_REG0_BASE(r22_gcr_addr)	// GCR_REG0_BASE
++	sw	    a0, GCR_REG0_MASK(r22_gcr_addr)	// GCR_REG0_MASK
++	sw	    a0, GCR_REG1_BASE(r22_gcr_addr)	// GCR_REG1_BASE
++	sw	    a0, GCR_REG1_MASK(r22_gcr_addr)	// GCR_REG1_MASK
++	sw	    a0, GCR_REG2_BASE(r22_gcr_addr)	// GCR_REG2_BASE
++	sw	    a0, GCR_REG2_MASK(r22_gcr_addr)	// GCR_REG2_MASK
++	sw	    a0, GCR_REG3_BASE(r22_gcr_addr)	// GCR_REG3_BASE
++	sw	    a0, GCR_REG3_MASK(r22_gcr_addr)	// GCR_REG3_MASK
++	sw	    a0, GCR_REG4_BASE(r22_gcr_addr)	// GCR_REG4_BASE
++	sw	    a0, GCR_REG4_MASK(r22_gcr_addr)	// GCR_REG4_MASK
++	sw	    a0, GCR_REG5_BASE(r22_gcr_addr)	// GCR_REG5_BASE
++	sw	    a0, GCR_REG5_MASK(r22_gcr_addr)	// GCR_REG5_MASK
++
++	// program CM CUSTOM
++	li       a0, CUS_P_BASE_ADDR | 1
++	sw       a0, 0x60(r22_gcr_addr)			// GCR Custom Base Register
++
++    li       a0, 3
++    sw       a0, 0x10(r22_gcr_addr)			// GCR Custom Base Register for UMT access to DMA3
++
++done_cm_init:
++	jr      ra
++	nop
++END(init_cm)
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(init_cpc)
++    li      a0, CPC_P_BASE_ADDR				
++    sw      a0, GCR_CPC_BASE(r22_gcr_addr)		
++    li      r30_cpc_addr, CPC_BASE_ADDR		
++    jr      ra
++    nop
++END(init_cpc)
++
++
++LEAF(release_mp)
++
++
++    // At this point, r30_cpc_addr = 0xb2310000
++    // CPS_CORE_LOCAL_CONTROL_BLOCK = 0x2000
++    // CPC_OTHERL_REG = 0x010
++    // CPS_CORE_OTHER_CONTROL_BLOCK = 0x4000
++    // CPC_CMDO_REG = 0x000
++
++powerup_next_core:
++    // Send PwrUp command to next core causing execution at their reset exception vector.
++    li      a0, 1
++    sll     a0, 16
++    sw      a0, (CPS_CORE_LOCAL_CONTROL_BLOCK | CPC_OTHERL_REG)(r30_cpc_addr)
++    li      a0, PWR_UP							// "PwrUp" power domain command.
++    sw      a0, (CPS_CORE_OTHER_CONTROL_BLOCK | CPC_CMDO_REG)(r30_cpc_addr)
++1:
++    jr      ra
++    nop
++
++END(release_mp)
++
++/**************************************************************************************
++**************************************************************************************/
++LEAF(join_domain)
++
++
++	// Enable coherence and allow interventions from all other cores.
++	// (Write access enabled via GCR_ACCESS by core 0.)
++	// r22_gcr_addr = 0xbfbf8000
++	// CORE_LOCAL_CONTROL_BLOCK = 0x2000
++	// GCR_CL_COHERENCE = 0x008
++	// GCR_CL_OTHER = 0x018
++
++	// Next command, 0x0f for 1004K, 0x03 for GRX500(2 cores) and 0x33 for GRX500(2x cores + 2x iocu)
++
++
++	li	    a0, 0x33					   // Set Coherent domain enable for all cores
++	sw	    a0, (CORE_LOCAL_CONTROL_BLOCK | GCR_CL_COHERENCE)(r22_gcr_addr)	// GCR_CL_COHERENCE
++	ehb
++
++	// Cores other than core 0 can relinquish write access to CM regs here.
++
++    move    a3, zero
++	li	 	t0, CORE_ON
++
++next_coherent_core:
++    sll     a0, a3, 16
++    sw      a0, (CORE_LOCAL_CONTROL_BLOCK | GCR_CL_OTHER)(r22_gcr_addr) 	// GCR_CL_OTHER[CoreNum]
++
++busy_wait_coherent_core:
++    lw      a0, (CORE_OTHER_CONTROL_BLOCK | GCR_CO_COHERENCE)(r22_gcr_addr) // GCR_CO_COHERENCE
++    beqz    a0, busy_wait_coherent_core   									// Busy wait on cores joining.
++    nop
++
++//  bne     a3, r19_more_cores, next_coherent_core
++    addiu   a3, 1
++
++    bne     a3, t0, next_coherent_core
++	nop
++
++done_join_domain:
++	jr      ra
++	nop
++END(join_domain)
++
++#define C0_MVPCTL $0, 1
++#define C0_MVPCONF0 $0, 2
++#define C0_VPECTL $1, 1
++#define C0_VPECONF0 $1, 2
++#define C0_TCSTATUS $2, 1
++#define C0_TCRESTART $2, 3
++#define C0_TCHALT $2, 4
++#define C0_TCBIND $2, 2
++
++LEAF(set_gpr_boot_values)
++
++    li      r1_all_ones, 0xffffffff             // Simplify code and improve clarity
++    
++    mfc0    k1, CP0_PRID             
++    ext     k1, k1, 8, 16						// Company ID & Processor ID
++    li	    k0, 0x0190							// 4KEc
++    beq     k0, k1, is_not_interAptiv
++    li 	    r23_cpu_num, 8						// Assign 8=CPUNum for 4KEc
++    
++    mfc0    a0, CP0_EBASE                		// Read CP0 EBase
++    li      r11_is_cps, 1
++    ext	    r23_cpu_num, a0, 0, 4     			// Extract CPUNum
++    li      r10_has_mt_ase, 1
++
++    // Every vpe will set up the following to simplify resource initialization.
++    mfc0    a0, C0_TCBIND						// Read CP0 TCBind
++    ext	    r9_vpe_num, a0,  0, 4				// Extract CurVPE
++    ext	    r18_tc_num, a0, 21, 8				// Extract CurTC
++    mfc0    a0, C0_MVPCONF0						// C0_MVPConf0
++    ext	    r21_more_tcs, a0, 0, 8   			// Extract PTC
++    ext	    r20_more_vpes, a0, 10, 4			// Extract VPE
++
++    li      r22_gcr_addr, GCR_CONFIG_ADDR
++    lw      r8_core_num, (CORE_LOCAL_CONTROL_BLOCK + GCR_CL_ID) (r22_gcr_addr) // Load GCR_CL_ID
++    lw      a0, GCR_CONFIG(r22_gcr_addr)                // Load GCR_CONFIG
++    ext     r19_more_cores, a0, PCORES, PCORES_S        // Extract PCORES (r19_more_cores=1 from core 0)
++    
++    b       done_init_gpr
++    nop
++
++is_not_interAptiv: 	// This processor is not a InterAptiv Core. Set up defaults for 4Kc.
++    li      r11_is_cps, 0
++    li      r8_core_num, 0
++    li      r9_vpe_num, 0
++    li      r18_tc_num, 0
++    li      r20_more_vpes, 0
++    li      r21_more_tcs, 0
++    li      r19_more_cores, 0
++        
++	
++done_init_gpr:
++    jr     ra
++    nop
++END(set_gpr_boot_values)
++
++LEAF(init_legacy)
++	mfc0	v0, CP0_CONFIG5
++	li		v1, 0x2fffffff
++	and		v0, v0, v1
++	mtc0	v0, CP0_CONFIG5
++	jr		ra
++	nop
++END(init_legacy)
++
+diff --git a/arch/mips/cpu/grx500/release_mp.S b/arch/mips/cpu/grx500/release_mp.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/release_mp.S
+@@ -0,0 +1,31 @@
++#include <asm/boot.h>
++#include <asm/regdef.h>
++#include <asm/cps.h>
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++/**************************************************************************************
++After the first processor in an MP system has completed the boot code, 
++it can release the remaining processors to execute the boot code.
++**************************************************************************************/
++LEAF(release_mp)
++
++
++    // At this point, r30_cpc_addr = 0xb2310000
++    // CPS_CORE_LOCAL_CONTROL_BLOCK = 0x2000
++    // CPC_OTHERL_REG = 0x010
++    // CPS_CORE_OTHER_CONTROL_BLOCK = 0x4000
++    // CPC_CMDO_REG = 0x000
++
++powerup_next_core:
++    // Send PwrUp command to next core causing execution at their reset exception vector.
++    li      a0, 1
++    sll     a0, 16
++    sw      a0, (CPS_CORE_LOCAL_CONTROL_BLOCK | CPC_OTHERL_REG)(r30_cpc_addr)
++    li      a0, PWR_UP							// "PwrUp" power domain command.
++    sw      a0, (CPS_CORE_OTHER_CONTROL_BLOCK | CPC_CMDO_REG)(r30_cpc_addr)
++1:
++    jr      ra
++    nop
++
++END(release_mp)
+diff --git a/arch/mips/cpu/grx500/set_gpr_boot_values.S b/arch/mips/cpu/grx500/set_gpr_boot_values.S
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/cpu/grx500/set_gpr_boot_values.S
+@@ -0,0 +1,65 @@
++#include <asm/boot.h>
++#include <config.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++#include <asm/addrspace.h>
++#include <asm/cps.h>
++
++#define C0_MVPCTL $0, 1
++#define C0_MVPCONF0 $0, 2
++#define C0_VPECTL $1, 1
++#define C0_VPECONF0 $1, 2
++#define C0_TCSTATUS $2, 1
++#define C0_TCRESTART $2, 3
++#define C0_TCHALT $2, 4
++#define C0_TCBIND $2, 2
++
++	.set	noreorder           // Don't allow the assembler to reorder instructions.
++	.set	noat                // Don't allow the assembler to use r1(at) for synthetic instr.
++/**************************************************************************************
++**************************************************************************************/
++LEAF(set_gpr_boot_values)
++
++    li      r1_all_ones, 0xffffffff             // Simplify code and improve clarity
++    
++    mfc0    k1, CP0_PRID             
++    ext     k1, k1, 8, 16						// Company ID & Processor ID
++    li	    k0, 0x0190							// 4KEc
++    beq     k0, k1, is_not_interAptiv
++    li 	    r23_cpu_num, 8						// Assign 8=CPUNum for 4KEc
++    
++    mfc0    a0, CP0_EBASE                		// Read CP0 EBase
++    li      r11_is_cps, 1
++    ext	    r23_cpu_num, a0, 0, 4     			// Extract CPUNum
++    li      r10_has_mt_ase, 1
++
++    // Every vpe will set up the following to simplify resource initialization.
++    mfc0    a0, C0_TCBIND						// Read CP0 TCBind
++    ext	    r9_vpe_num, a0,  0, 4				// Extract CurVPE
++    ext	    r18_tc_num, a0, 21, 8				// Extract CurTC
++    mfc0    a0, C0_MVPCONF0						// C0_MVPConf0
++    ext	    r21_more_tcs, a0, 0, 8   			// Extract PTC
++    ext	    r20_more_vpes, a0, 10, 4			// Extract VPE
++
++    li      r22_gcr_addr, GCR_CONFIG_ADDR
++    lw      r8_core_num, (CORE_LOCAL_CONTROL_BLOCK + GCR_CL_ID) (r22_gcr_addr) // Load GCR_CL_ID
++    lw      a0, GCR_CONFIG(r22_gcr_addr)                // Load GCR_CONFIG
++    ext     r19_more_cores, a0, PCORES, PCORES_S        // Extract PCORES (r19_more_cores=1 from core 0)
++    
++    b       done_init_gpr
++    nop
++
++is_not_interAptiv: 	// This processor is not a InterAptiv Core. Set up defaults for 4Kc.
++    li      r11_is_cps, 0
++    li      r8_core_num, 0
++    li      r9_vpe_num, 0
++    li      r18_tc_num, 0
++    li      r20_more_vpes, 0
++    li      r21_more_tcs, 0
++    li      r19_more_cores, 0
++        
++	
++done_init_gpr:
++    jr     ra
++    nop
++END(set_gpr_boot_values)
+diff --git a/arch/mips/cpu/grx500/start.S b/arch/mips/cpu/grx500/start.S
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/start.S
+@@ -0,0 +1,257 @@
++/*
++ *  Startup Code for MIPS32 CPU-core
++ *
++ *  Copyright (c) 2003	Wolfgang Denk <wd@denx.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++
++#include <config.h>
++#include <version.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++#include <asm/cacheops.h>
++#include <asm/addrspace.h>
++#include <asm/yamon.h>
++#include <asm/boot.h>
++
++/*****************************************************************************
++ * Local assembler register definitions
++ *****************************************************************************/
++#define C0_EBASe     $15,1
++
++#define S_EBASeExpBase     12       /* Exception Base */
++#define M_EBASeExpBase     (0x3ffff << S_EBASeExpBase)
++#define S_EBASeCPUNum      0        /* CPU Number */
++#define M_EBASeCPUNum      (0x1ff << S_EBASeCPUNum)
++
++/*
++ * Values in the CPU Number field
++ */
++#define K_EBASeCPUNum_Host 0
++#define K_EBASeCPUNum_Voice 1
++
++/* C0_EBASE register encoding */
++#define CO_EBASE_EXPBASE_SHF     S_EBASeExpBase
++#define CO_EBASE_EXPBASE_MSK     M_EBASeExpBase
++
++#define CO_EBASE_CPUNUM_SHF      S_EBASeCPUNum
++#define CO_EBASE_CPUNUM_MSK      M_EBASeCPUNum
++
++#define CO_EBASE_CPU_HOST     K_EBASeCPUNum_Host
++#define CO_EBASE_CPU_VOICE    K_EBASeCPUNum_Voice
++
++    .set noreorder
++/*	  .option pic0*/
++   	.globl _start
++   	.globl __exception_vector_tlb_refill
++   	.globl __exception_vector_xtlb_refill
++   	.globl __exception_vector_general
++   	.globl __exception_vector_int
++   	.text
++_start:
++	/* RESET entry */
++   	b     reset
++   	nop
++   	nop
++   	nop
++
++reset:
++        mtc0    zero, CP0_WATCHLO
++        mtc0    zero, CP0_WATCHHI
++        mtc0    zero, CP0_CAUSE
++	
++        /* Initialize GOT pointer.
++        */
++        bal     1f
++        nop
++        .word   _GLOBAL_OFFSET_TABLE_
++1:
++        move    gp, ra
++        lw      t1, 0(ra)
++        move    gp, t1
++
++
++        la      a2,  set_gpr_boot_values             // Fill register file boot info. r23_cpu_num = 8 for 4KEc
++        jalr    a2
++        nop
++
++        la          a2, init_cp0                    // Init CP0 Status, Count, Compare, Watch*, and Cause.
++        jalr        a2
++        nop
++
++init_core_resources:                            // All Cores (VPE0).
++
++        la          a2, disable_L23                 // Disable L2/L3 caches
++        jalr        a2
++        nop
++
++        la          a2, sys_init_icache                 // Initialize the L1 instruction cache. (Executing using I$ on return.)
++        jalr        a2
++        nop
++
++
++        la          a2, change_k0_cca
++        jalr        a2
++        nop
++
++        la          a2, sys_init_dcache                 // Initialize the L1 data cache
++        jalr        a2
++        nop
++
++
++        li              k0, 8
++        beq             k0, r23_cpu_num, init_sys_resources_done     // CPUNum = 8 = 4KEc, bypass the EVA setup
++        nop
++
++
++init_sys_resources:
++        la          a2, init_cpc                    // Initialize the CPS CPC (Cluster Power Controller.)
++        jalr        a2
++        nop
++
++        la          a2, init_cm                             // Initialize the CPS CM (Coherence Manager.)
++        jalr        a2
++        nop
++ 
++
++        la          a2, init_L23                    // Initialize the unified L2 and L3 caches
++        jalr        a2
++        nop
++
++init_sys_resources_done:
++
++lowlevel_init_done:
++
++	/* Set up temporary stack.
++	 */
++	li	t0, 0xa0400000
++	
++	la	sp, 0(t0)
++
++	la	t9, board_init_f
++
++	j	t9
++	nop
++        
++
++
++/*
++ * void relocate_code (addr_sp, gd, addr_moni)
++ *
++ * This "function" does not return, instead it continues in RAM
++ * after relocating the monitor code.
++ *
++ * a0 = addr_sp
++ * a1 = gd
++ * a2 = destination address
++ */
++
++	.globl	relocate_code
++	.ent	relocate_code
++relocate_code:
++	move	sp, a0		/* Set new stack pointer		*/
++
++	li	t0, CONFIG_SYS_MONITOR_BASE
++	la	t3, in_ram
++	lw	t2, -12(t3)	/* t2 <-- uboot_end_data	*/
++	move	t1, a2
++
++	/*
++	 * Fix GOT pointer:
++	 *
++	 * New GOT-PTR = (old GOT-PTR - CFG_MONITOR_BASE) + Destination Address
++	 */
++	move	t6, gp
++	sub	gp, CONFIG_SYS_MONITOR_BASE
++	add	gp, a2			/* gp now adjusted		*/
++	sub	t6, gp, t6		/* t6 <-- relocation offset	*/
++
++
++	sub	t4, t2, t0
++	move    t5, t1
++	/*
++	 * t0 = source address
++	 * t1 = target address
++	 * t2 = source end address
++	 * t4 = content length
++	 */
++
++1:
++	lw	t3, 0(t0)
++	sw	t3, 0(t1)
++    addu	t0, 4
++	ble	t0, t2, 1b
++	addu	t1, 4			/* delay slot			*/
++
++
++	/* Jump to where we've relocated ourselves.
++	 */
++	addi	t0, a2, in_ram - _start
++	j	t0
++	nop
++
++	.word	uboot_end_data
++	.word	uboot_end
++	.word	num_got_entries
++
++in_ram:
++	/* Now we want to update GOT.
++	 */
++	lw	t3, -4(t0)	/* t3 <-- num_got_entries	*/
++	addi	t4, gp, 8	/* Skipping first two entries.	*/
++	li	t2, 2
++1:
++	lw	t1, 0(t4)
++	beqz	t1, 2f
++	add	t1, t6
++	sw	t1, 0(t4)
++2:
++	addi	t2, 1
++	blt	t2, t3, 1b
++	addi	t4, 4		/* delay slot			*/
++clear_bss:
++	/* Clear BSS.
++	 */
++	lw	t1, -12(t0)	/* t1 <-- uboot_end_data	*/
++	lw	t2, -8(t0)	/* t2 <-- uboot_end		*/
++	add	t1, t6		/* adjust pointers		*/
++	add	t2, t6
++
++	sub	t1, 4
++1:	addi	t1, 4
++	bltl	t1, t2, 1b
++	sw	zero, 0(t1)	/* delay slot			*/
++
++	move	a0, a1
++	la	t9, board_init_r
++	j	t9
++	move	a1, a2		/* delay slot			*/
++	.end	relocate_code
++
++	/* Exception handlers.
++	 */
++romReserved:
++	b romReserved
++
++romExcHandle:
++	b romExcHandle
++
++
+diff --git a/arch/mips/cpu/grx500/start_nand_spl.S b/arch/mips/cpu/grx500/start_nand_spl.S
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/start_nand_spl.S
+@@ -0,0 +1,313 @@
++/*
++ *  Startup Code for MIPS32 CPU-core
++ *
++ *  Copyright (c) 2003	Wolfgang Denk <wd@denx.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++
++#include <config.h>
++#include <version.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++#include <asm/cacheops.h>
++#include <asm/addrspace.h>
++#include <asm/yamon.h>
++#include <asm/boot.h>
++#include <asm/cps.h>
++/*****************************************************************************
++ * Local assembler register definitions
++ *****************************************************************************/
++#define C0_EBASe     $15,1
++#define C0_SEGCTL0  $5,2
++#define C0_SEGCTL1  $5,3
++#define C0_SEGCTL2  $5,4
++#define C0_CONFIG5  $16,5
++
++
++#define S_EBASeExpBase     12       /* Exception Base */
++#define M_EBASeExpBase     (0x3ffff << S_EBASeExpBase)
++#define S_EBASeCPUNum      0        /* CPU Number */
++#define M_EBASeCPUNum      (0x1ff << S_EBASeCPUNum)
++
++/*
++ * Values in the CPU Number field
++ */
++#define K_EBASeCPUNum_Host 0
++#define K_EBASeCPUNum_Voice 1
++
++/* C0_EBASE register encoding */
++#define CO_EBASE_EXPBASE_SHF     S_EBASeExpBase
++#define CO_EBASE_EXPBASE_MSK     M_EBASeExpBase
++
++#define CO_EBASE_CPUNUM_SHF      S_EBASeCPUNum
++#define CO_EBASE_CPUNUM_MSK      M_EBASeCPUNum
++
++#define CO_EBASE_CPU_HOST     K_EBASeCPUNum_Host
++#define CO_EBASE_CPU_VOICE    K_EBASeCPUNum_Voice
++
++    .set noreorder
++/*	  .option pic0*/
++   	.globl _start
++   	.globl __exception_vector_tlb_refill
++   	.globl __exception_vector_xtlb_refill
++   	.globl __exception_vector_general
++   	.globl __exception_vector_int
++   	.text
++LEAF(__reset_vector)
++_start:
++	/* RESET entry */
++   	b     reset
++   	nop
++   	nop
++   	nop
++END(__reset_vector)
++.org 0x200 /* General exception. */
++    li      k0, (GIC_SH_WEDGE | GIC_BASE_ADDR)
++    mfc0    k1, CP0_EBASE                // Get cp0 EBase = $15
++    ext     k1, k1, 0, 10                               // Extract CPUNum
++    li      v0, 1
++    li      v1, 1
++    bne     k1, v0, 1f
++    add     v0, v1
++    li      k1, 20
++    b       ipi_calculation_done
++    nop
++
++1:  bne     k1, v0, 1f
++    add     v0, v1
++    li      k1, 21
++    b       ipi_calculation_done
++    nop
++
++1:  li      k1, 85
++    b       ipi_calculation_done
++    nop
++
++ipi_calculation_done:
++    sw      k1, 0(k0)                                   // Clear this IPI.
++    
++
++    li      k0, INTMSG
++    mfc0    k1, CP0_EBASE                                // Get cp0 EBase
++    ext     k1, k1, 0, 10                               // Extract CPUNum
++    sll     k1, k1, 2                                   // k1 = k1*4
++    addu    k0, k0, k1                                  // index into CMP global "C" variable start_test
++    li      k1, 1
++    sw      k1, 0(k0)                                   // Release "cpu"/vpe to execute "C" test code.
++    eret
++    nop
++
++reset:
++        /* Initialize GOT pointer.
++        */
++        bal     1f
++        nop
++        .word   _GLOBAL_OFFSET_TABLE_
++1:
++        move    gp, ra
++        lw      t1, 0(ra)
++        move    gp, t1
++
++    	/* Only set GOT for IAP Core 1 and abv */
++	    mfc0    k1, CP0_PRID             
++	    ext     k1, k1, 8, 16       /* Company ID & Processor ID */
++	    li      k0, 0x0190          /* 4Kec ID*/
++    	beq     k0, k1, start_init	/* jmp if 4Kec */
++	    nop
++
++		/* CPU core 0, we shall ignore and jmp away */
++	    mfc0    k0, CP0_EBASE       // Read CP0 EBase
++	    ext     k1, k0, 0, 4        // Extract CPUNum
++    	beq     k1, 0, start_init	/* jmp if core 0 */
++    	nop	
++
++		/* Check if the core is in EVA mode */
++    	mfc0	v0, CP0_CONFIG5	
++		li      v1, 0x40000000
++		and		v0, v0, v1
++		beqz	v0, start_init		/* if EVA bit is not set, we are in legacy mode. hence no need 	*/
++		nop							/* to change the GOT table location							 	*/
++
++		/* Re-adjust GOT when in EVA mode */
++        bal     1f
++        nop
++        .word   got_size
++1:
++        move    t1, ra
++        lw      t1, 0(t1)
++
++        move    t0, gp
++        add     t1, t0, t1
++        addi    t0, 8 /*skip first 2 entries*/
++		
++		/* Check if we need to add the GOT back to 0xA0000000 range */
++		lw		t2, 0(t0)
++		and		t2, t2, 0x70000000	/* mask value */
++		bnez	t2, start_init		/* if GOT already in 0xA000000 range, skip */
++		nop
++		
++		/* Remap GOT table to 0xA000XXXX region */
++2:
++        lw      t2, 0(t0)
++        addu    t2, 0x20000000
++        sw      t2, 0(t0)
++        bne     t0, t1, 2b
++        addi    t0, t0, 4
++
++start_init:
++        la      a2,  set_gpr_boot_values             // Fill register file boot info. r23_cpu_num = 8 for 4KEc
++        jalr    a2
++        nop
++
++        la          a2, init_cp0                    // Init CP0 Status, Count, Compare, Watch*, and Cause.
++        jalr        a2
++        nop
++
++#ifdef CONFIG_LTQ_SECURE_BOOT 
++        li              k0, 8
++        beq             k0, r23_cpu_num, init_done     // CPUNum = 8 = 4KEc
++        nop
++#endif        
++        la          a2, init_gic                    // Configure the global interrupt controller.
++        jalr        a2
++        nop
++        
++        la          a2, init_exception
++        jalr        a2
++        nop
++
++        la			a2,	ipi_reconfig			// reconfigure IPI interrupts for VPE1-VPE3
++        jalr		a2
++        nop
++        
++        bnez        r9_vpe_num, init_done   // If we are not vpe0 then we are done.
++        nop
++
++        la          a2, disable_L23                 // Disable L2/L3 caches
++        jalr        a2
++        nop
++
++        la          a2, sys_init_icache                 // Initialize the L1 instruction cache. (Executing using I$ on return.)
++        jalr        a2
++        nop
++
++        la          a2, change_k0_cca
++        jalr        a2
++        nop
++
++        la          a2, sys_init_dcache                 // Initialize the L1 data cache
++        jalr        a2
++        nop
++
++        li              k0, 8
++        beq             k0, r23_cpu_num, init_done     // CPUNum = 8 = 4KEc
++        nop
++
++        bgtz            r23_cpu_num, init_sys_resources_done
++        nop
++
++init_sys_resources:
++        /*interAptiv start to initialize system resources*/
++        la          a2, init_cpc                    // Initialize the CPS CPC (Cluster Power Controller.)
++        jalr        a2
++        nop
++
++        la          a2, init_cm                             // Initialize the CPS CM (Coherence Manager.)
++        jalr        a2
++        nop
++
++        la          a2, init_L23                    // Initialize the unified L2 and L3 caches
++        jalr        a2
++        nop
++        
++        la          a2, release_mp                  // Release other cores to execute this boot code.
++        jalr        a2
++        nop
++init_sys_resources_done:
++        la          a2, join_domain                 // Join the Coherence  domain. (OK to use D$ on return.)
++        jalr        a2
++        nop
++
++        la          a2, init_vpe1                   // Set up MT ASE vpe1 to execute this boot code also.
++        jalr        a2
++        nop
++
++init_done:
++        la          a2, init_legacy                 // init cpu into non-eva mode
++        jalr        a2
++        nop
++
++	/* Set up temporary stack.
++	 */
++
++        li              k1, (CONFIG_NAND_SPL_TEXT_BASE | 0x8000)
++        li              k0, 8
++        beq             k0, r23_cpu_num, change_got_table
++        nop
++        addi            k1, 0x2000
++        ins             k1, r23_cpu_num, STACK_SIZE_LOG2, 2 
++        b               change_got_table_done
++        nop
++               
++change_got_table:
++        bal     1f
++              nop
++        .word   got_size
++1:
++        move    t1, ra
++        lw      t1, 0(t1)
++
++        move    t0, gp
++        add     t1, t0, t1
++        addi    t0, 8 /*skip first 2 entries*/
++2:
++        lw      t2, 0(t0)
++        subu    t2, 0x20000000
++        sw      t2, 0(t0)
++        bne     t0, t1, 2b
++        addi    t0, t0, 4
++
++        subu    gp, 0x20000000
++
++change_got_table_done:
++#if defined(CONFIG_LTQ_SECURE_BOOT)
++        li      k0, 8
++        bne     k0, r23_cpu_num, iap_stack     // CPUNum = 8 = 4KEc
++        nop
++        li      sp, 0x9fc87ff0
++        j       stack_done
++        nop
++iap_stack:
++#endif
++        la      sp, 0(k1)
++#if defined(CONFIG_LTQ_SECURE_BOOT)
++stack_done:
++#endif
++
++    move    a0, r23_cpu_num                     // main(arg0) is the "cpu" number (cp0 EBase[CPUNUM].)
++    move    a1, r8_core_num                     // main(arg1) is the core number.
++    move    a2, r9_vpe_num                      // main(arg2) is the vpe number.
++	la	t9, main
++
++	j	t9
++	nop
++     
++
+diff --git a/arch/mips/cpu/grx500/start_uncomp.S b/arch/mips/cpu/grx500/start_uncomp.S
+new file mode 100644
+--- /dev/null
++++ b/arch/mips/cpu/grx500/start_uncomp.S
+@@ -0,0 +1,57 @@
++/*
++ *  Startup Code for MIPS32 CPU-core
++ *
++ *  Copyright (c) 2003	Wolfgang Denk <wd@denx.de>
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++
++#include <config.h>
++#include <version.h>
++#include <asm/regdef.h>
++#include <asm/mipsregs.h>
++#include <asm/cacheops.h>
++#include <asm/addrspace.h>
++#include <asm/yamon.h>
++
++    .set noreorder
++	  .option pic0
++
++   	.globl _start
++   	.text
++_start:
++     /* Initialize GOT pointer.
++        */
++        bal     1f
++        nop
++        .word   _GLOBAL_OFFSET_TABLE_
++1:
++        move    gp, ra
++        lw      t1, 0(ra)
++        move    gp, t1
++
++
++    li   t0, 0xa0600000
++    la      sp, 0(t0)
++    
++    la   t9, uncompress
++    j    t9
++    nop
++    
+diff --git a/arch/mips/include/asm/cacheops.h b/arch/mips/include/asm/cacheops.h
+--- a/arch/mips/include/asm/cacheops.h
++++ b/arch/mips/include/asm/cacheops.h
+@@ -82,4 +82,76 @@
+ #define Index_Store_Data_D	0x1d
+ #define Index_Store_Data_S	0x1f
+ 
++
++/*
++ * Cache Operations available on all MIPS processors with R4000-style caches
++ */
++#define INDEX_INVALIDATE_I      0x00
++#define INDEX_WRITEBACK_INV_D   0x01
++#define INDEX_LOAD_TAG_I	0x04
++#define INDEX_LOAD_TAG_D	0x05
++#define INDEX_STORE_TAG_I	0x08
++#define INDEX_STORE_TAG_D	0x09
++#if defined(CONFIG_CPU_LOONGSON2)
++#define HIT_INVALIDATE_I	0x00
++#else
++#define HIT_INVALIDATE_I	0x10
++#endif
++#define HIT_INVALIDATE_D	0x11
++#define HIT_WRITEBACK_INV_D	0x15
++
++/*
++ * R4000-specific cacheops
++ */
++#define CREATE_DIRTY_EXCL_D	0x0d
++#define FILL			0x14
++#define HIT_WRITEBACK_I		0x18
++#define HIT_WRITEBACK_D		0x19
++
++/*
++ * R4000SC and R4400SC-specific cacheops
++ */
++#define INDEX_INVALIDATE_SI     0x02
++#define INDEX_WRITEBACK_INV_SD  0x03
++#define INDEX_LOAD_TAG_SI	0x06
++#define INDEX_LOAD_TAG_SD	0x07
++#define INDEX_STORE_TAG_SI	0x0A
++#define INDEX_STORE_TAG_SD	0x0B
++#define CREATE_DIRTY_EXCL_SD	0x0f
++#define HIT_INVALIDATE_SI	0x12
++#define HIT_INVALIDATE_SD	0x13
++#define HIT_WRITEBACK_INV_SD	0x17
++#define HIT_WRITEBACK_SD	0x1b
++#define HIT_SET_VIRTUAL_SI	0x1e
++#define HIT_SET_VIRTUAL_SD	0x1f
++
++/*
++ * R5000-specific cacheops
++ */
++#define R5K_PAGE_INVALIDATE_S	0x17
++
++/*
++ * RM7000-specific cacheops
++ */
++#define PAGE_INVALIDATE_T	0x16
++
++/*
++ * R10000-specific cacheops
++ *
++ * Cacheops 0x02, 0x06, 0x0a, 0x0c-0x0e, 0x16, 0x1a and 0x1e are unused.
++ * Most of the _S cacheops are identical to the R4000SC _SD cacheops.
++ */
++#define INDEX_WRITEBACK_INV_S	0x03
++#define INDEX_LOAD_TAG_S	0x07
++#define INDEX_STORE_TAG_S	0x0B
++#define HIT_INVALIDATE_S	0x13
++#define CACHE_BARRIER		0x14
++#define HIT_WRITEBACK_INV_S	0x17
++#define INDEX_LOAD_DATA_I	0x18
++#define INDEX_LOAD_DATA_D	0x19
++#define INDEX_LOAD_DATA_S	0x1b
++#define INDEX_STORE_DATA_I	0x1c
++#define INDEX_STORE_DATA_D	0x1d
++#define INDEX_STORE_DATA_S	0x1f
++
+ #endif	/* __ASM_CACHEOPS_H */
+diff --git a/arch/mips/include/asm/cps.h b/arch/mips/include/asm/cps.h
+--- a/arch/mips/include/asm/cps.h
++++ b/arch/mips/include/asm/cps.h
+@@ -1,67 +1,3 @@
+-/*
+- * cps.h
+- *
+- *  Created on: May 1, 2012
+- *      Author: MIPS TECHNOLOGIES, INC
+-*/
+-/*
+-Unpublished work (c) MIPS Technologies, Inc.  All rights reserved.  Unpublished rights reserved
+-under the copyright laws of the United States of America and other countries.
+-
+-This code is confidential and proprietary to MIPS Technologies, Inc. ("MIPS Technologies") and
+-may be disclosed only as permitted in writing by MIPS Technologies or an authorized third party.
+-Any copying, reproducing, modifying, use or disclosure of this code (in whole or in part) that is
+-not expressly permitted in writing by MIPS Technologies or an authorized third party is strictly
+-prohibited. At a minimum, this code is protected under trade secret, unfair competition, and
+-copyright laws. Violations thereof may result in criminal penalties and fines.
+-
+-MIPS Technologies reserves the right to change this code to improve function, design or
+-otherwise. MIPS Technologies does not assume any liability arising out of the application or use
+-of this code, or of any error or omission in such code.  Any warranties, whether express, statutory,
+-implied or otherwise, including but not limited to the implied warranties of merchantability or
+-fitness for a particular purpose, are excluded.  Except as expressly provided in any written license
+-agreement from MIPS Technologies or an authorized third party, the furnishing of this code does
+-not give recipient any license to any intellectual property rights, including any patent rights, that
+-cover this code.
+-
+-This code shall not be exported, reexported, transferred, or released, directly or indirectly, in
+-violation of the law of any country or international law, regulation, treaty, Executive Order,
+-statute, amendments or supplements thereto.  Should a conflict arise regarding the export,
+-reexport, transfer, or release of this code, the laws of the United States of America shall be
+-the governing law.
+-
+-This code may only be disclosed to the United States government ("Government"), or to
+-Government users, with prior written consent from MIPS Technologies or an authorized third
+-party.  This code constitutes one or more of the following: commercial computer software,
+-commercial computer software documentation or other commercial items.  If the user of this
+-code, or any related documentation of any kind, including related technical data or manuals, is an
+-agency, department, or other entity of the Government, the use, duplication, reproduction, release,
+-modification, disclosure, or transfer of this code, or any related documentation of any kind, is
+-restricted in accordance with Federal Acquisition Regulation 12.212 for civilian agencies and
+-Defense Federal Acquisition Regulation Supplement 227.7202 for military agencies.  The use of
+-this code by the Government is further restricted in accordance with the terms of the license
+-agreement(s) and/or applicable contract terms and conditions covering this code from MIPS
+-Technologies or an authorized third party.
+-*/
+-
+-/*
+- * This include file contains #defines for the memory mapped registers in a coherent Processing system
+- * of both single cores and multi threaded cores. It contains registers offset for all the registers,
+- * defines for the fields with in the registers and encodings for some of the fields.
+- *
+- * The fields in the registers are defined by a pair of #defines, one define is the starting bit position of
+- * the field and another, (with a "_S" appended to the name), is the size of the field. Here is an example of
+- * how you would use these #defines in the the extraction of a filed:
+- *
+- *   li      $5, GIC_BASE_ADDR			         # load GIC KSEG0 Address
+- *   lw      $4, GIC_SH_CONFIG($5)               # Read the GIC_SH_CONFIG Register
+- *   ext     $4, NUMINTERRUPTS, NUMINTERRUPTS_S  # Extract NUMINTERRUPTS
+- *
+- *   The names for the registers and fields are usually the same as used in the Software Users Manual
+- *   (SUM). The exceptions occur when the names would conflict with each other in that case the name
+- *   is appended with something to make it unique.
+- */
+-
+ #ifndef CPS_H_
+ #define CPS_H_
+ 
+diff --git a/arch/mips/include/asm/grx500.h b/arch/mips/include/asm/grx500.h
+new file mode 100755
+--- /dev/null
++++ b/arch/mips/include/asm/grx500.h
+@@ -0,0 +1,866 @@
++#ifndef GRX500_H
++#define GRX500_H
++
++#define GRX500_PLATFORM            "GRX500"
++#define KSEG1 0xa0000000
++
++/***********************************************************************/
++/*  Module      :  CGU register address and bits                       */
++/***********************************************************************/
++#define CGU_BASE (KSEG1+0x16200000)
++#define CGU_PLL0A_CFG0  (CGU_BASE + 0x0004)
++#define CGU_PLL0A_CFG1  (CGU_BASE + 0x0008)
++#define CGU_PLL0B_CFG0  (CGU_BASE + 0x0034)
++#define CGU_PLL0B_CFG1  (CGU_BASE + 0x0038)
++
++#define CGU_CLKGSR0     (CGU_BASE + 0x114)
++#define CGU_CLKGCR0_A   (CGU_BASE + 0x118)
++#define CGU_CLKGCR0_B   (CGU_BASE + 0x11C)
++#define CGU_CLKGSR1     (CGU_BASE + 0x120)
++#define CGU_CLKGCR1_A   (CGU_BASE + 0x124)
++#define CGU_CLKGCR1_B   (CGU_BASE + 0x128)
++#define CGU_CLKGSR2     (CGU_BASE + 0x130)
++#define CGU_CLKGCR2_A   (CGU_BASE + 0x134) 
++#define CGU_CLKGCR2_B   (CGU_BASE + 0x138) 
++
++#define BSP_CLKGCR1_A   ((volatile u32*)CGU_CLKGCR1_A)
++
++#define CGU_CLKGCR1_A_SPI0_MASK      0x100
++
++/***********************************************************************/
++/*  Module      :  Reset Registers		                       */
++/***********************************************************************/
++#define RESET_BASE_REG	(0xB6000000)
++#define RESET_REQ	(volatile u32*)(RESET_BASE_REG + 0x10)
++#define RESET_STAT	(volatile u32*)(RESET_BASE_REG + 0x14)
++#define RESET_STAT2	(volatile u32*)(RESET_BASE_REG + 0x24)
++#define RESET_REQ2	(volatile u32*)(RESET_BASE_REG + 0x48)
++
++/***********************************************************************/
++/*  Module      :  GPTC1 register address and bits                       */
++/***********************************************************************/
++#define GPTC1_BASE_REGISTER				(KSEG1 + 0x16300000)
++#define GPT1_CLC						(GPTC1_BASE_REGISTER + 0x0)
++#define GPT1_ID 						(GPTC1_BASE_REGISTER + 0x8)
++#define GPT1_CON_1_A					(GPTC1_BASE_REGISTER + 0x10)
++#define GPT1_CON_1_B					(GPTC1_BASE_REGISTER + 0x14)
++#define GPT1_RUN_1_A					(GPTC1_BASE_REGISTER + 0x18)
++#define GPT1_RUN_1_B					(GPTC1_BASE_REGISTER + 0x1C)
++#define GPT1_RELOAD_1_A					(GPTC1_BASE_REGISTER + 0x20)
++#define GPT1_RELOAD_1_B					(GPTC1_BASE_REGISTER + 0x24)
++#define GPT1_COUNT_1_A					(GPTC1_BASE_REGISTER + 0x28)
++#define GPT1_COUNT_1_B					(GPTC1_BASE_REGISTER + 0x2C)
++#define GPT1_CON_2_A					(GPTC1_BASE_REGISTER + 0x30)
++#define GPT1_CON_2_B					(GPTC1_BASE_REGISTER + 0x34)
++#define GPT1_RUN_2_A					(GPTC1_BASE_REGISTER + 0x38)
++#define GPT1_RUN_2_B					(GPTC1_BASE_REGISTER + 0x3C)
++#define GPT1_RELOAD_2_A					(GPTC1_BASE_REGISTER + 0x40)
++#define GPT1_RELOAD_2_B					(GPTC1_BASE_REGISTER + 0x44)
++#define GPT1_COUNT_2_A					(GPTC1_BASE_REGISTER + 0x48)
++#define GPT1_COUNT_2_B					(GPTC1_BASE_REGISTER + 0x4C)
++
++/***********************************************************************/
++/*  Module      :  GPTC2 register address and bits                       */
++/***********************************************************************/
++#define GPTC2_BASE_REGISTER			(KSEG1 + 0x16400000)
++#define GPT2_CLC						(GPTC2_BASE_REGISTER + 0x0)
++#define GPT2_ID 						(GPTC2_BASE_REGISTER + 0x8)
++#define GPT2_CON_1_A					(GPTC2_BASE_REGISTER + 0x10)
++#define GPT2_CON_1_B					(GPTC2_BASE_REGISTER + 0x14)
++#define GPT2_RUN_1_A					(GPTC2_BASE_REGISTER + 0x18)
++#define GPT2_RUN_1_B					(GPTC2_BASE_REGISTER + 0x1C)
++#define GPT2_RELOAD_1_A					(GPTC2_BASE_REGISTER + 0x20)
++#define GPT2_RELOAD_1_B					(GPTC2_BASE_REGISTER + 0x24)
++#define GPT2_COUNT_1_A					(GPTC2_BASE_REGISTER + 0x28)
++#define GPT2_COUNT_1_B					(GPTC2_BASE_REGISTER + 0x2C)
++#define GPT2_CON_2_A					(GPTC2_BASE_REGISTER + 0x30)
++#define GPT2_CON_2_B					(GPTC2_BASE_REGISTER + 0x34)
++#define GPT2_RUN_2_A					(GPTC2_BASE_REGISTER + 0x38)
++#define GPT2_RUN_2_B					(GPTC2_BASE_REGISTER + 0x3C)
++#define GPT2_RELOAD_2_A					(GPTC2_BASE_REGISTER + 0x40)
++#define GPT2_RELOAD_2_B					(GPTC2_BASE_REGISTER + 0x44)
++#define GPT2_COUNT_2_A					(GPTC2_BASE_REGISTER + 0x48)
++#define GPT2_COUNT_2_B					(GPTC2_BASE_REGISTER + 0x4C)
++
++/***********************************************************************/
++/*  Module      :  GPTC3 register address and bits                       */
++/***********************************************************************/
++#define GPTC3_BASE_REGISTER			(KSEG1 + 0x16B00000)
++#define GPT3_CLC						(GPTC3_BASE_REGISTER + 0x0)
++#define GPT3_ID 						(GPTC3_BASE_REGISTER + 0x8)
++#define GPT3_CON_1_A					(GPTC3_BASE_REGISTER + 0x10)
++#define GPT3_CON_1_B					(GPTC3_BASE_REGISTER + 0x14)
++#define GPT3_RUN_1_A					(GPTC3_BASE_REGISTER + 0x18)
++#define GPT3_RUN_1_B					(GPTC3_BASE_REGISTER + 0x1C)
++#define GPT3_RELOAD_1_A					(GPTC3_BASE_REGISTER + 0x20)
++#define GPT3_RELOAD_1_B					(GPTC3_BASE_REGISTER + 0x24)
++#define GPT3_COUNT_1_A					(GPTC3_BASE_REGISTER + 0x28)
++#define GPT3_COUNT_1_B					(GPTC3_BASE_REGISTER + 0x2C)
++#define GPT3_CON_2_A					(GPTC3_BASE_REGISTER + 0x30)
++#define GPT3_CON_2_B					(GPTC3_BASE_REGISTER + 0x34)
++#define GPT3_RUN_2_A					(GPTC3_BASE_REGISTER + 0x38)
++#define GPT3_RUN_2_B					(GPTC3_BASE_REGISTER + 0x3C)
++#define GPT3_RELOAD_2_A					(GPTC3_BASE_REGISTER + 0x40)
++#define GPT3_RELOAD_2_B					(GPTC3_BASE_REGISTER + 0x44)
++#define GPT3_COUNT_2_A					(GPTC3_BASE_REGISTER + 0x48)
++#define GPT3_COUNT_2_B					(GPTC3_BASE_REGISTER + 0x4C)
++
++/***********************************************************************/
++/*  Module      :  LEDC register address and bits                       */
++/***********************************************************************/
++#define LED_BASE_REGISTER				(KSEG1 + 0x16D00000)
++#define LED_BLINK_H8_0					(LED_BASE_REGISTER + 0x0)
++#define LED_BLINK_H8_1					(LED_BASE_REGISTER + 0x4)
++#define DUTY_CYCLE_0					(LED_BASE_REGISTER + 0x8)
++#define DUTY_CYCLE_1					(LED_BASE_REGISTER + 0xC)
++#define DUTY_CYCLE_2					(LED_BASE_REGISTER + 0x10)
++#define DUTY_CYCLE_3					(LED_BASE_REGISTER + 0x14)
++#define DUTY_CYCLE_4					(LED_BASE_REGISTER + 0x18)
++#define DUTY_CYCLE_5					(LED_BASE_REGISTER + 0x1C)
++#define DUTY_CYCLE_6					(LED_BASE_REGISTER + 0x20)
++#define DUTY_CYCLE_7					(LED_BASE_REGISTER + 0x24)
++#define DUTY_CYCLE_8					(LED_BASE_REGISTER + 0x28)
++#define DUTY_CYCLE_9					(LED_BASE_REGISTER + 0x2C)
++#define DUTY_CYCLE_10					(LED_BASE_REGISTER + 0x30)
++#define DUTY_CYCLE_11					(LED_BASE_REGISTER + 0x34)
++#define DUTY_CYCLE_12					(LED_BASE_REGISTER + 0x38)
++#define DUTY_CYCLE_13					(LED_BASE_REGISTER + 0x3C)
++#define DUTY_CYCLE_14					(LED_BASE_REGISTER + 0x40)
++#define DUTY_CYCLE_15					(LED_BASE_REGISTER + 0x44)
++#define DUTY_CYCLE_16					(LED_BASE_REGISTER + 0x48)
++#define DUTY_CYCLE_17					(LED_BASE_REGISTER + 0x4C)
++#define DUTY_CYCLE_18					(LED_BASE_REGISTER + 0x50)
++#define DUTY_CYCLE_19					(LED_BASE_REGISTER + 0x54)
++#define DUTY_CYCLE_20					(LED_BASE_REGISTER + 0x58)
++#define DUTY_CYCLE_21					(LED_BASE_REGISTER + 0x5C)
++#define DUTY_CYCLE_22					(LED_BASE_REGISTER + 0x60)
++#define DUTY_CYCLE_23					(LED_BASE_REGISTER + 0x64)
++#define DUTY_CYCLE_24					(LED_BASE_REGISTER + 0x68)
++#define DUTY_CYCLE_25					(LED_BASE_REGISTER + 0x6C)
++#define DUTY_CYCLE_26					(LED_BASE_REGISTER + 0x70)
++#define DUTY_CYCLE_27					(LED_BASE_REGISTER + 0x74)
++#define DUTY_CYCLE_28					(LED_BASE_REGISTER + 0x78)
++#define DUTY_CYCLE_29					(LED_BASE_REGISTER + 0x7C)
++#define DUTY_CYCLE_30					(LED_BASE_REGISTER + 0x80)
++#define DUTY_CYCLE_31					(LED_BASE_REGISTER + 0x84)
++#define SSO_CON0						(LED_BASE_REGISTER + 0x2B0)
++#define SSO_CON1						(LED_BASE_REGISTER + 0x2B4)
++#define SSO_CPU0						(LED_BASE_REGISTER + 0x2B8)
++#define SSO_CPU1						(LED_BASE_REGISTER + 0x2BC)
++#define SSO_AR							(LED_BASE_REGISTER + 0x2C0)
++#define SSO_CON2						(LED_BASE_REGISTER + 0x2C4)
++#define SSO_CON3						(LED_BASE_REGISTER + 0x2C8)
++
++/***********************************************************************/
++/*  Module      :  GPIO register address and bits                       */
++/***********************************************************************/
++#define GPIO_FUNCTION_BASE           (KSEG1 + 0x16C00000)
++#define GPIO_FUNCTION_OUT_0          (GPIO_FUNCTION_BASE + 0x0  )   
++#define GPIO_FUNCTION_IN_0           (GPIO_FUNCTION_BASE + 0x4  )
++#define GPIO_FUNCTION_DIR_0          (GPIO_FUNCTION_BASE + 0x8  )
++#define GPIO_FUNCTION_EXINTCR00      (GPIO_FUNCTION_BASE + 0x18 )
++#define GPIO_FUNCTION_EXINTCR01      (GPIO_FUNCTION_BASE + 0x1C )
++#define GPIO_FUNCTION_IRNCR_0        (GPIO_FUNCTION_BASE + 0x20 )
++#define GPIO_FUNCTION_IRNICR_0       (GPIO_FUNCTION_BASE + 0x24 )
++#define GPIO_FUNCTION_IRNEN_0        (GPIO_FUNCTION_BASE + 0x28 )
++#define GPIO_FUNCTION_IRNCFG_0       (GPIO_FUNCTION_BASE + 0x2C )
++#define GPIO_FUNCTION_IRNENSET_0     (GPIO_FUNCTION_BASE + 0x30 )
++#define GPIO_FUNCTION_IRNENCLR_0     (GPIO_FUNCTION_BASE + 0x34 )
++#define GPIO_FUNCTION_OUTSET_0       (GPIO_FUNCTION_BASE + 0x40 )
++#define GPIO_FUNCTION_OUTCLR_0       (GPIO_FUNCTION_BASE + 0x44 )
++#define GPIO_FUNCTION_DIRSET_0       (GPIO_FUNCTION_BASE + 0x48 )
++#define GPIO_FUNCTION_DIRCLR_0       (GPIO_FUNCTION_BASE + 0x4C )
++#define GPIO_FUNCTION_OUT_1          (GPIO_FUNCTION_BASE + 0x100)
++#define GPIO_FUNCTION_IN_1           (GPIO_FUNCTION_BASE + 0x104)
++#define GPIO_FUNCTION_DIR_1          (GPIO_FUNCTION_BASE + 0x108)
++#define GPIO_FUNCTION_EXINTCR10      (GPIO_FUNCTION_BASE + 0x118)
++#define GPIO_FUNCTION_EXINTCR11      (GPIO_FUNCTION_BASE + 0x11C)                  
++#define GPIO_FUNCTION_IRNCR_1        (GPIO_FUNCTION_BASE + 0x120)
++#define GPIO_FUNCTION_IRNICR_1       (GPIO_FUNCTION_BASE + 0x124)
++#define GPIO_FUNCTION_IRNEN_1        (GPIO_FUNCTION_BASE + 0x128)
++#define GPIO_FUNCTION_IRNCFG_1       (GPIO_FUNCTION_BASE + 0x12C)
++#define GPIO_FUNCTION_IRNENSET_1     (GPIO_FUNCTION_BASE + 0x130)
++#define GPIO_FUNCTION_IRNENCLR_1     (GPIO_FUNCTION_BASE + 0x134)
++#define GPIO_FUNCTION_OUTSET_1       (GPIO_FUNCTION_BASE + 0x140)
++#define GPIO_FUNCTION_OUTCLR_1       (GPIO_FUNCTION_BASE + 0x144)
++#define GPIO_FUNCTION_DIRSET_1       (GPIO_FUNCTION_BASE + 0x148)
++#define GPIO_FUNCTION_DIRCLR_1       (GPIO_FUNCTION_BASE + 0x14C)
++
++
++
++#define GPIO_PAD_CTRL_BASE (KSEG1 + 0x16C80000)
++#define GPIO_PAD_CTRL_PORTMUXC0      (GPIO_PAD_CTRL_BASE + 0x0)   
++#define GPIO_PAD_CTRL_PORTMUXC1      (GPIO_PAD_CTRL_BASE + 0x04)  
++#define GPIO_PAD_CTRL_PORTMUXC2      (GPIO_PAD_CTRL_BASE + 0x08)  
++#define GPIO_PAD_CTRL_PORTMUXC3      (GPIO_PAD_CTRL_BASE + 0x0C)  
++#define GPIO_PAD_CTRL_PORTMUXC4      (GPIO_PAD_CTRL_BASE + 0x10) 
++#define GPIO_PAD_CTRL_PORTMUXC5      (GPIO_PAD_CTRL_BASE + 0x14) 
++#define GPIO_PAD_CTRL_PORTMUXC6      (GPIO_PAD_CTRL_BASE + 0x18) 
++#define GPIO_PAD_CTRL_PORTMUXC7      (GPIO_PAD_CTRL_BASE + 0x1C) 
++#define GPIO_PAD_CTRL_PORTMUXC8      (GPIO_PAD_CTRL_BASE + 0x20) 
++#define GPIO_PAD_CTRL_PORTMUXC9      (GPIO_PAD_CTRL_BASE + 0x24) 
++#define GPIO_PAD_CTRL_PORTMUXC10     (GPIO_PAD_CTRL_BASE + 0x28) 
++#define GPIO_PAD_CTRL_PORTMUXC11     (GPIO_PAD_CTRL_BASE + 0x2C) 
++#define GPIO_PAD_CTRL_PORTMUXC12     (GPIO_PAD_CTRL_BASE + 0x30) 
++#define GPIO_PAD_CTRL_PORTMUXC13     (GPIO_PAD_CTRL_BASE + 0x34) 
++#define GPIO_PAD_CTRL_PORTMUXC14     (GPIO_PAD_CTRL_BASE + 0x38) 
++#define GPIO_PAD_CTRL_PORTMUXC15     (GPIO_PAD_CTRL_BASE + 0x3C) 
++#define GPIO_PAD_CTRL_PORTMUXC16     (GPIO_PAD_CTRL_BASE + 0x40) 
++#define GPIO_PAD_CTRL_PORTMUXC17     (GPIO_PAD_CTRL_BASE + 0x44) 
++#define GPIO_PAD_CTRL_PORTMUXC18     (GPIO_PAD_CTRL_BASE + 0x48) 
++#define GPIO_PAD_CTRL_PORTMUXC19     (GPIO_PAD_CTRL_BASE + 0x4C) 
++#define GPIO_PAD_CTRL_PORTMUXC20     (GPIO_PAD_CTRL_BASE + 0x50) 
++#define GPIO_PAD_CTRL_PORTMUXC21     (GPIO_PAD_CTRL_BASE + 0x54) 
++#define GPIO_PAD_CTRL_PORTMUXC22     (GPIO_PAD_CTRL_BASE + 0x58) 
++#define GPIO_PAD_CTRL_PORTMUXC23     (GPIO_PAD_CTRL_BASE + 0x5C) 
++#define GPIO_PAD_CTRL_PORTMUXC24     (GPIO_PAD_CTRL_BASE + 0x60) 
++#define GPIO_PAD_CTRL_PORTMUXC25     (GPIO_PAD_CTRL_BASE + 0x64) 
++#define GPIO_PAD_CTRL_PORTMUXC26     (GPIO_PAD_CTRL_BASE + 0x68) 
++#define GPIO_PAD_CTRL_PORTMUXC27     (GPIO_PAD_CTRL_BASE + 0x6C) 
++#define GPIO_PAD_CTRL_PORTMUXC28     (GPIO_PAD_CTRL_BASE + 0x70) 
++#define GPIO_PAD_CTRL_PORTMUXC29     (GPIO_PAD_CTRL_BASE + 0x74) 
++#define GPIO_PAD_CTRL_PORTMUXC30     (GPIO_PAD_CTRL_BASE + 0x78) 
++#define GPIO_PAD_CTRL_PORTMUXC31     (GPIO_PAD_CTRL_BASE + 0x7C) 
++#define GPIO_PAD_CTRL_PUEN_0         (GPIO_PAD_CTRL_BASE + 0x80) 
++#define GPIO_PAD_CTRL_PDEN_0         (GPIO_PAD_CTRL_BASE + 0x84) 
++#define GPIO_PAD_CTRL_SRC_0          (GPIO_PAD_CTRL_BASE + 0x88) 
++#define GPIO_PAD_CTRL_DCC_0          (GPIO_PAD_CTRL_BASE + 0x8C) 
++#define GPIO_PAD_CTRL_DCC_1          (GPIO_PAD_CTRL_BASE + 0x90) 
++#define GPIO_PAD_CTRL_OD_0           (GPIO_PAD_CTRL_BASE + 0x94 ) 
++#define GPIO_PAD_CTRL_AVAIL_0        (GPIO_PAD_CTRL_BASE + 0x98 )
++#define GPIO_PAD_CTRL_PORTMUXC32     (GPIO_PAD_CTRL_BASE + 0x100)
++#define GPIO_PAD_CTRL_PORTMUXC33     (GPIO_PAD_CTRL_BASE + 0x104)
++#define GPIO_PAD_CTRL_PORTMUXC34     (GPIO_PAD_CTRL_BASE + 0x108)
++#define GPIO_PAD_CTRL_PORTMUXC35     (GPIO_PAD_CTRL_BASE + 0x10C)
++#define GPIO_PAD_CTRL_PORTMUXC36     (GPIO_PAD_CTRL_BASE + 0x110)
++#define GPIO_PAD_CTRL_PORTMUXC37     (GPIO_PAD_CTRL_BASE + 0x114)
++#define GPIO_PAD_CTRL_PORTMUXC38     (GPIO_PAD_CTRL_BASE + 0x118)
++#define GPIO_PAD_CTRL_PORTMUXC39     (GPIO_PAD_CTRL_BASE + 0x11C)
++#define GPIO_PAD_CTRL_PORTMUXC40     (GPIO_PAD_CTRL_BASE + 0x120)
++#define GPIO_PAD_CTRL_PORTMUXC41     (GPIO_PAD_CTRL_BASE + 0x124)
++#define GPIO_PAD_CTRL_PORTMUXC42     (GPIO_PAD_CTRL_BASE + 0x128)
++#define GPIO_PAD_CTRL_PORTMUXC43     (GPIO_PAD_CTRL_BASE + 0x12C)
++#define GPIO_PAD_CTRL_PORTMUXC44     (GPIO_PAD_CTRL_BASE + 0x130)
++#define GPIO_PAD_CTRL_PORTMUXC45     (GPIO_PAD_CTRL_BASE + 0x134)
++#define GPIO_PAD_CTRL_PORTMUXC46     (GPIO_PAD_CTRL_BASE + 0x138)
++#define GPIO_PAD_CTRL_PORTMUXC47     (GPIO_PAD_CTRL_BASE + 0x13C)
++#define GPIO_PAD_CTRL_PORTMUXC48     (GPIO_PAD_CTRL_BASE + 0x140)
++#define GPIO_PAD_CTRL_PORTMUXC49     (GPIO_PAD_CTRL_BASE + 0x144)
++#define GPIO_PAD_CTRL_PORTMUXC50     (GPIO_PAD_CTRL_BASE + 0x148)
++#define GPIO_PAD_CTRL_PORTMUXC51     (GPIO_PAD_CTRL_BASE + 0x14C)
++#define GPIO_PAD_CTRL_PORTMUXC52     (GPIO_PAD_CTRL_BASE + 0x150)
++#define GPIO_PAD_CTRL_PORTMUXC53     (GPIO_PAD_CTRL_BASE + 0x154)
++#define GPIO_PAD_CTRL_PORTMUXC54     (GPIO_PAD_CTRL_BASE + 0x158)
++#define GPIO_PAD_CTRL_PORTMUXC55     (GPIO_PAD_CTRL_BASE + 0x15C)
++#define GPIO_PAD_CTRL_PORTMUXC56     (GPIO_PAD_CTRL_BASE + 0x160)
++#define GPIO_PAD_CTRL_PORTMUXC57     (GPIO_PAD_CTRL_BASE + 0x164)
++#define GPIO_PAD_CTRL_PORTMUXC58     (GPIO_PAD_CTRL_BASE + 0x168)
++#define GPIO_PAD_CTRL_PORTMUXC59     (GPIO_PAD_CTRL_BASE + 0x16C)
++#define GPIO_PAD_CTRL_PORTMUXC60     (GPIO_PAD_CTRL_BASE + 0x170)
++#define GPIO_PAD_CTRL_PORTMUXC61     (GPIO_PAD_CTRL_BASE + 0x174)
++#define GPIO_PAD_CTRL_PUEN_1         (GPIO_PAD_CTRL_BASE + 0x180)
++#define GPIO_PAD_CTRL_PDEN_1         (GPIO_PAD_CTRL_BASE + 0x184)
++#define GPIO_PAD_CTRL_SRC_1          (GPIO_PAD_CTRL_BASE + 0x188)
++#define GPIO_PAD_CTRL_DCC_2          (GPIO_PAD_CTRL_BASE + 0x18C)
++#define GPIO_PAD_CTRL_DCC_3          (GPIO_PAD_CTRL_BASE + 0x190)
++#define GPIO_PAD_CTRL_OD_1           (GPIO_PAD_CTRL_BASE + 0x194)
++#define GPIO_PAD_CTRL_AVAIL_1        (GPIO_PAD_CTRL_BASE + 0x198)
++
++/***********************************************************************/
++/*  Module      :  DMA0 register address and bits                       */
++/***********************************************************************/
++
++//! Base Address of DMA0
++#define DMA0_MODULE_BASE		(KSEG1+0x16E00000)
++
++/***********************************************************************/
++/*  Module      :  DMA1TX register address and bits                     */
++/***********************************************************************/
++//! Base Address of DMA1_TX
++#define DMA1_TX_MODULE_BASE 		(KSEG1+0x1A100000)
++
++/***********************************************************************/
++/*  Module      :  DMA2TX register address and bits                     */
++/***********************************************************************/
++//! Base Address of DMA1_RX
++#define DMA1_RX_MODULE_BASE 		(KSEG1+0x1A200000)
++
++/***********************************************************************/
++/*  Module      :  DMA2TX register address and bits                     */
++/***********************************************************************/
++//! Base Address of DMA2_TX
++#define DMA2_TX_MODULE_BASE 		(KSEG1+0x1C100000)
++
++/***********************************************************************/
++/*  Module      :  DMA2RX register address and bits                     */
++/***********************************************************************/
++//! Base Address of DMA2_RX
++#define DMA2_RX_MODULE_BASE 		(KSEG1+0x1C200000)
++
++/***********************************************************************/
++/*  Module      :  DMA register offset address and bits                */
++/***********************************************************************/
++#define DMA_CLC 			0x0
++#define	DMA_ID				0x8
++#define DMA_CTRL			0x10
++#define	DMA_CPOLL 			0x14
++#define DMA_CS 				0x18
++#define DMA_CCTRL 			0x1C
++#define DMA_CDBA 			0x20
++#define DMA_CDLEN 			0x24
++#define DMA_CIS 			0x28
++#define DMA_CIE 			0x2C
++#define DMA_CGBL 			0x30
++#define DMA_CDPTNRD 		0x34
++#define DMA_PS 				0x40
++#define DMA_PCTRL 			0x44
++#define DMA_CS1				0x50
++#define DMA_CCTRL1 			0x54
++#define DMA_CDBA1 			0x58
++#define DMA_CDLEN1 			0x5C
++#define DMA_CIS1 			0x60
++#define DMA_CIE1 			0x64
++#define DMA_PS1 			0x70
++#define DMA_PCTRL1 			0x74
++#define DMA_CPDCNT 			0x80
++#define DMA_CPDCNT1 		0x84
++#define DMA_CS2 			0x90
++#define DMA_CCTRL2 			0x94
++#define DMA_CDBA2 			0x98
++#define DMA_CDLEN2 			0x9C
++#define DMA_CIS2 			0xA0
++#define DMA_CIE2 			0xA4
++#define DMA_CDPTNRD2 		0xAC
++#define DMA_PS2 			0xB0
++#define DMA_PCTRL2			0xB4
++#define DMA_CS3 			0xC0
++#define DMA_CCTRL3 			0xC4
++#define DMA_CDBA3 			0xC8
++#define DMA_CDLEN3 			0xCC
++#define DMA_CIS3 			0xD0
++#define DMA_CIE3 			0xD4
++#define DMA_CDPTNRD3 		0xDC
++#define DMA_PS3 			0xE0
++#define DMA_PCTRL3 			0xE4
++#define DMA_IRNEN1 			0xE8
++#define DMA_IRNCR1 			0xEC
++#define DMA_IRNICR1 		0xF0
++#define DMA_IRNEN 			0xF4
++#define DMA_IRNCR 			0xF8
++#define DMA_IRNICR 			0xFC
++
++#define DMA_CTRL_RST_POS		0
++#define DMA_PCTRL_GPC_POS		16
++#define	DMA_PCTRL_TXWGT_POS		12
++#define DMA_PCTRL_TXENDI_POS	10
++#define DMA_PCTRL_RXENDI_POS	8
++#define DMA_PCTRL_PDEN_POS		6
++#define	DMA_PCTRL_TXBL_POS		4
++#define DMA_PCTRL_RXBL_POS		2
++#define DMA_CCTRL_DIR_POS		8
++#define DMA_CCTRL_ON_OFF_POS	0
++#define DMA_CCTRL_RST_POS		1
++#define DMA_CCTRL_CLASS_MASK	0xE00
++#define DMA_CCTRL_CLASSH_MASK	0xC0000
++#define DMA_CPOLL_EN_POS		31
++#define DMA_CPOLL_CNT_POS		4
++
++#define DMA_CTRL_PKTARB_MASK 	0x80000000
++#define DMA_CTRL_MBRSTARB_MASK 	0x40000000
++#define DMA_CTRL_SK_CH_MASK 	0x40
++#define DMA_CTRL_DS_FOD_MASK 	0x80
++#define DMA_CTRL_DRB_MASK 		0x100
++#define DMA_CTRL_ENBE_MASK 		0x200
++
++
++
++/***********************************************************************/
++/*  Module      :  EBU register address and bits                       */
++/***********************************************************************/
++
++#define EBU_BASE            (KSEG1+0x16F00000)
++
++#define EBU_CLC             (volatile u32*)(EBU_BASE + 0x0  ) 
++#define EBU_ID              (volatile u32*)(EBU_BASE + 0x8  ) 
++#define EBU_CON             (volatile u32*)(EBU_BASE + 0x10 )
++#define EBU_ADDR_SEL_0      (volatile u32*)(EBU_BASE + 0x20 ) 
++#define EBU_ADDR_SEL_1      (volatile u32*)(EBU_BASE + 0x24 ) 
++#define EBU_ADDR_SEL_2      (volatile u32*)(EBU_BASE + 0x28 )
++#define EBU_ADDR_SEL_3      (volatile u32*)(EBU_BASE + 0x2C )
++#define EBU_CON_0           (volatile u32*)(EBU_BASE + 0x60 ) 
++#define EBU_CON_1           (volatile u32*)(EBU_BASE + 0x64 )
++#define EBU_CON_2           (volatile u32*)(EBU_BASE + 0x68 ) 
++#define EBU_CON_3           (volatile u32*)(EBU_BASE + 0x6C )
++#define EBU_EMU_ADDR        (volatile u32*)(EBU_BASE + 0x80 )
++#define EBU_EMU_CON         (volatile u32*)(EBU_BASE + 0x88 )
++#define EBU_SYN_CON         (volatile u32*)(EBU_BASE + 0x8C )
++#define EBU_ECC_ISTAT       (volatile u32*)(EBU_BASE + 0xA0 )
++#define EBU_ECC_IEN         (volatile u32*)(EBU_BASE + 0xA4 )
++#define EBU_ECC_INT_OUT     (volatile u32*)(EBU_BASE + 0xA8 ) 
++#define EBU_NAND_CON        (volatile u32*)(EBU_BASE + 0xB0 ) 
++#define EBU_NAND_WAIT       (volatile u32*)(EBU_BASE + 0xB4 )
++#define EBU_NAND_ECC0       (volatile u32*)(EBU_BASE + 0xB8 ) 
++#define EBU_NAND_ECC_AC     (volatile u32*)(EBU_BASE + 0xBC ) 
++#define EBU_NAND_ECC_CR     (volatile u32*)(EBU_BASE + 0xC0 ) 
++#define EBU_SYN_CON1        (volatile u32*)(EBU_BASE + 0xC4 ) 
++
++
++
++/***********************************************************************/
++/*  Module      :  DMA register address and bits                       */
++/***********************************************************************/
++#define BSP_DMA_OFFSET 0xB6e00000
++/***********************************************************************/
++#define BSP_DMA_CLC                   ((volatile u32*)(BSP_DMA_OFFSET + 0x0000))
++#define BSP_DMA_ID                    ((volatile u32*)(BSP_DMA_OFFSET + 0x0008))
++#define BSP_DMA_CTRL                  ((volatile u32*)(BSP_DMA_OFFSET + 0x0010))
++
++#define BSP_DMA_PS                    ((volatile u32*)(BSP_DMA_OFFSET + 0x0040))
++#define BSP_DMA_PCTRL                 ((volatile u32*)(BSP_DMA_OFFSET + 0x0044))
++#define BSP_DMA_IRNEN                 ((volatile u32*)(BSP_DMA_OFFSET + 0x00F4))
++#define BSP_DMA_IRNCR                 ((volatile u32*)(BSP_DMA_OFFSET + 0x00F8))
++#define BSP_DMA_IRNICR                ((volatile u32*)(BSP_DMA_OFFSET + 0x00FC))
++
++#define BSP_DMA_CS                    ((volatile u32*)(BSP_DMA_OFFSET + 0x0018))
++#define BSP_DMA_CCTRL                 ((volatile u32*)(BSP_DMA_OFFSET + 0x001C))
++#define BSP_DMA_CDBA                  ((volatile u32*)(BSP_DMA_OFFSET + 0x0020))
++#define BSP_DMA_CGBL                  ((volatile u32*)(BSP_DMA_OFFSET + 0x0030))
++#define BSP_DMA_CIE                   ((volatile u32*)(BSP_DMA_OFFSET + 0x002C))
++#define BSP_DMA_CIS                   ((volatile u32*)(BSP_DMA_OFFSET + 0x0028))
++#define BSP_DMA_CDLEN                 ((volatile u32*)(BSP_DMA_OFFSET + 0x0024))
++#define BSP_DMA_CPOLL                 ((volatile u32*)(BSP_DMA_OFFSET + 0x0014))
++
++
++/***********************************************************************/
++/*  Module      :  HSNAND registers                                    */
++/***********************************************************************/
++
++#define HSNAND_BASE                       (0xB7000000)
++
++#define BSP_NDAC_CTL1             ((volatile u32*)(HSNAND_BASE + 0x0110))
++#define BSP_NDAC_CTL2             ((volatile u32*)(HSNAND_BASE + 0x0114))
++#define BSP_INT_Msk_CTL           ((volatile u32*)(HSNAND_BASE + 0x0124))
++#define BSP_INT_Sta               ((volatile u32*)(HSNAND_BASE + 0x0128))
++#define BSP_MD_CTL                ((volatile u32*)(HSNAND_BASE + 0x0130))
++#define BSP_ND_PARA0              ((volatile u32*)(HSNAND_BASE + 0x013C))
++#define BSP_ND_ODD_ECC            ((volatile u32*)(HSNAND_BASE + 0x0140))
++#define BSP_ND_ODD_ECC1           ((volatile u32*)(HSNAND_BASE + 0x0144))
++#define BSP_ND_EVEN_ECC           ((volatile u32*)(HSNAND_BASE + 0x0148))
++#define BSP_ND_EVEN_ECC1          ((volatile u32*)(HSNAND_BASE + 0x014C))
++#define BSP_ND_CMSG_0             ((volatile u32*)(HSNAND_BASE + 0x0150))
++#define BSP_ND_CMSG_1             ((volatile u32*)(HSNAND_BASE + 0x0154))
++
++#define I2C_BASE_ADDR			(KSEG1+0x16A00000)
++#define I2C_CLC					((volatile u32*)(I2C_BASE_ADDR + 0x0000))
++#define I2C_ID					((volatile u32*)(I2C_BASE_ADDR + 0x0008))
++#define I2C_RUN_CTRL			((volatile u32*)(I2C_BASE_ADDR + 0X0010))
++#define I2C_ENDD_CTRL			((volatile u32*)(I2C_BASE_ADDR + 0x0014))
++#define I2C_FDIV_CFG			((volatile u32*)(I2C_BASE_ADDR + 0x0018))
++#define I2C_FDIV_HIGH_CFG		((volatile u32*)(I2C_BASE_ADDR + 0x001C))
++#define I2C_ADDR_CFG			((volatile u32*)(I2C_BASE_ADDR + 0x0020))
++#define I2C_BUS_STAT			((volatile u32*)(I2C_BASE_ADDR + 0x0024))
++#define I2C_FIFO_CFG			((volatile u32*)(I2C_BASE_ADDR + 0x0028))
++#define I2C_MRPS_CTRL			((volatile u32*)(I2C_BASE_ADDR + 0x002C))
++#define I2C_RPS_STAT			((volatile u32*)(I2C_BASE_ADDR + 0x0030))
++#define I2C_TPS_CTRL			((volatile u32*)(I2C_BASE_ADDR + 0x0034))
++#define I2C_FFS_STAT			((volatile u32*)(I2C_BASE_ADDR + 0x0038))
++#define I2C_TIM_CFG				((volatile u32*)(I2C_BASE_ADDR + 0x0040))
++#define I2C_ERR_IRQSM 			((volatile u32*)(I2C_BASE_ADDR + 0x0060))
++#define I2C_ERR_IRQSS			((volatile u32*)(I2C_BASE_ADDR + 0x0064))
++#define I2C_ERR_IRQSC			((volatile u32*)(I2C_BASE_ADDR + 0x0068))
++#define I2C_P_IRQSM				((volatile u32*)(I2C_BASE_ADDR + 0x0070))
++#define I2C_P_IRQSS				((volatile u32*)(I2C_BASE_ADDR + 0x0074))
++#define I2C_P_IRQSC				((volatile u32*)(I2C_BASE_ADDR + 0x0078))
++#define I2C_RIS					((volatile u32*)(I2C_BASE_ADDR + 0x0080))
++#define I2C_IMSC				((volatile u32*)(I2C_BASE_ADDR + 0x0084))
++#define I2C_MIS 				((volatile u32*)(I2C_BASE_ADDR + 0x0088))
++#define I2C_ICR					((volatile u32*)(I2C_BASE_ADDR + 0x008C))
++#define I2C_ISR					((volatile u32*)(I2C_BASE_ADDR + 0x0090))
++#define I2C_DMAE				((volatile u32*)(I2C_BASE_ADDR + 0x0094))
++#define I2C_TXD					((volatile u32*)(I2C_BASE_ADDR + 0x8000))
++#define I2C_RXD 				((volatile u32*)(I2C_BASE_ADDR + 0xC000))
++                                                         
++
++/***********************************************************************/
++/*  Module      :  Switch register address and bits                     */
++/***********************************************************************/
++#define GSW_BASE_ADDR					(KSEG1+0x1C000000)
++#define GSW_R_BASE_ADDR					(KSEG1+0x1A000000)
++#define GSW_TOP_LVL_OFFSET     			(0x00003C00)
++
++#define GSW_BM_PCFG(i)         			((0x080 + (0x2 * i)) * 4)
++
++#define GSWIP_TOP_L_MODULE_BASE 		(KSEG1+0x1C003C00)
++#define GSWIP_L_TOP_BASE_ADDR			GSWIP_TOP_L_MODULE_BASE
++#define GSWIP_L_GLOB_CTRL        		((volatile u32*)(GSWIP_L_TOP_BASE_ADDR))
++#define GSWIP_TOP_L_MDIO_CTRL			((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0010))
++#define GSWIP_TOP_L_MDIO_READ			((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0014))
++#define GSWIP_TOP_L_MDIO_WRITE			((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0018))
++#define GSW_L_MDC_CFG_0					((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x001C))
++#define GSW_L_MDC_CFG_1					((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0020))
++#define GSWIP_L_MII_CFG1         		((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0024))
++#define GSWIP_L_PHY_ADDR(i)    			((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0110 + (i-1)*0x10))
++#define GSWIP_TOP_L_GPHY2_CFG(i)		((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0220 + (i-1)*0x10))
++#define GSWIP_TOP_L_GPHY_BFDEV(i)		((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0224 + (i-1)*0x10))
++#define GSWIP_TOP_L_GPHY_LBADR(i)		((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x0228 + (i-1)*0x10))
++#define GSWIP_TOP_L_GPHY_MBADR(i)		((volatile u32*)(GSWIP_L_TOP_BASE_ADDR + 0x022C + (i-1)*0x10))
++
++#define GSWIP_L_MODULE_BASE 			(KSEG1+0x1C000000)
++#define GSW_L_BASE_ADDR					GSWIP_L_MODULE_BASE
++#define GSWIP_L_MAC_CTRL(i)    			((volatile u32*)(GSWIP_L_MODULE_BASE + 0x243C + (i-1)*0x30))
++#define GSWIP_L_BM_PCFG(i)     			((volatile u32*)(GSWIP_L_MODULE_BASE + 0x0200 + (i-1)*0x30))
++
++#define GSWIP_TOP_R_MODULE_BASE 		(KSEG1+0x1A003C00)
++#define GSWIP_TOP_R_MDC_CFG_0_R			((volatile u32*)(GSWIP_TOP_R_MODULE_BASE + 0x001C))
++#define GSWIP_TOP_R_MDC_CFG_1_R			((volatile u32*)(GSWIP_TOP_R_MODULE_BASE + 0x0020))
++
++#define GSW_R_MAC_CTRL_0(i)      		((0x8F7 + (0xC * i)) * 4) //MAC Control Register 0
++#define GSW_R_MDC_CFG_0					((volatile u32*)(GSWIP_TOP_R_MODULE_BASE + 0x001C))
++#define GSW_R_MDC_CFG_1					((volatile u32*)(GSWIP_TOP_R_MODULE_BASE + 0x0020))
++#define GSW_PMAC_TBL_VAL_4				(0xD40 * 4)
++#define GSW_PMAC_TBL_VAL_3				(0xD41 * 4)
++#define GSW_PMAC_TBL_VAL_2				(0xD42 * 4)
++#define GSW_PMAC_TBL_VAL_1				(0xD43 * 4)
++#define GSW_PMAC_TBL_VAL_0				(0xD44 * 4)
++#define GSW_PMAC_TBL_ADDR				(0xD45 * 4)
++#define GSW_PMAC_TBL_CTRL				(0xD46 * 4)
++#define PCE_PMAP_3						(0x455 * 4)
++#define PCE_PMAP_2						(0x454 * 4)
++#define GSW_FDMA_PCTRL(i)       		((0xA80 + (0x6 * i)) * 4)
++#define GSW_PCE_PCTRL_0(i)     			((0x480 + (0xA * i)) * 4)
++
++
++//ETHSW_PMAC:                  
++#define GSW_PMAC_ISR           (0xD01 * 4) //PMAC Interrupt Status Register 
++#define GSW_PMAC_IER           (0xD02 * 4) //PMAC Interrupt Enable Register 
++#define GSW_PMAC_CTRL_0        (0xD03 * 4) //PMAC Control Register 0 
++#define GSW_PMAC_CTRL_2        (0xD05 * 4) //PMAC Control Register 2 
++#define GSW_PMAC_CTRL_3        (0xD06 * 4) //PMAC Control Register 3 
++#define GSW_PMAC_CTRL_4        (0xD07 * 4) //PMAC Control Register 4
++#define GSW_PMAC_TBL_VAL_4     (0xD40 * 4) //Table Value Register 4    
++#define GSW_PMAC_TBL_VAL_3     (0xD41 * 4) //Table Value Register 3     
++#define GSW_PMAC_TBL_VAL_2     (0xD42 * 4) //Table Value Register 2     
++#define GSW_PMAC_TBL_VAL_1     (0xD43 * 4) //Table Value Register 1     
++#define GSW_PMAC_TBL_VAL_0     (0xD44 * 4) //Table Value Register 0     
++#define GSW_PMAC_TBL_ADDR      (0xD45 * 4) //Table Entry Address Register     
++#define GSW_PMAC_TBL_CTRL      (0xD46 * 4) //Table Access Control Register 
++
++/* Description: 'Access Request' */
++#define PCE_GCTRL_0_MC_VALID_OFFSET 0x456  
++#define PCE_GCTRL_0_MC_VALID_SHIFT  3
++#define PCE_GCTRL_0_MC_VALID_SIZE   1  
++
++/* --------------------------------------------------- */
++/* Register: 'Table Mask Write Register3' (LTQ_GSWIP_3_0) */
++/* Bit: 'MASK3' */
++/* Description: 'Mask Pattern [15:0]' */
++#define PCE_TBL_MASK_3_MASK3_OFFSET		0x42A
++#define PCE_TBL_MASK_3_MASK3_SHIFT		0
++#define PCE_TBL_MASK_3_MASK3_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Mask Write Register2' (LTQ_GSWIP_3_0) */
++/* Bit: 'MASK2' */
++/* Description: 'Mask Pattern [15:0]' */
++#define PCE_TBL_MASK_2_MASK2_OFFSET		0x42B
++#define PCE_TBL_MASK_2_MASK2_SHIFT		0
++#define PCE_TBL_MASK_2_MASK2_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Mask Write Register1' (LTQ_GSWIP_3_0) */
++/* Bit: 'MASK1' */
++/* Description: 'Mask Pattern [15:0]' */
++#define PCE_TBL_MASK_1_MASK1_OFFSET		0x42C
++#define PCE_TBL_MASK_1_MASK1_SHIFT		0
++#define PCE_TBL_MASK_1_MASK1_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register15' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL15' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_15_VAL15_OFFSET		0x42D
++#define PCE_TBL_VAL_15_VAL15_SHIFT		0
++#define PCE_TBL_VAL_15_VAL15_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register14' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL14' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_14_VAL14_OFFSET		0x42E
++#define PCE_TBL_VAL_14_VAL14_SHIFT		0
++#define PCE_TBL_VAL_14_VAL14_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register13' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL13' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_13_VAL13_OFFSET		0x42F
++#define PCE_TBL_VAL_13_VAL13_SHIFT		0
++#define PCE_TBL_VAL_13_VAL13_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register12' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL12' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_12_VAL12_OFFSET		0x430
++#define PCE_TBL_VAL_12_VAL12_SHIFT		0
++#define PCE_TBL_VAL_12_VAL12_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register11' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL11' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_11_VAL11_OFFSET		0x431
++#define PCE_TBL_VAL_11_VAL11_SHIFT		0
++#define PCE_TBL_VAL_11_VAL11_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register10' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL10' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_10_VAL10_OFFSET		0x432
++#define PCE_TBL_VAL_10_VAL10_SHIFT		0
++#define PCE_TBL_VAL_10_VAL10_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register9' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL9' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_9_VAL9_OFFSET		0x433
++#define PCE_TBL_VAL_9_VAL9_SHIFT		0
++#define PCE_TBL_VAL_9_VAL9_SIZE			16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register8' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL8' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_8_VAL8_OFFSET		0x434
++#define PCE_TBL_VAL_8_VAL8_SHIFT		0
++#define PCE_TBL_VAL_8_VAL8_SIZE			16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register7' (LTQ_GSWIP_3_0)*/
++/* Bit: 'VAL7' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_7_VAL7_OFFSET		0x435
++#define PCE_TBL_VAL_7_VAL7_SHIFT		0
++#define PCE_TBL_VAL_7_VAL7_SIZE			16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register6' */
++/* Bit: 'VAL6' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_6_VAL6_OFFSET		0x436
++#define PCE_TBL_VAL_6_VAL6_SHIFT		0
++#define PCE_TBL_VAL_6_VAL6_SIZE			16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register5' */
++/* Bit: 'VAL5' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_5_VAL5_OFFSET		0x437
++#define PCE_TBL_VAL_5_VAL5_SHIFT		0
++#define PCE_TBL_VAL_5_VAL5_SIZE			16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 15' */
++/* Bit: 'KEY15' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_15_KEY15_OFFSET	0x438
++#define PCE_TBL_KEY_15_KEY15_SHIFT	0
++#define PCE_TBL_KEY_15_KEY15_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 14' */
++/* Bit: 'KEY14' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_14_KEY14_OFFSET	0x439
++#define PCE_TBL_KEY_14_KEY14_SHIFT	0
++#define PCE_TBL_KEY_14_KEY14_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 13' */
++/* Bit: 'KEY13' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_13_KEY13_OFFSET	0x43A
++#define PCE_TBL_KEY_13_KEY13_SHIFT	0
++#define PCE_TBL_KEY_13_KEY13_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 12' */
++/* Bit: 'KEY12' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_12_KEY12_OFFSET	0x43B
++#define PCE_TBL_KEY_12_KEY12_SHIFT	0
++#define PCE_TBL_KEY_12_KEY12_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 11' */
++/* Bit: 'KEY11' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_11_KEY11_OFFSET	0x43C
++#define PCE_TBL_KEY_11_KEY11_SHIFT	0
++#define PCE_TBL_KEY_11_KEY11_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 10' */
++/* Bit: 'KEY10' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_10_KEY10_OFFSET	0x43D
++#define PCE_TBL_KEY_10_KEY10_SHIFT	0
++#define PCE_TBL_KEY_10_KEY10_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 9' */
++/* Bit: 'KEY9' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_9_KEY9_OFFSET	0x43E
++#define PCE_TBL_KEY_9_KEY9_SHIFT	0
++#define PCE_TBL_KEY_9_KEY9_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 8' */
++/* Bit: 'KEY8' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_8_KEY8_OFFSET	0x43F
++#define PCE_TBL_KEY_8_KEY8_SHIFT	0
++#define PCE_TBL_KEY_8_KEY8_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 7' */
++/* Bit: 'KEY7' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_7_KEY7_OFFSET	0x440
++#define PCE_TBL_KEY_7_KEY7_SHIFT	0
++#define PCE_TBL_KEY_7_KEY7_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 6' */
++/* Bit: 'KEY6' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_6_KEY6_OFFSET	0x441
++#define PCE_TBL_KEY_6_KEY6_SHIFT	0
++#define PCE_TBL_KEY_6_KEY6_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 5' */
++/* Bit: 'KEY5' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_5_KEY5_OFFSET	0x442
++#define PCE_TBL_KEY_5_KEY5_SHIFT	0
++#define PCE_TBL_KEY_5_KEY5_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 4' */
++/* Bit: 'KEY4' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_4_KEY4_OFFSET	0x443
++#define PCE_TBL_KEY_4_KEY4_SHIFT	0
++#define PCE_TBL_KEY_4_KEY4_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 3' */
++/* Bit: 'KEY3' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_3_KEY3_OFFSET	0x444
++#define PCE_TBL_KEY_3_KEY3_SHIFT	0
++#define PCE_TBL_KEY_3_KEY3_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 2' */
++/* Bit: 'KEY2' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_2_KEY2_OFFSET	0x445
++#define PCE_TBL_KEY_2_KEY2_SHIFT	0
++#define PCE_TBL_KEY_2_KEY2_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 1' */
++/* Bit: 'KEY1' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_1_KEY1_OFFSET	0x446
++#define PCE_TBL_KEY_1_KEY1_SHIFT	0
++#define PCE_TBL_KEY_1_KEY1_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Key Data 0' */
++/* Bit: 'KEY0' */
++/* Description: 'Key Value[15:0]' */
++#define PCE_TBL_KEY_0_KEY0_OFFSET	0x447
++#define PCE_TBL_KEY_0_KEY0_SHIFT	0
++#define PCE_TBL_KEY_0_KEY0_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Mask Write Register0' */
++/* Bit: 'MASK0' */
++/* Description: 'Mask Pattern [15:0]' */
++#define PCE_TBL_MASK_0_MASK0_OFFSET	0x448
++#define PCE_TBL_MASK_0_MASK0_SHIFT	0
++#define PCE_TBL_MASK_0_MASK0_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register4' */
++/* Bit: 'VAL4' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_4_VAL4_OFFSET	0x449
++#define PCE_TBL_VAL_4_VAL4_SHIFT	0
++#define PCE_TBL_VAL_4_VAL4_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register3' */
++/* Bit: 'VAL3' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_3_VAL3_OFFSET	0x44A
++#define PCE_TBL_VAL_3_VAL3_SHIFT	0
++#define PCE_TBL_VAL_3_VAL3_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register2' */
++/* Bit: 'VAL2' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_2_VAL2_OFFSET	0x44B
++#define PCE_TBL_VAL_2_VAL2_SHIFT	0
++#define PCE_TBL_VAL_2_VAL2_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register1' */
++/* Bit: 'VAL1' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_1_VAL1_OFFSET	0x44C
++#define PCE_TBL_VAL_1_VAL1_SHIFT	0
++#define PCE_TBL_VAL_1_VAL1_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Value Register0' */
++/* Bit: 'VAL0' */
++/* Description: 'Data value [15:0]' */
++#define PCE_TBL_VAL_0_VAL0_OFFSET	0x44D
++#define PCE_TBL_VAL_0_VAL0_SHIFT	0
++#define PCE_TBL_VAL_0_VAL0_SIZE		16
++/* --------------------------------------------------- */
++/* Register: 'Table Entry AddressRegister' */
++/* Bit: 'ADDR' */
++/* Description: 'Table Address' */
++#define PCE_TBL_ADDR_ADDR_OFFSET	0x44E
++#define PCE_TBL_ADDR_ADDR_SHIFT		0
++#define PCE_TBL_ADDR_ADDR_SIZE		12
++/* --------------------------------------------------- */
++/* Register: 'Table Access ControlRegister' */
++/* Bit: 'BAS' */
++/* Description: 'Access Busy/Access Start' */
++#define PCE_TBL_CTRL_BAS_OFFSET	0x44F
++#define PCE_TBL_CTRL_BAS_SHIFT	15
++#define PCE_TBL_CTRL_BAS_SIZE		1
++/* Bit: 'EXTOP' */
++/* Description: 'Lookup Table Access Extended Operation Mode' */
++#define PCE_TBL_CTRL_EXTOP_OFFSET	0x44F
++#define PCE_TBL_CTRL_EXTOP_SHIFT	14
++#define PCE_TBL_CTRL_EXTOP_SIZE		1
++/* Bit: 'TYPE' */
++/* Description: 'Lookup Entry Type' */
++#define PCE_TBL_CTRL_TYPE_OFFSET	0x44F
++#define PCE_TBL_CTRL_TYPE_SHIFT		13
++#define PCE_TBL_CTRL_TYPE_SIZE		1
++/* Bit: 'VLD' */
++/* Description: 'Lookup Entry Valid' */
++#define PCE_TBL_CTRL_VLD_OFFSET	0x44F
++#define PCE_TBL_CTRL_VLD_SHIFT	12
++#define PCE_TBL_CTRL_VLD_SIZE		1
++/* Bit: 'KEYFORM' */
++/* Description: 'Key Format' */
++#define PCE_TBL_CTRL_KEYFORM_OFFSET	0x44F
++#define PCE_TBL_CTRL_KEYFORM_SHIFT	11
++#define PCE_TBL_CTRL_KEYFORM_SIZE		1
++/* Bit: 'GMAP' */
++/* Description: 'Group Map' */
++#define PCE_TBL_CTRL_GMAP_OFFSET	0x44F
++#define PCE_TBL_CTRL_GMAP_SHIFT		7
++#define PCE_TBL_CTRL_GMAP_SIZE		4
++/* Bit: 'OPMOD' */
++/* Description: 'Lookup Table Access Operation Mode' */
++#define PCE_TBL_CTRL_OPMOD_OFFSET	0x44F
++#define PCE_TBL_CTRL_OPMOD_SHIFT	5
++#define PCE_TBL_CTRL_OPMOD_SIZE		2
++/* Bit: 'ADDR' */
++/* Description: 'Lookup Table Address' */
++#define PCE_TBL_CTRL_ADDR_OFFSET	0x44F
++#define PCE_TBL_CTRL_ADDR_SHIFT		0
++#define PCE_TBL_CTRL_ADDR_SIZE		5
++
++
++
++#define REG32(addr)                 *((volatile u32 *)(addr))                   
++#define REG16(addr)                 *((volatile u16 *)(addr))                   
++#define REG8(addr)                  *((volatile u8 *)(addr))                    
++#define ltq_dma_r32(x)           REG32((x))
++#define ltq_dma_w32(x, y)       (REG32((y)) = (x))
++#define ltq_dma_w32_mask(clear, set, reg)   \
++    ltq_dma_w32((ltq_dma_r32(reg) & ~(clear)) | (set), reg)
++
++/***********************************************************************/       
++#endif //GRX500_H                                                                 
+diff --git a/arch/mips/include/asm/ifx_ssc.h b/arch/mips/include/asm/ifx_ssc.h
+--- a/arch/mips/include/asm/ifx_ssc.h
++++ b/arch/mips/include/asm/ifx_ssc.h
+@@ -9,7 +9,11 @@
+ /***********************************************************************/
+ /*  Module      :  SSC1 register address and bits                      */
+ /***********************************************************************/
++#ifdef CONFIG_LANTIQ_UBOOT_grx500
++#define IFX_SPI_BASE        (0xb6800000)
++#else
+ #define IFX_SPI_BASE        (0xbe100800)
++#endif
+ #define SPI_CLC             ((volatile u32*)(IFX_SPI_BASE+0x0000))
+ #define SPI_PISEL           ((volatile u32*)(IFX_SPI_BASE+0x0004))
+ #define SPI_ID              ((volatile u32*)(IFX_SPI_BASE+0x0008))
+diff --git a/arch/mips/include/asm/ltq_vmb.h b/arch/mips/include/asm/ltq_vmb.h
+--- a/arch/mips/include/asm/ltq_vmb.h
++++ b/arch/mips/include/asm/ltq_vmb.h
+@@ -4,10 +4,13 @@
+ #define MAX_CORE 2 
+ #define MAX_VPE 2 
+ #define MAX_TC	6
++#define MAX_TCS	4
+ #define MAX_CPU (MAX_CORE * MAX_VPE)
+ 
+ #define vmb_msg_size (sizeof(VMB_fw_msg_t) + sizeof(FW_vmb_msg_t))
+ #define CPU_LAUNCH 0xa0000000
++#define IBL_LOADADDR 0xa0010000
++#define GIC_SH_WEDGE_REG  *((volatile unsigned int*) (0xb2320280))
+ 
+ /* REVERT BACK TO 10 */
+ #define QUEUE_TIMEOUT (100 * HZ) 
+@@ -37,8 +40,8 @@ typedef struct cpu_launch_t {
+ 	uint	a0;
+ 	uint	eva;
+ 	uint	mt_group;
++	uint	yield_res;
+ 	uint	priv_info;
+-	uint	res;
+ }CPU_launch_t; 
+ 
+ typedef struct tc_launch_t {
+@@ -55,7 +58,7 @@ typedef struct tc_launch_t {
+ typedef struct vmb_fw_msg_t{
+ 	uint	msg_id;
+ 	CPU_launch_t	cpu_launch;
+-	TC_launch_t	tc_launch[MAX_TC];
++	TC_launch_t	tc_launch[MAX_TCS];
+ 	uint	tc_num;
+ } VMB_fw_msg_t;
+ 
+@@ -88,6 +91,24 @@ void r4k_wait_irqoff(void)
+                 "       .set    pop             \n");
+ }
+ 
++/* IRQ Numbers and handler definations */
++#define  VMB_CPU_IPI1           20
++#define  VMB_CPU_IPI2           21
++#define  VMB_CPU_IPI3           85
+ 
++/* FW/IBL -> VMB IPI numbers */
++#define FW_VMB_IPI1             87
++#define FW_VMB_IPI2             88
++#define FW_VMB_IPI3             110
++
++void gic_send_ipi(unsigned int intr)
++{
++	(GIC_SH_WEDGE_REG) = (0x80000000 | intr);
++}
++
++void gic_clear_ipi(unsigned int intr)
++{
++	(GIC_SH_WEDGE_REG) = (0x00000000 | intr);
++}
+ 
+ #endif
+diff --git a/arch/mips/include/asm/m32c0.h b/arch/mips/include/asm/m32c0.h
+--- a/arch/mips/include/asm/m32c0.h
++++ b/arch/mips/include/asm/m32c0.h
+@@ -1,54 +1,3 @@
+-/*
+- * Copyright (c) 1999-2004 MIPS Technologies, Inc.
+- * All rights reserved.
+- * 
+- * Unpublished rights (if any) reserved under the copyright laws of the
+- * United States of America and other countries.
+- * 
+- * This code is proprietary to MIPS Technologies, Inc. ("MIPS
+- * Technologies").  Any copying, reproducing, modifying or use of
+- * this code (in whole or in part) that is not expressly permitted
+- * in writing by MIPS Technologies or an authorized third party is
+- * strictly prohibited.  At a minimum, this code is protected under
+- * unfair competition and copyright laws.  Violations thereof may result
+- * in criminal penalties and fines.
+- * 
+- * MIPS Technologies reserves the right to change this code to improve
+- * function, design or otherwise.  MIPS Technologies does not assume any
+- * liability arising out of the application or use of this code, or of
+- * any error or omission in such code.  Any warranties, whether express,
+- * statutory, implied or otherwise, including but not limited to the
+- * implied warranties of merchantability or fitness for a particular
+- * purpose, are excluded.  Except as expressly provided in any written
+- * license agreement from MIPS Technologies or an authorized third party,
+- * the furnishing of this code does not give recipient any license to
+- * any intellectual property rights, including any patent rights, that
+- * cover this code.
+- * 
+- * This code shall not be exported, reexported, transferred, or released,
+- * directly or indirectly, in violation of the law of any country or
+- * international law, regulation, treaty, Executive Order, statute,
+- * amendments or supplements thereto.  Should a conflict arise regarding
+- * the export, reexport, transfer, or release of this code, the laws of
+- * the United States of America shall be the governing law.
+- * 
+- * This code constitutes one or more of the following: commercial
+- * computer software, commercial computer software documentation or
+- * other commercial items.  If the user of this code, or any related
+- * documentation of any kind, including related technical data or
+- * manuals, is an agency, department, or other entity of the United
+- * States government ("Government"), the use, duplication, reproduction,
+- * release, modification, disclosure, or transfer of this code, or
+- * any related documentation of any kind, is restricted in accordance
+- * with Federal Acquisition Regulation 12.212 for civilian agencies
+- * and Defense Federal Acquisition Regulation Supplement 227.7202 for
+- * military agencies.  The use of this code by the Government is further
+- * restricted in accordance with the terms of the license agreement(s)
+- * and/or applicable contract terms and conditions covering this code
+- * from MIPS Technologies or an authorized third party.
+- * 
+- * 
+- */
+ 
+ /*
+  * m32c0.h : MIPS32 coprocessor 0 definitions
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -57,7 +57,9 @@
+ #define CP0_CAUSE $13
+ #define CP0_EPC $14
+ #define CP0_PRID $15
++#define CP0_EBASE $15,1
+ #define CP0_CONFIG $16
++#define CP0_CONFIG5 $16,5
+ #define CP0_LLADDR $17
+ #define CP0_WATCHLO $18
+ #define CP0_WATCHHI $19
+@@ -494,11 +496,17 @@
+ #define MIPS_CONF1_PC		(_ULCAST_(1) <<  4)
+ #define MIPS_CONF1_MD		(_ULCAST_(1) <<  5)
+ #define MIPS_CONF1_C2		(_ULCAST_(1) <<  6)
++#define MIPS_CONF1_DA_SHIFT	7
+ #define MIPS_CONF1_DA		(_ULCAST_(7) <<  7)
++#define MIPS_CONF1_DL_SHIFT	10
+ #define MIPS_CONF1_DL		(_ULCAST_(7) << 10)
++#define MIPS_CONF1_DS_SHIFT	13
+ #define MIPS_CONF1_DS		(_ULCAST_(7) << 13)
++#define MIPS_CONF1_IA_SHIFT	16
+ #define MIPS_CONF1_IA		(_ULCAST_(7) << 16)
++#define MIPS_CONF1_IL_SHIFT	19
+ #define MIPS_CONF1_IL		(_ULCAST_(7) << 19)
++#define MIPS_CONF1_IS_SHIFT	22
+ #define MIPS_CONF1_IS		(_ULCAST_(7) << 22)
+ #define MIPS_CONF1_TLBS		(_ULCAST_(63)<< 25)
+ 
+@@ -982,6 +990,8 @@ do {									\
+ #define read_c0_ebase()		__read_32bit_c0_register($15, 1)
+ #define write_c0_ebase(val)	__write_32bit_c0_register($15, 1, val)
+ 
++#define read_c0_tcbind()	__read_32bit_c0_register($2, 2)
++
+ /*
+  * Macros to access the floating point coprocessor control registers
+  */

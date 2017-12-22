@@ -1,0 +1,196 @@
+From 911223720b9c78ec4f3e7034a7b9ce98e796813f Mon Sep 17 00:00:00 2001
+From: Vinay Patel <vinay.r.patel@intel.com>
+Date: Thu, 17 Mar 2016 08:05:59 -0700
+Subject: [PATCH 364/441] Title: Enable CPU MSI trip interrupt IssueID: JIRA#
+ CPM-267 System Impact: No event to indicate when CPU thermal trip is crossed
+ Resolution: Enable the CPU thermal trip interrupt when the CPU thermal trip
+ is enabled. ReviewID: CCID-131902
+
+---
+ drivers/thermal/puma_thermal.c | 66 +++++++++++++++++++++++-------------------
+ 1 file changed, 36 insertions(+), 30 deletions(-)
+
+--- a/drivers/thermal/puma_thermal.c
++++ b/drivers/thermal/puma_thermal.c
+@@ -63,6 +63,7 @@
+ #define TE_AUX1               0x02D8
+ #define TE_AUX2               0x02DC
+ #define TE_AUX3               0x02E0
++#define TTE_SLM0              0x02F0
+ #define INT_ENABLE		      (1 << 11)
+ #else
+ #define SOC_DTS_CONTROL		   0x80
+@@ -75,6 +76,7 @@
+ #define TE_AUX1               0xB6
+ #define TE_AUX2               0xB7
+ #define TE_AUX3               0xB8
++#define TTE_SLM0              0xBC
+ #define INT_ENABLE		      (1 << 9)
+ #endif
+ 
+@@ -169,7 +171,7 @@ static inline int puma_read_punit_reg(un
+    *read_val = __raw_readl(puma_therm_mmio.reg_base + addr);
+    return 0;
+ #else
+-	return (iosf_mbi_read(PUNIT_PORT, PUNIT_READ_OPCODE, addr, read_val));
++   return (iosf_mbi_read(PUNIT_PORT, PUNIT_READ_OPCODE, addr, read_val));
+ #endif
+ }
+ 
+@@ -179,18 +181,18 @@ static inline int puma_write_punit_reg(u
+    __raw_writel(val, puma_therm_mmio.reg_base + addr);
+    return 0;
+ #else
+-	return (iosf_mbi_write(PUNIT_PORT, PUNIT_WRITE_OPCODE, addr, val));
++   return (iosf_mbi_write(PUNIT_PORT, PUNIT_WRITE_OPCODE, addr, val));
+ #endif
+ }
+ 
+ /* Get the maximum junction temperature/throttle temperature */
+ static int puma_get_tj_max(u32 *tj_max)
+ {
+-	u32 eax, edx;
+-	u32 val;
+-	int err = 0;
++   u32 eax, edx;
++   u32 val;
++   int err = 0;
+ 
+-	err = rdmsr_safe(MSR_IA32_TEMPERATURE_TARGET, &eax, &edx);
++   err = rdmsr_safe(MSR_IA32_TEMPERATURE_TARGET, &eax, &edx);
+    if (err == 0) {
+       val = (eax >> 16) & 0xff;
+       if (val)
+@@ -200,7 +202,7 @@ static int puma_get_tj_max(u32 *tj_max)
+       }
+    }
+    
+-	return err;
++   return err;
+ }
+ 
+ static int puma_configure_dts(void)
+@@ -394,6 +396,10 @@ static int puma_set_mode(struct thermal_
+                pr_err("PUMA SOC_DTS_CONTROL read failed: %d\n", ret);
+             } else if((ret = puma_write_punit_reg(SOC_DTS_CONTROL, ((mode == THERMAL_DEVICE_ENABLED) ? (val | ENABLE_CPU_TT) : (val & ~ENABLE_CPU_TT)))) < 0) {
+                pr_err("PUMA SOC_DTS_CONTROL write failed: %d\n", ret);
++	    } else if((ret = puma_read_punit_reg(TTE_SLM0, &val)) < 0) {
++	       pr_err("PUMA TTE_SLM0 read failed: %d\n", ret);
++	    } else if((ret = puma_write_punit_reg(TTE_SLM0, ((mode == THERMAL_DEVICE_ENABLED) ? (val | INT_ENABLE) : (val & ~INT_ENABLE)))) < 0) {
++	       pr_err("PUMA TTE_SLM0 write failed: %d\n", ret);
+             }
+             break;
+          default:   
+@@ -411,20 +417,20 @@ static int puma_set_mode(struct thermal_
+ static int puma_show_trip_type(struct thermal_zone_device *tzd,
+ 			int trip, enum thermal_trip_type *trip_type)
+ {
+-	/* All are passive trip points */
+-	*trip_type = THERMAL_TRIP_PASSIVE;
++   /* All are passive trip points */
++   *trip_type = THERMAL_TRIP_PASSIVE;
+ 
+-	return 0;
++   return 0;
+ }
+ 
+ static int puma_show_trip_temp(struct thermal_zone_device *tzd,
+ 				int trip, long *trip_temp)
+ {
+-	struct thermal_device_info *td_info = tzd->devdata;
+-	u32 aux_value, eax, edx; 
++   struct thermal_device_info *td_info = tzd->devdata;
++   u32 aux_value, eax, edx;
+    int ret = 0;
+ 
+-	mutex_lock(&td_info->lock);
++   mutex_lock(&td_info->lock);
+ 
+    switch(td_info->sensor_index) {
+       case PUMA_CORE0_DTS_INDEX:
+@@ -457,9 +463,9 @@ static int puma_show_trip_temp(struct th
+          pr_err("PUMA show trip temp failed: %d\n", ret);
+    }
+    
+-	mutex_unlock(&td_info->lock);
++   mutex_unlock(&td_info->lock);
+ 
+-	return ret;
++   return ret;
+ }
+ 
+ static int puma_store_trip_temp(struct thermal_zone_device *tzd,
+@@ -471,7 +477,7 @@ static int puma_store_trip_temp(struct t
+    unsigned int TE_AUX[] = {TE_AUX0, TE_AUX1, TE_AUX2, TE_AUX3};
+    struct thermal_device_info *td_info = tzd->devdata;
+ 
+-	mutex_lock(&td_info->lock);
++   mutex_lock(&td_info->lock);
+ 
+    switch(td_info->sensor_index) {
+       case PUMA_CORE1_DTS_INDEX:
+@@ -537,9 +543,9 @@ static int puma_store_trip_temp(struct t
+          pr_err("PUMA show trip temp failed: %d\n", ret);
+    }
+    
+-	mutex_unlock(&td_info->lock);
++   mutex_unlock(&td_info->lock);
+ 
+-	return ret;
++   return ret;
+ }
+ 
+ 
+@@ -569,15 +575,15 @@ static const struct thermal_zone_device_
+ 
+ 
+ static const struct x86_cpu_id puma_ids[] = {
+-	{ X86_VENDOR_INTEL, X86_FAMILY_ANY, 0x6E },
+-	{}
++   { X86_VENDOR_INTEL, X86_FAMILY_ANY, 0x6E },
++   {}
+ };
+ MODULE_DEVICE_TABLE(x86cpu, puma_ids);
+ 
+ static int puma_thermal_init(void)
+ {
+-	int i, ret = 0;
+-	char *name[PUMA_THERMAL_SENSORS] = {"Core0_DTS", "Core1_DTS", "SoC_DTS"};
++   int i, ret = 0;
++   char *name[PUMA_THERMAL_SENSORS] = {"Core0_DTS", "Core1_DTS", "SoC_DTS"};
+    int trips[PUMA_THERMAL_SENSORS] = {CPU_THERMAL_TRPIS, CPU_THERMAL_TRPIS, SOC_THERMAL_TRIPS};
+    int mask[PUMA_THERMAL_SENSORS] = {CPU0_TRIP_MASK, CPU1_TRIP_MASK, SOC_TRIP_MASK};
+    int index[PUMA_THERMAL_SENSORS] = {PUMA_CORE0_DTS_INDEX, PUMA_CORE1_DTS_INDEX, PUMA_SOC_DTS_INDEX};
+@@ -630,24 +636,24 @@ static int puma_thermal_init(void)
+       printk(KERN_INFO "Puma thermal driver built on %s @ %s\n", __DATE__, __TIME__);
+    }
+    
+-	return ret;
++   return ret;
+ } 
+ 
+ static void puma_thermal_exit(void)
+ {
+-	int i;
++   int i;
+    struct thermal_device_info *tdi_ptr;
+ 
+    tdi_ptr = &pdata_therm->tdi[0];
+ 
+-	/* Destroy mutex and unregister each sensor with the generic thermal framework */
+-	for (i = 0; i < PUMA_THERMAL_SENSORS; i++) {
++   /* Destroy mutex and unregister each sensor with the generic thermal framework */
++   for (i = 0; i < PUMA_THERMAL_SENSORS; i++) {
+       mutex_destroy(&tdi_ptr->lock);
+-		thermal_zone_device_unregister(pdata_therm->tzd[i]);
++      thermal_zone_device_unregister(pdata_therm->tzd[i]);
+       tdi_ptr++;
+-	}
+-   
+-	kfree(pdata_therm);
++   }
++
++   kfree(pdata_therm);
+ }
+ 
+ static void puma_thermal_do_wq(struct work_struct *twq)

@@ -1,0 +1,97 @@
+From 1c51f19754effec9e1fe6807d80827028d56d0a5 Mon Sep 17 00:00:00 2001
+From: Ido Reis <idox.reis@intel.com>
+Date: Mon, 5 Sep 2016 16:21:22 +0300
+Subject: [PATCH 44/69] hostapd: do cac on same chan
+
+Signed-off-by: Ido Reis <idox.reis@intel.com>
+---
+ src/ap/dfs.c            | 39 +++++++++++++++++++++++++++++++++++++++
+ src/common/ltq-vendor.h |  1 +
+ 2 files changed, 40 insertions(+)
+
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 4958322..1888140 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -19,6 +19,13 @@
+ #include "drivers/driver.h"
+ #include "dfs.h"
+ 
++/* Must be aligned with driver structure */
++struct vendor_cac_data
++{
++	int chan_width;
++	int cf1;
++	int cf2;
++};
+ 
+ static int dfs_get_used_n_chans(struct hostapd_iface *iface, int *seg1)
+ {
+@@ -760,6 +767,23 @@ int hostapd_handle_dfs(struct hostapd_iface *iface, Boolean *dfs_dbg_set_beacon)
+ 	return 0;
+ }
+ 
++int chan_width_enum_to_freq(enum chan_width width)
++{
++	switch (width) {
++	case CHAN_WIDTH_20_NOHT:
++	case CHAN_WIDTH_20:
++		return 20;
++	case CHAN_WIDTH_40:
++		return 40;
++	case CHAN_WIDTH_80:
++	case CHAN_WIDTH_80P80:
++		return 80;
++	case CHAN_WIDTH_160:
++		return 160;
++	default:
++		return 0;
++	}
++}
+ 
+ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 			     int ht_enabled, int chan_offset, int chan_width,
+@@ -770,6 +794,11 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 		success, freq, ht_enabled, chan_offset, chan_width, cf1, cf2);
+ 
+ 	if (success) {
++		struct vendor_cac_data chan_data;
++		chan_data.chan_width = chan_width_enum_to_freq(chan_width);
++		chan_data.cf1 = cf1;
++		chan_data.cf2 = cf2;
++
+ 		/* Complete iface/ap configuration */
+ 		if (iface->drv_flags & WPA_DRIVER_FLAGS_DFS_OFFLOAD) {
+ 			/* Complete AP configuration for the first bring up. */
+@@ -783,6 +812,16 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 				      HOSTAPD_CHAN_DFS_AVAILABLE);
+ 			iface->cac_started = 0;
+ 			hostapd_setup_interface_complete(iface, 0);
++
++		/* Set state back to usable to be able do the CAC again on the same channel */
++		set_dfs_state(iface, freq, ht_enabled, chan_offset,
++			      chan_width, cf1, cf2,
++			      HOSTAPD_CHAN_DFS_USABLE);
++
++		/* Notify driver that all vaps are set up after CAC and can change dfs flags */
++		if (hostapd_drv_vendor_cmd(iface->bss[0], OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_CAC_COMPLETE,
++			      (const u8*)&chan_data, sizeof(chan_data), NULL))
++			wpa_printf(MSG_WARNING, "Failed to send driver vendor command LTQ_NL80211_VENDOR_SUBCMD_CAC_COMPLETE");
+ 		}
+ 	}
+ 
+diff --git a/src/common/ltq-vendor.h b/src/common/ltq-vendor.h
+index 2c01c52..927053c 100644
+--- a/src/common/ltq-vendor.h
++++ b/src/common/ltq-vendor.h
+@@ -37,6 +37,7 @@ enum ltq_nl80211_vendor_subcmds {
+ 	LTQ_NL80211_VENDOR_SUBCMD_COUNTRY_CODE = 4,
+ 	LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE = 5,
+ 	LTQ_NL80211_VENDOR_SUBCMD_DFS_DEBUG = 6,
++	LTQ_NL80211_VENDOR_SUBCMD_CAC_COMPLETE = 7,
+ };
+ 
+ enum ltq_nl80211_vendor_events {
+-- 
+1.8.3.4
+

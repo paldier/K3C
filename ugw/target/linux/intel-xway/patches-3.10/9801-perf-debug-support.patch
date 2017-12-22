@@ -1,0 +1,374 @@
+diff --git a/arch/mips/kernel/perf_event_mipsxx.c b/arch/mips/kernel/perf_event_mipsxx.c
+--- a/arch/mips/kernel/perf_event_mipsxx.c
++++ b/arch/mips/kernel/perf_event_mipsxx.c
+@@ -805,7 +805,7 @@ static void reset_counters(void *arg)
+ 	}
+ }
+ 
+-/* 24K/34K/1004K cores can share the same event map. */
++/* 24K/34K/1004K/interAptiv/loongson1 cores share the same event map. */
+ static const struct mips_perf_event mipsxxcore_event_map
+ 				[PERF_COUNT_HW_MAX] = {
+ 	[PERF_COUNT_HW_CPU_CYCLES] = { 0x00, CNTR_EVEN | CNTR_ODD, P },
+@@ -814,8 +814,8 @@ static const struct mips_perf_event mips
+ 	[PERF_COUNT_HW_BRANCH_MISSES] = { 0x02, CNTR_ODD, T },
+ };
+ 
+-/* 74K core has different branch event code. */
+-static const struct mips_perf_event mipsxx74Kcore_event_map
++/* 74K/proAptiv core has different branch event code. */
++static const struct mips_perf_event mipsxxcore_event_map2
+ 				[PERF_COUNT_HW_MAX] = {
+ 	[PERF_COUNT_HW_CPU_CYCLES] = { 0x00, CNTR_EVEN | CNTR_ODD, P },
+ 	[PERF_COUNT_HW_INSTRUCTIONS] = { 0x01, CNTR_EVEN | CNTR_ODD, T },
+@@ -849,7 +849,7 @@ static const struct mips_perf_event xlp_
+ 	[PERF_COUNT_HW_BRANCH_MISSES] = { 0x1c, CNTR_ALL }, /* PAPI_BR_MSP */
+ };
+ 
+-/* 24K/34K/1004K cores can share the same cache event map. */
++/* 24K/34K/1004K/interAptiv/loongson1 cores share the same cache event map. */
+ static const struct mips_perf_event mipsxxcore_cache_map
+ 				[PERF_COUNT_HW_CACHE_MAX]
+ 				[PERF_COUNT_HW_CACHE_OP_MAX]
+@@ -930,8 +930,8 @@ static const struct mips_perf_event mips
+ },
+ };
+ 
+-/* 74K core has completely different cache event map. */
+-static const struct mips_perf_event mipsxx74Kcore_cache_map
++/* 74K/proAptiv core has completely different cache event map. */
++static const struct mips_perf_event mipsxxcore_cache_map2
+ 				[PERF_COUNT_HW_CACHE_MAX]
+ 				[PERF_COUNT_HW_CACHE_OP_MAX]
+ 				[PERF_COUNT_HW_CACHE_RESULT_MAX] = {
+@@ -971,13 +971,18 @@ static const struct mips_perf_event mips
+ [C(LL)] = {
+ 	[C(OP_READ)] = {
+ 		[C(RESULT_ACCESS)]	= { 0x1c, CNTR_ODD, P },
+-		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN | CNTR_ODD, P },
++		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN, P },
+ 	},
+ 	[C(OP_WRITE)] = {
+ 		[C(RESULT_ACCESS)]	= { 0x1c, CNTR_ODD, P },
+-		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN | CNTR_ODD, P },
++		[C(RESULT_MISS)]	= { 0x1d, CNTR_EVEN, P },
+ 	},
+ },
++/*
++ * 74K core does not have specific DTLB events. proAptiv core has
++ * "speculative" DTLB events which are numbered 0x63 (even/odd) and
++ * not included here. One can use raw events if really needed.
++ */
+ [C(ITLB)] = {
+ 	[C(OP_READ)] = {
+ 		[C(RESULT_ACCESS)]	= { 0x04, CNTR_EVEN, T },
+@@ -1378,6 +1383,10 @@ static irqreturn_t mipsxx_pmu_handle_irq
+ #define IS_BOTH_COUNTERS_74K_EVENT(b)					\
+ 	((b) == 0 || (b) == 1)
+ 
++/* proAptiv */
++#define IS_BOTH_COUNTERS_PROAPTIV_EVENT(b)				\
++	((b) == 0 || (b) == 1)
++
+ /* 1004K */
+ #define IS_BOTH_COUNTERS_1004K_EVENT(b)					\
+ 	((b) == 0 || (b) == 1 || (b) == 11)
+@@ -1391,6 +1400,20 @@ static irqreturn_t mipsxx_pmu_handle_irq
+ #define IS_RANGE_V_1004K_EVENT(r)	((r) == 47)
+ #endif
+ 
++/* interAptiv */
++#define IS_BOTH_COUNTERS_INTERAPTIV_EVENT(b)				\
++	((b) == 0 || (b) == 1 || (b) == 11)
++#ifdef CONFIG_MIPS_MT_SMP
++/* The P/V/T info is not provided for "(b) == 38" in SUM, assume P. */
++#define IS_RANGE_P_INTERAPTIV_EVENT(r, b)				\
++	((b) == 0 || (r) == 18 || (b) == 21 || (b) == 22 ||		\
++	 (b) == 25 || (b) == 36 || (b) == 38 || (b) == 39 ||		\
++	 (r) == 44 || (r) == 174 || (r) == 176 || ((b) >= 50 &&		\
++	 (b) <= 59) || (r) == 188 || (b) == 61 || (b) == 62 ||		\
++	 ((b) >= 64 && (b) <= 67))
++#define IS_RANGE_V_INTERAPTIV_EVENT(r)	((r) == 47 || (r) == 175)
++#endif
++
+ /* BMIPS5000 */
+ #define IS_BOTH_COUNTERS_BMIPS5000_EVENT(b)				\
+ 	((b) == 0 || (b) == 1)
+@@ -1451,6 +1474,16 @@ static const struct mips_perf_event *mip
+ 		raw_event.range = P;
+ #endif
+ 		break;
++	case CPU_PROAPTIV:
++		if (IS_BOTH_COUNTERS_PROAPTIV_EVENT(base_id))
++			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
++		else
++			raw_event.cntr_mask =
++				raw_id > 127 ? CNTR_ODD : CNTR_EVEN;
++#ifdef CONFIG_MIPS_MT_SMP
++		raw_event.range = P;
++#endif
++		break;
+ 	case CPU_1004K:
+ 		if (IS_BOTH_COUNTERS_1004K_EVENT(base_id))
+ 			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
+@@ -1466,6 +1499,21 @@ static const struct mips_perf_event *mip
+ 			raw_event.range = T;
+ #endif
+ 		break;
++	case CPU_INTERAPTIV:
++		if (IS_BOTH_COUNTERS_INTERAPTIV_EVENT(base_id))
++			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
++		else
++			raw_event.cntr_mask =
++				raw_id > 127 ? CNTR_ODD : CNTR_EVEN;
++#ifdef CONFIG_MIPS_MT_SMP
++		if (IS_RANGE_P_INTERAPTIV_EVENT(raw_id, base_id))
++			raw_event.range = P;
++		else if (unlikely(IS_RANGE_V_INTERAPTIV_EVENT(raw_id)))
++			raw_event.range = V;
++		else
++			raw_event.range = T;
++#endif
++		break;
+ 	case CPU_BMIPS5000:
+ 		if (IS_BOTH_COUNTERS_BMIPS5000_EVENT(base_id))
+ 			raw_event.cntr_mask = CNTR_EVEN | CNTR_ODD;
+@@ -1544,22 +1592,13 @@ init_hw_perf_events(void)
+ 		counters = counters_total_to_per_cpu(counters);
+ #endif
+ 
+-#ifdef MSC01E_INT_BASE
+-	if (cpu_has_veic) {
+-		/*
+-		 * Using platform specific interrupt controller defines.
+-		 */
+-		irq = MSC01E_INT_BASE + MSC01E_INT_PERFCTR;
+-	} else {
+-#endif
+-		if ((cp0_perfcount_irq >= 0) &&
+-				(cp0_compare_irq != cp0_perfcount_irq))
+-			irq = MIPS_CPU_IRQ_BASE + cp0_perfcount_irq;
+-		else
+-			irq = -1;
+-#ifdef MSC01E_INT_BASE
+-	}
+-#endif
++	if (get_c0_perfcount_int)
++		irq = get_c0_perfcount_int();
++	else if ((cp0_perfcount_irq >= 0) &&
++		 (cp0_compare_irq != cp0_perfcount_irq))
++		irq = MIPS_CPU_IRQ_BASE + cp0_perfcount_irq;
++	else
++		irq = -1;
+ 
+ 	mipspmu.map_raw_event = mipsxx_pmu_map_raw_event;
+ 
+@@ -1576,14 +1615,25 @@ init_hw_perf_events(void)
+ 		break;
+ 	case CPU_74K:
+ 		mipspmu.name = "mips/74K";
+-		mipspmu.general_event_map = &mipsxx74Kcore_event_map;
+-		mipspmu.cache_event_map = &mipsxx74Kcore_cache_map;
++		mipspmu.general_event_map = &mipsxxcore_event_map2;
++		mipspmu.cache_event_map = &mipsxxcore_cache_map2;
+ 		break;
+ 	case CPU_1004K:
+ 		mipspmu.name = "mips/1004K";
+ 		mipspmu.general_event_map = &mipsxxcore_event_map;
+ 		mipspmu.cache_event_map = &mipsxxcore_cache_map;
+ 		break;
++
++	case CPU_INTERAPTIV:
++		mipspmu.name = "mips/interAptiv";
++		mipspmu.general_event_map = &mipsxxcore_event_map;
++		mipspmu.cache_event_map = &mipsxxcore_cache_map;
++		break;
++	case CPU_PROAPTIV:
++		mipspmu.name = "mips/proAptiv";
++		mipspmu.general_event_map = &mipsxxcore_event_map2;
++		mipspmu.cache_event_map = &mipsxxcore_cache_map2;
++		break;
+ 	case CPU_LOONGSON1:
+ 		mipspmu.name = "mips/loongson1";
+ 		mipspmu.general_event_map = &mipsxxcore_event_map;
+diff --git a/tools/perf/Makefile b/tools/perf/Makefile
+--- a/tools/perf/Makefile
++++ b/tools/perf/Makefile
+@@ -814,6 +814,9 @@ else
+       endif
+     endif
+   endif
++  ifeq ($(ARCH),mips)
++    LIB_H += arch/mips/include/perf_regs.h
++  endif
+ endif
+ 
+ ifdef NO_DEMANGLE
+diff --git a/tools/perf/arch/mips/Makefile b/tools/perf/arch/mips/Makefile
+new file mode 100644
+--- /dev/null
++++ b/tools/perf/arch/mips/Makefile
+@@ -0,0 +1,7 @@
++ifndef NO_DWARF
++PERF_HAVE_DWARF_REGS := 1
++LIB_OBJS += $(OUTPUT)arch/$(ARCH)/util/dwarf-regs.o
++endif
++ifndef NO_LIBUNWIND
++LIB_OBJS += $(OUTPUT)arch/$(ARCH)/util/unwind.o
++endif
+diff --git a/tools/perf/arch/mips/include/perf_regs.h b/tools/perf/arch/mips/include/perf_regs.h
+new file mode 100644
+--- /dev/null
++++ b/tools/perf/arch/mips/include/perf_regs.h
+@@ -0,0 +1,84 @@
++#ifndef ARCH_PERF_REGS_H
++#define ARCH_PERF_REGS_H
++
++#include <stdlib.h>
++#include "../../util/types.h"
++#include <asm/perf_regs.h>
++
++#define PERF_REG_IP PERF_REG_MIPS_PC
++#define PERF_REG_SP PERF_REG_MIPS_R29
++
++#define PERF_REGS_MASK ((1ULL << PERF_REG_MIPS_MAX) - 1)
++
++static inline const char *perf_reg_name(int id)
++{
++       switch (id) {
++       case PERF_REG_MIPS_PC:
++               return "PC";
++       case PERF_REG_MIPS_R1:
++               return "$1";
++       case PERF_REG_MIPS_R2:
++               return "$2";
++       case PERF_REG_MIPS_R3:
++               return "$3";
++       case PERF_REG_MIPS_R4:
++               return "$4";
++       case PERF_REG_MIPS_R5:
++               return "$5";
++       case PERF_REG_MIPS_R6:
++               return "$6";
++       case PERF_REG_MIPS_R7:
++               return "$7";
++       case PERF_REG_MIPS_R8:
++               return "$8";
++       case PERF_REG_MIPS_R9:
++               return "$9";
++       case PERF_REG_MIPS_R10:
++               return "$10";
++       case PERF_REG_MIPS_R11:
++               return "$11";
++       case PERF_REG_MIPS_R12:
++               return "$12";
++       case PERF_REG_MIPS_R13:
++               return "$13";
++       case PERF_REG_MIPS_R14:
++               return "$14";
++       case PERF_REG_MIPS_R15:
++               return "$15";
++       case PERF_REG_MIPS_R16:
++               return "$16";
++       case PERF_REG_MIPS_R17:
++               return "$17";
++       case PERF_REG_MIPS_R18:
++               return "$18";
++       case PERF_REG_MIPS_R19:
++               return "$19";
++       case PERF_REG_MIPS_R20:
++               return "$20";
++       case PERF_REG_MIPS_R21:
++               return "$21";
++       case PERF_REG_MIPS_R22:
++               return "$22";
++       case PERF_REG_MIPS_R23:
++               return "$23";
++       case PERF_REG_MIPS_R24:
++               return "$24";
++       case PERF_REG_MIPS_R25:
++               return "$25";
++
++       case PERF_REG_MIPS_R28:
++               return "$28";
++       case PERF_REG_MIPS_R29:
++               return "$29";
++       case PERF_REG_MIPS_R30:
++               return "$30";
++       case PERF_REG_MIPS_R31:
++               return "$31";
++       default:
++               break;
++       }
++       return NULL;
++}
++
++
++#endif /* ARCH_PERF_REGS_H */
+diff --git a/tools/perf/arch/mips/util/dwarf-regs.c b/tools/perf/arch/mips/util/dwarf-regs.c
+new file mode 100644
+--- /dev/null
++++ b/tools/perf/arch/mips/util/dwarf-regs.c
+@@ -0,0 +1,37 @@
++/*
++ * dwarf-regs.c : Mapping of DWARF debug register numbers into register names.
++ *
++ * Copyright (C) 2013 Cavium, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <stddef.h>
++#include <dwarf-regs.h>
++
++static const char *mips_gpr_names[32] = {
++       "$0", "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9",
++       "$10", "$11", "$12", "$13", "$14", "$15", "$16", "$17", "$18", "$19",
++       "$20", "$21", "$22", "$23", "$24", "$25", "$26", "$27", "$28", "$29",
++       "$30", "$31"
++};
++
++const char *get_arch_regstr(unsigned int n)
++{
++       if (n < 32)
++               return mips_gpr_names[n];
++       if (n == 64)
++               return "hi";
++       if (n == 65)
++               return "lo";
++       return NULL;
++}
+diff --git a/tools/perf/arch/mips/util/unwind.c b/tools/perf/arch/mips/util/unwind.c
+new file mode 100644
+--- /dev/null
++++ b/tools/perf/arch/mips/util/unwind.c
+@@ -0,0 +1,20 @@
++
++#include <errno.h>
++#include <libunwind.h>
++#include "perf_regs.h"
++#include "../../util/unwind.h"
++
++int unwind__arch_reg_id(int regnum)
++{
++       switch (regnum) {
++       case UNW_MIPS_R1 ... UNW_MIPS_R25:
++               return regnum - UNW_MIPS_R1 + PERF_REG_MIPS_R1;
++       case UNW_MIPS_R28 ... UNW_MIPS_R31:
++               return regnum - UNW_MIPS_R28 + PERF_REG_MIPS_R28;
++       case UNW_MIPS_PC:
++               return PERF_REG_MIPS_PC;
++       default:
++               pr_err("unwind: invalid reg id %d\n", regnum);
++               return -EINVAL;
++       }
++}

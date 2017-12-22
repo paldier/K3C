@@ -1,0 +1,1277 @@
+# HG changeset patch
+# Parent 1afdb4f85a5a4f3916b12129a73dc9fa56b42da9
+
+diff --git a/include/linux/avalanche/generic/avalanche_pdsp_api.h b/include/linux/avalanche/generic/avalanche_pdsp_api.h
+--- a/include/linux/avalanche/generic/avalanche_pdsp_api.h
++++ b/include/linux/avalanche/generic/avalanche_pdsp_api.h
+@@ -146,6 +146,10 @@ typedef enum
+     PDSP_ACCUMULATOR_ENABLE_CH_RATE_LIMIT   = 0x85,
+     PDSP_ACCUMULATOR_ENABLE_RATE_LIMIT      = 0x86,
+ 
++    // Recycler  commands (For Sanity tests)
++    PDSP_RECYCLER_SANITY_START_CMD   = 0x83,
++    PDSP_RECYCLER_SANITY_STOP_CMD    = 0x84,
++
+     // Session Cache Commands
+     PDSP_SESSION_CACHE_SESSION_CMD  = 0x83,
+     PDSP_SESSION_CACHE_FLUSH_ALL    = 0x84,
+@@ -155,6 +159,11 @@ typedef enum
+     // Moca Commands
+     PDSP_MOCA_SET_PADDING                = 0x83,
+ 
++    // AQMC Commands
++    PDSP_AQMC_ADD_MC_MEMBER              = 0x83,
++    PDSP_AQMC_DEL_MC_MEMBER              = 0x84,
++    PDSP_AQMC_SET_AQM_BYPASS_MODE        = 0x85,
++
+ #ifdef CONFIG_WIFI_PROXY
+     //Wifi TX commands
+     PDSP_CMD_WIFI_TX_INIT                = 0x83,
+diff --git a/include/linux/avalanche/generic/avalanche_pp_api.h b/include/linux/avalanche/generic/avalanche_pp_api.h
+--- a/include/linux/avalanche/generic/avalanche_pp_api.h
++++ b/include/linux/avalanche/generic/avalanche_pp_api.h
+@@ -780,15 +780,24 @@ typedef enum
+ {
+     PP_LOOKUP_FIELD_L4_PROTOCOL_UDP             = 1,
+     PP_LOOKUP_FIELD_L4_PROTOCOL_TCP             = 2,
++    PP_LOOKUP_FIELD_L4_PROTOCOL_L2TPv3          = 3,
+     PP_LOOKUP_FIELD_L4_PROTOCOL_0xFF            = 15
+ }PP_LOOKUP_FIELD_L4_TYPES_e;
+ 
+ typedef enum
+ {
+-    PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE             = 1,
+-    PP_LOOKUP_FIELD_TUNNEL_TYPE_DsLITE          = 2,
+-    PP_LOOKUP_FIELD_TUNNEL_TYPE_PPPoE           = 3,
+-    PP_LOOKUP_FIELD_TUNNEL_TYPE_6rd             = 4
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE                = 1,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_DsLITE             = 2,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_PPPoE              = 3,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_6rd                = 4,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_L2TPv3             = 5,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_IPSEC_ESP          = 6,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE_IPSEC_ESP      = 7,             /* PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE + PP_LOOKUP_FIELD_TUNNEL_TYPE_IPSEC_ESP */
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_DsLITE_IPSEC_ESP   = 8,             /* PP_LOOKUP_FIELD_TUNNEL_TYPE_DsLITE + PP_LOOKUP_FIELD_TUNNEL_TYPE_IPSEC_ESP */
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_IPSEC_AH           = 9,
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE_IPSEC_AH       = 10,            /* PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE + PP_LOOKUP_FIELD_TUNNEL_TYPE_IPSEC_AH */
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_DsLITE_IPSEC_AH    = 11,            /* PP_LOOKUP_FIELD_TUNNEL_TYPE_GRE + PP_LOOKUP_FIELD_TUNNEL_TYPE_IPSEC_AH */
++    PP_LOOKUP_FIELD_TUNNEL_TYPE_NOT_VALID          = 16
+ }PP_LOOKUP_FIELD_TUNNEL_TYPE_e;
+ 
+ typedef enum
+@@ -837,7 +846,7 @@ typedef struct
+     Uint8       IPv6_Flow_Label[4];     /* IPv6 Flow Label (MSbits must be 0). For DS-Lite holds IPv4 destination IP */
+     Uint8       ToS;                    /* IP TOS for IPv4, Traffic Class for IPv6               */
+     Uint8       Reserved;               /* Must be 0                                             */
+-    __be16      PPPoE_session_id;       /* 0xFFFF if none                                        */
++    __be16      Tunn_L2_session_id;     /* 0xFFFF if none                                        */
+     __be16      L4_SRC_PORT;            /* UDP/TCP Source       Port. If not set, must be 0      */
+     __be16      L4_DST_PORT;            /* UDP/TCP Destintation Port. If not set, must be 0      */
+ }
+@@ -867,11 +876,13 @@ typedef struct // former TI_PP_SESSION_P
+ {
+     Uint8                               vpid_handle;
+ #if PUMA7_OR_NEWER_SOC_TYPE
+-    Uint8                               reserved0;
++    Uint8                               host_strip_off;
+ #else
+     Uint8                               pid_type;       /* Needed for WAN/LAN direction selection */
+ #endif
+-    Uint16                              reserved1;
++    Uint8                               flags;
++                                        #define AVALANCHE_PP_INGRESS_MULTICAST   0x1
++    Uint8                               reserved1;
+ 
+ #if defined(PUMA6_SOC_TYPE) && PUMA6_SOC_TYPE
+     Bool                                isTunnel;
+@@ -963,6 +974,40 @@ struct wifi_proxy_psi_t {
+ #define AVALANCHE_PP_EGRESS_DROP_SESS    0x01
+ 
+ 
++#if PUMA7_OR_NEWER_SOC_TYPE
++
++#define PP_MAX_MC_MEMBERS     (8)
++#define PP_MAX_MC_GROUPS      (64)
++#define PP_INVALID_MC_GROUPS  (PP_MAX_MC_GROUPS)
++
++typedef struct
++{
++    Uint8   Flags;
++#define PP_MCAST_FLAG_MEMBER_VALID (0x01)
++#define PP_MCAST_FLAG_VLAN         (0x02)
++#define PP_MCAST_FLAG_PSI          (0x04)
++    Uint8   Vpid;
++    Uint16  EgressQ;
++    Uint32  PsiVlan;
++}
++PP_Multiast_Member_Info_t;
++
++typedef struct
++{
++    PP_Multiast_Member_Info_t GroupMember[PP_MAX_MC_MEMBERS];
++}
++PP_Multiast_Group_Info_t;
++
++typedef struct
++{
++    Uint8                    GroupIndex;
++    Uint8                    MembersCount;
++    Uint8                    WaitingMembers;
++    Uint8                    Res;
++    PP_Multiast_Group_Info_t groupInfo;
++}
++PP_Multicast_Session_Rec_t;
++#endif
+ 
+ /**************************************************************************
+  * STRUCTURE NAME : AVALANCHE_PP_EGRESS_SESSION_PROPERTY_t
+@@ -978,7 +1023,7 @@ struct wifi_proxy_psi_t {
+ typedef struct
+ {
+     Uint8                       vpid_handle;
+-    Uint8                       enable;
++    Uint16                      enable;
+                                 #define AVALANCHE_PP_EGRESS_FIELD_ENABLE_VLAN                   0x01
+                                 #define AVALANCHE_PP_EGRESS_FIELD_ENABLE_TCP_SYN                0x02
+                                 #define AVALANCHE_PP_EGRESS_FIELD_ENABLE_TCP_CTRL               0x04
+@@ -986,7 +1031,9 @@ typedef struct
+                                 #define AVALANCHE_PP_EGRESS_WH_IPv4                             0x10
+                                 #define AVALANCHE_PP_EGRESS_WH_IPv6                             0x20
+                                 #define AVALANCHE_PP_EGRESS_WIFI_PID                            0x40
+-    Uint16                      reserved;
++                                #define AVALANCHE_PP_EGRESS_TUNNEL_BY_PASS                      0x80
++                                #define AVALANCHE_PP_EGRESS_MULTICAST                           0x100
++    Uint8                       reserved;
+ 
+     __Avalanche_PP_LUTs_Data_t  lookup;
+ 
+@@ -1006,6 +1053,8 @@ typedef struct
+ 
+     Uint8                       wrapHeader[ AVALNCHE_PP_WRAP_HEADER_MAX_LEN ];
+ 
++    PP_Multicast_Session_Rec_t  multicastInfo;
++
+ } AVALANCHE_PP_EGRESS_SESSION_PROPERTY_t;
+ #else
+ typedef struct // former TI_PP_SESSION_PROPERTY
+@@ -1197,8 +1246,11 @@ typedef struct // former TI_PP_SESSION
+ 
+     Uint8                   is_irreg_moca;
+ #endif
+-
+-
++#ifdef CONFIG_INTEL_L2VPN_MAC_AGING
++    Uint8                   cpe_number;
++    Uint8                   spare_align_byte;
++    Uint16                  spare_align_word;
++#endif
+ }
+ AVALANCHE_PP_SESSION_INFO_t;
+ 
+@@ -1413,6 +1465,8 @@ typedef struct
+     Uint32      SyncQ_threshold_overflow;
+     Uint32      SyncQ_PTID_sent;
+     Uint32      SyncQ_Sent_To_SyncQ;
++    Uint32      SyncQ_Not_Allocated_HostPkt;
++    Uint32      SyncQ_Not_Allocated_AccPkt;
+ 
+ } AVALANCHE_PP_STAGE1_STATS_t;
+ 
+@@ -1463,8 +1517,8 @@ typedef struct
+     Uint32      AQM_move_to_normal_mode_intrpt;
+     Uint32      AQM_sent_wakeup_upon_timer_expiry;
+     Uint32      AQM_sent_wakeup_upon_bytes_thrshold_crossed;
+-    Uint32      AQM_res7;
+-    Uint32      AQM_res8;
++    Uint32      MCAST_rx_pkts;
++    Uint32      MCAST_tx_pkts;
+ 
+     Uint32      DPI_res1;
+     Uint32      DPI_res2;
+@@ -1564,7 +1618,26 @@ typedef struct // former TI_PP_GLOBAL_ST
+ } AVALANCHE_PP_GLOBAL_STATS_t;
+ #endif
+ 
++/**************************************************************************
++ * STRUCTURE NAME : AVALANCHE_PP_SESSION_DELETE_CB_PARAM1_t
++ **************************************************************************
++ * DESCRIPTION   :
++ *  The structure describes the param1 of the session delete function call back.
++ *  Since the session handle is maximum 2 bytes value, it possible to use the
++ *  other 2 bytes for additional info, 1 byte will be used for saving the
++ *  cpe_number of the deleted session
++ * Note: former TI_PP_GLOBAL_STATS
++ **************************************************************************/
++struct AVALANCHE_PP_SESSION_DELETE_CB_PARAM1_t{
+ 
++	Uint32	session_handle;
++	Uint8	cpe_number;
++	Uint8	spare;
++};
++
++#ifdef CONFIG_INTEL_L2VPN_MAC_AGING
++#define AVALANCHE_PP_L2VPN_INVALID_CPE_NUMBER 0xff
++#endif
+ 
+ #ifdef __KERNEL__
+ /* **************************************************************************************** */
+@@ -1631,13 +1704,20 @@ extern AVALANCHE_PP_RET_e    avalanche_p
+ /* Session Management API */
+ extern AVALANCHE_PP_RET_e    avalanche_pp_session_create        ( AVALANCHE_PP_SESSION_INFO_t *  ptr_session, void * pkt_ptr );
+ #if PUMA7_OR_NEWER_SOC_TYPE
++/* Multicast support */
++extern AVALANCHE_PP_RET_e    avalanche_pp_check_multiple_egress ( AVALANCHE_PP_SESSION_INFO_t *ptr_session );
++extern AVALANCHE_PP_RET_e    avalanche_pp_del_mcast_member      ( void *ptr, Uint8 vpid_handle );
++extern AVALANCHE_PP_RET_e    avalanche_pp_mcast_dbg_add_member  ( Uint8 group_index, Uint8 vpid, Uint16 cluster, Uint32 psi);
++extern AVALANCHE_PP_RET_e    avalanche_pp_delete_mc_session     ( void *ptr);
++
+ extern AVALANCHE_PP_RET_e    avalanche_pp_session_delete        ( Uint32    session_handle,     AVALANCHE_PP_SESSION_STATS_t *  ptr_session_stats, Bool deleteFromFW );
++extern AVALANCHE_PP_RET_e   avalanche_pp_override_egress_queue  ( Uint32 session_handle,     Uint8 override_qMgr,                               Uint16 override_qNum);
+ #else
+ extern AVALANCHE_PP_RET_e    avalanche_pp_session_delete        ( Uint32    session_handle,     AVALANCHE_PP_SESSION_STATS_t *  ptr_session_stats );
+ #endif
+ extern AVALANCHE_PP_RET_e    avalanche_pp_session_get_list      ( Uint8     vpid_handle,        PP_LIST_ID_e   list_id, Uint32 * num_entries, Uint32 * session_handle_list );
+ extern AVALANCHE_PP_RET_e    avalanche_pp_session_get_info      ( Uint32    session_handle,     AVALANCHE_PP_SESSION_INFO_t**  ptr_session_info );
+-extern AVALANCHE_PP_RET_e    avalanche_pp_session_set_timeout   (Uint8 timeoutSeconds);
++extern AVALANCHE_PP_RET_e    avalanche_pp_session_set_timeout   ( Uint8     timeoutSeconds);
+ extern AVALANCHE_PP_RET_e    avalanche_pp_flush_sessions        ( Uint8     vpid_handle, PP_LIST_ID_e   list_id );
+ 
+ extern AVALANCHE_PP_RET_e   avalanche_pp_session_list_execute      ( Uint8     vpid_handle, PP_LIST_ID_e   list_id,    AVALANCHE_EXEC_HOOK_FN_t   handler, Ptr  data );
+@@ -1704,12 +1784,12 @@ extern AVALANCHE_PP_RET_e   avalanche_pp
+ extern AVALANCHE_PP_RET_e   avalanche_pp_qos_cluster_enable     ( Uint8     clst_indx );
+ extern AVALANCHE_PP_RET_e   avalanche_pp_qos_cluster_disable    ( Uint8     clst_indx );
+ extern AVALANCHE_PP_RET_e   avalanche_pp_qos_get_queue_stats    ( Uint32    qos_qnum,   AVALANCHE_PP_QOS_QUEUE_STATS_t*     stats );
+-
+ extern AVALANCHE_PP_RET_e   avalanche_pp_qos_set_cluster_max_global_credit  ( Bool creditTypeBytes, Uint8 cluster_id,   Uint32 max_global_credit );
+ extern AVALANCHE_PP_RET_e   avalanche_pp_qos_set_queue_max_credit           ( Bool creditTypeBytes, Uint8 queue_id,     Uint32 max_credit );
+ extern AVALANCHE_PP_RET_e   avalanche_pp_qos_set_queue_iteration_credit     ( Bool creditTypeBytes, Uint8 queue_id,     Uint32 it_credit  );
+ extern AVALANCHE_PP_RET_e   avalanche_pp_qos_set_queue_congestion           ( Bool creditTypeBytes, Uint8 queue_id,     Uint32 it_credit  );
+ #endif
++
+ /* Power Saving Mode (PSM) API. */
+ extern AVALANCHE_PP_RET_e    avalanche_pp_psm                       ( Uint8     onOff );
+ extern AVALANCHE_PP_RET_e    avalanche_pp_hw_init                   ( void );
+@@ -2211,6 +2291,42 @@ typedef     struct
+     Uint8   bAccRateLimitActive;
+     Uint8   mocaPaddingMode;
+ }avalanche_pp_db_address_param_t;
++
++/***************** Sanity manager api *******************/
++typedef struct
++{
++    Uint8* pktDataIngressDevName;
++    Uint8* pktDataEgressDevName;
++    Uint8* pktDataIngressP;
++    Uint8* pktDataEgressP;
++    Uint32 pktDataIngressSize;
++    Uint32 pktDataEgressSize;
++    Uint32 sessionHandleRet;
++}
++sanity_session_info_t;
++
++#define SANITY_PROC_NAME "sanity"
++
++
++/************** Power management info ****************/
++
++#define MAX_MONITORED_OBJECTS_NUM 16
++
++typedef struct
++{
++    Uint32* currResourcesNumRegAddr;
++    Uint32 lpmThreshold;
++
++}AVALANCHE_PP_OBJECT_INFO_t;
++
++typedef struct
++{
++    AVALANCHE_PP_OBJECT_INFO_t PMobjectsInfos[MAX_MONITORED_OBJECTS_NUM];
++    Uint32 ppsStatCntPhyAddr;
++    Uint32 validEntriesCount;
++
++}AVALANCHE_PP_PM_INFO_t;
++
+ /********************************************************************************************************/
+ /* IOCTL commands:
+ 
+@@ -2258,7 +2374,6 @@ typedef     struct
+ #define PP_DRIVER_GET_DB_PARAMS                     _IOWR (PP_DRIVER_MODULE_ID, 13, avalanche_pp_db_address_param_t)
+ #define PP_DRIVER_GET_SESSION_STATS                 _IOWR (PP_DRIVER_MODULE_ID, 14, AVALANCHE_PP_EXTENDED_SESSION_STATS_t)
+ 
+-
+ #endif //   _AVALANCHE_PP_H
+ 
+ 
+diff --git a/include/linux/avalanche/generic/modphy_mrpc_api.h b/include/linux/avalanche/generic/modphy_mrpc_api.h
+--- a/include/linux/avalanche/generic/modphy_mrpc_api.h
++++ b/include/linux/avalanche/generic/modphy_mrpc_api.h
+@@ -82,6 +82,10 @@
+ #define MODPHY_OK   (0)
+ #define MODPHY_FAIL (-1)
+ 
++#define MODPHY_DEV_NAME  "/dev/modphy_drv"
++#define MODPHY_NAME "modphy_drv"
++
++
+ typedef enum modphyController_e
+ {
+     MODPHY_MOCA_CLIENT_ID,
+@@ -111,6 +115,21 @@ typedef struct modphyClient_t
+     ModphyLanes_e      laneId;
+ }ModphyClient_t;
+ 
++#define MODPHY_DRIVER_DEV_NAME                  MODPHY_DEV_NAME
++#define MODPHY_DRIVER_ID                        (0xBE)
++#define MODPHY_INIT                             _IOW(MODPHY_DRIVER_ID, 1, ModphyController_e)
++#define MODPHY_CFG                              _IOW(MODPHY_DRIVER_ID, 2, ModphyClient_t)
++#define MODPHY_DISABLE_TX                       _IOW(MODPHY_DRIVER_ID, 3, ModphyClient_t)
++#define MODPHY_RESET_K_ALIGN                    _IOW(MODPHY_DRIVER_ID, 4, ModphyController_e)
++#define MODPHY_RESET_LANE                       _IOW(MODPHY_DRIVER_ID, 5, ModphyController_e)
++#define MODPHY_GO2_FAST_RECOVERY                _IOW(MODPHY_DRIVER_ID, 6, ModphyClient_t)
++#define MODPHY_GO2_FULL_FUNCTIONAL              _IOW(MODPHY_DRIVER_ID, 7, ModphyClient_t)
++#define MODPHY_COMMON_LANE_RESET                _IOW(MODPHY_DRIVER_ID, 8, ModphyController_e)
++#define MODPHY_COMMON_LANE_INIT                 _IOW(MODPHY_DRIVER_ID, 9, ModphyController_e)
++#define MODPHY_SET_KGREGS                       _IOW(MODPHY_DRIVER_ID, 10, modphyClientKgregs_t)
++#define MODPHY_LANE_POWER_STATE_TRANSITION      _IOW(MODPHY_DRIVER_ID, 11, ModphyClientPowerGate_t)
++
++
+ /*********************************************************************************************************/
+ /*! \fn int modphy_init(ModphyController_e modphyClientId)
+  *********************************************************************************************************
+diff --git a/include/linux/avalanche/puma7/puma7_cppi_bmgr_pools.h b/include/linux/avalanche/puma7/puma7_cppi_bmgr_pools.h
+--- a/include/linux/avalanche/puma7/puma7_cppi_bmgr_pools.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_bmgr_pools.h
+@@ -5,7 +5,7 @@
+ 
+   GPL LICENSE SUMMARY
+ 
+-  Copyright(c) 2014 Intel Corporation.
++  Copyright(c) 2008-2016 Intel Corporation.
+ 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of version 2 of the GNU General Public License as
+diff --git a/include/linux/avalanche/puma7/puma7_cppi_gqmgr1_q.h b/include/linux/avalanche/puma7/puma7_cppi_gqmgr1_q.h
+--- a/include/linux/avalanche/puma7/puma7_cppi_gqmgr1_q.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_gqmgr1_q.h
+@@ -356,8 +356,8 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_US_PREPROCESSING_BE13_HIGH_Q_NUM)                       /* PAL_CPPI_PP_QMGR_G1_Q293 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_US_PREPROCESSING_BE14_HIGH_Q_NUM)                       /* PAL_CPPI_PP_QMGR_G1_Q294 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_US_PREPROCESSING_BE15_HIGH_Q_NUM)                       /* PAL_CPPI_PP_QMGR_G1_Q295 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_Q296)                                                   /* PAL_CPPI_PP_QMGR_G1_Q296 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_Q297)                                                   /* PAL_CPPI_PP_QMGR_G1_Q297 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_SANITY_TESTS_EGRESS_Q0)                                 /* PAL_CPPI_PP_QMGR_G1_Q296 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_SANITY_TESTS_EGRESS_Q1)                                 /* PAL_CPPI_PP_QMGR_G1_Q297 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_Q298)                                                   /* PAL_CPPI_PP_QMGR_G1_Q298 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_Q299)                                                   /* PAL_CPPI_PP_QMGR_G1_Q299 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_Q300)                                                   /* PAL_CPPI_PP_QMGR_G1_Q300 */\
+@@ -410,10 +410,10 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_LOW_NP2APP_Q_NUM)                    /* PAL_CPPI_PP_QMGR_G1_Q347 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_HI_APP2NP_Q_NUM)                     /* PAL_CPPI_PP_QMGR_G1_Q348 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_LOW_APP2NP_Q_NUM)                    /* PAL_CPPI_PP_QMGR_G1_Q349 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_HI_TX_CH_20_Q_NUM)                   /* PAL_CPPI_PP_QMGR_G1_Q350 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_LOW_TX_CH_20_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G1_Q351 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_HI_TX_CH_21_Q_NUM)                   /* PAL_CPPI_PP_QMGR_G1_Q352 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_LOW_TX_CH_21_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G1_Q353 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_CTRL_HI_APP2NP_Q_NUM)                /* PAL_CPPI_PP_QMGR_G1_Q350 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_CTRL_LOW_APP2NP_Q_NUM)               /* PAL_CPPI_PP_QMGR_G1_Q351 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_CTRL_HI_NP2APP_Q_NUM)                /* PAL_CPPI_PP_QMGR_G1_Q352 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_CTRL_LOW_NP2APP_Q_NUM)               /* PAL_CPPI_PP_QMGR_G1_Q353 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_HI_TX_CH_22_Q_NUM)                   /* PAL_CPPI_PP_QMGR_G1_Q354 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_LOW_TX_CH_22_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G1_Q355 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_HI_TX_CH_23_Q_NUM)                   /* PAL_CPPI_PP_QMGR_G1_Q356 */\
+diff --git a/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h b/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h
+--- a/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_gqmgr2_q.h
+@@ -5,7 +5,7 @@
+ 
+   GPL LICENSE SUMMARY
+ 
+-  Copyright(c) 2014 Intel Corporation.
++  Copyright(c) 2014-2016 Intel Corporation.
+ 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of version 2 of the GNU General Public License as
+@@ -371,7 +371,7 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_FCC_UNUSED_Q6)                                        /* PAL_CPPI_PP_QMGR_G2_Q308 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_FCC_TX_Q7)                                            /* PAL_CPPI_PP_QMGR_G2_Q309 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_FCC_UNUSED_Q7)                                        /* PAL_CPPI_PP_QMGR_G2_Q310 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q311)                                                 /* PAL_CPPI_PP_QMGR_G2_Q311 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_SANITY_TESTS_INGRESS_Q)                               /* PAL_CPPI_PP_QMGR_G2_Q311 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q312)                                                 /* PAL_CPPI_PP_QMGR_G2_Q312 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q313)                                                 /* PAL_CPPI_PP_QMGR_G2_Q313 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_Q314)                                                 /* PAL_CPPI_PP_QMGR_G2_Q314 */\
+@@ -553,16 +553,16 @@ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_VOICE_DSP_RX_EMB_FD_Q_NUM)                            /* PAL_CPPI_PP_QMGR_G2_Q490 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_VOICE_INFRA_RX_EMB_FD_Q_NUM)                          /* PAL_CPPI_PP_QMGR_G2_Q491 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_WIFI_FW_RX_REASSEMBLY_EMB_FD_Q_NUM)                   /* PAL_CPPI_PP_QMGR_G2_Q492 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q46)                                           /* PAL_CPPI_PP_QMGR_G2_Q493 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q47)                                           /* PAL_CPPI_PP_QMGR_G2_Q494 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q48)                                           /* PAL_CPPI_PP_QMGR_G2_Q495 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q49)                                           /* PAL_CPPI_PP_QMGR_G2_Q496 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q50)                                           /* PAL_CPPI_PP_QMGR_G2_Q497 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q51)                                           /* PAL_CPPI_PP_QMGR_G2_Q498 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q52)                                           /* PAL_CPPI_PP_QMGR_G2_Q499 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q53)                                           /* PAL_CPPI_PP_QMGR_G2_Q500 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q54)                                           /* PAL_CPPI_PP_QMGR_G2_Q501 */\
+-PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q55)                                           /* PAL_CPPI_PP_QMGR_G2_Q502 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_ARM_SHARED_LOW_INFRA_HOST_FD_Q_NUM)                   /* PAL_CPPI_PP_QMGR_G2_Q493 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_ARM_SHARED_HIGH_INFRA_HOST_FD_Q_NUM)                  /* PAL_CPPI_PP_QMGR_G2_Q494 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_LOW_HOST_FD_Q_NUM)                        /* PAL_CPPI_PP_QMGR_G2_Q495 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_HIGH_HOST_FD_Q_NUM)                       /* PAL_CPPI_PP_QMGR_G2_Q496 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_LOW_TX_COMPLETE_Q_NUM)                    /* PAL_CPPI_PP_QMGR_G2_Q497 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_HI_TX_COMPLETE_Q_NUM)                     /* PAL_CPPI_PP_QMGR_G2_Q498 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_APP2NP_INFRA_CTRL_PPINFO_HOST_FD_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q499 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_APP2NP_INFRA_CTRL_DATA_HOST_FD_Q_NUM)                 /* PAL_CPPI_PP_QMGR_G2_Q500 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_NP2APP_INFRA_CTRL_PPINFO_HOST_FD_Q_NUM)               /* PAL_CPPI_PP_QMGR_G2_Q501 */\
++PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_NP2APP_INFRA_CTRL_DATA_HOST_FD_Q_NUM)                 /* PAL_CPPI_PP_QMGR_G2_Q502 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q56)                                           /* PAL_CPPI_PP_QMGR_G2_Q503 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q57)                                           /* PAL_CPPI_PP_QMGR_G2_Q504 */\
+ PAL_CPPI_QMGR_Q_ADD(PAL_CPPI_PP_QMGR_G2_EMB_FD_Q58)                                           /* PAL_CPPI_PP_QMGR_G2_Q505 */\
+diff --git a/include/linux/avalanche/puma7/puma7_cppi_prv.h b/include/linux/avalanche/puma7/puma7_cppi_prv.h
+--- a/include/linux/avalanche/puma7/puma7_cppi_prv.h
++++ b/include/linux/avalanche/puma7/puma7_cppi_prv.h
+@@ -513,6 +513,12 @@ typedef enum PAL_CPPI_PP_DESC_REGIONs
+ #define PAL_CPPI_PP_SHARED_LOW_INFRA_HOST_FD_DESC_COUNT                                     512
+ #endif
+ 
++#if !defined(CONFIG_INTEL_KERNEL_PP_DRIVER_LOCAL) && defined(CONFIG_ARM_AVALANCHE_SOC)
++#define PAL_CPPI_PP_QMGR_G2_ARM_SHARED_LOW_INFRA_HOST_FD_DESC_COUNT                         64
++#define PAL_CPPI_PP_QMGR_G2_ARM_SHARED_HIGH_INFRA_HOST_FD_DESC_COUNT                        0
++#define PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_LOW_HOST_FD_DESC_COUNT                              64
++#define PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_HIGH_HOST_FD_DESC_COUNT                             0
++#endif
+ 
+ #define PAL_CPPI_PP_DOCSIS_LOW_INFRA_HOST_FD_DESC_COUNT                                     128
+ #define PAL_CPPI_PP_DOCSIS_HI_INFRA_HOST_FD_DESC_COUNT                                      64
+@@ -660,6 +666,10 @@ typedef enum PAL_CPPI_PP_DESC_REGIONs
+ #define PAL_CPPI_PP_APP2NP_HOST_FD_DESC_COUNT                                               256
+ #define PAL_CPPI_PP_APP2NP_INFRA_PPINFO_HOST_FD_DESC_COUNT                                  128
+ #define PAL_CPPI_PP_APP2NP_INFRA_DATA_HOST_FD_DESC_COUNT                                    128
++#define PAL_CPPI_PP_APP2NP_INFRA_HIGH_PPINFO_HOST_FD_DESC_COUNT                             64
++#define PAL_CPPI_PP_APP2NP_INFRA_HIGH_DATA_HOST_FD_DESC_COUNT                               64
++#define PAL_CPPI_PP_NP2APP_INFRA_HIGH_PPINFO_HOST_FD_DESC_COUNT                             64
++#define PAL_CPPI_PP_NP2APP_INFRA_HIGH_DATA_HOST_FD_DESC_COUNT                               64
+ #else
+ #define PAL_CPPI_PP_NP2APP_HOST_FD_DESC_COUNT                                               64
+ #define PAL_CPPI_PP_NP2APP_INFRA_PPINFO_HOST_FD_DESC_COUNT                                  32
+@@ -1255,8 +1265,8 @@ typedef enum PAL_CPPI_PP_DMA10_INFRA_RX_
+     PAL_CPPI_PP_DMA10_VOICE_DSP_INFRA_RX_CH,
+     PAL_CPPI_PP_DMA10_NP2APP_INFRA_RX_CH,
+     PAL_CPPI_PP_DMA10_APP2NP_INFRA_RX_CH,
+-    PAL_CPPI_PP_DMA10_INFRA_RX_CH_20,
+-    PAL_CPPI_PP_DMA10_INFRA_RX_CH_21,
++    PAL_CPPI_PP_DMA10_APP2NP_INFRA_RX_CTRL_CH,
++    PAL_CPPI_PP_DMA10_NP2APP_INFRA_RX_CTRL_CH,
+     PAL_CPPI_PP_DMA10_INFRA_RX_CH_22,
+     PAL_CPPI_PP_DMA10_INFRA_RX_CH_23,
+     PAL_CPPI_PP_DMA10_INFRA_RX_CHANNELS_NUM
+@@ -1284,8 +1294,8 @@ typedef enum PAL_CPPI_PP_DMA10_INFRA_TX_
+     PAL_CPPI_PP_DMA10_VOICE_DSP_INFRA_TX_CH,
+     PAL_CPPI_PP_DMA10_NP2APP_INFRA_TX_CH,
+     PAL_CPPI_PP_DMA10_APP2NP_INFRA_TX_CH,
+-    PAL_CPPI_PP_DMA10_INFRA_TX_CH_20,
+-    PAL_CPPI_PP_DMA10_INFRA_TX_CH_21,
++    PAL_CPPI_PP_DMA10_APP2NP_INFRA_CTRL_TX_CH,
++    PAL_CPPI_PP_DMA10_NP2APP_INFRA_CTRL_TX_CH,
+     PAL_CPPI_PP_DMA10_INFRA_TX_CH_22,
+     PAL_CPPI_PP_DMA10_INFRA_TX_CH_23,
+     PAL_CPPI_PP_DMA10_INFRA_TX_CHANNELS_NUM
+@@ -1523,17 +1533,17 @@ typedef enum PAL_CPPI_DSG_DMA_BLOCKS
+ 
+     Channel Interrupt   Usage                                                   Channel Interrupt   Usage
+     -------------------------------------------                                 -------------------------------------------
+-    0       0           HOST to PP Tx Complete LOW                              0       0
++    0       0           HOST to PP Tx Complete LOW                              0       0           In Use
+     1                   HOST to PP Tx Complete HIGH                             1
+     -------------------------------------------                                 -------------------------------------------
+-    2       1           MoCA RX                                                 2       1
++    2       1           MoCA RX                                                 2       1           Arm TX Complete
+     3                                                                           3
+     4                                                                           4
+     5                                                                           5
+     -------------------------------------------                                 -------------------------------------------
+-    6       2           SGMII0 RX Low                                           6       2
++    6       2           SGMII0 RX Low                                           6       2           Encrypt
+     -------------------------------------------                                 -------------------------------------------
+-    7       3           SGMII0 RX High                                          7       3
++    7       3           SGMII0 RX High                                          7       3           Decrypt
+     -------------------------------------------                                 -------------------------------------------
+     8       4           SGMII1 RX Low                                           8       4           NP2APP RX
+     -------------------------------------------                                 -------------------------------------------
+@@ -1612,7 +1622,7 @@ typedef enum PAL_CPPI_PP_ACCUMULATOR_INT
+     PAL_CPPI_PP_RESERVED_INTD0_ACC_CH_NUM_25,                                                                       // 25
+     PAL_CPPI_PP_RESERVED_INTD0_ACC_CH_NUM_26,                                                                       // 26
+     PAL_CPPI_PP_RESERVED_INTD0_ACC_CH_NUM_27,                                                                       // 27
+-    PAL_CPPI_PP_VOICE_RX_INTD0_ACC_CH_NUM,                                                                         // 28
++    PAL_CPPI_PP_VOICE_RX_INTD0_ACC_CH_NUM,                                                                          // 28
+     PAL_CPPI_PP_RESERVED_INTD0_ACC_CH_NUM_29,                                                                       // 29
+     PAL_CPPI_PP_RESERVED_INTD0_ACC_CH_NUM_30,                                                                       // 30
+     PAL_CPPI_PP_RESERVED_INTD0_ACC_CH_NUM_31,                                                                       // 31
+@@ -1621,10 +1631,14 @@ typedef enum PAL_CPPI_PP_ACCUMULATOR_INT
+ 
+ typedef enum PAL_CPPI_PP_ACCUMULATOR_INTD1_CHANNELS
+ {
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_0,                                                                        // 0
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_1,                                                                        // 1
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_2,                                                                        // 2
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_3,                                                                        // 3
++    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_0,                                                                        // 0 *** This INTD is already in use ***
++    PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_1,                                                                        // 1 *** This INTD is already in use ***
++
++    PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_INTD1_ACC_CH_BASE,
++        PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_LOW_INTD1_ACC_CH_NUM = PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_INTD1_ACC_CH_BASE,   // 2
++        PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_HIGH_INTD1_ACC_CH_NUM,                                                          // 3
++    PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_INTD1_ACC_CH_LAST = PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_HIGH_INTD1_ACC_CH_NUM,
++        
+     PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_4,                                                                        // 4
+     PAL_CPPI_PP_RESERVED_INTD1_ACC_CH_NUM_5,                                                                        // 5
+     PAL_CPPI_PP_IPSEC_ENCRYPT_INTD1_ACC_CH_NUM,                                                                     // 6
+@@ -1672,10 +1686,10 @@ typedef enum PAL_CPPI_PP_ACCUMULATOR_INT
+ 
+ typedef enum PAL_CPPI_PP_ACCUMULATOR_INTD1_INTERRUPT_VECTORS
+ {
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_INTV_NUM_0,                                                                      // 0
+-    PAL_CPPI_PP_RESERVED_INTD1_ACC_INTV_NUM_1,                                                                      // 1
+-    PAL_CPPI_PP_IPSEC_ENCRYPT_INTD1_ACC_INTV_NUM,                                                                     // 2
+-    PAL_CPPI_PP_IPSEC_DECRYPT_INTD1_ACC_INTV_NUM,                                                                    // 3
++    PAL_CPPI_PP_RESERVED_INTD1_ACC_INTV_NUM_0,                                                                      // 0 *** This INTV is already in use ***
++    PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_INTD1_ACC_INTV_NUM,                                                         // 1
++    PAL_CPPI_PP_IPSEC_ENCRYPT_INTD1_ACC_INTV_NUM,                                                                   // 2
++    PAL_CPPI_PP_IPSEC_DECRYPT_INTD1_ACC_INTV_NUM,                                                                   // 3
+     PAL_CPPI_PP_NP2APP_RX_INTD1_ACC_INTV_NUM,                                                                       // 4
+     PAL_CPPI_PP_NP2APP_TX_COMPLETE_INTD1_ACC_INTV_NUM,                                                              // 5
+     PAL_CPPI_PP_APP2NP_RX_INTD1_ACC_INTV_NUM,                                                                       // 6
+@@ -1688,6 +1702,7 @@ typedef enum PAL_CPPI_PP_ACCUMULATOR_INT
+ }PAL_CPPI_PP_ACCUMULATOR_INTD1_INTERRUPT_VECTORS_e;
+ 
+ #define PAL_CPPI41_WPD_ACC_INTV_NUM(devInstance)       (PAL_CPPI_PP_WiFi_0_INTD1_ACC_INTV_NUM + (devInstance))
++#define ARM_TX_COMPLETE_MAP_INTD1_VEC_TO_ACC_INT(irq)  (irq + PAL_CPPI_PP_ACCUMULATOR_INTD0_MAX_INTERRUPT_VECTORS)
+ 
+ /**********************************************************************************************************************
+ 
+@@ -1784,14 +1799,18 @@ typedef enum PAL_CPPI_PP_SOURCE_PORTS
+ #define PAL_CPPI_PP_RGMII1_INFRA_DMA_CH_NUM(ch)                                (PAL_CPPI_PP_DMA10_RGMII1_LOW_INFRA_RX_CH + (ch))
+ #define PAL_CPPI_PP_SGMII0_INFRA_DMA_CH_NUM(ch)                                (PAL_CPPI_PP_DMA10_SGMII0_LOW_INFRA_RX_CH + (ch))
+ #define PAL_CPPI_PP_SGMII1_INFRA_DMA_CH_NUM(ch)                                (PAL_CPPI_PP_DMA10_SGMII1_LOW_INFRA_RX_CH + (ch))
++
++#if !defined(CONFIG_INTEL_KERNEL_PP_DRIVER_LOCAL) && defined(CONFIG_ARM_AVALANCHE_SOC)
++#define PAL_CPPI_PP_ATOM_INFRA_HOST_FD_Q_NUM(pri)                              ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_ARM_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_ATOM_HI_INFRA_HOST_FD_Q_NUM)
++#else
+ #define PAL_CPPI_PP_ATOM_INFRA_HOST_FD_Q_NUM(pri)                              ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_ATOM_HI_INFRA_HOST_FD_Q_NUM)
++#endif
+ #define PAL_CPPI_PP_RGMII0_INFRA_HOST_FD_Q_NUM(pri)                            ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_RGMII0_HI_INFRA_HOST_FD_Q_NUM)
+ #define PAL_CPPI_PP_RGMII1_INFRA_HOST_FD_Q_NUM(pri)                            ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_RGMII1_HI_INFRA_HOST_FD_Q_NUM)
+ #define PAL_CPPI_PP_SGMII0_INFRA_HOST_FD_Q_NUM(pri)                            ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_SGMII0_HI_INFRA_HOST_FD_Q_NUM)
+ #define PAL_CPPI_PP_SGMII1_INFRA_HOST_FD_Q_NUM(pri)                            ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_SGMII1_HI_INFRA_HOST_FD_Q_NUM)
+ #define PAL_CPPI_PP_WIFI_INFRA_HOST_FD_Q_NUM(pri)                              ((pri) == 0 ? PAL_CPPI_PP_QMGR_G2_SHARED_LOW_INFRA_HOST_FD_Q_NUM : PAL_CPPI_PP_QMGR_G2_WIFI_INFRA_HOST_RX_FD_Q_NUM)
+ 
+-
+ /* DOCSIS */
+ #define PAL_CPPI_PP_DOCSIS_INFRA_INPUT_Q_NUM(pri)                               (PAL_CPPI_PP_QMGR_G1_CDMA10_INFRA_INPUT_LOW_DOCSIS_LOW_Q_NUM + (2*(pri)))
+ #define PAL_CPPI_PP_DOCSIS_HOST_RX_COMPLETE_Q_NUM(pri)                          (PAL_CPPI_PP_QMGR_G2_HOST_RX_COMPLETE_DOCSIS_LOW_Q_NUM + (pri))
+@@ -1821,10 +1840,22 @@ typedef enum PAL_CPPI_PP_SOURCE_PORTS
+ #define PAL_CPPI_PP_HOST2PP_INFRA_EMB_FD_Q_NUM(pri)                             (PAL_CPPI_PP_QMGR_G2_HOST2PP_INFRA_LOW_EMB_FD_Q_NUM + (pri))
+ #define PAL_CPPI_PP_HOST2PP_INFRA_DMA_CH_COUNT                                  (PAL_CPPI_PP_DMA11_HOST2PP_HIGH_INFRA_RX_CH - PAL_CPPI_PP_DMA11_HOST2PP_LOW_INFRA_RX_CH + 1)
+ #define PAL_CPPI_PP_HOST2PP_INFRA_DMA_CH_NUM(ch)                                (PAL_CPPI_PP_DMA11_HOST2PP_LOW_INFRA_RX_CH + (ch))
++
++#if !defined(CONFIG_INTEL_KERNEL_PP_DRIVER_LOCAL) && defined(CONFIG_ARM_AVALANCHE_SOC)
++#define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_Q_NUM(pri)                              (PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_LOW_TX_COMPLETE_Q_NUM + (pri))
++#else
+ #define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_Q_NUM(pri)                              (PAL_CPPI_PP_QMGR_G2_HOST2PP_LOW_TX_COMPLETE_Q_NUM + (pri))
++#endif
++
++#if !defined(CONFIG_INTEL_KERNEL_PP_DRIVER_LOCAL) && defined(CONFIG_ARM_AVALANCHE_SOC)
++#define PAL_CPPI_PP_HOST2PP_HOST_FD_Q_NUM(pri)                                  (PAL_CPPI_PP_QMGR_G2_ARM_HOST2PP_LOW_HOST_FD_Q_NUM + (pri))
++#define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(pri)                         (PAL_CPPI_PP_ACC_INTD1_CH_TO_ACC_CH(PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_INTD1_ACC_CH_BASE + (pri)))
++#define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT                            (PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_INTD1_ACC_CH_LAST - PAL_CPPI_PP_ARM_HOST2PP_TX_COMPLETE_INTD1_ACC_CH_BASE + 1)
++#else
+ #define PAL_CPPI_PP_HOST2PP_HOST_FD_Q_NUM(pri)                                  (PAL_CPPI_PP_QMGR_G2_HOST2PP_LOW_HOST_FD_Q_NUM + (pri))
+ #define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_NUM(pri)                         (PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_CH_BASE + (pri))
+ #define PAL_CPPI_PP_HOST2PP_TX_COMPLETE_ACC_CH_COUNT                            (PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_CH_LAST - PAL_CPPI_PP_HOST2PP_TX_COMPLETE_INTD0_ACC_CH_BASE + 1)
++#endif
+ #define PAL_CPPI_NETDEV_BUILD_Q_INFO(qMgr, qNum)                                ( ((qMgr) << CPPI41_EM_PKTINFO_RETQMGR_SHIFT) | (qNum) )
+ 
+ #ifdef CONFIG_MACH_PUMA7_FPGA
+diff --git a/include/linux/avalanche/puma7/puma7_pp.h b/include/linux/avalanche/puma7/puma7_pp.h
+--- a/include/linux/avalanche/puma7/puma7_pp.h
++++ b/include/linux/avalanche/puma7/puma7_pp.h
+@@ -205,7 +205,7 @@ typedef enum {
+     WIFI_DEVS_CNT
+ } wifi_dev_id_e;
+ 
+-#ifdef CONFIG_WIFI_PROXY
++#if defined(CONFIG_WIFI_PROXY) || defined(CONFIG_PUMA_LITEPATH)
+ #define WIFI_DEVICE_ID_VALID(dev_id)                    (WIFI_DEV_ID_0 <= (dev_id) && (dev_id) < WIFI_DEVS_CNT)
+ #define FOR_EACH_WIFI_DEVICE_ID(i)                      for (i = WIFI_DEV_ID_0; i < WIFI_DEVS_CNT; i++)
+ #define WIFI_DEVICE_TO_PID(dev_id)                      ((dev_id) + PP_WiFi_PORT0_PID_NUM)
+diff --git a/include/linux/avalanche/puma7/synopsys_gbe_interface.h b/include/linux/avalanche/puma7/synopsys_gbe_interface.h
+--- a/include/linux/avalanche/puma7/synopsys_gbe_interface.h
++++ b/include/linux/avalanche/puma7/synopsys_gbe_interface.h
+@@ -7,7 +7,7 @@
+  *
+  * GPL LICENSE SUMMARY
+  *
+- *  Copyright(c) 2015 Intel Corporation.
++ *  Copyright(c) 2015-2016 Intel Corporation.
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of version 2 of the GNU General Public License as
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1486,7 +1486,7 @@ struct net_device {
+     struct net_device   *parentDev;
+ 
+     /* Hook for letting the net device set its own PSI during session creation */
+-    void (*netdev_set_psi_hook)(Uint32 *psi, struct sk_buff *skb, struct net_device *dev);
++    int (*netdev_set_psi_hook)(Uint32 *psi, struct sk_buff *skb, struct net_device *dev);
+ #endif
+ 
+     /* There QoS may be defined either for physical or virtual device
+diff --git a/include/linux/ti_hil.h b/include/linux/ti_hil.h
+--- a/include/linux/ti_hil.h
++++ b/include/linux/ti_hil.h
+@@ -1,25 +1,28 @@
+ /*
+- * ti_hil.h - Header file for HIL
+- *
+- * Description:
+- *  This file contains structures and definitions that are used by the
+- *  HIL Framework.
+- *
+- * Copyright (C) <2008>, Texas Instruments, Incorporated
+- *
+- *  This program is free software; you can distribute it and/or modify it
+- *  under the terms of the GNU General Public License (Version 2) as
+- *  published by the Free Software Foundation.
+- *
+- *  This program is distributed in the hope it will be useful, but WITHOUT
+- *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- *  for more details.
+- *
+- *  You should have received a copy of the GNU General Public License along
+- *  with this program; if not, write to the Free Software Foundation, Inc.,
+- *  59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+- */
++  GPL LICENSE SUMMARY
++
++  Copyright(c) 2016 Intel Corporation.
++
++  This program is free software; you can redistribute it and/or modify
++  it under the terms of version 2 of the GNU General Public License as
++  published by the Free Software Foundation.
++
++  This program is distributed in the hope that it will be useful, but
++  WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with this program; if not, write to the Free Software
++  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++  The full GNU General Public License is included in this distribution
++  in the file called LICENSE.GPL.
++
++  Contact Information:
++    Intel Corporation
++    2200 Mission College Blvd.
++    Santa Clara, CA  97052
++*/
+ 
+ #ifndef __TI_HIL_H__
+ #define __TI_HIL_H__
+@@ -27,6 +30,8 @@
+ #ifdef CONFIG_TI_PACKET_PROCESSOR_STATS
+ #include <linux/skbuff.h>
+ #endif /* CONFIG_TI_PACKET_PROCESSOR_STATS */
++#include <linux/in.h>
++#include <linux/in6.h>
+ #endif /* KERNEL*/
+ 
+ #ifdef CONFIG_APPCPU_GW_PP_HANDLE
+@@ -40,6 +45,17 @@ struct hil_core_notifier_param
+ #define TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS                    0x00000002
+ #define TI_HIL_PACKET_FLAG_PP_SESSION_DROP_OFFSET               24
+ 
++
++/**************************************************************************
++ **************** General Macros to get and set PP events *****************
++ **************************************************************************/
++
++#define TI_HIL_NETDEV_READ32_REG(x)                    ntohl(x)                /* convert network byte order to native host byte order */
++#define TI_HIL_NETDEV_WRITE32_REG(x)                   htonl(x)                /* convert native host byte order to network byte order */
++
++#define TI_HIL_NETDEV_GET_EVENT(skb)                   TI_HIL_NETDEV_READ32_REG( (SKB_GET_PP_INFO_P(skb)->flags) >> TI_HIL_PACKET_FLAG_PP_SESSION_DROP_OFFSET)
++#define TI_HIL_NETDEV_SET_EVENT(skb, f)                (SKB_GET_PP_INFO_P(skb)->flags |= TI_HIL_NETDEV_WRITE32_REG((f) << TI_HIL_PACKET_FLAG_PP_SESSION_DROP_OFFSET))
++
+ /**************************************************************************
+  ****************************** Module Identifers *************************
+  **************************************************************************/
+@@ -94,6 +110,33 @@ struct hil_core_notifier_param
+ #define TI_BRIDGE_PACKET_FLOODED     (TI_BRIDGE_EVENT + 0x6)
+ 
+ /**************************************************************************
++ **************************** PP Routing Event Identifiers *****************
++ **************************************************************************/
++
++/* Base for all routing PP Event identifiers. */
++#define TI_ROUTE_EVENT              0x10
++
++/* Event generated when a route is added. */
++#define TI_ROUTE_ADDED              (TI_ROUTE_EVENT + 0x1)
++
++/* Event generated when a route is deleted. */
++#define TI_ROUTE_DELETED            (TI_ROUTE_EVENT + 0x2)
++
++/**************************************************************************
++ **************************** PP VLAN Event Identifiers *****************
++ **************************************************************************/
++
++/* Base for all VLAN PP Event identifiers. */
++#define TI_VLAN_EVENT               0x20
++
++/* Event generated when a VLAN device is created. */
++#define TI_VLAN_DEV_CREATED         (TI_VLAN_EVENT + 0x1)
++
++/* Event generated when a VLAN device is deleted. */
++#define TI_VLAN_DEV_DELETED         (TI_VLAN_EVENT + 0x2)
++
++
++/**************************************************************************
+  ********************* PP Connection Tracking Event Identifiers ***********
+  **************************************************************************/
+ 
+@@ -120,69 +163,6 @@ struct hil_core_notifier_param
+ 
+ #define TI_NPCPU_CONNTRACK_FLUSH  (TI_CT_EVENT + 0x8)
+ 
+-/**************************************************************************
+- ************************* PP IP Event Identifiers ************************
+- **************************************************************************/
+-
+-/* Base for all IP PP Event identifiers. */
+-#define TI_IP_EVENT                 0x80
+-
+-/* Event generated for general packet drop */
+-#define TI_IP_DISCARD_PKT_IPV4   (TI_IP_EVENT + 0x1)
+-#define TI_IP_DISCARD_PKT_IPV6   (TI_IP_EVENT + 0x2)
+-
+-/**************************************************************************
+- **************************** PP Routing Event Identifiers *****************
+- **************************************************************************/
+-
+-/* Base for all routing PP Event identifiers. */
+-#define TI_ROUTE_EVENT              0x10
+-
+-/* Event generated when a route is added. */
+-#define TI_ROUTE_ADDED              (TI_ROUTE_EVENT + 0x1)
+-
+-/* Event generated when a route is deleted. */
+-#define TI_ROUTE_DELETED            (TI_ROUTE_EVENT + 0x2)
+-
+-/**************************************************************************
+- **************************** PP VLAN Event Identifiers *****************
+- **************************************************************************/
+-
+-/* Base for all VLAN PP Event identifiers. */
+-#define TI_VLAN_EVENT               0x20
+-
+-/* Event generated when a VLAN device is created. */
+-#define TI_VLAN_DEV_CREATED         (TI_VLAN_EVENT + 0x1)
+-
+-/* Event generated when a VLAN device is deleted. */
+-#define TI_VLAN_DEV_DELETED         (TI_VLAN_EVENT + 0x2)
+-
+-
+-/**************************************************************************
+- ********************* PP Connection Tracking Event Identifiers ***********
+- **************************************************************************/
+-
+-/* Base for all connection tracking PP Event identifiers. */
+-#define TI_CT_EVENT                  0x30
+-
+-/* Event generated when a connection tracking entry has been created. */
+-#define TI_CT_ENTRY_CREATED          (TI_CT_EVENT + 0x1)
+-
+-/* Event generated when a connection tracking entry has timed-out */
+-#define TI_CT_DEATH_BY_TIMEOUT       (TI_CT_EVENT + 0x2)
+-
+-/* Event generated when a Netfilter table is being updated. */
+-#define TI_CT_NETFILTER_TABLE_UPDATE (TI_CT_EVENT + 0x3)
+-
+-/* Event generated once Netfilter decides to drop the packet */
+-#define TI_CT_NETFILTER_DISCARD_PKT  (TI_CT_EVENT + 0x4)
+-
+-/* Event generated once Netfilter decides to cancel drop acceleration */
+-#define TI_CT_NETFILTER_CANCEL_DISCARD_ACCELERATION     (TI_CT_EVENT + 0x5)
+-
+-/* Event generated once Netfilter decides to delete a session */
+-#define TI_CT_NETFILTER_DELETE_SESSION     (TI_CT_EVENT + 0x6)
+-
+ /* Event generated as part of ATOM conntrack MRPC server handle */
+ #define CT_APPCPU_DEATH_BY_TIMEOUT  (TI_CT_EVENT + 0x7)
+ 
+@@ -201,6 +181,9 @@ struct hil_core_notifier_param
+ 
+ #define TI_MC_SESSION_DELETED         (TI_MFC_EVENT + 0x3)
+ 
++#define MC_SESSION_ADD_MEMBER         (TI_MFC_EVENT + 0x4)
++#define MC_SESSION_DEL_MEMBER         (TI_MFC_EVENT + 0x5)
++
+ /**************************************************************************
+  **************************** PP PPP Event Identifiers *****************
+  **************************************************************************/
+@@ -269,6 +252,23 @@ struct hil_core_notifier_param
+ /* Event generated when remove vpid */
+ #define TI_PP_REMOVE_VPID       (TI_PP_GENERAL_EVENT + 0x2)
+ 
++/* Event generated when created session by sanity test module */
++#define TI_PP_TEST_SESSION       (TI_PP_GENERAL_EVENT + 0x3)
++
++/**************************************************************************
++ ********************* PP L2TPv3 Event Identifiers ************************
++ **************************************************************************/
++
++/* Base for all L2TPv3 PP Event identifiers. */
++#define TI_L2TP_EVENT                  0x90
++
++/* Event generated when a L2TPv3 session is created. */
++#define TI_L2TP_ENTRY_CREATED          (TI_L2TP_EVENT + 0x1)
++
++/* Event generated when a L2TPv3 session is deleted. */
++#define TI_L2TP_ENTRY_DELETED          (TI_L2TP_EVENT + 0x2)
++
++
+ /* DOCSIS Packet processor start/delete session notification defines */
+ #define TI_DOCSIS_PP_SESSION_TYPE_FORWARDING                    0x1
+ #define TI_DOCSIS_PP_SESSION_TYPE_DISCARDING                    0x2
+@@ -321,6 +321,20 @@ struct pp_mr_param {
+     struct mfc_cache *cache;
+ };
+ 
++typedef enum {
++        HIL_MR_IPV4 = 0,
++        HIL_MR_IPV6,
++} hil_mr_ptype_t;
++
++struct hil_mr_ipaddr {
++        hil_mr_ptype_t type;
++        union {
++                struct in_addr  ip4;
++                struct in6_addr ip6;
++        } addr;
++        int ifindex;
++};
++
+ /**************************************************************************
+  **************************** HIL Core Exported API ***********************
+  **************************************************************************/
+@@ -360,6 +374,19 @@ extern int ti_hil_register_delete_sessio
+ extern int ti_hil_unregister_delete_session_notification(void);
+ #endif /* CONFIG_TI_PACKET_PROCESSOR_STATS */
+ 
++#ifdef CONFIG_INTEL_L2VPN_MAC_AGING
++/* DOCSIS Packet processor session notification API */
++typedef int (*TI_HIL_MAC_AGING_START_SESSION)(unsigned int sessionHandle, struct sk_buff* skb);
++typedef int (*TI_HIL_MAC_AGING_DELETE_SESSION)(unsigned char cpeNumber);
++
++extern int ti_hil_register_mac_aging_start_session_notification(
++	TI_HIL_MAC_AGING_START_SESSION ti_hil_start_session_notification);
++extern int ti_hil_unregister_mac_aging_start_session_notification(void);
++extern int ti_hil_register_mac_aging_delete_session_notification(
++	TI_HIL_MAC_AGING_DELETE_SESSION ti_hil_delete_session_notification);
++extern int ti_hil_unregister_mac_aging_delete_session_notification(void);
++#endif /* CONFIG_INTEL_L2VPN_MAC_AGING */
++
+ #ifdef CONFIG_MACH_PUMA5
+ /* Power Saving Mode (PSM) API */
+ extern int ti_hil_enable_psm (void);
+diff --git a/net/ti.Kconfig b/net/ti.Kconfig
+--- a/net/ti.Kconfig
++++ b/net/ti.Kconfig
+@@ -186,6 +186,20 @@ config INTEL_NS_DEVICE_FILTER
+ 
+ menu "TI Packet Processor Subsystem"
+ 
++
++config NPCPU_HARDCODED_OFFCHIP_INFO
++	bool "Hard coded address and size of NPCPU"
++	default n
++	help
++		Force Mapping NPCPU DDR in a hardcoded manner
++		Address and size will be hardcoded
++
++config EXCLUDE_GMAC4
++        bool "Exclude GMAC4"
++    default n
++        help
++	exclude GMAC4 from synopsys-gbe driver
++
+ config TI_PACKET_PROCESSOR
+ 	bool "TI Packet Processor"
+     default y
+@@ -303,9 +317,9 @@ config INTEL_KERNEL_FORCE_IPV6_DOWN_WHEN
+ 	force ipv6 down on network interface when it has no ipv6 address.  
+ endmenu
+ 
+-config INTEL_KERNEL_PP_DRIVER_ON_ATOM
+-	bool "Packet Processor driver on application CPU support in kernel"
++config INTEL_KERNEL_PP_DRIVER_LOCAL
++	bool "Packet Processor driver on CPU support in kernel"
+         default n
+ 	help
+-	  Support for running the Packet Processor on the application instead of the network processor CPU. 
++	  Support for running the Packet Processor on current cpu.
+ 	  Cannot coexist with gateway support. 
+diff --git a/net/ti/pp/ti_hil_core.c b/net/ti/pp/ti_hil_core.c
+--- a/net/ti/pp/ti_hil_core.c
++++ b/net/ti/pp/ti_hil_core.c
+@@ -1,7 +1,7 @@
+ /*
+   GPL LICENSE SUMMARY
+ 
+-  Copyright(c) 2008-2016 Intel Corporation.
++  Copyright(c) 2016 Intel Corporation.
+ 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of version 2 of the GNU General Public License as
+@@ -37,6 +37,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/inetdevice.h>
+ #include <linux/rtnetlink.h>
++#include <linux/byteorder/generic.h>
+ #include <linux/ti_hil.h>
+ #include <linux/notifier.h>
+ 
+@@ -48,10 +49,78 @@
+ #include <linux/avalanche/puma7/puma7_defs.h>
+ #endif
+ #endif
++#ifdef CONFIG_NETFILTER
++#include <linux/netfilter.h>
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_helper.h>
++#include <linux/netfilter_ipv4/ip_tables.h>
++#endif
++
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#endif
+ 
+ /**************************************************************************
+  ***************************** Static Declarations  ***********************
+  **************************************************************************/
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++static unsigned int notifier_list_was_init = 0;
++static struct   atomic_notifier_head notifier_list;
++static unsigned int dropped_packets_bit_map;
++
++#define DROPPED_PACKETS_BITMAP_IS_SET(__n)          ((dropped_packets_bit_map & (1 << (__n))) != 0)
++
++static int hil_core_register_notifier_block(struct notifier_block *nb)
++{
++    if(!notifier_list_was_init)
++    {
++        notifier_list_was_init = 1;
++        ATOMIC_INIT_NOTIFIER_HEAD(&notifier_list);
++    }
++    atomic_notifier_chain_register(&notifier_list, nb);
++    return 0;
++}
++EXPORT_SYMBOL(hil_core_register_notifier_block);
++
++static int hil_core_unregister_notifier_block(struct notifier_block *nb)
++{
++    if(!notifier_list_was_init)
++    {
++        return 0;
++    }
++
++    atomic_notifier_chain_unregister(&notifier_list, nb);
++    return 0;
++}
++EXPORT_SYMBOL(hil_core_unregister_notifier_block);
++
++/*!
++ * \fn create_drop_session
++ * \brief store the event in the pp info and send the packet to the ARM using data pipe
++ *
++ * \param sk_buff* skb to be sent
++ * \param event    the specific drop event value
++*/
++int create_drop_session(struct sk_buff* skb, unsigned long event)
++{
++    struct hil_core_notifier_param param;
++    unsigned int flags;
++
++    /* Read current flags */
++    flags = ntohl(skb->pp_packet_info->flags);
++
++    /* Store event in flags */
++    flags |= (event << TI_HIL_PACKET_FLAG_PP_SESSION_DROP_OFFSET );
++
++    /* Convert new flags back to network byte order */
++    skb->pp_packet_info->flags = htonl(flags);
++
++    param.skb = skb;
++    atomic_notifier_call_chain(&notifier_list, 0, &param);
++    return 0;
++}
++#endif /* CONFIG_APPCPU_GW_PP_HANDLE */
+ 
+ /* HIL Core Event Handler for all networking events. */
+ static int ti_hil_net_event_handler(struct notifier_block *chain, unsigned long event, void *ptr);
+@@ -109,6 +178,15 @@ TI_HIL_DELETE_SESSION ti_hil_delete_sess
+ EXPORT_SYMBOL(ti_hil_delete_session_notification_cb);
+ #endif /* CONFIG_TI_PACKET_PROCESSOR_STATS */
+ 
++#ifdef CONFIG_INTEL_L2VPN_MAC_AGING
++/* DOCSIS Packet processor MAC AGING start session notification Callback */
++TI_HIL_MAC_AGING_START_SESSION ti_hil_mac_aging_start_session_notification_cb = NULL;
++EXPORT_SYMBOL(ti_hil_mac_aging_start_session_notification_cb);
++/* DOCSIS Packet processor MAC AGING delete session notification Callback */
++TI_HIL_MAC_AGING_DELETE_SESSION ti_hil_mac_aging_delete_session_notification_cb = NULL;
++EXPORT_SYMBOL(ti_hil_mac_aging_delete_session_notification_cb);
++#endif
++
+ /**************************************************************************
+  ******************************* Functions  *******************************
+  **************************************************************************/
+@@ -301,10 +379,118 @@ int ti_hil_initialize (void)
+  *  0   -   Success
+  *  <0  -   Error
+  **************************************************************************/
++#ifdef CONFIG_TI_PACKET_PROCESSOR
+ int ti_hil_pp_event(unsigned long val, void *v)
+ {
+     return atomic_notifier_call_chain(&pp_chain, val, v);
++}	
++#else //CONFIG_TI_PACKET_PROCESSOR
++int ti_hil_pp_event(unsigned long event, void *v)
++{
++    struct sk_buff*              skb;
++    unsigned int                 flags;
++    struct xt_table              *xt;
++    /* Handle only the events currently supported in Atom SDK */
++    switch (event)
++    {
++        case TI_BRIDGE_PACKET_FLOODED:
++        {
++            /* Event indicates that the packet will now be flooded onto all interfaces. This can happen in any of the following cases:-
++             *  a) Unicast packet but no matching FDB entry is found.
++             *  b) Broadcast packet
++             *  c) Multicast packet but no layer2 extensions eg IGMP snooping exists */
++            skb = (struct sk_buff*) v;
++
++            /* Convert existing flags to host byte order */
++            flags = ntohl(skb->pp_packet_info->flags);
++
++            /* In the intrusive mode profile these packets are not considered as candidates for acceleration so mark the packet BYPASS mode so that the egress hook is bypassed */
++            flags |= TI_HIL_PACKET_FLAG_PP_SESSION_BYPASS;
++
++            /* Convert new flags back to network byte order */
++            skb->pp_packet_info->flags = htonl(flags);
++
++            break;
++        }
++#ifdef CONFIG_APPCPU_GW_PP_HANDLE
++        case TI_IP_DISCARD_PKT_IPV4:
++        case TI_IP_DISCARD_PKT_IPV6:
++            if (((event == TI_IP_DISCARD_PKT_IPV4) && DROPPED_PACKETS_BITMAP_IS_SET(4)) ||
++                ((event == TI_IP_DISCARD_PKT_IPV6) && DROPPED_PACKETS_BITMAP_IS_SET(6)))
++            {
++                	/* Hanlde event*/
++            }
++            else
++            {
++			break;  /* Appropriate bit is not set, discard event */
++            }
++#ifdef CONFIG_NETFILTER
++        case TI_CT_NETFILTER_DISCARD_PKT:
++#endif
++        {
++            struct sk_buff* new_skb  = NULL;
++            skb = (struct sk_buff *)v;
++
++	    if (!skb)
++            {
++		printk(KERN_NOTICE "%s[%u]: Recevied null skb. Failed to create drop session  \n", __FUNCTION__, __LINE__);
++                break;
++            }
++
++	    if (skb->pp_packet_info->input_device_index == 0)
++            {
++		break;
++            }
++
++	    if(0 == skb->len)
++            {
++                break;
++            }
++
++	    new_skb  = dev_alloc_skb(2048);
++	    if(!new_skb)
++	    {
++		printk(KERN_NOTICE "%s[%u]: failed to alloc skb \n", __FUNCTION__, __LINE__);
++		break;
++	    }
++
++            memcpy(new_skb->pp_packet_info, skb->pp_packet_info, sizeof(PP_PACKET_INFO_t));
++            memcpy(new_skb->data, skb->data, skb->len);
++            skb_put(new_skb, skb->len);
++
++            create_drop_session(new_skb, event);
++            break;
++	}
++
++        case TI_CT_NETFILTER_TABLE_UPDATE:
++        {
++            xt = (struct xt_table *)v; /* Get the netfilter table */
++
++            /* Flush all sessions only for NAT... No need to do anything for Mangle and Firewall */
++            if (strcmp (xt->name, "nat") == 0 || strcmp (xt->name, "filter") == 0)
++            {
++                /*pp_client MRPC call to invoke flush avalanche API on ARM to flush the session*/
++                if (avalanche_pp_flush_sessions( AVALANCHE_PP_MAX_VPID, PP_LIST_ID_ALL ) != PP_RC_SUCCESS)
++                {
++                    printk ("Error: Unable to flush all sessions\n");
++                    return 0;
++                }
++                printk ("NAT Table update all sessions flushed\n");
++            }
++            break;
++        }
++#endif /*  CONFIG_APPCPU_GW_PP_HANDLE */
++        default:
++        {
++            printk (KERN_NOTICE "Intrusive -> Does not handle event 0x%x\n", event);
++            break;
++        }
++
++    }
++    return 0;
+ }
++#endif //else TI_PACKET_PROCESSOR
++
+ 
+ #if PUMA7_OR_NEWER_SOC_TYPE
+ /**************************************************************************
+@@ -486,6 +672,104 @@ int ti_hil_unregister_delete_session_not
+ }
+ #endif /* CONFIG_TI_PACKET_PROCESSOR_STATS */
+ 
++#ifdef CONFIG_INTEL_L2VPN_MAC_AGING
++/**************************************************************************
++ * FUNCTION NAME : ti_hil_register_mac_aging_start_session_notification
++ **************************************************************************
++ * DESCRIPTION   :
++ *  Register the DOCSIS Packet Processor start session notification for mac aging feature
++ *  callback function
++ *
++ * RETURNS       :
++ *  0   -   Success
++ *  <0  -   Error
++ **************************************************************************/
++int ti_hil_register_mac_aging_start_session_notification(
++	TI_HIL_MAC_AGING_START_SESSION ti_hil_start_session_notification)
++{
++	if (ti_hil_mac_aging_start_session_notification_cb != NULL) {
++		pr_err("Error: DOCSIS Packet Processor mac aging start session notification callback already exist\n");
++		return -1;
++	}
++
++	ti_hil_mac_aging_start_session_notification_cb =
++		ti_hil_start_session_notification;
++
++	return 0;
++}
++
++/**************************************************************************
++ * FUNCTION NAME : ti_hil_unregister_mac_aging_start_session_notification
++ **************************************************************************
++ * DESCRIPTION   :
++ *  Un-Register the DOCSIS Packet Processor start session notification for mac aging feature
++ *  callback function
++ *
++ * RETURNS       :
++ *  0   -   Success
++ *  <0  -   Error
++ **************************************************************************/
++int ti_hil_unregister_mac_aging_start_session_notification(void)
++{
++	if (ti_hil_mac_aging_start_session_notification_cb == NULL) {
++		pr_err("Error: DOCSIS Packet Processor mac aging start session notification callback empty\n");
++		return -1;
++	}
++
++	ti_hil_mac_aging_start_session_notification_cb = NULL;
++
++	return 0;
++}
++
++/**************************************************************************
++ * FUNCTION NAME : ti_hil_register_mac_aging_delete_session_notification
++ **************************************************************************
++ * DESCRIPTION   :
++ *  Register the DOCSIS Packet processor delete session notification for mac aging feature
++ *  callback function
++ *
++ * RETURNS       :
++ *  0   -   Success
++ *  <0  -   Error
++ **************************************************************************/
++int ti_hil_register_mac_aging_delete_session_notification(
++	TI_HIL_MAC_AGING_DELETE_SESSION ti_hil_delete_session_notification)
++{
++	if (ti_hil_mac_aging_delete_session_notification_cb != NULL) {
++		pr_err("Error: DOCSIS Packet Processor delete session notification callback already exist\n");
++		return -1;
++	}
++
++	ti_hil_mac_aging_delete_session_notification_cb =
++		ti_hil_delete_session_notification;
++
++	return 0;
++}
++
++/**************************************************************************
++ * FUNCTION NAME : ti_hil_unregister_mac_aging_delete_session_notification
++ **************************************************************************
++ * DESCRIPTION   :
++ *  Un-Register the DOCSIS Packet processor delete session notification for mac aging feature
++ *  callback function
++ *
++ * RETURNS       :
++ *  0   -   Success
++ *  <0  -   Error
++ **************************************************************************/
++int ti_hil_unregister_mac_aging_delete_session_notification(void)
++{
++	if (ti_hil_mac_aging_delete_session_notification_cb == NULL) {
++		pr_err("Error: DOCSIS Packet Processor mac aging delete session notification callback empty\n");
++		return -1;
++	}
++
++	ti_hil_mac_aging_delete_session_notification_cb = NULL;
++
++	return 0;
++}
++#endif CONFIG_INTEL_L2VPN_MAC_AGING
++
+ /* Export all the Symbols for Linux; so that these can be called from modules. */
+ EXPORT_SYMBOL(ti_hil_initialize);
+ EXPORT_SYMBOL(ti_hil_register_profile);
+@@ -497,4 +781,11 @@ EXPORT_SYMBOL(ti_hil_unregister_start_se
+ EXPORT_SYMBOL(ti_hil_register_delete_session_notification);
+ EXPORT_SYMBOL(ti_hil_unregister_delete_session_notification);
+ #endif /* CONFIG_TI_PACKET_PROCESSOR_STATS */
++#ifdef CONFIG_INTEL_L2VPN_MAC_AGING
++/* DOCSIS Packet processor start/delete session notification API */
++EXPORT_SYMBOL(ti_hil_register_mac_aging_start_session_notification);
++EXPORT_SYMBOL(ti_hil_unregister_mac_aging_start_session_notification);
++EXPORT_SYMBOL(ti_hil_register_mac_aging_delete_session_notification);
++EXPORT_SYMBOL(ti_hil_unregister_mac_aging_delete_session_notification);
++#endif /* CONFIG_INTEL_L2VPN_MAC_AGING */
+ 

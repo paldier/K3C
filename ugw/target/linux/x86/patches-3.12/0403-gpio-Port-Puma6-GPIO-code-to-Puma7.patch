@@ -1,0 +1,2548 @@
+From e876fd5b3c3d17dfe73c0c10f67932c4e51a2a7c Mon Sep 17 00:00:00 2001
+From: Andrei Danaila <andrei.danaila@intel.com>
+Date: Thu, 26 May 2016 13:41:49 -0700
+Subject: [PATCH 403/441] gpio: Port Puma6 GPIO code to Puma7
+
+Port over the Puma 6 GPIO code to Puma7 as
+part of the branch merge.
+
+Change-Id: I02683854fd652e3fc5df09c1dd937984d3f70cff
+Signed-off-by: Andrei Danaila <andrei.danaila@intel.com>
+---
+ drivers/gpio/Kconfig        |   5 +
+ drivers/gpio/Makefile       |   6 +
+ drivers/gpio/ce2600-gpio.c  | 510 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/gpio/ce2600-gpio.h  |  86 ++++++++
+ drivers/gpio/ce4100-gpio.c  | 313 +++++++++++++++++++++++++++
+ drivers/gpio/ce4100-gpio.h  |  58 +++++
+ drivers/gpio/ce4200-gpio.c  | 346 ++++++++++++++++++++++++++++++
+ drivers/gpio/ce4200-gpio.h  |  69 ++++++
+ drivers/gpio/ce5300-gpio.c  | 414 +++++++++++++++++++++++++++++++++++
+ drivers/gpio/ce5300-gpio.h  |  66 ++++++
+ drivers/gpio/gpio-sch.c     |  13 +-
+ drivers/gpio/gpiolib.c      | 129 +++++++++++
+ drivers/gpio/intelce-gpio.c | 335 +++++++++++++++++++++++++++++
+ drivers/gpio/intelce-gpio.h |  66 ++++++
+ 14 files changed, 2413 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpio/ce2600-gpio.c
+ create mode 100644 drivers/gpio/ce2600-gpio.h
+ create mode 100644 drivers/gpio/ce4100-gpio.c
+ create mode 100644 drivers/gpio/ce4100-gpio.h
+ create mode 100644 drivers/gpio/ce4200-gpio.c
+ create mode 100644 drivers/gpio/ce4200-gpio.h
+ create mode 100644 drivers/gpio/ce5300-gpio.c
+ create mode 100644 drivers/gpio/ce5300-gpio.h
+ create mode 100644 drivers/gpio/intelce-gpio.c
+ create mode 100644 drivers/gpio/intelce-gpio.h
+
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -287,6 +287,11 @@ config GPIO_VR41XX
+ 	help
+ 	  Say yes here to support the NEC VR4100 series General-purpose I/O Uint
+ 
++config GPIO_INTELCE
++        tristate "INTELCE GPIO support"
++        depends on GPIOLIB && ARCH_GEN3
++        help
++          Say yes here to support GPIO functionality of IntelCE soc I/O controller.
+ config GPIO_SCH
+ 	tristate "Intel SCH/TunnelCreek/Centerton GPIO"
+ 	depends on PCI && X86
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -93,3 +93,9 @@ obj-$(CONFIG_GPIO_WM8350)	+= gpio-wm8350
+ obj-$(CONFIG_GPIO_WM8994)	+= gpio-wm8994.o
+ obj-$(CONFIG_GPIO_XILINX)	+= gpio-xilinx.o
+ obj-$(CONFIG_GPIO_INTELCE2700)  += gpio-intelce2700.o
++obj-$(CONFIG_GPIO_INTELCE)      += intelce_gpio.o
++intelce_gpio-objs       += intelce-gpio.o
++intelce_gpio-objs       += ce4100-gpio.o
++intelce_gpio-objs       += ce4200-gpio.o
++intelce_gpio-objs       += ce5300-gpio.o
++intelce_gpio-objs       += ce2600-gpio.o
+\ No newline at end of file
+--- /dev/null
++++ b/drivers/gpio/ce2600-gpio.c
+@@ -0,0 +1,510 @@
++/*
++ *  GPIO interface for Intel SOC CE2600.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++#include <linux/aep.h>
++
++#ifdef CONFIG_HW_MUTEXES
++#include <linux/hw_mutex.h>
++#endif
++
++#include "ce2600-gpio.h"
++#include "ce4200-gpio.h"
++
++void ce2600_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->high_base;
++
++	if (value ) {
++		intelce_gpio_mmio_write32(1 << offset, reg_base + CE2600_PUB_GPIO_SET);
++	} else {
++		intelce_gpio_mmio_write32(1 << offset, reg_base + CE2600_PUB_GPIO_CLEAR);
++	}
++}
++
++int ce2600_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->reg_base;
++	uint32_t orig;
++	unsigned long flags;
++	aep_result_t rc = AEP_SUCCESS;
++	/* Get the absolute offset to GPIO base */
++	uint32_t reg_offset = (uint32_t)reg_base -(uint32_t)c->gpio_reg_base;
++
++	if (aep_is_active()) {
++		rc  = aep_gpio_write_no_lock(reg_offset + CE2600_PUB_GPIO_OUT_EN, offset, 0);
++		if (rc)
++			return rc;
++	} else {
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_lock(HW_MUTEX_GPIO);
++#endif
++	spin_lock_irqsave(&c->lock, flags);
++	orig = intelce_gpio_mmio_read32(reg_base + CE2600_PUB_GPIO_OUT_EN);
++	orig &= ~(1 << offset);
++	intelce_gpio_mmio_write32(orig, reg_base + CE2600_PUB_GPIO_OUT_EN);
++	spin_unlock_irqrestore(&c->lock, flags);
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_unlock(HW_MUTEX_GPIO);
++#endif
++	}
++	return 0;
++}
++
++int ce2600_gpio_direction_output(struct gpio_chip *chip, unsigned offset, int value)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->reg_base;
++	uint32_t orig;
++	unsigned long flags;
++	aep_result_t rc = AEP_SUCCESS;
++	uint32_t reg_offset = (uint32_t)reg_base -(uint32_t)c->gpio_reg_base;
++
++	if (aep_is_active()) {
++		rc  = aep_gpio_write_no_lock(reg_offset + CE2600_PUB_GPIO_OUT, offset, value);
++		if (rc)
++			return rc;
++		rc  = aep_gpio_write_no_lock(reg_offset + CE2600_PUB_GPIO_OUT_EN, offset, 1);
++		if (rc)
++			return rc;
++	} else {
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_lock(HW_MUTEX_GPIO);
++#endif
++	spin_lock_irqsave(&c->lock, flags);
++        orig = intelce_gpio_mmio_read32(reg_base + CE2600_PUB_GPIO_OUT);
++        if (value) {
++                        orig |= (1 << offset);
++                } else {
++                        orig &= ~(1 << offset);
++        }
++        intelce_gpio_mmio_write32(orig, reg_base + CE2600_PUB_GPIO_OUT);
++
++	orig = intelce_gpio_mmio_read32(reg_base + CE2600_PUB_GPIO_OUT_EN);
++	orig |= (1 << offset);
++	intelce_gpio_mmio_write32(orig, reg_base + CE2600_PUB_GPIO_OUT_EN);
++
++	spin_unlock_irqrestore(&c->lock, flags);
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_unlock(HW_MUTEX_GPIO);
++#endif
++	}
++	return 0;
++}
++
++int ce2600_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t curr_reg_value = 0;
++	uint32_t new_reg_value = 0;
++	uint32_t bit_num = 0;
++	uint32_t revert = 0;
++	uint32_t gpio = chip->base + offset;
++	unsigned long flags;
++	aep_result_t rc = AEP_SUCCESS;
++
++	switch (gpio)
++	{
++		case 50:
++			bit_num = 0;
++			break;
++		case 116:
++		case 117:
++		case 118:
++		case 38:
++		case 39:
++		case 40:
++		case 41:
++			bit_num = 3;
++			break;
++		case 42:
++		case 43:
++			bit_num = 4;
++			break;
++		case 48:
++			bit_num = 7;
++			break;
++		case 55:
++			bit_num = 12;
++			revert = 1;
++			break;
++		case 54:
++			bit_num = 13;
++			revert = 1;
++			break;
++		case 53:
++			bit_num = 14;
++			revert = 1;
++			break;
++		case 52:
++			bit_num = 15;
++			revert = 1;
++			break;
++		case 56:
++			bit_num = 12;
++			break;
++		case 57:
++			bit_num = 13;
++			break;
++		case 58:
++			bit_num = 14;
++			break;
++		case 93:
++			bit_num = 15;
++			break;
++		case 51:
++			bit_num = 16;
++			break;
++		default:
++			return -EINVAL;
++	}
++	if (revert)
++		fn_num = !fn_num;
++
++	if (aep_is_active()) {
++		rc  = aep_gpio_write_no_lock(CE2600_PUB_GPIO_MUX_CTL, bit_num, fn_num);
++		if (rc)
++			return rc;
++	} else {
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_lock(HW_MUTEX_GPIO);
++#endif
++	spin_lock_irqsave(&c->lock, flags);
++	curr_reg_value = intelce_gpio_mmio_read32(reg_base);
++	if (0 == fn_num)
++		new_reg_value = curr_reg_value & ~(1 << bit_num);
++	else
++		new_reg_value = curr_reg_value | (1 << bit_num);
++	intelce_gpio_mmio_write32(new_reg_value, reg_base);
++	spin_unlock_irqrestore(&c->lock, flags);
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_unlock(HW_MUTEX_GPIO);
++#endif
++	}
++	return 0;
++}
++
++int ce2600_get_multi_function(struct gpio_chip *chip, unsigned offset)
++{
++/*
++ *  This function will set the pin associated with the gpio_num to it's alternate function.
++ *  bit_num-----function [0] / [1]
++ *  0 --- -disable / enable UART1_TXD_GPIO_50
++ *  3 ---- GPIO fucntions /Smart Card0  GPIO 116, 117,118, 38, 39, 40, 41
++ *  4 ---- gbe link assigned to 1 / GBE use LOS (loss of signal) pin as gbe link GPIO 42, 43
++ *  7--- - disable / enable UART0_TXD_GPIO_48
++ *  16---- disable  /eanble UART0 RTS GPIO 51
++ */
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t gpio = chip->base + offset;
++	int bit_num = -1;
++	int revert = 0;
++
++	switch (gpio) {
++		case 50:
++			bit_num = 0;
++			break;
++		case 38 ... 41:
++		case 116 ... 118:
++			bit_num = 3;
++			break;
++		case 42 ... 43:
++			bit_num = 4;
++			break;
++		case 48:
++			bit_num = 7;
++			break;
++		case 51:
++			bit_num = 16;
++			break;
++		case 52:
++			bit_num = 15;
++			revert = 1;
++			break;
++		case 53:
++			bit_num = 14;
++			revert = 1;
++			break;
++		case 54:
++			bit_num = 13;
++			revert = 1;
++			break;
++		case 55:
++			bit_num = 12;
++			revert = 1;
++			break;
++		case 56:
++			bit_num = 12;
++			break;
++		case 57:
++			bit_num = 13;
++			break;
++		case 58:
++			bit_num = 14;
++			break;
++		case 93:
++			bit_num = 15;
++			break;
++		default:
++			break;
++	}
++	if (-1 == bit_num) return -EINVAL;
++	if (revert)
++		return !((intelce_gpio_mmio_read32(reg_base) >> bit_num) & 0x1);
++	else
++		return (intelce_gpio_mmio_read32(reg_base) >> bit_num) & 0x1;
++
++}
++
++static int ce2600_gpio_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(d);
++	void __iomem *mode_le_reg, *mode_rf_reg;
++	uint32_t irq_offs = d->irq - c->irq_base;
++	uint32_t reg1 = 0, reg2 = 0;
++	int ret = 0;
++	aep_result_t rc = AEP_SUCCESS;
++	uint32_t reg_offset = (uint32_t)c->reg_base -(uint32_t)c->gpio_reg_base;
++
++	if (irq_offs > 32)
++		return -EINVAL;
++
++	if (aep_is_active()) {
++
++		switch (type) {
++		case IRQ_TYPE_EDGE_RISING:
++			reg1 = 1;
++			reg2 = 0;
++			break;
++
++		case IRQ_TYPE_EDGE_FALLING:
++			reg1 = 1;
++			reg2 = 1;
++			break;
++
++		case IRQ_TYPE_LEVEL_HIGH:
++			reg1 = 0;
++			reg2 = 0;
++			break;
++
++		case IRQ_TYPE_LEVEL_LOW:
++			reg1 = 0;
++			reg2 = 1;
++			break;
++
++		default:
++			ret =-EINVAL;
++			break;
++	}
++		rc  = aep_gpio_write_no_lock(reg_offset + CE2600_PUB_GPIO_INT_MODE_LE, irq_offs, reg1);
++		if (rc)
++			return rc;
++		rc  = aep_gpio_write_no_lock(reg_offset + CE2600_PUB_GPIO_INT_MODE_RF, irq_offs, reg2);
++		if (rc)
++			return rc;
++	} else {
++
++	mode_le_reg = c->reg_base + CE2600_PUB_GPIO_INT_MODE_LE;
++	mode_rf_reg = c->reg_base + CE2600_PUB_GPIO_INT_MODE_RF;
++
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_lock(HW_MUTEX_GPIO);
++#endif
++	reg1 = intelce_gpio_mmio_read32(mode_le_reg);
++	reg2 = intelce_gpio_mmio_read32(mode_rf_reg);
++
++	switch (type) {
++	case IRQ_TYPE_EDGE_RISING:
++		reg1 |= BIT(irq_offs);
++		reg2 &= ~BIT(irq_offs);
++		break;
++
++	case IRQ_TYPE_EDGE_FALLING:
++		reg1 |= BIT(irq_offs);
++		reg2 |= BIT(irq_offs);
++		break;
++
++	case IRQ_TYPE_LEVEL_HIGH:
++		reg1 &= ~BIT(irq_offs);
++		reg2 &= ~BIT(irq_offs);
++		break;
++
++	case IRQ_TYPE_LEVEL_LOW:
++		reg1 &= ~BIT(irq_offs);
++		reg2 |= BIT(irq_offs);
++		break;
++
++	default:
++		ret =-EINVAL;
++		break;
++	}
++	intelce_gpio_mmio_write32(reg1, mode_le_reg);
++	intelce_gpio_mmio_write32(reg2, mode_rf_reg);
++#ifdef CONFIG_HW_MUTEXES
++	hw_mutex_unlock(HW_MUTEX_GPIO);
++#endif
++	}
++	return ret;
++}
++
++static struct irq_chip ce2600_irq_chip = {
++	.irq_mask = ce4200_gpio_irq_mask,
++	.irq_unmask = ce4200_gpio_irq_unmask,
++	.irq_eoi = ce4200_gpio_irq_eoi,
++	.irq_set_type = ce2600_gpio_irq_set_type,
++};
++
++int ce2600_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev)
++{
++	int i;
++	int irq;
++	int ret;
++
++	c->irq_base = irq_alloc_descs(-1, INTELCE_GPIO_IRQ_BASE, CE2600_PUB_GPIOS_PER_BANK, -1);
++	if (c->irq_base < 0)
++		return c->irq_base;
++
++	/* mask + ACK all interrupt sources */
++	intelce_gpio_mmio_write32(0, c->reg_base + CE2600_PUB_GPIO_INT_EN);
++	intelce_gpio_mmio_write32(0xFFFFFFFF, c->reg_base + CE2600_PUB_GPIO_INT_STAT);
++
++	ret = request_irq(pdev->irq, ce4200_gpio_irq_handler, IRQF_SHARED, "ce2600_gpio", c);
++	if (ret)
++		goto out_free_desc;
++
++	/*
++	 * This gpio irq controller latches level irqs. Testing shows that if
++	 * we unmask & ACK the IRQ before the source of the interrupt is gone
++	 * then the interrupt is active again.
++	 */
++	irq = c->irq_base;
++	for (i=0; i < c->chip.ngpio; i++) {
++		irq_set_chip_and_handler_name(irq, &ce2600_irq_chip, handle_fasteoi_irq, "gpio_irq");
++		irq_set_chip_data(irq, c);
++		irq++;
++	}
++	return 0;
++
++out_free_desc:
++	irq_free_descs(c->irq_base, CE2600_PUB_GPIOS_PER_BANK);
++	return ret;
++}
++
++struct gpio_group {
++	uint32_t input;
++	uint32_t output;
++	uint32_t output_enable;
++	uint32_t int_status;
++	uint32_t int_enable;
++	uint32_t mode_le;
++	uint32_t mode_rf;
++	uint32_t polarity;
++};
++
++struct _gpio {
++	uint32_t cgen;
++	uint32_t cgio;
++	uint32_t cglv;
++	uint32_t cgtpe;
++	uint32_t cgtne;
++	uint32_t cggpe;
++	uint32_t cgsmi;
++	uint32_t cgts;
++
++	struct gpio_group group[4];
++	uint32_t mux_ctl;
++	uint32_t int_router;
++};
++
++static struct _gpio  _gpio;
++
++/*CE2600 gpio suspend routine */
++int ce2600_gpio_suspend(void *io_mem, unsigned short io_port)
++{
++	char *virt_io_mem = (char *)io_mem;
++  	int i;
++
++    /* Keep status of Core Well GPIO*/
++	_gpio.cgen = intelce_gpio_port_read32(io_port + CE2600_CORE_WELL_GPIO_CGEN);
++	_gpio.cgio = intelce_gpio_port_read32(io_port + CE2600_CORE_WELL_GPIO_CGIO);
++	_gpio.cglv = intelce_gpio_port_read32(io_port + CE2600_CORE_WELL_GPIO_CGLV);
++	_gpio.cgtpe = intelce_gpio_port_read32(io_port + CE2600_CORE_WELL_GPIO_CGTPE);
++	_gpio.cgtne = intelce_gpio_port_read32(io_port + CE2600_CORE_WELL_GPIO_CGTNE);
++	_gpio.cggpe = intelce_gpio_port_read32(io_port + CE2600_CORE_WELL_GPIO_CGGPE);
++	_gpio.cgsmi = intelce_gpio_port_read32(io_port + CE2600_CORE_WELL_GPIO_CGSMI);
++
++
++	/* Keep status of general purpose GPIO*/
++	_gpio.mux_ctl = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_MUX_CTL);
++	_gpio.group[0].polarity = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_POLARITY0);
++	_gpio.group[1].polarity = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_POLARITY1);
++	_gpio.group[2].polarity = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_POLARITY2);
++	_gpio.group[3].polarity = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_POLARITY3);
++	_gpio.int_router = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_INT_ROUTER);
++	for (i=0; i < 4; i++) {
++		_gpio.group[i].output = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_OUT);
++		_gpio.group[i].output_enable = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_OUT_EN);
++		_gpio.group[i].int_enable = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_INT_EN);
++		_gpio.group[i].mode_le = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_INT_MODE_LE);
++		_gpio.group[i].mode_rf = intelce_gpio_mmio_read32(virt_io_mem + CE2600_PUB_GPIO_INT_MODE_RF);
++		virt_io_mem += 0x20;
++	}
++	return 0;
++}
++
++/* CE2600 gpio resume routine */
++int ce2600_gpio_resume(void *io_mem, unsigned short io_port)
++{
++	char *virt_io_mem = (char *)io_mem;
++  	int i;
++
++    /* Restore status of general purpose GPIO*/
++	intelce_gpio_mmio_write32(_gpio.mux_ctl, virt_io_mem + CE2600_PUB_GPIO_MUX_CTL);
++	intelce_gpio_mmio_write32(_gpio.group[0].polarity, virt_io_mem + CE2600_PUB_GPIO_POLARITY0);
++	intelce_gpio_mmio_write32(_gpio.group[1].polarity, virt_io_mem + CE2600_PUB_GPIO_POLARITY1);
++	intelce_gpio_mmio_write32(_gpio.group[2].polarity, virt_io_mem + CE2600_PUB_GPIO_POLARITY2);
++	intelce_gpio_mmio_write32(_gpio.group[3].polarity, virt_io_mem + CE2600_PUB_GPIO_POLARITY3);
++	intelce_gpio_mmio_write32(_gpio.int_router, virt_io_mem + CE2600_PUB_GPIO_INT_ROUTER);
++	for (i=0; i < 4; i++) {
++		intelce_gpio_mmio_write32(_gpio.group[i].output, virt_io_mem + CE2600_PUB_GPIO_OUT);
++		intelce_gpio_mmio_write32(_gpio.group[i].output_enable, virt_io_mem + CE2600_PUB_GPIO_OUT_EN);
++		intelce_gpio_mmio_write32(_gpio.group[i].int_enable, virt_io_mem + CE2600_PUB_GPIO_INT_EN);
++		intelce_gpio_mmio_write32(_gpio.group[i].mode_le, virt_io_mem + CE2600_PUB_GPIO_INT_MODE_LE);
++		intelce_gpio_mmio_write32(_gpio.group[i].mode_rf, virt_io_mem + CE2600_PUB_GPIO_INT_MODE_RF);
++		virt_io_mem += 0x20;
++
++	}
++
++    /* Restore status of Core Well GPIO*/
++	intelce_gpio_port_write32(_gpio.cgen & 0x3FF, io_port + CE2600_CORE_WELL_GPIO_CGEN);
++	intelce_gpio_port_write32(_gpio.cgio & 0x3FF, io_port + CE2600_CORE_WELL_GPIO_CGIO);
++	intelce_gpio_port_write32(_gpio.cglv & 0x3FF, io_port + CE2600_CORE_WELL_GPIO_CGLV);
++	intelce_gpio_port_write32(_gpio.cgtpe & 0x3FF, io_port + CE2600_CORE_WELL_GPIO_CGTPE);
++	intelce_gpio_port_write32(_gpio.cgtne & 0x3FF, io_port + CE2600_CORE_WELL_GPIO_CGTNE);
++	intelce_gpio_port_write32(_gpio.cggpe & 0x3FF, io_port + CE2600_CORE_WELL_GPIO_CGGPE);
++	intelce_gpio_port_write32(_gpio.cgsmi & 0x3FF, io_port + CE2600_CORE_WELL_GPIO_CGSMI);
++	return 0;
++}
++
++
+--- /dev/null
++++ b/drivers/gpio/ce2600-gpio.h
+@@ -0,0 +1,86 @@
++/*
++ *  GPIO interface for Intel SOC CE2600.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#ifndef _CE2600_GPIO_H
++#define _CE2600_GPIO_H
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "intelce-gpio.h"
++
++
++#define CE2600_PUB_GPIOS_PER_BANK        32
++#define CE2600_PUB_GPIO_BANKS            4
++
++#define CE2600_PUB_GPIO_BANK0_BASE		0x0
++#define CE2600_PUB_GPIO_BANK1_BASE		0x20
++#define CE2600_PUB_GPIO_BANK2_BASE		0x40
++#define CE2600_PUB_GPIO_BANK3_BASE		0x60
++
++#define CE2600_PUB_GPIO_OUT				0x00
++#define CE2600_PUB_GPIO_OUT_EN			0x04
++#define CE2600_PUB_GPIO_INPUT			0x08
++#define CE2600_PUB_GPIO_INT_STAT		0x0c
++
++#define CE2600_PUB_GPIO_INT_EN			0x10
++#define CE2600_PUB_GPIO_INT_MODE_LE		0x14
++#define CE2600_PUB_GPIO_INT_MODE_RF		0x18
++
++#define CE2600_PUB_GPIO_MUX_CTL			0x1c
++
++#define CE2600_PUB_GPIO_BANK0_HIGH_BASE		0x80
++#define CE2600_PUB_GPIO_BANK1_HIGH_BASE		0x90
++#define CE2600_PUB_GPIO_BANK2_HIGH_BASE		0xA0
++#define CE2600_PUB_GPIO_BANK3_HIGH_BASE		0xB0
++
++#define CE2600_PUB_GPIO_CLEAR       		0x00
++#define CE2600_PUB_GPIO_SET     		  	0x04
++
++
++#define CE2600_PUB_GPIO_POLARITY0	0x88
++#define CE2600_PUB_GPIO_POLARITY1	0x98
++#define CE2600_PUB_GPIO_POLARITY2	0xa8
++#define CE2600_PUB_GPIO_POLARITY3	0xb8
++
++#define CE2600_PUB_GPIO_INT_ROUTER  0xbc
++
++/* Core Well GPIO Group in North brige */
++/* Core Well GPIO[7:0] */
++#define CE2600_CORE_WELL_GPIO_CGEN		0x00
++#define CE2600_CORE_WELL_GPIO_CGIO		0x04
++#define CE2600_CORE_WELL_GPIO_CGLV		0x08
++#define CE2600_CORE_WELL_GPIO_CGTPE		0x0C
++#define CE2600_CORE_WELL_GPIO_CGTNE		0x10
++#define CE2600_CORE_WELL_GPIO_CGGPE		0x14
++#define CE2600_CORE_WELL_GPIO_CGSMI		0x18
++#define CE2600_CORE_WELL_GPIO_CGTS		0x1C
++
++
++void ce2600_gpio_set(struct gpio_chip *chip, unsigned offset, int value);
++int ce2600_gpio_direction_output(struct gpio_chip *chip, unsigned offset, int value);
++int ce2600_gpio_direction_input(struct gpio_chip *chip, unsigned offset);
++int ce2600_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num);
++int ce2600_get_multi_function(struct gpio_chip *chip, unsigned offset);
++int ce2600_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev);
++
++int ce2600_gpio_suspend(void *io_mem, unsigned short io_port);
++int ce2600_gpio_resume(void *io_mem, unsigned short io_port);
++
++#endif
+--- /dev/null
++++ b/drivers/gpio/ce4100-gpio.c
+@@ -0,0 +1,313 @@
++/*
++ *  GPIO interface for Intel SoC CE4100.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "ce4100-gpio.h"
++
++int ce4100_gpio_get(struct gpio_chip *chip, unsigned offset)
++{
++	void *reg_base = to_intelce_gpio_chip(chip)->reg_base;
++
++	return (intelce_gpio_mmio_read32(reg_base + CE4100_PUB_GPIO_INPUT) >> offset) & 0x1;
++}
++
++void ce4100_gpio_set(struct gpio_chip *chip, unsigned offset, int value)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->reg_base;
++	uint32_t orig;
++	unsigned long flags;
++
++	spin_lock_irqsave(&c->lock, flags);
++	orig = intelce_gpio_mmio_read32(reg_base + CE4100_PUB_GPIO_OUT);
++	if (value) {
++			orig |= (1 << offset);
++		} else {
++			orig &= ~(1 << offset);
++	}
++	intelce_gpio_mmio_write32(orig, reg_base + CE4100_PUB_GPIO_OUT);
++	spin_unlock_irqrestore(&c->lock, flags);
++
++}
++
++
++int ce4100_gpio_direction_input(struct gpio_chip *chip, unsigned offset)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->reg_base;
++	uint32_t orig;
++	unsigned long flags;
++
++	spin_lock_irqsave(&c->lock, flags);
++	orig = intelce_gpio_mmio_read32(reg_base + CE4100_PUB_GPIO_OUT_EN);
++	orig &= ~(1 << offset);
++	intelce_gpio_mmio_write32(orig, reg_base + CE4100_PUB_GPIO_OUT_EN);
++	spin_unlock_irqrestore(&c->lock, flags);
++	return 0;
++}
++
++int ce4100_gpio_direction_output(struct gpio_chip *chip, unsigned offset, int value)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->reg_base;
++	uint32_t orig;
++	unsigned long flags;
++
++	spin_lock_irqsave(&c->lock, flags);
++	orig = intelce_gpio_mmio_read32(reg_base + CE4100_PUB_GPIO_OUT);
++	if (value) {
++			orig |= (1 << offset);
++		} else {
++			orig &= ~(1 << offset);
++	}
++	intelce_gpio_mmio_write32(orig, reg_base + CE4100_PUB_GPIO_OUT);
++
++	orig = intelce_gpio_mmio_read32(reg_base + CE4100_PUB_GPIO_OUT_EN);
++	orig |= (1 << offset);
++	intelce_gpio_mmio_write32(orig, reg_base + CE4100_PUB_GPIO_OUT_EN);
++	spin_unlock_irqrestore(&c->lock, flags);
++	return 0;
++}
++
++int ce4100_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t orig;
++	unsigned long flags;
++	uint32_t gpio = chip->base + offset;
++	int bit_num = -1;
++	int ret = 0;
++
++	switch (gpio) {
++		case 0 ... 5:
++			bit_num = 0;
++			break;
++		case 6 ... 7:
++			bit_num = 1;
++			break;
++		case 8 ... 11:
++			bit_num = 2;
++			break;
++		case 15 ... 16:
++			bit_num = 3;
++			break;
++		case 17 ... 19:
++			bit_num = 4;
++			break;
++		case 20:
++			bit_num = 5;
++			break;
++		case 21:
++			bit_num = 6;
++			break;
++		default:
++			break;
++	}
++	if (-1 == bit_num) return -EINVAL;
++
++	spin_lock_irqsave(&c->lock, flags);
++	orig = intelce_gpio_mmio_read32(reg_base);
++	switch (fn_num) {
++		case 0:
++			intelce_gpio_mmio_write32(orig & ~(1 << bit_num), reg_base);
++			break;
++		case 1:
++			intelce_gpio_mmio_write32(orig | (1 << bit_num), reg_base);
++			break;
++		default:
++			ret = -EINVAL;
++			break;
++	}
++	spin_unlock_irqrestore(&c->lock, flags);
++	return ret;
++}
++
++int ce4100_get_multi_function(struct gpio_chip *chip, unsigned offset)
++{
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t gpio = chip->base + offset;
++	int bit_num = -1;
++
++	switch (gpio) {
++		case 0 ... 5:
++			bit_num = 0;
++			break;
++		case 6 ... 7:
++			bit_num = 1;
++			break;
++		case 8 ... 11:
++			bit_num = 2;
++			break;
++		case 15 ... 16:
++			bit_num = 3;
++			break;
++		case 17 ... 19:
++			bit_num = 4;
++			break;
++		case 20:
++			bit_num = 5;
++			break;
++		case 21:
++			bit_num = 6;
++			break;
++		default:
++			break;
++	}
++	if (-1 == bit_num) return -EINVAL;
++
++	return (intelce_gpio_mmio_read32(reg_base) >> bit_num) & 0x1;
++}
++
++int ce4100_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
++{
++	return to_intelce_gpio_chip(chip)->irq_base + offset;
++}
++
++static irqreturn_t ce4100_gpio_irq_handler(int irq, void *data)
++{
++	struct intelce_gpio_chip *c = data;
++	uint32_t irq_stat = intelce_gpio_mmio_read32(c->reg_base + CE4100_PUB_GPIO_INT_STAT);
++
++	irq_stat &= intelce_gpio_mmio_read32(c->reg_base + CE4100_PUB_GPIO_INT_EN);
++	if (!irq_stat)
++		return IRQ_NONE;
++
++	while (irq_stat) {
++		uint32_t irq_bit = __fls(irq_stat);
++
++		irq_stat &= ~BIT(irq_bit);
++		generic_handle_irq(c->irq_base + irq_bit);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static void ce4100_gpio_irq_mask(struct irq_data *data)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(data);
++	void *reg_base = c->reg_base;
++	uint32_t orig;
++
++	orig = intelce_gpio_mmio_read32(reg_base + CE4100_PUB_GPIO_INT_EN);
++	orig &= ~(1 << (data->irq - c->irq_base));
++	intelce_gpio_mmio_write32(orig, reg_base + CE4100_PUB_GPIO_INT_EN);
++}
++
++static void ce4100_gpio_irq_unmask(struct irq_data *data)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(data);
++	void *reg_base = c->reg_base;
++	uint32_t orig;
++
++	orig = intelce_gpio_mmio_read32(reg_base + CE4100_PUB_GPIO_INT_EN);
++	orig |= (1 << (data->irq - c->irq_base));
++	intelce_gpio_mmio_write32(orig, reg_base + CE4100_PUB_GPIO_INT_EN);
++}
++
++static void ce4100_gpio_irq_eoi(struct irq_data *data)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(data);
++	void *reg_base = c->reg_base;
++
++	intelce_gpio_mmio_write32(1 << (data->irq -c->irq_base), reg_base + CE4100_PUB_GPIO_INT_STAT);
++}
++
++static int ce4100_gpio_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(d);
++	void __iomem *type_reg;
++	uint32_t irq_offs = d->irq - c->irq_base;
++	uint32_t bit_offs;
++	uint32_t reg;
++
++	if (irq_offs > 12)
++		return -EINVAL;
++
++	if (irq_offs < 8)
++		type_reg = c->reg_base + CE4100_PUB_GPIO_INT_TYPE0;
++	else
++		type_reg = c->reg_base + CE4100_PUB_GPIO_INT_TYPE1;
++
++	bit_offs = 4 *(irq_offs % 8);
++	reg = intelce_gpio_mmio_read32(type_reg);
++
++	reg &= ~(0xF << bit_offs);
++
++	switch (type) {
++		case IRQ_TYPE_LEVEL_HIGH:
++			break;
++
++		case IRQ_TYPE_LEVEL_LOW:
++			reg |= (1 << bit_offs);
++			break;
++
++		default:
++			return -EINVAL;
++	}
++
++	intelce_gpio_mmio_write32(reg, type_reg);
++	return 0;
++}
++
++static struct irq_chip ce4100_irq_chip = {
++	.irq_mask = ce4100_gpio_irq_mask,
++	.irq_unmask = ce4100_gpio_irq_unmask,
++	.irq_eoi = ce4100_gpio_irq_eoi,
++	.irq_set_type = ce4100_gpio_irq_set_type,
++};
++
++int ce4100_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev)
++{
++	int i;
++	int irq;
++	int ret;
++
++	c->irq_base = irq_alloc_descs(-1, INTELCE_GPIO_IRQ_BASE, CE4100_PUB_GPIOS_PER_BANK, -1);
++	if (c->irq_base < 0)
++		return c->irq_base;
++
++	/* mask + ACK all interrupt sources */
++	intelce_gpio_mmio_write32(0, c->reg_base + CE4100_PUB_GPIO_INT_EN);
++	intelce_gpio_mmio_write32(0xFFF, c->reg_base + CE4100_PUB_GPIO_INT_STAT);
++
++	ret = request_irq(pdev->irq, ce4100_gpio_irq_handler, IRQF_SHARED, "ce4100_gpio", c);
++	if (ret)
++		goto out_free_desc;
++
++	/*
++	 * This gpio irq controller latches level irqs. Testing shows that if
++	 * we unmask & ACK the IRQ before the source of the interrupt is gone
++	 * then the interrupt is active again.
++	 */
++	irq = c->irq_base;
++	for (i=0; i < c->chip.ngpio; i++) {
++		irq_set_chip_and_handler_name(irq, &ce4100_irq_chip, handle_fasteoi_irq, "gpio_irq");
++		irq_set_chip_data(irq, c);
++		irq++;
++	}
++	return 0;
++
++out_free_desc:
++	irq_free_descs(c->irq_base, CE4100_PUB_GPIOS_PER_BANK);
++	return ret;
++}
+--- /dev/null
++++ b/drivers/gpio/ce4100-gpio.h
+@@ -0,0 +1,58 @@
++/*
++ *  GPIO interface for Intel SoC CE4100.
++ *
++ *  file : ce4100-gpio.h
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++#ifndef _CE4100_GPIO_H
++#define _CE4100_GPIO_H
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "intelce-gpio.h"
++
++
++#define CE4100_PUB_GPIO_OUT				0x00
++#define CE4100_PUB_GPIO_OUT_EN			0x04
++#define CE4100_PUB_GPIO_INPUT			0x08
++#define CE4100_PUB_GPIO_INT_STAT		0x0c
++
++#define CE4100_PUB_GPIO_INT_TYPE0		0x10
++#define CE4100_PUB_GPIO_INT_EN			0x14
++#define CE4100_PUB_GPIO_INT_TYPE1		0x18
++
++#define CE4100_PUB_GPIO_MUX_CTL			0x1c
++
++#define CE4100_PUB_GPIOS_PER_BANK        12
++#define CE4100_PUB_GPIO_BANKS            1
++
++
++int ce4100_gpio_get(struct gpio_chip *chip, unsigned offset);
++void ce4100_gpio_set(struct gpio_chip *chip, unsigned offset, int value);
++
++int ce4100_gpio_direction_input(struct gpio_chip *chip, unsigned offset);
++int ce4100_gpio_direction_output(struct gpio_chip *chip, unsigned offset, int value);
++
++int ce4100_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num);
++int ce4100_get_multi_function(struct gpio_chip *chip, unsigned offset);
++
++
++int ce4100_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev);
++int ce4100_gpio_to_irq(struct gpio_chip *chip, unsigned offset);
++
++#endif
+--- /dev/null
++++ b/drivers/gpio/ce4200-gpio.c
+@@ -0,0 +1,346 @@
++/*
++ *  GPIO interface for Intel CE4200.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "ce4200-gpio.h"
++#include "ce4100-gpio.h"
++
++int ce4200_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num)
++{
++    /*
++	 *      0 --- GBE_LINK /GPIO_AUX[21]  -> GPIO[0]
++	 *      1 --- Smart Card 0 / TSD_ICAM -> GPIO[1]
++	 *      2 --- Smart Card 1 / NAND_CE_N, NAND_RE_N -> GPIO[2]
++	 *      3 --- UART0_DSRB_I2S0_IN_BCK_GPIO_24 -> GPIO[3]
++	 *      4 --- UART0_DTRB_I2S0_IN_MCLK_GPIO_25 -> GPIO[4]
++	 *      5 --- UART0_DCDB_I2S1_IN_BCK_GPIO_26 -> GPIO[5]
++	 *      6 --- UART0_RIB_SPDIF_IN_GPIO_27 -> GPIO[6]
++	 *      7 --- UART0_RTSB_I2S1_IN_SDATA_3_GPIO_28 -> GPIO[7]
++	 *      8 --- UART0_CTSB_I2S1_IN_SDATA_2_GPIO_29 -> GPIO[8]
++	 *      9 --- UART1_RXD and UART1_TXD enable / UART1_RXD and UART1_TXD disable -> GPIO[9]
++	 */
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t orig;
++	unsigned long flags;
++	uint32_t gpio = chip->base + offset;
++	int bit_num = -1;
++	int ret = 0;
++
++	switch(gpio) {
++		case 0:
++			bit_num = 4;
++			break;
++		case 1:
++			bit_num = 3;
++			break;
++		case 2:
++			bit_num = 2;
++			break;
++		case 3 ... 8:
++			bit_num = 0;
++			break;
++		case 9:
++			bit_num = 1;
++			break;
++		default:
++			break;
++	}
++	if (-1 == bit_num) return -EINVAL;
++
++	spin_lock_irqsave(&c->lock, flags);
++	orig = intelce_gpio_mmio_read32(reg_base);
++	switch (fn_num) {
++		case 0:
++			intelce_gpio_mmio_write32(orig & ~(1 << bit_num), reg_base);
++			break;
++		case 1:
++			intelce_gpio_mmio_write32(orig | (1 << bit_num), reg_base);
++			break;
++		default:
++			ret = -EINVAL;
++			break;
++	}
++	spin_unlock_irqrestore(&c->lock, flags);
++	return ret;
++}
++
++int ce4200_get_multi_function(struct gpio_chip *chip, unsigned offset)
++{
++    /*
++	 *      0 --- GBE_LINK /GPIO_AUX[21]  -> GPIO[0]
++	 *      1 --- Smart Card 0 / TSD_ICAM -> GPIO[1]
++	 *      2 --- Smart Card 1 / NAND_CE_N, NAND_RE_N -> GPIO[2]
++	 *      3 --- UART0_DSRB_I2S0_IN_BCK_GPIO_24 -> GPIO[3]
++	 *      4 --- UART0_DTRB_I2S0_IN_MCLK_GPIO_25 -> GPIO[4]
++	 *      5 --- UART0_DCDB_I2S1_IN_BCK_GPIO_26 -> GPIO[5]
++	 *      6 --- UART0_RIB_SPDIF_IN_GPIO_27 -> GPIO[6]
++	 *      7 --- UART0_RTSB_I2S1_IN_SDATA_3_GPIO_28 -> GPIO[7]
++	 *      8 --- UART0_CTSB_I2S1_IN_SDATA_2_GPIO_29 -> GPIO[8]
++	 *      9 --- UART1_RXD and UART1_TXD enable / UART1_RXD and UART1_TXD disable -> GPIO[9]
++	 */
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t gpio = chip->base + offset;
++	int bit_num = -1;
++
++	switch(gpio) {
++		case 0:
++			bit_num = 4;
++			break;
++		case 1:
++			bit_num = 3;
++			break;
++		case 2:
++			bit_num = 2;
++		case 3 ... 8:
++			bit_num = 0;
++			break;
++		case 9:
++			bit_num = 1;
++			break;
++		default:
++			break;
++	}
++	if (-1 == bit_num) return -EINVAL;
++
++	return (intelce_gpio_mmio_read32(reg_base) >> bit_num) & 0x1;
++
++}
++
++
++irqreturn_t ce4200_gpio_irq_handler(int irq, void *data)
++{
++	struct intelce_gpio_chip *c = data;
++	u32 irq_stat = intelce_gpio_mmio_read32(c->reg_base + CE4200_PUB_GPIO_INT_STAT);
++
++	irq_stat &= intelce_gpio_mmio_read32(c->reg_base + CE4200_PUB_GPIO_INT_EN);
++	if (!irq_stat)
++		return IRQ_NONE;
++
++	while (irq_stat) {
++		u32 irq_bit = __fls(irq_stat);
++
++		irq_stat &= ~BIT(irq_bit);
++		//printk("interterrupt %d coming\n", c->irq_base + irq_bit);
++		generic_handle_irq(c->irq_base + irq_bit);
++	}
++
++	return IRQ_HANDLED;
++}
++void ce4200_gpio_irq_mask(struct irq_data *data)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(data);
++	void *reg_base = c->reg_base;
++	u32 orig;
++
++	orig = intelce_gpio_mmio_read32(reg_base + CE4200_PUB_GPIO_INT_EN);
++	orig &= ~(1 << (data->irq - c->irq_base));
++	intelce_gpio_mmio_write32(orig, reg_base + CE4200_PUB_GPIO_INT_EN);
++}
++
++void ce4200_gpio_irq_unmask(struct irq_data *data)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(data);
++	void *reg_base = c->reg_base;
++	u32 orig;
++
++	orig = intelce_gpio_mmio_read32(reg_base + CE4200_PUB_GPIO_INT_EN);
++	orig |= (1 << (data->irq - c->irq_base));
++	intelce_gpio_mmio_write32(orig, reg_base + CE4200_PUB_GPIO_INT_EN);
++}
++
++void ce4200_gpio_irq_eoi(struct irq_data *data)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(data);
++	void *reg_base = c->reg_base;
++
++	intelce_gpio_mmio_write32(1 << (data->irq -c->irq_base), reg_base + CE4200_PUB_GPIO_INT_STAT);
++}
++
++static int ce4200_gpio_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(d);
++	char *reg_base = c->reg_base;
++	uint32_t irq_offs = d->irq - c->irq_base;
++	uint32_t bit_offs;
++	uint32_t reg;
++	int ret = 0;
++
++	if ((c->chip.base >= CE4200_PUB_GPIO_BANK1_BASE) || (irq_offs > 4)) {
++		switch (type) {
++			case IRQ_TYPE_LEVEL_HIGH:
++				break;
++			default:
++				ret = -EINVAL;
++				break;
++		}
++		return ret;
++	}
++
++	reg = intelce_gpio_mmio_read32(reg_base + CE4200_PUB_GPIO_INT_TYPE0);
++
++	bit_offs = 4 *irq_offs;
++	reg &= ~(0xF << bit_offs);
++
++	switch (type) {
++	case IRQ_TYPE_LEVEL_HIGH:
++		reg |= (0x0 << bit_offs);
++		break;
++	case IRQ_TYPE_LEVEL_LOW:
++		reg |= (0x1 << bit_offs);
++		break;
++	case IRQ_TYPE_EDGE_RISING:
++		reg |= (0x2 << bit_offs);
++		break;
++	case IRQ_TYPE_EDGE_FALLING:
++		reg |= (0x3 << bit_offs);
++		break;
++	default:
++		return -EINVAL;
++	}
++	intelce_gpio_mmio_write32(reg, reg_base + CE4200_PUB_GPIO_INT_TYPE0);
++
++	return 0;
++}
++
++static struct irq_chip ce4200_irq_chip = {
++	.irq_mask = ce4200_gpio_irq_mask,
++	.irq_unmask = ce4200_gpio_irq_unmask,
++	.irq_eoi = ce4200_gpio_irq_eoi,
++	.irq_set_type = ce4200_gpio_irq_set_type,
++};
++
++int ce4200_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev)
++{
++	int i;
++	int irq;
++	int ret;
++
++	c->irq_base = irq_alloc_descs(-1, INTELCE_GPIO_IRQ_BASE, CE4200_PUB_GPIOS_PER_BANK, -1);
++	if (c->irq_base < 0)
++		return c->irq_base;
++
++	/* mask + ACK all interrupt sources */
++	intelce_gpio_mmio_write32(0, c->reg_base + CE4200_PUB_GPIO_INT_EN);
++	intelce_gpio_mmio_write32(0xFFF, c->reg_base + CE4200_PUB_GPIO_INT_STAT);
++
++	ret = request_irq(pdev->irq, ce4200_gpio_irq_handler, IRQF_SHARED, "ce4200_gpio", c);
++	if (ret)
++		goto out_free_desc;
++
++	/*
++	 * This gpio irq controller latches level irqs. Testing shows that if
++	 * we unmask & ACK the IRQ before the source of the interrupt is gone
++	 * then the interrupt is active again.
++	 */
++	irq = c->irq_base;
++	for (i=0; i < c->chip.ngpio; i++) {
++		irq_set_chip_and_handler_name(irq, &ce4200_irq_chip, handle_fasteoi_irq, "gpio_irq");
++		irq_set_chip_data(irq, c);
++		irq++;
++	}
++	return 0;
++
++out_free_desc:
++	irq_free_descs(c->irq_base, CE4200_PUB_GPIOS_PER_BANK);
++	return ret;
++}
++
++struct gpio_group {
++	uint32_t input;
++	uint32_t output;
++	uint32_t output_enable;
++	uint32_t int_status;
++	uint32_t int_enable;
++	uint32_t int_mode;
++};
++
++struct _gpio {
++	uint32_t cgen;
++	uint32_t cgio;
++	uint32_t cglv;
++	uint32_t cgtpe;
++	uint32_t cgtne;
++	uint32_t cggpe;
++	uint32_t cgsmi;
++	uint32_t cgts;
++
++struct gpio_group group[3];
++uint32_t gpio_mux_ctl;
++};
++
++static struct _gpio  _gpio;
++
++/*CE4200 gpio suspend routine */
++int ce4200_gpio_suspend(void *io_mem, unsigned short io_port)
++{
++	char *virt_io_mem = (char *)io_mem;
++  	int i;
++
++    /* keep status of Core Well GPIO */
++	_gpio.cgen = intelce_gpio_port_read32(io_port + CE4200_CORE_WELL_GPIO_CGEN);
++	_gpio.cgio = intelce_gpio_port_read32(io_port + CE4200_CORE_WELL_GPIO_CGIO);
++	_gpio.cglv = intelce_gpio_port_read32(io_port + CE4200_CORE_WELL_GPIO_CGLV);
++	_gpio.cgtpe = intelce_gpio_port_read32(io_port + CE4200_CORE_WELL_GPIO_CGTPE);
++	_gpio.cgtne = intelce_gpio_port_read32(io_port + CE4200_CORE_WELL_GPIO_CGTNE);
++	_gpio.cggpe = intelce_gpio_port_read32(io_port + CE4200_CORE_WELL_GPIO_CGGPE);
++	_gpio.cgsmi = intelce_gpio_port_read32(io_port + CE4200_CORE_WELL_GPIO_CGSMI);
++
++    /* keep status of general purpose GPIO */
++	_gpio.group[0].int_mode = intelce_gpio_mmio_read32(virt_io_mem + CE4200_PUB_GPIO_INT_TYPE0);
++	_gpio.gpio_mux_ctl = intelce_gpio_mmio_read32(virt_io_mem + CE4200_PUB_GPIO_MUX_CTL);
++	for (i=0; i < 3; i++) {
++		_gpio.group[i].output = intelce_gpio_mmio_read32(virt_io_mem + CE4200_PUB_GPIO_OUT);
++		_gpio.group[i].output_enable = intelce_gpio_mmio_read32(virt_io_mem + CE4200_PUB_GPIO_OUT_EN);
++		_gpio.group[i].int_enable = intelce_gpio_mmio_read32(virt_io_mem +CE4200_PUB_GPIO_INT_EN);
++		virt_io_mem += 0x20;
++	}
++	return 0;
++}
++
++/* CE4200 gpio resume routine */
++int ce4200_gpio_resume(void *io_mem, unsigned short io_port)
++{
++	char *virt_io_mem = (char *)io_mem;
++  	int i;
++
++    /* restore general purpose GPIO */
++	intelce_gpio_mmio_write32(_gpio.group[0].int_mode, virt_io_mem + CE4200_PUB_GPIO_INT_TYPE0);
++	intelce_gpio_mmio_write32(_gpio.gpio_mux_ctl, virt_io_mem + CE4200_PUB_GPIO_MUX_CTL);
++	for (i=0; i < 3; i++) {
++		intelce_gpio_mmio_write32(_gpio.group[i].output, virt_io_mem + CE4200_PUB_GPIO_OUT);
++		intelce_gpio_mmio_write32(_gpio.group[i].output_enable, virt_io_mem + CE4200_PUB_GPIO_OUT_EN);
++		intelce_gpio_mmio_write32(_gpio.group[i].int_enable, virt_io_mem + CE4200_PUB_GPIO_INT_EN);
++		virt_io_mem += 0x20;
++
++	}
++    /* restore Core Well GPIO */
++	intelce_gpio_port_write32(_gpio.cgen & 0x3FF, io_port + CE4200_CORE_WELL_GPIO_CGEN);
++	intelce_gpio_port_write32(_gpio.cgio & 0x3FF, io_port + CE4200_CORE_WELL_GPIO_CGIO);
++	intelce_gpio_port_write32(_gpio.cglv & 0x3FF, io_port + CE4200_CORE_WELL_GPIO_CGLV);
++	intelce_gpio_port_write32(_gpio.cgtpe & 0x3FF, io_port + CE4200_CORE_WELL_GPIO_CGTPE);
++	intelce_gpio_port_write32(_gpio.cgtne & 0x3FF, io_port + CE4200_CORE_WELL_GPIO_CGTNE);
++	intelce_gpio_port_write32(_gpio.cggpe & 0x3FF, io_port + CE4200_CORE_WELL_GPIO_CGGPE);
++	intelce_gpio_port_write32(_gpio.cgsmi & 0x3FF, io_port + CE4200_CORE_WELL_GPIO_CGSMI);
++	return 0;
++}
++
+--- /dev/null
++++ b/drivers/gpio/ce4200-gpio.h
+@@ -0,0 +1,69 @@
++/*
++ *  GPIO interface for Intel CE4200.
++ *
++ *  Copyright (c) 2010, 2011 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++#ifndef _CE4200_GPIO_H
++#define _CE4200_GPIO_H
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "intelce-gpio.h"
++
++#define CE4200_PUB_GPIOS_PER_BANK        32
++#define CE4200_PUB_GPIO_BANKS            3
++
++#define CE4200_PUB_GPIO_BANK0_BASE		0x0
++#define CE4200_PUB_GPIO_BANK1_BASE		0x20
++#define CE4200_PUB_GPIO_BANK2_BASE		0x40
++#define CE4200_PUB_GPIO_BANK3_BASE		0x60
++
++#define CE4200_PUB_GPIO_OUT				0x00
++#define CE4200_PUB_GPIO_OUT_EN			0x04
++#define CE4200_PUB_GPIO_INPUT			0x08
++#define CE4200_PUB_GPIO_INT_STAT		0x0c
++
++#define CE4200_PUB_GPIO_INT_EN			0x10
++
++#define CE4200_PUB_GPIO_INT_TYPE0		0x14
++
++#define CE4200_PUB_GPIO_MUX_CTL			0x18
++
++/* Core Well GPIO Group in North brige */
++/* Core Well GPIO[7:0] */
++#define CE4200_CORE_WELL_GPIO_CGEN		0x00
++#define CE4200_CORE_WELL_GPIO_CGIO		0x04
++#define CE4200_CORE_WELL_GPIO_CGLV		0x08
++#define CE4200_CORE_WELL_GPIO_CGTPE		0x0C
++#define CE4200_CORE_WELL_GPIO_CGTNE		0x10
++#define CE4200_CORE_WELL_GPIO_CGGPE		0x14
++#define CE4200_CORE_WELL_GPIO_CGSMI		0x18
++#define CE4200_CORE_WELL_GPIO_CGTS		0x1C
++
++int ce4200_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num);
++int ce4200_get_multi_function(struct gpio_chip *chip, unsigned offset);
++
++irqreturn_t ce4200_gpio_irq_handler(int irq, void *data);
++void ce4200_gpio_irq_mask(struct irq_data *data);
++void ce4200_gpio_irq_unmask(struct irq_data *data);
++void ce4200_gpio_irq_eoi(struct irq_data *data);
++
++int ce4200_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev);
++
++int ce4200_gpio_suspend(void *io_mem, unsigned short io_port);
++int ce4200_gpio_resume(void *io_mem, unsigned short io_port);
++#endif
+--- /dev/null
++++ b/drivers/gpio/ce5300-gpio.c
+@@ -0,0 +1,414 @@
++/*
++ *  GPIO interface for Intel SoC CE5300.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "ce5300-gpio.h"
++#include "ce4200-gpio.h"
++
++int ce5300_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num)
++{
++    /*
++	 *       0 --- UART1_TXD_GPIO_64 enable [1] /disable [0]
++	 *       1 --- UART2_TXD_GPIO_66 enable [1] /disable [0]
++	 *       2 --- Smart Card 1 [1] / GPIO [0]
++	 *       3 --- Smart Card 0 [1] / GPIO [0]
++	 *       4 --- GBE_LINK [1] / GPIO95 [0]
++	 *       5-7 --- Reserved
++	 *       8 --- Select Internal video sync 0 as trigger input [1] / Select a GPIO as trigger input
++	 *       9 --- Select Internal video sync 0 as trigger input [1] / Select a GPIO as trigger input
++	 *       10 --- Select Internal video sync 1 as trigger input [1] / Select a GPIO as trigger input
++	 *       11 --- Select Internal video sync 1 as trigger input [1] / Select a GPIO as trigger input
++	 *       12 --- GPIO 77 supplies the trigger input [1] / GPIO 38 supplies the trigger input [0]
++	 *       13 --- GPIO 78 supplies the trigger input [1] / GPIO 37 supplies the trigger input [0]
++	 *       14 --- GPIO 79 supplies the trigger input [1] / GPIO 36 supplies the trigger input [0]
++	 *       15 --- GPIO 80 supplies the trigger input [1] / GPIO 35 supplies the trigger input [0]
++	 *
++	 */
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t orig;
++	uint32_t gpio = chip->base + offset;
++	unsigned long flags;
++	int bit_num = -1;
++	int ret = 0;
++
++	switch (gpio) {
++		case 64:
++			bit_num = 0;
++			break;
++		case 66:
++			bit_num = 1;
++			break;
++		case 58 ... 63:
++			bit_num = 2;
++			break;
++		case 33 ... 34:
++		case 99 ... 102:
++			bit_num = 3;
++			break;
++		case 95:
++			bit_num = 4;
++			break;
++		case 38:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32(orig & ~((1<<8)|(1<<12)), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<8), reg_base);
++			}else {
++				ret = -EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		case 77:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32((orig & ~(1<<8)) | (1<<12), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<8), reg_base);
++			} else {
++				ret = -EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		case 37:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32(orig & ~((1<<9)|(1<<13)), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<9), reg_base);
++			} else {
++				ret = -EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		case 78:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32((orig & ~(1<<9)) | (1<<13), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<9), reg_base);
++			} else {
++				ret = -EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		case 36:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32(orig & ~((1<<10)|(1<<14)), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<10), reg_base);
++			} else {
++				ret =-EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		case 79:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32((orig & ~(1<<10)) | (1<<14), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<10), reg_base);
++			} else {
++				ret = -EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		case 35:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32(orig & ~((1<<11)|(1<<15)), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<11), reg_base);
++			} else {
++				ret = -EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		case 80:
++			spin_lock_irqsave(&c->lock, flags);
++			orig = intelce_gpio_mmio_read32(reg_base);
++			if (1 == fn_num) {
++				intelce_gpio_mmio_write32((orig & ~(1<<11)) | (1<<15), reg_base);
++			} else if (0 == fn_num) {
++				intelce_gpio_mmio_write32(orig | (1<<11), reg_base);
++			} else {
++				ret = -EINVAL;
++			}
++			spin_unlock_irqrestore(&c->lock, flags);
++			return ret;
++		default:
++			break;
++	}
++
++	if (-1 == bit_num) return -EINVAL;
++
++	spin_lock_irqsave(&c->lock, flags);
++	orig = intelce_gpio_mmio_read32(reg_base);
++	switch (fn_num) {
++		case 0:
++			intelce_gpio_mmio_write32(orig & ~(1 << bit_num), reg_base);
++			break;
++		case 1:
++			intelce_gpio_mmio_write32(orig | (1 << bit_num), reg_base);
++			break;
++		default:
++			ret = -EINVAL;
++			break;
++	}
++	spin_unlock_irqrestore(&c->lock, flags);
++	return ret;
++}
++
++int ce5300_get_multi_function(struct gpio_chip *chip, unsigned offset)
++{
++    /*
++	 *       0 --- UART1_TXD_GPIO_64 enable [1] /disable [0]
++	 *       1 --- UART2_TXD_GPIO_66 enable [1] /disable [0]
++	 *       2 --- Smart Card 1 [1] / GPIO [0]
++	 *       3 --- Smart Card 0 [1] / GPIO [0]
++	 *       4 --- GBE_LINK [1] / GPIO95 [0]
++	 *       5-7 --- Reserved
++	 *       8 --- Select Internal video sync 0 as trigger input [1] / Select a GPIO as trigger input
++	 *       9 --- Select Internal video sync 0 as trigger input [1] / Select a GPIO as trigger input
++	 *       10 --- Select Internal video sync 1 as trigger input [1] / Select a GPIO as trigger input
++	 *       11 --- Select Internal video sync 1 as trigger input [1] / Select a GPIO as trigger input
++	 *       12 --- GPIO 77 supplies the trigger input [1] / GPIO 38 supplies the trigger input [0]
++	 *       13 --- GPIO 78 supplies the trigger input [1] / GPIO 37 supplies the trigger input [0]
++	 *       14 --- GPIO 79 supplies the trigger input [1] / GPIO 36 supplies the trigger input [0]
++	 *       15 --- GPIO 80 supplies the trigger input [1] / GPIO 35 supplies the trigger input [0]
++	 *
++	 */
++	struct intelce_gpio_chip *c = to_intelce_gpio_chip(chip);
++	void *reg_base = c->mux_ctl_base;
++	uint32_t gpio = chip->base + offset;
++	int bit_num = -1;
++
++	switch (gpio) {
++		case 64:
++			bit_num = 0;
++			break;
++		case 66:
++			bit_num = 1;
++			break;
++		case 58 ... 63:
++			bit_num = 2;
++			break;
++		case 33 ... 34:
++		case 99 ... 102:
++			bit_num = 3;
++			break;
++		case 95:
++			bit_num = 4;
++			break;
++		case 35 ... 38:
++		case 77 ... 80:
++			bit_num = 5;
++		default:
++			break;
++	}
++	if (-1 == bit_num) return -EINVAL;
++
++	return (intelce_gpio_mmio_read32(reg_base) >> bit_num) & 0x1;
++
++}
++
++
++static int ce5300_gpio_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	struct intelce_gpio_chip *c = irq_data_get_irq_chip_data(d);
++	void __iomem *mode_le_reg, *mode_rf_reg;
++	uint32_t irq_offs = d->irq - c->irq_base;
++	uint32_t reg1, reg2;
++
++	if (irq_offs > 32)
++		return -EINVAL;
++
++	mode_le_reg = c->reg_base + CE5300_PUB_GPIO_INT_MODE_LE;
++	mode_rf_reg = c->reg_base + CE5300_PUB_GPIO_INT_MODE_RF;
++
++	reg1 = intelce_gpio_mmio_read32(mode_le_reg);
++	reg2 = intelce_gpio_mmio_read32(mode_rf_reg);
++
++	switch (type) {
++	case IRQ_TYPE_EDGE_RISING:
++		reg1 |= BIT(irq_offs);
++		reg2 &= ~BIT(irq_offs);
++		break;
++
++	case IRQ_TYPE_EDGE_FALLING:
++		reg1 |= BIT(irq_offs);
++		reg2 |= BIT(irq_offs);
++		break;
++
++	case IRQ_TYPE_LEVEL_HIGH:
++		reg1 &= ~BIT(irq_offs);
++		reg2 &= ~BIT(irq_offs);
++		break;
++
++	case IRQ_TYPE_LEVEL_LOW:
++		reg1 &= ~BIT(irq_offs);
++		reg2 |= BIT(irq_offs);
++		break;
++
++	default:
++		return -EINVAL;
++	}
++	intelce_gpio_mmio_write32(reg1, mode_le_reg);
++	intelce_gpio_mmio_write32(reg2, mode_rf_reg);
++	return 0;
++}
++
++static struct irq_chip ce5300_irq_chip = {
++	.irq_mask = ce4200_gpio_irq_mask,
++	.irq_unmask = ce4200_gpio_irq_unmask,
++	.irq_eoi = ce4200_gpio_irq_eoi,
++	.irq_set_type = ce5300_gpio_irq_set_type,
++};
++
++int ce5300_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev)
++{
++	int i;
++	int irq;
++	int ret;
++
++	c->irq_base = irq_alloc_descs(-1, INTELCE_GPIO_IRQ_BASE, CE5300_PUB_GPIOS_PER_BANK, -1);
++	if (c->irq_base < 0)
++		return c->irq_base;
++
++	/* mask + ACK all interrupt sources */
++	intelce_gpio_mmio_write32(0, c->reg_base + CE5300_PUB_GPIO_INT_EN);
++	intelce_gpio_mmio_write32(0xFFFFFFFF, c->reg_base + CE5300_PUB_GPIO_INT_STAT);
++
++	ret = request_irq(pdev->irq, ce4200_gpio_irq_handler, IRQF_SHARED, "ce5300_gpio", c);
++	if (ret)
++		goto out_free_desc;
++
++	/*
++	 * This gpio irq controller latches level irqs. Testing shows that if
++	 * we unmask & ACK the IRQ before the source of the interrupt is gone
++	 * then the interrupt is active again.
++	 */
++	irq = c->irq_base;
++	for (i=0; i < c->chip.ngpio; i++) {
++		irq_set_chip_and_handler_name(irq, &ce5300_irq_chip, handle_fasteoi_irq, "gpio_irq");
++		irq_set_chip_data(irq, c);
++		irq++;
++	}
++	return 0;
++
++out_free_desc:
++	irq_free_descs(c->irq_base, CE5300_PUB_GPIOS_PER_BANK);
++	return ret;
++}
++
++struct gpio_group {
++	uint32_t input;
++	uint32_t output;
++	uint32_t output_enable;
++	uint32_t int_status;
++	uint32_t int_enable;
++	uint32_t mode_le;
++    uint32_t mode_rf;
++};
++
++struct _gpio {
++	uint32_t cgen;
++	uint32_t cgio;
++	uint32_t cglv;
++	uint32_t cgtpe;
++	uint32_t cgtne;
++	uint32_t cggpe;
++	uint32_t cgsmi;
++	uint32_t cgts;
++
++	struct gpio_group group[4];
++	uint32_t gpio_mux_ctl;
++};
++
++static struct _gpio  _gpio;
++
++/*CE5300 gpio suspend routine */
++int ce5300_gpio_suspend(void *io_mem, unsigned short io_port)
++{
++	char *virt_io_mem = (char *)io_mem;
++  	int i;
++
++    /* Keep status of Core Well GPIO*/
++	_gpio.cgen = intelce_gpio_port_read32(io_port + CE5300_CORE_WELL_GPIO_CGEN);
++	_gpio.cgio = intelce_gpio_port_read32(io_port + CE5300_CORE_WELL_GPIO_CGIO);
++	_gpio.cglv = intelce_gpio_port_read32(io_port + CE5300_CORE_WELL_GPIO_CGLV);
++	_gpio.cgtpe = intelce_gpio_port_read32(io_port + CE5300_CORE_WELL_GPIO_CGTPE);
++	_gpio.cgtne = intelce_gpio_port_read32(io_port + CE5300_CORE_WELL_GPIO_CGTNE);
++	_gpio.cggpe = intelce_gpio_port_read32(io_port + CE5300_CORE_WELL_GPIO_CGGPE);
++	_gpio.cgsmi = intelce_gpio_port_read32(io_port + CE5300_CORE_WELL_GPIO_CGSMI);
++
++    /* Keep status of general purpose GPIO*/
++	_gpio.gpio_mux_ctl = intelce_gpio_mmio_read32(virt_io_mem + CE5300_PUB_GPIO_MUX_CTL);
++	for (i=0; i < 4; i++) {
++		_gpio.group[i].output = intelce_gpio_mmio_read32(virt_io_mem + CE5300_PUB_GPIO_OUT);
++		_gpio.group[i].output_enable = intelce_gpio_mmio_read32(virt_io_mem + CE5300_PUB_GPIO_OUT_EN);
++		_gpio.group[i].int_enable = intelce_gpio_mmio_read32(virt_io_mem + CE5300_PUB_GPIO_INT_EN);
++		_gpio.group[i].mode_le = intelce_gpio_mmio_read32(virt_io_mem + CE5300_PUB_GPIO_INT_MODE_LE);
++		_gpio.group[i].mode_rf = intelce_gpio_mmio_read32(virt_io_mem + CE5300_PUB_GPIO_INT_MODE_RF);
++		virt_io_mem += 0x20;
++	}
++	return 0;
++}
++
++
++/* CE5300 gpio resume routine */
++int ce5300_gpio_resume(void *io_mem, unsigned short io_port)
++{
++	char *virt_io_mem = (char *)io_mem;
++  	int i;
++
++    /* Restore status of general purpose GPIO*/
++	intelce_gpio_mmio_write32( _gpio.gpio_mux_ctl, virt_io_mem + CE5300_PUB_GPIO_MUX_CTL);
++	for (i=0; i < 4; i++) {
++		intelce_gpio_mmio_write32(_gpio.group[i].output, virt_io_mem + CE5300_PUB_GPIO_OUT);
++		intelce_gpio_mmio_write32(_gpio.group[i].output_enable, virt_io_mem + CE5300_PUB_GPIO_OUT_EN);
++		intelce_gpio_mmio_write32(_gpio.group[i].int_enable, virt_io_mem + CE5300_PUB_GPIO_INT_EN);
++		intelce_gpio_mmio_write32(_gpio.group[i].mode_le, virt_io_mem +CE5300_PUB_GPIO_INT_MODE_LE);
++		intelce_gpio_mmio_write32(_gpio.group[i].mode_rf, virt_io_mem + CE5300_PUB_GPIO_INT_MODE_RF);
++		virt_io_mem += 0x20;
++
++	}
++
++    /* Restore status of Core Well GPIO*/
++	intelce_gpio_port_write32(_gpio.cgen & 0x3FF, io_port + CE5300_CORE_WELL_GPIO_CGEN);
++	intelce_gpio_port_write32(_gpio.cgio & 0x3FF, io_port + CE5300_CORE_WELL_GPIO_CGIO);
++	intelce_gpio_port_write32(_gpio.cgtpe & 0x3FF, io_port + CE5300_CORE_WELL_GPIO_CGLV);
++	intelce_gpio_port_write32(_gpio.cgtpe & 0x3FF, io_port + CE5300_CORE_WELL_GPIO_CGTPE);
++	intelce_gpio_port_write32(_gpio.cgtne & 0x3FF, io_port + CE5300_CORE_WELL_GPIO_CGTNE);
++	intelce_gpio_port_write32(_gpio.cggpe & 0x3FF, io_port + CE5300_CORE_WELL_GPIO_CGGPE);
++	intelce_gpio_port_write32( _gpio.cgsmi & 0x3FF, io_port + CE5300_CORE_WELL_GPIO_CGSMI);
++	return 0;
++}
++
+--- /dev/null
++++ b/drivers/gpio/ce5300-gpio.h
+@@ -0,0 +1,66 @@
++/*
++ *  GPIO interface for Intel SoC CE5300.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++#ifndef _CE5300_GPIO_H
++#define _CE5300_GPIO_H
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "intelce-gpio.h"
++
++#define CE5300_PUB_GPIOS_PER_BANK        32
++#define CE5300_PUB_GPIO_BANKS            4
++
++#define CE5300_PUB_GPIO_BANK0_BASE		0x0
++#define CE5300_PUB_GPIO_BANK1_BASE		0x20
++#define CE5300_PUB_GPIO_BANK2_BASE		0x40
++#define CE5300_PUB_GPIO_BANK3_BASE		0x60
++
++#define CE5300_PUB_GPIO_OUT				0x00
++#define CE5300_PUB_GPIO_OUT_EN			0x04
++#define CE5300_PUB_GPIO_INPUT			0x08
++#define CE5300_PUB_GPIO_INT_STAT		0x0c
++
++#define CE5300_PUB_GPIO_INT_EN	 0x10
++#define CE5300_PUB_GPIO_INT_MODE_LE	0x14
++#define CE5300_PUB_GPIO_INT_MODE_RF	0x18
++
++
++#define CE5300_PUB_GPIO_MUX_CTL	0x1c
++
++/* Core Well GPIO Group in North brige */
++/* Core Well GPIO[7:0] */
++#define CE5300_CORE_WELL_GPIO_CGEN		0x00
++#define CE5300_CORE_WELL_GPIO_CGIO		0x04
++#define CE5300_CORE_WELL_GPIO_CGLV		0x08
++#define CE5300_CORE_WELL_GPIO_CGTPE		0x0C
++#define CE5300_CORE_WELL_GPIO_CGTNE		0x10
++#define CE5300_CORE_WELL_GPIO_CGGPE		0x14
++#define CE5300_CORE_WELL_GPIO_CGSMI		0x18
++#define CE5300_CORE_WELL_GPIO_CGTS		0x1C
++
++
++int ce5300_set_multi_function(struct gpio_chip *chip, unsigned offset,  int fn_num);
++int ce5300_get_multi_function(struct gpio_chip *chip, unsigned offset);
++int ce5300_gpio_irq_setup(struct intelce_gpio_chip *c, struct pci_dev *pdev);
++
++int ce5300_gpio_suspend(void *io_mem, unsigned short io_port);
++int ce5300_gpio_resume(void *io_mem, unsigned short io_port);
++
++#endif
+--- a/drivers/gpio/gpio-sch.c
++++ b/drivers/gpio/gpio-sch.c
+@@ -109,6 +109,9 @@ static int sch_gpio_core_direction_out(s
+ 		outb(curr_dirs & ~(1 << bit), gpio_ba + offset);
+ 
+ 	spin_unlock(&gpio_lock);
++#ifdef CONFIG_ARCH_GEN3
++        sch_gpio_core_set(gc, gpio_num, val);
++#endif
+ 	return 0;
+ }
+ 
+@@ -206,6 +209,7 @@ static int sch_gpio_probe(struct platfor
+ {
+ 	struct resource *res;
+ 	int err, id;
++	int gpio_base = 0;
+ 
+ 	id = pdev->id;
+ 	if (!id)
+@@ -219,12 +223,15 @@ static int sch_gpio_probe(struct platfor
+ 		return -EBUSY;
+ 
+ 	gpio_ba = res->start;
+-
++#ifdef CONFIG_ARCH_GEN3
++        res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
++        gpio_base = res->start;
++#endif
+ 	switch (id) {
+ 	case PCI_DEVICE_ID_INTEL_SCH_LPC:
+-		sch_gpio_core.base = 0;
++		sch_gpio_core.base = gpio_base;
+ 		sch_gpio_core.ngpio = 10;
+-		sch_gpio_resume.base = 10;
++		sch_gpio_resume.base = gpio_base + 10;
+ 		sch_gpio_resume.ngpio = 4;
+ 		/*
+ 		 * GPIO[6:0] enabled by default
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -512,6 +512,56 @@ found:
+ }
+ 
+ static DEVICE_ATTR(edge, 0644, gpio_edge_show, gpio_edge_store);
++#ifdef CONFIG_ARCH_GEN3
++static ssize_t gpio_multi_show(struct device *dev,
++                struct device_attribute *attr, char *buf)
++{
++        const struct gpio_desc  *desc = dev_get_drvdata(dev);
++        unsigned                gpio = desc - gpio_desc;
++        ssize_t                 status;
++
++        mutex_lock(&sysfs_lock);
++
++        if (!test_bit(FLAG_EXPORT, &desc->flags)) {
++                status = -EIO;
++        } else {
++                int value;
++
++                value = gpio_get_multi_function(gpio);
++                status = sprintf(buf, "%d\n", value);
++        }
++
++        mutex_unlock(&sysfs_lock);
++        return status;
++}
++
++static ssize_t gpio_multi_store(struct device *dev,
++                struct device_attribute *attr, const char *buf, size_t size)
++{
++        const struct gpio_desc  *desc = dev_get_drvdata(dev);
++        unsigned                gpio = desc - gpio_desc;
++        ssize_t                 status;
++
++        mutex_lock(&sysfs_lock);
++
++        if (!test_bit(FLAG_EXPORT, &desc->flags))
++                status = -EIO;
++        else {
++                long            value;
++
++                status = strict_strtol(buf, 0, &value);
++                if (status == 0) {
++                        gpio_set_multi_function(gpio, value);
++                        status = size;
++                }
++        }
++
++        mutex_unlock(&sysfs_lock);
++        return status;
++}
++
++static const DEVICE_ATTR(multi, 0644, gpio_multi_show, gpio_multi_store);
++#endif
+ 
+ static int sysfs_set_active_low(struct gpio_desc *desc, struct device *dev,
+ 				int value)
+@@ -816,6 +866,13 @@ static int gpiod_export(struct gpio_desc
+ 		if (status)
+ 			goto fail_remove_attr_direction;
+ 	}
++#ifdef CONFIG_ARCH_GEN3                 
++	if (!status && (gpio_get_multi_function(desc_to_gpio(desc)) >= 0)) {
++		status = device_create_file(dev, &dev_attr_multi);
++                if (status)
++                        goto fail_unregister_device;
++	}
++#endif
+ 
+ 	set_bit(FLAG_EXPORT, &desc->flags);
+ 	mutex_unlock(&sysfs_lock);
+@@ -2076,6 +2133,78 @@ void gpio_set_value_cansleep(unsigned gp
+ }
+ EXPORT_SYMBOL_GPL(gpio_set_value_cansleep);
+ 
++#ifdef CONFIG_ARCH_GEN3
++/*  Some gpio pin supports multi function usage, the following two functions are used to configure 
++ *  GPIO mux register.
++ */
++
++int gpio_get_multi_function(unsigned gpio)
++{
++        struct gpio_chip        *chip;
++
++        chip = gpio_to_chip(0);
++        return chip->get_multi_function ? chip->get_multi_function(chip, gpio) : -1;
++}
++EXPORT_SYMBOL_GPL(gpio_get_multi_function);
++
++int gpio_set_multi_function(unsigned gpio, int value)
++{
++        struct gpio_chip        *chip;
++
++        chip = gpio_to_chip(0);
++        return chip->set_multi_function ? chip->set_multi_function(chip, gpio, value) : -1;
++}
++EXPORT_SYMBOL_GPL(gpio_set_multi_function);
++
++struct gpio_irq_internal{
++  unsigned int gpio;
++  unsigned int irq;
++  void (*handler)(void *data);
++  void *data;
++ };
++
++static irqreturn_t gpio_shim_irq_handler(int irq, void *data)
++{
++        struct gpio_irq_internal *internal = (struct gpio_irq_internal *)data;
++        internal->handler(internal->data);
++        return IRQ_HANDLED;
++}
++
++gpio_irq_handle  gpio_request_irq(unsigned gpio, void (*func)(void *data), unsigned long flags, const char *name, void *data)
++{
++        unsigned int irq;
++        struct gpio_irq_internal *internal;
++
++        internal = kzalloc(sizeof(*internal), GFP_KERNEL);
++        if (NULL == internal)
++                return NULL;
++        irq = gpio_to_irq(gpio);
++        internal->gpio = gpio;
++        internal->irq = irq;
++        internal->handler = func;
++        internal->data = data;
++
++        if (request_irq(irq, gpio_shim_irq_handler, flags, name, internal)) {
++                memset(internal, 0, sizeof(*internal));
++                kfree(internal);
++                return NULL;
++        }
++        return (gpio_irq_handle)internal;
++}
++EXPORT_SYMBOL_GPL(gpio_request_irq);
++
++int gpio_free_irq(gpio_irq_handle handle, void *data)
++{
++        struct gpio_irq_internal *internal = (struct gpio_irq_internal *)handle;
++
++        free_irq(internal->irq, internal);
++        memset(internal, 0, sizeof(*internal));
++        kfree(internal);
++        return 0;
++}
++EXPORT_SYMBOL_GPL(gpio_free_irq);
++#endif
++
+ #ifdef CONFIG_DEBUG_FS
+ 
+ static void gpiolib_dbg_show(struct seq_file *s, struct gpio_chip *chip)
+--- /dev/null
++++ b/drivers/gpio/intelce-gpio.c
+@@ -0,0 +1,335 @@
++/*
++ *  GPIO interface for Intel CE SoCs.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++#include "intelce-gpio.h"
++#include "ce4100-gpio.h"
++#include "ce4200-gpio.h"
++#include "ce5300-gpio.h"
++#include "ce2600-gpio.h"
++
++static int banks, gpios_per_bank;
++static char *label[CE5300_PUB_GPIO_BANKS] = {
++	"gpio_bank0",
++	"gpio_bank1",
++	"gpio_bank2",
++	"gpio_bank3",
++};
++
++static struct resource sch_gpio_resource[] = {
++	[0] = {
++		.start = 1048,
++		.end   = 1048 + 64 - 1,
++		.flags = IORESOURCE_IO,
++	},
++	[1] = {
++		.start = 0,
++		.end   = 0,
++		.flags = IORESOURCE_IRQ,
++	},
++};
++static struct platform_device sch_device_gpio = {
++	.name		  = "sch_gpio",
++	.id		  = PCI_DEVICE_ID_INTEL_SCH_LPC,
++	.num_resources	  = ARRAY_SIZE(sch_gpio_resource),
++	.resource	  = sch_gpio_resource,
++};
++
++static uint16_t  legacy_iobase = 1048;
++static int sch_gpio_setup(struct pci_dev *pdev, int gpio_base)
++{
++    struct pci_dev *lpc;
++
++	sch_device_gpio.dev.parent = get_device(&pdev->dev);
++
++    lpc = pci_get_bus_and_slot(0,PCI_DEVFN(31, 0));
++    if (NULL == lpc) {
++       printk(KERN_ERR "Can't detect the  LPC PCI device!!");
++       return -ENODEV;
++    }
++    pci_read_config_word(lpc, 0x44, &legacy_iobase);
++    pci_dev_put(lpc);
++	legacy_iobase &= ~(64 - 1);
++	sch_gpio_resource[0].start = legacy_iobase;
++	sch_gpio_resource[0].end = legacy_iobase + 64 - 1;
++	sch_gpio_resource[1].start = gpio_base;
++	sch_gpio_resource[1].end = gpio_base;
++
++	return platform_device_register(&sch_device_gpio);
++}
++
++static int (*intelce_gpio_suspend)(void *io_mem, unsigned short io_port);
++static int (*intelce_gpio_resume)(void *io_mem, unsigned short io_port);
++
++static int intelce_gpio_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
++{
++	struct intelce_gpio_chip *c, *p;
++	unsigned long paddr;
++	void *vaddr;
++	int i;
++	unsigned int id;
++	int gpio_base = 0;
++	int mux_ctl_offset = CE4100_PUB_GPIO_MUX_CTL;
++	int (*gpio_set_multi_function)(struct gpio_chip *chip, unsigned offset, int fn_num);
++	int (*gpio_get_multi_function)(struct gpio_chip *chip, unsigned offset);
++	void (*gpio_set)(struct gpio_chip *chip, unsigned offset, int value);
++	int (*gpio_direction_output)(struct gpio_chip *chip, unsigned offset, int value);
++	int (*gpio_direction_input)(struct gpio_chip *chip, unsigned offset);
++	int (*gpio_irq_setup)(struct intelce_gpio_chip *c, struct pci_dev *pdev);
++	int ret;
++
++
++	intelce_get_soc_info(&id, NULL);
++	switch(id) {
++		case CE4100_SOC_DEVICE_ID:
++			banks = CE4100_PUB_GPIO_BANKS;
++			gpios_per_bank = CE4100_PUB_GPIOS_PER_BANK;
++			mux_ctl_offset = CE4100_PUB_GPIO_MUX_CTL;
++			gpio_set_multi_function = ce4100_set_multi_function;
++			gpio_get_multi_function = ce4100_get_multi_function;
++			gpio_set = ce4100_gpio_set;
++			gpio_direction_output = ce4100_gpio_direction_output;
++			gpio_direction_input = ce4100_gpio_direction_input;
++			gpio_irq_setup = ce4100_gpio_irq_setup;
++			dev_info(&pdev->dev, "CE4100 GPIO controller detected.\n");
++			break;
++		case CE4200_SOC_DEVICE_ID:
++			banks = CE4200_PUB_GPIO_BANKS;
++			gpios_per_bank = CE4200_PUB_GPIOS_PER_BANK;
++			mux_ctl_offset = CE4200_PUB_GPIO_MUX_CTL;
++			gpio_set_multi_function = ce4200_set_multi_function;
++			gpio_get_multi_function = ce4200_get_multi_function;
++			gpio_set = ce4100_gpio_set;
++			gpio_direction_output = ce4100_gpio_direction_output;
++			gpio_direction_input = ce4100_gpio_direction_input;
++			gpio_irq_setup = ce4200_gpio_irq_setup;
++			intelce_gpio_suspend = ce4200_gpio_suspend;
++			intelce_gpio_resume =ce4200_gpio_resume;
++			dev_info(&pdev->dev, "CE4200 GPIO controller detected.\n");
++			break;
++		case CE5300_SOC_DEVICE_ID:
++			banks = CE5300_PUB_GPIO_BANKS;
++			gpios_per_bank = CE5300_PUB_GPIOS_PER_BANK;
++			mux_ctl_offset = CE5300_PUB_GPIO_MUX_CTL;
++			gpio_set_multi_function = ce5300_set_multi_function;
++			gpio_get_multi_function = ce5300_get_multi_function;
++			gpio_set = ce4100_gpio_set;
++			gpio_direction_output = ce4100_gpio_direction_output;
++			gpio_direction_input = ce4100_gpio_direction_input;
++			gpio_irq_setup = ce5300_gpio_irq_setup;
++			intelce_gpio_suspend = ce5300_gpio_suspend;
++			intelce_gpio_resume =ce5300_gpio_resume;
++			dev_info(&pdev->dev, "CE5300 GPIO controller detected.\n");
++			break;
++		case CE2600_SOC_DEVICE_ID:
++			banks = CE2600_PUB_GPIO_BANKS;
++			gpios_per_bank = CE2600_PUB_GPIOS_PER_BANK;
++			mux_ctl_offset = CE2600_PUB_GPIO_MUX_CTL;
++			gpio_set_multi_function = ce2600_set_multi_function;
++			gpio_get_multi_function = ce2600_get_multi_function;
++			gpio_set = ce2600_gpio_set;
++			gpio_direction_output = ce2600_gpio_direction_output;
++			gpio_direction_input = ce2600_gpio_direction_input;
++			gpio_irq_setup = ce2600_gpio_irq_setup;
++			intelce_gpio_suspend = NULL;
++			intelce_gpio_resume = NULL;
++			dev_info(&pdev->dev, "CE2600 GPIO controller detected.\n");
++			break;
++		default:
++		dev_err(&pdev->dev, "Does not support the platform\n");
++			return -ENODEV;
++	}
++
++	c = kzalloc(sizeof(struct intelce_gpio_chip)*banks, GFP_KERNEL);
++	if (!c)
++		return -ENOMEM;
++	ret = pci_enable_device(pdev);
++	if (ret) {
++		dev_err(&pdev->dev, "can't enable device.\n");
++		goto done;
++	}
++
++	ret = pci_request_region(pdev, INTELCE_GPIO_BAR, INTELCE_GPIO_DRV_NAME);
++	if (ret) {
++		dev_err(&pdev->dev, "can't alloc PCI BAR #%d\n", INTELCE_GPIO_BAR);
++		goto disable_pci;
++	}
++
++	paddr = pci_resource_start(pdev, INTELCE_GPIO_BAR);
++	if (!paddr)
++		goto release_reg;
++	vaddr = ioremap(paddr, pci_resource_len(pdev, INTELCE_GPIO_BAR));
++
++	for (i=0; i < banks; i++) {
++		p = c + i;
++		spin_lock_init(&p->lock);
++		/* Save absolute offset to the GPIO register base for AEP read/write functions use */
++		p->gpio_reg_base = vaddr;
++		p->reg_base = vaddr + 0x20*i;
++		p->high_base = vaddr + 0x80 + 0x10*i;
++		p->mux_ctl_base = vaddr + mux_ctl_offset;
++		if ((CE4200_SOC_DEVICE_ID == id) && ((CE4200_PUB_GPIO_BANKS-1)) == i) {
++
++			p->chip.ngpio = gpios_per_bank - 18;
++		}
++		else {
++			p->chip.ngpio = gpios_per_bank;
++		}
++		p->chip.set_multi_function = gpio_set_multi_function;
++		p->chip.get_multi_function = gpio_get_multi_function;
++		p->chip.set = gpio_set;
++		p->chip.get = ce4100_gpio_get;
++		p->chip.direction_output = gpio_direction_output;
++		p->chip.direction_input = gpio_direction_input;
++		p->chip.to_irq = ce4100_gpio_to_irq;
++		p->chip.label = label[i];
++		p->chip.base = gpio_base;
++		ret = gpiochip_add(&p->chip);
++		if (ret)
++			goto unmap;
++		ret = gpio_irq_setup(p, pdev);
++		if (ret) {
++			gpiochip_remove(&p->chip);
++			goto unmap;
++		}
++		gpio_base += p->chip.ngpio;
++	}
++	sch_gpio_setup(pdev, gpio_base);
++	pci_set_drvdata(pdev, c);
++	return 0;
++
++unmap:
++	for (i--; i >= 0; i--) {
++		p = c + i ;
++		free_irq(pdev->irq, p);
++		irq_free_descs(p->irq_base, gpios_per_bank);
++		gpiochip_remove(&p->chip);
++	}
++	iounmap(c->reg_base);
++release_reg:
++	pci_release_region(pdev, INTELCE_GPIO_BAR);
++disable_pci:
++	pci_disable_device(pdev);
++done:
++	kfree(c);
++	return ret;
++}
++
++static void intelce_gpio_remove(struct pci_dev *pdev)
++{
++	struct intelce_gpio_chip *c = pci_get_drvdata(pdev);
++	struct intelce_gpio_chip *p;
++	int i;
++
++	platform_device_del(&sch_device_gpio);
++	put_device(&pdev->dev);
++	for (i=0; i < banks; i++) {
++		p = c + i;
++		free_irq(pdev->irq, p);
++		irq_free_descs(p->irq_base, gpios_per_bank);
++		if (gpiochip_remove(&p->chip))
++			dev_err(&pdev->dev, "gpiochip_remove() gpio bank %d failed.\n", i);
++	}
++	pci_release_region(pdev, INTELCE_GPIO_BAR);
++	iounmap(c->reg_base);
++	pci_disable_device(pdev);
++	kfree(c);
++	pci_set_drvdata(pdev, NULL);
++}
++
++static DEFINE_PCI_DEVICE_TABLE(intelce_gpio_pci_ids)= {
++	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_INTELCE_GPIO_DEVICE_ID) },
++	{ 0, },
++};
++MODULE_DEVICE_TABLE(pci, intelce_gpio_pci_ids);
++
++#ifdef CONFIG_PM
++
++int intelce_gpio_device_suspend(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct intelce_gpio_chip *c = pci_get_drvdata(pdev);
++	int ret = 0;
++
++    /*gpio suspend */
++	if (intelce_gpio_suspend) {
++   		ret = intelce_gpio_suspend(c->reg_base, legacy_iobase);
++		if (ret)
++	 	  	 return ret;
++	}
++	/*pci device save*/
++	pci_save_state(pdev);
++	pci_disable_device(pdev);
++	pci_set_power_state(pdev, PCI_D3hot);
++	return 0;
++}
++
++int intelce_gpio_device_resume(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct intelce_gpio_chip *c = pci_get_drvdata(pdev);
++	int ret = 0;
++
++	/*pci device restore*/
++	pci_set_power_state(pdev, PCI_D0);
++	pci_restore_state(pdev);
++	ret = pci_enable_device(pdev);
++	if (ret)
++		return ret;
++	/*gpio resume */
++	if (intelce_gpio_resume) {
++		return intelce_gpio_resume(c->reg_base, legacy_iobase);
++	} else {
++		return 0;
++	}
++}
++
++static const struct dev_pm_ops intelce_gpio_pm_ops = {
++	.suspend	= intelce_gpio_device_suspend,
++	.resume		= intelce_gpio_device_resume,
++};
++#endif
++
++static struct pci_driver intelce_gpio_driver = {
++	.name = INTELCE_GPIO_DRV_NAME,
++	.id_table = intelce_gpio_pci_ids,
++	.probe = intelce_gpio_probe,
++	.remove = intelce_gpio_remove,
++#ifdef CONFIG_PM
++	.driver.pm = &intelce_gpio_pm_ops,
++#endif
++};
++
++static int __init intelce_gpio_init(void)
++{
++	return pci_register_driver(&intelce_gpio_driver);
++
++}
++module_init(intelce_gpio_init);
++
++static void __exit intelce_gpio_exit(void)
++{
++	pci_unregister_driver(&intelce_gpio_driver);
++}
++module_exit(intelce_gpio_exit);
++
++MODULE_DESCRIPTION("GPIO interface for Intel intelce SoCs");
++MODULE_LICENSE("GPL v2");
+--- /dev/null
++++ b/drivers/gpio/intelce-gpio.h
+@@ -0,0 +1,66 @@
++/*
++ *  GPIO interface for Intel CE GPIO.
++ *
++ *  Copyright (c) 2010, 2012 Intel Corporation
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License 2 as published
++ *  by the Free Software Foundation.
++ *
++ */
++#ifndef _INTELCE_GPIO_H
++#define _INTELCE_GPIO_H
++#include <linux/errno.h>
++#include <linux/gpio.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/platform_device.h>
++
++
++#define INTELCE_GPIO_DRV_NAME		"intelce_gpio"
++#define PCI_INTELCE_GPIO_DEVICE_ID	0x2e67
++
++#define INTELCE_GPIO_BAR        0
++
++#define INTELCE_GPIO_IRQ_BASE 128 /* Search free IRQS start from this number*/
++
++struct intelce_gpio_chip{
++	int irq_base;
++	void __iomem *gpio_reg_base; /* Absolute base of GPIO */
++	void __iomem *reg_base;
++	void __iomem *high_base;
++	void __iomem *mux_ctl_base;
++	struct gpio_chip chip;
++	struct spinlock lock;
++};
++
++static inline uint32_t intelce_gpio_mmio_read32(const volatile void  __iomem *addr)
++{
++	return readl(addr);
++}
++
++static inline void  intelce_gpio_mmio_write32(uint32_t value, volatile void __iomem *addr)
++{
++	writel(value, addr);
++}
++
++static inline uint32_t intelce_gpio_port_read32(int port)
++{
++	return inl(port);
++}
++
++static inline void  intelce_gpio_port_write32(uint32_t value, int port)
++{
++	outl(value, port);
++}
++
++static inline struct intelce_gpio_chip *to_intelce_gpio_chip(struct gpio_chip *c)
++{
++     return container_of(c, struct intelce_gpio_chip, chip);;
++}
++#endif

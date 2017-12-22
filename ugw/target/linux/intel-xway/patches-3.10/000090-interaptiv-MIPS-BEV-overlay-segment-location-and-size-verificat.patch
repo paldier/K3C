@@ -1,0 +1,241 @@
+From 14b9f8c6ffa23bf67e52a91acf4e8e69b026b41a Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Tue, 2 Apr 2013 13:34:23 -0700
+Subject: [PATCH 090/105] MIPS: BEV overlay segment location and size verification.
+
+In case of EVA and CM2 available - verify location and size of
+BEV Overlay segment in each core, it shouldn't overlap with any
+vital kernel space like VMALLOC, memory etc.
+
+It also can enforce the BEV and BEV Overlay segment to some specific
+place in I/O register space via 'force-bev-location[=address]'.
+In this case NMI/EJTAG/sRESET may or may not work properly (if boot
+monitor is not built with PIC feature).
+
+During this enforcement it tryes to cover the whole I/O space with
+BEV Overlay segment to provide boot monitor an access to I/O devices.
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+(cherry picked from commit 4489ae4a42269c7a65a385e0e474746c2049e938)
+---
+ arch/mips/include/asm/gcmpregs.h          |    5 ++
+ arch/mips/include/asm/mach-malta/spaces.h |    5 +-
+ arch/mips/kernel/smp-cmp.c                |  108 +++++++++++++++++++++++++++++
+ arch/mips/mti-malta/malta-int.c           |    2 +-
+ arch/mips/mti-malta/malta-setup.c         |    8 ++
+ 5 files changed, 126 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/include/asm/gcmpregs.h b/arch/mips/include/asm/gcmpregs.h
+index a7359f7..d47c537 100644
+--- a/arch/mips/include/asm/gcmpregs.h
++++ b/arch/mips/include/asm/gcmpregs.h
+@@ -115,6 +115,11 @@
+ #define GCMP_CCB_RESETBASE_OFS		0x0020		/* Reset Exception Base */
+ #define	 GCMP_CCB_RESETBASE_BEV_SHF	12
+ #define	 GCMP_CCB_RESETBASE_BEV_MSK	GCMPCCBMSK(RESETBASE_BEV, 20)
++#define GCMP_CCB_RESETBASEEXT_OFS       0x0030          /* Reset Exception Base Extention */
++#define  GCMP_CCB_RESETEXTBASE_BEV_SHF      20
++#define  GCMP_CCB_RESETEXTBASE_BEV_MASK_MSK GCMPCCBMSK(RESETEXTBASE_BEV, 8)
++#define  GCMP_CCB_RESETEXTBASE_LOWBITS_SHF     0
++#define  GCMP_CCB_RESETEXTBASE_BEV_MASK_LOWBITS GCMPCCBMSK(RESETEXTBASE_LOWBITS, 20)
+ #define GCMP_CCB_ID_OFS			0x0028		/* Identification */
+ #define GCMP_CCB_DINTGROUP_OFS		0x0030		/* DINT Group Participate */
+ #define GCMP_CCB_DBGGROUP_OFS		0x0100		/* DebugBreak Group */
+diff --git a/arch/mips/include/asm/mach-malta/spaces.h b/arch/mips/include/asm/mach-malta/spaces.h
+index a8de733..ea3c928 100644
+--- a/arch/mips/include/asm/mach-malta/spaces.h
++++ b/arch/mips/include/asm/mach-malta/spaces.h
+@@ -137,7 +137,7 @@
+ #define CKUSEG                  0x00000000
+ #define CKSEG0                  0x80000000
+ #define CKSEG3                  0xa0000000
+-#define CKSEG2                  0xc0000000
++#define CKSEG2                  _AC(0xc0000000, UL)
+ #define CKSEG1                  0xe0000000
+ 
+ #define MAP_BASE                CKSEG2
+@@ -145,6 +145,9 @@
+ 
+ #endif  /* CONFIG_EVA_3GB */
+ 
++#define IO_SIZE                 _AC(0x10000000, UL)
++#define IO_SHIFT                _AC(0x10000000, UL)
++
+ #endif  /* CONFIG_EVA */
+ 
+ #include <asm/mach-generic/spaces.h>
+diff --git a/arch/mips/kernel/smp-cmp.c b/arch/mips/kernel/smp-cmp.c
+index cf87640..1026be8 100644
+--- a/arch/mips/kernel/smp-cmp.c
++++ b/arch/mips/kernel/smp-cmp.c
+@@ -38,6 +38,8 @@
+ #include <asm/mips_mt.h>
+ #include <asm/amon.h>
+ #include <asm/gic.h>
++#include <asm/gcmpregs.h>
++#include <asm/bootinfo.h>
+ 
+ static void ipi_call_function(unsigned int cpu)
+ {
+@@ -87,6 +89,107 @@ static void cmp_send_ipi_mask(const struct cpumask *mask, unsigned int action)
+ 		cmp_send_ipi_single(i, action);
+ }
+ 
++#ifdef CONFIG_EVA
++extern int gcmp_present;
++extern unsigned long _gcmp_base;
++static unsigned long bev_location = -1;
++
++static int rd_bev_location(char *p)
++{
++	if ((strlen(p) > 19) && (*(p + 18) == '=')) {
++		p += 19;
++		bev_location = memparse(p, &p);
++	} else
++		bev_location = 0xbfc00000;
++	return 0;
++}
++early_param("force-bev-location", rd_bev_location);
++
++static void BEV_overlay_segment_map_check(unsigned long excBase,
++	unsigned long excMask, unsigned long excSize)
++{
++	unsigned long addr;
++
++	if ((excBase == (IO_BASE + IO_SHIFT)) && (excSize == IO_SIZE))
++		return;
++
++	printk("WARNING: BEV overlay segment doesn't fit whole I/O reg space, NMI/EJTAG/sRESET may not work\n");
++
++	if ((MAP_BASE < (excBase + excSize)) && (excBase < VMALLOC_END))
++		panic("BEV Overlay segment overlaps VMALLOC area\n");
++#ifdef CONFIG_HIGHMEM
++	if ((PKMAP_BASE < (excBase + excSize)) &&
++	    (excBase < (PKMAP_BASE + (PAGE_SIZE*(LAST_PKMAP-1)))))
++		panic("BEV Overlay segment overlaps HIGHMEM/PKMAP area\n");
++#endif
++	for (addr = excBase; addr < (excBase + excSize); addr += PAGE_SIZE) {
++		if (page_is_ram(__pa(addr>>PAGE_SHIFT)))
++			panic("BEV Overlay segment overlaps memory at %lx\n",addr);
++	}
++}
++
++void BEV_overlay_segment(void)
++{
++	unsigned long RExcBase;
++	unsigned long RExcExtBase;
++	unsigned long excBase;
++	unsigned long excMask;
++	unsigned long excSize;
++	unsigned long addr;
++	char *p;
++
++	printk("IO: BASE = 0x%lx, SHIFT = 0x%lx, SIZE = 0x%lx\n",IO_BASE, IO_SHIFT, IO_SIZE);
++	RExcBase = GCMPCLCB(RESETBASE);
++	RExcExtBase = GCMPCLCB(RESETBASEEXT);
++	printk("GCMP base addr = 0x%lx, CLB: ResetExcBase = 0x%lx, ResetExcExtBase = 0x%lx\n",
++		_gcmp_base,RExcBase,RExcExtBase);
++	if ( !(RExcExtBase & 0x1) )
++		return;
++
++	if (bev_location == -1) {
++		if ((p = strstr(arcs_cmdline, "force-bev-location")))
++			rd_bev_location(p);
++	}
++	if (bev_location != -1) {
++		addr = fls((IO_BASE + IO_SHIFT) ^ bev_location);
++nextSize:
++		if (addr > 28)
++			panic("enforced BEV location is too far from I/O reg space\n");
++
++		excMask = (0xffffffffUL >> (32 - addr));
++		excBase = bev_location & ~excMask;
++		if (((IO_BASE + IO_SHIFT + IO_SIZE - 1) & ~excMask) != excBase) {
++			addr++;
++			goto nextSize;
++		}
++		excSize = ((excBase | excMask) + 1) - excBase;
++		printk("Setting BEV = 0x%lx, Overlay segment = 0x%lx, size = 0x%lx\n",
++			bev_location, excBase, excSize);
++
++		BEV_overlay_segment_map_check(excBase, excMask, excSize);
++
++		GCMPCLCB(RESETBASEEXT) = (GCMPCLCB(RESETBASEEXT) &
++			~GCMP_CCB_RESETEXTBASE_BEV_MASK_MSK) |
++			(excMask & GCMP_CCB_RESETEXTBASE_BEV_MASK_MSK);
++		GCMPCLCB(RESETBASE) = (GCMPCLCB(RESETBASE) & ~GCMP_CCB_RESETBASE_BEV_MSK) |
++			bev_location;
++		RExcBase = GCMPCLCB(RESETBASE);
++		RExcExtBase = GCMPCLCB(RESETBASEEXT);
++
++		return;
++	}
++
++	excBase = RExcBase & GCMP_CCB_RESETBASE_BEV_MSK;
++	excMask = (RExcExtBase & GCMP_CCB_RESETEXTBASE_BEV_MASK_MSK) |
++		    GCMP_CCB_RESETEXTBASE_BEV_MASK_LOWBITS;
++	excBase &= ~excMask;
++	excSize = ((excBase | excMask) + 1) - excBase;
++	printk("BEV Overlay segment = 0x%lx, size = 0x%lx\n",excBase, excSize);
++
++	BEV_overlay_segment_map_check(excBase, excMask, excSize);
++}
++#endif
++
+ static void cmp_init_secondary(void)
+ {
+ 	struct cpuinfo_mips *c = &current_cpu_data;
+@@ -104,6 +207,11 @@ static void cmp_init_secondary(void)
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 	c->tc_id  = (read_c0_tcbind() & TCBIND_CURTC) >> TCBIND_CURTC_SHIFT;
+ #endif
++
++#ifdef CONFIG_EVA
++	if (gcmp_present)
++		BEV_overlay_segment();
++#endif
+ }
+ 
+ static void cmp_smp_finish(void)
+diff --git a/arch/mips/mti-malta/malta-int.c b/arch/mips/mti-malta/malta-int.c
+index c69da37..66f91b8 100644
+--- a/arch/mips/mti-malta/malta-int.c
++++ b/arch/mips/mti-malta/malta-int.c
+@@ -48,7 +48,7 @@
+ 
+ int gcmp_present = -1;
+ static unsigned long _msc01_biu_base;
+-static unsigned long _gcmp_base;
++unsigned long _gcmp_base;
+ static unsigned int ipi_map[NR_CPUS];
+ 
+ static DEFINE_RAW_SPINLOCK(mips_irq_lock);
+diff --git a/arch/mips/mti-malta/malta-setup.c b/arch/mips/mti-malta/malta-setup.c
+index c3384a3..cff9a74 100644
+--- a/arch/mips/mti-malta/malta-setup.c
++++ b/arch/mips/mti-malta/malta-setup.c
+@@ -357,6 +357,9 @@ void __init plat_eva_setup(void)
+ 
+ 	printk("Enhanced Virtual Addressing (EVA) active\n");
+ }
++
++extern int gcmp_present;
++void BEV_overlay_segment(void);
+ #endif
+ 
+ void __init plat_mem_setup(void)
+@@ -364,6 +367,11 @@ void __init plat_mem_setup(void)
+ 	unsigned int i;
+ 
+ #ifdef CONFIG_EVA
++#ifdef CONFIG_MIPS_CMP
++	if (gcmp_present)
++		BEV_overlay_segment();
++#endif
++
+ 	if ((cpu_has_segments) && (cpu_has_eva))
+ 		plat_eva_setup();
+ 	else {
+-- 
+1.7.1
+

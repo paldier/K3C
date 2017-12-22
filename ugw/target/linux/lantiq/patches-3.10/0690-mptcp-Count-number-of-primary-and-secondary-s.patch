@@ -1,0 +1,73 @@
+# HG changeset patch
+# Parent 3b9f467c9406258a73b949c781f082c31561b3d9
+
+diff --git a/net/mptcp/mptcp_ctrl.c b/net/mptcp/mptcp_ctrl.c
+--- a/net/mptcp/mptcp_ctrl.c
++++ b/net/mptcp/mptcp_ctrl.c
+@@ -2476,8 +2476,19 @@ EXPORT_SYMBOL(mptcp_wq);
+ static int mptcp_pm_seq_show(struct seq_file *seq, void *v)
+ {
+ 	struct tcp_sock *meta_tp;
++	struct sock *sk;
+ 	const struct net *net = seq->private;
+-	int i, n = 0;
++	int i, maxidx, n = 0;
++
++	/* idx[0].primary counts sks without a dev
++	   idx[0].secondary counts i/fs that don't fit into the idx array */
++	struct {
++		int index;
++		u64 primary;
++		u64 secondary;
++	} idx[10] = { { -1, 0, 0}, };
++
++	maxidx = sizeof(idx) / sizeof(idx[0]);
+ 
+ 	seq_printf(seq, "  sl  loc_tok  rem_tok  v6 local_address                         remote_address                        st ns tx_queue rx_queue inode");
+ 	seq_putc(seq, '\n');
+@@ -2490,6 +2501,7 @@ static int mptcp_pm_seq_show(struct seq_
+ 			struct mptcp_cb *mpcb = meta_tp->mpcb;
+ 			struct sock *meta_sk = (struct sock *)meta_tp;
+ 			struct inet_sock *isk = inet_sk(meta_sk);
++			int t;
+ 
+ 			if (!mptcp(meta_tp) || !net_eq(net, sock_net(meta_sk)))
+ 				continue;
+@@ -2528,6 +2540,37 @@ static int mptcp_pm_seq_show(struct seq_
+ 					 meta_tp->copied_seq, 0),
+ 				   sock_i_ino(meta_sk));
+ 			seq_putc(seq, '\n');
++
++			mptcp_for_each_sk(mpcb, sk) {
++				struct dst_entry *dst_ent;
++
++				dst_ent = sk->sk_dst_cache;
++				if (dst_ent && dst_ent->dev) {
++
++					for (t = 1; t < maxidx; t++)
++						if (!idx[t].index || idx[t].index ==  dst_ent->dev->ifindex)
++							break;
++
++					if (t < maxidx) {
++						idx[t].index = dst_ent->dev->ifindex;
++						if (dst_ent->dev->flags & IFF_MPMASTER)
++							idx[t].primary++;
++						else
++							idx[t].secondary++;
++					} else {
++						idx[0].secondary++;
++					}
++				} else {
++					idx[0].primary++;
++				}
++			}
++			for (t = 1; t < maxidx && idx[t].index; t++)
++				seq_printf(seq,
++					"ifindex %d primary %llu secondary %llu\n",
++					idx[t].index,
++					idx[t].primary, idx[t].secondary);
++			seq_printf(seq, "no ifindex %llu unlisted ifindex %llu\n",
++				idx[0].primary, idx[0].secondary);
+ 		}
+ 
+ 		rcu_read_unlock_bh();

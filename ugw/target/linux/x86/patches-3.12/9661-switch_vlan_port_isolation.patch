@@ -1,0 +1,65 @@
+--- a/net/8021q/vlan_core.c
++++ b/net/8021q/vlan_core.c
+@@ -69,6 +69,21 @@ bool vlan_do_receive(struct sk_buff **sk
+ 	bool tag_remove = false;
+ #endif
+ 
++#ifdef CONFIG_LTQ_VLAN_SWITCH_PORT_ISOLATION
++	/* The switch port is configured with VID 1-4 for Port0-3 in Tx,
++	*  and VID  0x801-804 for Port0-3 in Rx. vconfig
++	*  interfaces in stack are only made for VID1-4 as in
++	*  eth0.1-eth0.4
++	* */
++#define INTERNAL_VLANS_START 0x800
++#define INTERNAL_VLANS_END   0x805
++	if (vlan_id>=INTERNAL_VLANS_START && vlan_id<=INTERNAL_VLANS_END) {
++		if (!memcmp(skb->dev->name, "eth0", 4)) {
++			vlan_id &= ~0x800; /* Strip off the MSbit of 12-bit VLAN Id */
++		}
++	}
++#endif
++
+ 	vlan_dev = vlan_find_dev(skb->dev, vlan_proto, vlan_id);
+ 	if (!vlan_dev) {
+ #ifdef VLAN_DEBUG
+--- a/net/bridge/Kconfig
++++ b/net/bridge/Kconfig
+@@ -59,3 +59,12 @@ config BRIDGE_VLAN_FILTERING
+ 	  Say N to exclude this support and reduce the binary size.
+ 
+ 	  If unsure, say Y.
++
++config LTQ_VLAN_SWITCH_PORT_ISOLATION
++	bool "Isolate Switch Ports using VLAN"
++	depends on VLAN_8021Q
++	default n
++	---help---
++		Select this and you will be able to create
++		802.1Q VLAN interfaces corresponding to each
++		switch port in the stack.
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -37,6 +37,23 @@ static int deliver_clone(const struct ne
+ static inline int should_deliver(const struct net_bridge_port *p,
+ 				 const struct sk_buff *skb)
+ {
++#ifdef CONFIG_LTQ_VLAN_SWITCH_PORT_ISOLATION
++	/* Check if pkt was Rx on switch port, if so don't Tx back on
++	 * another
++	 *          * switch port, since switch has already done this
++	 *                   * We don't want a) duplicate pkts; b) MAC
++	 *                   table entry bouncing
++	 *                            * -- Ritesh
++	 *                                     */
++        if (!(skb->dev->priv_flags & IFF_802_1Q_VLAN))
++                goto lbl_ahead;
++
++        if (!memcmp(p->dev->name, skb->dev->name, 4)) {
++                return 0; /* don't forward */
++        }
++
++lbl_ahead:
++#endif
+ 	return (((p->flags & BR_HAIRPIN_MODE) || skb->dev != p->dev) &&
+ 		br_allowed_egress(p->br, nbp_get_vlan_info(p), skb) &&
+ 		p->state == BR_STATE_FORWARDING);

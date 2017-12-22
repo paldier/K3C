@@ -1,0 +1,207 @@
+From f8985679873fa943ae1255e528eb5755f3ca3926 Mon Sep 17 00:00:00 2001
+From: Marco A Vital Yep <marco.a.vital.yep@intel.com>
+Date: Tue, 29 Sep 2015 16:10:06 -0700
+Subject: [PATCH 172/441] Fixed GBE issues: - MTL queue size. - Hang while
+ polling TX transactions. - Race condition in ISR. - Disabled TSO to avoid
+ kernel crash.
+
+---
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_desc.c   |  4 ++--
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c    |  2 ++
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c    | 22 +++++++---------------
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c    | 22 +++++++++++-----------
+ .../net/ethernet/synopsys/DWC_ETH_QOS_yheader.h    |  5 ++---
+ .../net/ethernet/synopsys/DWC_ETH_QOS_yregacc.h    |  6 ------
+ 6 files changed, 24 insertions(+), 37 deletions(-)
+
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_desc.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_desc.c
+@@ -893,7 +893,7 @@ static int DWC_ETH_QOS_map_page_buffs(st
+ 
+ 	if (size > DWC_ETH_QOS_MAX_DATA_PER_TX_BUF) {
+ 		if (!prev_buffer->dma2) {
+-			DBGPR("prev_buffer->dma2 is empty\n");
++			DBGPR("prev_buffer->dma2 is empty (1)\n");
+ 			/* fill the first buffer pointer in pre_buffer->dma2 */
+ 			prev_buffer->dma2 =
+ 				dma_map_page((&pdata->pdev->dev),
+@@ -955,7 +955,7 @@ static int DWC_ETH_QOS_map_page_buffs(st
+ 		}
+ 	} else {
+ 		if (!prev_buffer->dma2) {
+-			DBGPR("prev_buffer->dma2 is empty\n");
++			DBGPR("prev_buffer->dma2 is empty (2)\n");
+ 			/* fill the first buffer pointer in pre_buffer->dma2 */
+ 			prev_buffer->dma2 = dma_map_page((&pdata->pdev->dev),
+ 						frag->page.p,
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
+@@ -1884,6 +1884,8 @@ static INT disable_mmc_interrupts(void)
+   MMC_INTR_MASK_TX_RgWr(0xffffffff);
+   /* disable all RX interrupts */
+   MMC_INTR_MASK_RX_RgWr(0xffffffff);
++  /* disable all IPC RX interrupts */
++  MMC_IPC_INTR_MASK_RX_RgWr(0xffffffff);
+ 
+   return Y_SUCCESS;
+ }
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c
+@@ -1416,12 +1416,12 @@ enum hrtimer_restart gbe_timeout(struct
+ {
+ 	struct DWC_ETH_QOS_prv_data *pdata;
+ 	pdata = container_of(timer, struct DWC_ETH_QOS_prv_data, gbe_timer);
+-	//DBGPR("-->gbe_timeout irq(%d)\n", pdata->irq_number);
++	DBGPR("-->gbe_timeout irq(%d)\n", pdata->irq_number);
+ 	disable_irq(pdata->irq_number);
+ 	DWC_ETH_QOS_ISR_SW_DWC_ETH_QOS(pdata->irq_number, pdata);
+ 	hrtimer_start(&pdata->gbe_timer, ktime_set(0, 100000), HRTIMER_MODE_REL);
+ 	enable_irq(pdata->irq_number);
+-	//DBGPR("<--gbe_timeout\n");
++	DBGPR("<--gbe_timeout\n");
+ 	return HRTIMER_NORESTART;
+ }
+ #endif
+@@ -1512,17 +1512,8 @@ static int DWC_ETH_QOS_open(struct net_d
+ 		pdata->eee_enabled = false;
+ 
+ #ifndef DWC_ETH_QOS_CONFIG_PGTEST
+-//	if (pdata->phydev)
+-	netif_tx_start_all_queues(dev);
+-	pdata->pcs_duplex = 1;
+-	pdata->pcs_speed = SPEED_1000;
+-	hw_if->set_full_duplex();
+-	hw_if->set_gmii_speed();
+-	set_bit(__LINK_STATE_START, &dev->state);
+-	netif_carrier_on(dev);
+-	hw_if->start_mac_tx_rx();
+-	DWC_ETH_QOS_start_all_ch_tx_dma(pdata);
+-	DWC_ETH_QOS_start_all_ch_rx_dma(pdata);
++	if (pdata->phydev)
++		netif_tx_start_all_queues(dev);
+ #ifdef GBE_POLLING
+ 	hrtimer_init(&pdata->gbe_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	pdata->gbe_timer.function = gbe_timeout;
+@@ -3446,14 +3437,15 @@ int DWC_ETH_QOS_poll_mq(struct napi_stru
+ 	/* If we processed all pkts, we are done;
+ 	 * tell the kernel & re-enable interrupt */
+ 	if (received < budget) {
++		unsigned long flags;
+ 		if (pdata->dev->features & NETIF_F_GRO) {
+ 			/* to turn off polling */
+ 			napi_complete(napi);
++			spin_lock_irqsave(&pdata->lock, flags);
+ 			/* Enable all ch RX interrupt */
+ 			DWC_ETH_QOS_enable_all_ch_rx_interrpt(pdata);
++			spin_unlock_irqrestore(&pdata->lock, flags);
+ 		} else {
+-			unsigned long flags;
+-
+ 			spin_lock_irqsave(&pdata->lock, flags);
+ 			__napi_complete(napi);
+ 			/* Enable all ch RX interrupt */
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
+@@ -61,7 +61,7 @@ static int DWC_ETH_QOS_init_general_gbe(
+       DBGPR("[GBE] bcfg2ssx_gbem_cfg = 0x%08x\n", reg_val);
+       GET_VAR32_BITS(reg_val, reg_cfg, GBEM_SNOOPED_WIDTH, GBEM_SNOOPED_OFF);
+       if (!reg_cfg) {
+-         printk(KERN_ALERT "[GBE] Snooped bit not set in BTCFG!\n");
++         printk(KERN_ALERT "[GBE] Snooped bit not set in BootConfig!\n");
+          iounmap(reg_base);
+       } else {
+          // Disable GMAC5 core
+@@ -109,8 +109,8 @@ static int DWC_ETH_QOS_init_general_gbe(
+          } else {
+             DBGPR("[GBE] GMAC5 is not connected!\n");
+          }
+-         // The default PHY speed is 1G (0), it can be changed here, if required
+-         SET_VAR32_BITS(reg_val, 0, GCR5_PHY_SPEED_WIDTH, GCR5_PHY_SPEED_OFF);
++         // Default PHY speed is 1G (0), it can be changed here, if required
++         //SET_VAR32_BITS(reg_val, 0, GCR5_PHY_SPEED_WIDTH, GCR5_PHY_SPEED_OFF);
+          // Set endianess (LE)
+          SET_VAR32_BITS(reg_val, 0, GCR5_ENDIANESS_WIDTH, GCR5_ENDIANESS_OFF);
+          // Write configuration
+@@ -190,14 +190,12 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 		printk(KERN_ALERT "%s:Unable to enable device\n", DEV_NAME);
+ 		goto err_out_enb_failed;
+ 	}
+-#ifdef GBE_MSI
++#ifdef INIT_NETSS_GBE
+ 	else if (pci_enable_msi(pdev)) {
+ 		printk(KERN_ALERT "%s:Unable to enable MSI\n", DEV_NAME);
+ 		goto err_out_msi_failed;
+ 	}
+-#endif
+ 
+-#ifdef INIT_NETSS_GBE
+    if (DWC_ETH_QOS_init_general_gbe(&gbe_base)) {
+       goto err_out_req_reg_failed;
+    }
+@@ -275,9 +273,11 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 	DWC_ETH_QOS_get_all_hw_features(pdata);
+ 	DWC_ETH_QOS_print_all_hw_features(pdata);
+ 
+-	memset(&pdata->hw_feat, 0, sizeof(struct DWC_ETH_QOS_hw_features));
+-	pdata->hw_feat.mmc_sel = 1;
+-	
++	// Disable MDIO
++	pdata->hw_feat.sma_sel = 0;
++	// Disable TSO
++	pdata->hw_feat.tso_en = 0;
++
+ 	ret = desc_if->alloc_queue_struct(pdata);
+ 	if (ret < 0) {
+ 		printk(KERN_ALERT "ERROR: Unable to alloc Tx/Rx queue\n");
+@@ -415,7 +415,7 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 	pci_release_regions(pdev);
+ 
+  err_out_req_reg_failed:
+-#ifdef GBE_MSI
++#ifdef INIT_NETSS_GBE
+ 	pci_disable_msi(pdev);
+  err_out_msi_failed:
+ #endif
+@@ -483,7 +483,7 @@ void DWC_ETH_QOS_remove(struct pci_dev *
+ 	pci_iounmap(pdev, (void __iomem *)dwc_eth_qos_pci_base_addr);
+ 
+ 	pci_release_regions(pdev);
+-#ifdef GBE_MSI
++#ifdef INIT_NETSS_GBE
+ 	pci_disable_msi(pdev);
+ #endif
+ 	pci_disable_device(pdev);
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
+@@ -130,11 +130,10 @@
+ //#define DWC_ETH_QOS_QUEUE_SELECT_ALGO
+ //#define DWC_ETH_QOS_CERTIFICATION_PKTBURSTCNT
+ //#define DWC_ETH_QOS_CERTIFICATION_PKTBURSTCNT_HALFDUPLEX
+-#define DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++//#define DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
+ 
+-#define GBE_MSI
++/* Uncomment this macro to poll ISR registers */
+ //#define GBE_POLLING
+-//#define GBE_IOSF_BRIDGE
+ 
+ #ifdef DWC_ETH_QOS_CONFIG_PTP
+ #undef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yregacc.h
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yregacc.h
+@@ -44163,15 +44163,9 @@
+ #define GBEM_SNOOPED_OFF      ( 15 )
+ #define GBEM_SNOOPED_WIDTH    ( 1 )
+ 
+-
+ #define GBE_REG_RD(base, offset)          be32_to_cpu(ioread32((base) + (offset)))
+ #define GBE_REG_WR(base, offset, data)    iowrite32(cpu_to_be32(data),(base) + (offset))
+ 
+-#ifdef GBE_IOSF_BRIDGE
+-#define REG_RD(base, offset)          ioread32((base) + (offset))
+-#define REG_WR(base, offset, data)    iowrite32((data),(base) + (offset))
+-#endif
+-
+ #define SET_VAR32_BITS(x, val, width, offset) \
+ do { \
+    x &= ~((0xFFFFFFFF >> (32-width)) << offset); \

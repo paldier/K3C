@@ -1,0 +1,383 @@
+From 599097a7a3b424b343b5a8ef27fbe219baa68bf6 Mon Sep 17 00:00:00 2001
+From: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Date: Thu, 12 Sep 2013 13:26:41 -0500
+Subject: [PATCH 075/105] MIPS: FPU2 IEEE754-2008 SNaN support
+
+(FPU2 supports only IEEE754-2008 Nan/SNaN formats but not MIPS)
+
+Because IEEE754-2008 SNaN single precision is not compatible with
+IEEE double precision SNaN, we can't use the single DP value to cover both, so
+there is no win-win situation for -mfp32 applications.
+
+So, FPRs are initialized for MIPS SNaN for FPU1 or -mfp32 applications.
+In case of FPU2 and -mfp64 application (32 regs by 64 bits) IEEE SNaN
+is used for FPRs initialization. I know, it is not ideal for GCCv4+ -mfp32,
+but it still has IEEE2008 QNaN. At least FPRs initialization is a tool
+to trigger bugs in GCC and kernel but not in applications.
+
+Also, kernel FPU emulator is fixed to support both NaN variants.
+It matches FPU NaN capability (looking into FCSR31.NAN2008 bit).
+(But it is no uMIPS32 -mfp64 for FPU2 support yet).
+
+Kernel boot parameter 'nan2008=0/1' can be used to enforce selection
+in case of non-FPU cores (in kernel FPU emulator).
+
+Signed-off-by: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+---
+ arch/mips/include/asm/mipsregs.h    |   25 ++++++++++++++++++
+ arch/mips/kernel/cpu-probe.c        |   23 +++++++++++++++++
+ arch/mips/kernel/r4k_switch.S       |   47 +++++++++++++++++++++++++++-------
+ arch/mips/math-emu/ieee754.h        |   10 ++++++-
+ arch/mips/math-emu/ieee754dp.c      |    4 ++-
+ arch/mips/math-emu/ieee754int.h     |   30 ++++++++++++++++------
+ arch/mips/math-emu/ieee754sp.c      |    2 +
+ arch/mips/math-emu/kernel_linkage.c |   40 ++++++++++++++++++++++++++---
+ 8 files changed, 156 insertions(+), 25 deletions(-)
+
+diff --git a/arch/mips/include/asm/mipsregs.h b/arch/mips/include/asm/mipsregs.h
+--- a/arch/mips/include/asm/mipsregs.h
++++ b/arch/mips/include/asm/mipsregs.h
+@@ -140,6 +140,12 @@
+  * and should be written as zero.
+  */
+ #define FPU_CSR_RSVD	0x001c0000
++/* ... but FPU2 uses that bits */
++#define FPU_CSR_NAN2008 0x00040000
++#define FPU_CSR_ABS2008 0x00080000
++#define FPU_CSR_MAC2008 0x00100000
++
++#define FPU_CSR_DEFAULT 0x00000000
+ 
+ /*
+  * X the exception cause indicator
+@@ -622,6 +628,9 @@
+ #define MIPS_FPIR_W		(_ULCAST_(1) << 20)
+ #define MIPS_FPIR_L		(_ULCAST_(1) << 21)
+ #define MIPS_FPIR_F64		(_ULCAST_(1) << 22)
++/* additional bits in MIPS32/64 coprocessor 2 (FPU) */
++#define MIPS_FPIR_HAS2008       (_ULCAST_(1) << 23)
++#define MIPS_FPIR_FC            (_ULCAST_(1) << 24)
+ 
+ #ifndef __ASSEMBLY__
+ 
+@@ -1181,6 +1190,22 @@ do {									\
+ 	__res;								\
+ })
+ 
++#define write_32bit_cp1_register(dest,value)                            \
++({									\
++	__asm__ __volatile__(						\
++	"	.set	push					\n"	\
++	"	.set	reorder					\n"	\
++	"	# gas fails to assemble cfc1 for some archs,	\n"	\
++	"	# like Octeon.					\n"	\
++	"	.set	mips1					\n"	\
++	"       ctc1    %0,"STR(dest)"                          \n"     \
++	"	.set	pop					\n"	\
++	:: "r" (value));                                                \
++})
++
++/*
++ * Macros to access the DSP ASE registers
++ */
+ #ifdef HAVE_AS_DSP
+ #define rddsp(mask)							\
+ ({									\
+diff --git a/arch/mips/kernel/cpu-probe.c b/arch/mips/kernel/cpu-probe.c
+--- a/arch/mips/kernel/cpu-probe.c
++++ b/arch/mips/kernel/cpu-probe.c
+@@ -118,6 +118,22 @@ static inline unsigned long cpu_get_fpu_
+ }
+ 
+ /*
++ * Set and Get the FPU CSR31.
++ */
++static inline unsigned long cpu_test_fpu_csr31(unsigned long fcr31)
++{
++	unsigned long tmp;
++
++	tmp = read_c0_status();
++	__enable_fpu();
++	write_32bit_cp1_register(CP1_STATUS,fcr31);
++	enable_fpu_hazard();
++	fcr31 = read_32bit_cp1_register(CP1_STATUS);
++	write_c0_status(tmp);
++	return fcr31;
++}
++
++/*
+  * Check the CPU has an FPU the official way.
+  */
+ static inline int __cpu_has_fpu(void)
+@@ -970,6 +986,8 @@ EXPORT_SYMBOL(__ua_limit);
+ 
+ const char *__cpu_name[NR_CPUS];
+ const char *__elf_platform;
++unsigned int fpu_fcr31 __read_mostly = 0;
++unsigned int system_has_fpu __read_mostly = 0;
+ 
+ __cpuinit void cpu_probe(void)
+ {
+@@ -1031,12 +1049,17 @@ const char *__elf_platform;
+ 		c->ases &= ~(MIPS_ASE_DSP | MIPS_ASE_DSP2P);
+ 
+ 	if (c->options & MIPS_CPU_FPU) {
++		system_has_fpu = 1;
++		fpu_fcr31 = cpu_test_fpu_csr31(FPU_CSR_DEFAULT);
++
+ 		c->fpu_id = cpu_get_fpu_id();
+ 
+ 		if (c->isa_level & (MIPS_CPU_ISA_M32R1 | MIPS_CPU_ISA_M32R2 |
+ 				    MIPS_CPU_ISA_M64R1 | MIPS_CPU_ISA_M64R2)) {
+ 			if (c->fpu_id & MIPS_FPIR_3D)
+ 				c->ases |= MIPS_ASE_MIPS3D;
++			if (c->fpu_id & MIPS_FPIR_HAS2008)
++				fpu_fcr31 = cpu_test_fpu_csr31(FPU_CSR_DEFAULT|FPU_CSR_MAC2008|FPU_CSR_ABS2008|FPU_CSR_NAN2008);
+ 		}
+ 	}
+ 
+diff --git a/arch/mips/kernel/r4k_switch.S b/arch/mips/kernel/r4k_switch.S
+--- a/arch/mips/kernel/r4k_switch.S
++++ b/arch/mips/kernel/r4k_switch.S
+@@ -182,8 +182,6 @@ LEAF(_restore_fp)
+  * We initialize fcr31 to rounding to nearest, no exceptions.
+  */
+ 
+-#define FPU_DEFAULT  0x00000000
+-
+ LEAF(_init_fpu)
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 	/* Rather than manipulate per-VPE Status, set per-TC bit in TCStatus */
+@@ -200,15 +198,32 @@ LEAF(_init_fpu)
+ #endif /* CONFIG_MIPS_MT_SMTC */
+ 	enable_fpu_hazard
+ 
+-	li	t1, FPU_DEFAULT
+-	ctc1	t1, fcr31
++#if defined(CONFIG_CPU_MIPS32) || defined(CONFIG_CPU_MIPS64)
++	li      t2, MIPS_FPIR_HAS2008
++	cfc1    t1, CP1_REVISION
++	and     t2, t2, t1
++	li      t1, FPU_CSR_DEFAULT
++	beq     t2, $0, 3f
++	li      t1, FPU_CSR_DEFAULT|FPU_CSR_MAC2008|FPU_CSR_ABS2008|FPU_CSR_NAN2008
++3:
++#endif
++	ctc1    t1, fcr31
+ 
+-	li	t1, -1				# SNaN
++	li      t1, -1                          # SNaN MIPS, DP or SP or DP+SP
+ 
+ #ifdef CONFIG_64BIT
+ 	sll     t0, t0, 31 - _ST0_FR
+ 	bgez	t0, 1f				# 16 / 32 register mode?
+ 
++#ifdef CONFIG_CPU_MIPSR2
++	enable_fpu_hazard
++	li      t2, FPU_CSR_NAN2008
++	cfc1    t3, fcr31
++	and     t2, t2, t3
++	beq     t2, $0, 2f
++	dli     t1, 0x7ff000007fa00000          # SNaN 2008, DP + SP
++2:
++#endif
+ 	dmtc1	t1, $f1
+ 	dmtc1	t1, $f3
+ 	dmtc1	t1, $f5
+@@ -229,6 +244,20 @@ 1:
+ #endif /* CONFIG_64BIT */
+ 
+ #ifdef CONFIG_CPU_MIPS32
++#ifdef CONFIG_CPU_MIPS32_R2
++	sll     t0, t0, 31 - _ST0_FR
++	bgez    t0, 2f                          # 16 / 32 register mode?
++
++	enable_fpu_hazard
++	li      t2, FPU_CSR_NAN2008
++	cfc1    t3, fcr31
++	and     t2, t2, t3
++	move    t3, t1                          # SNaN MIPS, DP high word
++	beq     t2, $0, 2f
++	li      t1, 0x7fa00000                  # SNaN 2008, SP
++	li      t3, 0x7ff00000                  # SNaN 2008, DP high word
++2:
++#endif
+ 	mtc1	t1, $f0
+ 	mtc1	t1, $f1
+ 	mtc1	t1, $f2
+@@ -263,13 +292,11 @@ 1:
+ 	mtc1	t1, $f31
+ 
+ #ifdef CONFIG_CPU_MIPS32_R2
++	bgez    t0, 1f                          # 16 / 32 register mode?
++
++	move    t1, t3                          # move SNaN, DP high word
+ 	.set    push
+ 	.set    mips64r2
+-	.set    noreorder
+-	sll     t0, t0, 31 - _ST0_FR
+-	bgez    t0, 1f                       # 16 / 32 register mode?
+-	 nop
+-
+ 	mthc1   t1, $f0
+ 	mthc1   t1, $f1
+ 	mthc1   t1, $f2
+diff --git a/arch/mips/math-emu/ieee754.h b/arch/mips/math-emu/ieee754.h
+--- a/arch/mips/math-emu/ieee754.h
++++ b/arch/mips/math-emu/ieee754.h
+@@ -311,7 +311,10 @@ struct _ieee754_csr {
+ 	unsigned pad0:7;
+ 	unsigned nod:1;		/* set 1 for no denormalised numbers */
+ 	unsigned c:1;		/* condition */
+-	unsigned pad1:5;
++	unsigned pad1a:2;
++	unsigned mac2008:1;
++	unsigned abs2008:1;
++	unsigned nan2008:1;
+ 	unsigned cx:6;		/* exceptions this operation */
+ 	unsigned mx:5;		/* exception enable  mask */
+ 	unsigned sx:5;		/* exceptions total */
+@@ -322,7 +325,10 @@ struct _ieee754_csr {
+ 	unsigned sx:5;		/* exceptions total */
+ 	unsigned mx:5;		/* exception enable  mask */
+ 	unsigned cx:6;		/* exceptions this operation */
+-	unsigned pad1:5;
++	unsigned nan2008:1;
++	unsigned abs2008:1;
++	unsigned mac2008:1;
++	unsigned pad1a:2;
+ 	unsigned c:1;		/* condition */
+ 	unsigned nod:1;		/* set 1 for no denormalised numbers */
+ 	unsigned pad0:7;
+diff --git a/arch/mips/math-emu/ieee754dp.c b/arch/mips/math-emu/ieee754dp.c
+--- a/arch/mips/math-emu/ieee754dp.c
++++ b/arch/mips/math-emu/ieee754dp.c
+@@ -41,7 +41,9 @@ int ieee754dp_isnan(ieee754dp x)
+ int ieee754dp_issnan(ieee754dp x)
+ {
+ 	assert(ieee754dp_isnan(x));
+-	return ((DPMANT(x) & DP_MBIT(DP_MBITS-1)) == DP_MBIT(DP_MBITS-1));
++	if (ieee754_csr.nan2008)
++		return !(DPMANT(x) & DP_MBIT(DP_MBITS-1));
++	return (DPMANT(x) & DP_MBIT(DP_MBITS-1));
+ }
+ 
+ 
+diff --git a/arch/mips/math-emu/ieee754int.h b/arch/mips/math-emu/ieee754int.h
+--- a/arch/mips/math-emu/ieee754int.h
++++ b/arch/mips/math-emu/ieee754int.h
+@@ -83,10 +83,17 @@
+     if(ve == SP_EMAX+1+SP_EBIAS){\
+ 	if(vm == 0)\
+ 	  vc = IEEE754_CLASS_INF;\
+-	else if(vm & SP_MBIT(SP_MBITS-1)) \
+-	  vc = IEEE754_CLASS_SNAN;\
+-	else \
+-	  vc = IEEE754_CLASS_QNAN;\
++	else if (ieee754_csr.nan2008) { \
++	  if(vm & SP_MBIT(SP_MBITS-1)) \
++	    vc = IEEE754_CLASS_QNAN;\
++	  else \
++	    vc = IEEE754_CLASS_SNAN;\
++	} else { \
++	  if(vm & SP_MBIT(SP_MBITS-1)) \
++	    vc = IEEE754_CLASS_SNAN;\
++	  else \
++	    vc = IEEE754_CLASS_QNAN;\
++	} \
+     } else if(ve == SP_EMIN-1+SP_EBIAS) {\
+ 	if(vm) {\
+ 	    ve = SP_EMIN;\
+@@ -117,10 +124,17 @@ u64 ym; int ye; int ys; int yc
+     if(ve == DP_EMAX+1+DP_EBIAS){\
+ 	if(vm == 0)\
+ 	  vc = IEEE754_CLASS_INF;\
+-	else if(vm & DP_MBIT(DP_MBITS-1)) \
+-	  vc = IEEE754_CLASS_SNAN;\
+-	else \
+-	  vc = IEEE754_CLASS_QNAN;\
++	else if (ieee754_csr.nan2008) { \
++	  if(vm & DP_MBIT(DP_MBITS-1)) \
++	    vc = IEEE754_CLASS_QNAN;\
++	  else \
++	    vc = IEEE754_CLASS_SNAN;\
++	} else { \
++	  if(vm & DP_MBIT(DP_MBITS-1)) \
++	    vc = IEEE754_CLASS_SNAN;\
++	  else \
++	    vc = IEEE754_CLASS_QNAN;\
++	} \
+     } else if(ve == DP_EMIN-1+DP_EBIAS) {\
+ 	if(vm) {\
+ 	    ve = DP_EMIN;\
+diff --git a/arch/mips/math-emu/ieee754sp.c b/arch/mips/math-emu/ieee754sp.c
+--- a/arch/mips/math-emu/ieee754sp.c
++++ b/arch/mips/math-emu/ieee754sp.c
+@@ -41,6 +41,8 @@ int ieee754sp_isnan(ieee754sp x)
+ int ieee754sp_issnan(ieee754sp x)
+ {
+ 	assert(ieee754sp_isnan(x));
++	if (ieee754_csr.nan2008)
++		return !(SPMANT(x) & SP_MBIT(SP_MBITS-1));
+ 	return (SPMANT(x) & SP_MBIT(SP_MBITS-1));
+ }
+ 
+diff --git a/arch/mips/math-emu/kernel_linkage.c b/arch/mips/math-emu/kernel_linkage.c
+--- a/arch/mips/math-emu/kernel_linkage.c
++++ b/arch/mips/math-emu/kernel_linkage.c
+@@ -27,7 +27,21 @@
+ #include <asm/fpu.h>
+ #include <asm/fpu_emulator.h>
+ 
+-#define SIGNALLING_NAN 0x7ff800007ff80000LL
++#define SIGNALLING_NAN      0x7ff800007ff80000LL
++#define SIGNALLING_NAN2008  0x7ff000007fa00000LL
++
++extern unsigned int fpu_fcr31 __read_mostly;
++extern unsigned int system_has_fpu __read_mostly;
++static int nan2008 __read_mostly = -1;
++
++static int __init setup_nan2008(char *str)
++{
++	get_option (&str, &nan2008);
++
++	return 1;
++}
++
++__setup("nan2008=", setup_nan2008);
+ 
+ #ifdef CONFIG_MIPS_FPU_EMU
+ void fpu_emulator_init_fpu(void)
+@@ -40,10 +54,28 @@ void fpu_emulator_init_fpu(void)
+ 		printk("Algorithmics/MIPS FPU Emulator v1.5\n");
+ 	}
+ 
+-	current->thread.fpu.fcr31 = 0;
+-	for (i = 0; i < 32; i++) {
+-		current->thread.fpu.fpr[i] = SIGNALLING_NAN;
++	if (system_has_fpu)
++		current->thread.fpu.fcr31 = fpu_fcr31;
++	else if (nan2008 < 0) {
++		if (!test_thread_flag(TIF_32BIT_REGS))
++			current->thread.fpu.fcr31 = FPU_CSR_DEFAULT|FPU_CSR_MAC2008|FPU_CSR_ABS2008|FPU_CSR_NAN2008;
++		else
++			current->thread.fpu.fcr31 = FPU_CSR_DEFAULT;
++	} else {
++		if (nan2008)
++			current->thread.fpu.fcr31 = FPU_CSR_DEFAULT|FPU_CSR_MAC2008|FPU_CSR_ABS2008|FPU_CSR_NAN2008;
++		else
++			current->thread.fpu.fcr31 = FPU_CSR_DEFAULT;
+ 	}
++
++	if (current->thread.fpu.fcr31 & FPU_CSR_NAN2008)
++		for (i = 0; i < 32; i++) {
++			current->thread.fpu.fpr[i] = SIGNALLING_NAN2008;
++		}
++	else
++		for (i = 0; i < 32; i++) {
++			current->thread.fpu.fpr[i] = SIGNALLING_NAN;
++		}
+ }
+ 
+ 

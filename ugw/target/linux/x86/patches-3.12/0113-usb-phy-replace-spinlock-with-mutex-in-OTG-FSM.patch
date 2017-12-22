@@ -1,0 +1,105 @@
+From 1db9d9135a30f15f78d042ec786fdde6f778aed0 Mon Sep 17 00:00:00 2001
+From: Anton Tikhomirov <av.tikhomirov@samsung.com>
+Date: Tue, 26 Nov 2013 11:46:05 +0900
+Subject: [PATCH 113/441] usb: phy: replace spinlock with mutex in OTG FSM
+
+OTG Final State Machine calls functions which may sleep.
+
+For example, start_gadget callback implementation can use
+usb_gadget_vbus_connect(), whose context: can sleep.
+
+If so, mutex should be used instead of spinlock.
+
+Signed-off-by: Anton Tikhomirov <av.tikhomirov@samsung.com>
+Signed-off-by: Felipe Balbi <balbi@ti.com>
+(cherry picked from commit 16e569e9661ea2b964b8abb607a51e5285254021)
+Signed-off-by: Maladau Mou <maladau.mou@intel.com>
+---
+ drivers/usb/phy/phy-fsl-usb.c | 7 +++----
+ drivers/usb/phy/phy-fsm-usb.c | 7 +++----
+ include/linux/usb/otg-fsm.h   | 4 ++--
+ 3 files changed, 8 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/phy/phy-fsl-usb.c
++++ b/drivers/usb/phy/phy-fsl-usb.c
+@@ -848,7 +848,7 @@ static int fsl_otg_conf(struct platform_
+ 		pr_info("Couldn't init OTG timers\n");
+ 		goto err;
+ 	}
+-	spin_lock_init(&fsl_otg_tc->fsm.lock);
++	mutex_init(&fsl_otg_tc->fsm.lock);
+ 
+ 	/* Set OTG state machine operations */
+ 	fsl_otg_tc->fsm.ops = &fsl_otg_ops;
+@@ -1017,10 +1017,9 @@ static int show_fsl_usb2_otg_state(struc
+ 	struct otg_fsm *fsm = &fsl_otg_dev->fsm;
+ 	char *next = buf;
+ 	unsigned size = PAGE_SIZE;
+-	unsigned long flags;
+ 	int t;
+ 
+-	spin_lock_irqsave(&fsm->lock, flags);
++	mutex_lock(&fsm->lock);
+ 
+ 	/* basic driver infomation */
+ 	t = scnprintf(next, size,
+@@ -1088,7 +1087,7 @@ static int show_fsl_usb2_otg_state(struc
+ 	size -= t;
+ 	next += t;
+ 
+-	spin_unlock_irqrestore(&fsm->lock, flags);
++	mutex_unlock(&fsm->lock);
+ 
+ 	return PAGE_SIZE - size;
+ }
+--- a/drivers/usb/phy/phy-fsm-usb.c
++++ b/drivers/usb/phy/phy-fsm-usb.c
+@@ -23,7 +23,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+-#include <linux/spinlock.h>
++#include <linux/mutex.h>
+ #include <linux/delay.h>
+ #include <linux/usb.h>
+ #include <linux/usb/gadget.h>
+@@ -244,9 +244,8 @@ int otg_set_state(struct otg_fsm *fsm, e
+ int otg_statemachine(struct otg_fsm *fsm)
+ {
+ 	enum usb_otg_state state;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&fsm->lock, flags);
++	mutex_lock(&fsm->lock);
+ 
+ 	state = fsm->otg->phy->state;
+ 	state_changed = 0;
+@@ -358,7 +357,7 @@ int otg_statemachine(struct otg_fsm *fsm
+ 	default:
+ 		break;
+ 	}
+-	spin_unlock_irqrestore(&fsm->lock, flags);
++	mutex_lock(&fsm->lock);
+ 
+ 	VDBG("quit statemachine, changed = %d\n", state_changed);
+ 	return state_changed;
+--- a/include/linux/usb/otg-fsm.h
++++ b/include/linux/usb/otg-fsm.h
+@@ -18,7 +18,7 @@
+ #ifndef __LINUX_USB_OTG_FSM_H
+ #define __LINUX_USB_OTG_FSM_H
+ 
+-#include <linux/spinlock.h>
++#include <linux/mutex.h>
+ #include <linux/errno.h>
+ 
+ #undef VERBOSE
+@@ -116,7 +116,7 @@ struct otg_fsm {
+ 
+ 	/* Current usb protocol used: 0:undefine; 1:host; 2:client */
+ 	int protocol;
+-	spinlock_t lock;
++	struct mutex lock;
+ };
+ 
+ struct otg_fsm_ops {

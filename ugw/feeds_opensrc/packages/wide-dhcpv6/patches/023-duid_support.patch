@@ -1,0 +1,659 @@
+diff -Nuar wide-dhcpv6-20080615_org/common.c wide-dhcpv6-20080615/common.c
+--- wide-dhcpv6-20080615_org/common.c	2011-09-09 16:25:29.949642010 +0530
++++ wide-dhcpv6-20080615/common.c	2011-09-09 16:26:20.530642284 +0530
+@@ -139,6 +139,7 @@
+ 
+ #ifdef RCCONF_CHANGE
+ 
++int lq_duid_type; /* referenced in dhcp6c.c */
+ int xtoi(const char* xs, unsigned int* result)
+ {
+  size_t szlen = strlen(xs);
+@@ -1078,26 +1079,31 @@
+ #endif
+ }
+ 
++int str_2_bin(char *dst, const char *src, int len)
++{
++        int i = 0;
++        while( len > 0) {
++                char tmpbuf[4]={0};
++                int ret;
++                strncpy(tmpbuf, src + i*2, 2);
++		dst[i++] = strtol(tmpbuf, NULL, 16);
++                len -= 2;
++        }
++        return 0;
++}
++
++
+ int
+ get_duid(idfile, duid)
+ 	char *idfile;
+ 	struct duid *duid;
+ {
+ 	FILE *fp = NULL;
+-	u_int16_t len = 0, hwtype, tp = 0;
++	u_int16_t len = 0, hwtype;
+ 	struct dhcp6opt_duid_type1 *dp; /* we only support the type1 DUID */
+ 	char tmpbuf[256];	/* DUID should be no more than 256 bytes */
+-	char sCommand[50];
+-
+-#ifdef RCCONF_CHANGE
+-	char *buf, *cp;
+-	unsigned long  flags = IFX_F_MODIFY, outFlag = IFX_F_DEFAULT;
+-	int duid_flag = 0 , i=0 , n=0;
+-	signed long ret = IFX_SUCCESS;
+-#endif
+-
+-	memset (sCommand,'\0', 50);
+ 
++#ifndef RCCONF_CHANGE
+ 	if ((fp = fopen(idfile, "r")) == NULL && errno != ENOENT)
+ 		dprintf(LOG_NOTICE, FNAME, "failed to open DUID file: %s",
+ 		    idfile);
+@@ -1108,145 +1114,9 @@
+ 			dprintf(LOG_ERR, FNAME, "DUID file corrupted");
+ 			goto fail;
+ 		}
+-		if(len <= 0 && len > 256) {
+-			dprintf(LOG_INFO, FNAME, "Invalid duid len");
+-			goto fail;
+-		}
+-
+ 	} else {
+ 		int l;
+-		
+-#ifdef RCCONF_CHANGE
+-		// if buf is epmty then go normal else  
+-		//extract this info from rc.conf and fill the value and put it in the file
+-		
+-		system("mkdir /var/db");
+-		buf = (char *) malloc (256);
+-		if(buf == NULL) {
+-			dprintf(LOG_ERR, FNAME, "Unable to allocate 256 bytes");
+-			goto fail;
+-		}
+-		memset(buf,0,256);
+-		memset(duid, 0, sizeof(*duid));
+-        	if ((ret = ifx_GetObjData(FILE_RC_CONF, TAG_IPV6, "dhcpv6_len", IFX_F_GET_ANY, &outFlag, buf)) != IFX_SUCCESS) { 
+-              		printf ("FAILED TO GET THE DHCPv6_len ret = %lu\n", ret);
+-			free(buf);		
+-			goto gen_duid;
+-		}
+-		/* strncpy(buf,buf,strlen(buf)); */
+-
+-		len = (size_t)atoi(buf);
+-
+-		if (len == 0 || !strcmp(buf,"0"))
+-		{
+-			free(buf);
+-			duid_flag = 1;
+-			goto gen_duid;	
+-		}		
+-
+-		duid->duid_len = len;
+-             
+-      	  if ((duid->duid_id = (char *)malloc(len)) == NULL) {
+-                dprintf(LOG_ERR, FNAME, "failed to allocate memory");
+-		free(buf);
+-                goto fail;
+-         }
+-
+-		 memset(buf,0,80); 
+-		if ((ret = ifx_GetObjData(FILE_RC_CONF, TAG_IPV6, "dhcpv6_duid", IFX_F_GET_ANY, &outFlag, buf)) != IFX_SUCCESS) {
+-                        free(buf);
+-			duid_flag = 1;
+-                        goto gen_duid;
+-                }
+-		/* strncpy(buf,buf,strlen(buf));  */
+-
+-		if (!strcmp(buf,"0"))
+-		{
+-			free(buf);
+-			duid_flag = 1;
+-			goto gen_duid;
+-		}
+-	
+-
+-		dp = (struct dhcp6opt_duid_type1 *)duid->duid_id;
+-		
+-		memset (tmpbuf,'\0',256);
+-		cp = buf;
+-		strncpy(tmpbuf,cp,sizeof(u_int32_t));
+-		/* strncpy(tmpbuf,tmpbuf,strlen(tmpbuf)); */
+-		tp = atol(tmpbuf);	
+-		dp->dh6_duid1_type = htonl(tp);
+-
+-		cp = cp + sizeof(u_int32_t);
+-		memset (tmpbuf,'\0',256);
+-		strncpy(tmpbuf,cp,sizeof(u_int32_t));
+-		hwtype = atol(tmpbuf);
+-		dp->dh6_duid1_hwtype = htonl(hwtype);
+-
+-                cp = cp + sizeof(u_int32_t);                                                                                                          
+-                memset (tmpbuf,'\0',256);                                                                                                             
+-		strncpy(tmpbuf,cp,sizeof(u_int64_t));
+-
+-		unsigned long tmpbuf1;
+-		xtoi(tmpbuf,&tmpbuf1);
+-
+-		dp->dh6_duid1_time = htonl((u_long)(tmpbuf1 & 0xffffffff));
+-		
+-		memset (tmpbuf,'\0',256);
+-                if ((l = gethwid(tmpbuf, sizeof(tmpbuf), NULL, &hwtype)) < 0) {                                                                       
+-                        dprintf(LOG_INFO, FNAME,                                                                                                      
+-                            "failed to get a hardware address");                                                                                      
+-                        goto fail;                                                                                                                    
+-                }
+-		memcpy((void *)(dp + 1), tmpbuf, (len - sizeof(*dp)));
+-			
+-		free(buf);
+-		
+-		if (duid_flag == 0){
+-
+-                if ((fp = fopen(idfile, "w+")) == NULL) {                                                                                             
+-                        dprintf(LOG_ERR, FNAME,                                                                                                       
+-                            "failed to open DUID file for save");                                                                                     
+-                        goto fail;                                                                                                                    
+-                }                                                                                                                                     
+-                if ((fwrite(&len, sizeof(len), 1, fp)) != 1) {                                                                                        
+-                        dprintf(LOG_ERR, FNAME, "failed to save DUID");                                                                               
+-                        goto fail;                                                                                                                    
+-                }                                                                                                                                     
+-                if ((fwrite(duid->duid_id, len, 1, fp)) != 1) {                                                                                       
+-                        dprintf(LOG_ERR, FNAME, "failed to save DUID");                                                                               
+-                        goto fail;                                                                                                                    
+-                }                                                                                                                                     
+-                
+-		fclose (fp);                                                                                                                                      
+-                dprintf(LOG_DEBUG, FNAME, "saved generated DUID to %s",                                                                               
+-                    idfile); 
+-     
+-		len = 0;
+-	
+-       		if ((fp = fopen(idfile, "r")) == NULL )
+-		{
+-               		 dprintf(LOG_NOTICE, FNAME, "failed to open DUID file: %s",
+-                    idfile);
+-			goto fail;
+-		}
+- 
+-               /* decode length */                                                                                                                   
+-                if (fread(&len, sizeof(len), 1, fp) != 1) {                                                                                           
+-                        dprintf(LOG_ERR, FNAME, "DUID file corrupted");                                                                               
+-			
+-                        goto fail;                                                                                                                    
+-                }     
+-		if(len <= 0 && len > 64) {
+-			dprintf(LOG_INFO, FNAME, "Invalid duid len");
+-			goto fail;
+-		}
+-
+-			goto cpy_duid;	                                       
+-		}
+ 
+-gen_duid:
+-#endif
+ 		if ((l = gethwid(tmpbuf, sizeof(tmpbuf), NULL, &hwtype)) < 0) {
+ 			dprintf(LOG_INFO, FNAME,
+ 			    "failed to get a hardware address");
+@@ -1257,17 +1127,11 @@
+ 
+ 	memset(duid, 0, sizeof(*duid));
+ 	duid->duid_len = len;
+-	if(len <= 0 && len > 64) {
+-		dprintf(LOG_INFO, FNAME, "Invalid duid len");
+-		goto fail;
+-	}
+-		
+ 	if ((duid->duid_id = (char *)malloc(len)) == NULL) {
+ 		dprintf(LOG_ERR, FNAME, "failed to allocate memory");
+ 		goto fail;
+ 	}
+ 
+-cpy_duid:
+ 	/* copy (and fill) the ID */
+ 	if (fp) {
+ 		if (fread(duid->duid_id, len, 1, fp) != 1) {
+@@ -1278,15 +1142,12 @@
+ 		dprintf(LOG_DEBUG, FNAME,
+ 		    "extracted an existing DUID from %s: %s",
+ 		    idfile, duidstr(duid));
+-		sprintf(sCommand,"echo %s > /tmp/dhcp6c_duid",duidstr(duid));
+-		system(sCommand);
+ 	} else {
+ 		u_int64_t t64;
++
+ 		dp = (struct dhcp6opt_duid_type1 *)duid->duid_id;
+ 		dp->dh6_duid1_type = htons(1); /* type 1 */
+-
+ 		dp->dh6_duid1_hwtype = htons(hwtype);
+-
+ 		/* time is Jan 1, 2000 (UTC), modulo 2^32 */
+ 		t64 = (u_int64_t)(time(NULL) - 946684800);
+ 		dp->dh6_duid1_time = htonl((u_long)(t64 & 0xffffffff));
+@@ -1294,48 +1155,10 @@
+ 
+ 		dprintf(LOG_DEBUG, FNAME, "generated a new DUID: %s",
+ 		    duidstr(duid));
+-		sprintf(sCommand,"echo %s > /tmp/dhcp6c_duid",duidstr(duid));
+-		system(sCommand);
+-
+ 	}
+ 
+-
+-
+ 	/* save the (new) ID to the file for next time */
+ 	if (!fp) {
+-
+-     		//write in rc.conf  if the extarted duid is zero then exec below                                                                                              
+-#ifdef RCCONF_CHANGE
+-	if (duid_flag == 1){
+-		buf = (char *) malloc(256);   
+-		if(buf == NULL) {
+-			dprintf(LOG_DEBUG, FNAME, "Unable to allocate memory 256 bytes");
+-			goto fail;
+-		}
+-                
+-		sprintf(buf,"dhcpv6_len=\"%d\"\n",len);                                                                                                                
+-                /* strncpy(buf,buf,strlen(buf)); */  
+-                ifx_SetObjData(FILE_RC_CONF, TAG_IPV6, flags, 1, buf);                                                                                
+-                memset(buf,0,256);
+-		cp = buf;
+-		for (i = 0; i < duid->duid_len && i <= 128; i++) {
+-			n = sprintf(cp,"%02x",(duid->duid_id[i] & 0xff));
+-			if (n < 0)
+-				break;
+-			cp+=n;
+-		}
+-		memset(tmpbuf,'\0',256);
+-		sprintf(tmpbuf,"dhcpv6_duid=\"%s\"\n",buf);
+-                ifx_SetObjData(FILE_RC_CONF, TAG_IPV6, flags, 1, &tmpbuf);
+-		free(buf);
+-
+-                if (ifx_flash_write()<=0) {      
+-			printf ("Save settings FAILED for DUID \n");                                                                                                     
+-                }
+-         
+- 
+-	}
+-#endif
+ 		if ((fp = fopen(idfile, "w+")) == NULL) {
+ 			dprintf(LOG_ERR, FNAME,
+ 			    "failed to open DUID file for save");
+@@ -1352,8 +1175,284 @@
+ 
+ 		dprintf(LOG_DEBUG, FNAME, "saved generated DUID to %s",
+ 		    idfile);
++	}
++#else		/* extract persistent duid from rc.conf */
++	char *buf = NULL, *cp;
++	unsigned long  flags = IFX_F_MODIFY, outFlag = IFX_F_DEFAULT;
++	int i=0 , n=0,l, ascii_duid_len = 0;
++	u_int32_t en = 0;
++	signed long ret = IFX_SUCCESS;
++	struct dhcp6opt_duid_type1 *dp1 = NULL;
++	struct dhcp6opt_duid_type2 *dp2 = NULL;
++	struct dhcp6opt_duid_type3 *dp3 = NULL;
++	unsigned long tmpbuf1;
++	u_int64_t t64;
++	u_int16_t tp = 0;
++	char sCommand[300];
+ 
++#define LQ_TMB_BUF_SIZE	1024
++#define LTQ_ENTERPRISE_NUMBER 38319 /* should be a part of header file */
++
++	if(lq_duid_type != 1 && lq_duid_type != 2 && lq_duid_type != 3) {
++		lq_duid_type = 1; 	/* making default as LLT */
++	}
++
++	buf = (char *) malloc (LQ_TMB_BUF_SIZE);
++	if(buf == NULL) {
++		dprintf(LOG_ERR, FNAME, "Unable to allocate 1024 bytes");
++		goto fail;
++	}
++
++	memset(buf, 0, LQ_TMB_BUF_SIZE);
++	memset(duid, 0, sizeof(*duid));
++
++	snprintf(sCommand, sizeof(sCommand), "dhcpv6_%d_duid_len", lq_duid_type);
++
++	if ((ret = ifx_GetObjData(FILE_RC_CONF, TAG_IPV6, sCommand, IFX_F_GET_ANY, &outFlag, buf)) != IFX_SUCCESS) { 
++		printf ("failed to get the dhcpv6_len ret = %lu\n", ret);
++		goto gen_duid;
++	}
++
++	len = (size_t)atoi(buf);
++
++	if (len <= 0 || !strcmp(buf,"0") )
++	{
++		goto gen_duid;	
++	}		
++
++	if(len > 260) {  /* each octate takes 2 bytes in string + duid type */
++/* rfc 3315, section 9.1.  A DUID can be no more than 128 octets long (not
++ * including the type code) */
++		dprintf(LOG_ERR, FNAME, "duid len exceeds max allowable size");
++		goto gen_duid;
+ 	}
++     
++
++	duid->duid_len = len;
++
++	if ((duid->duid_id = (char *)malloc(len)) == NULL) {
++		dprintf(LOG_ERR, FNAME, "failed to allocate memory");
++		goto fail;
++ 	}
++
++	memset(buf, 0, LQ_TMB_BUF_SIZE); 
++
++	snprintf(sCommand, sizeof(sCommand), "dhcpv6_%d_duid", lq_duid_type);
++	if ((ret = ifx_GetObjData(FILE_RC_CONF, TAG_IPV6, sCommand, IFX_F_GET_ANY, &outFlag, buf)) != IFX_SUCCESS) {
++		goto gen_duid;
++	}
++
++	if (!strcmp(buf,"0"))
++	{
++		goto gen_duid;
++	}
++	ascii_duid_len = strlen(buf);
++
++	switch(lq_duid_type) {
++	case 1:	/* type LLT  */
++		dp1 = (struct dhcp6opt_duid_type1 *)duid->duid_id;
++		
++		memset (tmpbuf, '\0', sizeof(tmpbuf));
++		cp = buf;
++		strncpy(tmpbuf, cp, sizeof(dp1->dh6_duid1_type)*2);
++
++		tp = strtol(tmpbuf, NULL, 16);	
++		dp1->dh6_duid1_type = htonl(tp);
++		cp = cp + sizeof(dp1->dh6_duid1_type)*2;
++
++		memset (tmpbuf, '\0', sizeof(tmpbuf));
++		strncpy(tmpbuf, cp, sizeof(dp1->dh6_duid1_hwtype)*2);
++		hwtype = strtol(tmpbuf, NULL, 16);	
++		dp1->dh6_duid1_hwtype = htonl(hwtype);
++		cp = cp + sizeof(dp1->dh6_duid1_hwtype)*2;
++
++		memset (tmpbuf, '\0', sizeof(tmpbuf));
++		strncpy(tmpbuf, cp, sizeof(dp1->dh6_duid1_time)*2);
++		xtoi(tmpbuf,&tmpbuf1);
++		dp1->dh6_duid1_time = htonl((u_long)(tmpbuf1 & 0xffffffff));
++		cp = cp + sizeof(dp1->dh6_duid1_time)*2;
++		
++		ret = str_2_bin((void *)(dp1 + 1), cp, ascii_duid_len - (sizeof(*dp1)*2));
++		break;
++	case 2:	/* DUID-EN */
++		dp2 = (struct dhcp6opt_duid_type2 *)duid->duid_id;
++		
++		memset (tmpbuf, '\0', sizeof(tmpbuf));
++		cp = buf;
++		strncpy(tmpbuf, cp, sizeof(dp2->dh6_duid2_type)*2);
++
++		tp = strtol(tmpbuf, NULL, 16);
++		dp2->dh6_duid2_type = htonl(tp);
++		cp = cp + sizeof(dp2->dh6_duid2_type)*2;
++
++		memset (tmpbuf, '\0', sizeof(tmpbuf));
++		strncpy(tmpbuf, cp, sizeof(dp2->dh6_duid2_en)*2);
++		en = strtol(tmpbuf, NULL, 16);
++		dp2->dh6_duid2_en = htonl(en);
++		cp = cp + sizeof(dp2->dh6_duid2_en)*2;
++
++		ret = str_2_bin((void *)(dp2 + 1), cp, ascii_duid_len - (sizeof(*dp2)*2));
++		break;
++	case 3:	/* DUID-LL */
++		dp3 = (struct dhcp6opt_duid_type3 *)duid->duid_id;
++		
++		memset (tmpbuf, '\0', sizeof(tmpbuf));
++		cp = buf;
++		strncpy(tmpbuf, cp, sizeof(dp3->dh6_duid3_type)*2);
++
++		tp = strtol(tmpbuf, NULL, 16);	
++		dp3->dh6_duid3_type = htonl(tp);
++		cp = cp + sizeof(dp3->dh6_duid3_type)*2;
++
++		memset (tmpbuf, '\0', sizeof(tmpbuf));
++		strncpy(tmpbuf, cp, sizeof(dp3->dh6_duid3_hwtype)*2);
++		hwtype = strtol(tmpbuf, NULL, 16);	
++		dp3->dh6_duid3_hwtype = htonl(hwtype);
++		cp = cp + sizeof(dp3->dh6_duid3_hwtype)*2;
++
++		ret = str_2_bin((void *)(dp3 + 1), cp, ascii_duid_len - (sizeof(*dp3)*2));
++		break;
++	}
++
++	dprintf(LOG_INFO, FNAME, "DUID Type = %d\n"
++		"DUID:%s\n", lq_duid_type, duidstr(duid));
++	if(ret != 0) {
++		dprintf(LOG_INFO, FNAME, "str_2_bin returned error going to gen_duid\n");
++		goto gen_duid;
++	}
++	
++	snprintf(sCommand, sizeof(sCommand), "echo %s > /tmp/dhcp6c_%d_duid", duidstr(duid), lq_duid_type);
++	system(sCommand);
++	if(buf != NULL) {
++		free(buf);
++	}
++	return 0;
++
++gen_duid:
++	memset(tmpbuf, 0, sizeof(tmpbuf));
++	if ((l = gethwid(tmpbuf, sizeof(tmpbuf), NULL, &hwtype)) < 0) {
++			dprintf(LOG_INFO, FNAME,
++			    "failed to get a hardware address");
++			goto fail;
++	}
++
++	switch(lq_duid_type) {
++	case 1:	/* DUID LLT  */
++	
++		len = l + sizeof(struct dhcp6opt_duid_type1);
++
++		memset(duid, 0, sizeof(*duid));
++		duid->duid_len = len;
++		if(len <= 0 && len > 130) {
++			dprintf(LOG_INFO, FNAME, "Invalid duid len");
++			goto fail;
++		}
++			
++		if ((duid->duid_id = (char *)malloc(len)) == NULL) {
++			dprintf(LOG_ERR, FNAME, "failed to allocate memory");
++			goto fail;
++		}
++
++		dp1 = (struct dhcp6opt_duid_type1 *)duid->duid_id;
++		dp1->dh6_duid1_type = htons(1); /* type 1 */
++
++		dp1->dh6_duid1_hwtype = htons(hwtype);
++
++		/* time is Jan 1, 2000 (UTC), modulo 2^32 */
++		t64 = (u_int64_t)(time(NULL) - 946684800);
++		dp1->dh6_duid1_time = htonl((u_long)(t64 & 0xffffffff));
++		memcpy((void *)(dp1 + 1), tmpbuf, (len - sizeof(*dp1)));
++
++		dprintf(LOG_DEBUG, FNAME, "generated a new DUID: %s",
++		    duidstr(duid));
++		break;
++	case 2:	/* DUID EN  */
++		len = l + sizeof(struct dhcp6opt_duid_type2);
++
++		memset(duid, 0, sizeof(*duid));
++		duid->duid_len = len;
++		if(len <= 0 && len > 130) {
++			dprintf(LOG_INFO, FNAME, "Invalid duid len");
++			goto fail;
++		}
++			
++		if ((duid->duid_id = (char *)malloc(len)) == NULL) {
++			dprintf(LOG_ERR, FNAME, "failed to allocate memory");
++			goto fail;
++		}
++
++		dp2 = (struct dhcp6opt_duid_type2 *)duid->duid_id;
++		dp2->dh6_duid2_type = htons(2); /* type 2 */
++
++		dp2->dh6_duid2_en = htonl(LTQ_ENTERPRISE_NUMBER);
++		memcpy((void *)(dp2 + 1), tmpbuf, (len - sizeof(*dp2)));
++		dprintf(LOG_DEBUG, FNAME, "generated a new DUID: %s",
++		    duidstr(duid));
++		break;
++	case 3:	/* DUID LL */
++		len = l + sizeof(struct dhcp6opt_duid_type3);
++
++		memset(duid, 0, sizeof(*duid));
++		duid->duid_len = len;
++		if(len <= 0 && len > 130) {
++			dprintf(LOG_INFO, FNAME, "Invalid duid len");
++			goto fail;
++		}
++			
++		if ((duid->duid_id = (char *)malloc(len)) == NULL) {
++			dprintf(LOG_ERR, FNAME, "failed to allocate memory");
++			goto fail;
++		}
++
++		dp3 = (struct dhcp6opt_duid_type3 *)duid->duid_id;
++		dp3->dh6_duid3_type = htons(3); /* type 2 */
++
++		dp3->dh6_duid3_hwtype = htons(hwtype);
++
++		memcpy((void *)(dp3 + 1), tmpbuf, (len - sizeof(*dp3)));
++
++		dprintf(LOG_DEBUG, FNAME, "generated a new DUID: %s",
++		    duidstr(duid));
++		break;
++	}
++
++	dprintf(LOG_INFO, FNAME, "DUID Type = %d\n"
++		"DUID:%s\n", lq_duid_type, duidstr(duid));
++
++	snprintf(sCommand, sizeof(sCommand), "echo %s > /tmp/dhcp6c_%d_duid",duidstr(duid), lq_duid_type);
++	system(sCommand);
++	
++	snprintf(buf, LQ_TMB_BUF_SIZE,"dhcpv6_%d_duid_len=\"%d\"\n", lq_duid_type, len);
++
++	ret = ifx_SetObjData(FILE_RC_CONF, TAG_IPV6, flags, 1, buf);                                                                                
++	if(ret != IFX_SUCCESS) {
++		dprintf(LOG_INFO, FNAME, "ifx_SetObjData failed for dhcpv6_%d_duid_len\n", lq_duid_type);
++	}
++	memset(buf, 0, LQ_TMB_BUF_SIZE);
++	cp = buf;
++	for (i = 0; i < duid->duid_len && i <= 128; i++) {
++		n = sprintf(cp,"%02x",(duid->duid_id[i] & 0xff));
++		if (n < 0)
++			break;
++		cp+=n;
++	}
++	memset(tmpbuf, '\0', sizeof(tmpbuf));
++	sprintf(tmpbuf,"dhcpv6_%d_duid=\"%s\"\n", lq_duid_type, buf);
++	ret = ifx_SetObjData(FILE_RC_CONF, TAG_IPV6, flags, 1, &tmpbuf);
++	if(ret != IFX_SUCCESS) {
++		dprintf(LOG_INFO, FNAME, "ifx_SetObjData failed for dhcpv6_%d_duid\n", lq_duid_type);
++	}
++
++	if (ifx_flash_write()<=0) {      
++		dprintf(LOG_INFO, FNAME, "Save settings FAILED for DUID \n");
++	}
++ 
++	if(buf != NULL) {
++		free(buf);
++		buf = NULL;
++	}
++
++#endif
+ 
+ 	if (fp)
+ 		fclose(fp);
+@@ -1366,9 +1465,15 @@
+ 		free(duid->duid_id);
+ 		duid->duid_id = NULL; /* for safety */
+ 	}
++#ifdef RCCONF_CHANGE
++	if(buf != NULL) {
++		free(buf);
++	}
++#endif
+ 	return (-1);
+ }
+ 
++
+ #ifdef __sun__
+ struct hwparms {
+ 	char *buf;
+diff -Nuar wide-dhcpv6-20080615_org/dhcp6c.c wide-dhcpv6-20080615/dhcp6c.c
+--- wide-dhcpv6-20080615_org/dhcp6c.c	2011-09-09 16:25:29.950641778 +0530
++++ wide-dhcpv6-20080615/dhcp6c.c	2011-09-09 16:26:14.810641985 +0530
+@@ -100,6 +100,9 @@
+ int ctlsock = -1;		/* control TCP port */
+ char *ctladdr = DEFAULT_CLIENT_CONTROL_ADDR;
+ char *ctlport = DEFAULT_CLIENT_CONTROL_PORT;
++#ifdef RCCONF_CHANGE
++extern int lq_duid_type; 
++#endif
+ 
+ #define DEFAULT_KEYFILE SYSCONFDIR "/dhcp6cctlkey"
+ #define CTLSKEW 300
+@@ -193,7 +196,7 @@
+ 	else
+ 		progname++;
+ 
+-	while ((ch = getopt(argc, argv, "c:dDfik:p:")) != -1) {
++	while ((ch = getopt(argc, argv, "c:dDfik:p:t:")) != -1) {
+ 		switch (ch) {
+ 		case 'c':
+ 			conffile = optarg;
+@@ -216,6 +219,18 @@
+ 		case 'p':
+ 			pid_file = optarg;
+ 			break;
++#ifdef RCCONF_CHANGE
++		case 't':
++			lq_duid_type = atoi(optarg);
++			
++			if(lq_duid_type != 1 && lq_duid_type != 2 && 
++			lq_duid_type != 3 && lq_duid_type != 0) {
++				usage();
++				exit(0);
++			}
++			break;
++#endif
++
+ 		default:
+ 			usage();
+ 			exit(0);
+@@ -277,7 +292,7 @@
+ {
+ 
+ 	fprintf(stderr, "usage: dhcp6c [-c configfile] [-dDfi] "
+-	    "[-p pid-file] interface [interfaces...]\n");
++	    "[-p pid-file] [-t duid-type(eg 0,1,2,3)] interface [interfaces...]\n");
+ }
+ 
+ /*------------------------------------------------------------*/
+diff -Nuar wide-dhcpv6-20080615_org/dhcp6.h wide-dhcpv6-20080615/dhcp6.h
+--- wide-dhcpv6-20080615_org/dhcp6.h	2011-09-09 16:25:29.951642384 +0530
++++ wide-dhcpv6-20080615/dhcp6.h	2011-09-09 16:26:14.815641701 +0530
+@@ -336,6 +336,20 @@
+ 	/* link-layer address follows */
+ } __attribute__ ((__packed__));
+ 
++/* DUID type 2 */
++struct dhcp6opt_duid_type2 {
++	u_int16_t dh6_duid2_type;
++	u_int32_t dh6_duid2_en;
++	/* identifier follows */
++} __attribute__ ((__packed__));
++
++/* DUID type 3 */
++struct dhcp6opt_duid_type3 {
++	u_int16_t dh6_duid3_type;
++	u_int16_t dh6_duid3_hwtype;
++	/* link-layer address follows */
++} __attribute__ ((__packed__));
++
+ /* Status Code */
+ struct dhcp6opt_stcode {
+ 	u_int16_t dh6_stcode_type;

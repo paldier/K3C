@@ -1,0 +1,670 @@
+diff -Nuar wide-dhcpv6-20080615_org/addrconf.c wide-dhcpv6-20080615/addrconf.c
+--- wide-dhcpv6-20080615_org/addrconf.c	2011-11-28 16:02:22.599890376 +0530
++++ wide-dhcpv6-20080615/addrconf.c	2011-11-28 16:19:50.153765096 +0530
+@@ -184,8 +184,7 @@
+ 	#endif 
+ 
+ 	if (sa->addr.vltime != 0)
+-		if (na_ifaddrconf(IFADDRCONF_ADD, sa, ev) < 0)
+-			return (-1);
++		na_ifaddrconf(IFADDRCONF_ADD, sa, ev);
+ 
+ 	/*
+ 	 * If the new vltime is 0, this address immediately expires.
+@@ -414,7 +413,7 @@
+ 	    addr->pltime, addr->vltime);
+ 	#else
+ #ifdef DHCP6_TAHI_FIX
+-	ret = ifaddrconf(cmd, sa->dhcpif->ifname, &sin6, 64,
++	ret = ifaddrconf(cmd, sa->dhcpif->ifname, &sin6, 128,
+ 	    addr->pltime, addr->vltime);
+ #else
+ 	ret = ifaddrconf(cmd, sa->dhcpif->ifname, &sin6, 128,
+diff -Nuar wide-dhcpv6-20080615_org/common.c wide-dhcpv6-20080615/common.c
+--- wide-dhcpv6-20080615_org/common.c	2011-11-28 16:02:22.601889887 +0530
++++ wide-dhcpv6-20080615/common.c	2011-11-28 16:19:50.154765011 +0530
+@@ -3722,6 +3722,10 @@
+ 		syslog(level, "%s%s%s", fname, printfname ? ": " : "", logbuf);
+ }
+ 
++#if 1 /* REBIND_REMOVEADDR */
++char addr_br0[256];
++char addr_wan[256];
++#endif
+ int
+ ifaddrconf(cmd, ifname, addr, plen, pltime, vltime)
+ 	ifaddrconf_cmd_t cmd;
+@@ -3826,6 +3830,17 @@
+ 	dprintf(LOG_DEBUG, FNAME, "%s an address %s/%d on %s", cmdstr,
+ 	    addr2str((struct sockaddr *)addr), plen, ifname);
+ 
++#if 1	/* REBIND_REMOVEADDR */
++	if(strstr("br0", ifname)) {
++		snprintf(addr_br0, sizeof(addr_br0), "ip -6 addr %%s %s/%d dev %s", 
++		 addr2str((struct sockaddr *)addr),  plen,  ifname);
++	} else {
++		snprintf(addr_wan,  sizeof(addr_br0), "ip -6 addr %%s %s/%d dev %s", 
++		 addr2str((struct sockaddr *)addr),  plen,  ifname);
++	}
++#endif
++		
++
+ 	close(s);
+ 	return (0);
+ }
+diff -Nuar wide-dhcpv6-20080615_org/config.h wide-dhcpv6-20080615/config.h
+--- wide-dhcpv6-20080615_org/config.h	2011-11-28 16:02:22.602907838 +0530
++++ wide-dhcpv6-20080615/config.h	2011-11-28 16:19:50.155765516 +0530
+@@ -155,8 +155,13 @@
+ #ifdef RECONFIGURE_CLIENT
+ 	int sub_state;
+ #endif
++	int gp_flag;
+ 
+ };
++/* Flags used for gp_flag */
++#define LTQ_IANA_RELEASE 0x1 
++#define LTQ_IAPD_RELEASE 0x2
++#define LTQ_IAPD_RESEASE_SCHED 0x4
+ #ifdef RECONFIGURE_CLIENT
+ typedef enum { DHCP6_EVDATA_IAPD, DHCP6_EVDATA_IANA, DHCP6_EVDATA_ORO } dhcp6_eventdata_t;
+ #else
+diff -Nuar wide-dhcpv6-20080615_org/dhcp6c.c wide-dhcpv6-20080615/dhcp6c.c
+--- wide-dhcpv6-20080615_org/dhcp6c.c	2011-11-28 16:02:22.603764936 +0530
++++ wide-dhcpv6-20080615/dhcp6c.c	2011-11-28 16:19:50.156764948 +0530
+@@ -85,6 +85,8 @@
+ static sig_atomic_t sig_flags = 0;
+ #define SIGF_TERM 0x1
+ #define SIGF_HUP 0x2
++#define SIGF_USR1 0x4
++#define SIGF_USR2 0x8
+ 
+ const dhcp6_mode_t dhcp6_mode = DHCP6_MODE_CLIENT;
+ 
+@@ -126,7 +128,7 @@
+ static void usage __P((void));
+ static void client6_init __P((void));
+ static void client6_startall __P((int));
+-static void free_resources __P((struct dhcp6_if *));
++void free_resources __P((struct dhcp6_if *));
+ static void client6_mainloop __P((void));
+ static int client6_do_ctlcommand __P((char *, ssize_t));
+ static void client6_reload __P((void));
+@@ -449,6 +451,18 @@
+ 		    strerror(errno));
+ 		exit(1);
+ 	}
++	if (signal(SIGUSR1, client6_signal) == SIG_ERR) {
++		dprintf(LOG_WARNING, FNAME, "failed to set signal: %s",
++		    strerror(errno));
++		exit(1);
++	}
++	if (signal(SIGUSR2, client6_signal) == SIG_ERR) {
++		dprintf(LOG_WARNING, FNAME, "failed to set signal: %s",
++		    strerror(errno));
++		exit(1);
++	}
++
++
+ }
+ 
+ int
+@@ -506,8 +520,7 @@
+ 			exit(1); /* initialization failure.  we give up. */
+ 	}
+ }
+-
+-static void
++void
+ free_resources(freeifp)
+ 	struct dhcp6_if *freeifp;
+ {
+@@ -574,6 +587,27 @@
+ 		free_resources(NULL);
+ 		client6_startall(1);
+ 	}
++	if ((sig_flags & SIGF_USR1)) {
++		dprintf(LOG_INFO, FNAME, "releaseing resources");
++		free_resources(NULL);
++	}
++#if 1
++	if ((sig_flags & SIGF_USR2)) {
++		dprintf(LOG_INFO, FNAME, "reloading..");
++		free_resources(NULL);
++		client6_startall(1);
++	}
++#else 
++	if ((sig_flags & SIGF_USR2)) {
++		struct dhcp6_if *ifp = NULL;
++		dprintf(LOG_INFO, FNAME, "reconfigure...");
++		for (ifp = dhcp6_if; ifp; ifp = ifp->next) {
++			extern void renew_all_ia(struct dhcp6_if *ifp);
++			renew_all_ia(ifp);
++		}
++	}
++#endif
++
+ 
+ 	sig_flags = 0;
+ }
+@@ -1076,6 +1110,13 @@
+                     }
+                     else if (ret == 2)
+                     {
++			char cmdbuf[300];
++			
++			snprintf(cmdbuf, sizeof(cmdbuf), 
++				"echo 0 > /proc/sys/net/ipv6/conf/%s/disable_ipv6", 
++				ev->ifp->ifname);
++			system(cmdbuf);
++			sleep(1);
+                         client6_send(ev);
+ 		        ev->state=DHCP6S_DECLINE_SENT;
+                         ev->max_retrans_cnt = DEC_MAX_RC;
+@@ -1334,6 +1375,14 @@
+ 	case SIGHUP:
+ 		sig_flags |= SIGF_HUP;
+ 		break;
++	case SIGUSR1:
++		sig_flags |= SIGF_USR1;
++		break;
++	case SIGUSR2:
++		sig_flags |= SIGF_USR2;
++		break;
++
++	
+ 	}
+ }
+ 
+@@ -1504,6 +1553,19 @@
+ 				    "failed to add an IAPD");
+ 				goto end;
+ 			}
++#if 1 /* REBIND_REMOVEADDR */
++			if(ev->state == DHCP6S_REBIND) {
++				char cmdbuf[300];
++				extern addr_br0[256];
++				extern addr_wan[256];
++				snprintf(cmdbuf, sizeof(cmdbuf), addr_br0, "del");
++				dprintf(LOG_NOTICE, FNAME, "executing %s\n", cmdbuf);
++				system(cmdbuf);
++				snprintf(cmdbuf, sizeof(cmdbuf), addr_wan, "del");
++				dprintf(LOG_NOTICE, FNAME, "executing %s\n", cmdbuf);
++				system(cmdbuf);
++			}
++#endif
+ 			break;
+ 		case DHCP6_EVDATA_IANA:
+ 			if (dhcp6_copy_list(&optinfo.iana_list,
+@@ -1512,6 +1574,15 @@
+ 				    "failed to add an IAPD");
+ 				goto end;
+ 			}
++#if 1 /* REBIND_REMOVEADDR */
++			if(ev->state == DHCP6S_REBIND) {
++				char cmdbuf[300];
++				extern addr_wan[256];
++				snprintf(cmdbuf, sizeof(cmdbuf), addr_wan, "del");
++				system(cmdbuf);
++			}
++#endif
++
+ 			break;
+ #ifdef RECONFIGURE_CLIENT
+ 		case DHCP6_EVDATA_ORO: 
+@@ -2028,6 +2099,12 @@
+ 	}
+ 
+ 	if(state == DHCP6S_RENEW) {
++
++		extern void renew_all_ia(struct dhcp6_if *ifp);
++		renew_all_ia(ifp);
++	}
++/*
++	 {
+ 		ial = NULL;
+ 		evd = NULL;
+ 
+@@ -2104,6 +2181,7 @@
+ 	ifp->reconfig_flag |= DHCPIFF_RECONF_PROCESSING;
+ 
+ 	client6_send(ev);
++*/
+ 
+ 	return (0);
+ 
+@@ -2416,14 +2494,24 @@
+ 	}
+ 
+ 	/* dhcp6_remove_event(ev); Decline hander will remove it*/
+-        if((ev->state != DHCP6S_DECLINE) && (ev->state != DHCP6S_DECLINE_SENT))
++        if(((ev->state != DHCP6S_DECLINE) && (ev->state != DHCP6S_DECLINE_SENT))
++	/*|| !(ev->gp_flag & LTQ_IAPD_RELEASE)*/)
+         {
+ 		dhcp6_remove_event(ev);
+         }
+         else if((ev->state == DHCP6S_DECLINE_SENT) && !strcmp(decline_status, decline_stat))
+         {
++		char cmdbuf[300];
+ 		dhcp6_remove_event(ev);
+-        }
++
++		snprintf(cmdbuf, sizeof(cmdbuf), 
++				"echo 1 > /proc/sys/net/ipv6/conf/%s/disable_ipv6", 
++				ev->ifp->ifname);
++		system(cmdbuf);
++        } else {
++		dhcp6_remove_evdata(ev);
++		TAILQ_INIT(&ev->data_list);
++	}
+ 
+ 	if (state == DHCP6S_RELEASE) {
+ 		/*
+@@ -2433,7 +2521,29 @@
+ 		 * by the server.
+ 		 * [RFC3315 Section 18.1.8]
+ 		 */
++		/* Test CPEInterop.1.5: DHCPv6 Prefix Delegation D:Release Message
++		 *  Date: 3rd Nov 2011 */
++		
++#if 0
++		if(ev->gp_flag & LTQ_IAPD_RELEASE) {
++			int32_t t1 = find1st_ia(IATYPE_PD, &optinfo->iapd_list, ifp, &optinfo->serverID);
++			struct timeval timo;
++			if(t1 != -1) {
++				timo.tv_sec = t1;
++                		timo.tv_usec = 0;
++                		dhcp6_set_timer(&timo, ev->timer);
++				ev->gp_flag=ev->gp_flag&(~LTQ_IAPD_RELEASE);
++			}
++			
++			dprintf(LOG_DEBUG, FNAME, "%s:%d LTQ_IAPD_RELEASE is set\n", __func__, __LINE__);
++				
++		} else {
++			check_exit();
++		}
++#else
+ 		check_exit();
++#endif
++		
+ 	}
+ 
+ 	dprintf(LOG_DEBUG, FNAME, "got an expected reply, sleeping.");
+@@ -2625,7 +2735,8 @@
+ 			 * Right now, we simply discard unauthenticated
+ 			 * messages.
+ 			 */
+-			return (-1);
++			return 0;
++			//return (-1); 
+ 		}
+ 	} else {
+ 		/* if authenticated, update the "previous" RD value */
+diff -Nuar wide-dhcpv6-20080615_org/dhcp6c_ia.c wide-dhcpv6-20080615/dhcp6c_ia.c
+--- wide-dhcpv6-20080615_org/dhcp6c_ia.c	2011-11-28 16:02:22.605765043 +0530
++++ wide-dhcpv6-20080615/dhcp6c_ia.c	2011-11-28 16:19:50.158765479 +0530
+@@ -49,7 +49,7 @@
+ #include "prefixconf.h"
+ #include "addrconf.h"
+ 
+-typedef enum {IAS_ACTIVE, IAS_RENEW, IAS_REBIND} iastate_t;
++typedef enum {IAS_ACTIVE, IAS_RENEW, IAS_REBIND, IAS_RELEASEPD} iastate_t;
+ 
+ struct ia {
+ 	TAILQ_ENTRY(ia) link;
+@@ -80,7 +80,7 @@
+ static int update_authparam __P((struct ia *, struct authparam *));
+ static void reestablish_ia __P((struct ia *));
+ static void callback __P((struct ia *));
+-static int release_ia __P((struct ia *));
++static int release_ia __P((struct ia *, struct dhcp6_if *));
+ static void remove_ia __P((struct ia *));
+ static struct ia *get_ia __P((iatype_t, struct dhcp6_if *, struct ia_conf *,
+     struct dhcp6_listval *, struct duid *));
+@@ -109,6 +109,67 @@
+ 	return iac;
+ }
+ #endif
++#if 0
++int32_t
++find1st_ia(iatype, ialist, ifp, serverid)
++	iatype_t iatype;
++	struct dhcp6_list *ialist;
++	struct dhcp6_if *ifp;
++	struct duid *serverid;
++{
++	struct ia *ia;
++	struct ia_conf *iac;
++	struct dhcp6_listval *iav, *siav;
++
++	for (iav = TAILQ_FIRST(ialist); iav; iav = TAILQ_NEXT(iav, link)) {
++		/* if we're not interested in this IA, ignore it. */
++		if ((iac = find_iaconf(&ifp->iaconf_list, iatype,
++		    iav->val_ia.iaid)) == NULL) {
++			continue;
++		}
++
++		/* validate parameters */
++		/*
++		 * If a client receives an IA_NA with T1 greater than T2, and
++		 * both T1 and T2 are greater than 0, the client discards the
++		 * IA_NA option and processes the remainder of the message as
++		 * though the server had not included the invalid IA_NA option.
++		 * [RFC3315 22.4]
++		 * We apply the same rule to IA_PD as well.
++		 */
++		if (iav->val_ia.t2 != 0 && iav->val_ia.t1 > iav->val_ia.t2) {
++			dprintf(LOG_INFO, FNAME,
++			    "invalid IA: T1(%lu) > T2(%lu)",
++			    iav->val_ia.t1, iav->val_ia.t2);
++			continue;
++		}
++
++		/* locate the local IA or make a new one */
++		ia = get_ia(iatype, ifp, iac, iav, serverid);
++		if(ia) {
++			return (int32_t)ia->t1;
++		}
++		
++
++	}	
++	return -1;
++}
++#endif
++int
++release_ia_pd(ia)
++	struct ia *ia;
++{
++	struct timeval timo;
++	ia->state = IAS_RELEASEPD;
++	
++	if (ia->timer)
++        	dhcp6_remove_timer(&ia->timer);
++	ia->timer = dhcp6_add_timer(ia_timo, ia);
++	timo.tv_sec = ia->t1;
++        timo.tv_usec = 0;
++        dhcp6_set_timer(&timo, ia->timer);
++}
++
+ 
+ void
+ update_ia(iatype, ialist, ifp, serverid, authparam, optinfo, ev)
+@@ -181,7 +242,17 @@
+ 					    "failed to update a prefix %s/%d",
+ 					    in6addr2str(&siav->val_prefix6.addr, 0),
+ 					    siav->val_prefix6.plen);
++				} 
++#if 1	/* REBIND_REMOVEADDR */
++				else {
++					if(ev->state == DHCP6S_REBIND) {
++						char cmdbuf[300];
++						extern addr_br0[256];
++						snprintf(cmdbuf, sizeof(cmdbuf), addr_br0, "add");
++						system(cmdbuf);
++					}
+ 				}
++#endif
+ 				break;
+ 			case DHCP6_LISTVAL_STATEFULADDR6:
+ 				ianac = (struct iana_conf *)iac;
+@@ -442,7 +513,7 @@
+ 		for (ia = TAILQ_FIRST(&iac->iadata); ia; ia = ia_next) {
+ 			ia_next = TAILQ_NEXT(ia, link);
+ 
+-			(void)release_ia(ia);
++			int32_t gp_flag = release_ia(ia, ifp);
+ 
+ 			/*
+ 			 * The client MUST stop using all of the addresses
+@@ -450,14 +521,20 @@
+ 			 * Release message exchange process.
+ 			 * [RFC3315 Section 18.1.6]
+ 			 */
+-			remove_ia(ia);
++			if(gp_flag != -1 && (gp_flag&LTQ_IAPD_RELEASE)) {
++				dprintf(LOG_DEBUG, FNAME, "****LTQ_IAPD_RELEASE is set skip ia***\n");
++				release_ia_pd(ia);
++			} else {
++				remove_ia(ia);
++			}
+ 		}
+ 	}
+ }
+ 
+ static int
+-release_ia(ia)
++release_ia(ia, ifp)
+ 	struct ia *ia;
++	struct dhcp6_if *ifp;
+ {
+ 	struct dhcp6_ia iaparam;
+ 	struct dhcp6_event *ev;
+@@ -466,13 +543,22 @@
+ 	dprintf(LOG_DEBUG, FNAME, "release an IA: %s-%lu",
+ 	    iastr(ia->conf->type), ia->conf->iaid);
+ 
++	dprintf(LOG_DEBUG, FNAME, "ifp->ifname = %s\n", ifp->ifname);
++	dprintf(LOG_DEBUG, FNAME, "ia->ifp->ifname = %s\n", ia->ifp->ifname);
+ 	if ((ev = dhcp6_create_event(ia->ifp, DHCP6S_RELEASE))
+ 	    == NULL) {
+ 		dprintf(LOG_NOTICE, FNAME, "failed to create a new event");
+ 		goto fail;
+ 	}
+-	TAILQ_INSERT_TAIL(&ia->ifp->event_list, ev, link);
++	TAILQ_INSERT_TAIL(&ifp->event_list, ev, link);
+ 
++	if(ia->conf->type == IATYPE_PD) {
++		ev->gp_flag |= LTQ_IAPD_RELEASE;
++	} 
++	if (ia->conf->type == IATYPE_NA) {
++		ev->gp_flag |= LTQ_IANA_RELEASE;
++	}
++		
+ 
+ 	if ((ev->timer = dhcp6_add_timer(client6_timo, ev)) == NULL) {
+ 		dprintf(LOG_NOTICE, FNAME,
+@@ -519,7 +605,7 @@
+ 
+ 	client6_send(ev);
+ 
+-	return (0);
++	return (ev->gp_flag);
+ 
+   fail:
+ 	if (ev)
+@@ -564,7 +650,7 @@
+ 	(void)client6_start(ifp);
+ }
+ 
+-static struct dhcp6_timer *
++struct dhcp6_timer *
+ ia_timo(arg)
+ 	void *arg;
+ {
+@@ -598,6 +684,7 @@
+ 	case IAS_RENEW:
+ 		ia->state = IAS_REBIND;
+ 		dhcpstate = DHCP6S_REBIND;
++		/* remove_iapd_addr(ia->ctl); */
+ 
+ 		/*
+ 		 * We need keep DUID for sending Release in this state.
+@@ -607,6 +694,10 @@
+ 		 */
+ 		dhcp6_remove_timer(&ia->timer);
+ 		break;
++	case IAS_RELEASEPD:
++		dhcpstate = DHCP6S_RELEASE;
++		dhcp6_remove_timer(&ia->timer);
++		break;
+ 	default:
+ 		dprintf(LOG_ERR, FNAME, "invalid IA state (%d)",
+ 		    (int)ia->state);
+@@ -636,7 +727,7 @@
+ 	evd->event = ev;
+ 	TAILQ_INSERT_TAIL(&ev->data_list, evd, link);
+ 
+-	if (ia->state == IAS_RENEW) {
++	if (ia->state == IAS_RENEW ||ia->state == IAS_RELEASEPD) {
+ 		if (duidcpy(&ev->serverid, &ia->serverid)) {
+ 			dprintf(LOG_NOTICE, FNAME, "failed to copy server ID");
+ 			goto fail;
+@@ -648,6 +739,7 @@
+ 	iaparam.t2 = ia->t2;
+ 	switch(ia->state) {
+ 	case IAS_RENEW:
++	case IAS_RELEASEPD:
+ 		if (ia->ctl && ia->ctl->renew_data) {
+ 			if ((*ia->ctl->renew_data)(ia->ctl, &iaparam,
+ 			    &ia->evdata, evd)) {
+@@ -688,12 +780,22 @@
+ 	switch(ia->state) {
+ 	case IAS_RENEW:
+ 	case IAS_REBIND:
++	case IAS_RELEASEPD:
+ 		client6_send(ev);
+ 		break;
+ 	case IAS_ACTIVE:
+ 		/* what to do? */
+ 		break;
+ 	}
++	if(ia->state == IAS_RELEASEPD) {
++		extern free_resources(void *);
++		if (ia->timer)
++        		dhcp6_remove_timer(&ia->timer);
++		remove_ia(ia);
++		free_resources(NULL);
++		return NULL;
++	}
++		
+ 
+ 	return (ia->timer);
+ 
+@@ -704,6 +806,29 @@
+ 	return (NULL);
+ }
+ 
++void renew_all_ia(ifp)
++	struct dhcp6_if *ifp;
++{
++	struct ia_conf *iac;
++	struct ia *ia, *ia_next;
++	struct timeval timo;
++
++	for (iac = TAILQ_FIRST(&ifp->iaconf_list); iac;
++	iac = TAILQ_NEXT(iac, link)) {
++	for (ia = TAILQ_FIRST(&iac->iadata); ia; ia = ia_next) {
++		ia_next = TAILQ_NEXT(ia, link);
++			ia->state=IAS_ACTIVE;
++
++			if (ia->timer)
++        			dhcp6_remove_timer(&ia->timer);
++			ia->timer = dhcp6_add_timer(ia_timo, ia);
++			timo.tv_sec = 0;
++        		timo.tv_usec = 500;
++        		dhcp6_set_timer(&timo, ia->timer);
++		}
++	}
++}
++
+ static struct ia *
+ get_ia(type, ifp, iac, iaparam, serverid)
+ 	iatype_t type;
+diff -Nuar wide-dhcpv6-20080615_org/dhcp6_ctl.c wide-dhcpv6-20080615/dhcp6_ctl.c
+--- wide-dhcpv6-20080615_org/dhcp6_ctl.c	2011-11-28 16:02:22.605765043 +0530
++++ wide-dhcpv6-20080615/dhcp6_ctl.c	2011-11-28 16:19:50.159765560 +0530
+@@ -60,6 +60,9 @@
+ #include <base64.h>
+ #include <control.h>
+ #include <dhcp6_ctl.h>
++#include <unistd.h>
++#include <fcntl.h>
++
+ 
+ TAILQ_HEAD(dhcp6_commandqueue, dhcp6_commandctx);
+ 
+@@ -76,7 +79,27 @@
+ 	ssize_t input_filled;
+ 	int (*callback) __P((char *, ssize_t));
+ };
+-
++/* Set the FD_CLOEXEC  flag of desc if value is nonzero,
++   or clear the flag if value is 0.
++   Return 0 on success, or -1 on error with errno  set. 
++*/ 
++        
++int
++set_cloexec_flag (int desc, int value)
++{
++	int oldflags = fcntl (desc, F_GETFD, 0);
++	/* If reading the flags failed, return error indication now. */
++	if (oldflags < 0)
++		return oldflags;
++
++	/* Set just the flag we want to set. */
++	if (value != 0)
++		oldflags |= FD_CLOEXEC;
++	else
++		oldflags &= ~FD_CLOEXEC;
++	/* Store modified flag word in the descriptor. */
++	return fcntl (desc, F_SETFD, oldflags);
++}
+ int
+ dhcp6_ctl_init(addr, port, max, sockp)
+ 	char *addr, *port;
+@@ -103,6 +126,7 @@
+ 		    strerror(errno));
+ 		goto fail;
+ 	}
++	set_cloexec_flag(ctlsock, 1);
+ 	on = 1;
+ 	if (setsockopt(ctlsock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))
+ 	    < 0) {
+diff -Nuar wide-dhcpv6-20080615_org/prefixconf.c wide-dhcpv6-20080615/prefixconf.c
+--- wide-dhcpv6-20080615_org/prefixconf.c	2011-11-28 16:02:22.606765422 +0530
++++ wide-dhcpv6-20080615/prefixconf.c	2011-11-28 16:39:47.786889755 +0530
+@@ -578,7 +578,25 @@
+ 
+ 	free(iac);
+ }
++/* void
++remove_iapd_addr(iac)
++	struct iactl *iac;
++{
++	struct iactl_pd *iac_pd = (struct iactl_pd *)iac;
++	struct siteprefix *sp;
++	struct dhcp6_ifprefix *ip;
+ 
++	for (sp = TAILQ_FIRST(&iac_pd->siteprefix_head); sp;
++	    sp = TAILQ_NEXT(sp, link)) {
++
++		dprintf(LOG_DEBUG, FNAME, "=========remove a site prefix %s/%d from interface=========",
++	    		in6addr2str(&sp->prefix.addr, 0), sp->prefix.plen);
++		for (ip = TAILQ_FIRST(&sp->ifprefix_list); ip; ip=TAILQ_NEXT(ip, plink)) {
++			dprintf(LOG_DEBUG, FNAME, "=========remove address from ip = %#x=========\n", ip);
++			pd_ifaddrconf(IFADDRCONF_REMOVE, ip);
++		}
++	}
++} */
+ static int
+ renew_prefix(iac, iaparam, evdp, evd)
+ 	struct iactl *iac;
+@@ -859,6 +877,9 @@
+ 	call_user_script_pd(siteprefix, prefix, pconf, dhcpifp, optinfo, a, ifpfx);
+ #endif
+ 
++#ifdef DHCP6_TAHI_FIX
++	pconf->sla_len = SLA_LEN_UNSPECIFIED;
++#endif
+ 	if (pd_ifaddrconf(IFADDRCONF_ADD, ifpfx))
+ 		goto bad;
+ 
+diff -Nuar wide-dhcpv6-20080615_org/prefixconf.h wide-dhcpv6-20080615/prefixconf.h
+--- wide-dhcpv6-20080615_org/prefixconf.h	2011-11-28 16:02:22.607764809 +0530
++++ wide-dhcpv6-20080615/prefixconf.h	2011-11-28 16:19:50.160764896 +0530
+@@ -39,3 +39,5 @@
+ 			       struct duid *));
+ extern int prefix6_update __P((struct dhcp6_event *, struct dhcp6_list *,
+ 				  struct duid *));
++ /* extern void remove_iapd_addr(struct iactl *iac); */
++

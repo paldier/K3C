@@ -1,0 +1,96 @@
+From 88a447556e4d36f5390a78f508cbe9a3497145bf Mon Sep 17 00:00:00 2001
+From: Jouni Malinen <j@w1.fi>
+Date: Sat, 25 Feb 2017 19:15:24 +0200
+Subject: [PATCH] Fix SELECT_NETWORK freq parameter
+
+This functionality was originally added in commit
+204c9ac4eed9f0ad69497f2efcd0d095dfd6e61c ('Extend select_network command
+with freq= to reduce scan time') re-using wpa_s->manual_scan_freqs and
+MANUAL_SCAN_REQ. That got broken when commit
+35d403096eb63c787bd736dd8ba0902c34398fa8 ('Set NORMAL_SCAN_REQ on
+SELECT_NETWORK/ENABLE_NETWORK') started overriding wpa_s->scan_req for
+SELECT_NETWORK.
+
+Fix this by adding a new scan frequency list specifically for
+SELECT_NETWORK so that this does not need to depend on any specific
+wpa_s->scan_req value.
+
+Signed-off-by: Jouni Malinen <j@w1.fi>
+---
+ wpa_supplicant/ctrl_iface.c       | 7 ++++---
+ wpa_supplicant/scan.c             | 7 +++++++
+ wpa_supplicant/wpa_supplicant.c   | 2 ++
+ wpa_supplicant/wpa_supplicant_i.h | 1 +
+ 4 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index ad7922a..14dcdcd 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -2984,9 +2984,8 @@ static int wpa_supplicant_ctrl_iface_select_network(
+ 	if (pos) {
+ 		int *freqs = freq_range_to_channel_list(wpa_s, pos + 6);
+ 		if (freqs) {
+-			wpa_s->scan_req = MANUAL_SCAN_REQ;
+-			os_free(wpa_s->manual_scan_freqs);
+-			wpa_s->manual_scan_freqs = freqs;
++			os_free(wpa_s->select_network_scan_freqs);
++			wpa_s->select_network_scan_freqs = freqs;
+ 		}
+ 	}
+ 
+@@ -7601,6 +7600,8 @@ static void wpa_supplicant_ctrl_iface_flush(struct wpa_supplicant *wpa_s)
+ 	wpa_s->disconnected = 0;
+ 	os_free(wpa_s->next_scan_freqs);
+ 	wpa_s->next_scan_freqs = NULL;
++	os_free(wpa_s->select_network_scan_freqs);
++	wpa_s->select_network_scan_freqs = NULL;
+ 
+ 	wpa_bss_flush(wpa_s);
+ 	if (!dl_list_empty(&wpa_s->bss)) {
+diff --git a/wpa_supplicant/scan.c b/wpa_supplicant/scan.c
+index 3a100cd..f3ff4cd 100644
+--- a/wpa_supplicant/scan.c
++++ b/wpa_supplicant/scan.c
+@@ -1018,6 +1018,13 @@ ssid_list_set:
+ 		wpa_s->manual_scan_freqs = NULL;
+ 	}
+ 
++	if (params.freqs == NULL && wpa_s->select_network_scan_freqs) {
++		wpa_dbg(wpa_s, MSG_DEBUG,
++			"Limit select_network scan to specified channels");
++		params.freqs = wpa_s->select_network_scan_freqs;
++		wpa_s->select_network_scan_freqs = NULL;
++	}
++
+ 	if (params.freqs == NULL && wpa_s->next_scan_freqs) {
+ 		wpa_dbg(wpa_s, MSG_DEBUG, "Optimize scan based on previously "
+ 			"generated frequency list");
+diff --git a/wpa_supplicant/wpa_supplicant.c b/wpa_supplicant/wpa_supplicant.c
+index 7757a03..774d2c7 100644
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -526,6 +526,8 @@ static void wpa_supplicant_cleanup(struct wpa_supplicant *wpa_s)
+ 
+ 	os_free(wpa_s->manual_scan_freqs);
+ 	wpa_s->manual_scan_freqs = NULL;
++	os_free(wpa_s->select_network_scan_freqs);
++	wpa_s->select_network_scan_freqs = NULL;
+ 
+ 	os_free(wpa_s->manual_sched_scan_freqs);
+ 	wpa_s->manual_sched_scan_freqs = NULL;
+diff --git a/wpa_supplicant/wpa_supplicant_i.h b/wpa_supplicant/wpa_supplicant_i.h
+index 83bfbd5..50cdf86 100644
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -665,6 +665,7 @@ struct wpa_supplicant {
+ 	struct os_reltime scan_min_time;
+ 	int scan_runs; /* number of scan runs since WPS was started */
+ 	int *next_scan_freqs;
++	int *select_network_scan_freqs;
+ 	int *manual_scan_freqs;
+ 	int *manual_sched_scan_freqs;
+ 	unsigned int manual_scan_passive:1;
+-- 
+2.10.1
+

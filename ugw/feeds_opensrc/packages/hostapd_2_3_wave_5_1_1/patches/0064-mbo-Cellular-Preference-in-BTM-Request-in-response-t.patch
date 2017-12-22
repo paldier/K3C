@@ -1,0 +1,274 @@
+From 54ab02ea2e0fb8a383e43bb09b3f368237c43aba Mon Sep 17 00:00:00 2001
+From: Simon Dinkin <simonx.dinkin@intel.com>
+Date: Tue, 1 Nov 2016 18:40:53 +0200
+Subject: [PATCH] mbo: Cellular Preference in BTM Request in response to BTM
+ Query
+
+Added cellular preference to BSS Transition Management Request sent in response to BTM Query.
+Added cellular preference set control interface command.
+
+usage: cellular_pref_set <BSS_name> <cellular preference value - 0 or 1 or 255>
+0 - The MBO AP does not want the MBO STA to use the cellular data connection.
+1 - The MBO AP prefers the MBO STA should not use cellular.
+255 - The MBO AP prefers the MBO STA should use cellular.
+
+Signed-off-by: Simon Dinkin <simonx.dinkin@intel.com>
+---
+ hostapd/ctrl_iface.c         | 58 +++++++++++++++++++++++++++++++++++++++++++-
+ hostapd/hostapd_cli.c        | 19 +++++++++++++++
+ src/ap/hostapd.h             |  1 +
+ src/ap/wnm_ap.c              | 36 ++++++++++++++++++++++-----
+ src/common/ieee802_11_defs.h |  3 ++-
+ wpa_supplicant/mbo.c         |  3 ---
+ 6 files changed, 109 insertions(+), 11 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 31f24af..895b89b 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1086,7 +1086,7 @@ static int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 
+ 		/* Valid values for Cellular preference are: 0, 1, 255 */
+ 		/* A value of -1 indicates that Cellular Data Connection Preference Attribute will not be added to MBO IE */
+-		if (cell_pref != -1 && cell_pref != 0 && cell_pref != 1 && cell_pref != 255) {
++		if (cell_pref != -1 && cell_pref != MBO_CELL_PREF_EXCLUDED && cell_pref != MBO_CELL_PREF_NO_USE && cell_pref != MBO_CELL_PREF_USE) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "Invalid MBO cellular capability %u",
+ 				   cell_pref);
+@@ -3294,6 +3294,59 @@ int hostapd_ctrl_iface_get_radio_info(struct hostapd_data *hapd,
+   return len;
+ }
+ 
++#ifdef CONFIG_MBO
++static int hostapd_ctrl_iface_cellular_pref_set(struct hostapd_data *hapd, char *cmd)
++{
++	char *token, *context = NULL;
++	int val;
++
++        hapd = get_bss_index(cmd, hapd->iface);
++        if (!hapd) {
++                wpa_printf(MSG_INFO,
++                                "CTRL: CELLULAR_PREF_SET - there is no iface with the given name");
++                return -1;
++        }
++
++	if (!hapd->conf->mbo_enabled) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - mbo is not enabled");
++		return -1;
++	}
++
++	if (!hapd->conf->mbo_cell_aware) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - AP is not cellular aware");
++		return -1;
++	}
++
++	cmd = os_strchr(cmd, ' ');
++	if (cmd)
++		cmd++;
++	else {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - Cellular Preference is missing");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - Cellular Preference is missing");
++		return -1;
++	}
++
++	val = atoi(token);
++	if (val != MBO_CELL_PREF_EXCLUDED && val != MBO_CELL_PREF_NO_USE && val != MBO_CELL_PREF_USE) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - Cellular Preference value is out of range (can be 0, 1 or 255)");
++		return -1;
++	}
++
++	hapd->mbo_cell_pref = val;
++
++	return 0;
++}
++#endif /* CONFIG_MBO */
+ 
+ int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const char *cmd)
+ {
+@@ -3949,6 +4002,9 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "MBO_BSS_ASSOC_DISALLOW ", 23) == 0) {
+ 		if (hostapd_ctrl_iface_mbo_bss_assoc_disallow(hapd, buf + 23))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "CELLULAR_PREF_SET ", 18) == 0) {
++		if (hostapd_ctrl_iface_cellular_pref_set(hapd, buf + 18))
++			reply_len = -1;
+ #endif /* CONFIG_MBO */
+ 	} else if (os_strcmp(buf, "ERP_FLUSH") == 0) {
+ 		ieee802_1x_erp_flush(hapd);
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 50fa8e8..dc8bfb2 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1641,6 +1641,24 @@ static int hostapd_cli_cmd_mbo_bss_assoc_disallow(struct wpa_ctrl *ctrl, int arg
+ 	}
+ 	return wpa_ctrl_command(ctrl, cmd);
+ }
++
++static int hostapd_cli_cmd_cellular_pref_set(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 2) {
++		printf("Invalid cellular_pref_set command - requires <BSS_name> and pref <0 or 1 or 255>\n");
++		return -1;
++	}
++
++	res = os_snprintf(cmd, sizeof(cmd), "CELLULAR_PREF_SET %s %s", argv[0], argv[1]);
++	if (os_snprintf_error(sizeof(cmd), res)) {
++		printf("Too long CELLULAR_PREF_SET command.\n");
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
+ #endif /* CONFIG_MBO */
+ 
+ struct hostapd_cli_cmd {
+@@ -1773,6 +1791,7 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  " get list of restricted channels" },
+ #ifdef CONFIG_MBO
+ 	{ "mbo_bss_assoc_disallow", hostapd_cli_cmd_mbo_bss_assoc_disallow, NULL, NULL },
++	{ "cellular_pref_set", hostapd_cli_cmd_cellular_pref_set, NULL, NULL },
+ #endif /* CONFIG_MBO */
+ 	{ NULL, NULL, NULL, NULL }
+ };
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index c48ae0c..54c0f54 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -297,6 +297,7 @@ struct hostapd_data {
+ #ifdef CONFIG_MBO
+ 	unsigned int mbo_assoc_disallow;
+ 	unsigned int mbo_bss_assoc_disallow;
++	unsigned int mbo_cell_pref;
+ #endif /* CONFIG_MBO */
+ 
+ 	struct dl_list nr_db;
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index ac1b348..3b7ffe7 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -253,8 +253,8 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 						  const u8 *addr,
+ 						  u8 dialog_token,
+ 						  const char *url,
+-						  const u8 *nei_rep,
+-						  int nei_rep_len)
++						  const u8 *nei_rep, int nei_rep_len,
++						  const u8 *mbo_attrs, size_t mbo_len)
+ {
+ 	struct ieee80211_mgmt *mgmt;
+ 	size_t url_len, len;
+@@ -266,7 +266,7 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	else
+ 		url_len = 0;
+ 
+-	mgmt = os_zalloc(sizeof(*mgmt) + (url_len ? 1 + url_len : 0) + nei_rep_len);
++	mgmt = os_zalloc(sizeof(*mgmt) + (url_len ? 1 + url_len : 0) + nei_rep_len + (mbo_len ? mbo_len + MBO_IE_HEADER : 0));
+ 	if (mgmt == NULL)
+ 		return -1;
+ 	os_memcpy(mgmt->da, addr, ETH_ALEN);
+@@ -293,13 +293,17 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 		pos += nei_rep_len;
+ 	}
+ 
++	if (mbo_len > 0) {
++		pos += mbo_add_ie(pos, mbo_len + MBO_IE_HEADER, mbo_attrs, mbo_len);
++	}
++
+ 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
+ 		   MACSTR " dialog_token=%u req_mode=0x%x disassoc_timer=%u "
+-		   "validity_interval=%u",
++		   "validity_interval=%u, mbo_len=%u",
+ 		   MAC2STR(addr), dialog_token,
+ 		   mgmt->u.action.u.bss_tm_req.req_mode,
+ 		   le_to_host16(mgmt->u.action.u.bss_tm_req.disassoc_timer),
+-		   mgmt->u.action.u.bss_tm_req.validity_interval);
++		   mgmt->u.action.u.bss_tm_req.validity_interval, mbo_len);
+ 
+ 	len = pos - &mgmt->u.action.category;
+ 	res = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
+@@ -322,6 +326,8 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 	/* Neighbor report buffer - Maximum candidate list size assuming there are no other optional fields */
+ 	u8 nei_rep [IEEE80211_MAX_MMPDU_SIZE-7]={0};
+ 	size_t bss_tm_req_nr_list_len = 0;
++	u8 mbo_attributes[3];
++	size_t mbo_len = 0;
+ 
+ 	if (len < 2) {
+ 		wpa_printf(MSG_DEBUG, "WNM: Ignore too short BSS Transition Management Query from "
+@@ -435,7 +441,25 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 
+ 	}
+ 
+-	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token, NULL, bss_tm_req_nr_list_len > 0 ? nei_rep : NULL, bss_tm_req_nr_list_len);
++#ifdef CONFIG_MBO
++
++	struct sta_info *sta;
++	/* MBO: Add Cellular Preference value for Multimode stations */
++	if (hapd->conf->mbo_enabled && hapd->conf->mbo_cell_aware){
++		sta = ap_get_sta(hapd, addr);
++		if (sta && sta-> mbo_supported && (sta->cell_capa == MBO_CELL_CAPA_AVAILABLE)) {
++			mbo_attributes[0] = MBO_ATTR_ID_CELL_DATA_PREF;
++			mbo_attributes[1] = 1;
++			mbo_attributes[2] = hapd->mbo_cell_pref;
++			mbo_len = 3;
++		}
++	}
++
++#endif /* CONFIG_MBO */
++
++	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token, NULL,
++			bss_tm_req_nr_list_len > 0 ? nei_rep : NULL, bss_tm_req_nr_list_len,
++			mbo_len ? mbo_attributes : NULL, mbo_len);
+ 
+ }
+ 
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 19ade22..7656a37 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -976,6 +976,7 @@ struct ieee80211_ampe_ie {
+ #define OSEN_IE_VENDOR_TYPE 0x506f9a12
+ #define MBO_IE_VENDOR_TYPE 0x506f9a16
+ #define MBO_OUI_TYPE 22
++#define MBO_IE_HEADER 6 /* type + length + oui + oui type */
+ 
+ #define WMM_OUI_TYPE 2
+ #define WMM_OUI_SUBTYPE_INFORMATION_ELEMENT 0
+@@ -1163,7 +1164,7 @@ enum mbo_assoc_disallow_reason {
+ 
+ /* MBO v0.0_r19, 4.2.5: Cellular Data Connection Preference Attribute */
+ /* Table 4-17: Cellular Preference Field Values */
+-enum mbo_cell_pref {
++enum mbo_cell_pref_values {
+ 	MBO_CELL_PREF_EXCLUDED = 0,
+ 	MBO_CELL_PREF_NO_USE = 1,
+ 	MBO_CELL_PREF_USE = 255
+diff --git a/wpa_supplicant/mbo.c b/wpa_supplicant/mbo.c
+index 7e049be..2596f9d 100644
+--- a/wpa_supplicant/mbo.c
++++ b/wpa_supplicant/mbo.c
+@@ -21,9 +21,6 @@
+ #include "bss.h"
+ #include "scan.h"
+ 
+-/* type + length + oui + oui type */
+-#define MBO_IE_HEADER 6
+-
+ 
+ static int wpas_mbo_validate_non_pref_chan(u8 oper_class, u8 chan, u8 reason)
+ {
+-- 
+2.7.4
+

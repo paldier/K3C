@@ -1,0 +1,166 @@
+#!/bin/sh
+
+if [ ! "$CONFIGLOADED" ]; then
+	if [ -r /etc/rc.d/config.sh ]; then
+		. /etc/rc.d/config.sh 2>/dev/null
+		CONFIGLOADED="1"
+	fi
+fi
+
+if [ "$1x" = "x" ]; then
+	echo "Error: should be called from udhcpc"
+else #[
+
+
+	RESOLV_CONF="/etc/resolv.conf"
+	[ -n "$broadcast" ] && BROADCAST="$broadcast"
+	[ -n "$subnet" ] && NETMASK="$subnet"
+	[ -n "$mtu" ] && MTU="$mtu"
+
+	if [ -n "$CONFIG_FEATURE_LTQ_HNX_CONFIG" -a "$CONFIG_FEATURE_LTQ_HNX_CONFIG" = "1" -o -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" = "1" ]; then
+		eval search_str="lan_main_[0-9+]_interface=\\\"$interface\\\""
+	else
+		eval search_str="_interface=\\\"$interface\\\""
+	fi
+	lan_idx=`grep $search_str /flash/rc.conf`
+	lan_idx=${lan_idx%_*}
+	lan_idx=${lan_idx##*_}
+
+	gbc_mode=`/usr/sbin/status_oper -u -f /flash/rc.conf GET gen_bd_cfg gbc_mode`
+
+		# lan dhcp config
+		case "$1" in
+			deconfig)
+				/sbin/ifconfig $interface 0.0.0.0
+				if [ -n "$CONFIG_FEATURE_LTQ_HNX_CONFIG" -a "$CONFIG_FEATURE_LTQ_HNX_CONFIG" = "1" -o -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" = "1" ]; then
+					# set autoip and mask as there is no dhcp ip available
+					AUTOIP=`/usr/sbin/status_oper GET "Lan${lan_idx}_AUTOIF_Info" AUTOIP`
+					if [ $? -eq 0 -a "$AUTOIP" != "0.0.0.0" ]; then
+						/usr/sbin/status_oper SET "Lan${lan_idx}_IF_Info" STATUS CONNECTED IP "$AUTOIP" MASK "255.255.0.0"
+					else
+						/usr/sbin/status_oper SET "Lan${lan_idx}_IF_Info" STATUS DISCONNECTED IP "0.0.0.0" MASK "0.0.0.0"
+					fi
+
+					# update /etc/hosts file
+					/usr/sbin/update_host
+
+					# delete default route with gateway
+					count=1
+					while [ 1 ] ; do
+						ROUTER=`/usr/sbin/status_oper GET "Lan${lan_idx}_GATEWAY" ROUTER$count`
+						if [ $? -ne 0 -o "$ROUTER" = "0.0.0.0" ]; then
+							break;
+						fi
+						/sbin/route del default gw $ROUTER
+						if [ $? -eq 0 ]; then
+							break;
+						fi
+						count=$(( $count + 1 ))
+					done
+
+					# reset /etc/resolv.conf
+					echo -n > /etc/resolv.conf
+					domainname=${hostname#*.}
+					echo "domain $domainname" >> /etc/resolv.conf
+					echo "search $domainname" >> /etc/resolv.conf
+				else
+					/usr/sbin/status_oper SET "Lan${lan_idx}_IF_Info" STATUS DISCONNECTED
+				fi
+				/usr/sbin/status_oper SET "Lan${lan_idx}_GATEWAY" ROUTER1 "0.0.0.0"
+				/usr/sbin/status_oper SET "Lan${lan_idx}_DNS_SERVER" DNS1 "0.0.0.0"
+				/usr/sbin/status_oper SET "Lan${lan_idx}_DOMAIN" DOMAIN ""
+				;;
+			renew)
+				echo "IP renewing..."
+				;;
+			bound)
+				if [ -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" ]; then
+					# remove backdoor IP address (meant for non-dhcp environment)
+					ip address del dev $interface 192.168.1.227
+				fi
+
+				if [ -n "$BROADCAST" ]; then
+					/sbin/ifconfig $interface $ip broadcast $BROADCAST netmask $NETMASK up
+				else
+					/sbin/ifconfig $interface $ip netmask $NETMASK up
+				fi
+
+				/usr/sbin/status_oper SET "Lan${lan_idx}_IF_Info" STATUS CONNECTED IP "$ip" MASK "$NETMASK"
+
+				# add default route with gateway from env - router
+				count=1
+				for i in $router ; do
+					ROUTER="$ROUTER ROUTER$count $i"
+					count=$(( $count + 1 ))
+				done
+
+				if [ -n "$CONFIG_FEATURE_LTQ_HNX_CONFIG" -a "$CONFIG_FEATURE_LTQ_HNX_CONFIG" = "1" -o -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" = "1" ]; then
+					for i in $router ; do
+						/sbin/route add default gw $i dev $interface
+						if [ $? -eq 0 ]; then
+							break;
+						fi
+					done
+				else
+					route add default gw $router
+				fi
+				/usr/sbin/status_oper SET "Lan${lan_idx}_GATEWAY" $ROUTER
+
+				# read each dns server ip address from env and put in /etc/resolv.conf
+				echo -n > /etc/resolv.conf
+				if [ -n "$CONFIG_FEATURE_LTQ_HNX_CONFIG" -a "$CONFIG_FEATURE_LTQ_HNX_CONFIG" = "1" -o -n "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" -a "$CONFIG_TARGET_LTQCPE_PLATFORM_AR9_VB" = "1" ]; then
+					if [ -n "$domain" ]; then
+						echo "domain $domain" >> /etc/resolv.conf
+						echo "search $domain" >> /etc/resolv.conf
+					else
+						domainname=${hostname#*.}
+						echo "domain $domainname" >> /etc/resolv.conf
+						echo "search $domainname" >> /etc/resolv.conf
+					fi
+				fi
+				if [ -n "$dns" ]; then
+					count=1
+					for i in $dns ; do
+						echo "nameserver $i" >> /etc/resolv.conf
+						DNS_ARG="$DNS_ARG DNS$count $i"
+						count=$(( $count + 1 ))
+					done
+					/usr/sbin/status_oper SET "Lan${lan_idx}_DNS_SERVER" $DNS_ARG
+				fi
+
+				/usr/sbin/status_oper SET "Lan${lan_idx}_DOMAIN" DOMAIN "$domain"
+
+				if [ -n "$CONFIG_FEATURE_LTQ_HNX_CONFIG" -a "$CONFIG_FEATURE_LTQ_HNX_CONFIG" = "1" ]; then
+					# update /etc/hosts file
+					/usr/sbin/update_host
+				fi
+
+				bridge_status=`/usr/sbin/status_oper GET global_bridge_config bridge_status`
+				if [ "$bridge_status" = "UNCONFIGURED" ]; then
+					# configure AP mode
+					/usr/sbin/status_oper -u -f /flash/rc.conf SET wlan_main wlmn_0_apType "0"
+					/usr/sbin/status_oper SET global_bridge_config bridge_status "CONFIGURED" bridge_mode "AP"
+				else # bridge_status is empty or "CONFIGURED"
+					bridge_mode=`/usr/sbin/status_oper GET global_bridge_config bridge_mode`
+					# for Video Bridge STA, we acquired this IP address via WLAN.
+					# Trigger attached eth clients to try DHCP again by restart autoneg.
+					if [ "$bridge_mode" = "STA" ]; then
+						eth_ifaces=`cat /proc/net/dev | grep 'eth[0-9]:' | cut -d ':' -f 1`
+						for i in $eth_ifaces ; do
+							/usr/sbin/ethtool -r $i
+						done
+					fi
+				fi
+				;;
+			leasefail)
+				echo "Lease fail..."
+				# configure STA mode
+				bridge_status=`/usr/sbin/status_oper GET global_bridge_config bridge_status`
+				if [ "$bridge_status" = "UNCONFIGURED" ]; then
+					/usr/sbin/status_oper -u -f /flash/rc.conf SET wlan_main wlmn_0_apType "2"
+					/usr/sbin/status_oper SET global_bridge_config bridge_status "CONFIGURED" bridge_mode "STA"
+				fi
+				;;
+		esac
+fi #]
+	#exit 0

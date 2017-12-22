@@ -1,0 +1,425 @@
+From 59fa5fbf58e61043eaadfbc7f548bd39ec929d18 Mon Sep 17 00:00:00 2001
+From: Emmanuel Jillela <emmanuel.jillela@intel.com>
+Date: Tue, 4 Aug 2015 11:56:54 -0700
+Subject: [PATCH 142/441] Updated Mailbox driver with handling of SRAM endian
+ for internal messages.
+
+---
+ arch/x86/hw_mailbox/hw_mbox_drv.c | 231 +++++++++++++++++++++++++-------------
+ include/linux/hw_mbox_defs.h      |  16 ++-
+ 2 files changed, 163 insertions(+), 84 deletions(-)
+
+--- a/arch/x86/hw_mailbox/hw_mbox_drv.c
++++ b/arch/x86/hw_mailbox/hw_mbox_drv.c
+@@ -153,6 +153,69 @@
+ */
+ #define HW_MBOX_IS_ERROR_BIT_SET_FOR_SUPERVISOR(interruptStatus_H)      (((interruptStatus_H) & HW_MBOX_ERROR_BIT_FOR_SUPERVISOR) != 0)
+ 
++#ifdef HW_MBOX_IS_APP_CPU
++/*! \def HW_MBOX_OPCODE_MESSAGE_COPY_TO_SRAM( _pHwMboxMsg , _destSramOffset )
++    \brief Copy a HW MBOX OPCODE Internal Message to the SRAM.
++    \note If CPU is APP_CPU which is LE, handles swap to BE before writing to the SRAM.
++    \param[in] _pHwMboxMsg - pointer to a hwMbox_opcodeMessage_t that holds
++                             the message to be sent.
++    \param[in] _destSramOffset - internal destination offset within the SRAM.
++*/
++#define HW_MBOX_OPCODE_MESSAGE_COPY_TO_SRAM( _pHwMboxMsg, _destSramOffset ) \
++do{\
++    Uint32 _byteCnt = 0;                                    \
++    Uint32 *_pWord = (Uint32 *)( _pHwMboxMsg );             \
++    Uint32 _wordSwapped;                                    \
++    while ( _byteCnt < HW_MBOX_OPCODE_MESSAGE_SIZE )                \
++    {                                                               \
++        _wordSwapped = HW_MBOX_CONVERT_TO_BIG_ENDIAN32(*_pWord);    \
++        HW_MBOX_COPY_TO_SRAM( &_wordSwapped,                        \
++                              sizeof(Uint32),                       \
++                              _destSramOffset + _byteCnt );         \
++        _pWord++;                                                   \
++        _byteCnt += 4;                                              \
++    }                                                               \
++} while (0)
++#else /* HW_MBOX_IS_APP_CPU */
++#define HW_MBOX_OPCODE_MESSAGE_COPY_TO_SRAM( _pHwMboxMsg, _destSramOffset ) \
++do{\
++    HW_MBOX_COPY_TO_SRAM( _pHwMboxMsg,                  \
++                          HW_MBOX_OPCODE_MESSAGE_SIZE,  \
++                          _destSramOffset );            \
++} while (0)
++#endif /* ! HW_MBOX_IS_APP_CPU */
++
++#ifdef HW_MBOX_IS_APP_CPU
++/*! \def HW_MBOX_OPCODE_MESSAGE_COPY_FROM_SRAM( _srcSramOffset, _pHwMboxMsg )
++    \brief Copy a HW MBOX OPCODE Internal Message from the SRAM.
++    \note If CPU is APP_CPU which is LE, handles swap from BE after reading from the SRAM.
++    \param[in]  _srcSramOffset - internal source offset within the SRAM.
++    \param[out] _pHwMboxMsg - pointer to a hwMbox_opcodeMessage_t that will hold
++                              the message that was sent.
++*/
++#define HW_MBOX_OPCODE_MESSAGE_COPY_FROM_SRAM( _srcSramOffset, _pHwMboxMsg ) \
++do{\
++    Uint32 _byteCnt = 0;                                \
++    Uint32 *_pWord = (Uint32 *)( _pHwMboxMsg );         \
++    while ( _byteCnt < HW_MBOX_OPCODE_MESSAGE_SIZE )    \
++    {                                                           \
++        HW_MBOX_COPY_FROM_SRAM( _srcSramOffset + _byteCnt,      \
++                                sizeof(Uint32),                 \
++                                _pWord );                       \
++        *_pWord = HW_MBOX_CONVERT_FROM_BIG_ENDIAN32(*_pWord);   \
++        _pWord++;                                               \
++        _byteCnt += 4;                                          \
++    }                                                           \
++} while (0)
++#else /* HW_MBOX_IS_APP_CPU */
++#define HW_MBOX_OPCODE_MESSAGE_COPY_FROM_SRAM( _srcSramOffset, _pHwMboxMsg ) \
++do{\
++    HW_MBOX_COPY_FROM_SRAM( _srcSramOffset,               \
++                            HW_MBOX_OPCODE_MESSAGE_SIZE,  \
++                            _pHwMboxMsg );                \
++} while (0)
++#endif /* ! HW_MBOX_IS_APP_CPU */
++
+ /************************************************************************/
+ /*     HW_MBOX Package configuration data arrays:                       */
+ /************************************************************************/
+@@ -1042,6 +1105,9 @@ static hwMbox_statistics_t stats;
+ #define STATS_GET_COUNTER( _peer, _type, _isPeerCommander)    (stats.serviceCounters[ _peer ][ ( ( _type ) << 1 ) + ( _isPeerCommander ) ])
+ #define STATS_INC_COUNTER( _peer, _type, _isPeerCommander)    (stats.serviceCounters[ _peer ][ ( ( _type ) << 1 ) + ( _isPeerCommander ) ]++)
+ 
++#define STATS_PEER_IS_COMMANDER   ( True )
++#define STATS_PEER_IS_SUBJECT     ( False )
++
+ /*** High Level Function Helpers ***/
+ 
+ /*! \def WAIT_FOR_CHN_INTR( _cid, _timeOutInMsec)
+@@ -1188,7 +1254,7 @@ int hwMbox_sendCommand(hw_mbox_Masters_e
+         HW_MBOX_COPY_FROM_SRAM(CHN_CFG_MEMBUFF_GET_START(paramCID), dataLen, dataBuf);
+     }
+ 
+-    STATS_INC_COUNTER(subject, hw_mbox_command, False);
++    STATS_INC_COUNTER(subject, hw_mbox_command, STATS_PEER_IS_SUBJECT);
+ 
+     /* release Lock... */
+     up(&CHN_LOCK(paramCID));
+@@ -1287,7 +1353,7 @@ int hwMbox_recvCommand(hw_mbox_Masters_e
+     DPRINTK("receive Command from %s(%d) - command value 0x%08x (%u) with %uB of data",
+             HW_MBOX_MASTER_GET_NAME(commander), commander, *cmd, *cmd, dataLen);
+ 
+-    STATS_INC_COUNTER(commander, hw_mbox_command, True);
++    STATS_INC_COUNTER(commander, hw_mbox_command, STATS_PEER_IS_COMMANDER);
+ 
+     /* release Lock... */
+     up(&CHN_LOCK(paramCID));
+@@ -1503,7 +1569,7 @@ int hwMbox_sendOpcode(hw_mbox_Masters_e
+     {
+         DPRINTK("cid %d: NOTICE - using reserved HW_MBOX opcode tag %u", paramCID, tag);
+     }
+-#endif  /* HW_MBOX_KDBG */
++#endif /* HW_MBOX_KDBG */
+ 
+     if ((dataBuf == NULL) || (dataLen == 0))
+     {
+@@ -1605,48 +1671,11 @@ int hwMbox_sendOpcode(hw_mbox_Masters_e
+     DPRINTK("cid %d: cmdRegVal=0x%08x -> opcode fields: tag=%u, lenInBytes=%u",
+             paramCID, cmdRegVal, opFlds.tag, opFlds.lenInBytes);
+ 
+-    if (opFlds.lenInBytes > 0)
+-    {
+-        /* Reply has data! */
+-
+-        if (opFlds.lenInBytes > dataLen)
+-        {
+-            /* Opcode reply data longer than specified buffer... */
+-            PRINTK_ERR("send Opcode to %s(%d) - opcode reply data length (%uB) > specified buffer size (%uB)!",
+-                       HW_MBOX_MASTER_GET_NAME(subject), subject, opFlds.lenInBytes, dataLen);
+-
+-            /* Output status messge in User Buffer: */
+-            pOpcodeMsg = (hwMbox_opcodeMessage_t *)dataBuf;
+-
+-            pOpcodeMsg->msgType = HW_MBOX_OPCODE_MESSAGE_TYPE_STATUS;
+-            pOpcodeMsg->msgData.msgStatus.status = HW_MBOX_STATUS_OPCODE_ERROR_MESSAGE_TOO_LONG;
+-
+-            /* Set the correct size: */
+-            *replyDataLen = HW_MBOX_OPCODE_MESSAGE_SIZE;
+-
+-            /* release Lock... */
+-            up(&CHN_LOCK(paramCID));
+-            return (-1);
+-        }
+-
+-        /* Get Reply Opcode Data from SRAM: */
+-        DPRINTK("send Opcode to %s(%d) - copying %uB of reply opcode data from SRAM",
+-                HW_MBOX_MASTER_GET_NAME(subject), subject, opFlds.lenInBytes);
+-
+-        DPRINTK("cid %d: copying %uB [out of total %uB channel has] from SRAM at offset 0x%08x",
+-                paramCID, opFlds.lenInBytes, CHN_CFG_MEMBUFF_GET_SIZE(paramCID), CHN_CFG_MEMBUFF_GET_START(paramCID));
+-
+-        HW_MBOX_COPY_FROM_SRAM(CHN_CFG_MEMBUFF_GET_START(paramCID), opFlds.lenInBytes, dataBuf);
+-    }
+-
+-    /* output the Reply size: */
+-    *replyDataLen = opFlds.lenInBytes;
+-
+-    /* check for internal replies: */
++    /* First check for internal replies: */
+     if (opFlds.tag == HW_MBOX_OPCODE_TAG)
+     {
+         /* 3 possible options here:
+-             1. this was a HW MBOX sendOp.
++             1. this was a HW MBOX TAG sendOpcode.
+              2. this was not a HW MBOX sendOpcode but it failed and the
+                 data returned is a Status Message with the error code.
+              3. this was not a HW MBOX sendOpcode and subject used
+@@ -1654,11 +1683,11 @@ int hwMbox_sendOpcode(hw_mbox_Masters_e
+         */
+ 
+         /* Either way we should check for a status message: */
+-        if (*replyDataLen != HW_MBOX_OPCODE_MESSAGE_SIZE)
++        if (opFlds.lenInBytes != HW_MBOX_OPCODE_MESSAGE_SIZE)
+         {
+             PRINTK_ERR("send Opcode to %s(%d) - invalid message for tag %u [got size %uB, excpected size %uB]!",
+                        HW_MBOX_MASTER_GET_NAME(subject), subject,
+-                       HW_MBOX_OPCODE_TAG, *replyDataLen, HW_MBOX_OPCODE_MESSAGE_SIZE);
++                       HW_MBOX_OPCODE_TAG, opFlds.lenInBytes, HW_MBOX_OPCODE_MESSAGE_SIZE);
+ 
+             /* Output status messge in User Buffer: */
+             pOpcodeMsg = (hwMbox_opcodeMessage_t *)dataBuf;
+@@ -1678,6 +1707,17 @@ int hwMbox_sendOpcode(hw_mbox_Masters_e
+         /* Opcode message was sent: */
+         pOpcodeMsg = (hwMbox_opcodeMessage_t *)dataBuf;
+ 
++        /* Copy the Opcode Message from SRAM: */
++
++        DPRINTK("cid %d: copying %uB [out of total %uB channel has] from SRAM at offset 0x%08x",
++                paramCID, opFlds.lenInBytes, CHN_CFG_MEMBUFF_GET_SIZE(paramCID), CHN_CFG_MEMBUFF_GET_START(paramCID));
++
++        HW_MBOX_OPCODE_MESSAGE_COPY_FROM_SRAM(CHN_CFG_MEMBUFF_GET_START(paramCID),
++                                              pOpcodeMsg);
++
++        /* output the Reply size: */
++        *replyDataLen = opFlds.lenInBytes;
++
+         DPRINTK("cid %d: received HW_MBOX_OPCODE_MESSAGE - msgType %d",
+                 paramCID, pOpcodeMsg->msgType);
+ 
+@@ -1695,43 +1735,78 @@ int hwMbox_sendOpcode(hw_mbox_Masters_e
+             up(&CHN_LOCK(paramCID));
+             return (-1);
+         }
++
++        /* Opcode Reply Message of type STATUS: */
++
++        DPRINTK("cid %d: received HW_MBOX_OPCODE_MESSAGE of type STATUS(%d) - STATUS = 0x%x (%u)",
++                paramCID, pOpcodeMsg->msgType,
++                pOpcodeMsg->msgData.msgStatus.status, pOpcodeMsg->msgData.msgStatus.status);
++
++        /* Check the returned STATUS value: */
++        if (pOpcodeMsg->msgData.msgStatus.status != HW_MBOX_STATUS_OK)
++        {
++            /* Internal Error! */
++            PRINTK_ERR("send Opcode to %s(%d) - subject replied with internal error! STATUS = 0x%x (%u)",
++                       HW_MBOX_MASTER_GET_NAME(subject), subject,
++                       pOpcodeMsg->msgData.msgStatus.status, pOpcodeMsg->msgData.msgStatus.status);
++
++            /* release Lock... */
++            up(&CHN_LOCK(paramCID));
++            return (-1);
++        }
+         else
+         {
+-            /* Opcode Reply Message of type STATUS: */
++            DPRINTK("send Opcode to %s(%d) - subject replied with ACK!",
++                    HW_MBOX_MASTER_GET_NAME(subject), subject);
+ 
+-            DPRINTK("cid %d: received HW_MBOX_OPCODE_MESSAGE of type STATUS(%d) - STATUS = 0x%x (%u)",
+-                    paramCID, pOpcodeMsg->msgType,
+-                    pOpcodeMsg->msgData.msgStatus.status, pOpcodeMsg->msgData.msgStatus.status);
+-
+-            /* Check the returned STATUS value: */
+-            if (pOpcodeMsg->msgData.msgStatus.status != HW_MBOX_STATUS_OK)
+-            {
+-                /* Internal Error! */
+-                PRINTK_ERR("send Opcode to %s(%d) - subject replied with internal error! STATUS = 0x%x (%u)",
+-                           HW_MBOX_MASTER_GET_NAME(subject), subject,
+-                           pOpcodeMsg->msgData.msgStatus.status, pOpcodeMsg->msgData.msgStatus.status);
++            /* ACK should succeed and return with no Data: */
++            *replyDataLen = 0;
++        }
++    }
++    else
++    {
++        if (opFlds.lenInBytes > 0)
++        {
++            /* Reply has data! */
++
++            if (opFlds.lenInBytes > dataLen)
++            {
++                /* Opcode reply data longer than specified buffer... */
++                PRINTK_ERR("send Opcode to %s(%d) - opcode reply data length (%uB) > specified buffer size (%uB)!",
++                           HW_MBOX_MASTER_GET_NAME(subject), subject, opFlds.lenInBytes, dataLen);
++
++                /* Output status messge in User Buffer: */
++                pOpcodeMsg = (hwMbox_opcodeMessage_t *)dataBuf;
++
++                pOpcodeMsg->msgType = HW_MBOX_OPCODE_MESSAGE_TYPE_STATUS;
++                pOpcodeMsg->msgData.msgStatus.status = HW_MBOX_STATUS_OPCODE_ERROR_MESSAGE_TOO_LONG;
++
++                /* Set the correct size: */
++                *replyDataLen = HW_MBOX_OPCODE_MESSAGE_SIZE;
+ 
+                 /* release Lock... */
+                 up(&CHN_LOCK(paramCID));
+                 return (-1);
+             }
+-            else
+-            {
+-                DPRINTK("send Opcode to %s(%d) - subject replied with ACK!",
+-                        HW_MBOX_MASTER_GET_NAME(subject), subject);
+ 
+-                /* ACK should succeed and return with no Data: */
+-                *replyDataLen = 0;
+-            }
++            /* Get Reply Opcode Data from SRAM: */
++            DPRINTK("send Opcode to %s(%d) - copying %uB of reply opcode data from SRAM",
++                    HW_MBOX_MASTER_GET_NAME(subject), subject, opFlds.lenInBytes);
++
++            DPRINTK("cid %d: copying %uB [out of total %uB channel has] from SRAM at offset 0x%08x",
++                    paramCID, opFlds.lenInBytes, CHN_CFG_MEMBUFF_GET_SIZE(paramCID), CHN_CFG_MEMBUFF_GET_START(paramCID));
++
++            HW_MBOX_COPY_FROM_SRAM(CHN_CFG_MEMBUFF_GET_START(paramCID), opFlds.lenInBytes, dataBuf);
+         }
+-    }
+-    else
+-    {
++
++        /* output the Reply size: */
++        *replyDataLen = opFlds.lenInBytes;
++
+         DPRINTK("send Opcode to %s(%d) - opcode reply with %uB of data",
+                 HW_MBOX_MASTER_GET_NAME(subject), subject, *replyDataLen);
+     }
+ 
+-    STATS_INC_COUNTER(subject, hw_mbox_opcode, False);
++    STATS_INC_COUNTER(subject, hw_mbox_opcode, STATS_PEER_IS_SUBJECT);
+ 
+     /* release Lock... */
+     up(&CHN_LOCK(paramCID));
+@@ -1861,9 +1936,8 @@ int hwMbox_sendAckOpcode(hw_mbox_Masters
+             paramCID, HW_MBOX_OPCODE_MESSAGE_SIZE, CHN_CFG_MEMBUFF_GET_SIZE(paramCID), CHN_CFG_MEMBUFF_GET_START(paramCID));
+ 
+     /* Copy the opcode message to the SRAM: */
+-    HW_MBOX_COPY_TO_SRAM(&opcodeMsg,
+-                         HW_MBOX_OPCODE_MESSAGE_SIZE,
+-                         CHN_CFG_MEMBUFF_GET_START(paramCID));
++    HW_MBOX_OPCODE_MESSAGE_COPY_TO_SRAM(&opcodeMsg,
++                                        CHN_CFG_MEMBUFF_GET_START(paramCID));
+ 
+     /* Build the opcode: */
+     opFlds.tag = HW_MBOX_OPCODE_TAG;
+@@ -2337,7 +2411,7 @@ static int proc_dump_serviceCounter_show
+ 
+         for (type = 0; type < HW_MBOX_TYPE_COUNT; type++)
+         {
+-            seq_printf(m, " %10u | %10u |", STATS_GET_COUNTER(i, type, False), STATS_GET_COUNTER(i, type, True));
++            seq_printf(m, " %10u | %10u |", STATS_GET_COUNTER(i, type, STATS_PEER_IS_SUBJECT), STATS_GET_COUNTER(i, type, STATS_PEER_IS_COMMANDER));
+             /* fmt:         SEND | RECV | */
+         }
+         seq_printf(m, "\n");
+@@ -3035,9 +3109,8 @@ static int hwMbox_recvOpcodeListenerEntr
+                                 CHN_CFG_MEMBUFF_GET_START(threadData->cid));
+ 
+             /* Get the opcode message from the SRAM: */
+-            HW_MBOX_COPY_FROM_SRAM(CHN_CFG_MEMBUFF_GET_START(threadData->cid),
+-                                   HW_MBOX_OPCODE_MESSAGE_SIZE,
+-                                   &opcodeMsg);
++            HW_MBOX_OPCODE_MESSAGE_COPY_FROM_SRAM(CHN_CFG_MEMBUFF_GET_START(threadData->cid),
++                                                  &opcodeMsg);
+ 
+             LOG_RECVOP_LISTENER("incoming message is of type %d", opcodeMsg.msgType);
+ 
+@@ -3242,7 +3315,7 @@ static int hwMbox_recvOpcodeListenerEntr
+         }
+ 
+         /* Opcode successfully received, INC count! */
+-        STATS_INC_COUNTER(CHN_CFG_GET_COMMANDER(threadData->cid), hw_mbox_opcode, True);
++        STATS_INC_COUNTER(CHN_CFG_GET_COMMANDER(threadData->cid), hw_mbox_opcode, STATS_PEER_IS_COMMANDER);
+ 
+         /* release Lock... */
+         up(&CHN_LOCK(threadData->cid));
+@@ -3250,7 +3323,7 @@ static int hwMbox_recvOpcodeListenerEntr
+ 
+ SEND_OP_REPLY:
+         /* Opcode successfully received, INC count! */
+-        STATS_INC_COUNTER(CHN_CFG_GET_COMMANDER(threadData->cid), hw_mbox_opcode, True);
++        STATS_INC_COUNTER(CHN_CFG_GET_COMMANDER(threadData->cid), hw_mbox_opcode, STATS_PEER_IS_COMMANDER);
+ 
+         LOG_RECVOP_LISTENER("send opcode reply to subject!");
+ 
+@@ -3263,9 +3336,8 @@ SEND_OP_REPLY:
+                             replyOpFlds.lenInBytes, CHN_CFG_MEMBUFF_GET_SIZE(threadData->cid), CHN_CFG_MEMBUFF_GET_START(threadData->cid));
+ 
+         /* Copy the opcode message to the SRAM: */
+-        HW_MBOX_COPY_TO_SRAM(&replyOpcodeMsg,
+-                             replyOpFlds.lenInBytes,
+-                             CHN_CFG_MEMBUFF_GET_START(threadData->cid));
++        HW_MBOX_OPCODE_MESSAGE_COPY_TO_SRAM(&replyOpcodeMsg,
++                                            CHN_CFG_MEMBUFF_GET_START(threadData->cid));
+ 
+         /* Create opcode reply value: */
+         HW_MBOX_OPCODE_FIELDS_SET_FROM_STRUCT(cmdRegVal, &replyOpFlds);
+@@ -4089,9 +4161,8 @@ static int __init hwMbox_drv_init(void)
+                             paramCID, opFlds.lenInBytes, CHN_CFG_MEMBUFF_GET_SIZE(paramCID), CHN_CFG_MEMBUFF_GET_START(paramCID));
+ 
+                     /* Send the opcode message: */
+-                    HW_MBOX_COPY_TO_SRAM(&opcodeMsg,
+-                                         opFlds.lenInBytes,
+-                                         CHN_CFG_MEMBUFF_GET_START(paramCID));
++                    HW_MBOX_OPCODE_MESSAGE_COPY_TO_SRAM(&opcodeMsg,
++                                                        CHN_CFG_MEMBUFF_GET_START(paramCID));
+ 
+                     DPRINTK("using cid %d as INIT CID master %d, sending cmdRegVal=0x%08x", paramCID, paramMID, cmdRegVal);
+ 
+--- a/include/linux/hw_mbox_defs.h
++++ b/include/linux/hw_mbox_defs.h
+@@ -720,6 +720,8 @@ typedef union hwMbox_opcodeMessageData
+ 
+ /*! \struct hwMbox_opcodeMessage_t
+     \brief Opcode message for tag HW_MBOX_OPCODE_TAG.
++    \note This message struct size should always be a multiple of 4 Bytes.
++    \attention When writing these messages to SRAM it should always be Big Endian.
+ */
+ typedef struct hwMbox_opcodeMessage
+ {
+@@ -729,6 +731,12 @@ typedef struct hwMbox_opcodeMessage
+ 
+ #define HW_MBOX_OPCODE_MESSAGE_SIZE     sizeof(hwMbox_opcodeMessage_t)
+ 
++/*! \typedef __hwMbox_opcodeMessageSizeIsNotAMultipleOf4Bytes
++    \brief Sanity check for opcode message size being a mutiple of 4 Bytes.
++    \note if compilation fails here then hwMbox_opcodeMessage_t is not a multiple of 4 Bytes.
++*/
++typedef Uint8 __hwMbox_opcodeMessageSizeIsNotAMultipleOf4Bytes[0 - (HW_MBOX_OPCODE_MESSAGE_SIZE & 0x3)];
++
+ /*! \typedef __hwMbox_opcodeMessageSizeExceededAllowedSize
+     \brief Sanity check for opcode message size.
+     \note if compilation fails here then hwMbox_opcodeMessage_t exceeded the allowed size.
+@@ -757,16 +765,16 @@ typedef Uint8 __hwMbox_opcodeMessageSize
+ /*       |       | [hw_mbox_Masters_e]                 | [hw_mbox_Masters_e]                 | [hw_mbox_channel_type_e] | [Bytes]   | */ \
+ /*       +--------------------------------------------------------------------------------------------------------------------------+ */ \
+     ENTRY(    0  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_BBU_C                , hw_mbox_command          , 0         )    \
+-    ENTRY(    1  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_PHY_CPU              , hw_mbox_command          , 8         )    \
++    ENTRY(    1  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_PHY_CPU              , hw_mbox_command          , 32        )    \
+     ENTRY(    2  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_command          , 0         )    \
+     ENTRY(    3  , HW_MBOX_MASTER_BBU_C                , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
+-    ENTRY(    4  , HW_MBOX_MASTER_PHY_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
++    ENTRY(    4  , HW_MBOX_MASTER_PHY_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 136       )    \
+     ENTRY(    5  , HW_MBOX_MASTER_MOCA_C               , HW_MBOX_MASTER_NP_CPU               , hw_mbox_event            , 8         )    \
+     ENTRY(    6  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_BBU_C                , hw_mbox_opcode           , 8         )    \
+-    ENTRY(    7  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_APP_CPU              , hw_mbox_opcode           , 64        )    \
++    ENTRY(    7  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_APP_CPU              , hw_mbox_opcode           , 64         )    \
+     ENTRY(    8  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_PHY_CPU              , hw_mbox_opcode           , 8         )    \
+     ENTRY(    9  , HW_MBOX_MASTER_NP_CPU               , HW_MBOX_MASTER_MOCA_C               , hw_mbox_opcode           , 8         )    \
+-    ENTRY(   10  , HW_MBOX_MASTER_APP_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_opcode           , 64        )
++    ENTRY(   10  , HW_MBOX_MASTER_APP_CPU              , HW_MBOX_MASTER_NP_CPU               , hw_mbox_opcode           , 64         )
+ 
+ /* static channel Table Expanders: */
+ 

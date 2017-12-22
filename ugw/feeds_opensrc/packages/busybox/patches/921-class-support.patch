@@ -1,0 +1,1534 @@
+Index: busybox-1.17.1/Makefile.flags
+===================================================================
+--- busybox-1.17.1.orig/Makefile.flags	2010-07-06 07:55:53.000000000 +0530
++++ busybox-1.17.1/Makefile.flags	2011-04-18 20:19:43.016784351 +0530
+@@ -97,7 +97,7 @@
+ #"))
+ endif
+ 
+-LDLIBS += m crypt
++LDLIBS += m crypt dl
+ 
+ ifeq ($(CONFIG_PAM),y)
+ LDLIBS += pam pam_misc
+Index: busybox-1.17.1/networking/udhcp/Config.src
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/Config.src	2010-07-25 03:42:43.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/Config.src	2011-04-18 20:19:43.017783847 +0530
+@@ -40,6 +40,21 @@
+ 	  to send SIGUSR1 for the initial writing or updating. Any timed
+ 	  rewriting remains undisturbed
+ 
++config FEATURE_DHCP_USER_CLASS
++	bool "user class support"
++	default n
++	depends on UDHCPD
++	help
++	  User class support
++
++config FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++	bool "  Compile udhcp with TR-111 device association capability"
++	default n
++	depends on UDHCPD || UDHCPC
++	help
++	  If selected, udhcpd and udhcpc will be able to add vendor specific
++	  optoins for showing the device or gateway specific info.
++
+ config DHCPD_LEASES_FILE
+ 	string "Absolute path to lease file"
+ 	default "/var/lib/misc/udhcpd.leases"
+@@ -48,6 +63,13 @@
+ 	  udhcpd stores addresses in a lease file. This is the absolute path
+ 	  of the file. Normally it is safe to leave it untouched.
+ 
++config FEATURE_DHCP_RUN_FROM_INETD
++        bool "inetd enhancement"
++        depends on UDHCPD
++        default n
++        help
++          Selecting this option will make udhcpd run through inetd super server
++
+ config UDHCPC
+ 	bool "udhcp client (udhcpc)"
+ 	default y
+Index: busybox-1.17.1/networking/udhcp/common.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/common.c	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/common.c	2011-04-18 20:19:43.018783116 +0530
+@@ -6,6 +6,10 @@
+  */
+ #include "common.h"
+ 
++#if defined ENABLE_FEATURE_DHCP_USER_CLASS || ENABLE_FEATURE_DEVM_DEVICE_ASSOCIATION
++#include <dlfcn.h>
++#endif
++
+ #if defined CONFIG_UDHCP_DEBUG && CONFIG_UDHCP_DEBUG >= 1
+ unsigned dhcp_verbose;
+ #endif
+@@ -48,7 +52,11 @@
+ 	{ OPTION_STRING                           , 0x42 }, /* DHCP_TFTP_SERVER_NAME */
+ 	{ OPTION_STRING                           , 0x43 }, /* DHCP_BOOT_FILE     */
+ //TODO: not a string, but a set of LASCII strings:
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	{ OPTION_STRING                           , 0x4D }, /* DHCP_USER_CLASS    */
++#else
+ //	{ OPTION_STRING                           , 0x4D }, /* DHCP_USER_CLASS    */
++#endif
+ #if ENABLE_FEATURE_UDHCP_RFC3397
+ 	{ OPTION_DNS_STRING | OPTION_LIST         , 0x77 }, /* DHCP_DOMAIN_SEARCH */
+ 	{ OPTION_SIP_SERVERS                      , 0x78 }, /* DHCP_SIP_SERVERS   */
+@@ -104,7 +112,11 @@
+ 	"message" "\0"     /* DHCP_ERR_MESSAGE    */
+ 	"tftp" "\0"        /* DHCP_TFTP_SERVER_NAME */
+ 	"bootfile" "\0"    /* DHCP_BOOT_FILE      */
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	"userclass" "\0"   /* DHCP_USER_CLASS     */
++#else
+ //	"userclass" "\0"   /* DHCP_USER_CLASS     */
++#endif
+ #if ENABLE_FEATURE_UDHCP_RFC3397
+ 	"search" "\0"      /* DHCP_DOMAIN_SEARCH  */
+ // doesn't work in udhcpd.conf since OPTION_SIP_SERVERS
+@@ -115,6 +127,13 @@
+ // is not handled yet by "string->option" conversion code:
+ 	"staticroutes" "\0"/* DHCP_STATIC_ROUTES  */
+ 	"wpad" "\0"        /* DHCP_WPAD           */
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	"requestip" "\0"	/* DHCP_REQUEST_IP	*/
++	"message" "\0"		/* DHCP_MESSAGE		*/
++	"maxsize" "\0"		/* DHCP_MAXSIZE		*/
++	"vendorclass" "\0"	/* DHCP_VENDOR		*/
++	"clientid" "\0"		/* DHCP_CLIENTID	*/
++#endif
+ 	;
+ 
+ /* Lengths of the option types in binary form.
+@@ -520,3 +539,501 @@
+ 
+ 	return retval;
+ }
++
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++/* same as udhcp_str2optset except for creation of linked list node in server via create_node()*/
++/* Need a way to re-use udhcp_str2optset as it is... */
++
++int FAST_FUNC udhcp_str2optset_server(const char *const_str, void *arg)
++{
++	struct option_set **opt_list = arg;
++	char *opt, *val, *endptr;
++	char *str;
++	const struct dhcp_optflag *optflag;
++	struct dhcp_optflag bin_optflag;
++	unsigned optcode;
++	int retval, length;
++	char buffer[8] ALIGNED(4);
++	uint16_t *result_u16 = (uint16_t *) buffer;
++	uint32_t *result_u32 = (uint32_t *) buffer;
++
++	/* Cheat, the only *const* str possible is "" */
++	str = (char *) const_str;
++	opt = strtok(str, " \t=");
++	if (!opt)
++		return 0;
++
++	optcode = bb_strtou(opt, NULL, 0);
++	if (!errno && optcode < 255) {
++		/* Raw (numeric) option code */
++		bin_optflag.flags = OPTION_BIN;
++		bin_optflag.code = optcode;
++		optflag = &bin_optflag;
++	} else {
++		optflag = &dhcp_optflags[udhcp_option_idx(opt)];
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++		switch (optflag->code) {
++		case DHCP_USER_CLASS:
++		case DHCP_VENDOR:
++		case DHCP_CLIENT_ID:
++			create_node(optflag->code,opt_list);
++			break;
++		default:
++			break;
++		}
++#endif
++	}
++
++	retval = 0;
++	do {
++		val = strtok(NULL, ", \t");
++		if (!val)
++			break;
++		length = dhcp_option_lengths[optflag->flags & OPTION_TYPE_MASK];
++		retval = 0;
++		opt = buffer; /* new meaning for variable opt */
++		switch (optflag->flags & OPTION_TYPE_MASK) {
++		case OPTION_IP:
++			retval = udhcp_str2nip(val, buffer);
++			break;
++		case OPTION_IP_PAIR:
++			retval = udhcp_str2nip(val, buffer);
++			val = strtok(NULL, ", \t/-");
++			if (!val)
++				retval = 0;
++			if (retval)
++				retval = udhcp_str2nip(val, buffer + 4);
++			break;
++		case OPTION_STRING:
++#if ENABLE_FEATURE_UDHCP_RFC3397
++		case OPTION_DNS_STRING:
++#endif
++			length = strnlen(val, 254);
++			if (length > 0) {
++				opt = val;
++				retval = 1;
++			}
++			break;
++//		case OPTION_BOOLEAN: {
++//			static const char no_yes[] ALIGN1 = "no\0yes\0";
++//			buffer[0] = retval = index_in_strings(no_yes, val);
++//			retval++; /* 0 - bad; 1: "no" 2: "yes" */
++//			break;
++//		}
++		case OPTION_U8:
++			buffer[0] = strtoul(val, &endptr, 0);
++			retval = (endptr[0] == '\0');
++			break;
++		/* htonX are macros in older libc's, using temp var
++		 * in code below for safety */
++		/* TODO: use bb_strtoX? */
++		case OPTION_U16: {
++			unsigned long tmp = strtoul(val, &endptr, 0);
++			*result_u16 = htons(tmp);
++			retval = (endptr[0] == '\0' /*&& tmp < 0x10000*/);
++			break;
++		}
++//		case OPTION_S16: {
++//			long tmp = strtol(val, &endptr, 0);
++//			*result_u16 = htons(tmp);
++//			retval = (endptr[0] == '\0');
++//			break;
++//		}
++		case OPTION_U32: {
++			unsigned long tmp = strtoul(val, &endptr, 0);
++			*result_u32 = htonl(tmp);
++			retval = (endptr[0] == '\0');
++			break;
++		}
++		case OPTION_S32: {
++			long tmp = strtol(val, &endptr, 0);
++			*result_u32 = htonl(tmp);
++			retval = (endptr[0] == '\0');
++			break;
++		}
++		case OPTION_BIN: /* handled in attach_option() */
++			opt = val;
++			retval = 1;
++		default:
++			break;
++		}
++		if (retval)
++			attach_option(opt_list, optflag, opt, length);
++	} while (retval && optflag->flags & OPTION_LIST);
++
++	return retval;
++}
++#endif
++
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++/*
++
++This function takes pointer to the first enterprise no of the vendor specific options
++
++    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++   |  option-code  |  option-len   |
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++   |      enterprise-number1       |
++   |                               |
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++   |   data-len1   |               |
++   +-+-+-+-+-+-+-+-+ option-data1  |
++   /                               /
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ ----
++   |      enterprise-number2       |   ^
++   |                               |   |
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+   |
++   |   data-len2   |               | optional
++   +-+-+-+-+-+-+-+-+ option-data2  |   |
++   /                               /   |
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+   |
++   ~            ...                ~   V
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ ----
++
++And then returns the pointer to Vendor specific info for the specified Enterprise number.
++If the info relatedd to enterprise no is not present, then NULL is returned.
++
++
++pVSO : ponter to the first enterprise no field below the VSI.
++iEnterpriseNo : is the enterprise no of interest
++option_len : is the length of the buffer pointer to by pVSO as mentioned in the option-len of VSI.
++
++*/
++
++uint8_t *get_vsi_option(uint8_t *pVSO, uint32_t iEnterpriseNo, uint8_t option_len)
++{
++	int i, length;
++	uint8_t *optionptr=NULL;
++	uint32_t *pEntNo = NULL;
++	int done=0;
++
++	return pVSO;
++
++	log1( " GET_VSI_OPTION  called\n");
++	optionptr = pVSO;
++	i = 0;
++	length = option_len;
++	while (!done) {
++		if (i >= length) {
++			log1("bogus packet, option fields too long.");
++			return NULL;
++		}
++
++		pEntNo = (uint32_t *)(optionptr +i);
++
++		if (*pEntNo == iEnterpriseNo) {
++			if (i + OPT_VSI_ENTPNO_LEN + optionptr[i + OPT_VSI_ENTPNO_LEN] >= length) {
++				log1("bogus packet, option fields too long.");
++				return NULL;
++			}
++			return optionptr + i + OPT_VSI_ENTPNO_LEN;
++		}else{
++			i += OPT_VSI_ENTPNO_LEN + optionptr[i + OPT_VSI_ENTPNO_LEN];
++
++		}
++	}
++	log1( " GET_VSI_OPTION  over\n");
++	return NULL;
++}
++
++
++/******************************************************************
++This function posts a message with appropriats options and
++null string when the entry for Gateway or Device is to be removed
++Function used by :
++DEVICE to write empty string for gateway, ipaddr = 0
++GATEWAY to delete the ipaddr of a device whose lease has expired
++*******************************************************************/
++int writenullmsg(uint32_t iIpaddr){
++	int iRetrn = 0;
++
++	iRetrn = writemsg( TR69_FIFO, NULL, 2,iIpaddr);
++
++	return iRetrn;
++}
++
++/*
++This function takes pointer to Vendor Specific info below the identified enterprise no.
++
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++   |   data-len1   |               |
++   +-+-+-+-+-+-+-+-+ option-data   |
++   /                               /
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++
++Where option-data is a collection of sub-options each with the format
++
++   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++   |  subopt-code  |  subopt-len   |
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++   /        sub-option-data        /
++   /                               /
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++
++And fills the string in the form
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
++   / sub-option-data1\0suboption-data2\0suboption-data3\0 /
++   /                               						  /
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-++-+-+-+-+-+-+-+-+-+-+-+
++
++
++RETURN VALUES :
++	SUCCESS 	string length for output
++	FAILURE		-1
++
++*/
++
++
++int form_vsi_string(uint8_t *pVSD,char *string)
++{
++        int i;
++        uint8_t *optionptr=NULL;
++        uint8_t data_len, option_len;
++	uint8_t string_len = 0;
++
++        optionptr = pVSD;
++	data_len = optionptr[0];
++	optionptr++;
++        i = 0;
++
++		log1( " FORM_VSI_STRING called\n");
++        while ( i < data_len) {
++#ifdef CONFIG_FEATURE_DEVM_DEVICE
++			if(( optionptr[i + SUBOPT_CODE] < 0x04) || ( optionptr[i + SUBOPT_CODE] > 0x06)){
++				log1("bogus packet, invalid sub-option code from device");
++				return -1; //failure
++			}
++#else
++			if(( optionptr[i + SUBOPT_CODE] < 0x01) || ( optionptr[i + SUBOPT_CODE] > 0x03)){
++				log1("bogus packet, invalid sub-option code from device");
++				return -1; //failure
++			}
++#endif
++
++			option_len = optionptr[i + SUBOPT_LEN];
++
++			if( i + 1 +  option_len > data_len) {
++					log1("bogus packet, option fields too long.");
++					return -1 ; // failure
++			}
++
++			log1( " FORM_VSI_STRING : copying option to be sent\n");
++			memcpy(string+ string_len,optionptr + i + SUBOPT_DATA, option_len);
++
++			i += 1 + 1 + option_len; // move the offset to next VSD
++			string_len = string_len + option_len;	// update the total string size
++			*(string + string_len)= '\0'; //add a null in the end of thie string
++			string_len++;
++		}
++
++
++		log1( " FORM_VSI_STRING done\n");
++		return string_len-1; //success
++}
++
++
++
++
++
++
++/************************************************************
++This function writes a message to file.
++The structure of the message is
++
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++   |   data-len    |               |
++   +-+-+-+-+-+-+-+-+      data     |
++   /                               /
++   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++
++
++************************************************************/
++
++/********************************************************************************************
++The operation defined are :
++ 1	Add	Add the information in the table (requires add object and write of parameters
++ 2	Del 	GATEWAY :Delete the information from the table (required delete of object)
++		DEVICE : Clear GatewayInfo
++
++The operation to be done is also reflected in the Reserved field of the message
++The data of the message sent is only needed in ADD
++For a delete or write only the ipaddr matters
++********************************************************************************************/
++int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr){
++	int iFd, iRet;
++	x_IFX_IPC_Msg xMsg = {0};
++	char string[380] = {'\0'};
++	uint16_t string_len = 0;
++
++	log1( " WRITEMSG CALLED\n");
++	memset(&xMsg, 0, sizeof(x_IFX_IPC_Msg));
++
++	if((operation == 1)&&(msg == NULL))
++		return -1; //error
++
++
++	xMsg.xHdr.ucFrom = IFX_IPC_APP_ID_DHCP;
++	xMsg.xHdr.ucTo = operation;
++	xMsg.xHdr.uiReserved = htonl(ipaddr);
++
++	// data is meaningful only in add
++	if(operation == 1){
++		log1( " WRITEMSG : FORM STRING TO BE POSTED \n");
++		string_len =  form_vsi_string(msg+4, string);
++		if(string_len < 0){
++			log1( "Failure in forminmg string data");
++			return -1;
++		}
++
++		xMsg.xHdr.unMsgSize =  htons(string_len);
++		memcpy(xMsg.acMsg, (void *)string, string_len);
++	}
++
++	iFd = open(file,O_WRONLY | O_NONBLOCK);
++	log1( " WRITEMSG : FIFO OPENED WITH FD : %d \n", iFd);
++	if(iFd > -1 ){  	//now post this msg to TR69 stack
++		iRet = write( iFd,(void *)&xMsg, string_len + IFX_IPC_HDR_SIZE);
++		close(iFd);
++		if(iRet <=0){
++			log1( "Failure in writing data");
++			return -1;
++		}
++		log1( " WRITEMSG DONE \n");
++	}
++	return iRet;
++}
++
++/* This function initializes the variables to be used in TR-111 option 125
++*/
++char subopt1[IFX_DEVM_DHCP_PARAM_SIZE];
++char subopt2[IFX_DEVM_DHCP_PARAM_SIZE];
++char subopt3[IFX_DEVM_DHCP_PARAM_SIZE];
++char subopt4[IFX_DEVM_DHCP_PARAM_SIZE];
++char subopt5[IFX_DEVM_DHCP_PARAM_SIZE];
++char subopt6[IFX_DEVM_DHCP_PARAM_SIZE];
++
++void ifx_init_tr111_vars(){
++	int iRet = 0;
++	char sValue[IFX_DEVM_DHCP_PARAM_SIZE] = {0};
++	void *dlHandle = NULL;
++	int (*func_ptr)(const char *, const char *, char *, char *) = NULL;
++	char *error = NULL;
++	char sVal[MAX_FILELINE_LEN]={0};
++	int iFD=-1;
++    	char caBuff[32] = { 0 };
++    	char *psTmp = NULL;
++
++
++	dlHandle = dlopen("libifx_common.so",RTLD_LAZY);
++	if(dlHandle) {
++		*(void **) &func_ptr = dlsym(dlHandle,"ifx_GetCfgData");
++		if((error = dlerror()) != NULL) {
++			log1( "could not find function ifx_GetCfgData in libifx_common.so\n");
++			log1( "dlopen failed !! taking backup values \n");
++			goto BACKUP;
++		}
++
++		if ( (int)(* func_ptr)(IFX_SYS_CONF, IFX_DEVICE_INFO_SECTION, "device_info_oui", sValue) == 1){
++
++			// frame the OUI from the MAC address - logic picked from IFXAPIs/src/mapi/ifx_api_dev_info.c:130
++			memset(sVal, 0x00, sizeof(sVal));
++			system("upgrade mac_get 2 >/tmp/macget");
++			iFD = open("/tmp/macget", O_RDONLY);
++			if(iFD < 0)
++			{
++				bb_error_msg("failed to open /tmp/macget\n");
++				return -1;
++			}
++			read(iFD, caBuff, sizeof(caBuff));
++			psTmp = strtok(caBuff, ":");
++			if(psTmp == NULL)
++			{
++				bb_error_msg("Unable to parse version /tmp/macget\n");
++				return -1;
++			}
++			strcpy(sVal, psTmp);
++			psTmp = strtok(NULL, ":");
++			strcat(sVal, psTmp);
++			psTmp = strtok(NULL, ":");
++			strcat(sVal, psTmp);
++			close(iFD);
++			system("rm /tmp/macget");
++
++			if ((strlen(sVal) + 1) > IFX_DEVM_DHCP_PARAM_SIZE)
++			{
++				goto BACKUP;
++			}
++			strcpy(sValue, sVal);
++
++#ifdef CONFIG_FEATURE_DEVM_DEVICE 	//  it is a device
++			strcpy(subopt1,sValue);
++#else	// it is a gateway
++			strcpy(subopt4,sValue);
++#endif
++		}else{
++			goto BACKUP;
++		}
++
++/*		if ( (int)(* func_ptr)(IFX_SYS_CONF, IFX_DEVICE_INFO_SECTION, "device_info_sernum", sValue) == 1)*/
++
++        iFD = -1;
++
++        memset(caBuff, 0x00, sizeof(caBuff));
++        memset(sVal, 0x00, sizeof(sVal));
++        iFD = open("/tmp/sernumget", O_RDONLY);
++        if(iFD < 0)
++        {
++            system("upgrade boardid_get 0 >/tmp/sernumget");
++            iFD = open("/tmp/sernumget", O_RDONLY);
++            if(iFD < 0)
++            {
++                bb_error_msg("failed to open /tmp/sernumget\n");
++                return -1;
++            }
++        }
++        read(iFD, caBuff, sizeof(caBuff));
++        strncpy(sVal, caBuff, (sizeof(caBuff) - 1));
++        close(iFD);
++
++        if(strlen(caBuff)) {
++#ifdef CONFIG_FEATURE_DEVM_DEVICE 	//  it is a device
++			strcpy(subopt2,sVal);
++#else	// it is a gateway
++			strcpy(subopt5,sVal);
++#endif
++		} else {
++			goto BACKUP;
++		}
++
++		if ( (int)(* func_ptr)(IFX_SYS_CONF, IFX_DEVICE_INFO_SECTION, "device_info_prodclass", sValue) == 1){
++#ifdef CONFIG_FEATURE_DEVM_DEVICE 	//  it is a device
++			strcpy(subopt3,sValue);
++#else	// it is a gateway
++			strcpy(subopt6,sValue);
++#endif
++		}else{
++			goto BACKUP;
++		}
++
++	} else {
++		log1( "dlopen failed !! taking backup values \n");
++BACKUP :
++#ifdef CONFIG_FEATURE_DEVM_DEVICE 	//  it is a device
++		strcpy(subopt1,"001212");
++		strcpy(subopt2,"DMA67");
++		strcpy(subopt3,"DEVICE");
++#else	// it is a gateway
++		strcpy(subopt4,"011111");
++		strcpy(subopt5,"112233");
++		strcpy(subopt6,"GATEWAY");
++#endif
++
++}
++
++	dlclose(dlHandle);
++	return;
++}
++
++#endif
+Index: busybox-1.17.1/networking/udhcp/common.h
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/common.h	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/common.h	2011-04-18 20:19:43.019783843 +0530
+@@ -16,7 +16,15 @@
+ 
+ extern const uint8_t MAC_BCAST_ADDR[6]; /* six all-ones */
+ 
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++#define TR69_FIFO       "/tmp/tr"
++#endif
+ 
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++#include "ifx_amazon_cfg.h"
++#define _IFX_API_INCLUDE_H
++#include "ifx_common.h"
++#endif
+ /*** DHCP packet ***/
+ 
+ /* DHCP protocol. See RFC 2131 */
+@@ -139,8 +147,11 @@
+ #define DHCP_CLIENT_ID          0x3d /* by default client's MAC addr, but may be arbitrarily long */
+ //#define DHCP_TFTP_SERVER_NAME 0x42 /* same as 'sname' field */
+ //#define DHCP_BOOT_FILE        0x43 /* same as 'file' field */
+-//#define DHCP_USER_CLASS       0x4d /* RFC 3004. set of LASCII strings. "I am a printer" etc */
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++#define DHCP_USER_CLASS       0x4d /* RFC 3004. set of LASCII strings. "I am a printer" etc */
++#endif
+ #define DHCP_FQDN               0x51 /* client asks to update DNS to map its FQDN to its new IP */
++#define DHCP_VSI				0x7d
+ //#define DHCP_DOMAIN_SEARCH    0x77 /* RFC 3397. set of ASCIZ string, DNS-style compressed */
+ //#define DHCP_SIP_SERVERS      0x78 /* RFC 3361. flag byte, then: 0: domain names, 1: IP addrs */
+ //#define DHCP_STATIC_ROUTES    0x79 /* RFC 3442. (mask,ip,router) tuples */
+@@ -178,6 +189,56 @@
+ 	struct option_set *next;
+ };
+ 
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++/* added for TR-111 */
++#define VSI_ENTERPRISE_NO_DSL	3561
++#define IFX_IPC_APP_ID_DHCP		211
++
++#define OPT_VSI_ENTPNO_LEN 4
++#define SUBOPT_CODE		0
++#define SUBOPT_LEN  	1
++#define SUBOPT_DATA 	2
++
++typedef struct
++{
++   /* ID of the module sending the message */
++   unsigned char ucFrom;
++   /* ID of the module to which the message is addressed */
++   unsigned char ucTo;
++   /* ucTo may be just used for strict validation, since
++      the message destined for a module will be in the
++      module's FIFO anyway
++    */
++   /* Size of the Message */
++   uint16_t unMsgSize;
++   /* Reserved for future use */
++   uint32_t uiReserved;
++
++} x_IFX_IPC_MsgHdr;
++
++#define IFX_IPC_HDR_SIZE sizeof(x_IFX_IPC_MsgHdr)
++#define IFX_IPC_MAX_MSG_SIZE (4192 - IFX_IPC_HDR_SIZE)
++
++typedef struct
++{
++   x_IFX_IPC_MsgHdr xHdr;
++
++   /* Buffer to contain the message */
++   char acMsg[IFX_IPC_MAX_MSG_SIZE];
++   /* Each module is expected to write a union in the acMsg part */
++
++} x_IFX_IPC_Msg;
++
++#define IFX_DEVM_DHCP_PARAM_SIZE 65
++extern char subopt1[IFX_DEVM_DHCP_PARAM_SIZE];
++extern char subopt2[IFX_DEVM_DHCP_PARAM_SIZE];
++extern char subopt3[IFX_DEVM_DHCP_PARAM_SIZE];
++extern char subopt4[IFX_DEVM_DHCP_PARAM_SIZE];
++extern char subopt5[IFX_DEVM_DHCP_PARAM_SIZE];
++extern char subopt6[IFX_DEVM_DHCP_PARAM_SIZE];
++
++#endif
++
+ extern const struct dhcp_optflag dhcp_optflags[];
+ extern const char dhcp_option_strings[];
+ extern const uint8_t dhcp_option_lengths[];
+@@ -194,6 +255,15 @@
+ #endif
+ struct option_set *udhcp_find_option(struct option_set *opt_list, uint8_t code) FAST_FUNC;
+ 
++/* added for TR-111 */
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++uint8_t *get_vsi_option(uint8_t *pVSO, uint32_t iEnterpriseNo, uint8_t option_len);
++int writenullmsg(uint32_t ipaddr);
++int form_vsi_string(uint8_t *pVSD,char *string);
++int writemsg(char *file, uint8_t *msg, uint8_t operation, uint32_t ipaddr);
++void ifx_init_tr111_vars(void);
++#endif
++
+ 
+ // RFC 2131  Table 5: Fields and options used by DHCP clients
+ //
+@@ -272,6 +342,9 @@
+ int FAST_FUNC udhcp_str2nip(const char *str, void *arg);
+ /* 2nd param is "struct option_set**" */
+ int FAST_FUNC udhcp_str2optset(const char *str, void *arg);
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++int FAST_FUNC udhcp_str2optset_server(const char *str, void *arg);
++#endif
+ 
+ uint16_t udhcp_checksum(void *addr, int count) FAST_FUNC;
+ 
+Index: busybox-1.17.1/networking/udhcp/dhcpd.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpd.c	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpd.c	2011-04-18 20:42:23.863782523 +0530
+@@ -25,6 +25,55 @@
+ #include "dhcpc.h"
+ #include "dhcpd.h"
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++int total_num_classes;
++#endif
++
++// structures defined for TR-111
++#ifndef CONFIG_FEATURE_DEVM_DEVICE 	// if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++
++static char * ifx_create_server_vsi(){
++
++	char *newServerVSI = NULL;
++
++	char vsi_option_code = DHCP_VSI;
++	uint32_t enterprise_no = VSI_ENTERPRISE_NO_DSL;
++
++	char suboptCode4 = 0x4;
++	char suboptCode5 = 0x5;
++	char suboptCode6 = 0x6;
++
++	char suboptCodeLen4;
++	char suboptCodeLen5;
++	char suboptCodeLen6;
++	char suboptLen_total;
++	char vsi_option_len;
++
++	//if you want to get subopt from elsewhere, get it here
++
++	suboptCodeLen4 = (char)(strlen(subopt4));
++	suboptCodeLen5 = (char)(strlen(subopt5));
++	suboptCodeLen6 = (char)(strlen(subopt6));
++	suboptLen_total = (char)(suboptCodeLen4 + suboptCodeLen5 + suboptCodeLen6 + 6);
++	vsi_option_len = (char)(suboptLen_total + 5);
++
++	newServerVSI = (char *)calloc(vsi_option_len + 1, 1);
++
++	sprintf(newServerVSI,"%c%c%d%c%c%c%s%c%c%s%c%c%s",
++				vsi_option_code,vsi_option_len,
++				enterprise_no, suboptLen_total,
++		 		suboptCode4, suboptCodeLen4, subopt4,
++		 		suboptCode5, suboptCodeLen5, subopt5,
++		 		suboptCode6, suboptCodeLen6, subopt6);
++	newServerVSI[2] = 0x00;
++	newServerVSI[3] = 0x00;
++	newServerVSI[4] = 0x0d;
++	newServerVSI[5] = 0xe9;
++	return newServerVSI;
++}
++#endif
++#endif
+ 
+ /* Send a packet to a specific mac address and ip address by creating our own ip packet */
+ static void send_packet_to_client(struct dhcp_packet *dhcp_pkt, int force_broadcast)
+@@ -57,10 +106,17 @@
+ 		chaddr = dhcp_pkt->chaddr;
+ 	}
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	udhcp_send_raw_packet(dhcp_pkt,
++		/*src*/ head->server_config_global.server_nip, SERVER_PORT,
++		/*dst*/ ciaddr, CLIENT_PORT, chaddr,
++		head->server_config_global.ifindex);
++#else
+ 	udhcp_send_raw_packet(dhcp_pkt,
+ 		/*src*/ server_config.server_nip, SERVER_PORT,
+ 		/*dst*/ ciaddr, CLIENT_PORT, chaddr,
+ 		server_config.ifindex);
++#endif
+ }
+ 
+ /* Send a packet to gateway_nip using the kernel ip stack */
+@@ -68,9 +124,15 @@
+ {
+ 	log1("Forwarding packet to relay");
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	udhcp_send_kernel_packet(dhcp_pkt,
++			head->server_config_global.server_nip, SERVER_PORT,
++			dhcp_pkt->gateway_nip, SERVER_PORT);
++#else
+ 	udhcp_send_kernel_packet(dhcp_pkt,
+ 			server_config.server_nip, SERVER_PORT,
+ 			dhcp_pkt->gateway_nip, SERVER_PORT);
++#endif
+ }
+ 
+ static void send_packet(struct dhcp_packet *dhcp_pkt, int force_broadcast)
+@@ -92,7 +154,11 @@
+ 	packet->flags = oldpacket->flags;
+ 	packet->gateway_nip = oldpacket->gateway_nip;
+ 	packet->ciaddr = oldpacket->ciaddr;
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	udhcp_add_simple_option(packet, DHCP_SERVER_ID, head->server_config_global.server_nip);
++#else
+ 	udhcp_add_simple_option(packet, DHCP_SERVER_ID, server_config.server_nip);
++#endif
+ }
+ 
+ /* Fill options field, siaddr_nip, and sname and boot_file fields.
+@@ -137,6 +203,11 @@
+ 	struct dhcp_packet packet;
+ 	uint32_t lease_time_sec;
+ 	struct in_addr addr;
++#ifndef CONFIG_FEATURE_DEVM_DEVICE   // if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++	char *pServerVSI = NULL;
++#endif
++#endif
+ 
+ 	init_packet(&packet, oldpacket, DHCPOFFER);
+ 
+@@ -197,6 +268,16 @@
+ 	add_server_options(&packet);
+ 
+ 	addr.s_addr = packet.yiaddr;
++#ifndef CONFIG_FEATURE_DEVM_DEVICE   // if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++	log1( "VIVEK : SERVERPACKET : send dhcp offer along with vsi \n");
++	pServerVSI =  ifx_create_server_vsi();
++	udhcp_add_binary_option(&packet, (uint8_t *)pServerVSI);
++	free(pServerVSI);
++	//udhcp_add_binary_option(&packet, (uint8_t *) &VendorOpts);
++#endif
++#endif
++
+ 	bb_info_msg("Sending OFFER of %s", inet_ntoa(addr));
+ 	/* send_packet emits error message itself if it detects failure */
+ 	send_packet(&packet, /*force_bcast:*/ 0);
+@@ -218,6 +299,11 @@
+ 	uint32_t lease_time_sec;
+ 	struct in_addr addr;
+ 	const char *p_host_name;
++#ifndef CONFIG_FEATURE_DEVM_DEVICE   // if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++	char *pServerVSI = NULL;
++#endif
++#endif
+ 
+ 	init_packet(&packet, oldpacket, DHCPACK);
+ 	packet.yiaddr = yiaddr;
+@@ -228,6 +314,19 @@
+ 	add_server_options(&packet);
+ 
+ 	addr.s_addr = yiaddr;
++
++#ifndef CONFIG_FEATURE_DEVM_DEVICE   // if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++	log1( "VIVEK : SERVERPACKET : send dhcp ack along with vsi \n");
++
++	pServerVSI =  ifx_create_server_vsi();
++	udhcp_add_binary_option(&packet, (uint8_t *)pServerVSI);
++	free(pServerVSI);
++
++//	udhcp_add_binary_option(&packet, (uint8_t *) &VendorOpts);
++#endif
++#endif
++
+ 	bb_info_msg("Sending ACK to %s", inet_ntoa(addr));
+ 	send_packet(&packet, /*force_bcast:*/ 0);
+ 
+@@ -246,6 +345,11 @@
+ static void send_inform(struct dhcp_packet *oldpacket)
+ {
+ 	struct dhcp_packet packet;
++#ifndef CONFIG_FEATURE_DEVM_DEVICE   // if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++	char *pServerVSI = NULL;
++#endif
++#endif
+ 
+ 	/* "If a client has obtained a network address through some other means
+ 	 * (e.g., manual configuration), it may use a DHCPINFORM request message
+@@ -267,6 +371,18 @@
+ 	init_packet(&packet, oldpacket, DHCPACK);
+ 	add_server_options(&packet);
+ 
++#ifndef CONFIG_FEATURE_DEVM_DEVICE   // if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++	log1( "VIVEK : SERVERPACKET : send dhcp inform along with vsi \n");
++
++	pServerVSI =  ifx_create_server_vsi();
++	udhcp_add_binary_option(&packet, (uint8_t*)pServerVSI);
++	free(pServerVSI);
++
++	//udhcp_add_binary_option(&packet, (uint8_t *) &VendorOpts);
++#endif
++#endif
++
+ 	send_packet(&packet, /*force_bcast:*/ 0);
+ }
+ 
+@@ -276,6 +392,76 @@
+ /* struct server_config_t server_config is in bb_common_bufsiz1 */
+ 
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++static int find_class (struct dhcp_packet *packet)
++{
++	int mac_match_found = 0;
++	struct global *node, *max_match_node;
++	struct option_set *node_options;
++	uint8_t pktmac[6]={0,0,0,0,0,0};
++	uint8_t poolmac[6]={0,0,0,0,0,0};
++	uint8_t zero_mac[6]={0,0,0,0,0,0};
++	int k, class_match=0;
++	struct option_set *userclass_conf_option=NULL,*vendorclass_conf_option=NULL,*clientid_conf_option=NULL;
++	uint8_t *userclass_packet_option=NULL;
++	uint8_t *vendorclass_packet_option=NULL;
++	uint8_t *clientid_packet_option=NULL;
++	int max_match_count = 0;
++	int max_match_node_number = 0, i = 0;
++	node = head->next;
++	userclass_packet_option = (uint8_t *)udhcp_get_option(packet, DHCP_USER_CLASS);
++	clientid_packet_option = (uint8_t *)udhcp_get_option(packet,DHCP_CLIENT_ID);
++	vendorclass_packet_option = (uint8_t *)udhcp_get_option(packet, DHCP_VENDOR);
++
++	while (node !=NULL) {
++		userclass_conf_option = udhcp_find_option (node->server_config_global.options,DHCP_USER_CLASS);
++		vendorclass_conf_option = udhcp_find_option (node->server_config_global.options,DHCP_VENDOR);
++		clientid_conf_option = udhcp_find_option (node->server_config_global.options,DHCP_CLIENT_ID);
++        mac_match_found = 0;
++        node->server_config_global.match_count = 0;
++        i++;
++		if (userclass_conf_option && userclass_packet_option && !memcmp(userclass_packet_option,userclass_conf_option->data+OPT_DATA,*(userclass_packet_option-1)))
++            node->server_config_global.match_count++;
++
++		if (vendorclass_conf_option && vendorclass_packet_option && !memcmp(vendorclass_packet_option,vendorclass_conf_option->data+OPT_DATA,*(vendorclass_packet_option-1)))
++            node->server_config_global.match_count++;
++
++		if (clientid_conf_option && clientid_packet_option && !memcmp(clientid_packet_option,clientid_conf_option->data+OPT_DATA,*(clientid_packet_option-1)))
++            node->server_config_global.match_count++;
++
++		for(k=0; k<6; k++){
++			poolmac[k] = node->server_config_global.macaddr[k] & node->server_config_global.macaddrmask[k];
++			pktmac[k] = packet->chaddr[k] & node->server_config_global.macaddrmask[k];
++		}
++		if(!memcmp(&pktmac[0],&poolmac[0],6)) {
++            mac_match_found = 1;
++            node->server_config_global.match_count++;
++		}
++		if (mac_match_found) { /* mac address is a MUST for considering any pool */
++            if ( node->server_config_global.match_count > max_match_count ) {
++                max_match_count = node->server_config_global.match_count;
++        		max_match_node_number = i;
++                class_match = 1;
++		    }
++    	}
++        node = node->next;
++    }
++
++    g_leases = head->server_config_global.g_leases;
++
++    if ( class_match != 0 ) {
++  	    i = 1;
++    	node  = head->next;
++	    while (node != NULL && i != max_match_node_number) {
++		    node = node->next;
++    		i++;
++	    }
++        server_config = node->server_config_global;
++        node->server_config_global = server_config;
++        g_leases = server_config.g_leases;
++    }
++}
++#endif
+ int udhcpd_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int udhcpd_main(int argc UNUSED_PARAM, char **argv)
+ {
+@@ -290,6 +476,10 @@
+ 	struct option_set *option;
+ 	struct dyn_lease *lease, fake_lease;
+ 	IF_FEATURE_UDHCP_PORT(char *str_P;)
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	int classindex=0;
++	int i;
++#endif
+ 
+ #if ENABLE_FEATURE_UDHCP_PORT
+ 	SERVER_PORT = 67;
+@@ -305,10 +495,12 @@
+ 		, &dhcp_verbose
+ #endif
+ 		);
++#ifndef ENABLE_FEATURE_DHCP_RUN_FROM_INETD
+ 	if (!(opt & 1)) { /* no -f */
+ 		bb_daemonize_or_rexec(0, argv);
+ 		logmode = LOGMODE_NONE;
+ 	}
++#endif
+ 	/* update argv after the possible vfork+exec in daemonize */
+ 	argv += optind;
+ 	if (opt & 2) { /* -S */
+@@ -336,14 +528,40 @@
+ 
+ 	bb_info_msg("%s (v"BB_VER") started", applet_name);
+ 
+-	option = udhcp_find_option(server_config.options, DHCP_LEASE_TIME);
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	current=head;
++	while (current != NULL ) {
++		server_config=current->server_config_global;
+ 	server_config.max_lease_sec = DEFAULT_LEASE_TIME;
++		option = udhcp_find_option(server_config.options, DHCP_LEASE_TIME);
+ 	if (option) {
+ 		move_from_unaligned32(server_config.max_lease_sec, option->data + OPT_DATA);
+ 		server_config.max_lease_sec = ntohl(server_config.max_lease_sec);
+ 	}
++	/* Sanity check */
++		num_ips = server_config.end_ip - server_config.start_ip + 1;
++		if (server_config.max_leases > num_ips) {
++			bb_error_msg("max_leases=%u is too big, setting to %u",
++				(unsigned)server_config.max_leases, num_ips);
++			server_config.max_leases = num_ips;
++		}
++		server_config.g_leases = xzalloc(server_config.max_leases * sizeof(g_leases[0]));
++		g_leases = server_config.g_leases;
++		read_leases(server_config.lease_file);
++		current->server_config_global = server_config;
++		current = current->next;
++	}
++	server_config = head->server_config_global;
++	g_leases = server_config.g_leases;
++#else
++	option = udhcp_find_option(server_config.options, DHCP_LEASE_TIME);
+ 
+ 	/* Sanity check */
++	server_config.max_lease_sec = DEFAULT_LEASE_TIME;
++	if (option) {
++		move_from_unaligned32(server_config.max_lease_sec, option->data + OPT_DATA);
++		server_config.max_lease_sec = ntohl(server_config.max_lease_sec);
++	}
+ 	num_ips = server_config.end_ip - server_config.start_ip + 1;
+ 	if (server_config.max_leases > num_ips) {
+ 		bb_error_msg("max_leases=%u is too big, setting to %u",
+@@ -353,7 +571,7 @@
+ 
+ 	g_leases = xzalloc(server_config.max_leases * sizeof(g_leases[0]));
+ 	read_leases(server_config.lease_file);
+-
++#endif
+ 	if (udhcp_read_interface(server_config.interface,
+ 			&server_config.ifindex,
+ 			&server_config.server_nip,
+@@ -362,23 +580,51 @@
+ 		retval = 1;
+ 		goto ret;
+ 	}
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++		current=head;
++		while ( current != NULL ) {
++			current->server_config_global.ifindex=server_config.ifindex;
++			memcpy(&current->server_config_global.server_nip,&server_config.server_nip,sizeof(server_config.server_nip));
++			memcpy(&current->server_config_global.server_mac,&server_config.server_mac,6);
++			current=current->next;
++		}
++#endif
+ 
+ 	/* Setup the signal pipe */
+ 	udhcp_sp_setup();
+ 
+ 	timeout_end = monotonic_sec() + server_config.auto_time;
++
++#ifndef CONFIG_FEATURE_DEVM_DEVICE  // TR-111 for gateway
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++            ifx_init_tr111_vars();
++#endif
++#endif
++
+ 	while (1) { /* loop until universe collapses */
+ 		int bytes;
+ 		struct timeval tv;
+ 		uint8_t *server_id_opt;
+ 		uint8_t *requested_opt;
+ 		uint32_t requested_nip = requested_nip; /* for compiler */
+-
++#ifndef CONFIG_FEATURE_DEVM_DEVICE   // if TR-111 enabled and if it is not a device
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++		int iRet;
++		uint8_t *pVSI,*pVsiMessage;
++#endif
++#endif
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++		server_config=head->server_config_global;
++#endif
++#if ENABLE_FEATURE_DHCP_RUN_FROM_INETD
++		if(server_socket < 0)
++			server_socket = 0;
++#else
+ 		if (server_socket < 0) {
+ 			server_socket = udhcp_listen_socket(/*INADDR_ANY,*/ SERVER_PORT,
+ 					server_config.interface);
+ 		}
+-
++#endif
+ 		max_sock = udhcp_sp_fd_set(&rfds, server_socket);
+ 		if (server_config.auto_time) {
+ 			tv.tv_sec = timeout_end - monotonic_sec();
+@@ -392,6 +638,11 @@
+ 		if (retval == 0) {
+ 			write_leases();
+ 			timeout_end = monotonic_sec() + server_config.auto_time;
++
++#if ENABLE_FEATURE_DHCP_RUN_FROM_INETD
++			log1("Timed out. Exiting\n");
++			goto ret0;
++#endif
+ 			continue;
+ 		}
+ 		if (retval < 0 && errno != EINTR) {
+@@ -439,6 +690,10 @@
+ 			continue;
+ 		}
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++		classindex = 0;
++		classindex = find_class( &packet );
++#endif
+ 		/* Look for a static/dynamic lease */
+ 		static_lease_nip = get_static_nip_by_mac(server_config.static_leases, &packet.chaddr);
+ 		if (static_lease_nip) {
+@@ -581,6 +836,39 @@
+ 				 * "No, we don't have this IP for you". */
+ 				send_NAK(&packet);
+ 			}
++
++#ifndef CONFIG_FEATURE_DEVM_DEVICE  // TR-111 for gateway
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++                        log1(
++                              "VIVEK : DHCPD : DHCPREQUEST RECVD : GETTING VSI FROM DATA RECVD \n");
++                        if((pVSI = udhcp_get_option(&packet, DHCP_VSI)) == NULL) {
++								log1("couldn't get Vendor specific option from packet, ignoring");
++                            // continue;
++                        }
++                        else {
++                            log1(
++                                  "VIVEK : DHCPD : DHCPREQUEST RECVD : GOT VSI FROM DATA  \n");
++
++                            pVsiMessage =
++                                get_vsi_option(pVSI, VSI_ENTERPRISE_NO_DSL,
++                                               pVSI[-1]);
++
++                            log1(
++                                  "VIVEK : DHCPD : DHCPREQUEST RECVD : GETTING IANA SPECIFIC VSI DATA and writing msg to TR69  \n");
++                            // now post this buffer to TR69 stack
++                            iRet =
++                                writemsg(TR69_FIFO, pVsiMessage, 1,
++                                         lease->lease_nip);
++                            if(iRet <= 0) {
++                                log1(
++                                      "couldn't write any data to TR69 fifo");
++                            }
++                            log1(
++                                  "VIVEK : DHCPD : DHCPREQUEST RECVD : MESSAGE SENT TO TR69 for ipaddr : %d \n",
++                                  lease->lease_nip);
++                        }
++#endif
++#endif
+ 			break;
+ 
+ 		case DHCPDECLINE:
+@@ -624,11 +912,54 @@
+ 			) {
+ 				lease->expires = time(NULL);
+ 			}
++#ifndef CONFIG_FEATURE_DEVM_DEVICE  // TR-111 for gateway
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++			// if TR-111 defined. post a message to TR-69 resetting
++			// the device data
++			log1( "VIVEK : DHCPD : IP ADDR RELEASED, REMOVE DEVICE ENTRY FROM TR69 for IPADDR : %d \n",
++				lease->lease_nip);
++			writenullmsg(lease->lease_nip);
++#endif
++#endif
+ 			break;
+ 
+ 		case DHCPINFORM:
+ 			log1("Received INFORM");
+ 			send_inform(&packet);
++#ifndef CONFIG_FEATURE_DEVM_DEVICE  // TR-111 for gateway
++#if ENABLE_FEATURE_DHCP_TR111_DEVICE_ASSOCIATION
++                        // if TR-111 defined, then get data and post to TR-69
++                        log1(
++                              "VIVEK : DHCPD : INFORM RECVD : GETTING VSI FROM DATA RECVD \n");
++                        if((pVSI = udhcp_get_option(&packet, DHCP_VSI)) == NULL) {
++                            log1(
++                                  "couldn't get Vendor specific option from packet, ignoring");
++                            continue;
++                        }
++                        else {
++
++                            log1(
++                                  "VIVEK : DHCPD : INFORM RECVD : GOT VSI FROM DATA  \n");
++
++                            pVsiMessage =
++                                get_vsi_option(pVSI, VSI_ENTERPRISE_NO_DSL,
++                                               pVSI[-1]);
++                            log1(
++                                  "VIVEK : DHCPD : INFORM RECVD : GETTING IANA SPECIFIC VSI DATA and writing msg to TR69  \n");
++
++                            iRet =
++                                writemsg(TR69_FIFO, pVsiMessage, 1,
++                                         packet.yiaddr);
++                            if(iRet <= 0) {
++                                log1(
++                                      "couldn't write any data to TR69 fifo");
++                            }
++                            log1(
++                                  "VIVEK : DHCPD : INFORM RECVD : MESSAGE SENT TO TR69 for ipaddr : %d\n",
++                                  packet.yiaddr);
++                        }
++#endif
++#endif
+ 			break;
+ 		}
+ 	}
+Index: busybox-1.17.1/networking/udhcp/dhcpd.h
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dhcpd.h	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/dhcpd.h	2011-04-18 20:40:32.797782451 +0530
+@@ -55,9 +55,34 @@
+ 	char *sname;                    /* bootp server name */
+ 	char *boot_file;                /* bootp boot file option */
+ 	struct static_lease *static_leases; /* List of ip/mac pairs to assign static leases */
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	struct dyn_lease *g_leases;		/* leases for classes */
++	uint8_t macaddr[6];
++	uint8_t macaddrmask[6];
++	uint8_t match_count;
++#endif
+ } FIX_ALIASING;
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++#define CLASSIFER_VENDORID_MATCH 1
++#define CLASSIFER_USERCLASS_MATCH 2
++#define CLASSIFER_CLIENTID_MATCH 4
++#define CLASSIFER_MACADDR_MATCH 8
++#define CLASSIFER_MACADDRMASK_MATCH 16
++#define CLASSIFER_INTERFACE_MATCH 32
++#endif
++
++#ifndef ENABLE_FEATURE_DHCP_USER_CLASS
+ #define server_config (*(struct server_config_t*)&bb_common_bufsiz1)
++#else
++struct global {
++	struct server_config_t server_config_global;
++	struct global *next;
++}*head,*current,*temp;
++
++struct server_config_t server_config;
++extern int total_num_classes;
++#endif
+ /* client_config sits in 2nd half of bb_common_bufsiz1 */
+ 
+ #if ENABLE_FEATURE_UDHCP_PORT
+Index: busybox-1.17.1/networking/udhcp/files.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/files.c	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/files.c	2011-04-18 20:38:39.124781537 +0530
+@@ -63,6 +63,21 @@
+ 	return 1;
+ }
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++static int FAST_FUNC read_macaddr(const char *const_line,uint8_t *arg)
++{
++	char *line;
++	char *mac_string;
++	struct ether_addr mac_bytes; /* it's "struct { uint8_t mac[6]; }" */
++
++	line = (char *) const_line;
++	mac_string = strtok_r(line, " \t", &line);
++	if (!mac_string || !ether_aton_r(mac_string, &mac_bytes))
++		return 0;
++	memcpy(arg,&mac_bytes,6);
++	return 1;
++}
++#endif
+ 
+ struct config_keyword {
+ 	const char *keyword;
+@@ -87,9 +102,18 @@
+ 	{"lease_file"   , read_str        , &server_config.lease_file   , LEASES_FILE},
+ 	{"pidfile"      , read_str        , &server_config.pidfile      , "/var/run/udhcpd.pid"},
+ 	{"siaddr"       , udhcp_str2nip   , &server_config.siaddr_nip   , "0.0.0.0"},
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	{"macaddr"		, read_macaddr	  , &server_config.macaddr		, ""},
++	{"macaddrmask"	, read_macaddr	  , &server_config.macaddrmask	, ""},
++#endif
+ 	/* keywords with no defaults must be last! */
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	{"option"       , udhcp_str2optset_server, &server_config.options      , ""},
++	{"opt"          , udhcp_str2optset_server, &server_config.options      , ""},
++#else
+ 	{"option"       , udhcp_str2optset, &server_config.options      , ""},
+ 	{"opt"          , udhcp_str2optset, &server_config.options      , ""},
++#endif
+ 	{"notify_file"  , read_str        , &server_config.notify_file  , ""},
+ 	{"sname"        , read_str        , &server_config.sname        , ""},
+ 	{"boot_file"    , read_str        , &server_config.boot_file    , ""},
+@@ -103,7 +127,11 @@
+ 	const struct config_keyword *k;
+ 	unsigned i;
+ 	char *token[2];
+-
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	head=(struct global *)calloc(1,sizeof(struct global));
++	server_config=head->server_config_global;
++	current=head;
++#endif
+ 	for (i = 0; i < KWS_WITH_DEFAULTS; i++)
+ 		keywords[i].handler(keywords[i].def, keywords[i].var);
+ 
+@@ -125,14 +153,99 @@
+ 
+ 	server_config.start_ip = ntohl(server_config.start_ip);
+ 	server_config.end_ip = ntohl(server_config.end_ip);
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	head->server_config_global=server_config;
++	current=head;
++	while (current->next != NULL) {
++		current->next->server_config_global.start_ip=ntohl(current->next->server_config_global.start_ip);
++		current->next->server_config_global.end_ip=ntohl(current->next->server_config_global.end_ip);
++		current=current->next;
++	}
++#endif
+ }
+ 
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++static void set_node_defaults() {
++	int i;
++	for (i = 0; i < KWS_WITH_DEFAULTS; i++)
++    	    keywords[i].handler(keywords[i].def, keywords[i].var);
++}
++
++static void copy_head_config()
++{
++	strcpy(server_config.interface,head->server_config_global.interface);
++	server_config.ifindex=head->server_config_global.ifindex;
++	server_config.server_nip=head->server_config_global.server_nip;
++#if ENABLE_FEATURE_UDHCP_PORT
++	server_config.port=head->server_config_global.port;
++#endif
++//	strcpy(server_config.server_mac,head->server_config_global.server_mac);
++	server_config.max_lease_sec=head->server_config_global.max_lease_sec;
++	server_config.min_lease_sec=head->server_config_global.min_lease_sec;
++	server_config.max_leases=head->server_config_global.max_leases;
++	server_config.auto_time=head->server_config_global.auto_time;
++	server_config.decline_time=head->server_config_global.decline_time;
++	server_config.conflict_time=head->server_config_global.conflict_time;
++	server_config.offer_time=head->server_config_global.offer_time;
++	server_config.siaddr_nip=head->server_config_global.siaddr_nip;
++#if 0
++	strcpy(server_config.lease_file,head->server_config_global.lease_file);
++	strcpy(server_config.pidfile,head->server_config_global.pidfile);
++	strcpy(server_config.notify_file,head->server_config_global.notify_file);
++	strcpy(server_config.sname,head->server_config_global.sname);
++	strcpy(server_config.boot_file,head->server_config_global.boot_file);
++#endif
++}
++
++int FAST_FUNC create_node(uint8_t code,void *arg1)
++{
++	static int userclass=0,vendorclass=0,clientid=0;
++        if ( userclass == 0 && vendorclass == 0 && clientid == 0 ) {
++			current->next=(struct global*)calloc(1,sizeof(struct global));
++			current=current->next;
++			current->next=NULL;
++			head->server_config_global=server_config;
++			server_config=current->server_config_global;
++			arg1=&server_config.options;
++			set_node_defaults();
++			copy_head_config();
++        }
++	switch (code) {
++	case DHCP_USER_CLASS:
++		userclass++;
++		break;
++	case DHCP_VENDOR:
++		vendorclass++;
++		break;
++	case DHCP_CLIENT_ID:
++		clientid++;
++		break;
++	default:
++		break;
++	}
++		if ( (userclass == 0 || userclass == 2) && (vendorclass == 0 || vendorclass == 2) && (clientid == 0 || clientid == 2 )) {
++				current->server_config_global=server_config;
++                server_config=head->server_config_global;
++				total_num_classes++;
++				userclass=vendorclass=clientid=0;
++        }
++	return 1;
++}
++#endif
++
+ void FAST_FUNC write_leases(void)
+ {
+ 	int fd;
+ 	unsigned i;
+ 	leasetime_t curr;
+ 	int64_t written_at;
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	struct global *node; /* temporary variable */
++	node = head;
++	while ( node != NULL ) {
++		server_config = node->server_config_global;
++		g_leases = server_config.g_leases;
++#endif
+ 
+ 	fd = open_or_warn(server_config.lease_file, O_WRONLY|O_CREAT|O_TRUNC);
+ 	if (fd < 0)
+@@ -173,6 +286,10 @@
+ 		argv[2] = NULL;
+ 		spawn_and_wait(argv);
+ 	}
++#if ENABLE_FEATURE_DHCP_USER_CLASS
++	node = node->next;
++	}
++#endif
+ }
+ 
+ void FAST_FUNC read_leases(const char *file)
+Index: busybox-1.17.1/include/usage.src.h
+===================================================================
+--- busybox-1.17.1.orig/include/usage.src.h	2011-04-18 20:19:42.858783068 +0530
++++ busybox-1.17.1/include/usage.src.h	2011-04-18 20:31:58.517783914 +0530
+@@ -1068,11 +1068,13 @@
+ 	IF_LONG_OPTS( \
+      "\n	-f,--file=FILE	Lease file" \
+      "\n	-r,--remaining	Show remaining time" \
++     "\n	-s,--seconds	Show remaining time in seconds" \
+      "\n	-a,--absolute	Show expiration time" \
+ 	) \
+ 	IF_NOT_LONG_OPTS( \
+      "\n	-f FILE	Lease file" \
+      "\n	-r	Show remaining time" \
++     "\n	-s	Show remaining time in seconds" \
+      "\n	-a	Show expiration time" \
+ 	)
+ 
+Index: busybox-1.17.1/networking/udhcp/dumpleases.c
+===================================================================
+--- busybox-1.17.1.orig/networking/udhcp/dumpleases.c	2010-07-06 07:55:54.000000000 +0530
++++ busybox-1.17.1/networking/udhcp/dumpleases.c	2011-04-18 20:19:43.027782245 +0530
+@@ -27,17 +27,20 @@
+ 	const char *file = LEASES_FILE;
+ 	struct dyn_lease lease;
+ 	struct in_addr addr;
++	char *unknown_string = "unknown";
+ 
+ 	enum {
+ 		OPT_a	= 0x1,	// -a
+ 		OPT_r	= 0x2,	// -r
+ 		OPT_f	= 0x4,	// -f
++		OPT_s	= 0x8,	// -s
+ 	};
+ #if ENABLE_LONG_OPTS
+ 	static const char dumpleases_longopts[] ALIGN1 =
+ 		"absolute\0"  No_argument       "a"
+ 		"remaining\0" No_argument       "r"
+ 		"file\0"      Required_argument "f"
++		"seconds\0"   No_argument       "s"
+ 		;
+ 
+ 	applet_long_options = dumpleases_longopts;
+@@ -45,7 +48,7 @@
+ 	init_unicode();
+ 
+ 	opt_complementary = "=0:a--r:r--a";
+-	opt = getopt32(argv, "arf:", &file);
++	opt = getopt32(argv, "arf:s", &file);
+ 
+ 	fd = xopen(file, O_RDONLY);
+ 
+@@ -75,7 +78,10 @@
+ #else
+ 		/* actually, 15+1 and 19+1, +1 is a space between columns */
+ 		/* lease.hostname is char[20] and is always NUL terminated */
++		if ( *lease.hostname)
+ 		printf(" %-16s%-20s", inet_ntoa(addr), lease.hostname);
++		else
++			printf(" %-16s%-20s", inet_ntoa(addr),unknown_string);
+ #endif
+ 		expires_abs = ntohl(lease.expires) + written_at;
+ 		if (expires_abs <= curr) {
+@@ -85,12 +91,16 @@
+ 		if (!(opt & OPT_a)) { /* no -a */
+ 			unsigned d, h, m;
+ 			unsigned expires = expires_abs - curr;
++			if (opt & OPT_s) {
++				printf ("%d seconds\n",expires);
++			} else {
+ 			d = expires / (24*60*60); expires %= (24*60*60);
+ 			h = expires / (60*60); expires %= (60*60);
+ 			m = expires / 60; expires %= 60;
+ 			if (d)
+ 				printf("%u days ", d);
+ 			printf("%02u:%02u:%02u\n", h, m, (unsigned)expires);
++			}
+ 		} else { /* -a */
+ 			time_t t = expires_abs;
+ 			fputs(ctime(&t), stdout);

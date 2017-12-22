@@ -1,0 +1,901 @@
+From d2ab5621f6e5e132f500cabf8922ed35ee2864ca Mon Sep 17 00:00:00 2001
+From: Marco A Vital Yep <marco.a.vital.yep@intel.com>
+Date: Wed, 11 Nov 2015 10:55:48 -0700
+Subject: [PATCH 231/441] GBE driver - ITR fixed mode and Tx polling
+
+---
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c    |  58 ++---
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c    | 241 +++++++++++----------
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c    |  28 +--
+ drivers/net/ethernet/synopsys/DWC_ETH_QOS_pktgen.c |   4 +-
+ .../net/ethernet/synopsys/DWC_ETH_QOS_yheader.h    |  31 +--
+ .../net/ethernet/synopsys/DWC_ETH_QOS_yregacc.h    |   8 +-
+ 6 files changed, 185 insertions(+), 185 deletions(-)
+
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_dev.c
+@@ -2002,43 +2002,42 @@ static INT config_mmc_counters(void)
+   return Y_SUCCESS;
+ }
+ 
+-
+-
+ /*!
+ * \brief This sequence is used to disable given DMA channel rx interrupts
+ * \param[in] qInx
+-* \return Success or Failure
+-* \retval  0 Success
+-* \retval -1 Failure
+ */
+-
+-static INT disable_rx_interrupt(UINT qInx)
++static VOID disable_rx_interrupt(UINT qInx)
+ {
+-
+   DMA_IER_RBUE_UdfWr(qInx, 0);
+   DMA_IER_RIE_UdfWr(qInx, 0);
+-
+-  return Y_SUCCESS;
+ }
+ 
+-
+-
+-
+ /*!
+ * \brief This sequence is used to enable given DMA channel rx interrupts
+ * \param[in] qInx
+-* \return Success or Failure
+-* \retval  0 Success
+-* \retval -1 Failure
+ */
+-
+-static INT enable_rx_interrupt(UINT qInx)
++static VOID enable_rx_interrupt(UINT qInx)
+ {
+-
+   DMA_IER_RBUE_UdfWr(qInx, 0x1);
+   DMA_IER_RIE_UdfWr(qInx, 0x1);
++}
+ 
+-  return Y_SUCCESS;
++/*!
++* \brief This sequence is used to disable given DMA channel tx interrupts
++* \param[in] qInx
++*/
++static VOID disable_tx_interrupt(UINT qInx)
++{
++	DMA_IER_TBUE_UdfWr(qInx, 0);
++}
++
++/*!
++* \brief This sequence is used to enable given DMA channel tx interrupts
++* \param[in] qInx
++*/
++static VOID enable_tx_interrupt(UINT qInx)
++{
++	DMA_IER_TBUE_UdfWr(qInx, 1);
+ }
+ 
+ 
+@@ -2926,14 +2925,16 @@ static INT enable_dma_interrupts(UINT qI
+ 	    ((0x1) << 6) | ((0x1) << 7) | ((0x1) << 8) | ((0x1) << 15) |
+ 	    ((0x1) << 16) | ((0x1) << 12);
+ #else
+-	varDMA_IER = varDMA_IER | ((0x1) << 1) | ((0x1) << 2) |
++	varDMA_IER = varDMA_IER | ((0x1) << 1) |
+ 	    ((0x1) << 6) | ((0x1) << 7) | ((0x1) << 8) | ((0x1) << 14) |
+ 	    ((0x1) << 15) | ((0x1) << 12);
+ #endif
+-#ifndef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
+-	/* TIE - Transmit Interrupt Enable */
++#ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
+ 	/* TBUE - Transmit Buffer Unavailable Enable */
+-	varDMA_IER |= ((0x1) << 0) | ((0x1) << 2);
++	varDMA_IER |= ((0x1) << 2);
++#else
++	/* TIE - Transmit Interrupt Enable */
++	varDMA_IER |= ((0x1) << 0);
+ #endif
+ 	DMA_IER_RgWr(qInx, varDMA_IER);
+ 
+@@ -4113,7 +4114,7 @@ static INT configure_mtl_queue(UINT qInx
+ {
+ 	struct DWC_ETH_QOS_tx_queue *queue_data = GET_TX_QUEUE_PTR(qInx);
+ 	ULONG retryCount = 1000;
+-	ULONG vy_count;
++	ULONG vy_count, tx_queue_size, rx_queue_size;
+ 	volatile ULONG varMTL_QTOMR;
+ 	UINT p_rx_fifo = eDWC_ETH_QOS_256, p_tx_fifo = eDWC_ETH_QOS_256;
+ 
+@@ -4160,8 +4161,10 @@ static INT configure_mtl_queue(UINT qInx
+ 	/* Transmit/Receive queue fifo size programmed */
+ 	MTL_QROMR_RQS_UdfWr(qInx, p_rx_fifo);
+ 	MTL_QTOMR_TQS_UdfWr(qInx, p_tx_fifo);
++	tx_queue_size = (p_tx_fifo + 1) * 256;
++	rx_queue_size = (p_rx_fifo + 1) * 256;
+ 	printk(KERN_ALERT "Queue%d Tx fifo size %d, Rx fifo size %d\n",
+-			qInx, ((p_tx_fifo + 1) * 256), ((p_rx_fifo + 1) * 256));
++			qInx, tx_queue_size, rx_queue_size);
+ 
+ 	/* flow control will be used only if
+ 	 * each channel gets 8KB or more fifo */
+@@ -4750,6 +4753,9 @@ void DWC_ETH_QOS_init_function_ptrs_dev(
+ 	hw_if->disable_rx_interrupt = disable_rx_interrupt;
+ 	hw_if->enable_rx_interrupt = enable_rx_interrupt;
+ 
++	hw_if->disable_tx_interrupt = disable_tx_interrupt;
++	hw_if->enable_tx_interrupt = enable_tx_interrupt;
++
+ 	/* for handling MMC */
+ 	hw_if->disable_mmc_interrupts = disable_mmc_interrupts;
+ 	hw_if->config_mmc_counters = config_mmc_counters;
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_drv.c
+@@ -42,8 +42,6 @@ extern ULONG dwc_eth_qos_pci_base_addr;
+ 
+ #include "DWC_ETH_QOS_yregacc.h"
+ 
+-static INT DWC_ETH_QOS_GStatus;
+-
+ /* SA(Source Address) operations on TX */
+ unsigned char mac_addr0[6] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+ unsigned char mac_addr1[6] = { 0x00, 0x66, 0x77, 0x88, 0x99, 0xaa };
+@@ -69,12 +67,9 @@ void DWC_ETH_QOS_stop_all_ch_tx_dma(stru
+ {
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+ 	UINT qInx;
+-
+ 	DBGPR("-->DWC_ETH_QOS_stop_all_ch_tx_dma\n");
+-
+ 	for(qInx = 0; qInx < DWC_ETH_QOS_TX_QUEUE_CNT; qInx++)
+ 		hw_if->stop_dma_tx(qInx);
+-
+ 	DBGPR("<--DWC_ETH_QOS_stop_all_ch_tx_dma\n");
+ }
+ 
+@@ -82,12 +77,9 @@ static void DWC_ETH_QOS_stop_all_ch_rx_d
+ {
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+ 	UINT qInx;
+-
+ 	DBGPR("-->DWC_ETH_QOS_stop_all_ch_rx_dma\n");
+-
+ 	for(qInx = 0; qInx < DWC_ETH_QOS_RX_QUEUE_CNT; qInx++)
+ 		hw_if->stop_dma_rx(qInx);
+-
+ 	DBGPR("<--DWC_ETH_QOS_stop_all_ch_rx_dma\n");
+ }
+ 
+@@ -95,12 +87,9 @@ static void DWC_ETH_QOS_start_all_ch_tx_
+ {
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+ 	UINT i;
+-
+ 	DBGPR("-->DWC_ETH_QOS_start_all_ch_tx_dma\n");
+-
+ 	for(i = 0; i < DWC_ETH_QOS_TX_QUEUE_CNT; i++)
+ 		hw_if->start_dma_tx(i);
+-
+ 	DBGPR("<--DWC_ETH_QOS_start_all_ch_tx_dma\n");
+ }
+ 
+@@ -108,43 +97,24 @@ static void DWC_ETH_QOS_start_all_ch_rx_
+ {
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+ 	UINT i;
+-
+ 	DBGPR("-->DWC_ETH_QOS_start_all_ch_rx_dma\n");
+-
+ 	for(i = 0; i < DWC_ETH_QOS_RX_QUEUE_CNT; i++)
+ 		hw_if->start_dma_rx(i);
+-
+ 	DBGPR("<--DWC_ETH_QOS_start_all_ch_rx_dma\n");
+ }
+ 
+-static void DWC_ETH_QOS_napi_enable_mq(struct DWC_ETH_QOS_prv_data *pdata)
++static void DWC_ETH_QOS_napi_enable(struct DWC_ETH_QOS_prv_data *pdata)
+ {
+-	struct DWC_ETH_QOS_rx_queue *rx_queue = NULL;
+-	int qInx;
+-
+-	DBGPR("-->DWC_ETH_QOS_napi_enable_mq\n");
+-
+-	for (qInx = 0; qInx < DWC_ETH_QOS_RX_QUEUE_CNT; qInx++) {
+-		rx_queue = GET_RX_QUEUE_PTR(qInx);
+-		napi_enable(&rx_queue->napi);
+-	}
+-
+-	DBGPR("<--DWC_ETH_QOS_napi_enable_mq\n");
++	DBGPR("-->DWC_ETH_QOS_napi_enable\n");
++	napi_enable(&pdata->rx_napi);
++	DBGPR("<--DWC_ETH_QOS_napi_enable\n");
+ }
+ 
+-static void DWC_ETH_QOS_all_ch_napi_disable(struct DWC_ETH_QOS_prv_data *pdata)
++static void DWC_ETH_QOS_napi_disable(struct DWC_ETH_QOS_prv_data *pdata)
+ {
+-	struct DWC_ETH_QOS_rx_queue *rx_queue = NULL;
+-	int qInx;
+-
+-	DBGPR("-->DWC_ETH_QOS_napi_enable\n");
+-
+-	for (qInx = 0; qInx < DWC_ETH_QOS_RX_QUEUE_CNT; qInx++) {
+-		rx_queue = GET_RX_QUEUE_PTR(qInx);
+-		napi_disable(&rx_queue->napi);
+-	}
+-
+-	DBGPR("<--DWC_ETH_QOS_napi_enable\n");
++	DBGPR("-->DWC_ETH_QOS_napi_disable\n");
++	napi_disable(&pdata->rx_napi);
++	DBGPR("<--DWC_ETH_QOS_napi_disable\n");
+ }
+ 
+ /*!
+@@ -169,7 +139,7 @@ static void DWC_ETH_QOS_stop_dev(struct
+ 
+ 	netif_tx_disable(pdata->dev);
+ 
+-	DWC_ETH_QOS_all_ch_napi_disable(pdata);
++	DWC_ETH_QOS_napi_disable(pdata);
+ 
+ 	/* stop DMA TX/RX */
+ 	DWC_ETH_QOS_stop_all_ch_tx_dma(pdata);
+@@ -333,7 +303,7 @@ static void DWC_ETH_QOS_start_dev(struct
+ 
+ 	DWC_ETH_QOS_configure_rx_fun_ptr(pdata);
+ 
+-	DWC_ETH_QOS_napi_enable_mq(pdata);
++	DWC_ETH_QOS_napi_enable(pdata);
+ 
+ 	/* reinit descriptor */
+ 	desc_if->wrapper_tx_desc_init(pdata);
+@@ -376,12 +346,11 @@ static void DWC_ETH_QOS_restart_dev(stru
+ {
+ 	struct desc_if_struct *desc_if = &(pdata->desc_if);
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+-	struct DWC_ETH_QOS_rx_queue *rx_queue = GET_RX_QUEUE_PTR(qInx);
+ 
+ 	DBGPR("-->DWC_ETH_QOS_restart_dev\n");
+ 
+ 	netif_stop_subqueue(pdata->dev, qInx);
+-	napi_disable(&rx_queue->napi);
++	DWC_ETH_QOS_napi_disable(pdata);
+ 
+ 	/* stop DMA TX/RX */
+ 	hw_if->stop_dma_tx(qInx);
+@@ -408,7 +377,7 @@ static void DWC_ETH_QOS_restart_dev(stru
+ 	desc_if->wrapper_tx_desc_init_single_q(pdata, qInx);
+ 	desc_if->wrapper_rx_desc_init_single_q(pdata, qInx);
+ 
+-	napi_enable(&rx_queue->napi);
++	DWC_ETH_QOS_napi_enable(pdata);
+ 
+ 	/* initializes MAC and DMA
+ 	 * NOTE : Do we need to init only one channel
+@@ -422,32 +391,44 @@ static void DWC_ETH_QOS_restart_dev(stru
+ 	DBGPR("<--DWC_ETH_QOS_restart_dev\n");
+ }
+ 
+-void DWC_ETH_QOS_disable_all_ch_rx_interrpt(
+-			struct DWC_ETH_QOS_prv_data *pdata)
++void DWC_ETH_QOS_disable_rx_interrupts(struct DWC_ETH_QOS_prv_data *pdata)
+ {
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+ 	UINT qInx;
+-
+-	DBGPR("-->DWC_ETH_QOS_disable_all_ch_rx_interrpt\n");
+-
++	DBGPR("-->DWC_ETH_QOS_disable_rx_interrupts\n");
+ 	for (qInx = 0; qInx < DWC_ETH_QOS_RX_QUEUE_CNT; qInx++)
+ 		hw_if->disable_rx_interrupt(qInx);
+-
+-	DBGPR("<--DWC_ETH_QOS_disable_all_ch_rx_interrpt\n");
++	DBGPR("<--DWC_ETH_QOS_disable_rx_interrupts\n");
+ }
+ 
+-void DWC_ETH_QOS_enable_all_ch_rx_interrpt(
+-			struct DWC_ETH_QOS_prv_data *pdata)
++void DWC_ETH_QOS_enable_rx_interrupts(struct DWC_ETH_QOS_prv_data *pdata)
+ {
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+ 	UINT qInx;
+-
+-	DBGPR("-->DWC_ETH_QOS_enable_all_ch_rx_interrpt\n");
+-
++	DBGPR("-->DWC_ETH_QOS_enable_rx_interrupts\n");
+ 	for (qInx = 0; qInx < DWC_ETH_QOS_RX_QUEUE_CNT; qInx++)
+ 		hw_if->enable_rx_interrupt(qInx);
++	DBGPR("<--DWC_ETH_QOS_enable_rx_interrupts\n");
++}
+ 
+-	DBGPR("<--DWC_ETH_QOS_enable_all_ch_rx_interrpt\n");
++void DWC_ETH_QOS_disable_tx_interrupts(struct DWC_ETH_QOS_prv_data *pdata)
++{
++	struct hw_if_struct *hw_if = &(pdata->hw_if);
++	UINT qInx;
++	DBGPR("-->DWC_ETH_QOS_disable_tx_interrupts\n");
++	for (qInx = 0; qInx < DWC_ETH_QOS_TX_QUEUE_CNT; qInx++)
++		hw_if->disable_tx_interrupt(qInx);
++	DBGPR("<--DWC_ETH_QOS_disable_tx_interrupts\n");
++}
++
++void DWC_ETH_QOS_enable_tx_interrupts(struct DWC_ETH_QOS_prv_data *pdata)
++{
++	struct hw_if_struct *hw_if = &(pdata->hw_if);
++	UINT qInx;
++	DBGPR("-->DWC_ETH_QOS_enable_tx_interrupts\n");
++	for (qInx = 0; qInx < DWC_ETH_QOS_TX_QUEUE_CNT; qInx++)
++		hw_if->enable_tx_interrupt(qInx);
++	DBGPR("<--DWC_ETH_QOS_enable_tx_interrupts\n");
+ }
+ 
+ 
+@@ -461,6 +442,9 @@ void DWC_ETH_QOS_enable_all_ch_rx_interr
+ * \retval IRQ_HANDLED
+ */
+ 
++#define HI_PRIORITY_INT  0x1
++#define LO_PRIORITY_INT  0x2
++
+ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_QOS(int irq, void *device_id)
+ {
+ 	ULONG varDMA_ISR;
+@@ -474,23 +458,21 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 	struct net_device *dev = pdata->dev;
+ 	struct hw_if_struct *hw_if = &(pdata->hw_if);
+ 	UINT qInx;
+-	int napi_sched = 0;
+-	struct DWC_ETH_QOS_rx_queue *rx_queue = NULL;
+-	ULONG varMAC_ANS = 0;
+-	ULONG varMAC_PCS = 0;
+-	ULONG atom_ims = 0, gmac5_int = 0;
++	ULONG varMAC_ANS = 0, varMAC_PCS = 0;
++	unsigned int sched_rx_napi = 0, atom_ims = 0, gmac5_int = 0;
+ 
+ 	DBGPR("-->DWC_ETH_QOS_ISR_SW_DWC_ETH_QOS\n");
+ 
+ 	atom_ims = GBE_REG_RD(pdata->gbe_base, GBE_ATOM_IMS_OFF); //Interrupts are cleared when IMS is read
+ 	GET_VAR32_BITS(atom_ims, gmac5_int, GMAC5_INTC_WIDTH, GMAC5_INTC_OFF);
+ 	if (!gmac5_int) {
+-		printk(KERN_ALERT "GMAC5 ISR triggered with bit not set IMS(0x%08x)\n", atom_ims);
++		printk(KERN_ALERT "GMAC5 ISR with no bit set!\n");
++		return IRQ_NONE;
+ 	}
+ 
+ 	DMA_ISR_RgRd(varDMA_ISR);
+ 	if (varDMA_ISR == 0x0) {
+-		DBGPR("DMA_ISR = %#lx, AtomIC_IMS = %#lx\n", varDMA_ISR, atom_ims);
++		printk(KERN_ALERT "GMAC5 ISR with no DMA bit set AtomIC_IMS(0x%08x)\n", atom_ims);
+ 		return IRQ_NONE;
+ 	}
+ 
+@@ -499,7 +481,6 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 
+ 	/* Handle DMA interrupts */
+ 	for (qInx = 0; qInx < DWC_ETH_QOS_TX_QUEUE_CNT; qInx++) {
+-		rx_queue = GET_RX_QUEUE_PTR(qInx);
+ 
+ 		DMA_SR_RgRd(qInx, varDMA_SR);
+ 		/* clear interrupts */
+@@ -514,23 +495,13 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 		if (varDMA_SR == 0)
+ 			continue;
+ 
+-		if ((GET_VALUE(varDMA_SR, DMA_SR_RI_LPOS, DMA_SR_RI_HPOS) & 1) ||
+-			(GET_VALUE(varDMA_SR, DMA_SR_RBU_LPOS, DMA_SR_RBU_HPOS) & 1)) {
+-			if (!napi_sched) {
+-				napi_sched = 1;
+-				if (likely(napi_schedule_prep(&rx_queue->napi))) {
+-					DWC_ETH_QOS_disable_all_ch_rx_interrpt(pdata);
+-					__napi_schedule(&rx_queue->napi);
+-				} else {
+-					printk(KERN_ALERT "driver bug! Rx interrupt while in poll\n");
+-					DWC_ETH_QOS_disable_all_ch_rx_interrpt(pdata);
+-				}
+-
+-				if ((GET_VALUE(varDMA_SR, DMA_SR_RI_LPOS, DMA_SR_RI_HPOS) & 1))
+-					pdata->xstats.rx_normal_irq_n[qInx]++;
+-				else
+-					pdata->xstats.rx_buf_unavailable_irq_n[qInx]++;
+-			}
++		if (GET_VALUE(varDMA_SR, DMA_SR_RI_LPOS, DMA_SR_RI_HPOS) & 1) {
++			pdata->xstats.rx_normal_irq_n[qInx]++;
++			sched_rx_napi |= LO_PRIORITY_INT;
++		}
++		if (GET_VALUE(varDMA_SR, DMA_SR_RBU_LPOS, DMA_SR_RBU_HPOS) & 1) {
++			pdata->xstats.rx_buf_unavailable_irq_n[qInx]++;
++			sched_rx_napi |= HI_PRIORITY_INT;
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_TI_LPOS, DMA_SR_TI_HPOS) & 1) {
+ 			pdata->xstats.tx_normal_irq_n[qInx]++;
+@@ -538,27 +509,48 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_TPS_LPOS, DMA_SR_TPS_HPOS) & 1) {
+ 			pdata->xstats.tx_process_stopped_irq_n[qInx]++;
+-			DWC_ETH_QOS_GStatus = -E_DMA_SR_TPS;
++			printk(KERN_ALERT "Tx stopped interrupt!\n");
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_TBU_LPOS, DMA_SR_TBU_HPOS) & 1) {
+ 			pdata->xstats.tx_buf_unavailable_irq_n[qInx]++;
+-			DWC_ETH_QOS_GStatus = -E_DMA_SR_TBU;
++#ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++			sched_rx_napi |= LO_PRIORITY_INT;
++#endif
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_RPS_LPOS, DMA_SR_RPS_HPOS) & 1) {
+ 			pdata->xstats.rx_process_stopped_irq_n[qInx]++;
+-			DWC_ETH_QOS_GStatus = -E_DMA_SR_RPS;
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_RWT_LPOS, DMA_SR_RWT_HPOS) & 1) {
+ 			pdata->xstats.rx_watchdog_irq_n++;
+-			DWC_ETH_QOS_GStatus = S_DMA_SR_RWT;
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_FBE_LPOS, DMA_SR_FBE_HPOS) & 1) {
+ 			pdata->xstats.fatal_bus_error_irq_n++;
+-			DWC_ETH_QOS_GStatus = -E_DMA_SR_FBE;
+ 			DWC_ETH_QOS_restart_dev(pdata, qInx);
+ 		}
+ 	}
+ 
++	/* Schedule Rx NAPI, if required*/
++	if (sched_rx_napi) {
++		if (pdata->rx_napi_pending) {
++			printk(KERN_ALERT "DMA interrupt while in polling!\n");
++		} else {
++			spin_lock(&pdata->lock);
++			DWC_ETH_QOS_disable_rx_interrupts(pdata);
++#ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++			DWC_ETH_QOS_disable_tx_interrupts(pdata);
++#endif
++			pdata->rx_napi_pending = true;
++			spin_unlock(&pdata->lock);
++			if (sched_rx_napi & HI_PRIORITY_INT) // || itr_mode == NONE
++				/* Schedule NAPI now */
++				napi_schedule(&pdata->rx_napi);
++			else
++				/* Delay schedule of NAPI */
++				hrtimer_start(&pdata->rx_itr_timer,
++					ns_to_ktime(500000), HRTIMER_MODE_REL);
++		}
++	}
++
+ 	/* Handle MAC interrupts */
+ 	if (GET_VALUE(varDMA_ISR, DMA_ISR_MACIS_LPOS, DMA_ISR_MACIS_HPOS) & 1) {
+ 		/* handle only those MAC interrupts which are enabled */
+@@ -568,7 +560,6 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 		/* PMT interrupt */
+ 		if (GET_VALUE(varMAC_ISR, MAC_ISR_PMTIS_LPOS, MAC_ISR_PMTIS_HPOS) & 1) {
+ 			pdata->xstats.pmt_irq_n++;
+-			DWC_ETH_QOS_GStatus = S_MAC_ISR_PMTIS;
+ 			MAC_PMTCSR_RgRd(varMAC_PMTCSR);
+ 			if (pdata->power_down)
+ 				DWC_ETH_QOS_powerup(pdata->dev, DWC_ETH_QOS_IOCTL_CONTEXT);
+@@ -1314,6 +1305,7 @@ static void DWC_ETH_QOS_default_common_c
+ 	pdata->use_lpi_tx_automate = true;
+ 	pdata->eee_active = 0;
+ 	pdata->one_nsec_accuracy = 1;
++	pdata->rx_napi_pending = false;
+ 
+ 	DBGPR("<--DWC_ETH_QOS_default_common_confs\n");
+ }
+@@ -1413,6 +1405,19 @@ static void DWC_ETH_QOS_default_rx_confs
+ 	DBGPR("<--DWC_ETH_QOS_default_rx_confs\n");
+ }
+ 
++enum hrtimer_restart rx_itr_timeout(struct hrtimer *timer)
++{
++	struct DWC_ETH_QOS_prv_data *pdata;
++	pdata = container_of(timer, struct DWC_ETH_QOS_prv_data, rx_itr_timer);
++	DBGPR("-->rx_itr_timeout\n");
++	/* Schedule TX NAPI to start polling */
++	if (likely(napi_schedule_prep(&pdata->rx_napi))) {
++		__napi_schedule(&pdata->rx_napi);
++	}
++	DBGPR("<--rx_itr_timeout\n");
++	return HRTIMER_NORESTART;
++}
++
+ #ifdef GBE_POLLING
+ enum hrtimer_restart gbe_timeout(struct hrtimer *timer)
+ {
+@@ -1449,6 +1454,7 @@ static int DWC_ETH_QOS_open(struct net_d
+ 	int ret = Y_SUCCESS;
+ 	struct hw_if_struct *hw_if = &pdata->hw_if;
+ 	struct desc_if_struct *desc_if = &pdata->desc_if;
++	unsigned long flags;
+ 
+ 	DBGPR("-->DWC_ETH_QOS_open (%d)\n", dev->irq);
+ 
+@@ -1466,7 +1472,6 @@ static int DWC_ETH_QOS_open(struct net_d
+ 		ret = -EBUSY;
+ 		goto err_irq_0;
+ 	}
+-	netss_interrupt_enable(NETSS_INTERUPT_GBE);
+ 
+ 	ret = desc_if->alloc_buff_and_desc(pdata);
+ 	if (ret < 0) {
+@@ -1485,7 +1490,7 @@ static int DWC_ETH_QOS_open(struct net_d
+ 	DWC_ETH_QOS_default_rx_confs(pdata);
+ 	DWC_ETH_QOS_configure_rx_fun_ptr(pdata);
+ 
+-	DWC_ETH_QOS_napi_enable_mq(pdata);
++	DWC_ETH_QOS_napi_enable(pdata);
+ #endif /* end of DWC_ETH_QOS_CONFIG_PGTEST */
+ 
+ 	DWC_ETH_QOS_set_rx_mode(dev);
+@@ -1518,13 +1523,17 @@ static int DWC_ETH_QOS_open(struct net_d
+ 		hw_if->set_full_duplex();
+ 		hw_if->set_gmii_speed();
+ 		netif_tx_start_all_queues(dev);
+-   } else if (pdata->phydev) {
++	} else if (pdata->phydev) {
+ 		netif_tx_start_all_queues(dev);
+-   }
++	}
++	hrtimer_init(&pdata->rx_itr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	pdata->rx_itr_timer.function = rx_itr_timeout;
+ #ifdef GBE_POLLING
+ 	hrtimer_init(&pdata->gbe_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	pdata->gbe_timer.function = gbe_timeout;
+ 	hrtimer_start(&pdata->gbe_timer, ktime_set(0, 10000), HRTIMER_MODE_REL);
++#else
++	netss_interrupt_enable(NETSS_INTERUPT_GBE);
+ #endif
+ #else
+ 	netif_tx_disable(dev);
+@@ -1576,7 +1585,7 @@ static int DWC_ETH_QOS_close(struct net_
+ 
+ #ifndef DWC_ETH_QOS_CONFIG_PGTEST
+ 	netif_tx_disable(dev);
+-	DWC_ETH_QOS_all_ch_napi_disable(pdata);
++	DWC_ETH_QOS_napi_disable(pdata);
+ #endif /* end of DWC_ETH_QOS_CONFIG_PGTEST */
+ 
+ 	/* issue software reset to device */
+@@ -2548,7 +2557,7 @@ static void DWC_ETH_QOS_receive_skb(stru
+ 	skb->protocol = eth_type_trans(skb, dev);
+ 
+ 	if (dev->features & NETIF_F_GRO) {
+-		napi_gro_receive(&rx_queue->napi, skb);
++		napi_gro_receive(&pdata->rx_napi, skb);
+ 	} else if ((dev->features & NETIF_F_LRO) &&
+ 		(skb->ip_summed == CHECKSUM_UNNECESSARY)) {
+ 		lro_receive_skb(&rx_queue->lro_mgr, skb, (void *)pdata);
+@@ -3417,11 +3426,11 @@ void DWC_ETH_QOS_update_rx_errors(struct
+ * \retval number of packets received.
+ */
+ 
+-int DWC_ETH_QOS_poll_mq(struct napi_struct *napi, int budget)
++int DWC_ETH_QOS_poll_rx(struct napi_struct *napi, int budget)
+ {
+-	struct DWC_ETH_QOS_rx_queue *rx_queue =
+-		container_of(napi, struct DWC_ETH_QOS_rx_queue, napi);
+-	struct DWC_ETH_QOS_prv_data *pdata = rx_queue->pdata;
++	struct DWC_ETH_QOS_prv_data *pdata =
++		container_of(napi, struct DWC_ETH_QOS_prv_data, rx_napi);
++	struct DWC_ETH_QOS_rx_queue *rx_queue = NULL;
+ 	/* divide the budget evenly among all the queues */
+ 	int per_q_budget = budget / DWC_ETH_QOS_RX_QUEUE_CNT;
+ 	int qInx = 0;
+@@ -3456,20 +3465,20 @@ int DWC_ETH_QOS_poll_mq(struct napi_stru
+ 	 * tell the kernel & re-enable interrupt */
+ 	if (received < budget) {
+ 		unsigned long flags;
+-		if (pdata->dev->features & NETIF_F_GRO) {
+-			/* to turn off polling */
++		/* Turn off polling */
++		if (pdata->dev->features & NETIF_F_GRO)
+ 			napi_complete(napi);
+-			spin_lock_irqsave(&pdata->lock, flags);
+-			/* Enable all ch RX interrupt */
+-			DWC_ETH_QOS_enable_all_ch_rx_interrpt(pdata);
+-			spin_unlock_irqrestore(&pdata->lock, flags);
+-		} else {
+-			spin_lock_irqsave(&pdata->lock, flags);
++		else
+ 			__napi_complete(napi);
+-			/* Enable all ch RX interrupt */
+-			DWC_ETH_QOS_enable_all_ch_rx_interrpt(pdata);
+-			spin_unlock_irqrestore(&pdata->lock, flags);
+-		}
++		spin_lock_irqsave(&pdata->lock, flags);
++		/* Enable Rx interrupts */
++		DWC_ETH_QOS_enable_rx_interrupts(pdata);
++#ifdef DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++		/* Enable Tx interrupts */
++		DWC_ETH_QOS_enable_tx_interrupts(pdata);
++#endif
++		pdata->rx_napi_pending = false;
++		spin_unlock_irqrestore(&pdata->lock, flags);
+ 	}
+ 
+ 	DBGPR("<--DWC_ETH_QOS_poll_mq\n");
+@@ -5305,8 +5314,7 @@ static int DWC_ETH_QOS_vlan_rx_kill_vid(
+ 	int crc32_val = 0;
+ 	unsigned int enb_12bit_vhash;
+ 
+-	printk(KERN_ALERT "-->DWC_ETH_QOS_vlan_rx_kill_vid: vid = %d\n",
+-		vid);
++	DBGPR("-->DWC_ETH_QOS_vlan_rx_kill_vid: vid = %d\n", vid);
+ 
+ 	if (pdata->vlan_hash_filtering) {
+ 		crc32_val = (bitrev32(~crc32_le(~0, (unsigned char *)&vid, 2)) >> 28);
+@@ -5330,7 +5338,7 @@ static int DWC_ETH_QOS_vlan_rx_kill_vid(
+ 		pdata->vlan_ht_or_id = 1;
+ 	}
+ 
+-	printk(KERN_ALERT "<--DWC_ETH_QOS_vlan_rx_kill_vid\n");
++	DBGPR("<--DWC_ETH_QOS_vlan_rx_kill_vid\n");
+    return 0;
+ }
+ 
+@@ -5359,8 +5367,7 @@ static int DWC_ETH_QOS_vlan_rx_add_vid(s
+ 	int crc32_val = 0;
+ 	unsigned int enb_12bit_vhash;
+ 
+-	printk(KERN_ALERT "-->DWC_ETH_QOS_vlan_rx_add_vid: vid = %d\n",
+-		vid);
++	DBGPR("-->DWC_ETH_QOS_vlan_rx_add_vid: vid = %d\n", vid);
+ 
+ 	if (pdata->vlan_hash_filtering) {
+ 		/* The upper 4 bits of the calculated CRC are used to
+@@ -5388,7 +5395,7 @@ static int DWC_ETH_QOS_vlan_rx_add_vid(s
+ 		pdata->vlan_ht_or_id = vid;
+ 	}
+ 
+-	printk(KERN_ALERT "<--DWC_ETH_QOS_vlan_rx_add_vid\n");
++	DBGPR("<--DWC_ETH_QOS_vlan_rx_add_vid\n");
+    return 0;
+ }
+ 
+@@ -5441,7 +5448,7 @@ INT DWC_ETH_QOS_powerdown(struct net_dev
+ 		netif_device_detach(dev);
+ 
+ 	netif_tx_disable(dev);
+-	DWC_ETH_QOS_all_ch_napi_disable(pdata);
++	DWC_ETH_QOS_napi_disable(pdata);
+ 
+ 	/* stop DMA TX/RX */
+ 	DWC_ETH_QOS_stop_all_ch_tx_dma(pdata);
+@@ -5527,7 +5534,7 @@ INT DWC_ETH_QOS_powerup(struct net_devic
+ 	if (caller == DWC_ETH_QOS_DRIVER_CONTEXT)
+ 		netif_device_attach(dev);
+ 
+-	DWC_ETH_QOS_napi_enable_mq(pdata);
++	DWC_ETH_QOS_napi_enable(pdata);
+ 
+ 	netif_tx_start_all_queues(dev);
+ 
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pci.c
+@@ -36,8 +36,6 @@
+ #include "DWC_ETH_QOS_yheader.h"
+ #include "DWC_ETH_QOS_pci.h"
+ #include "DWC_ETH_QOS_yregacc.h"
+-
+-#ifdef INIT_NETSS_GBE
+ #include <linux/netip_subsystem.h>
+ 
+ static int DWC_ETH_QOS_init_general_gbe(void __iomem **gbe_base,
+@@ -140,8 +138,6 @@ static int DWC_ETH_QOS_init_general_gbe(
+    return ret;
+ }
+ 
+-#endif
+-
+ static UCHAR dev_addr[6] = {0, 0x55, 0x7b, 0xb5, 0x7d, 0xf7};
+ 
+ ULONG dwc_eth_qos_pci_base_addr;
+@@ -192,16 +188,17 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 		printk(KERN_ALERT "%s:Unable to enable device\n", DEV_NAME);
+ 		goto err_out_enb_failed;
+ 	}
+-#ifdef INIT_NETSS_GBE
+-	else if (pci_enable_msi(pdev)) {
++
++#ifdef GBE_MSI
++	if (pci_enable_msi(pdev)) {
+ 		printk(KERN_ALERT "%s:Unable to enable MSI\n", DEV_NAME);
+ 		goto err_out_msi_failed;
+ 	}
++#endif
+ 
+    if (DWC_ETH_QOS_init_general_gbe(&gbe_base, &gbe_mux_cfg)) {
+ 		goto err_out_req_reg_failed;
+    }
+-#endif
+ 
+ 	if (pci_request_regions(pdev, DEV_NAME)) {
+ 		printk(KERN_ALERT "%s:Failed to get PCI regions\n", DEV_NAME);
+@@ -259,10 +256,9 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 	pdata->dev = dev;
+ 	pdata->tx_queue_cnt = tx_q_count;
+ 	pdata->rx_queue_cnt = rx_q_count;
+-#ifdef INIT_NETSS_GBE
++
+ 	pdata->gbe_base = gbe_base;
+ 	pdata->mux_cfg = gbe_mux_cfg;
+-#endif
+ 
+ #ifdef DWC_ETH_QOS_CONFIG_DEBUGFS
+ 	/* to give prv data to debugfs */
+@@ -310,12 +306,8 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 		enable_irq_wake(dev->irq);
+ 	}
+ 
+-	for (i = 0; i < DWC_ETH_QOS_RX_QUEUE_CNT; i++) {
+-		struct DWC_ETH_QOS_rx_queue *rx_queue = GET_RX_QUEUE_PTR(i);
+-
+-		netif_napi_add(dev, &rx_queue->napi, DWC_ETH_QOS_poll_mq,
+-				(64 * DWC_ETH_QOS_RX_QUEUE_CNT));
+-	}
++   netif_napi_add(dev, &pdata->rx_napi, DWC_ETH_QOS_poll_rx,
++		64 * DWC_ETH_QOS_RX_QUEUE_CNT);
+ 
+ 	SET_ETHTOOL_OPS(dev, DWC_ETH_QOS_get_ethtool_ops());
+ 	if (pdata->hw_feat.tso_en) {
+@@ -420,7 +412,7 @@ int DWC_ETH_QOS_probe(struct pci_dev *pd
+ 	pci_release_regions(pdev);
+ 
+  err_out_req_reg_failed:
+-#ifdef INIT_NETSS_GBE
++#ifdef GBE_MSI
+ 	pci_disable_msi(pdev);
+  err_out_msi_failed:
+ #endif
+@@ -473,14 +465,12 @@ void DWC_ETH_QOS_remove(struct pci_dev *
+ 
+ 	desc_if->free_queue_struct(pdata);
+ 
+-#ifdef INIT_NETSS_GBE
+ 	// Disable GMAC5 core
+ 	reg_val = GBE_REG_RD(pdata->gbe_base, GBE_GCR5_OFF);
+ 	SET_VAR32_BITS(reg_val, 0, GCR5_ENABLE_WIDTH, GCR5_ENABLE_OFF);
+ 	GBE_REG_WR(pdata->gbe_base, GBE_GCR5_OFF, reg_val);
+ 	iounmap(pdata->gbe_base);
+ 	pdata->gbe_base = NULL;
+-#endif
+ 
+ 	free_netdev(dev);
+ 
+@@ -488,7 +478,7 @@ void DWC_ETH_QOS_remove(struct pci_dev *
+ 	pci_iounmap(pdev, (void __iomem *)dwc_eth_qos_pci_base_addr);
+ 
+ 	pci_release_regions(pdev);
+-#ifdef INIT_NETSS_GBE
++#ifdef GBE_MSI
+ 	pci_disable_msi(pdev);
+ #endif
+ 	pci_disable_device(pdev);
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pktgen.c
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_pktgen.c
+@@ -238,7 +238,7 @@ static void DWC_ETH_QOS_poll_pg(struct D
+ 	}
+ 
+ 	/* Enable all ch RX interrupt */
+-	DWC_ETH_QOS_enable_all_ch_rx_interrpt(pdata);
++	DWC_ETH_QOS_enable_rx_interrupts(pdata);
+ 
+ 	DBGPR_PG("<--DWC_ETH_QOS_poll_pg\n");
+ }
+@@ -479,7 +479,7 @@ irqreturn_t DWC_ETH_QOS_ISR_SW_DWC_ETH_Q
+ 			DMA_SR_TBU_UdfWr(qInx, 1);
+ 		}
+ 		if (GET_VALUE(varDMA_SR, DMA_SR_RI_LPOS, DMA_SR_RI_HPOS) & 1) {
+-			DWC_ETH_QOS_disable_all_ch_rx_interrpt(pdata);
++			DWC_ETH_QOS_disable_rx_interrupts(pdata);
+ 			DWC_ETH_QOS_poll_pg(pdata);
+ 			DMA_SR_RI_UdfWr(qInx, 1);
+ 		}
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yheader.h
+@@ -133,9 +133,11 @@
+ //#define DWC_ETH_QOS_QUEUE_SELECT_ALGO
+ //#define DWC_ETH_QOS_CERTIFICATION_PKTBURSTCNT
+ //#define DWC_ETH_QOS_CERTIFICATION_PKTBURSTCNT_HALFDUPLEX
+-//#define DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
++#define DWC_ETH_QOS_TXPOLLING_MODE_ENABLE
+ 
+-/* Uncomment this macro to poll ISR registers */
++/* This macro enables/disables the MSI interrupt mode */
++#define GBE_MSI
++/* This macro enables polling GBE ISR status registers */
+ //#define GBE_POLLING
+ 
+ #ifdef DWC_ETH_QOS_CONFIG_PTP
+@@ -698,18 +700,18 @@ struct hw_if_struct {
+ 	 VOID(*enable_vlan_reg_control) (struct DWC_ETH_QOS_tx_wrapper_descriptor *desc_data);
+ 	 VOID(*enable_vlan_desc_control) (struct DWC_ETH_QOS_prv_data *pdata);
+ 
+-	/* for rx vlan stripping */
+-//	 VOID(*config_rx_outer_vlan_stripping) (u32);
+-//	 VOID(*config_rx_inner_vlan_stripping) (u32);
+-
+ 	/* for sa(source address) insert/replace */
+ 	 VOID(*configure_mac_addr0_reg) (UCHAR *);
+ 	 VOID(*configure_mac_addr1_reg) (UCHAR *);
+ 	 VOID(*configure_sa_via_reg) (u32);
+ 
+-	/* for handling multi-queue */
+-	INT(*disable_rx_interrupt)(UINT);
+-	INT(*enable_rx_interrupt)(UINT);
++	/* for handling rx interrupts */
++	VOID(*disable_rx_interrupt)(UINT);
++	VOID(*enable_rx_interrupt)(UINT);
++
++	/* for handling tx interrupts */
++	VOID(*disable_tx_interrupt)(UINT);
++	VOID(*enable_tx_interrupt)(UINT);
+ 
+ 	/* for handling MMC */
+ 	INT(*disable_mmc_interrupts)(VOID);
+@@ -948,7 +950,6 @@ struct DWC_ETH_QOS_rx_wrapper_descriptor
+ struct DWC_ETH_QOS_rx_queue {
+ 	/* Rx descriptors */
+ 	struct DWC_ETH_QOS_rx_wrapper_descriptor rx_desc_data;
+-	struct napi_struct napi;
+ 	struct DWC_ETH_QOS_prv_data *pdata;
+ 
+ 	struct net_lro_mgr lro_mgr;
+@@ -1200,8 +1201,11 @@ struct DWC_ETH_QOS_prv_data {
+ 
+ 	/* RX Queue */
+ 	struct DWC_ETH_QOS_rx_queue *rx_queue;
++	struct napi_struct rx_napi;
+ 	UCHAR rx_queue_cnt;
+ 	UINT rx_qInx;
++	struct hrtimer rx_itr_timer;
++	bool rx_napi_pending;
+ 
+ 	struct mii_bus *mii;
+ 	struct phy_device *phydev;
+@@ -1364,7 +1368,7 @@ void DWC_ETH_QOS_init_function_ptrs_dev(
+ void DWC_ETH_QOS_init_function_ptrs_desc(struct desc_if_struct *);
+ struct net_device_ops *DWC_ETH_QOS_get_netdev_ops(void);
+ struct ethtool_ops *DWC_ETH_QOS_get_ethtool_ops(void);
+-int DWC_ETH_QOS_poll_mq(struct napi_struct *, int);
++int DWC_ETH_QOS_poll_rx(struct napi_struct *, int);
+ 
+ void DWC_ETH_QOS_get_pdata(struct DWC_ETH_QOS_prv_data *pdata);
+ 
+@@ -1391,10 +1395,9 @@ INT DWC_ETH_QOS_powerup(struct net_devic
+ INT DWC_ETH_QOS_powerdown(struct net_device *, UINT, UINT);
+ u32 DWC_ETH_QOS_usec2riwt(u32 usec, struct DWC_ETH_QOS_prv_data *pdata);
+ void DWC_ETH_QOS_init_rx_coalesce(struct DWC_ETH_QOS_prv_data *pdata);
+-void DWC_ETH_QOS_enable_all_ch_rx_interrpt(struct DWC_ETH_QOS_prv_data *pdata);
+-void DWC_ETH_QOS_disable_all_ch_rx_interrpt(struct DWC_ETH_QOS_prv_data *pdata);
++void DWC_ETH_QOS_enable_rx_interrupts(struct DWC_ETH_QOS_prv_data *pdata);
++void DWC_ETH_QOS_disable_rx_interrupts(struct DWC_ETH_QOS_prv_data *pdata);
+ void DWC_ETH_QOS_update_rx_errors(struct net_device *, unsigned int);
+-void DWC_ETH_QOS_stop_all_ch_tx_dma(struct DWC_ETH_QOS_prv_data *pdata);
+ UCHAR get_tx_queue_count(void);
+ UCHAR get_rx_queue_count(void);
+ void DWC_ETH_QOS_mmc_read(struct DWC_ETH_QOS_mmc_counters *mmc);
+--- a/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yregacc.h
++++ b/drivers/net/ethernet/synopsys/DWC_ETH_QOS_yregacc.h
+@@ -37888,10 +37888,6 @@
+   (GET_VALUE(data,(lbit+(index)*(hbit-lbit+1)),(hbit+(index)*(hbit-lbit+1))))
+ #endif
+ 
+-#define INIT_NETSS_GBE
+-
+-#ifdef INIT_NETSS_GBE
+-
+ /** GBE GENERAL REGISTERS */
+ 
+ #define GBE_GEN_REGISTER_OFF    (0x0)
+@@ -37913,7 +37909,7 @@
+ #define GBE_ATOM_IRS_OFF   (GBE_GEN_ATOM_IC_OFF + 0x10) // Interrupt Status Register
+ #define GBE_ATOM_IMS_OFF   (GBE_GEN_ATOM_IC_OFF + 0x14) // Interrupt Masked Status Register
+ 
+-// GMAC5 Configuration Register offsets
++/* GMAC5 Configuration Register offsets */
+ #define GCR5_ENABLE_OFF       ( 31 )   // 1 - Enabled; 0 - Disabled
+ #define GCR5_PHY_CFG_OFF      ( 29 )   // 00 - GMII; 01 - RGMII; 10 - SGMII
+ #define GCR5_ENDIANESS_OFF    ( 28 )   // 0 - LE; 1 - BE
+@@ -37957,5 +37953,3 @@ do { \
+ do { \
+    val = (x >> offset) & (0xFFFFFFFF >> (32-width));\
+ } while (0)
+-
+-#endif

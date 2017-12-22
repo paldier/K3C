@@ -1,0 +1,95 @@
+Filesystems like squashfs under a UBI volume require Gluebi support which emulates virtual mtd's
+on volumes. On bootup, kernel could mount those filesystems only with a mtdblock number passed on
+kernel command line. Example root=/dev/mtdblock6. This patch helps in mounting a rootfs based on
+volume name instead of using a mtdblock number. This require a different kernel command line
+argument named 'rootfsname'. Example:- rootfsname=rootfs_vol
+When using 'rootfsname=', argument 'root=' must be avoided.
+
+Initial submit: 24-Feb-2012 - alexander.abraham@lantiq.com
+
+Index: linux-3.8.10/drivers/mtd/ubi/Kconfig
+===================================================================
+--- linux-3.8.10.orig/drivers/mtd/ubi/Kconfig	2013-05-13 13:53:40.000000000 +0530
++++ linux-3.8.10/drivers/mtd/ubi/Kconfig	2013-05-13 14:06:07.000000000 +0530
+@@ -87,4 +87,14 @@
+ 	   work on top of UBI. Do not enable this unless you use legacy
+ 	   software.
+ 
++config MTD_UBI_GLUEBI_ROOTFS_DEV
++	bool "Set root filesystem based on rootfs volume name"
++	depends on MTD_UBI_GLUEBI
++	default y
++	help
++	   This option helps kernel to mount a root filesystem which works on top
++	   of a gluebi volume using its volume name instead of using its mtd number.
++	   ie. instead of using root=/dev/mtdblockN, we can pass
++	   'rootfsname=volume_name' via kernel commandline.
++
+ endif # MTD_UBI
+Index: linux-3.8.10/drivers/mtd/ubi/gluebi.c
+===================================================================
+--- linux-3.8.10.orig/drivers/mtd/ubi/gluebi.c	2013-05-13 13:53:40.000000000 +0530
++++ linux-3.8.10/drivers/mtd/ubi/gluebi.c	2013-05-13 14:06:07.000000000 +0530
+@@ -38,6 +38,9 @@
+ #include <linux/mutex.h>
+ #include <linux/mtd/ubi.h>
+ #include <linux/mtd/mtd.h>
++#ifdef CONFIG_MTD_UBI_GLUEBI_ROOTFS_DEV
++  #include <linux/root_dev.h>
++#endif
+ #include "ubi-media.h"
+ 
+ #define err_msg(fmt, ...)                                   \
+@@ -65,6 +68,26 @@
+ /* List of all gluebi devices */
+ static LIST_HEAD(gluebi_devices);
+ static DEFINE_MUTEX(devices_mutex);
++#ifdef CONFIG_MTD_UBI_GLUEBI_ROOTFS_DEV
++  /* Buffers to read kernel command line */
++  extern char *saved_command_line;
++  char *rootfsmtd_ptr;
++  char command_line_buf[64];
++  #define ROOTFS_CMDLINE "rootfsname="
++
++/*
++ * gluebi_read_cmdline - read kernel command line and get value of 'rootfsname'
++ * return: 0
++ */
++static void __init gluebi_read_cmdline (void)
++{
++	rootfsmtd_ptr = strstr(saved_command_line, ROOTFS_CMDLINE);
++	if (rootfsmtd_ptr) {
++		sscanf(rootfsmtd_ptr, ROOTFS_CMDLINE"%s", command_line_buf);
++		printk("Gluebi: Found kernel commandline option 'rootfsname=%s'\n", command_line_buf);
++	}
++}
++#endif
+ 
+ /**
+  * find_gluebi_nolock - find a gluebi device.
+@@ -352,6 +375,15 @@
+ 		return -ENFILE;
+ 	}
+ 
++#ifdef CONFIG_MTD_UBI_GLUEBI_ROOTFS_DEV
++	if (rootfsmtd_ptr) {
++		if (!strcmp(mtd->name, command_line_buf)) {
++			ROOT_DEV = MKDEV(MTD_BLOCK_MAJOR, mtd->index);
++			printk("Gluebi: mtd '%s' set to be root filesystem\n", mtd->name);
++		}
++	}
++#endif
++
+ 	mutex_lock(&devices_mutex);
+ 	list_add_tail(&gluebi->list, &gluebi_devices);
+ 	mutex_unlock(&devices_mutex);
+@@ -492,6 +524,9 @@
+ 
+ static int __init ubi_gluebi_init(void)
+ {
++#ifdef CONFIG_MTD_UBI_GLUEBI_ROOTFS_DEV
++	gluebi_read_cmdline ();
++#endif
+ 	return ubi_register_volume_notifier(&gluebi_notifier, 0);
+ }
+ 
