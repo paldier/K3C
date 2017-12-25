@@ -10,14 +10,16 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ez-ipupdate
 PKG_VERSION:=3.0.11b8
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
-PKG_SOURCE:=$(PKG_NAME)_$(PKG_VERSION).orig.tar.gz
-
+PKG_SOURCE:=$(PKG_NAME)_$(PKG_VERSION).tar.gz
+PKG_SOURCE_VERSION:=dd076c70ab62fce1871e27857484e36714cf1b69
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+PKG_SOURCE_SUBDIR ?= $(PKG_NAME)-$(PKG_VERSION)
 
 ####
-PKG_SOURCE_URL:=https://downloads.openwrt.org/sources/
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/paldier/ez-ipupdate-k3c.git
 #PKG_MD5SUM:=f5f491564812db5d8783daa538c49186
 PKG_NO_AUTORECONF=y
 PKG_DEFAULT_CUSTOM_SOURCE_DIR:=$(TOPDIR)/../../../wlnsw/wireline_sw_linux26/open_ez_ipupdate
