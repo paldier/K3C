@@ -56,8 +56,8 @@ tune_network_parameters()
 	fi
 
 	if [ -n "$CONFIG_TARGET_LANTIQ_XRX500" ]; then
-		sysctl -w net.netfilter.nf_conntrack_max="6144"
-		sysctl -w net.netfilter.nf_conntrack_expect_max="100"
+		sysctl -w net.netfilter.nf_conntrack_max="16384"
+		sysctl -w net.netfilter.nf_conntrack_expect_max="256"
 	fi
 	
 	if [ -n "$CONFIG_TARGET_LANTIQ_XRX200" ]; then

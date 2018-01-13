@@ -89,6 +89,9 @@ fi
 ubus call csd factoryreset
 sync; sleep 2;
 
+rm -rf /overlay/*
+sync; sleep 2;
+
 ubus call servd notify '{"nid":'$NOTIFY_FACTORY_RESET',"type":false}';
 sync; sleep 2;
 
