@@ -366,9 +366,11 @@ xlnetacc_query() {
 
 # 带宽提速处理
 xlnetacc_acc() {
-	_api_url_down=; _api_url_up=
-	_dial_account_down=; _dial_account_up=
-	_cur_down=0; _max_down=0; _cur_up=0; _max_up=0
+	if [ $1 -eq 1 ]; then
+		_api_url_down=; _dial_account_down=; _cur_down=0; _max_down=0
+	else
+		_api_url_up=; _dial_account_up=; _cur_up=0; _max_up=0
+	fi
 
 	xlnetacc_portal $1 || return
 	xlnetacc_bandwidth $1 || return
