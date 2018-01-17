@@ -21,72 +21,6 @@ local index = nil
 -- Fastindex
 local fi
 
-function remove_idx(  tbl, index )
-
-	-- initiate variables for save procedure
-	local tables,lookup = { tbl },{ [tbl] = 1 }
-
-	for idx,t in ipairs( tables ) do
-		local thandled = {}
-
-		for i,v in ipairs( t ) do
-			thandled[i] = true
-			local stype = type( v )
-			-- only handle value
-			if stype == "table" then
-				if not lookup[v] then
-					table.insert( tables, v )
-					lookup[v] = #tables
-				end
-			else
-				if i == index then
-					t[i] = nil
-					return
-				end
-			end
-		end
-
-		for i,v in pairs( t ) do
-			-- escape handled values
-			if (not thandled[i]) then
-
-				local flag = 0
-				local stype = type( i )
-				-- handle index
-				if stype == "table" then
-					if not lookup[i] then
-						table.insert( tables,i )
-						lookup[i] = #tables
-					end
-				else
-					flag = 1
-					if i == index then
-						t[i] = nil
-						return
-					end
-				end
-
-				if flag == 1 then
-					stype = type( v )
-					-- handle value
-					if stype == "table" then
-						if not lookup[v] then
-							table.insert( tables,v )
-							lookup[v] = #tables
-						end
-					else
-						if i == index then
-							t[i] = nil
-							return
-						end
-					end
-				end
-
-			end
-		end
-	end
-end 
-
 
 function build_url(...)
 	local path = {...}
@@ -366,7 +300,7 @@ function dispatch(request)
 		"Access Violation\nThe page at '" .. table.concat(request, "/") .. "/' " ..
 		"has no parent node so the access to this location has been denied.\n" ..
 		"This is a software bug, please report this message at " ..
-		"http://luci.subsignal.org/trac/newticket"
+		"https://github.com/openwrt/luci/issues"
 	)
 
 	if track.sysauth then
@@ -475,25 +409,6 @@ function dispatch(request)
 		if util.copcall(tpl.render, "indexer", {}) then
 			return true
 		end
-	end
-
-	local is_ugw = io.open("/etc/version", "r")
-
-	--Checking if we are running ugw
-	if is_ugw ~= nil then
-		io.close(is_ugw)
-		local table_remove = {
-                                status  =  {"iptables", "routes", "syslog", "dmesg", "realtime"},
-                                system  =  {"startup", "crontab", "leds", "flashops", "reboot", "logout"},
-                                network =  {"dhcp", "hosts", "routes", "diagnostics", "firewall"}
-                        	}
-
-
-        	for menu,list in pairs(table_remove) do
-                	for i,v in ipairs(list) do
-                        	remove_idx(ctx.tree, v)
-                	end
-        	end
 	end
 
 	if type(target) == "function" then

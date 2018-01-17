@@ -51,14 +51,20 @@ rf.optional = true
 
 
 s:taboption("files", Flag, "nohosts",
-	translate("Ignore Hosts files")).optional = true
+	translate("Ignore <code>/etc/hosts</code>")).optional = true
 
-hf = s:taboption("files", DynamicList, "addnhosts",
-	translate("Additional Hosts files"))
+s:taboption("files", DynamicList, "addnhosts",
+	translate("Additional Hosts files")).optional = true
 
-hf:depends("nohosts", "")
-hf.optional = true
+qu = s:taboption("advanced", Flag, "quietdhcp",
+	translate("Suppress logging"),
+	translate("Suppress logging of the routine operation of these protocols"))
+qu.optional = true
 
+se = s:taboption("advanced", Flag, "sequential_ip",
+	translate("Allocate IP sequentially"),
+	translate("Allocate IP addresses sequentially, starting from the lowest available address"))
+se.optional = true
 
 s:taboption("advanced", Flag, "boguspriv",
 	translate("Filter private"),

@@ -127,22 +127,29 @@ function _list(action, pat, cb)
 		(pat and (" '%s'" % pat:gsub("'", "")) or ""))
 
 	if fd then
-		local name, version, desc
+		local name, version, sz, desc
 		while true do
 			local line = fd:read("*l")
 			if not line then break end
 
-			name, version, desc = line:match("^(.-) %- (.-) %- (.+)")
+			name, version, sz, desc = line:match("^(.-) %- (.-) %- (.-) %- (.+)")
 
 			if not name then
-				name, version = line:match("^(.-) %- (.+)")
+				name, version, sz = line:match("^(.-) %- (.-) %- (.+)")
 				desc = ""
 			end
 
-			cb(name, version, desc)
+			if name and version then
+				if #version > 26 then
+					version = version:sub(1,21) .. ".." .. version:sub(-3,-1)
+				end
+
+				cb(name, version, sz, desc)
+			end
 
 			name    = nil
 			version = nil
+			sz      = nil
 			desc    = nil
 		end
 
@@ -151,15 +158,15 @@ function _list(action, pat, cb)
 end
 
 function list_all(pat, cb)
-	_list("list", pat, cb)
+	_list("list --size", pat, cb)
 end
 
 function list_installed(pat, cb)
-	_list("list_installed", pat, cb)
+	_list("list_installed --size", pat, cb)
 end
 
 function find(pat, cb)
-	_list("find", pat, cb)
+	_list("find --size", pat, cb)
 end
 
 

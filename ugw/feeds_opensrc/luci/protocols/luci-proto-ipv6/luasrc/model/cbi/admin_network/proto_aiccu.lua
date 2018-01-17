@@ -76,7 +76,7 @@ requiretls = section:taboption("general", Flag, "requiretls",
 	translate("Require TLS"),
 	translate("Connection to server fails when TLS cannot be used"))
 requiretls.optional = true
-requiretls.default = enabled
+requiretls.default = requiretls.enabled
 
 
 verbose = section:taboption("advanced", Flag, "verbose",

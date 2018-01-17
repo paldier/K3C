@@ -30,12 +30,12 @@ LUCI_LANG.pt-br=Português do Brasil (Brazialian Portuguese)
 LUCI_LANG.pt=Português (Portuguese)
 LUCI_LANG.ro=Română (Romanian)
 LUCI_LANG.ru=Русский (Russian)
-LUCI_LANG.sk=Slovenčina (Slovene)
+LUCI_LANG.sk=Slovenčina (Slovak)
 LUCI_LANG.sv=Svenska (Swedish)
 LUCI_LANG.tr=Türkçe (Turkish)
 LUCI_LANG.uk=украї́нська (Ukrainian)
 LUCI_LANG.vi=Tiếng Việt (Vietnamese)
-LUCI_LANG.zh-cn=普通话 (Chinese)
+LUCI_LANG.zh-cn=中文 (Chinese)
 LUCI_LANG.zh-tw=臺灣華語 (Taiwanese)
 
 # Submenu titles
@@ -53,17 +53,24 @@ PKG_VERSION?=$(if $(DUMP),x,$(strip $(shell \
 	if svn info >/dev/null 2>/dev/null; then \
 		revision="svn-r$$(LC_ALL=C svn info | sed -ne 's/^Revision: //p')"; \
 	elif git log -1 >/dev/null 2>/dev/null; then \
-		revision="svn-r$$(LC_ALL=C git log -1 | sed -ne 's/.*git-svn-id: .*@\([0-9]\+\) .*/\1/p')"; \
-		if [ "$$revision" = "svn-r" ]; then \
-			set -- $$(git log -1 --format="%ct %h"); \
-			secs="$$(($$1 % 86400))"; \
-			yday="$$(date --utc --date="@$$1" "+%y.%j")"; \
-			revision="$$(printf 'git-%s.%05d-%s' "$$yday" "$$secs" "$$2")"; \
-		fi; \
+		revision="for-K3C-15.05"; \
 	else \
-		revision="unknown"; \
+		revision="for-K3C-15.05"; \
 	fi; \
 	echo "$$revision" \
+)))
+
+PKG_GITBRANCH?=$(if $(DUMP),x,$(strip $(shell \
+	variant="LuCI"; \
+	if git log -1 >/dev/null 2>/dev/null; then \
+		branch="$$(git symbolic-ref --short -q HEAD 2>/dev/null)"; \
+		if [ "$$branch" != "master" ]; then \
+			variant="LuCI $$branch branch"; \
+		else \
+			variant="LuCI Master"; \
+		fi; \
+	fi; \
+	echo "$$variant" \
 )))
 
 PKG_RELEASE?=1
@@ -121,7 +128,7 @@ endef
 
 ifneq ($(wildcard ${CURDIR}/src/Makefile),)
  MAKE_PATH := src/
- MAKE_VARS += FPIC="$(FPIC)" LUCI_VERSION="$(PKG_VERSION)"
+ MAKE_VARS += FPIC="$(FPIC)" LUCI_VERSION="$(PKG_VERSION)" LUCI_GITBRANCH="$(PKG_GITBRANCH)"
 
  define Build/Compile
 	$(call Build/Compile/Default,clean compile)
