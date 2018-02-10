@@ -1,0 +1,341 @@
+#!/bin/sh
+# Configure AccessPoint.X_LANTIQ_COM_Vendor.HS20 parameters
+# Needed object: AccessPoint.X_LANTIQ_COM_Vendor.HS20
+
+script_name="$0"
+
+[ ! "$LIB_COMMON_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_common.sh
+[ ! "$LIB_CONVERT_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_convert.sh
+[ ! "$IN_CONF_SOURCED" ] && in_conf_source
+
+interface_name=$1
+pid=$$
+interface_index=`find_index_from_interface_name $interface_name`
+
+#echo "fapi_wlan_wave_firewall_conf_change: Start" > /dev/console
+#echo "fapi_wlan_wave_firewall_conf_change: interface_name=$interface_name" > /dev/console
+
+###########################################################################
+# Complete L2F objects recieved from HS2.0 without rule numbers.
+# Therefore, on every L2F modification, all rules are deleted and rewrite with new rule index.
+# This script is called only if a change in L2F config occure.
+# It gets interface name only.
+#
+# Previous configuration is saved in file HS20_CONF_L2F_FW_RULES (${CONF_DIR}/l2f_rules)
+# Format:
+#   wave_wifi_l2f_ctrl.sh add <interface_name> <rule_number> <rule>
+# Example:
+#   "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan0 1 -a logdeny -p 1)"
+#   "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan0 2 -a accept -p 3)"
+#   "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan1 3 -a logaccept -p 2)"
+#   "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan1 4 -a logdeny -p 3)"
+#
+# Actions:
+# Loop over commands in HS20_CONF_L2F_FW_RULES
+# -delete rull
+# -for other interfaces, save in ${HS20_CONF_L2F_FW_RULES}_tmp with rule number change serially
+# Add rules from IN_CONF to ${HS20_CONF_L2F_FW_RULES}_tmp with incremented rule number 
+# Loop over commands in ${HS20_CONF_L2F_FW_RULES}_tmp
+# -add rule
+# mv ${HS20_CONF_L2F_FW_RULES}_tmp $HS20_CONF_L2F_FW_RULES
+#
+# More:
+# wave_wifi_l2f_ctrl.sh dump
+# > Interface: wlan0
+# > ==========
+# > Rule num: 1    Action: Deny    Log: Off    Packets processed: 0
+# >         IP Proto=1      Source MAC=00:11:22:33:44:55    Destination MAC=00:11:22:33:44:66       Source port=0   Destination port=0  Ingress intf=eth0
+# > Rule num: 2    Action: Accept    Log: Off    Packets processed: 0
+# >         IP Proto=2      Source MAC=00:11:22:33:44:55    Destination MAC=00:11:22:33:44:88       Source port=0   Destination port=0  Ingress intf=eth2
+# > Rule num: 3    Action: Accept    Log: Off    Packets processed: 0
+# >         IP Proto=0      Source port=0   Destination port=0      Ingress intf=eth0
+# 
+# Test Code:
+# -----------
+# Use the above example rules in file HS20_CONF_L2F_FW_RULES
+# Code:
+# HS20_CONF_L2F_FW_RULES=${CONF_DIR}/l2f_rules
+# while read line
+# do
+# 	command=${line%%-*}
+# 	command=`echo $command | sed 's/add/remove/`
+# 	echo "Del command = $command" > /dev/console
+# done < $HS20_CONF_L2F_FW_RULES
+
+
+
+##############################################################################################
+#
+# New Requirements:
+# hs_cli L2F -O ADD -I <interface> -N <rule number> -R “<rule>”
+# hs_cli L2F -O DEL -I <interface> -N <rule number>
+# hs_cli L2F -O DUMP
+#
+##############################################################################################
+
+
+
+# # TEST CODE:
+#
+# # Prepare in file:
+#
+# touch /tmp/test_l2f_in:
+# OLD:
+# echo "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan0 2 -a logdeny -p 1)" > /tmp/test_l2f_in
+# echo "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan0 3 -a logdeny -p 1)" >> /tmp/test_l2f_in
+# NEW:
+# hs_cli L2F -O ADD -I  wlan0 2 -a logdeny -p 1
+# hs_cli L2F -O ADD -I  wlan0 3 -a logdeny -p 1
+# EXPECTED OUTPUT (DEL instead of ADD):
+# hs_cli L2F -O DEL -I wlan0 2 -a logdeny -p 1
+# hs_cli L2F -O DEL -I wlan0 3 -a logdeny -p 1
+
+# # CODE:
+#
+# # Remove rules:
+#
+# echo "test: START" > /dev/console
+# HS20_CONF_L2F_FW_RULES=/tmp/test_l2f_in
+# rm ${HS20_CONF_L2F_FW_RULES}_remove
+# rm ${HS20_CONF_L2F_FW_RULES}_tmp
+#
+# rule_index=1
+# i=0
+# while read line
+# do
+# 	echo "test: line $i: $line" > /dev/console
+# 	if [  -n $line ]
+# 	then
+# 		continue
+# 	fi
+# 	command=${line%%-*}
+# 	echo "test: command=$command" > /dev/console
+# 	# Get command interface:
+# 	word_count=`echo $command | awk '{print NF}'`
+# 	let word_count=$word_count-1
+# 	echo "test: word_count=$word_count" > /dev/console
+# 	#rule_interface=${command##add*}
+# 	rule_interface=${command##hs_cli L2F -O ADD -I*}
+# 	rule_interface=`echo $rule_interface | awk -v var=$word_count '{print $var}'`
+# 	echo "test: rule_interface=$rule_interface" > /dev/console
+# 	if [ "$rule_interface" != "$interface_name" ]
+# 	then
+# 		# Other interface, save the command with new rule index
+# 		echo "test: rule_interface != interface_name, Replace rule number. rule_index=$rule_index" > /dev/console
+# 		# Replace rule number:
+# 		#line=`echo $line | awk -v var=$rule_index '{$5 = $var; print}'`
+# 		#'s/^/'${list_type}'_/' -e 's/$/=\"1\"/' -e 's/:/_/g' $acl_file > ${CONF_DIR}/acl_params_${interface_name}
+# 		#line_tmp=`echo $line | sed -e "s/\<\w\+/${rule_index}/9"` 
+# 		line_tmp=`echo $line | sed -e "s/\<\w\+/${rule_index}/7"`
+# 		echo "test: line_tmp=$line_tmp" > /dev/console
+# 		echo "$line_tmp" >> ${HS20_CONF_L2F_FW_RULES}_tmp
+# 		let rule_index=$rule_index+1
+# 	fi
+# 
+# 	echo "test: after add \line=$line" > /dev/console
+# 	#line=`echo $line | sed 's/add/remove/'`
+#	line=`echo $line | sed 's/ADD/DEL/'`
+# 	echo "test: after change to remove: line=$line" > /dev/console
+# 	echo $line >> ${HS20_CONF_L2F_FW_RULES}_remove
+# #	[ -e $L2F_CTRL_SCRIPT ] && set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name $command
+# 	let i=$i+1
+# 	
+# done < $HS20_CONF_L2F_FW_RULES
+# 
+# echo "test: END" > /dev/console
+#
+# # Add commands to file, format: "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan0 1 -a logdeny -p 1)"
+# command="-a logdeny -p 1"
+# line="(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh\" \"add wlan0 $rule_index $command)"
+# echo "test: after add line=$line to ${HS20_CONF_L2F_FW_RULES}_tmp" > /dev/console
+# echo $line >> ${HS20_CONF_L2F_FW_RULES}_tmp
+# let rule_index=$rule_index+1
+
+
+add_replace_command()
+{
+	command=$*
+	# TODO: smart add to file...
+	#echo "add_replace_command: add $command" > /dev/console
+	echo $command >> ${HS20_COMMANDS_SAVE}_$interface_name
+}
+
+
+# Remove rules:
+# Also save other interfaces in ${HS20_CONF_L2F_FW_RULES}_tmp.
+# Will add list to L2F...
+rule_index=1
+while read line
+do
+	#echo "fapi_wlan_wave_firewall_conf_change: rule_index=$rule_index, line: $line" > /dev/console
+	if [  -n $line ]
+	then
+		continue
+	fi
+	command=${line%%-*}
+	#echo "fapi_wlan_wave_firewall_conf_change: command=$command" > /dev/console
+	# Get command interface:
+	word_count=`echo $command | awk '{print NF}'`
+	let word_count=$word_count-1
+#	rule_interface=${command##add*}
+	rule_interface=${command##hs_cli L2F -O ADD -I*}
+	rule_interface=`echo $rule_interface | awk -v var=$word_count '{print $var}'`
+	#echo "fapi_wlan_wave_firewall_conf_change: rule_interface=$rule_interface" > /dev/console
+	if [ "$rule_interface" != "$interface_name" ]
+	then
+		# Other interface, save the command with new rule index
+		#echo "fapi_wlan_wave_firewall_conf_change: rule_interface != interface_name, Replace rule number. rule_index=$rule_index" > /dev/console
+		# Replace rule number:
+		#line=`echo $line | awk -v var=$rule_index '{$5 = $var; print}'`
+		#'s/^/'${list_type}'_/' -e 's/$/=\"1\"/' -e 's/:/_/g' $acl_file > ${CONF_DIR}/acl_params_${interface_name}
+#		line_tmp=`echo $line | sed -e "s/\<\w\+/${rule_index}/9"`
+		line_tmp=`echo $line | sed -e "s/\<\w\+/${rule_index}/7"`
+		#echo "fapi_wlan_wave_firewall_conf_change: line_tmp=$line_tmp" > /dev/console
+		echo "$line_tmp" >> ${HS20_CONF_L2F_FW_RULES}_tmp
+		let rule_index=$rule_index+1
+	fi
+	# Remove rule:
+#	line=`echo $line | sed 's/add/remove/'`
+	line=`echo $line | sed 's/ADD/DEL/'`
+	line=`echo $line | sed 's/ADD/\" \"DEL/'`
+	#echo "fapi_wlan_wave_firewall_conf_change: Remove rule, line=$line" > /dev/console
+	echo $line >> ${HS20_CONF_L2F_FW_RULES}_remove
+	#[ -e $L2F_CTRL_SCRIPT ] && set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name $line
+	set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name "$line"
+done < $HS20_CONF_L2F_FW_RULES
+
+
+# Exec ${HS20_CONF_L2F_FW_RULES}_tmp
+# Use rule_index to new rules to add rules from IN_CONF.
+# Loop over L2F instances and parse file for the soecific interface.
+#
+# Params:
+#	Action
+#	IngressInterface
+#	EgressInterface
+#	Protocol
+#	SourceMAC
+#	DestinationMAC
+#	PacketType
+#	SourceIP
+#	DestinationIP
+#	SourcePort
+#	DestinationPort"
+# Format:
+#   NEW: hs_cli L2F -O ADD -I <interface> -N <rule number> -R “<rule>”
+#   OLD: "(. /opt/lantiq/wave/scripts/wave_wifi_l2f_ctrl.sh" "add wlan0 2 -a logdeny -p 1)"
+#
+# EXAMPLE:
+# ~# hs_cli L2F -O ADD -I wlan0 -N 1 "-R -a logdeny -i wlan0 -i 1 -t mc -i 192.168.1.10 -i 2000 -i 0"
+# ~#
+# ~# cat /proc/net/wave_wifi_l2f/l2f
+# Interface: wlan1
+# ==========
+# No rule set.
+# 
+# Interface: wlan0
+# ==========
+# Rule num: 1    Action: Deny    Log: On    Packets processed: 0
+#         Pkt type=Multicast      Ingress intf=0000168.1.10
+
+if [ -e ${HS20_CONF_L2F_FW_RULES}_tmp ]
+then
+	while read line
+	do
+		#echo "fapi_wlan_wave_firewall_conf_change: line=$line" > /dev/console
+		if [ -n $line ]
+		then
+			#echo "fapi_wlan_wave_firewall_conf_change: end of ${HS20_CONF_L2F_FW_RULES}_tmp file" > /dev/console
+			break
+		fi
+		$line
+	done < ${HS20_CONF_L2F_FW_RULES}_tmp
+fi
+
+L2FirewallNumOfEntries=`db2fapi_convert regular L2FirewallNumberOfEntries $interface_index`
+#echo "fapi_wlan_wave_firewall_conf_change: handle hs20_oper_friendly_name, L2FirewallNumOfEntries=$L2FirewallNumOfEntries" > /dev/console
+i=0
+while [ $i -lt $L2FirewallNumOfEntries ]; do
+	eval file_name=${HS20_CONF_L2F_FW}_${i}
+	#echo "fapi_wlan_wave_firewall_conf_change: handle L2Firewall, file_name=$file_name" > /dev/console
+	if [ -e $file_name ]; then
+		. $file_name
+		#echo "fapi_wlan_wave_firewall_conf_change: handle L2Firewall, get Action" > /dev/console
+		action=`db2fapi_convert regular Action $interface_index`
+		#echo "fapi_wlan_wave_firewall_conf_change: Action=$action" > /dev/console
+		
+		# Serve only if exist configuration for the interface, else continu to next file:
+		if [ -z "$action" ]; then continue; fi
+		
+#		value="add $interface_name $rule_index"
+		value="L2F -O ADD -I $interface_name -N $rule_index \"-R"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		case "$action" in
+			"0") value="${value} -a accept";;
+			"1") value="${value} -a deny";;
+			"2") value="${value} -a logaccept";;
+			"3") value="${value} -a logdeny";;
+		esac
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		ingressIface=`db2fapi_convert regular IngressInterface $interface_index`
+		[ -n "$ingressIface" ] && value="${value} -i $ingressIface"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		# Is EgressInterface Supported ???
+		#egressInterface=`db2fapi_convert regular EgressInterface $interface_index`
+		#[ -n "$egressInterface" ] && value="${value} -i $egressInterface"
+		
+		protocol=`db2fapi_convert regular Protocol $interface_index`
+		[ -n "$protocol" ] && value="${value} -p $protocol"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		sourceMAC=`db2fapi_convert regular SourceMAC $interface_index`
+		[ -n "$sourceMAC" ] && value="${value} -s $sourceMAC"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		destinationMAC=`db2fapi_convert regular DestinationMAC $interface_index`
+		[ -n "$destinationMAC" ] && value="${value} -d $destinationMAC"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		packetType=`db2fapi_convert regular PacketType $interface_index`
+		if [ -n "$packetType" ]; then
+			case "$packetType" in
+				"1") value="${value} -t uc";;
+				"2") value="${value} -t mc";;
+				"3") value="${value} -t bc";;
+			esac
+		fi
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		sourceIP=`db2fapi_convert regular SourceIP $interface_index`
+		[ -n "$sourceIP" ] && value="${value} -sip $sourceIP"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		destinationIP=`db2fapi_convert regular DestinationIP $interface_index`
+		[ -n "$destinationIP" ] && value="${value} -dip $destinationIP"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		sourcePort=`db2fapi_convert regular SourcePort $interface_index`
+		[ -n "$sourcePort" ] && value="${value} -sp $sourcePort"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+		
+		destinationPort=`db2fapi_convert regular DestinationPort $interface_index`
+		[ -n "$destinationPort" ] && value="${value} -dp $destinationPort"
+		#echo "fapi_wlan_wave_firewall_conf_change: value=$value" > /dev/console
+
+		value="${value}\""
+		# Write command to file:
+		#echo "fapi_wlan_wave_firewall_conf_change: Write command to file: alumnus otf $pid $interface_name" > /dev/console
+		#echo "fapi_wlan_wave_firewall_conf_change: with: hs_cli value=$value" > /dev/console
+		#[ -e $L2F_CTRL_SCRIPT ] && set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name "(. $L2F_CTRL_SCRIPT" "${value})"
+		set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name "hs_cli" "${value}"
+		add_replace_command hs_cli ${value}
+	fi
+	i=$((i+1))
+	rule_index=$((rule_index+1))
+done
+
+
+#echo "fapi_wlan_wave_firewall_conf_change: End" > /dev/console
+

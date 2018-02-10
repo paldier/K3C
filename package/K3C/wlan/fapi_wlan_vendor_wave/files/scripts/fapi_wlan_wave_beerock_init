@@ -1,0 +1,228 @@
+#!/bin/sh
+# /opt/lantiq/wave/scripts/fapi_wlan_wave_beerock_init
+#
+# fapi_wlan_wave_beerock_init 
+# Bring up the interfaces of a Wave radio
+# Needed object: None
+#set -ex
+#set -o errtrace
+
+die() {
+        echo >&2 "$@"
+        exit 1;
+}
+
+# copy_if_need checks whether a file of a given name exists. If it does NOT exist,
+# attempts to copy it into place from a backup of the same name (but with a given
+# extension).
+# 1st param: path/filename of file that must exist
+# 2nd param: filename extension of backup copy to use when making a copy ("gw" or "ire")
+copy_if_need() {
+        # validate params
+        if [ -z "$1" ]
+        then
+                echo "copy_if_need - ERROR - Please specify a file to check for."
+                return 1;
+        fi
+        if [ -z "$2" ]
+        then
+                echo "copy_if_need - ERROR - Please specify gw or ire for 2nd parameter."
+                return 1;
+        fi
+
+        # check for file
+        if [ ! -f "$1" ]
+        then
+                # restore if needed
+                cp "${1}.${2}" "$1"
+                if [ $? -ne 0 ]
+                then
+                        echo "copy_if_need - ERROR - Failed to restore ${1}.${2} to ${1}"
+                        return 1;
+                else
+                        echo "copy_if_need - Successfully restored ${1}.${2} to ${1}"
+                fi
+        else
+                echo "copy_if_need - File ${1} already exists."
+        fi
+
+        # if here, was successful
+        return 0;
+}
+
+script_name="$0"
+
+echo " ############################## $script_name ############################## "
+
+[ ! "$LIB_COMMON_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_common.sh
+
+# Source config.sh on UGW:
+[ -e /etc/rc.d/config.sh ] && . /etc/rc.d/config.sh
+
+# determine whether this device is gateway or ire (WIDAN_DEVICE_TYPE)
+# (logic from fapi_wlan_wave_beerock_is_master_query)
+echo "IWIFIEX_INIT - Model name: ${CONFIG_IFX_MODEL_NAME}"
+[ -n "$CONFIG_IFX_MODEL_NAME" ] && echo "$script_name CONFIG_IFX_MODEL_NAME = $CONFIG_IFX_MODEL_NAME" > /dev/console
+if [ `echo "$CONFIG_IFX_MODEL_NAME" | grep IRE` ]
+then
+        echo "IWIFIEX_INIT - Device is an IRE"
+        WIDAN_DEVICE_TYPE=ire
+else
+        echo "IWIFIEX_INIT - Device is a Gateway"
+        WIDAN_DEVICE_TYPE=gw
+fi
+
+# restore widan_ire.conf for all devices
+copy_if_need /opt/widan/widan_ire.conf $WIDAN_DEVICE_TYPE
+
+# restore device_config_file.conf for all devices
+copy_if_need /opt/widan/device_config_file.conf $WIDAN_DEVICE_TYPE
+
+# restore widan_gw.conf only for gateways
+if [ "gw" == "$WIDAN_DEVICE_TYPE" ]
+then
+        copy_if_need /opt/widan/widan_gw.conf $WIDAN_DEVICE_TYPE
+fi
+
+# check for dhcp_event section of dhcp_notify_event script.
+if grep dhcp_event /opt/lantiq/etc/rc.d/dhcp_notify_event.sh
+then
+        echo "dhcp_event found."
+        EVENTFOUND=yes
+else
+        echo "dhcp_event NOT found."
+        EVENTFOUND=no
+fi
+
+# first assume file doesn't need to be copied
+COPYDHCPSCRIPT=no
+# copy if gw mode but dhcp_event NOT found (copy gw)
+if [ "$EVENTFOUND" == "no" ] && [ "$WIDAN_DEVICE_TYPE" == "gw" ]
+then
+        echo "gw mode, should copy dhcp_notify_event script."
+        COPYDHCPSCRIPT=yes
+fi
+
+# copy if ire mode but dhcp_event found (copy ire)
+if [ "$EVENTFOUND" == "yes" ] && [ "$WIDAN_DEVICE_TYPE" == "ire" ]
+then
+        echo "ire mode, should copy dhcp_notify_event script."
+        COPYDHCPSCRIPT=yes
+fi
+
+# install correct version of script, only when needed
+if [ "$COPYDHCPSCRIPT" == "yes" ]
+then
+        echo "Copying /opt/widan/dhcp_notify_event.sh.${WIDAN_DEVICE_TYPE} to /opt/lantiq/etc/rc.d/dhcp_notify_event.sh"
+        cp /opt/widan/dhcp_notify_event.sh.${WIDAN_DEVICE_TYPE} /opt/lantiq/etc/rc.d/dhcp_notify_event.sh
+else
+        echo "No need to update /opt/lantiq/etc/rc.d/dhcp_notify_event.sh"
+fi
+
+if [ -f "/etc/rc.d/udhcpc.script.ire" ]
+then
+        echo "/etc/rc.d/udhcpc.script.ire exists."
+        UDHCPCIREFOUND=yes
+else
+        echo "/etc/rc.d/udhcpc.script.ire does not exist."
+        UDHCPCIREFOUND=no
+fi
+
+if [ "$UDHCPCIREFOUND" == "yes" ] && [ "$WIDAN_DEVICE_TYPE" == "gw" ]
+then
+        echo "Removing /etc/rc.d/udhcpc.script.ire"
+        rm /etc/rc.d/udhcpc.script.ire
+fi
+
+if [ "$UDHCPCIREFOUND" == "no" ] && [ "$WIDAN_DEVICE_TYPE" == "ire" ]
+then
+        echo "Copying /opt/widan/udhcpc.script.ire to /etc/rc.d/udhcpc.script.ire"
+        cp /opt/widan/udhcpc.script.ire /etc/rc.d/udhcpc.script.ire
+fi
+
+#init AP manager
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib:
+
+# disable odhcpd and dnsmasq on IRE devices
+if [ "ire" == "$WIDAN_DEVICE_TYPE" ]
+then
+        if [ -f "/usr/sbin/odhcpd" ]
+        then
+                killall -9 odhcpd
+                mv /usr/sbin/odhcpd /usr/sbin/odhcpd.old
+        fi
+
+        if [ -f "/usr/sbin/dnsmasq" ]
+        then
+                killall -9 dnsmasq
+                mv /usr/sbin/dnsmasq /usr/sbin/dnsmasq.old
+        fi
+
+        # Note: Not doing anything with ire_state.conf at the moment.
+
+        echo "Starting iwlwifi drivers..."
+        # NOTE: `uname -r` resolves to the currently running kernel version (ex: "3.10.104").
+        lsmod | grep "^iwlwifi"
+        if [ $? -ne 0 ]
+        then
+            echo "iwlwifi is not loaded; loading..."
+            insmod /lib/modules/`uname -r`/iwlwifi.ko
+            DOSLEEP=yes
+        fi
+
+        lsmod | grep "^iwlmvm"
+        if [ $? -ne 0 ]
+        then
+            echo "iwlmvm is not loaded; loading..."
+            insmod /lib/modules/`uname -r`/iwlmvm.ko
+            DOSLEEP=yes
+        fi
+
+        if [ "$DOSLEEP" == "yes" ]
+        then
+            echo "Letting drivers start..."
+            sleep 5
+        fi
+
+        echo "Enabling wlan2..."
+        ifconfig wlan2 up
+
+        echo "Running ppacmd..."
+        ppacmd addwan -i wlan2
+
+        echo "Starting net filter driver..."
+        insmod /lib/modules/`uname -r`/widan_netf.ko
+
+        echo "Setting up bridge routing..."
+        # TODO: Remove this step once bridging and DHCP client is configured automatically by image.
+        ifconfig br-lan 192.168.1.180
+        # TODO: Use CAL or environment settings to set this dynamically rather than assuming 192.168.1.x subnet.
+        ip route del 192.168.1.0/24 dev br-lan
+
+        echo "Starting wlan2 supplicant..."
+        wpa_supplicant -i wlan2 -B -C /var/run/wpa_supplicant &
+
+        sleep 2
+fi
+
+# start master and wait if gw device
+if [ "gw" == "$WIDAN_DEVICE_TYPE" ]
+then
+        echo "Starting iwifiexmd..."
+        /opt/widan/iwifiexmd_start.sh start
+        echo "Sleeping for 10 seconds at `date`"
+        sleep 10
+        echo "Sleep completed at `date`"
+
+        # TODO: What to do about ire_state.conf? (I think we are not going to install it?)
+fi
+
+# always start slave
+echo "Starting iwifiexsd..."
+/opt/widan/iwifiexsd_start.sh start
+
+echo "Finished beerock init."
+
+cat /dev/null > ${OUT_CONF}
+
+update_conf_out "wlan_configuration_status" "success"

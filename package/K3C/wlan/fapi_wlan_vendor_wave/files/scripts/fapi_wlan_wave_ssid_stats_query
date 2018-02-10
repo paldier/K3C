@@ -1,0 +1,325 @@
+#!/bin/sh
+# Return the SSID Stats
+# Needed object: None or SSID.Stats
+
+script_name="$0"
+
+[ ! "$LIB_COMMON_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_common.sh
+[ ! "$IN_CONF_SOURCED" ] && in_conf_source
+
+interface_name=$1
+
+# Find the radio index
+radio_name=${interface_name%%.*}
+radio_index=`find_index_from_interface_name $radio_name`
+
+print2log $radio_index DEBUG "$script_name $*"
+timestamp $radio_index "$script_name:begin"
+
+# If interface name is not supplied, exit script
+[ -z "$interface_name" ] && print2log $radio_index ALERT "$script_name: interface_name is missing. exit execution" && exit 1
+
+# Verify interface is up and ready. If not, exit
+[ `check_interface_is_ready $interface_name` = "1" ] && exit
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the in conf file
+[ "$debug_save_conf" ] && cp ${IN_CONF} ${CONF_DIR}/ssid_stats_in_conf_${interface_name}
+
+# Map the objects indexes to the received objects in the in.conf file
+ssid_stats_index=`map_param_index Object $SSID_STATS_OBJECT`
+
+# If an object that needs to be in the output conf wasn't in the input conf, set it with an index
+[ -z "$ssid_stats_index" ] && next_object_index=`get_next_object_index` && ssid_stats_index=$next_object_index
+
+bytes_sent_successfully=0
+bytes_received=0
+packets_transmitted=0
+packets_received=0
+errors_sent=0
+retrans_count=0
+failed_retrans_count=0
+retry_count=0
+multiple_retry_count=0
+ack_failure_count=0
+aggregated_packet_count=0
+errors_received=0
+unicast_packets_transmitted=0
+unicast_packets_received=0
+discard_packets_sent=0
+discard_packets_received=0
+multicast_packets_transmitted=0
+multicast_packets_received=0
+broadcast_packets_transmitted=0
+broadcast_packets_received=0
+unknown_proto_packets_received=0
+
+# Read statistics once, to temp files
+ifconfig $interface_name > ${CONF_DIR}/tmp_ifconfig
+${BINDIR}/mtdump $interface_name TR181WLANStat > ${CONF_DIR}/tmp_mtdump
+
+bytes_sent_successfully_stats()
+{
+	bytes_sent_successfully=`grep "Number of bytes sent successfully" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+bytes_received_stats()
+{
+	bytes_received=`grep "Number of bytes received" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+packets_transmitted_stats()
+{
+	packets_transmitted=`grep "Number of packets transmitted" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+packets_received_stats()
+{
+	packets_received=`grep "Number of packets received" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+unicast_packets_transmitted_stats()
+{
+	unicast_packets_transmitted=`grep "Number of unicast packets transmitted" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+unicast_packets_received()
+{
+	unicast_packets_received=`grep "Number of unicast packets received" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+multicast_packets_transmitted_stats()
+{
+	multicast_packets_transmitted=`grep "Number of multicast packets transmitted" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+multicast_packets_received_stats()
+{
+	multicast_packets_received=`grep "Number of multicast packets received" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+broadcast_packets_transmitted()
+{
+	broadcast_packets_transmitted=`grep "Number of broadcast packets transmitted" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+broadcast_packets_received()
+{
+	broadcast_packets_received=`grep "Number of broadcast packets received" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+errors_sent_stats()
+{
+	errors_sent=`grep "Number of Tx packets not transmitted because of errors" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+errors_received_stats()
+{
+	errors_received=`grep "Number of Rx packets that contained errors" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+discard_packets_sent_stats()
+{
+	discard_packets_sent=`grep "Number of Tx packets discarded" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+discard_packets_received_stats()
+{
+	discard_packets_received=`grep "Number of Rx packets discarded" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+# TODO: how to get the following stats (do we need them?)
+retrans_count_stats()
+{
+	retrans_count=`grep "Number of transmitted packets which were retransmissions" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+failed_retrans_count_stats()
+{
+	failed_retrans_count=`grep "Number of packets not transmitted due to retry limit" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+retry_count_stats()
+{
+	retry_count=`grep "Number of packets sent after one or more retransmissions" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+multiple_retry_count()
+{
+	multiple_retry_count=`grep "Number of packets sent after more than one retransmission" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+ack_failure_count()
+{
+	ack_failure_count=`grep "Number of expected ACKs never received" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+aggregated_packet_count()
+{
+	aggregated_packet_count=`grep "Number of aggregated packets transmitted" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+unknown_proto_packets_received()
+{
+	unknown_proto_packets_received=`grep "Number of Rx packets unknown or unsupported protocol" ${CONF_DIR}/tmp_mtdump | awk '{print $1}'`
+}
+
+
+# Create the output configuration file and set the statistics in it
+cat /dev/null > ${OUT_CONF}
+
+# Return only the requested statistics
+# If input.conf is empty, return all statistics
+if [ `wc -c < ${IN_CONF}` = "0" ]
+then
+	update_conf_out "Object_${ssid_stats_index}" "$SSID_STATS_OBJECT"
+	bytes_sent_successfully_stats
+	update_conf_out "BytesSent_${ssid_stats_index}" "$bytes_sent_successfully"
+	bytes_received_stats
+	update_conf_out "BytesReceived_${ssid_stats_index}" "$bytes_received"
+	packets_transmitted_stats
+	update_conf_out "PacketsSent_${ssid_stats_index}" "$packets_transmitted"
+	packets_received_stats
+	update_conf_out "PacketsReceived_${ssid_stats_index}" "$packets_received"
+	errors_sent_stats
+	update_conf_out "ErrorsSent_${ssid_stats_index}" "$errors_sent"
+	retrans_count_stats
+	update_conf_out "RetransCount_${ssid_stats_index}" "$retrans_count"
+	failed_retrans_count_stats
+	update_conf_out "FailedRetransCount_${ssid_stats_index}" "$failed_retrans_count"
+	retry_count_stats
+	update_conf_out "RetryCount_${ssid_stats_index}" "$retry_count"
+	multiple_retry_count
+	update_conf_out "MultipleRetryCount_${ssid_stats_index}" "$multiple_retry_count"
+	ack_failure_count
+	update_conf_out "ACKFailureCount_${ssid_stats_index}" "$ack_failure_count"
+	aggregated_packet_count
+	update_conf_out "AggregatedPacketCount_${ssid_stats_index}" "$aggregated_packet_count"
+	errors_received_stats
+	update_conf_out "ErrorsReceived_${ssid_stats_index}" "$errors_received"
+	unicast_packets_transmitted_stats
+	update_conf_out "UnicastPacketsSent_${ssid_stats_index}" "$unicast_packets_transmitted"
+	unicast_packets_received
+	update_conf_out "UnicastPacketsReceived_${ssid_stats_index}" "$unicast_packets_received"
+	discard_packets_sent_stats
+	update_conf_out "DiscardPacketsSent_${ssid_stats_index}" "$discard_packets_sent"
+	discard_packets_received_stats
+	update_conf_out "DiscardPacketsReceived_${ssid_stats_index}" "$discard_packets_received"
+	multicast_packets_transmitted_stats
+	update_conf_out "MulticastPacketsSent_${ssid_stats_index}" "$multicast_packets_transmitted"
+	multicast_packets_received_stats
+	update_conf_out "MulticastPacketsReceived_${ssid_stats_index}" "$multicast_packets_received"
+	broadcast_packets_transmitted
+	update_conf_out "BroadcastPacketsSent_${ssid_stats_index}" "$broadcast_packets_transmitted"
+	broadcast_packets_received
+	update_conf_out "BroadcastPacketsReceived_${ssid_stats_index}" "$broadcast_packets_received"
+	unknown_proto_packets_received
+	update_conf_out "UnknownProtoPacketsReceived_${ssid_stats_index}" "$unknown_proto_packets_received"
+fi
+
+while read statistics
+do
+	stats_name=${statistics%%_*}
+	case $stats_name in
+		"Object")
+			object_index=${statistics##*_}
+			object_index=${object_index%%=*}
+			object_name=${statistics##*=}
+			update_conf_out "Object_${object_index}" "$object_name"
+			;;
+		"BytesSent")
+			bytes_sent_successfully_stats
+			update_conf_out "BytesSent_${object_index}" "$bytes_sent_successfully"
+			;;
+		"BytesReceived")
+			bytes_received_stats
+			update_conf_out "BytesReceived_${object_index}" "$bytes_received"
+			;;
+		"PacketsSent")
+			packets_transmitted_stats
+			update_conf_out "PacketsSent_${object_index}" "$packets_transmitted"
+			;;
+		"PacketsReceived")
+			packets_received_stats
+			update_conf_out "PacketsReceived_${object_index}" "$packets_received"
+			;;
+		"ErrorsSent")
+			errors_sent_stats
+			update_conf_out "ErrorsSent_${object_index}" "$errors_sent"
+			;;
+		"RetransCount")
+			retrans_count_stats
+			update_conf_out "RetransCount_${object_index}" "$retrans_count"
+			;;
+		"FailedRetransCount")
+			failed_retrans_count_stats
+			update_conf_out "FailedRetransCount_${object_index}" "$failed_retrans_count"
+			;;
+		"RetryCount")
+			retry_count_stats
+			update_conf_out "RetryCount_${object_index}" "$retry_count"
+			;;
+		"MultipleRetryCount")
+			multiple_retry_count
+			update_conf_out "MultipleRetryCount_${object_index}" "$multiple_retry_count"
+			;;
+		"ACKFailureCount")
+			ack_failure_count
+			update_conf_out "ACKFailureCount_${object_index}" "$ack_failure_count"
+			;;
+		"AggregatedPacketCount")
+			aggregated_packet_count
+			update_conf_out "AggregatedPacketCount_${object_index}" "$aggregated_packet_count"
+			;;
+		"ErrorsReceived")
+			errors_received_stats
+			update_conf_out "ErrorsReceived_${object_index}" "$errors_received"
+			;;
+		"UnicastPacketsSent")
+			unicast_packets_transmitted_stats
+			update_conf_out "UnicastPacketsSent_${object_index}" "$unicast_packets_transmitted"
+			;;
+		"UnicastPacketsReceived")
+			unicast_packets_received
+			update_conf_out "UnicastPacketsReceived_${object_index}" "$unicast_packets_received"
+			;;
+		"DiscardPacketsSent")
+			discard_packets_sent_stats
+			update_conf_out "DiscardPacketsSent_${object_index}" "$discard_packets_sent"
+			;;
+		"DiscardPacketsReceived")
+			discard_packets_received_stats
+			update_conf_out "DiscardPacketsReceived_${object_index}" "$discard_packets_received"
+			;;
+		"MulticastPacketsSent")
+			multicast_packets_transmitted_stats
+			update_conf_out "MulticastPacketsSent_${object_index}" "$multicast_packets_transmitted"
+			;;
+		"MulticastPacketsReceived")
+			multicast_packets_received_stats
+			update_conf_out "MulticastPacketsReceived_${object_index}" "$multicast_packets_received"
+			;;
+		"BroadcastPacketsSent")
+			broadcast_packets_transmitted
+			update_conf_out "BroadcastPacketsSent_${object_index}" "$broadcast_packets_transmitted"
+			;;
+		"BroadcastPacketsReceived")
+			broadcast_packets_received
+			update_conf_out "BroadcastPacketsReceived_${object_index}" "$broadcast_packets_received"
+			;;
+		"UnknownProtoPacketsReceived")
+			unknown_proto_packets_received
+			update_conf_out "UnknownProtoPacketsReceived_${object_index}" "$unknown_proto_packets_received"
+			;;
+	esac
+done < ${IN_CONF}
+
+# Configuration is completed successfully
+update_conf_out "wlan_configuration_status" "success"
+
+rm -f ${CONF_DIR}/tmp_ifconfig ${CONF_DIR}/tmp_mtdump
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the out conf file
+[ "$debug_save_conf" ] && cp ${OUT_CONF} ${CONF_DIR}/ssid_stats_out_conf_${interface_name}
+
+print2log $radio_index DEBUG "$script_name done"
+timestamp $radio_index "$script_name:$interface_name:done"

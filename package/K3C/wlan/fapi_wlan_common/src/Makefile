@@ -1,0 +1,1 @@
+all: libfapiwlancommon.so fapi_wlan_cli fapi_wlan_dbXml fapi_wlan_beerock_cli

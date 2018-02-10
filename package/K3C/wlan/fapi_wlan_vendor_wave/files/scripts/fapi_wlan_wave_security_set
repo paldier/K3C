@@ -1,0 +1,387 @@
+#!/bin/sh
+# Configure AccessPoint.Security parameters
+# Needed object: AccessPoint.Security, AccessPoint.X_LANTIQ_COM_Vendor.Security
+
+script_name="$0"
+
+[ ! "$LIB_COMMON_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_common.sh
+[ ! "$LIB_CONVERT_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_convert.sh
+
+interface_name=$1
+pid=$$
+
+# Find the interface index and the radio index
+interface_index=`find_index_from_interface_name $interface_name`
+radio_name=${interface_name%%.*}
+radio_index=`find_index_from_interface_name $radio_name`
+
+print2log $radio_index DEBUG "$script_name $*"
+timestamp $radio_index "$script_name:begin"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the in conf file
+[ "$debug_save_conf" ] && cp ${IN_CONF} ${CONF_DIR}/security_set_in_conf_${interface_name}
+
+# Map the objects indexes to the received objects in the in.conf file
+security_index=`map_param_index Object $ACCESSPOINT_SECURITY_OBJECT`
+security_vendor_index=`map_param_index Object $ACCESSPOINT_SECURITY_VENDOR_OBJECT`
+
+# Save the input configuration parameters to a local DB used by Wave FAPI
+[ -n "$security_index" ] && save_db_params security_set $interface_name $security_index $interface_index
+[ -n "$security_vendor_index" ] && save_db_params security_set $interface_name $security_vendor_index $interface_index
+# Source SECURITY
+local_db_source SECURITY
+local_db_source HS20
+
+comment="___Security_parameters___###"
+r11_comment="___802.11r parameters___###"
+
+# Define list of security parameters
+hostapd_params="auth_algs
+eapol_key_index_workaround
+wpa
+eap_server
+wep_default_key
+wep_key0
+wpa_key_mgmt
+wpa_passphrase
+wpa_psk
+wpa_group_rekey
+wpa_gmk_rekey
+wpa_pairwise
+rsn_pairwise
+osen
+ieee8021x
+auth_server_addr
+auth_server_port
+auth_server_shared_secret
+acct_server_addr
+acct_server_port
+acct_server_shared_secret
+eap_reauth_period
+ieee80211w
+assoc_sa_query_max_timeout
+assoc_sa_query_retry_timeout"
+
+driver_params="route"
+
+r11_params="mobility_domain
+ft_over_ds
+r0_key_lifetime
+r1_key_holder
+reassociation_deadline
+pmk_r1_push
+iapp_interface
+nas_identifier
+nas_identifier_ap"
+
+r0kh_params="r0kh"
+
+r1kh_params="r1kh"
+
+# Prepare the temporary configuration files to use
+prepare_confs $interface_name $radio_name $pid $VAP security
+# Get the pid to use in this configuration session
+. ${CONF_IN_PROGRESS}_${radio_name}
+
+# Read current values and initiate new values file.
+hostapd_current_values=${CONF_DIR}/hostapd_current_values_${interface_name}_${pid}
+read_current_values $HOSTAPD_VAP_CONF_PREFIX $interface_name $hostapd_current_values
+
+# Calculate new values.
+auth_algs=1
+eapol_key_index_workaround=0
+wep_default_key=""
+wep_key0=""
+rsn_pairwise=""
+pmf_enabled=`db2fapi_convert boolean ManagementFrameProtection $interface_index`
+pmf_required=`db2fapi_convert boolean ManagementFrameProtectionRequired $interface_index`
+[ -z "$pmf_required" ] && pmf_required=0
+fast_transtion_support=`db2fapi_convert boolean FastTransionSupport $interface_index`
+fast_transition_key_mgmt=""
+[ -n $fast_transtion_support ] && fast_transition_key_mgmt=`db2fapi_convert regular FTKeyManagment $interface_index`
+
+# Set values to parameters related to the ModeEnabled.
+# If ModeEnabled is not set, value will be the default value in hostapd.
+# auth_type parameter can be Personal or Enterprise
+# security_type parameter can be None, WEP, WPA, WPA2
+security_mode=`db2fapi_convert regular ModeEnabled $interface_index`
+auth_type=${security_mode##*-}
+security_type=${security_mode%%-*}
+
+# HS2.0 support:
+# If osen is enables, need to change to 
+osen_enable=`db2fapi_convert boolean OSENEnabled $interface_index`
+if [ "$osen_enable" = "1" ]
+then
+	security_mode="WPA-WPA2-Enterprise"
+	osen=1
+	disable_dgaf=1
+fi
+
+case "$security_mode" in
+	"None")
+		pmf_enabled=""
+		wpa=0
+		eap_server=1
+		;;
+	"WEP-64"|"WEP-128")
+		pmf_enabled=""
+		eap_server=1
+		wep_default_key=0
+		wep_key0=`db2fapi_convert regular WEPKey $interface_index`
+		;;
+	"WPA-Personal")
+		pmf_enabled="0"
+		wpa=1
+		wpa_pairwise="TKIP"
+		eap_server=1
+		;;
+	"WPA2-Personal")
+		wpa=2
+		wpa_pairwise="CCMP"
+		eap_server=1
+		;;
+	"WPA-WPA2-Personal")
+		pmf_enabled="0"
+		wpa=3
+		wpa_pairwise="TKIP"
+		rsn_pairwise="CCMP"
+		eap_server=1
+		;;
+	"WPA-Enterprise")
+		pmf_enabled="0"
+		wpa=1
+		wpa_pairwise="TKIP"
+		ieee8021x=1
+		eap_server=0
+		;;
+	"WPA2-Enterprise")
+		pmf_enabled="0"
+		wpa=2
+		wpa_pairwise="CCMP"
+		ieee8021x=1
+		eap_server=0
+		;;
+	"WPA-WPA2-Enterprise")
+		pmf_enabled="0"
+		wpa=3
+		wpa_pairwise="TKIP"
+		rsn_pairwise="CCMP"
+		ieee8021x=1
+		eap_server=0
+		;;
+esac
+
+### WPA and WPA2 parameters
+wpa_passphrase=""
+wpa_psk=""
+wpa_key_mgmt=""
+group_key_interval=""
+wpa_group_rekey=""
+wpa_gmk_rekey=""
+if [ "$security_type" = "WPA" ] || [ "$security_type" = "WPA2" ]
+then
+	wpa_passphrase=`db2fapi_convert regular KeyPassphrase $interface_index`
+	wpa_psk=`db2fapi_convert regular PreSharedKey $interface_index`
+	wpa_key_mgmt=`convert_wpa_key_mgmt $security_mode $security_type $auth_type $pmf_enabled $pmf_required $fast_transtion_support $fast_transition_key_mgmt`
+	group_key_interval=`db2fapi_convert regular RekeyingInterval $interface_index`
+	wpa_group_rekey=$group_key_interval
+	wpa_gmk_rekey=$group_key_interval
+fi
+
+### RADIUS parameters
+ieee8021x=""
+auth_server_addr=""
+auth_server_port=""
+auth_server_shared_secret=""
+acct_server_addr=""
+acct_server_port=""
+acct_server_shared_secret=""
+eap_reauth_period=""
+if [ "$auth_type" = "Enterprise" ]
+then
+	ieee8021x=1
+	server_addr=`db2fapi_convert regular RadiusServerIPAddr $interface_index`
+	server_port=`db2fapi_convert regular RadiusServerPort $interface_index`
+	server_shared_secret=`db2fapi_convert regular RadiusSecret $interface_index`
+	auth_server_addr="$server_addr"
+	auth_server_port="$server_port"
+	auth_server_shared_secret="$server_shared_secret"
+	acct_server_addr="$server_addr"
+	acct_server_port=$((server_port+1))
+	acct_server_shared_secret="$server_shared_secret"
+
+	eap_reauth_period=`db2fapi_convert regular RekeyingInterval $interface_index`
+fi
+
+### 802.11w - PMF parameters
+assoc_sa_query_max_timeout=""
+assoc_sa_query_retry_timeout=""
+if [ -n "$pmf_enabled" ]
+then
+	if [ "$pmf_enabled" = "0" ]
+	then
+		ieee80211w=0
+	else
+		ieee80211w=$((pmf_required+1))
+		assoc_sa_query_max_timeout=`db2fapi_convert regular SAQueryMaxTimeout $interface_index`
+		assoc_sa_query_retry_timeout=`db2fapi_convert regular SAQueryRetryTimeout $interface_index`
+	fi
+fi
+
+# Check if a hostapd parameter was changed.
+hostapd_changed=`check_param_changed "$hostapd_params"`
+# Prepare the hostapd vap conf file
+hostapd_vap_conf_name=${CONF_DIR}/hostapd_vap_${interface_name}_${pid}.conf
+
+# If a hostapd parameter was changed, remove sec parameters from hostapd_vap temp conf file and write all of them with updated values.
+if [ "$hostapd_changed" ]
+then
+	# Remove the hostapd sec parameters.
+	remove_params_from_conf "###$comment $hostapd_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+
+	# Write OSEN parameters
+	[ "$osen" ] && set_conf_param hostapd_vap regular no_otf $pid $interface_name osen "$osen"
+	[ "$disable_dgaf" ] && set_conf_param hostapd_vap regular no_otf $pid $interface_name disable_dgaf "$disable_dgaf"
+
+	# Write the hostapd sec parameters.
+	set_conf_param hostapd_vap comment otf $pid $interface_name comment "$comment"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name auth_algs "$auth_algs"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name eapol_key_index_workaround "$eapol_key_index_workaround"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wpa "$wpa"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name eap_server "$eap_server"
+
+	# Write WEP parameters.
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wep_default_key "$wep_default_key"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wep_key0 "$wep_key0"
+
+	# Write wpa parameters
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wpa_key_mgmt "$wpa_key_mgmt"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wpa_passphrase "$wpa_passphrase"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wpa_psk "$wpa_psk"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wpa_group_rekey "$wpa_group_rekey"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wpa_gmk_rekey "$wpa_gmk_rekey"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wpa_pairwise "$wpa_pairwise"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rsn_pairwise "$rsn_pairwise"
+
+	# Write radius parameters
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name ieee8021x "$ieee8021x"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name auth_server_addr "$auth_server_addr"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name auth_server_port "$auth_server_port"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name auth_server_shared_secret "$auth_server_shared_secret"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name acct_server_addr "$acct_server_addr"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name acct_server_port "$acct_server_port"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name acct_server_shared_secret "$acct_server_shared_secret"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name eap_reauth_period "$eap_reauth_period"
+
+	# Write 802.11w - PMF parameters
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name ieee80211w "$ieee80211w"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name assoc_sa_query_max_timeout "$assoc_sa_query_max_timeout"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name assoc_sa_query_retry_timeout "$assoc_sa_query_retry_timeout"
+
+fi
+
+# If fast_transition is enabled, check if hostapd 802.11r parameter changed.
+# If so, remove old value and write all of them with updated values.
+if [ -n "$fast_transtion_support" ]
+then
+	drv_config_pre_up_conf_name=${CONF_DIR}/drv_config_pre_up_${interface_name}_${pid}.conf
+
+	if [ "$fast_transtion_support" = "1" ]
+	then
+		mobility_domain=`db2fapi_convert regular dot11FTMobilityDomainID $interface_index`
+		ft_over_ds=`db2fapi_convert boolean FTOverDS $interface_index`
+		r0_key_lifetime=`db2fapi_convert regular dot11FTR0KeyLifetime $interface_index`
+		r1_key_holder=`db2fapi_convert regular dot11FTR1KeyHolderID $interface_index`
+		reassociation_deadline=`db2fapi_convert regular dot11FTReassociationDeadline $interface_index`
+		pmk_r1_push=`db2fapi_convert boolean PmkR1Push $interface_index`
+		iapp_interface=`db2fapi_convert regular InterAccessPointProtocol $interface_index`
+		# TBD to use when multi object instance will be supported
+		num_of_r0_keys=`db2fapi_convert regular R0KHNumberOfEntries $interface_index`
+		num_of_r1_keys=`db2fapi_convert regular R1KHNumberOfEntries $interface_index`
+
+		# Check if a hostapd r11 parameters were changed.
+		hostapd_r11_changed=`check_param_changed "$r11_params"`
+		r0kh_params_changed=`check_rkh_param_changed R0KH ${IN_CONF}`
+		r1kh_params_changed=`check_rkh_param_changed R1KH ${IN_CONF}`
+
+		if [ "$hostapd_r11_changed" ] || [ "$r0kh_params_changed" ] || [ "$r1kh_params_changed" ]
+		then
+			remove_params_from_conf "###$r11_comment $r11_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+			remove_params_from_conf "$driver_params" $drv_config_pre_up_conf_name $DRIVER_PRE_UP_CONF_PREFIX
+
+			set_conf_param hostapd_vap comment otf $pid $interface_name comment "$r11_comment"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name mobility_domain "$mobility_domain"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name ft_over_ds "$ft_over_ds"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name r0_key_lifetime "$r0_key_lifetime"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name r1_key_holder "$r1_key_holder"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name reassociation_deadline "$reassociation_deadline"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name pmk_r1_push "$pmk_r1_push"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name iapp_interface "$iapp_interface"
+
+			[ "$iapp_interface" ] && set_conf_param drv_config_pre_up route no_otf $pid $interface_name add "224.0.1.178 $iapp_interface"
+
+			remove_params_from_conf "$r0kh_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+			# R0KH list entry 1
+			r0kh_mac_addr=`db2fapi_convert regular R0KH1MACAddress $interface_index`
+			nas_identifier=`db2fapi_convert regular NASIdentifier1 $interface_index`
+			r0kh_key=`db2fapi_convert regular R0KH1key $interface_index`
+			r0kh="$r0kh_mac_addr $nas_identifier $r0kh_key"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name r0kh "$r0kh"
+			# R0KH list entry 2
+			r0kh_mac_addr=`db2fapi_convert regular R0KH2MACAddress $interface_index`
+			nas_identifier=`db2fapi_convert regular NASIdentifier2 $interface_index`
+			r0kh_key=`db2fapi_convert regular R0KH2key $interface_index`
+			r0kh="$r0kh_mac_addr $nas_identifier $r0kh_key"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name r0kh "$r0kh"
+
+			nas_identifier_ap=`db2fapi_convert regular NASIdentifierAp $interface_index`
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name nas_identifier $nas_identifier_ap
+
+			remove_params_from_conf "$r1kh_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+			# R1KH list entry 1
+			r1kh_mac_addr=`db2fapi_convert regular R1KH1MACAddress $interface_index`
+			r1kh_id=`db2fapi_convert regular R1KH1Id $interface_index`
+			r1kh_key=`db2fapi_convert regular R1KH1key $interface_index`
+			r1kh="$r1kh_mac_addr $r1kh_id $r1kh_key"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name r1kh "$r1kh"
+			# R1KH list entry 2
+			r1kh_mac_addr=`db2fapi_convert regular R1KH2MACAddress $interface_index`
+			r1kh_id=`db2fapi_convert regular R1KH2Id $interface_index`
+			r1kh_key=`db2fapi_convert regular R1KH2key $interface_index`
+			r1kh="$r1kh_mac_addr $r1kh_id $r1kh_key"
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name r1kh "$r1kh"
+		fi
+	else
+		# If disabled then removed all from hostapd vap conf
+		remove_params_from_conf "###$r11_comment $r11_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+		remove_params_from_conf "$r0kh_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+		remove_params_from_conf "$r1kh_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+		
+		# Remove the route command from the pre-up.
+		remove_params_from_conf "$driver_params" $drv_config_pre_up_conf_name $DRIVER_PRE_UP_CONF_PREFIX
+
+		# Set the restart flag
+		echo "restart_${interface_name%%.*}=yes" >> ${CONF_DIR}/${RESTART_FLAG}_${radio_name}
+	fi
+fi
+
+# Create the output configuration file
+cat /dev/null > ${OUT_CONF}
+
+# TODO !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# HS2.0 support:
+# if osen=1, update dB param ModeEnabled with "WPA-WPA2-Enterprise"
+if [ "$osen_enable" = "1" ]
+then
+	echo "TODO !!!: set dB ModeEnabled param with WPA-WPA2-Enterprise" > /dev/console
+fi
+
+# Configuration is completed successfully
+update_conf_out "wlan_configuration_status" "success"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the out conf file
+[ "$debug_save_conf" ] && cp ${OUT_CONF} ${CONF_DIR}/security_set_out_conf_${interface_name}
+
+print2log $radio_index DEBUG "$script_name done"
+timestamp $radio_index "$script_name:done"

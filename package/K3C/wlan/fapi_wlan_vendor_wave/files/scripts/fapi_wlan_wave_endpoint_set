@@ -1,0 +1,125 @@
+#!/bin/sh
+# Configure EndPoint parameters
+# Needed object: EndPoint
+
+script_name="$0"
+
+[ ! "$LIB_COMMON_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_common.sh
+
+interface_name=$1
+pid=$$
+
+# Find the interface index and the radio index
+interface_index=`find_index_from_interface_name $interface_name`
+radio_name=`get_radio_name_from_endpoint $interface_name`
+radio_index=`find_index_from_interface_name $radio_name`
+
+print2log $radio_index DEBUG "$script_name $*"
+timestamp $radio_index "$script_name:$interface_name:begin"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the in conf file
+[ "$debug_save_conf" ] && cp ${IN_CONF} ${CONF_DIR}/endpoint_set_in_conf_${interface_name}
+
+# Map the objects indexes to the received objects in the in.conf file
+end_point_index=`map_param_index Object $ENDPOINT_OBJECT`
+profile_index=`map_param_index Object $ENDPOINT_PROFILE_OBJECT`
+profile_security_index=`map_param_index Object $ENDPOINT_PROFILE_SECURITY_OBJECT`
+
+# Save the input configuration parameters to a local DB used by Wave FAPI
+[ -n "$end_point_index" ] && save_db_params endpoint_set $interface_name $end_point_index $interface_index
+[ -n "$profile_index" ] && save_db_params connect_to_ap $interface_name $profile_index $interface_index
+[ -n "$profile_security_index" ] && save_db_params connect_to_ap $interface_name $profile_security_index $interface_index
+
+# Source needed DBs
+local_db_source RADIO
+local_db_source ENDPOINT
+
+# Define list of EndPoint parameters
+driver_params=""
+
+supplicant_params="wds"
+
+# Create the output configuration file
+cat /dev/null > ${OUT_CONF}
+
+# Check if execution is to perform scan
+scan_status=`db2fapi_convert regular X_LANTIQ_COM_Vendor_ScanStatus $interface_index $end_point_index`
+
+if [ "$scan_status" = "$ENDPOINT_SCANNING" ]
+then
+	(. ${ETC_PATH}/fapi_wlan_wave_endpoint_scan.sh $interface_name $end_point_index)
+	# Configuration is completed successfully
+	update_conf_out "wlan_configuration_status" "success"
+
+	# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the out conf file
+	[ "$debug_save_conf" ] && cp ${OUT_CONF} ${CONF_DIR}/endpoint_set_out_conf_scan_${interface_name}
+
+	print2log $radio_index DEBUG "$script_name done"
+	timestamp $radio_index "$script_name:$interface_name:done"
+	exit 0
+fi
+# Update the status file with the interface status
+update_enable_disable $radio_name $interface_name $interface_index $interface_name
+
+# Prepare the temporary configuration files to use
+prepare_confs $interface_name $interface_name $pid $STA
+# Get the pid to use in this configuration session
+. ${CONF_IN_PROGRESS}_${interface_name}
+
+# Check if execution is to connect to an AP
+connect_to_ap=`set_connect_flags $interface_name`
+[ -e "$INIT_FLAG" ] && rm -rf ${PROFILE_REFERENCE_FLAG}_${interface_name} ${PROFILE_SECURITY_FLAG}_${interface_name} ${PROFILE_FLAG}_${interface_name}
+if [ "$connect_to_ap" = "true" ]
+then
+	rm -rf ${PROFILE_REFERENCE_FLAG}_${interface_name} ${PROFILE_SECURITY_FLAG}_${interface_name} ${PROFILE_FLAG}_${interface_name}
+	(. ${ETC_PATH}/fapi_wlan_wave_connect_to_ap.sh $interface_name $interface_index $pid $radio_index "$ENDPOINT_CONNECT")
+elif [ "$connect_to_ap" = "disconnect" ]
+then
+	(. ${ETC_PATH}/fapi_wlan_wave_connect_to_ap.sh $interface_name $interface_index $pid $radio_index "$ENDPOINT_DISCONNECT")
+fi
+
+# Read current values and initiate new values file.
+supplicant_current_values=${CONF_DIR}/supplicant_current_values_${interface_name}_${pid}
+
+read_current_values $SUPPLICANT_CONFIGURATION_CONF_PREFIX $interface_name $supplicant_current_values
+
+# Calculate new values.
+wds=`db2fapi_convert boolean X_LANTIQ_COM_Vendor_WaveEndPointWDS $interface_index`
+
+# Write the parameters to the configuration files.
+# Check if a supplicant parameter was changed.
+supplicant_changed=`check_param_changed "$supplicant_params"`
+
+# If a supplicant parameter was changed, remove EndPoint parameters from wpa_supplicant configuration temp conf file and write all of them with updated values.
+if [ "$supplicant_changed" ]
+then
+	wpa_supplicant_conf_name=${CONF_DIR}/${SUPPLICANT_CONFIGURATION_CONF_PREFIX}_${interface_name}_${pid}.conf
+	# Remove the supplicant EndPoint parameters.
+	remove_params_from_conf "$supplicant_params" $wpa_supplicant_conf_name $SUPPLICANT_CONFIGURATION_CONF_PREFIX
+
+	# Write the supplicant EndPoint parameters.
+	set_conf_param wpa_supplicant_configuration regular otf $pid $interface_name wds "$wds"
+fi
+
+# Update the EndPoint in the PPA if it is enabled
+# If PPA exists, check if fastpath is enabled for the radio of this EndPoint.
+# If fastpath is enabled for the radio, write the PPA commands. If disabled, remove the EndPoint from the PPA.
+endpoint_enabled=`db2fapi_convert boolean Enable $interface_index`
+if [ $endpoint_enabled -eq 1 ]
+then
+	fastpath_enabled=`db2fapi_convert boolean WaveFastpathEnabled $radio_index`
+	if [ -e ${SBINDIR}/ppacmd ] && [ "$fastpath_enabled" = "1" ]
+	then
+		set_conf_param drv_config_post_up ppa otf $pid $interface_name ppacmd "add"
+	else
+		set_conf_param drv_config_post_up ppa otf $pid $interface_name ppacmd "remove"
+	fi
+fi
+# Configuration is completed successfully
+update_conf_out "wlan_configuration_status" "success"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the out conf file
+[ "$debug_save_conf" ] && cp ${OUT_CONF} ${CONF_DIR}/endpoint_set_out_conf_${interface_name}
+
+print2log $radio_index DEBUG "$script_name done"
+timestamp $radio_index "$script_name:$interface_name:done"
