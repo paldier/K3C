@@ -1,0 +1,210 @@
+#!/bin/sh
+
+script_name="wave_wlan_init"
+
+. /etc/rc.d/wave_wlan_lib_common.sh
+
+eeprom_partition=wlanconfig
+eeprom_tar=eeprom.tar.gz
+
+mkdir -p $CONF_DIR
+mkdir -p $TEMP_CONF_DIR
+
+rc_conf_source
+. $ETC_PATH/config.sh
+
+# Define local parameters
+local ap_index ap_index1
+local driver_mode driver_path wave_count fastpath_cmd fastpath0 fastpath1 ahb_off_cmd
+
+ap_index=`find_index_from_wave_if wlan0`
+
+# driver_mode can be ap or dut
+driver_mode=$1
+[ -z "$driver_mode" ] && driver_mode="ap"
+
+# wlan0 interface wasn't found in rc.conf, print error and exit script.
+if [ -z $ap_index ]
+then
+	echo "wlan0 interface not found in rc.conf" > $CONF_DIR/$WAVE_WLAN_RUNNNER
+	exit 1
+fi
+
+timestamp $ap_index "$script_name:$ap_index:begin"
+print2log $ap_index DEBUG "$script_name $*"
+
+# Create softlinks for library functions
+cp -s $ETC_PATH/wave_wlan_lib* /tmp/
+
+# Delete the runner file
+rm -f $CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Count number of physical WAVE interfaces
+# Read information of physical Wlan interface from wlan_discover output
+. /tmp/wlan_discover.txt
+
+wave_count=$((PCI_LTQ_COUNT+AHB_WLAN_COUNT))
+# No Wave interfaces were found, print error and exit script.
+if [ "$wave_count" = "0" ]
+then
+	print2log 0 ERROR "$script_name: No WAVE interfaces found"
+	echo "$script_name: No WAVE interfaces found" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+	exit 1
+fi
+
+echo "cd /tmp" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Create softlinks needed in /tmp
+echo "cp -s ${DRIVER_PATH}/mtlkroot.ko /tmp/" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "cp -s $BINDIR/fw_scd_file.scd /tmp/" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "cp -s $DRIVER_PATH/mtlk.ko /tmp/" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "cp -s $IMAGES_PATH/* /tmp/" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Use the ls.txt file to load files to /tmp if the wave_wlan_debug_ls_txt.sh script exists.
+[ -e "$ETC_PATH/wave_wlan_debug_tftp_bins.sh" ] && (. $ETC_PATH/wave_wlan_debug_tftp_bins.sh)
+
+# Start udevd and call crda once, for triggering regulatory domain change notifications
+# The crda calls should be done only once on the first init. Using flag to detect first init.
+echo "udevd_up=\`ps | grep -c udevd\`" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "[ \$udevd_up -gt 1 ] || udevd --daemon" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+if [ ! -e $CRDA_FLAG ]
+then
+	echo "export COUNTRY=00" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+	echo "crda" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+	echo "touch $CRDA_FLAG" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+fi
+
+# insmod rtlogoer
+echo "insmod mtlkroot.ko" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+# TODO: add check for insmod success.
+# Set MAC address to the logger interface and add it to the bridge
+# TODO: currently moved to the start sequence, needs to be moved back to init
+#echo "ifconfig rtlog0 hw ether 00:00:00:00:00:00" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+#echo "brctl addif br0 rtlog0" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+#echo "ifconfig rtlog0 up" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+# Create the logger streams
+#i=0
+#while [ $i -lt $wave_count ]
+#do
+#	(. $ETC_PATH/wave_wlan_logger_modify $i init)
+#	i=$((i+1))
+#done
+# Load logserver
+echo "cp -s $BINDIR/logserver /tmp/" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "/tmp/logserver -f /tmp/dev/mtlkroot0 -s  /tmp/fw_scd_file.scd &" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Get calibration file from FLASH only if file doesn't already exist in /tmp/ already.
+echo "if [ ! -e /tmp/cal_wlan0.bin ]" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "then" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "	read_img $eeprom_partition /tmp/$eeprom_tar" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+echo "	tar xzf /tmp/$eeprom_tar -C /tmp/" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+# TODO: add verification for calibration extract success.
+echo "fi" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Insmod WAVE driver
+# fastpath enables/disables GSWIP usage. Needed only for GRX350.
+fastpath_cmd=""
+fastpath0=""
+fastpath1=""
+eval fastpath0=\${wlphywave_${ap_index}_fastpath}
+if [ "$wave_count" = "2" ]
+then
+	ap_index1=`find_index_from_wave_if wlan1`
+	eval fastpath1=\${wlphywave_${ap_index1}_fastpath}
+fi
+
+# If platform is not GRX350, don't set fastpath command and disable fastpath in rc.conf
+if [ "$CONFIG_IFX_CONFIG_CPU" != "GRX500" ]
+then
+	[ -n "$fastpath0" ] && status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_0_fastpath" ""
+	[ -n "$fastpath1" ] && status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_1_fastpath" ""
+else
+	# If AHB is enabled, wlan0 doesn't support fastpath and will be disabled in rc.conf
+	if [ "$AHB_WLAN_COUNT" = "1" ]
+	then
+		[ "$fastpath0" = "1" ] && status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_0_fastpath" "0"
+		fastpath0=0
+	fi
+	
+	if [ "$wave_count" = "2" ]
+	then
+		# GRX350 A21 supports fastpath on 2 interfaces
+		# GRX350 A11 supports fastpath on 1 interface
+		# Check if platform is GRX350 A11 with 2 interfaces with fastpath enabled, if so, set wlan0 to fastpath disabled in rc.conf
+		if [ "$CONFIG_PACKAGE_KMOD_GRX500_A21" != "1" ]
+		then
+			if [ "$fastpath0" = "1" ] && [ "$fastpath1" = "1" ]
+			then
+				fastpath0=0
+				status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_0_fastpath" "0"
+			fi
+		fi
+		fastpath1=",${fastpath1}"
+	fi
+	fastpath_cmd="fastpath=${fastpath0}${fastpath1}"
+fi
+
+# If AHB is not used (2 PCIe cards are connected), set ahb_off flag
+ahb_off_cmd=""
+[ $AHB_WLAN_COUNT = 0 ] && ahb_off_cmd="ahb_off=1"
+if [ $wave_count = 1 ]
+then
+	print2log $ap_index DEBUG "$script_name: insmod command: insmod mtlk.ko $driver_mode=1 $fastpath_cmd $ahb_off_cmd"
+	echo "insmod mtlk.ko $driver_mode=1 $fastpath_cmd $ahb_off_cmd" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+else
+	print2log $ap_index DEBUG "$script_name: insmod command: insmod mtlk.ko $driver_mode=1,1 $fastpath_cmd $ahb_off_cmd"
+	echo "insmod mtlk.ko $driver_mode=1,1 $fastpath_cmd $ahb_off_cmd" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+fi
+# TODO: add check for insmod success.
+echo "cd - > /dev/null" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Init HS2.0 related drivers
+[ -e $ETC_PATH/wave_wifi_parp_ctrl.sh ] && echo "(. $ETC_PATH/wave_wifi_parp_ctrl.sh start)" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+[ -e $ETC_PATH/wave_wifi_l2f_ctrl.sh ] && echo "(. $ETC_PATH/wave_wifi_l2f_ctrl.sh start)" >> $CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Execute the runner
+chmod +x $CONF_DIR/$WAVE_WLAN_RUNNNER
+$CONF_DIR/$WAVE_WLAN_RUNNNER
+
+# Set country from calibration file/EEPROM to rc.conf
+set_country $ap_index
+
+# Set maximum number of STAs from driver to rc.conf
+set_max_num_sta
+
+# Set number of antennas from driver to rc.conf
+set_num_antennas
+
+# Set BF-ANTENNA and SOUNDING-DIMENSION from driver to rc.conf
+set_vht_antennas
+
+# Set AutoCoC disabled for fastpath enabled interface. Only for GRX350
+[ "$CONFIG_IFX_CONFIG_CPU" = "GRX500" ] && set_auto_coc $ap_index $fastpath0 $ap_index1 $fastpath1
+
+# Set beamforming from driver to rc.conf
+set_beamforming
+
+# TEMPORARY WORKAROUND: set fast and full recovery disabled for Wave500
+status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_1_fwFastRecoverEna" 0
+status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_1_fwFullRecoverEna" 0
+if [ $AHB_WLAN_COUNT = 0 ] && [ $PCI_LTQ_COUNT = 2 ]
+then
+	status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_0_fwFastRecoverEna" 0
+	status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_phy_vendor_wave" "wlphywave_0_fwFullRecoverEna" 0
+fi
+
+# TEMPORARY WORKAROUND: if qos map value is empty, set edfault value: 0,7,8,15,16,23,24,31,32,39,40,47,48,55,56,63
+eval qos_map_set=\${wlhs2_${ap_index}_qosMap}
+[ -z "$qos_map_set" ] && status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_hs2" "wlhs2_${ap_index}_qosMap" "0,7,8,15,16,23,24,31,32,39,40,47,48,55,56,63"
+if [ "$wave_count" = "2" ]
+then
+	eval qos_map_set1=\${wlhs2_${ap_index1}_qosMap}
+	[ -z "$qos_map_set1" ] && status_oper -f $CONFIGS_PATH/rc.conf -u SET "wlan_hs2" "wlhs2_${ap_index1}_qosMap" "0,7,8,15,16,23,24,31,32,39,40,47,48,55,56,63"
+fi
+
+
+# Backup rc.conf changes
+/etc/rc.d/backup
+
+print2log $ap_index DEBUG "$script_name done"
+timestamp $ap_index "$script_name:$ap_index:done"
