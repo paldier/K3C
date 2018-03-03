@@ -36,23 +36,8 @@ endef
 define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/usr/bin
 
-ifeq ($(ARCH),mipsel)
-	$(INSTALL_BIN) ./files/7620n/brook $(1)/usr/bin/
-endif
 ifeq ($(ARCH),mips)
 	$(INSTALL_BIN) ./files/ar71xx/brook $(1)/usr/bin/
-endif
-ifeq ($(ARCH),i386)
-	$(INSTALL_BIN) ./files/x86/brook $(1)/usr/bin/
-endif
-ifeq ($(ARCH),x86_64)
-	$(INSTALL_BIN) ./files/x86_64/brook $(1)/usr/bin/
-endif
-ifeq ($(ARCH),arm)
-	$(INSTALL_BIN) ./files/arm/brook $(1)/usr/bin/
-endif
-ifeq ($(ARCH),aarch64)
-	$(INSTALL_BIN) ./files/armv7/brook $(1)/usr/bin/
 endif
 endef
 
