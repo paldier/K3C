@@ -95,7 +95,7 @@ define Package/oscam
 	CATEGORY:=Network
 	TITLE:=Open Source Conditional Access Modul
 	URL:=http://www.streamboard.tv/oscam
-	DEPENDS:=+OSCAM_USE_LIBCRYPTO:libopenssl +OSCAM_USE_LIBUSB:libusb-1.0 +OSCAM_USE_PCSC:pcscd
+	DEPENDS:=+OSCAM_USE_LIBCRYPTO:libopenssl +OSCAM_USE_LIBUSB:libusb-1.0 +OSCAM_USE_PCSC:pcscd +libpthread +librt
 endef
 
 define Package/list-smargo
