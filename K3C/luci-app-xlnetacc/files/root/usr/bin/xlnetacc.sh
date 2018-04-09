@@ -131,10 +131,10 @@ gen_device_sign() {
 
 	# 计算devicesign
 	# sign = div.10?.device_id + md5(sha1(packageName + businessType + md5(a protocolVersion specific GUID)))
-	local fake_device_id=$(echo -n "$macaddr" | openssl md5 | awk '{print $2}')
+	local fake_device_id=$(echo -n "${macaddr//:/}" | openssl dgst -md5 | awk '{print $2}')
 	local fake_device_sign=$(echo -n "${fake_device_id}${packageName}${businessType}c7f21687eed3cdb400ca11fc2263c998" \
-		| openssl sha1 | awk '{print $2}')
-	readonly _devicesign="div101.${fake_device_id}"$(echo -n "$fake_device_sign" | openssl md5 | awk '{print $2}')
+		| openssl dgst -sha1 | awk '{print $2}')
+	readonly _devicesign="div101.${fake_device_id}"$(echo -n "$fake_device_sign" | openssl dgst -md5 | awk '{print $2}')
 	_log "_devicesign is $_devicesign" $(( 1 | 4 ))
 }
 
@@ -410,11 +410,11 @@ isp_upgrade() {
 
 	case ${lasterr:=-1} in
 		0)
-			local max_bandwidth
+			local bandwidth
 			json_select "bandwidth" >/dev/null 2>&1
-			json_get_var max_bandwidth "downstream"
-			max_bandwidth=$(expr ${max_bandwidth:-0} / 1024)
-			local outmsg="${link_cn}提速成功，带宽已提升到 ${max_bandwidth}M"; _log "$outmsg" $(( 1 | $1 * 8 ))
+			json_get_var bandwidth "downstream"
+			bandwidth=$(expr ${bandwidth:-0} / 1024)
+			local outmsg="${link_cn}提速成功，带宽已提升到 ${bandwidth}M"; _log "$outmsg" $(( 1 | $1 * 8 ))
 			[ $1 -eq 1 ] && down_acc=2 || up_acc=2
 			;;
 		812) # 812 已处于提速状态
@@ -450,7 +450,7 @@ isp_keepalive() {
 			local outmsg="${link_cn}心跳信号返回正常"; _log "$outmsg";;
 		513) # 513 提速通道不存在
 			lasterr=-2
-			local outmsg="${link_cn}提速超时。原因: 提速通道不存在"; _log "$outmsg" $(( 1 | $1 * 8 | 32 ));;
+			local outmsg="${link_cn}提速超时，提速通道不存在"; _log "$outmsg" $(( 1 | $1 * 8 | 32 ));;
 		-1)
 			local outmsg="${link_cn}心跳信号发送失败。运营商服务器未响应，请稍候"; _log "$outmsg";;
 		*)
@@ -591,8 +591,9 @@ xlnetacc_init() {
 	_log "迅雷快鸟正在启动..."
 
 	# 检查外部调用工具
-	command -v wget-ssl >/dev/null || { _log "GNU Wget 工具不存在"; return 3; }
-	command -v openssl >/dev/null || { _log "openssl 工具不存在"; return 3; }
+	command -v wget-ssl >/dev/null || { _log "GNU Wget 未安装"; return 3; }
+	local opensslchk=$(echo -n 'openssl' | openssl dgst -sha1 | awk '{print $2}')
+	[ "$opensslchk" != 'c898fa1e7226427010e329971e82c669f8d8abb4' ] && { _log "openssl-util 未安装或计算错误"; return 3; }
 
 	# 捕获中止信号
 	trap 'sigterm' INT # Ctrl-C
@@ -601,7 +602,7 @@ xlnetacc_init() {
 
 	# 生成设备标识
 	gen_device_sign
-	[ -z "$_peerid" -o -z "$_devicesign" ] && return 4
+	[ ${#_peerid} -ne 16 -o ${#_devicesign} -ne 71 ] && return 4
 
 	clean_log
 	[ -d /var/state ] || mkdir -p /var/state

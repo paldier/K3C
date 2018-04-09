@@ -23,7 +23,7 @@ o:depends("logging", "1")
 
 o = s:option(ListValue, "network", translate("Upgrade interface"))
 uci:foreach("network", "interface", function(section)
-	if section[".name"] ~= "loopback" and section[".name"] ~= "lan" then
+	if section[".name"] ~= "loopback" then
 		o:value(section[".name"])
 	end
 end)
