@@ -151,7 +151,7 @@ end
 
 server = s:taboption("main",Value, "address", translate("Server Address"))
 server.datatype = "host"
-server:depends("use_conf_file", 0)
+server:depends("use_conf_file", 1)
 
 server_port = s:taboption("main",Value, "port", translate("Server Port"))
 server_port.datatype = "range(0,65535)"
