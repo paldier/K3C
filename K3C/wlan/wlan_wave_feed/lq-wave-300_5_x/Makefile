@@ -36,12 +36,11 @@ WAVE_PSD_VER:=TODO_UPDATE_VER_STRING
 PKG_RELEASE:=1
 PKG_SOURCE_VERSION:=$(DRV_VERSION).gpl.wls.src
 PKG_SOURCE_NAME:=$(DRV_VERSION).wls.src
-PKG_SOURCE:=lq-wave-300-$(PKG_SOURCE_VERSION).tar.bz2
+
 
 DRV_RFLIB_PKG_NAME:=$(PKG_NAME)-rflib
 DRV_RFLIB_PKG_VERSION:=05.04.00.49
 DRV_RFLIB_PKG_SOURCE:=lq-wave-300-$(DRV_VERSION).rflib.wls.src.tar.bz2
-DRV_RFLIB_PKG_SOURCE_URL:=http://localhost
 DRV_RFLIB_PKG_BIN:=lq-wave-300-$(DRV_VERSION).rflib.wls.bin.tar.bz2
 KERNEL_PKG_NAME_BCKPRT_SPPRT:=$(KERNEL_PKG_NAME)_backport_support
 
@@ -57,8 +56,7 @@ else
 endif
 
 PKG_BUILD_DEPENDS:=libnl3 $(DRV_RFLIB_PKG_NAME) $(PKG_BUILD_DEPENDS_EXTRA)
-PKG_SOURCE_URL:=http://localhost
-PKG_DEFAULT_CUSTOM_SOURCE_DIR:=
+PKG_DEFAULT_CUSTOM_SOURCE_DIR:=$(shell pwd)/src
 PKG_NO_AUTORECONF:=y
 
 COPY_SCRIPTS:=y
@@ -255,35 +253,11 @@ endef
 
 
 #### Target Rules ##########################
-# Helper func for downloading rflib tarball:
-define Download/files
-ifneq ($(4),y)
- define Download/$(1)
-  FILE:=$(2)
-  URL:=http://localhost/
-  MD5SUM:=$(3)
- endef
- define Prepare/$(1)
-  tar xjf "$(DL_DIR)/$(2)" -C "$(BUILD_DIR)"
- endef
- $$(eval $$(call Download,$(1)))
-else
- define Prepare/$(1)
- endef
-endif
-endef
-
-# Download rflib src tarball
-ifneq ($(CONFIG_PACKAGE_$(DRV_RFLIB_PKG_NAME)),)
- ifneq ($(BINARY_PKG),y)
-   $(eval $(call Download/files,$(DRV_RFLIB_PKG_NAME),$(DRV_RFLIB_PKG_SOURCE),$(DRV_RFLIB_PKG_MD5SUM),,))
- else
-   $(eval $(call Download/files,$(DRV_RFLIB_PKG_NAME),$(DRV_RFLIB_PKG_BIN),$(DRV_RFLIB_PKG_MD5SUM),$(BUILD_DIR),,))
- endif
-endif
-
 
 define Build/Prepare
+	$(call Build/Prepare/Default)
+	#$(call Prepare/$(DRV_RFLIB_PKG_NAME))
+	$(if $(CONFIG_$(PKG_NAME)_USE_CUSTOM_SOURCE_DIR),,$(CP) -L ./src/* $(PKG_BUILD_DIR)/)
 endef
 
 define Build/Configure
@@ -342,25 +316,19 @@ endif
 
 	@echo "******* COPY images completed ***********"
 
-	$(CP) ./files/mtlk.ko $(1)/$(DRIVER_FOLDER)/
-	$(CP) ./files/mtlkroot.ko $(1)/$(DRIVER_FOLDER)/
+	$(CP) ./src/mtlk.ko $(1)/$(DRIVER_FOLDER)/
+	$(CP) ./src/mtlkroot.ko $(1)/$(DRIVER_FOLDER)/
 	chmod 555 $(1)/$(DRIVER_FOLDER)/mtlk.ko
 	chmod 555 $(1)/$(DRIVER_FOLDER)/mtlkroot.ko
-	$(if $(COPY_SCRIPTS),
-		$(INSTALL_DIR) -p $(1)/ramdisk_copy/flash/
-		$(INSTALL_DIR) -p $(1)/$(SCRIPTS_FOLDER)/
-		$(CP) ./files/ramdisk_copy/* $(1)/ramdisk_copy/flash/
-		$(CP) ./files/scripts/* $(1)/$(SCRIPTS_FOLDER)/)
-	$(if $(REMOVE_TFTP_BINS_SCRIPT),
-		rm -f $(1)/$(SCRIPTS_FOLDER)/*_debug_tftp_bins.sh)
+
 	$(CP) ./$(IMAGES_FOLDER)/fw/fw_scd_file.scd $(1)/$(BIN_FOLDER)/ || echo "Skipping fw_scd_file.scd install"
-	$(CP) ./files/*.mtidlc $(1)/$(BIN_FOLDER)/	|| echo "Skipping mtidlc from driver folder install"
-	$(CP) ./files/drvhlpr $(1)/$(BIN_FOLDER)/	|| echo "Skipping drvhlpr install"
-	$(CP) ./files/mtdump $(1)/$(BIN_FOLDER)/ || echo "Skipping mtdump install"
-	$(CP) ./files/mtlk_cli $(1)/$(BIN_FOLDER)/ || echo "Skipping mtlk_cli install"
-	$(CP) ./files/BclSockServer $(1)/$(BIN_FOLDER)/ || echo "Skipping BclSockServer install"
-	$(CP) ./files/logserver $(1)/$(BIN_FOLDER)/ || echo "Skipping logserver install"
-	$(CP) ./files/dutserver $(1)/$(BIN_FOLDER)/ || echo "Skipping Dutserver install"
+	$(CP) ./src/*.mtidlc $(1)/$(BIN_FOLDER)/	|| echo "Skipping mtidlc from driver folder install"
+	$(CP) ./src/drvhlpr $(1)/$(BIN_FOLDER)/	|| echo "Skipping drvhlpr install"
+	$(CP) ./src/mtdump $(1)/$(BIN_FOLDER)/ || echo "Skipping mtdump install"
+	$(CP) ./src/mtlk_cli $(1)/$(BIN_FOLDER)/ || echo "Skipping mtlk_cli install"
+	$(CP) ./src/BclSockServer $(1)/$(BIN_FOLDER)/ || echo "Skipping BclSockServer install"
+	$(CP) ./src/logserver $(1)/$(BIN_FOLDER)/ || echo "Skipping logserver install"
+	$(CP) ./src/dutserver $(1)/$(BIN_FOLDER)/ || echo "Skipping Dutserver install"
 	./files/config/mtidlc-generator.sh $(1)/$(BIN_FOLDER)/ || echo "Skipping generation of minimized mtidlc files"
 
 	chmod 555 $(1)/$(BIN_FOLDER)/drvhlpr || true

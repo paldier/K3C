@@ -1,10 +1,10 @@
 #!/bin/sh
 set -e
-rm -rf linux-3.10.12
-echo "Preparing kernel source tree under ./linux-3.10.12..."
-echo "Extracting dl/linux-3.10.12 tar ball..."
-tar -xjf dl/linux-3.10.12.tar.bz2
-cd linux-3.10.12
+rm -rf linux-3.10.104
+echo "Preparing kernel source tree under ./linux-3.10.104..."
+echo "Extracting dl/linux-3.10.104 tar ball..."
+tar -xjf dl/linux-3.10.104.tar.bz2
+cd linux-3.10.104
 echo "Copying driver files..."
 cp -aL ../target/linux/generic/files/* .
 cp -aL ../target/linux/lantiq/files/* .

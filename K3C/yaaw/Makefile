@@ -41,13 +41,13 @@ define Build/Compile
 endef
 
 define Package/yaaw/install
-	$(INSTALL_DIR) $(1)/opt/lantiq/www/yaaw
+	$(INSTALL_DIR) $(1)/www/yaaw
 	$(CP) \
 		$(PKG_BUILD_DIR)/{css,img,js} \
-		$(1)/opt/lantiq/www/yaaw
+		$(1)/www/yaaw
 	$(CP) \
 		$(PKG_BUILD_DIR)/{index.html,offline.appcache} \
-		$(1)/opt/lantiq/www/yaaw
+		$(1)/www/yaaw
 endef
 
 $(eval $(call BuildPackage,yaaw))

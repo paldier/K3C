@@ -45,14 +45,14 @@ endef
 
 define Package/ariang/install
 	$(INSTALL_DIR) \
-		$(1)/opt/lantiq/www/aria
+		$(1)/www/aria
 
 	$(CP) \
 		$(PKG_BUILD_DIR)/{css,fonts,js,langs} \
 		$(PKG_BUILD_DIR)/index.html \
 		$(PKG_BUILD_DIR)/robots.txt \
 		$(PKG_BUILD_DIR)/LICENSE \
-		$(1)/opt/lantiq/www/aria
+		$(1)/www/aria
 endef
 
 $(eval $(call BuildPackage,ariang))

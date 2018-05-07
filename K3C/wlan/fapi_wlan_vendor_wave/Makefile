@@ -47,7 +47,9 @@ endef
 
 #### Target Rules ###############################
 define Build/Prepare
-
+	$(call Build/Prepare/Default)
+	$(if $(CONFIG_$(PKG_NAME)_USE_CUSTOM_SOURCE_DIR),,$(CP) -L ./src/* $(PKG_BUILD_DIR)/)
+	$(if $(CONFIG_$(PKG_NAME)_USE_CUSTOM_SOURCE_DIR),,$(CP) -L ./files/ $(PKG_BUILD_DIR)/)
 endef
 
 # To ipkg / Rootfs
@@ -56,11 +58,8 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/opt/lantiq/usr/sbin
 	$(INSTALL_DIR) $(1)/opt/lantiq/wave/scripts
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/libfapiwave.so $(1)/opt/lantiq/lib
-	#$(INSTALL_BIN) $(PKG_BUILD_DIR)/test_wlan $(1)/opt/lantiq/usr/sbin
 	# Copy Scripts
 	$(CP) ./files/scripts/fapi* $(1)/opt/lantiq/wave/scripts
-	$(INSTALL_DIR) $(STAGING_DIR)/usr/docs
-	$(CP) $(PKG_BUILD_DIR)/fapi_wlan_wave.h $(STAGING_DIR)/usr/docs/.
 endef
 
 define Build/Clean
