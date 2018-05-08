@@ -122,4 +122,12 @@ define Profile/easy350_hgu/Description
         EASY350 HGU
 endef
 $(eval $(call Profile,easy350_hgu))
+define Profile/easy350_anywan_800m_owrt
+  NAME:=easy350_anywan_800m_owrt
+endef
+
+define Profile/easy350_anywan_800m_owrt/Description
+        easy350_anywan_800m_owrt
+endef
+$(eval $(call Profile,easy350_anywan_800m_owrt))
 
