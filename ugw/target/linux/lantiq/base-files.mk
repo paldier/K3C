@@ -10,7 +10,13 @@ define Package/base-files/install-target
 
 	mkdir -p $(1)/overlay
 	mkdir -p $(1)/mnt/data
+	mkdir -p $(1)/ramdisk/{tmp,var}
 	rm -f $(1)/etc/config/network
+	rm -f $(1)/var
+	rm -rf $(1)/tmp
+	cd $(1); \
+	ln -sf ramdisk/var var; \
+	ln -sf ramdisk/tmp tmp
 
 	echo "#<< switch_ports" > $(1)/etc/switchports.conf
 	echo "switch_mii1_port=\""$(CONFIG_SWITCH_MII1_PORT)"\"" >> $(1)/etc/switchports.conf
