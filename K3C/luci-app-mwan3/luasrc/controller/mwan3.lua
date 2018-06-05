@@ -116,12 +116,6 @@ function interfaceStatus()
 		end
 	end
 
-	-- overview status log
-	local mwanLog = ut.trim(sys.exec("logread | grep mwan3 | tail -n 50 | sed 'x;1!H;$!d;x' 2>/dev/null"))
-	if mwanLog ~= "" then
-		mArray.mwanlog = { mwanLog }
-	end
-
 	luci.http.prepare_content("application/json")
 	luci.http.write_json(mArray)
 end
