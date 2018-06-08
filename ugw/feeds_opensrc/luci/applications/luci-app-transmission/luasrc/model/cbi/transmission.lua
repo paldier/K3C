@@ -219,4 +219,9 @@ scrape_paused_torrents_enabled=queueing:option(Flag, "scrape_paused_torrents_ena
 scrape_paused_torrents_enabled.enabled="true"
 scrape_paused_torrents_enabled.disabled="false"
 
+local apply = luci.http.formvalue("cbi.apply")
+if apply then
+	os.execute("/etc/init.d/transmission restart >/dev/null 2>&1 &")
+end
+
 return m

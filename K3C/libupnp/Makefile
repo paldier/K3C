@@ -29,7 +29,7 @@ endef
 
 define Package/libupnp
   $(call Package/libupnp/Default)
-  DEPENDS:=+libpthread
+  DEPENDS:=+libpthread +ugw-devm
   TITLE:=UPnP SDK library
   MENU:=1
 endef
