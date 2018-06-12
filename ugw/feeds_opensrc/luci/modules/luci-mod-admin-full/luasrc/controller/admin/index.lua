@@ -22,8 +22,6 @@ function index()
 	-- Empty services menu to be populated by addons
 	entry({"admin", "services"}, firstchild(), _("Services"), 40).index = true
 
-	entry({"admin", "switchUI"}, call("switch_ui"), _("ISDK"), 80)
-
 	entry({"admin", "logout"}, call("action_logout"), _("Logout"), 90)
 end
 
@@ -43,8 +41,4 @@ function action_logout()
 	end
 
 	luci.http.redirect(luci.dispatcher.build_url())
-end
-
-function switch_ui()
-	luci.http.redirect("/#")
 end

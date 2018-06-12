@@ -1,4 +1,5 @@
 -- Copyright 2017 Stan Grishin <stangri@melmac.net>
+-- Copyright 2018 paldier <paldier@hotmail.com>
 -- Licensed to the public under the Apache License 2.0.
 
 module("luci.controller.advanced_reboot", package.seeall)
@@ -16,11 +17,11 @@ errorMessage = ""
     boot_envvar2_partition_one = "A"
     boot_envvar2_partition_two = "B"
     if partition_one_mtd and partition_skip then
-      partition_one_label = luci.util.trim(luci.sys.exec("dd if=/dev/" .. partition_one_mtd .. " bs=1 skip=" .. partition_skip .. " count=26" .. "  2>/dev/null"))
+      partition_one_label = luci.util.trim(luci.sys.exec("dd if=/dev/" .. partition_one_mtd .. " bs=1 skip=" .. partition_skip .. " count=27" .. "  2>/dev/null"))
       n, partition_one_version = string.match(partition_one_label, '(Linux)-([%d|.]+)')
     end
     if partition_two_mtd and partition_skip then
-      partition_two_label = luci.util.trim(luci.sys.exec("dd if=/dev/" .. partition_two_mtd .. " bs=1 skip=" .. partition_skip .. " count=26" .. "  2>/dev/null"))
+      partition_two_label = luci.util.trim(luci.sys.exec("dd if=/dev/" .. partition_two_mtd .. " bs=1 skip=" .. partition_skip .. " count=27" .. "  2>/dev/null"))
       n, partition_two_version = string.match(partition_two_label, '(Linux)-([%d|.]+)')
     end
     if string.find(partition_one_label, "LEDE") then partition_one_os = "LEDE" end
