@@ -12,11 +12,6 @@ define Package/base-files/install-target
 	mkdir -p $(1)/mnt/data
 	rm -f $(1)/etc/config/network
 
-	echo "#<< switch_ports" > $(1)/etc/switchports.conf
-	echo "switch_mii1_port=\""$(CONFIG_SWITCH_MII1_PORT)"\"" >> $(1)/etc/switchports.conf
-	echo "switch_lan_ports=\""$(CONFIG_SWITCH_LAN_PORTS)"\"" >> $(1)/etc/switchports.conf
-	echo "#>> switch_ports" >> $(1)/etc/switchports.conf
-
 	$(if $(CONFIG_TARGET_DATAFS_JFFS2),
 		echo jffs2:$(CONFIG_TARGET_ROOTFS_DATAFS_SIZE) > $(1)/mnt/data/fs)
 	$(if $(CONFIG_TARGET_DATAFS_UBIFS),

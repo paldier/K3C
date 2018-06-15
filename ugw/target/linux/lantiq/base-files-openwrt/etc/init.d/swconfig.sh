@@ -567,26 +567,26 @@ parse_uci_file() {
 	fi
 }
 led_config_ethernet_350() {
-	local section=$1
-	local port
 
-	config_get port $section port
-
-	port=$((port+1))
-
-	if [ $port -eq 15 ]
-	then
+		#LAN Switch Port 2 GPHY ( eth0_1 )
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=2 nAddressReg=0x1f01e2 nData=0x70
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=2 nAddressReg=0x1f01e3 nData=0x0B
+		#LAN Switch Port 3 GPHY ( eth0_2 )
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=3 nAddressReg=0x1f01e2 nData=0x70
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=3 nAddressReg=0x1f01e3 nData=0x0B
+		#LAN Switch Port 4 GPHY ( eth0_3 )
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=4 nAddressReg=0x1f01e2 nData=0x70
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=4 nAddressReg=0x1f01e3 nData=0x0B
+		#LAN Switch Port 5 GPHY ( eeth0_4 )
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=5 nAddressReg=0x1f01e2 nData=0x70
+		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=5 nAddressReg=0x1f01e3 nData=0x0B
 		#WAN PAE  Port 15 ( eth1 )
 		switch_cli dev=1 GSW_MMD_DATA_WRITE nAddressDev=1 nAddressReg=0x1f01e2 nData=0x70
 		switch_cli dev=1 GSW_MMD_DATA_WRITE nAddressDev=1 nAddressReg=0x1f01e3 nData=0x0B
-	else
-		#LAN Switch Port (2 3 4 5) GPHY ( eth0_x )
-		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=$(port) nAddressReg=0x1f01e2 nData=0x70
-		switch_cli dev=0 GSW_MMD_DATA_WRITE nAddressDev=$(port) nAddressReg=0x1f01e3 nData=0x0B
-	fi
+
 
 	echo GPT > /sys/devices/16000000.ssx4/16d00000.sso/update_clock_source
-	echo 255 > /sys/class/leds/xrx500\:green\:1/brightness
+	echo 255 > /sys/class/leds/sys/brightness
 
 }
 
