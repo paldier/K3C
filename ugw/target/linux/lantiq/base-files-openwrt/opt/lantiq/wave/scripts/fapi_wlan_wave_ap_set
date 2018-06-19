@@ -1,0 +1,448 @@
+#!/bin/sh
+# Configure AccessPoint parameters
+# Needed object: AccessPoint, AccessPoint.X_LANTIQ_COM_Vendor
+
+script_name="$0"
+
+[ ! "$LIB_COMMON_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_common.sh
+[ ! "$LIB_CONVERT_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_convert.sh
+
+interface_name=$1
+pid=$$
+
+# Find the interface index and the radio index
+interface_index=`find_index_from_interface_name $interface_name`
+radio_name=${interface_name%%.*}
+radio_index=`find_index_from_interface_name $radio_name`
+
+print2log $radio_index DEBUG "$script_name $*"
+timestamp $radio_index "$script_name:$interface_name:begin"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the in conf file
+[ "$debug_save_conf" ] && cp ${IN_CONF} ${CONF_DIR}/ap_set_in_conf_${interface_name}
+
+# Map the objects indexes to the received objects in the in.conf file
+access_point_index=`map_param_index Object $ACCESSPOINT_OBJECT`
+access_point_vendor_index=`map_param_index Object $ACCESSPOINT_VENDOR_OBJECT`
+
+# Save the input configuration parameters to a local DB used by Wave FAPI
+[ -n "$access_point_index" ] && save_db_params ap_set $interface_name $access_point_index $interface_index
+[ -n "$access_point_vendor_index" ] && save_db_params ap_set $interface_name $access_point_vendor_index $interface_index
+
+local_db_source HS20
+hs20_enable=`db2fapi_convert boolean Enable $interface_index`
+access_network_type=`db2fapi_convert regular AccessNetworkType $interface_index`
+echo "fapi_wlan_wave_ap_set: hs20_enable=$hs20_enable, access_network_type=$access_network_type" > /dev/console
+
+# Source RADIO and ACCESSPOINT DBs
+local_db_source RADIO
+local_db_source ACCESSPOINT
+
+[ -e /etc/rc.d/config.sh ] && . /etc/rc.d/config.sh
+
+comment="___AccessPoint_parameters___###"
+
+# Define list of AccessPoint parameters
+driver_params="sAPforwarding
+AP_ISO
+sReliableMcast
+sIpxPpaEnabled
+sBridgeMode
+sPeerAPkeyIdx
+key
+sFourAddrMode
+sAggrConfig"
+
+hostapd_params="ignore_broadcast_ssid
+ap_isolate
+dtim_period
+ap_max_inactivity
+max_num_sta
+num_res_sta
+opmode_notif
+qos_map_set
+wmm_enabled
+uapsd_advertisement_enabled
+proxy_arp
+macaddr_acl
+accept_mac_file
+deny_mac_file
+gas_comeback_delay
+wds_wpa_sta_file"
+
+hostapd_mbo_params="mbo
+mbo_cell_aware
+rrm_neighbor_report
+bss_transition
+mbo_pmf_bypass
+interworking
+access_network_type"
+
+hostapd_11k_params="rrm_link_measurement
+rrm_sta_statistics
+rrm_channel_load
+rrm_noise_histogram
+rrm_beacon_report_passive
+rrm_beacon_report_table"
+
+hostapd_vap_atf_params="atf_vap_stations_and_weights"
+
+# Update the status file with the interface status
+update_enable_disable $radio_name $interface_name $interface_index $radio_name
+
+# Update the EnableOnline file with the interfaces EnableOnline status
+update_enable_online $radio_name $interface_name $interface_index
+
+# Prepare the temporary configuration files to use
+prepare_confs $interface_name $radio_name $pid $VAP
+# Get the pid to use in this configuration session
+. ${CONF_IN_PROGRESS}_${radio_name}
+
+# Read current values and initiate new values file.
+driver_current_values=${CONF_DIR}/driver_current_values_${interface_name}
+hostapd_current_values=${CONF_DIR}/hostapd_current_values_${interface_name}_${pid}
+
+read_current_values $HOSTAPD_VAP_CONF_PREFIX $interface_name $hostapd_current_values
+read_current_values $DRIVER_POST_UP_CONF_PREFIX $interface_name $driver_current_values
+
+# Calculate new values.
+# Some commands are executed according to the fastpath state
+fastpath_enabled=`db2fapi_convert boolean WaveFastpathEnabled $radio_index`
+
+### 802.11 parameters
+AP_ISO=""
+
+ignore_broadcast_ssid=`convert_ignore_broadcast_ssid $interface_index`
+ap_isolate=`db2fapi_convert boolean IsolationEnable $interface_index`
+# When ap_isolate is enabled, sAPforwarding is disabled and vice versa
+sAPforwarding=$((ap_isolate^1))
+# Add hs_cli AP_ISO command to set ap isolation if fastpath is enabled
+[ "$fastpath_enabled" = "1" ] && AP_ISO=`convert_ap_iso $ap_isolate`
+dtim_period=`db2fapi_convert regular DTIMPeriod $radio_index`
+
+### Station inactivity parameters
+ap_max_inactivity=`db2fapi_convert regular APMaxInactivity $interface_index`
+
+### VAP limits
+max_num_sta=`db2fapi_convert regular MaxAssociatedDevices $interface_index`
+num_res_sta=`db2fapi_convert regular ReservedAssociatedDevices $interface_index`
+
+### 11ac parameters
+opmode_notif=`convert_opmode_notif $radio_index`
+
+### Multicast parameters
+sReliableMcast=`db2fapi_convert boolean ReliableMuticastEnable $interface_index`
+
+### PPA parameters
+# Configure PPA only if PPA exists by checking if ${SBINDIR}/ppacmd exists
+sIpxPpaEnabled=""
+# sIpxPpaEnabled is set on interfaces that are not fastpath enabled
+[ "$fastpath_enabled" != "1" ] && [ -e "${SBINDIR}/ppacmd" ] && sIpxPpaEnabled=`db2fapi_convert boolean PPAEnable $interface_index`
+# For grx750_haven_park, PPA will be always enabled
+if [ "$CONFIG_IFX_CONFIG_CPU" = "GRX750" ] 
+then
+	sIpxPpaEnabled=1
+fi
+proxy_arp=`db2fapi_convert boolean ProxyArp $interface_index`
+
+### QOS map parameter
+qos_map_set=""
+qos_map_set=`db2fapi_convert regular QosMap $interface_index`
+
+## WMM parameters
+wmm_enabled=`db2fapi_convert boolean WMMEnable $interface_index`
+uapsd_advertisement_enabled=`db2fapi_convert boolean UAPSDEnable $interface_index`
+
+### WDS parameters
+wds_mode=`db2fapi_convert regular WaveWDSMode $interface_index`
+sBridgeMode=0
+wds_wpa_sta_file=""
+if [ "$wds_mode" = "$WDS_ENABLED" ]
+then
+	sBridgeMode=1
+	sPeerAPkeyIdx=`convert_peer_ap_key_index $interface_index`
+	# Configure the wep keys if wep is set
+	[ $sPeerAPkeyIdx -gt 0 ] && key=`convert_wds_wep_keys $interface_index`
+	# Get the list of peer APs in driver and in the DB
+	driver_peer_aps=`get_wds_driver_list $interface_name wds`
+	db_peer_aps=`get_wds_db_list $interface_index wds`
+elif [ "$wds_mode" = "$WDS_HYBRID" ]
+then
+	sBridgeMode=1
+	wds_wpa_sta_file=${CONF_DIR}/wds_hybrid_${interface_name}.conf
+	update_wds_wpa_sta_file $interface_name $interface_index $pid
+fi
+
+### 4 addresses parameters
+sFourAddrMode=`convert_four_addresses_mode $interface_index`
+# If 4 addresses mode is List (value is 3), set the list of STAs
+# Get the list of 4 addresses STAs in driver and in the DB
+if [ "$sFourAddrMode" = "3" ]
+then
+	driver_4_addr_stas=`get_wds_driver_list $interface_name four_addr`
+	db_4_addr_stas=`get_wds_db_list $interface_index four_addr`
+fi
+
+### ACL parameters
+acl_db=`db2fapi_convert regular MACAddressControlMode $interface_index`
+
+# if ACL mode is Allow and ACL list is empty disable it, fix WLANSW-4814.
+if [ "$acl_db" = "Allow" ]; then
+	db_acl_list=`db2fapi_convert regular MACAddressControlList $interface_index`
+	if [ -z "$db_acl_list" ]; then
+		acl_db="Disabled"
+		build_wlan_notification "servd" "NOTIFY_WIFI_UPDATE_PARAM" "Name:$interface_name Object:${ACCESSPOINT_VENDOR_OBJECT} MACAddressControlMode:$acl_db"
+	fi
+fi
+macaddr_acl=`convert_macaddr_acl $acl_db`
+accept_mac_file=""
+deny_mac_file=""
+
+# If ACL is enabled in DB (Allow or Deny), set ACL files parameters
+if [ "$acl_db" != "Disabled" ]
+then
+	accept_mac_file="${CONF_DIR}/${ACCEPT_ACL_FILE}.${interface_name}.conf"
+	deny_mac_file="${CONF_DIR}/${DENY_ACL_FILE}.${interface_name}.conf"
+	touch ${CONF_DIR}/${ACCEPT_ACL_FILE}.${interface_name}.conf
+	touch ${CONF_DIR}/${DENY_ACL_FILE}.${interface_name}.conf
+fi
+
+gas_comeback_delay=`db2fapi_convert regular GasComebackDelay $interface_index`
+
+### Aggregation config
+sAggrConfig=`convert_aggregation_config $interface_index`
+
+### MBO parameters
+mbo_comment="___MBO_parameters___###"
+mbo=`db2fapi_convert boolean WaveMBOEnabled $interface_index`
+mbo_cell_aware=""
+rrm_neighbor_report=""
+bss_transition=""
+mbo_pmf_bypass=""
+
+if [ "$mbo" = "1" ]
+then
+	mbo_cell_aware=`db2fapi_convert boolean WaveMBOCellAware $interface_index`
+	rrm_neighbor_report=`db2fapi_convert boolean WaveMBORrmNeighborReport $interface_index`
+	bss_transition=`db2fapi_convert boolean WaveMBOBssTransition $interface_index`
+	mbo_pmf_bypass=`db2fapi_convert boolean WaveMBOPmfBypass $interface_index`
+	interworking=1
+
+	if [ -n "$hs20_enable" ] && [ "$hs20_enable" = "0" ]
+	then
+		access_network_type=0
+	elif [ -z "$hs20_enable" ]
+	then
+		# Case Init - HS2.0 configure after ap set
+		access_network_type=0
+	fi
+else
+	# If HS2.0 is configured, do not clear interworking
+	if [ -n "$hs20_enable" ] && [ "$hs20_enable" = "0" ]
+	then
+		interworking=""
+		access_network_type=""
+	elif [ -z "$hs20_enable" ]
+	then
+		interworking=""
+		access_network_type=""
+	fi	
+	# Arad: TODO- fixme !?
+fi
+
+### 11k parameters
+rrm_11k_comment="___11k_parameters___###"
+rrm_link_measurement=`db2fapi_convert boolean RrmLinkMeasurement $interface_index`
+rrm_sta_statistics=`db2fapi_convert boolean RrmStaStatistics $interface_index`
+rrm_channel_load=`db2fapi_convert boolean RrmChannelLoad $interface_index`
+rrm_noise_histogram=`db2fapi_convert boolean RrmNoiseHistogram $interface_index`
+rrm_beacon_report_passive=`db2fapi_convert boolean RrmBeaconReportPassive $interface_index`
+rrm_beacon_report_table=`db2fapi_convert boolean RrmBeaconReportTable $interface_index`
+
+### atf parameters
+atf_comment_prefix="___ATF_"
+atf_comment_postfix="_PARAMETERS___###"
+atf_vap_comment="$atf_comment_prefix$interface_name$atf_comment_postfix"
+atf_vap_stations_and_weights=`db2fapi_convert regular WaveAtfVapStationsAndWeights $interface_index`
+
+# Write the parameters to the configuration files.
+# Check if a hostapd parameter was changed.
+hostapd_changed=`check_param_changed "$hostapd_params"`
+
+# If a hostapd parameter was changed, remove AccessPoint parameters from hostapd_vap temp conf file and write all of them with updated values.
+if [ "$hostapd_changed" ]
+then
+	hostapd_vap_conf_name=${CONF_DIR}/hostapd_vap_${interface_name}_${pid}.conf
+	# Remove the hostapd AccessPoint parameters.
+	remove_params_from_conf "###$comment $hostapd_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+
+	# Write the hostapd AccessPoint parameters.
+	set_conf_param hostapd_vap comment otf $pid $interface_name comment "$comment"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name ignore_broadcast_ssid "$ignore_broadcast_ssid"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name ap_isolate "$ap_isolate"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name dtim_period "$dtim_period"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name ap_max_inactivity "$ap_max_inactivity"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name max_num_sta "$max_num_sta"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name num_res_sta "$num_res_sta"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name opmode_notif "$opmode_notif"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name qos_map_set "$qos_map_set"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wmm_enabled "$wmm_enabled"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name uapsd_advertisement_enabled "$uapsd_advertisement_enabled"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name proxy_arp "$proxy_arp"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name macaddr_acl "$macaddr_acl"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name accept_mac_file "$accept_mac_file"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name deny_mac_file "$deny_mac_file"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name gas_comeback_delay "$gas_comeback_delay"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name wds_wpa_sta_file "$wds_wpa_sta_file"
+fi
+
+# Check if a driver parameter was changed.
+driver_changed=`check_param_changed "$driver_params"`
+
+# Check if WDS peer APs list was changed.
+wds_changed=""
+[ "$wds_mode" = "$WDS_ENABLED" ] && wds_changed=`check_wds_list_changed "$driver_peer_aps" "$db_peer_aps"`
+
+# Check if 4 addresses STAs list was changed.
+[ "$sFourAddrMode" = "3" ] && four_addr_changed=`check_wds_list_changed "$driver_4_addr_stas" "$db_4_addr_stas"`
+
+# If a driver parameter was changed, remove AccessPoint parameters from drv_config_post_up temp conf file and write all of them with updated values.
+if [ "$driver_changed" -o "$wds_changed" -o "$four_addr_changed" ]
+then
+	drv_config_post_up_conf_name=${CONF_DIR}/drv_config_post_up_${interface_name}_${pid}.conf
+	# Remove the driver AccessPoint, WDS and 4 addresses parameters.
+	remove_params_from_conf "sAddPeerAP sDelPeerAP sAddFourAddrSta sDelFourAddrSta $driver_params" $drv_config_post_up_conf_name $DRIVER_POST_UP_CONF_PREFIX
+
+	set_conf_param drv_config_post_up iwpriv otf $pid $interface_name sAPforwarding "$sAPforwarding"
+	set_conf_param drv_config_post_up hs_cli otf $pid $interface_name AP_ISO "$AP_ISO"
+	set_conf_param drv_config_post_up iwpriv otf $pid $interface_name sReliableMcast "$sReliableMcast"
+	set_conf_param drv_config_post_up iwpriv otf $pid $interface_name sIpxPpaEnabled "$sIpxPpaEnabled"
+	set_conf_param drv_config_post_up iwpriv otf $pid $interface_name sBridgeMode "$sBridgeMode"
+	if [ -n "$key" ]
+	then
+		# WLANSW-5369: for key update require to disconnect peers:
+		WaveWDSModeChanged=`cat ${IN_CONF} | grep WaveWDSMode -c`
+		if [ "$WaveWDSEnabledChanged" = "0" ]
+		then
+			set_conf_param $DRIVER_SINGLE_CALL_CONFIG_FILE iwpriv otf $pid $interface_name sBridgeMode "0"
+			set_conf_param $DRIVER_SINGLE_CALL_CONFIG_FILE iwpriv otf $pid $interface_name sBridgeMode "1"
+		fi
+	fi
+	set_conf_param drv_config_post_up iwconfig otf $pid $interface_name key "$key"
+	set_conf_param drv_config_post_up iwpriv otf $pid $interface_name sFourAddrMode "$sFourAddrMode"
+	set_conf_param drv_config_post_up iwpriv otf $pid $interface_name sPeerAPkeyIdx "$sPeerAPkeyIdx"
+	set_conf_param drv_config_post_up iwpriv otf $pid $interface_name sAggrConfig "$sAggrConfig"
+	# Update the AP peers list
+	update_wds_list $interface_name $pid "wds" "$driver_peer_aps" "$db_peer_aps"
+	# Update the 4 addresses STAs list
+	update_wds_list $interface_name $pid "four_addr" "$driver_4_addr_stas" "$db_4_addr_stas"
+fi
+
+# If PPA exists, check if the PPA is enabled for this interface and if fastpath is enabled for the radio of this interface.
+# If ppa enabled or fastpath is enabled for the radio, write the PPA commands. If both disabled, remove the interface from the PPA.
+if [ -e ${SBINDIR}/ppacmd ]
+then
+	if [ "$sIpxPpaEnabled" = "1" ] || [ "$fastpath_enabled" = "1" ]
+	then
+		set_conf_param drv_config_post_up ppa otf $pid $interface_name ppacmd "add"
+	else
+		set_conf_param drv_config_post_up ppa otf $pid $interface_name ppacmd "remove"
+	fi
+fi
+
+# Update the ACL accept list
+# Write the MAC addresses to the deny/accept lists and clear the other list.
+case $acl_db in
+"Allow")
+	update_acl_list ACCEPT $interface_index $pid $interface_name $radio_name
+	[ -e "${CONF_DIR}/${DENY_ACL_FILE}.${interface_name}.conf" ] && cat /dev/null > ${CONF_DIR}/${DENY_ACL_FILE}.${interface_name}.conf
+	;;
+"Deny")
+	update_acl_list DENY $interface_index $pid $interface_name $radio_name
+	[ -e "${CONF_DIR}/${ACCEPT_ACL_FILE}.${interface_name}.conf" ] && cat /dev/null > ${CONF_DIR}/${ACCEPT_ACL_FILE}.${interface_name}.conf
+	;;
+"Disabled")
+	update_acl_list DENY $interface_index $pid $interface_name $radio_name empty
+	[ -e "${CONF_DIR}/${ACCEPT_ACL_FILE}.${interface_name}.conf" ] && cat /dev/null > ${CONF_DIR}/${ACCEPT_ACL_FILE}.${interface_name}.conf
+	[ -e "${CONF_DIR}/${DENY_ACL_FILE}.${interface_name}.conf" ] && cat /dev/null > ${CONF_DIR}/${DENY_ACL_FILE}.${interface_name}.conf
+	;;
+esac
+
+# Create the output configuration file
+cat /dev/null > ${OUT_CONF}
+
+# Set maximum number of STAs from driver to XML
+value_to_set=`driver_to_db_set_max_num_sta $radio_name $interface_index`
+if [ -n "$value_to_set" ]
+then
+	update_conf_out "Object_${access_point_index}" "${ACCESSPOINT_OBJECT}"
+	update_conf_out "MaxAssociatedDevices_${access_point_index}" "$value_to_set"
+	# If set, need to remove already configured max_num_sta from hostapd conf...
+	clear_hostapd_params $interface_name $pid max_num_sta
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name "max_num_sta" "$value_to_set"
+	# Update database value
+	build_wlan_notification "servd" "NOTIFY_WIFI_UPDATE_PARAM" "Name:wlan0 Object:${ACCESSPOINT_OBJECT} MaxAssociatedDevices:$value_to_set"
+fi
+
+# Check if a hostapd MBO parameter was changed.
+hostapd_mbo_changed=`check_param_changed "$hostapd_mbo_params"`
+
+# If a hostapd MBO parameter was changed, remove MBO parameters from hostapd_vap temp conf file and write all of them with updated values.
+if [ "$hostapd_mbo_changed" ]
+then
+	hostapd_vap_conf_name=${CONF_DIR}/hostapd_vap_${interface_name}_${pid}.conf
+	# Remove the hostapd MBO parameters.
+	remove_params_from_conf "###$mbo_comment $hostapd_mbo_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+
+	# Write the hostapd MBO parameters.
+	set_conf_param hostapd_vap comment otf $pid $interface_name comment "$mbo_comment"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name mbo "$mbo"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name mbo_cell_aware "$mbo_cell_aware"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rrm_neighbor_report "$rrm_neighbor_report"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name bss_transition "$bss_transition"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name mbo_pmf_bypass "$mbo_pmf_bypass"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name interworking "$interworking"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name access_network_type "$access_network_type"
+fi
+
+# Check if a hostapd 11k parameter was changed.
+hostapd_11k_changed=`check_param_changed "$hostapd_11k_params"`
+
+# If a hostapd 11k parameter was changed, remove 11k parameters from hostapd_vap temp conf file and write all of them with updated values.
+if [ "$hostapd_11k_changed" ]
+then
+	hostapd_vap_conf_name=${CONF_DIR}/hostapd_vap_${interface_name}_${pid}.conf
+	# Remove the hostapd 11k parameters.
+	remove_params_from_conf "###$rrm_11k_comment $hostapd_11k_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+
+	# Write the hostapd 11k parameters.
+	set_conf_param hostapd_vap comment otf $pid $interface_name comment "$rrm_11k_comment"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rrm_link_measurement "$rrm_link_measurement"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rrm_sta_statistics "$rrm_sta_statistics"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rrm_channel_load "$rrm_channel_load"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rrm_noise_histogram "$rrm_noise_histogram"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rrm_beacon_report_passive "$rrm_beacon_report_passive"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name rrm_beacon_report_table "$rrm_beacon_report_table"
+fi
+
+# ATF: Check if a hostapd atf parameter was changed.
+hostapd_vap_atf_changed=`check_atf_param_changed Atf ${IN_CONF}`
+
+if [ "$hostapd_vap_atf_changed" = "1" ]
+then
+	hostapd_vap_atf_conf_name=${CONF_DIR}/hostapd_vap_atf_${interface_name}_${pid}.conf
+
+	# Write the hostapd atf parameters.
+	set_conf_param hostapd_vap_atf comment otf $pid $interface_name comment "$atf_vap_comment"
+	echo "[$interface_name]" >> ${hostapd_vap_atf_conf_name}
+	convert_atf_stations_and_weights $pid $interface_name hostapd_vap_atf "$atf_vap_stations_and_weights"
+fi
+
+# Configuration is completed successfully
+update_conf_out "wlan_configuration_status" "success"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the out conf file
+[ "$debug_save_conf" ] && cp ${OUT_CONF} ${CONF_DIR}/ap_set_out_conf_${interface_name}
+
+print2log $radio_index DEBUG "$script_name done"
+timestamp $radio_index "$script_name:$interface_name:done"

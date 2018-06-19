@@ -1,4 +1,5 @@
 -- Copyright 2008 Steven Barth <steven@midlink.org>
+-- Copyright 2018 paldier <paldier@hotmail.com>
 -- Licensed to the public under the Apache License 2.0.
 
 local wa = require "luci.tools.webadmin"
@@ -52,7 +53,7 @@ function m.parse(map)
 
 		nw:commit("wireless")
 		luci.sys.call("(env -i /bin/ubus call network reload) >/dev/null 2>/dev/null")
-
+		os.execute("/etc/init.d/wifi_start.sh restart ")
 		luci.http.redirect(luci.dispatcher.build_url("admin/network/wireless", arg[1]))
 		return
 	end
@@ -291,8 +292,26 @@ if hwtype == "atheros" then
 	--s:option(Flag, "nosbeacon", translate("Disable HW-Beacon timer"))
 end
 
+------------------- MTLK Device ------------------
+if hwtype == "mtlk" then
+	tp = s:taboption("general",
+		(#tx_power_list > 0) and ListValue or Value,
+		"txpower", translate("Transmit Power"), "dBm")
 
+	tp.rmempty = true
+	tp.default = tx_power_cur
 
+	function tp.cfgvalue(...)
+		return txpower_current(Value.cfgvalue(...), tx_power_list)
+	end
+
+	for _, p in ipairs(tx_power_list) do
+		tp:value(p.driver_dbm, "%i dBm (%i mW)"
+			%{ p.display_dbm, p.display_mw })
+	end
+	
+	s:taboption("advanced", Value, "country", translate("Country Code"))
+end
 ------------------- Broadcom Device ------------------
 
 if hwtype == "broadcom" then
@@ -569,7 +588,38 @@ if hwtype == "atheros" then
 	probereq.disabled = "1"
 end
 
+-------------------- MTLK Interface ----------------------
+if hwtype == "mtlk" then
+	mode:value("wds", translate("WDS"))
+	mode:value("monitor", translate("Monitor"))
 
+	hidden = s:taboption("general", Flag, "hidden", translate("Hide <abbr title=\"Extended Service Set Identifier\">ESSID</abbr>"))
+	hidden:depends({mode="ap"})
+	hidden:depends({mode="adhoc"})
+	hidden:depends({mode="wds"})
+
+	isolate = s:taboption("advanced", Flag, "isolate", translate("Separate Clients"),
+	 translate("Prevents client-to-client communication"))
+	isolate:depends({mode="ap"})
+
+	s:taboption("advanced", Flag, "doth", "802.11h")
+	s:taboption("advanced", Flag, "wmm", translate("WMM Mode"))
+
+	bssid:depends({mode="wds"})
+	bssid:depends({mode="adhoc"})
+	
+	mp = s:taboption("macfilter", ListValue, "macpolicy", translate("MAC-Address Filter"))
+	mp:value("", translate("disable"))
+	mp:value("allow", translate("Allow listed only"))
+	mp:value("deny", translate("Allow all except listed"))
+
+	ml = s:taboption("macfilter", DynamicList, "maclist", translate("MAC-List"))
+	ml.datatype = "macaddr"
+	ml:depends({macpolicy="allow"})
+	ml:depends({macpolicy="deny"})
+	nt.mac_hints(function(mac, name) ml:value(mac, "%s (%s)" %{ mac, name }) end)
+
+end
 -------------------- Broadcom Interface ----------------------
 
 if hwtype == "broadcom" then
@@ -690,9 +740,9 @@ encr:value("none", "No Encryption")
 encr:value("wep-open",   translate("WEP Open System"), {mode="ap"}, {mode="sta"}, {mode="ap-wds"}, {mode="sta-wds"}, {mode="adhoc"}, {mode="ahdemo"}, {mode="wds"})
 encr:value("wep-shared", translate("WEP Shared Key"),  {mode="ap"}, {mode="sta"}, {mode="ap-wds"}, {mode="sta-wds"}, {mode="adhoc"}, {mode="ahdemo"}, {mode="wds"})
 
-if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" then
-	local supplicant = fs.access("/usr/sbin/wpa_supplicant")
-	local hostapd = fs.access("/usr/sbin/hostapd")
+if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" or hwtype == "mtlk" then
+	local supplicant = fs.access("/opt/lantiq/bin/wpa_supplicant")
+	local hostapd = fs.access("/opt/lantiq/bin/hostapd")
 
 	-- Probe EAP support
 	local has_ap_eap  = (os.execute("hostapd -veap >/dev/null 2>/dev/null") == 0)
@@ -851,7 +901,7 @@ for slot=1,4 do
 end
 
 
-if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" then
+if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" or hwtype == "mtlk" then
 	nasid = s:taboption("encryption", Value, "nasid", translate("NAS ID"))
 	nasid:depends({mode="ap", encryption="wpa"})
 	nasid:depends({mode="ap", encryption="wpa2"})
@@ -929,9 +979,9 @@ if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" then
 	password:depends({mode="sta-wds", eap_type="ttls", encryption="wpa"})
 end
 
-if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" then
-	local wpasupplicant = fs.access("/usr/sbin/wpa_supplicant")
-	local hostcli = fs.access("/usr/sbin/hostapd_cli")
+if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" or hwtype == "mtlk" then
+	local wpasupplicant = fs.access("/opt/lantiq/bin/wpa_supplicant")
+	local hostcli = fs.access("/opt/lantiq/bin/hostapd_cli")
 	if hostcli and wpasupplicant then
 		wps = s:taboption("encryption", Flag, "wps_pushbutton", translate("Enable WPS pushbutton, requires WPA(2)-PSK"))
 		wps.enabled = "1"
@@ -944,3 +994,4 @@ if hwtype == "atheros" or hwtype == "mac80211" or hwtype == "prism2" then
 end
 
 return m
+

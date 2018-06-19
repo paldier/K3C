@@ -1,0 +1,196 @@
+#!/bin/sh
+# Configure SSID parameters
+# Needed objects: SSID
+
+script_name="$0"
+
+[ ! "$LIB_COMMON_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_common.sh
+[ ! "$LIB_CONVERT_SOURCED" ] && . /tmp/fapi_wlan_wave_lib_convert.sh
+
+interface_name=$1
+pid=$$
+
+# Find the interface index and the radio index
+interface_index=`find_index_from_interface_name $interface_name`
+local_db_source SSID
+ssid_type=`db2fapi_convert regular X_LANTIQ_COM_Vendor_SsidType $interface_index`
+if [ "$ssid_type" = "EndPoint" ]
+then
+	radio_name=`get_radio_name_from_endpoint $interface_name`
+	conf_in_progress_interface=$interface_name
+else
+	radio_name=${interface_name%%.*}
+	conf_in_progress_interface=$radio_name
+fi
+radio_index=`find_index_from_interface_name $radio_name`
+
+print2log $radio_index DEBUG "$script_name $*"
+timestamp $radio_index "$script_name:$interface_name:begin"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the in conf file
+[ "$debug_save_conf" ] && cp ${IN_CONF} ${CONF_DIR}/ssid_set_in_conf_${interface_name}
+
+# Map the objects indexes to the received objects in the in.conf file
+ssid_index=`map_param_index Object $SSID_OBJECT`
+
+# Save the input configuration parameters to a local DB used by Wave FAPI
+[ -n "$ssid_index" ] && save_db_params ssid_set $interface_name $ssid_index $interface_index
+local_db_source SSID
+
+comment="___SSID_parameters___###"
+
+# Check if call is to configure AP/VAP or EndPoint by checking value of X_LANTIQ_COM_Vendor_SsidType
+# For Radio: value is "Radio"
+# For EndPoint: value is "EndPoint"
+# For VAP: value is empty
+ssid_type=`db2fapi_convert regular X_LANTIQ_COM_Vendor_SsidType $interface_index`
+if [ "$ssid_type" = "EndPoint" ]
+then
+	echo "### TODO: ADD CONFIGURATION OF STA" > /dev/console
+	# Create the output configuration file
+	cat /dev/null > ${OUT_CONF}
+
+	# Configuration is completed successfully
+	update_conf_out "wlan_configuration_status" "success"
+	exit
+fi
+
+# Define list of ssid parameters
+hostapd_params="bridge
+ssid"
+
+hostapd_ssid_atf_params="atf_grant"
+
+# Prepare the temporary configuration files to use
+prepare_confs $interface_name $conf_in_progress_interface $pid $VAP
+# Get the pid to use in this configuration session
+. ${CONF_IN_PROGRESS}_${conf_in_progress_interface}
+
+# Read current values and initiate new values file.
+hostapd_current_values=${CONF_DIR}/hostapd_current_values_${interface_name}_${pid}
+
+read_current_values $HOSTAPD_VAP_CONF_PREFIX $interface_name $hostapd_current_values
+
+# Calculate new values.
+bridge=`db2fapi_convert regular X_LANTIQ_COM_Vendor_BridgeName $interface_index`
+ssid=`db2fapi_convert regular SSID $interface_index`
+
+### atf
+atf_grant=`db2fapi_convert regular X_LANTIQ_COM_Vendor_WaveAtfVapWeight $interface_index`
+# multiple by 100 for the Driver
+atf_grant=$(( $atf_grant * 100 ))
+
+# Write the parameters to the configuration files.
+# Check if a hostapd parameter was changed.
+hostapd_changed=`check_param_changed "$hostapd_params"`
+
+# If a hostapd parameter was changed, remove ssid parameters from hostapd_vap temp conf file and write all of them with updated values.
+if [ "$hostapd_changed" ]
+then
+	hostapd_vap_conf_name=${CONF_DIR}/hostapd_vap_${interface_name}_${pid}.conf
+	# Remove the hostapd main parameters.
+	remove_params_from_conf "###$comment $hostapd_params" $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+
+	# Write the hostapd main parameters.
+	set_conf_param hostapd_vap comment otf $pid $interface_name comment "$comment"
+	[ -n "$bridge" ] && [ "$bridge" != "NoBridge" ] && [ -n "`brctl show | grep -w ${bridge}`" ] && set_conf_param hostapd_vap regular no_otf $pid $interface_name bridge "$bridge"
+	set_conf_param hostapd_vap regular no_otf $pid $interface_name ssid "$ssid"
+fi
+
+hostapd_ssid_atf_changed=`check_atf_param_changed Atf ${IN_CONF}`
+
+if [ "$hostapd_ssid_atf_changed" = "1" ]
+then
+	hostapd_vap_atf_conf_name=${CONF_DIR}/hostapd_ssid_atf_${interface_name}_${pid}.conf
+	set_conf_param hostapd_ssid_atf atf otf $pid $interface_name vap_grant "$atf_grant"
+fi
+
+# Create the output configuration file
+cat /dev/null > ${OUT_CONF}
+
+read_wps_vap_name_from_hostapd()
+{
+	enable_log=0
+	interface_name=$1
+	radio_name=$2
+	hostapd_conf_file_file=${CONF_DIR}/hostapd_${radio_name}.conf
+	vap_found=0
+	wps_of_vap_found=0
+	
+	[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: interface_name=$interface_name, radio_name=$radio_name, hostapd_conf_file_file=$hostapd_conf_file_file" > /dev/console
+	
+	section_start=""
+	start_vap=" VAP parameters #"
+	
+	while read line
+	do
+		#[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: line=$line" > /dev/console
+		start_vap=`echo $line | grep ' VAP parameters #' -c`
+		if [ "$vap_found" = "0" ] && [ "$start_vap" = "1" ]
+		then
+			[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: found VAP Start, get interface name" > /dev/console
+			tmp1=${line################ }
+			vap_name=`echo $tmp1 | awk '{print $1}'`
+			[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: vap_name=$vap_name" > /dev/console
+			# Overrun with last name
+			if [ "$interface_name" = "$vap_name" ]
+			then
+				vap_found=1
+				[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: vap_found=1" > /dev/console
+			fi
+		fi
+		if [ "$vap_found" = "1" ]
+		then
+			[ "$wps_of_vap_found" = "0" ] && wps_of_vap_found=`echo $line | grep "___WPS_parameters___" -c`
+			#[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: wps_of_vap_found=$wps_of_vap_found" > /dev/console
+	
+			if [ "$wps_of_vap_found" = "1" ]
+			then
+				# Look for wps_state
+				[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: wps_of_vap_found: line=$line" > /dev/console
+				line1=`echo $line | awk -F "=" '{print $1}'`
+				[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: wps_of_vap_found: line1=$line1" > /dev/console
+				if [ "$line1" = "wps_state" ]
+				then
+					[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: :-) :-) :-) " > /dev/console
+					echo $line
+					return
+				fi
+			fi
+		fi
+	done < $hostapd_conf_file_file
+	
+	[ "$enable_log" = "1" ] && echo "read_wps_vap_name_from_hostapd: Warning - interface name ($interface_name) not found in $hostapd_conf_file_file file (AddVap operation?)" > /dev/console
+}
+
+if [ ! -e $INIT_FLAG ]
+then
+	print2log $radio_index DEBUG "$script_name ssid=$ssid"
+	if [ -n "$ssid" ]
+	then
+		print2log $radio_index DEBUG "call read_wps_vap_name_from_hostapd $interface_name $radio_name"
+		wps_state=`read_wps_vap_name_from_hostapd $interface_name $radio_name`
+		print2log $radio_index DEBUG "From read_wps_vap_name_from_hostapd: wps_state=$wps_state"
+		
+		#wps_state=`db2fapi_convert regular ConfigState $radio_index` # =Configured
+		#wps_state_unconf_count=`cat ${CONF_DIR}/hostapd_${radio_name}.conf | grep "wps_state=1" -c`
+
+		if [ "$wps_state" = "wps_state=1" ]
+		then
+			print2log $radio_index DEBUG "$script_name SSID changed, wps_state=1: change $RADIO_WPS_VENDOR_OBJECT to Configured"
+			# Remove the hostapd main parameters and update with new.
+			remove_params_from_conf wps_state $hostapd_vap_conf_name $HOSTAPD_VAP_CONF_PREFIX
+			set_conf_param hostapd_vap regular no_otf $pid $interface_name wps_state "2"
+			build_wlan_notification "servd" "NOTIFY_WIFI_UPDATE_PARAM" "Name:$radio_name Object:${RADIO_WPS_VENDOR_OBJECT} ConfigState:Configured"
+		fi
+	fi
+fi
+
+# Configuration is completed successfully
+update_conf_out "wlan_configuration_status" "success"
+
+# DEBUG: set debug_save_conf in fapi_wlan_wave_lib_common.sh to save the out conf file
+[ "$debug_save_conf" ] && cp ${OUT_CONF} ${CONF_DIR}/ssid_set_out_conf_${interface_name}
+
+print2log $radio_index DEBUG "$script_name done"
+timestamp $radio_index "$script_name:$interface_name:done"

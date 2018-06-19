@@ -1,0 +1,101 @@
+#!/bin/sh
+
+# Uninit Wave driver and clean the environment
+# Needed object: None
+
+script_name="$0"
+pid=$$
+
+# If fapi_wlan_wave_lib_common.sh link in /tmp/wlan_wave is broken, source directly from scripts folder
+# Support Puma and UGW paths
+if [ ! "$LIB_COMMON_SOURCED" ]
+then
+	if [ -e /tmp/wlan_wave/fapi_wlan_wave_lib_common.sh ]
+	then
+		. /tmp/wlan_wave/fapi_wlan_wave_lib_common.sh
+	elif [ -e /opt/lantiq/wave/scripts/fapi_wlan_wave_lib_common.sh ]
+	then
+		. /opt/lantiq/wave/scripts/fapi_wlan_wave_lib_common.sh
+	elif [ -e /etc/wave/scripts/fapi_wlan_wave_lib_common.sh ]
+	then
+		. /etc/wave/scripts/fapi_wlan_wave_lib_common.sh
+	fi
+fi
+
+# Find the interface index of wlan0
+interface_index=`find_index_from_interface_name wlan0`
+
+timestamp $interface_index "$script_name:begin"
+print2log $interface_index DEBUG "$script_name $*"
+
+# Delete the runner file
+rm -f ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+
+# rmmod HS2.0 related drivers
+[ -e $WMDCTRL_SCRIPT ] && set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name "(. $WMDCTRL_SCRIPT" "stop)"
+set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name "hs_cli PARP -O" "STOP"
+if [ -e /proc/net/wave_wifi_l2f/ ]
+then
+	set_conf_param $ALUMNUS_HS20_CONFIG_FILE alumnus otf $pid $interface_name "hs_cli L2F -O" "STOP"
+fi
+
+echo "echo "\$script_name killall hostapds" > /dev/console" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+echo "killall hostapd 2>/dev/null" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+echo "hostapd_count=\`ps | grep hostapd -c\`" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+echo "while [ "\$hostapd_count" -gt 1 ]; do sleep 1; hostapd_count=\`ps | grep hostapd -c\`; echo "hostapd kill wait [\$hostapd_count]" > /dev/console; done" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+
+# Stop drvhlpr
+echo "echo "\$script_name killall drvhlprs" > /dev/console" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+echo "killall drvhlpr 2>/dev/null" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+echo "drvhlpr_count=\`ps | grep drvhlpr -c\`" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+echo "while [ "\$drvhlpr_count" -gt 1 ]; do sleep 1; drvhlpr_count=\`ps | grep drvhlpr -c\`; echo "drvhlpr kill wait [\$drvhlpr_count]" > /dev/console; done" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+
+# rmmod WAVE driver
+echo "echo "\$script_name rmmod mtlk" > /dev/console" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+if [ `lsmod | grep "mtlk " -c` -gt 0  ]
+then
+	# In mtlkroot.ko insmod we pass to the driver the Netlink ID to reuse it on Netlink create.
+	# Therefore, before removing driver, use iwpriv to read the ID that the kernel allocated, save it in file.
+	mtlk_genl_family_id=`iwpriv wlan0 gGenlFamilyId | sed 's/.*gGenlFamilyId://'`
+	if [ "$mtlk_genl_family_id" != "" ]
+	then
+		echo "echo $mtlk_genl_family_id > $GENL_FAMILY_ID_FILE" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+	fi
+	echo "rmmod mtlk" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+	#TODO: add check for rmmod success.
+fi
+
+# Bring down the logger interface and remove it from the bridge
+echo "ifconfig rtlog0 down" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+# Read the bridge name for rtlog0
+bridge_name=`read_bridge_from_db rtlog0 $interface_index`
+[ -n "`brctl show | grep -w ${bridge_name}`" ] && echo "brctl delif ${bridge_name} rtlog0" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+
+# rmmod RTLogger
+echo "echo "\$script_name killall logserver / killall mtdump / rmmod mtlkroot" > /dev/console" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+if [ `lsmod | grep -c "mtlkroot"` -gt 0 ]
+then
+	echo "killall mtdump 2>/dev/null" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+	# Kill logserver
+	echo "killall logserver 2>/dev/null" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+	#TODO: add check for rmmod success.
+	# Unload driver
+	echo "rmmod mtlkroot" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+fi
+
+# Remove related soflinks and folder from /tmp/wlan_wave
+echo "cd /tmp/" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+echo "rm -rf mtlk*.ko *_scd_file.scd ${CONF_DIR}/* \`cd $IMAGES_PATH/; ls *; cd - > /dev/null\`" >> ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+cp ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER} /tmp/
+
+# Execute the runner
+chmod +x ${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+${CONF_DIR}/${FAPI_WLAN_WAVE_RUNNNER}
+# No longer in /tmp folder after exec runner? Use full path to copy runner:
+mv /tmp/${FAPI_WLAN_WAVE_RUNNNER} ${CONF_DIR}/
+
+# Configuration is completed successfully
+update_conf_out "wlan_configuration_status" "success"
+
+print2log $interface_index DEBUG "$script_name done"
+timestamp $interface_index "$script_name:done"

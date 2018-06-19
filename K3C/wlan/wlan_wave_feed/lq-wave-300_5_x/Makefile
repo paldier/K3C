@@ -59,32 +59,15 @@ PKG_BUILD_DEPENDS:=libnl3 $(DRV_RFLIB_PKG_NAME) $(PKG_BUILD_DEPENDS_EXTRA)
 PKG_DEFAULT_CUSTOM_SOURCE_DIR:=$(shell pwd)/src
 PKG_NO_AUTORECONF:=y
 
-COPY_SCRIPTS:=y
-SCRIPTS_FOLDER:=etc/rc.d
-BIN_FOLDER:=bin
-BINS_FOLDER:=root/mtlk/images
+COPY_SCRIPTS:=
+SCRIPTS_FOLDER:=opt/lantiq/wave/scripts
+BIN_FOLDER:=opt/lantiq/bin
+BINS_FOLDER:=opt/lantiq/wave/images
 IMAGES_FOLDER:=files/root/mtlk/images
-DRIVER_FOLDER:=lib/modules/$(LINUX_VERSION)/net
-SBIN_FOLDER:=sbin
+DRIVER_FOLDER:=opt/lantiq/lib/modules/$(LINUX_VERSION)/net
+SBIN_FOLDER:=opt/lantiq/sbin
 
-ifeq ($(CONFIG_PACKAGE_fapi_wlan_vendor_wave),y)
- COPY_SCRIPTS:=
- SCRIPTS_FOLDER=opt/lantiq/wave/scripts
- BIN_FOLDER:=opt/lantiq/bin
- BINS_FOLDER:=opt/lantiq/wave/images
- DRIVER_FOLDER:=opt/lantiq/lib/modules/$(LINUX_VERSION)/net
- SBIN_FOLDER:=opt/lantiq/sbin
-endif
-ifeq ($(CONFIG_FEATURE_LTQ_WAVE_300),y)
- COPY_WAVE300:=y
- WAVE_CFG_SFX:=
-endif
-ifeq ($(CONFIG_FEATURE_LTQ_WAVE_400),y)
- COPY_WAVE400:=y
- WAVE_CFG_SFX:=-vbg400
-endif
 
-FW_FOLDER:=real_phy_wrx300
 ifeq ($(CONFIG_FEATURE_LTQ_WAVE_500),y)
  FW_FOLDER:=real_phy_wrx500
  COPY_WAVE500:=y
