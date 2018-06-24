@@ -3,25 +3,52 @@
 #
 
 START=99
+STOP=10
+
+EXTRA_COMMANDS="reload_rule"
 
 SS_REDIR_PORT=7070
 SS_REDIR_PIDFILE=/var/run/ssr-redir-go.pid 
 PDNSD_LOCAL_PORT=7453
 SSRCONF=/etc/shadowsocksr.json
 CRON_FILE=/etc/crontabs/root
-CONFIG=shadowsocksr
+CONFIG=ssrpro
+KEEP_GFWLIST=Y
+vt_np_ipset="china"
+
+get_config()
+{
+	config_get_bool vt_enabled $1 enabled 0
+	config_get vt_server_addr $1 server
+	config_get vt_server_port $1 server_port
+	config_get vt_password $1 password
+	config_get vt_method $1 method
+	config_get vt_protocol $1 protocol
+	config_get vt_protoparam $1 protoparam
+	config_get vt_obfs $1 obfs
+	config_get obfs_param $1 obfs_param
+	config_get vt_proxy_mode $1 proxy_mode
+	config_get vt_timeout $1 timeout
+	config_get vt_safe_dns $1 safe_dns
+	config_get vt_timeout $1 timeout
+	config_get vt_safe_dns $1 safe_dns
+	config_get vt_safe_dns_port $1 safe_dns_port
+	config_get vt_safe_dns_tcp $1 safe_dns_tcp
+	config_get cron_mode $1 cron_mode 1
+	config_get_bool vt_more $1 more 0
+}
+
+
 
 
 # -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
-	# $covered_subnets, $local_addresses are not required
-covered_subnets=`uci get shadowsocksr.@shadowsocksr[0].covered_subnets 2>/dev/null`
-local_addresses=`uci get shadowsocksr.@shadowsocksr[0].local_addresses 2>/dev/null`
 	# Get LAN settings as default parameters
 	[ -f /lib/functions/network.sh ] && . /lib/functions/network.sh
-	[ -z "$covered_subnets" ] && network_get_subnet covered_subnets lan
-	[ -z "$local_addresses" ] && network_get_ipaddr local_addresses lan
-vt_np_ipset="china"  # Must be global variable
+	network_get_subnet covered_subnets lan
+	network_get_ipaddr local_addresses lan
+
+# -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 __gfwlist_by_mode()
 {
@@ -31,46 +58,24 @@ __gfwlist_by_mode()
 	esac
 }
 
-
-
-# -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
-
 start()
-{
-  local vt_enabled=`uci get shadowsocksr.@shadowsocksr[0].enabled 2>/dev/null`
-  local vt_server_addr=`uci get shadowsocksr.@shadowsocksr[0].server`
-  local vt_server_port=`uci get shadowsocksr.@shadowsocksr[0].server_port`
-  local vt_password=`uci get shadowsocksr.@shadowsocksr[0].password 2>/dev/null`
-  local vt_method=`uci get shadowsocksr.@shadowsocksr[0].method`
-  local vt_protocol=`uci get shadowsocksr.@shadowsocksr[0].protocol`
-  local vt_protoparam=`uci get shadowsocksr.@shadowsocksr[0].protoparam 2>/dev/null`
-  local vt_obfs=`uci get shadowsocksr.@shadowsocksr[0].obfs`
-  local vt_timeout=`uci get shadowsocksr.@shadowsocksr[0].timeout 2>/dev/null`
-  local vt_safe_dns=`uci get shadowsocksr.@shadowsocksr[0].safe_dns 2>/dev/null`
-  local vt_safe_dns_port=`uci get shadowsocksr.@shadowsocksr[0].safe_dns_port 2>/dev/null`
-  local vt_safe_dns_tcp=`uci get shadowsocksr.@shadowsocksr[0].safe_dns_tcp 2>/dev/null`
-  local vt_proxy_mode=`uci get shadowsocksr.@shadowsocksr[0].proxy_mode`
-  local obfs_param=`uci get shadowsocksr.@shadowsocksr[0].obfs_param 2>/dev/null`
-  local cron_mode=`uci get shadowsocksr.@shadowsocksr[0].cron_mode 2>/dev/null`
-  local vt_gfwlist=`__gfwlist_by_mode $vt_proxy_mode`
-
-	insmod /lib/modules/3.10.104/nfnetlink.ko
-	insmod /lib/modules/3.10.104/ip_set.ko
-	insmod /lib/modules/3.10.104/xt_set.ko
-
+{   
+  config_load ssrpro
+	config_foreach get_config ssrpro
+	
 	[ -f /etc/init.d/pdnsd ] && /etc/init.d/pdnsd disable 2>/dev/null
-
-	# -----------------------------------------------------------------
+	
 	if [ "$vt_enabled" = 0 ]; then
 		echo "WARNING: Shadowsocksr is disabled."
-		return 1
+		exit 0
 	fi
 
 	if [ -z "$vt_server_addr" -o -z "$vt_server_port" ]; then
 		echo "WARNING: Shadowsocksr not fully configured, not starting."
-		return 1
+		exit 0
 	fi
-
+	
+	local vt_gfwlist=`__gfwlist_by_mode $vt_proxy_mode`
 	[ -z "$vt_proxy_mode" ] && vt_proxy_mode=M
 	[ -z "$vt_method" ] && vt_method=table
 	[ -z "$vt_timeout" ] && vt_timeout=60
@@ -100,7 +105,14 @@ start()
     "fast_open": false
 }
 EOF
-	/usr/bin/ssr-redir -u -c $SSRCONF -f $SS_REDIR_PIDFILE || return 1
+
+	if [ "$vt_more" = 0 ]; then
+    ln -sf /usr/bin/ssr-redir /usr/sbin/ssr-redir
+	else
+    ln -sf /usr/bin/ss-redir /usr/sbin/ssr-redir
+	fi
+	
+	/usr/sbin/ssr-redir -u -c $SSRCONF -f $SS_REDIR_PIDFILE || return 1
 
 	# IPv4 firewall rules
   add_rule
@@ -137,11 +149,11 @@ EOF
 conf-dir=/var/etc/dnsmasq-go.d
 EOF
 		/etc/init.d/dnsmasq restart
-
-
 	fi
+	
 	add_cron
 }
+
 
 stop()
 {
@@ -167,23 +179,14 @@ stop()
 	del_cron
 }
 
-restart()
-{
-	KEEP_GFWLIST=Y
-	stop
-	start
-}
 
-reload()
+reload_rule()
 {
-  local vt_enabled=`uci get shadowsocksr.@shadowsocksr[0].enabled 2>/dev/null`
-  local vt_server_addr=`uci get shadowsocksr.@shadowsocksr[0].server`
-  local vt_server_port=`uci get shadowsocksr.@shadowsocksr[0].server_port`
-  local vt_safe_dns=`uci get shadowsocksr.@shadowsocksr[0].safe_dns 2>/dev/null`
-  local vt_safe_dns_port=`uci get shadowsocksr.@shadowsocksr[0].safe_dns_port 2>/dev/null`
-  local vt_safe_dns_tcp=`uci get shadowsocksr.@shadowsocksr[0].safe_dns_tcp 2>/dev/null`
-  local vt_proxy_mode=`uci get shadowsocksr.@shadowsocksr[0].proxy_mode`
-  local vt_gfwlist=`__gfwlist_by_mode $vt_proxy_mode`
+  config_load ssrpro
+	config_foreach get_config ssrpro
+	
+	local vt_gfwlist=`__gfwlist_by_mode $vt_proxy_mode`
+	
 	KEEP_GFWLIST=Y
 	del_rule
 	add_rule
@@ -192,6 +195,14 @@ reload()
     start_pdnsd
 	fi
 }
+
+restart()
+{
+	KEEP_GFWLIST=Y
+	stop
+	start
+}
+
 
 # $1: upstream DNS server
 start_pdnsd()
@@ -207,7 +218,7 @@ start_pdnsd()
 	mkdir -p /var/etc /var/pdnsd
 	if ! test -f "/var/pdnsd/pdnsd.cache"; then
     dd if=/dev/zero of="/var/pdnsd/pdnsd.cache" bs=1 count=4 2> /dev/null
-    chown -R admin.root /var/pdnsd
+    chown -R nobody.nogroup /var/pdnsd
   fi
 	
 	cat > /var/etc/pdnsd.conf <<EOF
@@ -215,7 +226,7 @@ global {
 	perm_cache=10240;
 	cache_dir="/var/pdnsd";
 	pid_file = /var/run/pdnsd.pid;
-	run_as="admin";
+	run_as="nobody";
 	server_ip = 127.0.0.1;
 	server_port = $PDNSD_LOCAL_PORT;
 	status_ctl = on;
@@ -375,8 +386,8 @@ del_rule()
 	iptables -t nat -D OUTPUT -p tcp -m multiport --dports 80,443 -m set --match-set china-banned dst -j REDIRECT --to $SS_REDIR_PORT 2>/dev/null
 	iptables -t nat -D OUTPUT -p tcp -m multiport --dports 80,443 -m set ! --match-set $vt_np_ipset dst -j REDIRECT --to $SS_REDIR_PORT 2>/dev/null
 	
-	/usr/sbin/ip rule del fwmark 0x01/0x01 table 100
-	/usr/sbin/ip route del local 0.0.0.0/0 dev lo table 100
+	/usr/bins/ip rule del fwmark 0x01/0x01 table 100
+	/usr/bins/ip route del local 0.0.0.0/0 dev lo table 100
 	if iptables -t mangle -F gameboost 2>/dev/null; then
 		while iptables -t mangle -D PREROUTING -m set --match-set gameuser src -j gameboost 2>/dev/null; do :; done
 		iptables -t mangle -X gameboost 2>/dev/null
@@ -388,3 +399,4 @@ del_rule()
 	# -----------------------------------------------------------------
 	[ "$KEEP_GFWLIST" = Y ] || ipset destroy "$vt_gfwlist" 2>/dev/null
 }
+
