@@ -120,7 +120,15 @@ kill -9 $(ps |grep hostapd |cut -c1-5)
 		;;
 	esac
     if [ "ssid2" != "ssid2t" ] || [ "sec2" != "sec2t" ] || [ "pwd2" != "pwd2t" ] || [ "reg2" != "reg2t" ] || [ "ssid5" != "ssid5t" ] || [ "sec5" != "sec5t" ] || [ "pwd5" != "pwd5t" ] || [ "reg5" != "reg5t" ]; then
-        /opt/lantiq/wave/scripts/fapi_wlan_wave_update_defaults.sh $ssid2 $ssid5 $sec2 $sec5 $pwd2 $pwd5 $ch2 $ch5 $reg2 $reg5
+        fapi_wlan_cli setSsid $ssid2 -i 0
+        fapi_wlan_cli setSsid $ssid5 -i 2 
+        fapi_wlan_cli setAuthMode $sec2 -i 0
+        fapi_wlan_cli setAuthMode $sec5 -i 2
+        fapi_wlan_cli setKeyPassphrase $pwd2 -i 0
+        fapi_wlan_cli setKeyPassphrase $pwd5 -i 2
+        #fapi_wlan_cli setKeyPassphrase $ch2 $ch5 $reg2 $reg5
+        fapi_wlan_cli setCountryCode $reg2 -i 0
+        fapi_wlan_cli setCountryCode $reg5 -i 2
     fi
 #--------- fapi_wlan_cli init . -----------
 if [ ! -n "`lsmod | grep directconnect_datapath`" ]
