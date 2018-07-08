@@ -281,6 +281,9 @@ endif
 	@echo "******* COPY_WAVE500B (y?)-> $(COPY_WAVE500B) ***********"
 
 ifeq ($(COPY_WAVE500B),y)
+	$(CP) ./$(IMAGES_FOLDER)/cal/cal_wlan0.bin $(1)/$(BINS_FOLDER)/cal_wlan0.bin
+	$(CP) ./$(IMAGES_FOLDER)/cal/cal_wlan1.bin $(1)/$(BINS_FOLDER)/cal_wlan1.bin
+	$(CP) ./$(IMAGES_FOLDER)/cal/cal_wlan2.bin $(1)/$(BINS_FOLDER)/cal_wlan2.bin
  ifeq ($(wildcard ./$(IMAGES_FOLDER)/progmodels/bin_files.list.mod),)
 	$(CP) ./$(IMAGES_FOLDER)/progmodels/wave500/CHIP/* $(1)/$(BINS_FOLDER)/
 	$(CP) ./$(IMAGES_FOLDER)/progmodels/wave500b/FPGA/* $(1)/$(BINS_FOLDER)/
