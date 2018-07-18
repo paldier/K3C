@@ -53,7 +53,7 @@ function m.parse(map)
 
 		nw:commit("wireless")
 		luci.sys.call("(env -i /bin/ubus call network reload) >/dev/null 2>/dev/null")
-		os.execute("/etc/init.d/wifi_start.sh restart ")
+		--os.execute("/etc/init.d/wifi_start.sh restart ")
 		luci.http.redirect(luci.dispatcher.build_url("admin/network/wireless", arg[1]))
 		return
 	end
