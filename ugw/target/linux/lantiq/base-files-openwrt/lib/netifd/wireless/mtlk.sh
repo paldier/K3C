@@ -1,12 +1,22 @@
 #!/bin/sh
 #
-# Copyright (c) 2018 zhaowei xu <paldier@hotmail.com>
+# Copyright (c) 2018 paldier <paldier@hotmail.com>
+# lantiq 5xx 无线驱动netifd脚本
 
 . /lib/netifd/netifd-wireless.sh
 . /lib/netifd/hostapd.sh
 
 init_wireless_driver "$@"
 
+MP_CONFIG_INT="mesh_retry_timeout mesh_confirm_timeout mesh_holding_timeout mesh_max_peer_links
+	       mesh_max_retries mesh_ttl mesh_element_ttl mesh_hwmp_max_preq_retries
+	       mesh_path_refresh_time mesh_min_discovery_timeout mesh_hwmp_active_path_timeout
+	       mesh_hwmp_preq_min_interval mesh_hwmp_net_diameter_traversal_time mesh_hwmp_rootmode
+	       mesh_hwmp_rann_interval mesh_gate_announcements mesh_sync_offset_max_neighor
+	       mesh_rssi_threshold mesh_hwmp_active_path_to_root_timeout mesh_hwmp_root_interval
+	       mesh_hwmp_confirmation_interval mesh_awake_window mesh_plink_timeout"
+MP_CONFIG_BOOL="mesh_auto_open_plinks mesh_fwding"
+MP_CONFIG_STRING="mesh_power_mode"
 
 drv_mtlk_init_device_config() {
 	hostapd_common_add_device_config
@@ -15,8 +25,9 @@ drv_mtlk_init_device_config() {
 	config_add_string hwmode
 	config_add_int beacon_int chanbw frag rts
 	config_add_int rxantenna txantenna antenna_gain txpower distance
-	config_add_boolean noscan ht_coex
+	config_add_boolean noscan
 	config_add_array ht_capab
+	config_add_array channels
 	config_add_boolean \
 		rxldpc \
 		short_gi_80 \
@@ -51,6 +62,11 @@ drv_mtlk_init_iface_config() {
 	config_add_int dtim_period
 	config_add_int start_disabled
 
+	# mesh
+	config_add_string mesh_id
+	config_add_int $MP_CONFIG_INT
+	config_add_boolean $MP_CONFIG_BOOL
+	config_add_string $MP_CONFIG_STRING
 }
 
 mtlk_add_capabilities() {
@@ -77,9 +93,11 @@ mtlk_hostapd_setup_base() {
 
 	json_select config
 
-	[ "$auto_channel" -gt 0 ] && channel=acs_survey
+	#[ "$auto_channel" -gt 0 ] && channel=acs_survey
+	[ "$auto_channel" -gt 0 ] && channel=0
+	[ "$auto_channel" -gt 0 ] && json_get_values channel_list channels
 
-	json_get_vars noscan ht_coex
+	json_get_vars noscan
 	json_get_values ht_capab_list ht_capab
 
 	ieee80211n=1
@@ -115,9 +133,6 @@ mtlk_hostapd_setup_base() {
 
 	[ -n "$ieee80211n" ] && {
 		append base_cfg "ieee80211n=1" "$N"
-
-		set_default ht_coex 0
-		append base_cfg "ht_coex=$ht_coex" "$N"
 
 		json_get_vars \
 			ldpc:1 \
@@ -207,7 +222,6 @@ mtlk_hostapd_setup_base() {
 			vht_max_a_mpdu_len_exp:7 \
 			vht_max_mpdu:11454 \
 			rx_stbc:4 \
-			tx_stbc:4 \
 			vht_link_adapt:3 \
 			vht160:2
 
@@ -219,13 +233,13 @@ mtlk_hostapd_setup_base() {
 
 		cap_rx_stbc=$((($vht_cap >> 8) & 7))
 		[ "$rx_stbc" -lt "$cap_rx_stbc" ] && cap_rx_stbc="$rx_stbc"
-		ht_cap_mask="$(( ($vht_cap & ~(0x700)) | ($cap_rx_stbc << 8) ))"
+		vht_cap="$(( ($vht_cap & ~(0x700)) | ($cap_rx_stbc << 8) ))"
 
 		mtlk_add_capabilities vht_capab $vht_cap \
 			RXLDPC:0x10::$rxldpc \
 			SHORT-GI-80:0x20::$short_gi_80 \
 			SHORT-GI-160:0x40::$short_gi_160 \
-			TX-STBC-2BY1:0x80::$tx_stbc \
+			TX-STBC-2BY1:0x80::$tx_stbc_2by1 \
 			SU-BEAMFORMER:0x800::$su_beamformer \
 			SU-BEAMFORMEE:0x1000::$su_beamformee \
 			MU-BEAMFORMER:0x80000::$mu_beamformer \
@@ -234,10 +248,10 @@ mtlk_hostapd_setup_base() {
 			HTC-VHT:0x400000::$htc_vht \
 			RX-ANTENNA-PATTERN:0x10000000::$rx_antenna_pattern \
 			TX-ANTENNA-PATTERN:0x20000000::$tx_antenna_pattern \
-			RX-STBC1:0x700:0x100:1 \
-			RX-STBC12:0x700:0x200:1 \
-			RX-STBC123:0x700:0x300:1 \
-			RX-STBC1234:0x700:0x400:1 \
+			RX-STBC-1:0x700:0x100:1 \
+			RX-STBC-12:0x700:0x200:1 \
+			RX-STBC-123:0x700:0x300:1 \
+			RX-STBC-1234:0x700:0x400:1 \
 
 		# supported Channel widths
 		vht160_hw=0
@@ -290,6 +304,7 @@ mtlk_hostapd_setup_base() {
 	hostapd_prepare_device_config "$hostapd_conf_file" nl80211
 	cat >> "$hostapd_conf_file" <<EOF
 ${channel:+channel=$channel}
+${channel_list:+chanlist=$channel_list}
 ${noscan:+noscan=$noscan}
 $base_cfg
 
@@ -323,13 +338,20 @@ ${max_listen_int:+max_listen_interval=$max_listen_int}
 EOF
 }
 
+mtlk_get_addr() {
+	local phy="$1"
+	local idx="$(($2 + 1))"
+
+	head -n $(($macidx + 1)) /sys/class/ieee80211/${phy}/addresses | tail -n1
+}
+
 
 mtlk_generate_mac() {
-    phyx= $1
-	[ "$phyx" = "0" ] && phy_offset=0
-	[ "$phyx" = "1" ] && phy_offset=2
-	[ "$phyx" = "2" ] && phy_offset=4
-	[ "$phyx" = "3" ] && phy_offset=6
+    phyx=$1
+	[ "$phyx" = "wlan0" ] && phy_offset=0
+	[ "$phyx" = "wlan1" ] && phy_offset=2
+	[ "$phyx" = "wlan2" ] && phy_offset=4
+	[ "$phyx" = "wlan3" ] && phy_offset=6
     board_mac=`upgrade mac_get 0`
 
 	board_mac1=0x`echo $board_mac | cut -c 1-2`
@@ -337,7 +359,6 @@ mtlk_generate_mac() {
 	board_mac46=0x`echo $board_mac | sed s/://g | cut -c 7-12`
 
 	board_mac46=$((board_mac46+phy_offset))
-    board_mac46=$((board_mac46+$phyx))
 	vap_mac4=$((board_mac46/65536))
 	board_mac46=$((board_mac46-vap_mac4*65536))
 	vap_mac5=$((board_mac46/256))
@@ -349,18 +370,18 @@ mtlk_generate_mac() {
 }
 
 find_phy() {
+        phyname="$1"
 	[ -n "$phy" -a -d /sys/class/ieee80211/$phy ] && return 0
 	[ -n "$path" ] && {
-		for phy in /sys/devices/$path/ieee80211/phy*; do
-			[ -e "$phy" ] && {
-				phy="${phy##*/}"
-				return 0
-			}
+		for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
+			case "$(readlink -f /sys/class/ieee80211/$phy/device)" in
+				*$path) return 0;;
+			esac
 		done
 	}
-	[ -n "$macaddr" ] && {
-		for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
-			grep -i -q "$macaddr" "/sys/class/ieee80211/${phy}/macaddress" && return 0
+	[ -n "$phyname" ] && {
+		for phy in $(ls /sys/class/net/$phyname/device/ieee80211 2>/dev/null); do
+			[ "$phy" == "phy0" -o "$phy" == "phy2" ] && return 0
 		done
 	}
 	return 1
@@ -414,6 +435,9 @@ mtlk_prepare_vif() {
 				hostapd_ctrl="${hostapd_ctrl:-/var/run/hostapd/$ifname}"
 			}
 		;;
+		mesh)
+			iw phy "$phy" interface add "$ifname" type mp
+		;;
 		monitor)
 			iw phy "$phy" interface add "$ifname" type monitor
 		;;
@@ -428,7 +452,7 @@ mtlk_prepare_vif() {
 	esac
 
 	case "$mode" in
-		monitor)
+		monitor|mesh)
 			[ "$auto_channel" -gt 0 ] || iw dev "$ifname" set channel "$channel" $htmode
 		;;
 	esac
@@ -438,7 +462,7 @@ mtlk_prepare_vif() {
 		# All interfaces must have unique mac addresses
 		# which can either be explicitly set in the device
 		# section, or automatically generated
-		ifconfig "$ifname" hw ether "$macaddr"
+		ip link set dev "$ifname" address "$macaddr"
 	fi
 
 	json_select ..
@@ -453,7 +477,7 @@ mtlk_setup_supplicant() {
 mtlk_setup_adhoc_htmode() {
 	case "$htmode" in
 		VHT20|HT20) ibss_htmode=HT20;;
-		HT40*|VHT40|VHT80|VHT160)
+		HT40*|VHT40|VHT160)
 			case "$hwmode" in
 				a)
 					case "$(( ($channel / 4) % 2 ))" in
@@ -476,6 +500,12 @@ mtlk_setup_adhoc_htmode() {
 				;;
 			esac
 			[ "$auto_channel" -gt 0 ] && ibss_htmode="HT40+"
+		;;
+		VHT80)
+			ibss_htmode="80MHZ"
+		;;
+		NONE|NOHT)
+			ibss_htmode="NOHT"
 		;;
 		*) ibss_htmode="" ;;
 	esac
@@ -534,7 +564,7 @@ mtlk_setup_vif() {
 	json_get_vars mode
 	json_get_var vif_txpower txpower
 
-	ifconfig "$ifname" up || {
+	ip link set dev "$ifname" up || {
 		wireless_setup_vif_failed IFUP_ERROR
 		json_select ..
 		return
@@ -544,6 +574,31 @@ mtlk_setup_vif() {
 	[ -z "$vif_txpower" ] || iw dev "$ifname" set txpower fixed "${vif_txpower%%.*}00"
 
 	case "$mode" in
+		mesh)
+			# authsae or wpa_supplicant
+			json_get_vars key
+			if [ -n "$key" ]; then
+				if [ -e "/lib/wifi/authsae.sh" ]; then
+					. /lib/wifi/authsae.sh
+					authsae_start_interface || failed=1
+				else
+					wireless_vif_parse_encryption
+					mac80211_setup_supplicant || failed=1
+				fi
+			else
+				json_get_vars mesh_id mcast_rate
+
+				mcval=
+				[ -n "$mcast_rate" ] && wpa_supplicant_add_rate mcval "$mcast_rate"
+
+				iw dev "$ifname" mesh join "$mesh_id" ${mcval:+mcast-rate $mcval}
+			fi
+
+			for var in $MP_CONFIG_INT $MP_CONFIG_BOOL $MP_CONFIG_STRING; do
+				json_get_var mp_val "$var"
+				[ -n "$mp_val" ] && iw dev "$ifname" set mesh_param "$var" "$mp_val"
+			done
+		;;
 		adhoc)
 			wireless_vif_parse_encryption
 			mtlk_setup_adhoc_htmode
@@ -591,15 +646,14 @@ drv_mtlk_setup() {
 		frag rts beacon_int htmode
 	json_get_values basic_rate_list basic_rate
 	json_select ..
-
-	find_phy || {
+#waiting for wlan0 wlan2 up
+	sleep 4
+	find_phy "$1" || {
 		echo "Could not find PHY for device '$1'"
 		wireless_set_retry 0
 		return 1
 	}
-
 	wireless_set_data phy="$phy"
-	mtlk_interface_cleanup "$phy"
 
 	# convert channel to frequency
 	[ "$auto_channel" -gt 0 ] || freq="$(get_freq "$phy" "$channel")"
@@ -646,16 +700,16 @@ drv_mtlk_setup() {
 	for_each_interface "ap" mtlk_prepare_vif
 
 	[ -n "$hostapd_ctrl" ] && {
-		/usr/sbin/hostapd -P /var/run/wifi-$phy.pid -B "$hostapd_conf_file"
+		/opt/lantiq/bin/hostapd -P /var/run/wifi-$phy.pid -B "$hostapd_conf_file"
 		ret="$?"
-		wireless_add_process "$(cat /var/run/wifi-$phy.pid)" "/usr/sbin/hostapd" 1
+		wireless_add_process "$(cat /var/run/wifi-$phy.pid)" "/opt/lantiq/bin/hostapd" 1
 		[ "$ret" != 0 ] && {
 			wireless_setup_failed HOSTAPD_START_FAILED
 			return
 		}
 	}
 
-	for_each_interface "ap sta adhoc monitor" mtlk_setup_vif
+	for_each_interface "ap sta adhoc mesh monitor" mtlk_setup_vif
 
 	wireless_set_up
 }

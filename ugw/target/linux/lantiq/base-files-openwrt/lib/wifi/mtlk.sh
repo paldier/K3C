@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Copyright (c) 2018 zhaowei xu <paldier@hotmail.com>
+# Copyright (c) 2018 paldier <paldier@hotmail.com>
 # lantiq 5xx 无线驱动detect脚本
 
 append DRIVERS "mtlk"
@@ -64,12 +64,9 @@ detect_mtlk() {
 			${dev_id}
 			set wireless.${phyname}.hwmode=$hwmode
 			set wireless.${phyname}.channel=auto
-			set wireless.${phyname}.txpower=100
 			set wireless.${phyname}.htmode=$htmode
-			set wireless.${phyname}.country=CN
-			set wireless.${phyname}.txburst=1
-			set wireless.${phyname}.noscan=1
-
+			set wireless.${phyname}.disabled=0
+			
 			set wireless.default_${phyname}=wifi-iface
 			set wireless.default_${phyname}.device=${phyname}
 			set wireless.default_${phyname}.network=lan

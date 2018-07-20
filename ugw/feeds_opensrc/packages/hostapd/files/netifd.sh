@@ -726,7 +726,7 @@ wpa_supplicant_run() {
 
 	_wpa_supplicant_common "$ifname"
 
-	/usr/sbin/wpa_supplicant -B \
+	/opt/lantiq/bin/wpa_supplicant -B \
 		${network_bridge:+-b $network_bridge} \
 		-P "/var/run/wpa_supplicant-${ifname}.pid" \
 		-D ${_w_driver:-wext} \
@@ -736,7 +736,7 @@ wpa_supplicant_run() {
 		"$@"
 
 	ret="$?"
-	wireless_add_process "$(cat "/var/run/wpa_supplicant-${ifname}.pid")" /usr/sbin/wpa_supplicant 1
+	wireless_add_process "$(cat "/var/run/wpa_supplicant-${ifname}.pid")" /opt/lantiq/bin/wpa_supplicant 1
 
 	[ "$ret" != 0 ] && wireless_setup_vif_failed WPA_SUPPLICANT_FAILED
 

@@ -33,6 +33,7 @@ udevd_up=`ps | grep -c udevd`
 [ $udevd_up -gt 1 ] || udevd --daemon
 export COUNTRY=00
 crda
+mkdir /tmp/wlan_wave
 touch /tmp/wlan_wave/crda_executed
 insmod mtlkroot.ko cdebug=0 rdebug=0
 cp -s /opt/lantiq/bin/logserver /tmp/
