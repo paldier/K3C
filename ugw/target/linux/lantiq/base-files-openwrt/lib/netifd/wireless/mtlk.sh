@@ -167,6 +167,9 @@ mtlk_hostapd_setup_base() {
 
 		ht_capab="$ht_capab$ht_capab_flags"
 		[ -n "$ht_capab" ] && append base_cfg "ht_capab=$ht_capab" "$N"
+#Beamforming?
+		append base_cfg "ht_tx_bf_capab=[IMPL-TXBF-RX][EXPL-COMPR-STEER][EXPL-COMPR-FB-FBACK-IMM][MIN-GROUP-124][CSI-BF-ANT-1][NONCOMPS-BF-ANT-1][COMPS-BF-ANT-3][CSI-MAX-ROWS-BF-1][CHE-SPACE-TIME-STR-1][TX-NDP][RX-NDP]" "$N"
+
 	}
 
 	# 802.11ac
@@ -300,6 +303,21 @@ mtlk_hostapd_setup_base() {
 
 		[ -n "$vht_capab" ] && append base_cfg "vht_capab=$vht_capab" "$N"
 	fi
+#lantiq 5xx
+	append base_cfg "ap_max_num_sta=128" "$N"
+	append base_cfg "acs_num_scans=1" "$N"
+	append base_cfg "obss_interval=0" "$N"
+	append base_cfg "acs_numbss_info_file=/tmp/wlan_wave/acs_numbss_info_wlan2.txt" "$N"
+	append base_cfg "acs_smart_info_file=/tmp/wlan_wave/acs_smart_info_wlan2.txt" "$N"
+	append base_cfg "acs_history_file=/tmp/wlan_wave/acs_history_wlan2.txt" "$N"
+	append base_cfg "assoc_rsp_rx_mcs_mask=1" "$N"
+	append base_cfg "ignore_40_mhz_intolerant=0" "$N"
+	append base_cfg "acs_vht_dynamic_bw=0" "$N"
+	append base_cfg "acs_policy=0" "$N"
+	append base_cfg "acs_penalty_factors=1 0 0 0 1 0 1 0 1 1 0" "$N"
+	append base_cfg "acs_fallback_chan=36 40 40" "$N"
+	append base_cfg "ht_rifs=1" "$N"
+	append base_cfg "vendor_vht=0" "$N"
 
 	hostapd_prepare_device_config "$hostapd_conf_file" nl80211
 	cat >> "$hostapd_conf_file" <<EOF

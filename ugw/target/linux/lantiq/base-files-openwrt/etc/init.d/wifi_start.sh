@@ -1,6 +1,6 @@
 #!/bin/sh /etc/rc.common
 
-# Copyright (c) 2018 zhaowei xu <paldier@hotmail.com>
+# Copyright (c) 2018 paldier <paldier@hotmail.com>
 
 START=21
 

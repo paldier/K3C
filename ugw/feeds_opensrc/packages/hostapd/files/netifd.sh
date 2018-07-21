@@ -189,8 +189,8 @@ hostapd_set_bss_options() {
 		iapp_interface eapol_version acct_server acct_secret acct_port
 
 	set_default isolate 0
-	set_default maxassoc 0
-	set_default max_inactivity 0
+	set_default maxassoc 128
+	set_default max_inactivity 60
 	set_default short_preamble 1
 	set_default disassoc_low_ack 1
 	set_default hidden 0
@@ -198,6 +198,8 @@ hostapd_set_bss_options() {
 	set_default uapsd 1
 	set_default eapol_version 0
 	set_default acct_port 1813
+	set_default wpa_group_rekey 3600
+	set_default wpa_gmk_rekey 3600
 
 	append bss_conf "ctrl_interface=/var/run/hostapd"
 	if [ "$isolate" -gt 0 ]; then
@@ -209,6 +211,13 @@ hostapd_set_bss_options() {
 	if [ "$max_inactivity" -gt 0 ]; then
 		append bss_conf "ap_max_inactivity=$max_inactivity" "$N"
 	fi
+#lantiq 5xx
+	append bss_conf "dtim_period=2" "$N"
+	append bss_conf "num_res_sta=0" "$N"
+	append bss_conf "opmode_notif=1" "$N"
+	append bss_conf "qos_map_set=0,7,8,15,16,23,24,31,32,39,40,47,48,55,56,63" "$N"
+	append bss_conf "proxy_arp=1" "$N"
+	append bss_conf "gas_comeback_delay=0" "$N"
 
 	append bss_conf "disassoc_low_ack=$disassoc_low_ack" "$N"
 	append bss_conf "preamble=$short_preamble" "$N"

@@ -40,13 +40,13 @@ detect_mtlk() {
 		config_get type $phyname type
 		[ "$type" == "mtlk" ] || {
 			case $phyname in
-				wlan0)
+				wlan2)
 					hwmode=11g
-					htmode=HT40
+					htmode=HT40+
 					macaddr="$(find_mtlk_mac $phyname)"
 					ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
 					;;
-				wlan2)
+				wlan0)
 					hwmode=11a
 					htmode=VHT80
 					macaddr="$(find_mtlk_mac $phyname)"
@@ -65,6 +65,8 @@ detect_mtlk() {
 			set wireless.${phyname}.hwmode=$hwmode
 			set wireless.${phyname}.channel=auto
 			set wireless.${phyname}.htmode=$htmode
+			set wireless.${phyname}.country=CN
+			set wireless.${phyname}.beacon_int=100
 			set wireless.${phyname}.disabled=0
 			
 			set wireless.default_${phyname}=wifi-iface
