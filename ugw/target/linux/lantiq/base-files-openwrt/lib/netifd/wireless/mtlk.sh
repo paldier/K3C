@@ -366,10 +366,12 @@ mtlk_get_addr() {
 
 mtlk_generate_mac() {
     phyx=$1
+	local id="${macidx:-0}"
 	[ "$phyx" = "wlan0" ] && phy_offset=0
 	[ "$phyx" = "wlan1" ] && phy_offset=2
 	[ "$phyx" = "wlan2" ] && phy_offset=4
 	[ "$phyx" = "wlan3" ] && phy_offset=6
+	macidx=$(($id + 1))
     board_mac=`upgrade mac_get 0`
 
 	board_mac1=0x`echo $board_mac | cut -c 1-2`

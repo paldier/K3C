@@ -3,6 +3,5 @@
 #
 
 rm -rf /overlay/*
-
-sync
+sync; sleep 2;
 reboot

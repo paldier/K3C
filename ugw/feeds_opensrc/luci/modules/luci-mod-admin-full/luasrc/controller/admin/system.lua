@@ -171,7 +171,7 @@ function action_flashops()
 	local fs  = require "nixio.fs"
 
 	local upgrade_avail = fs.access("/lib/upgrade/platform.sh")
-	local reset_avail   = os.execute([[grep -E '"rootfs_data"|"ubi"' /proc/mtd >/dev/null 2>&1]]) == 0
+	local reset_avail   = os.execute([[grep -E '"data_vol"|"ubi"' /proc/mtd >/dev/null 2>&1]]) == 0
 
 	local restore_cmd = "tar -xzC/ >/dev/null 2>&1"
 	local backup_cmd  = "sysupgrade --create-backup - 2>/dev/null"
