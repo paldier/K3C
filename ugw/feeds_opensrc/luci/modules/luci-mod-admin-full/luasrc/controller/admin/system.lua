@@ -287,7 +287,7 @@ function action_flashops()
 			msg   = luci.i18n.translate("The system is erasing the configuration partition now and will reboot itself when finished."),
 			addr  = "192.168.1.1"
 		})
-		fork_exec("sleep 1; killall dropbear uhttpd; sleep 1; jffs2reset -y && reboot")
+		fork_exec("sleep 1; killall dropbear uhttpd; sleep 1; rm -rf /overlay/*; sync; sleep 1; reboot")
 	else
 		--
 		-- Overview

@@ -315,6 +315,10 @@ user_add() {
 	return $rc
 }
 
+board_name() {
+	[ -e /tmp/sysinfo/board_name ] && cat /tmp/sysinfo/board_name || echo "generic"
+}
+
 user_exists() {
 	grep -qs "^${1}:" ${IPKG_INSTROOT}/etc/passwd
 }
