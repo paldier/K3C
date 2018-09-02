@@ -14,7 +14,7 @@ PKG_VERSION:=2016-10-08
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=http://mirror2.openwrt.org/sources
 PKG_BACKPORT_VERSION:=
-PKG_MD5SUM:=c68cb39daff750f464c271c162ccc225
+PKG_MD5SUM:=67f4d51f8a26989018d430f084877712
 
 PKG_SOURCE:=compat-wireless-$(PKG_VERSION)$(PKG_BACKPORT_VERSION).tar.bz2
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/compat-wireless-$(PKG_VERSION)
@@ -1734,8 +1734,8 @@ endef
 
 define KernelPackage/cfg80211/install
 	$(INSTALL_DIR) $(1)/lib/wifi $(1)/lib/netifd/wireless
-	$(INSTALL_DATA) ./files/lib/wifi/mac80211.sh $(1)/lib/wifi
-	$(INSTALL_BIN) ./files/lib/netifd/wireless/mac80211.sh $(1)/lib/netifd/wireless
+	#$(INSTALL_DATA) ./files/lib/wifi/mac80211.sh $(1)/lib/wifi
+	#$(INSTALL_BIN) ./files/lib/netifd/wireless/mac80211.sh $(1)/lib/netifd/wireless
 endef
 
 define KernelPackage/ipw2100/install

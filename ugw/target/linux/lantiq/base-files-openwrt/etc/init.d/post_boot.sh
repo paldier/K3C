@@ -3,7 +3,6 @@
 START=99
 
 . /lib/functions/common_utils.sh
-. /lib/functions/dsl_fapi.sh
 
 # After a sysupgrade with fullimage, mark current bank as active bank in case of a dual bank image.
 sysupgrade_dualbank_update()
@@ -28,13 +27,6 @@ sysupgrade_dualbank_update()
 	}
 }
 
-## Post initialization part
-post_init()
-{
-	dsl_fapi "start"
-}
-
 start() {
-	post_init
 	sysupgrade_dualbank_update
 }

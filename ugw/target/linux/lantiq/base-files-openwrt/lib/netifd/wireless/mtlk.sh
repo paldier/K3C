@@ -451,7 +451,7 @@ mtlk_prepare_vif() {
 			mtlk_hostapd_setup_bss "$phy" "$ifname" "$macaddr" "$type" || return
 
 			[ -n "$hostapd_ctrl" ] || {
-				iw phy "$phy" interface add "$ifname" type __ap
+				#iw phy "$phy" interface add "$ifname" type __ap
 				hostapd_ctrl="${hostapd_ctrl:-/var/run/hostapd/$ifname}"
 			}
 		;;
@@ -648,7 +648,7 @@ mtlk_interface_cleanup() {
 
 	for wdev in $(list_phy_interfaces "$phy"); do
 		ifconfig "$wdev" down 2>/dev/null
-		iw dev "$wdev" del
+		#iw dev "$wdev" del
 	done
 }
 
