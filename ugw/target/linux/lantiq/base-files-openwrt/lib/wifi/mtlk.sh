@@ -32,31 +32,134 @@ find_mtlk_mac() {
     echo "$mac_address"
 }
 
+lookup_phy() {
+	[ -n "$phy" ] && {
+		[ -d /sys/class/ieee80211/$phy ] && return
+	}
+
+	local devpath
+	config_get devpath "$device" path
+	[ -n "$devpath" ] && {
+		for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
+			case "$(readlink -f /sys/class/ieee80211/$phy/device)" in
+				*$devpath) return;;
+			esac
+		done
+	}
+
+	local device="$(config_get "$device" device)"
+	[ -n "$device" ] && {
+		for _phy in /sys/class/ieee80211/*; do
+			[ -e "$_phy" ] || continue
+
+			[ "$device" = "wlan0" ] && phy="phy0" && return
+			[ "$device" = "wlan1" ] && phy="phy1" && return
+			[ "$device" = "wlan2" ] && phy="phy2" && return
+			[ "$device" = "wlan3" ] && phy="phy3" && return
+			
+		done
+	}
+	phy=
+	return
+}
+
+find_mtlk_phy() {
+	local device="$1"
+
+	config_get phy "$device" phy
+	lookup_phy
+	[ -n "$phy" -a -d "/sys/class/ieee80211/$phy" ] || {
+		echo "PHY for wifi device $1 not found"
+		return 1
+	}
+	config_set "$device" phy "$phy"
+
+	return 0
+}
+
+check_mtlk_device() {
+	config_get phy "$1" phy
+	[ -z "$phy" ] && {
+		find_mtlk_phy "$1" >/dev/null || return 0
+		config_get phy "$1" phy
+	}
+}
+
 detect_mtlk() {
 	local macaddr
 
 	for phyname in wlan0 wlan2; do
 	{
+
 		config_get type $phyname type
 		[ "$type" == "mtlk" ] || {
+
+			mode=ap
 			case $phyname in
-				wlan2)
-					hwmode=11g
-					htmode=HT40+
-					macaddr="$(find_mtlk_mac $phyname)"
-					ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
-					;;
 				wlan0)
-					hwmode=11a
-					htmode=VHT80
-					macaddr="$(find_mtlk_mac $phyname)"
-					ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+					[ "$(lantiq_board_name)" == "BlueCave" ] && {
+						hwmode=11g
+						htmode=HT40+
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="OpenWrt-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+					}
+					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						hwmode=11a
+						htmode=VHT80
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+					}
+					;;
+				wlan2)
+					[ "$(lantiq_board_name)" == "BlueCave" ] && {
+						hwmode=11a
+						htmode=VHT80
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="OpenWrt-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+					}
+					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						hwmode=11g
+						htmode=HT40+
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+					}
+					;;
+#how to fix?
+				wlan1)
+					[ "$(lantiq_board_name)" == "BlueCave" ] && {
+						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="OpenWrt-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						mode=client
+					}
+					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						mode=client
+					}
+					;;
+				wlan3)
+					[ "$(lantiq_board_name)" == "BlueCave" ] && {
+						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="OpenWrt-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						mode=client
+					}
+					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-$band-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						mode=client
+					}
 					;;
 			esac
-			
+
 		[ -n "$macaddr" ] && {
 			dev_id="set wireless.${phyname}.macaddr=${macaddr}"
 		}
+		config_foreach check_mtlk_device wifi-device
+
 		[ ! -e /etc/config/wireless ] && touch /etc/config/wireless
 		uci -q batch <<EOF
 			set wireless.${phyname}=wifi-device
@@ -72,7 +175,7 @@ detect_mtlk() {
 			set wireless.default_${phyname}=wifi-iface
 			set wireless.default_${phyname}.device=${phyname}
 			set wireless.default_${phyname}.network=lan
-			set wireless.default_${phyname}.mode=ap
+			set wireless.default_${phyname}.mode=$mode
 			set wireless.default_${phyname}.ssid=${ssid}
 			set wireless.default_${phyname}.encryption=none
 EOF

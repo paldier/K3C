@@ -104,7 +104,7 @@ mtlk_hostapd_setup_base() {
 	ht_capab=
 	case "$htmode" in
 		VHT20|HT20) ;;
-		HT40*|VHT40|VHT80|VHT160)
+		HT40|HT40*|VHT40|VHT80|VHT160)
 			case "$hwmode" in
 				a)
 					case "$(( ($channel / 4) % 2 ))" in
@@ -315,9 +315,13 @@ mtlk_hostapd_setup_base() {
 	append base_cfg "acs_vht_dynamic_bw=0" "$N"
 	append base_cfg "acs_policy=0" "$N"
 	append base_cfg "acs_penalty_factors=1 0 0 0 1 0 1 0 1 1 0" "$N"
+	if [ "$enable_ac" != "0" ]; then
 	append base_cfg "acs_fallback_chan=36 40 40" "$N"
+	else
+	append base_cfg "acs_fallback_chan=1 5 40" "$N"
+	fi
 	append base_cfg "ht_rifs=1" "$N"
-	append base_cfg "vendor_vht=0" "$N"
+	append base_cfg "vendor_vht=1" "$N"
 
 	hostapd_prepare_device_config "$hostapd_conf_file" nl80211
 	cat >> "$hostapd_conf_file" <<EOF
@@ -354,13 +358,6 @@ bssid=$macaddr
 ${dtim_period:+dtim_period=$dtim_period}
 ${max_listen_int:+max_listen_interval=$max_listen_int}
 EOF
-}
-
-mtlk_get_addr() {
-	local phy="$1"
-	local idx="$(($2 + 1))"
-
-	head -n $(($macidx + 1)) /sys/class/ieee80211/${phy}/addresses | tail -n1
 }
 
 
@@ -401,7 +398,10 @@ find_phy() {
 	}
 	[ -n "$phyname" ] && {
 		for phy in $(ls /sys/class/net/$phyname/device/ieee80211 2>/dev/null); do
-			[ "$phy" == "phy0" -o "$phy" == "phy2" ] && return 0
+			[ "$phyname" = "wlan0" ] && phy="phy0" && return 0
+			[ "$phyname" = "wlan1" ] && phy="phy1" && return 0
+			[ "$phyname" = "wlan2" ] && phy="phy2" && return 0
+			[ "$phyname" = "wlan3" ] && phy="phy3" && return 0
 		done
 	}
 	return 1
@@ -425,7 +425,7 @@ mtlk_prepare_vif() {
 	json_select ..
 
 	[ -n "$macaddr" ] || {
-		macaddr="$(mtlk_generate_mac $phy)"
+		macaddr="$(mtlk_generate_mac $ifname)"
 		macidx="$(($macidx + 1))"
 	}
 
@@ -437,7 +437,7 @@ mtlk_prepare_vif() {
 	# It is far easier to delete and create the desired interface
 	case "$mode" in
 		adhoc)
-			iw phy "$phy" interface add "$ifname" type adhoc
+			#iw phy "$phy" interface add "$ifname" type adhoc
 		;;
 		ap)
 			# Hostapd will handle recreating the interface and
@@ -456,16 +456,18 @@ mtlk_prepare_vif() {
 			}
 		;;
 		mesh)
-			iw phy "$phy" interface add "$ifname" type mp
+			#iw phy "$phy" interface add "$ifname" type mp
 		;;
 		monitor)
-			iw phy "$phy" interface add "$ifname" type monitor
+			#iw phy "$phy" interface add "$ifname" type monitor
 		;;
 		sta)
 			local wdsflag=
 			staidx="$(($staidx + 1))"
 			[ "$wds" -gt 0 ] && wdsflag="4addr on"
-			iw phy "$phy" interface add "$ifname" type managed $wdsflag
+			#iw phy "$phy" interface add "$ifname" type managed $wdsflag
+			[ "$ifname" = "wlan0" ] && ifname="wlan1"
+			[ "$ifname" = "wlan2" ] && ifname="wlan3"
 			[ "$powersave" -gt 0 ] && powersave="on" || powersave="off"
 			iw "$ifname" set power_save "$powersave"
 		;;
@@ -489,6 +491,8 @@ mtlk_prepare_vif() {
 }
 
 mtlk_setup_supplicant() {
+	[ "$ifname" = "wlan0" ] && ifname="wlan1"
+	[ "$ifname" = "wlan2" ] && ifname="wlan3"
 	wpa_supplicant_prepare_interface "$ifname" nl80211 || return 1
 	wpa_supplicant_add_network "$ifname"
 	wpa_supplicant_run "$ifname" ${hostapd_ctrl:+-H $hostapd_ctrl}
@@ -534,7 +538,8 @@ mtlk_setup_adhoc_htmode() {
 
 mtlk_setup_adhoc() {
 	json_get_vars bssid ssid key mcast_rate
-
+	[ "$ifname" = "wlan0" ] && ifname="wlan1"
+	[ "$ifname" = "wlan2" ] && ifname="wlan3"
 	keyspec=
 	[ "$auth_type" = "wep" ] && {
 		set_default key 1
@@ -603,7 +608,7 @@ mtlk_setup_vif() {
 					authsae_start_interface || failed=1
 				else
 					wireless_vif_parse_encryption
-					mac80211_setup_supplicant || failed=1
+					mtlk_setup_supplicant || failed=1
 				fi
 			else
 				json_get_vars mesh_id mcast_rate
