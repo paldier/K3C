@@ -55,12 +55,14 @@ e.datatype = "ip4addr"
 e:depends("type","udp")
 e:depends("type","http")
 e:depends("type","https")
+e:depends("type","tcp")
 e:depends("enable_plugin",0)
 e = t:taboption("base",Value, "local_port", translate("Local Host Port"))
 e.datatype = "port"
 e:depends("type","udp")
 e:depends("type","http")
 e:depends("type","https")
+e:depends("type","tcp")
 e:depends("enable_plugin",0)
 e = t:taboption("base",Value, "stcp_secretkey", translate("STCP Screct Key"))
 e.default = "abcdefg"
