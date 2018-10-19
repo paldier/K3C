@@ -307,9 +307,6 @@ mtlk_hostapd_setup_base() {
 	append base_cfg "ap_max_num_sta=128" "$N"
 	append base_cfg "acs_num_scans=1" "$N"
 	append base_cfg "obss_interval=0" "$N"
-	append base_cfg "acs_numbss_info_file=/tmp/wlan_wave/acs_numbss_info_wlan2.txt" "$N"
-	append base_cfg "acs_smart_info_file=/tmp/wlan_wave/acs_smart_info_wlan2.txt" "$N"
-	append base_cfg "acs_history_file=/tmp/wlan_wave/acs_history_wlan2.txt" "$N"
 	append base_cfg "assoc_rsp_rx_mcs_mask=1" "$N"
 	append base_cfg "ignore_40_mhz_intolerant=0" "$N"
 	append base_cfg "acs_vht_dynamic_bw=0" "$N"
@@ -317,8 +314,14 @@ mtlk_hostapd_setup_base() {
 	append base_cfg "acs_penalty_factors=1 0 0 0 1 0 1 0 1 1 0" "$N"
 	if [ "$enable_ac" != "0" ]; then
 	append base_cfg "acs_fallback_chan=36 40 40" "$N"
+	append base_cfg "acs_numbss_info_file=/tmp/wlan_wave/acs_numbss_info_wlan0.txt" "$N"
+	append base_cfg "acs_smart_info_file=/tmp/wlan_wave/acs_smart_info_wlan0.txt" "$N"
+	append base_cfg "acs_history_file=/tmp/wlan_wave/acs_history_wlan0.txt" "$N"
 	else
 	append base_cfg "acs_fallback_chan=1 5 40" "$N"
+	append base_cfg "acs_numbss_info_file=/tmp/wlan_wave/acs_numbss_info_wlan2.txt" "$N"
+	append base_cfg "acs_smart_info_file=/tmp/wlan_wave/acs_smart_info_wlan2.txt" "$N"
+	append base_cfg "acs_history_file=/tmp/wlan_wave/acs_history_wlan2.txt" "$N"
 	fi
 	append base_cfg "ht_rifs=1" "$N"
 	append base_cfg "vendor_vht=1" "$N"
