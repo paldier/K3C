@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2006-2016 OpenWrt.org
+# Copyright (C) 2006-2015 OpenWrt.org
 #
 # This is free software, licensed under the GNU General Public License v2.
 # See /LICENSE for more information.
@@ -12,12 +12,11 @@ include ./files/python-package.mk
 
 PKG_NAME:=python
 PKG_VERSION:=$(PYTHON_VERSION).$(PYTHON_VERSION_MICRO)
-PKG_RELEASE:=9
+PKG_RELEASE:=1
 
 PKG_SOURCE:=Python-$(PKG_VERSION).tar.xz
 PKG_SOURCE_URL:=https://www.python.org/ftp/python/$(PKG_VERSION)
-#PKG_MD5SUM:=1dbcc848b4cd8399a8199d000f9f823c
-PKG_MD5SUM:=38d530f7efc373d64a8fb1637e3baaa7
+PKG_MD5SUM:=57dffcee9cee8bb2ab5f82af1d8e9a69
 
 PKG_LICENSE:=PSF
 PKG_LICENSE_FILES:=LICENSE Modules/_ctypes/libffi_msvc/LICENSE Modules/_ctypes/darwin/LICENSE Modules/_ctypes/libffi/LICENSE Modules/_ctypes/libffi_osx/LICENSE Tools/pybench/LICENSE
@@ -30,7 +29,7 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/Python-$(PKG_VERSION)
 HOST_BUILD_DIR:=$(BUILD_DIR_HOST)/Python-$(PKG_VERSION)
 
 PKG_BUILD_DEPENDS:=python/host
-HOST_BUILD_DEPENDS:=expat/host libffi/host
+HOST_BUILD_DEPENDS:=bzip2/host expat/host
 
 include $(INCLUDE_DIR)/host-build.mk
 include $(INCLUDE_DIR)/package.mk
@@ -40,7 +39,7 @@ define Package/python/Default
   SECTION:=lang
   CATEGORY:=Languages
   TITLE:=Python $(PYTHON_VERSION) programming language
-  URL:=https://www.python.org/
+  URL:=http://www.python.org/
   MAINTAINER:=Alexandru Ardelean <ardeleanalex@gmail.com>
 endef
 
@@ -76,14 +75,16 @@ define Package/python-light/description
   into separate packages.
 endef
 
+# Define newline here, since it's not defined in OpenWRT
+define newline
+
+
+endef
+
 PYTHON_LIB_FILES_DEL:=
 PYTHON_PACKAGES:=
-PYTHON_PACKAGES_DEPENDS:=
 define PyBasePackage
   PYTHON_PACKAGES+=$(1)
-  ifeq ($(3),)
-    PYTHON_PACKAGES_DEPENDS+=$(1)
-  endif
   PYTHON_LIB_FILES_DEL+=$(2)
   define PyPackage/$(1)/filespec
     $(subst $(space),$(newline),$(foreach lib_file,$(2),+|$(lib_file)))
@@ -94,7 +95,7 @@ include ./files/python-package-*.mk
 
 define Package/python
 $(call Package/python/Default)
-  DEPENDS:=+python-light $(foreach package,$(PYTHON_PACKAGES_DEPENDS),+$(package))
+  DEPENDS:=+python-light $(foreach package,$(PYTHON_PACKAGES),+$(package))
 endef
 
 define Package/python/description
@@ -137,21 +138,18 @@ define Build/InstallDev
 	$(INSTALL_DIR) $(STAGING_DIR)/mk/
 	$(INSTALL_DIR) $(1)/usr/include/ $(1)/usr/lib/ $(1)/usr/lib/pkgconfig
 	$(INSTALL_DIR) $(1)/usr/lib/python$(PYTHON_VERSION)/
-	$(INSTALL_DATA) \
-		./files/python-package.mk \
-		./files/python-host.mk \
-		$(STAGING_DIR)/mk/
+	$(INSTALL_DATA) ./files/python-package.mk $(STAGING_DIR)/mk/
 	$(CP) \
 		$(PKG_INSTALL_DIR)/usr/include/python$(PYTHON_VERSION) \
 		$(1)/usr/include/
 	$(CP) \
-		$(STAGING_DIR)/host/lib/python$(PYTHON_VERSION) \
+		$(STAGING_DIR_HOST)/lib/python$(PYTHON_VERSION) \
 		$(PKG_INSTALL_DIR)/usr/lib/libpython$(PYTHON_VERSION).so* \
 		$(1)/usr/lib/
 	$(CP) \
-		$(STAGING_DIR)/host/lib/pkgconfig/python.pc \
-		$(STAGING_DIR)/host/lib/pkgconfig/python2.pc \
-		$(STAGING_DIR)/host/lib/pkgconfig/python-$(PYTHON_VERSION).pc \
+		$(STAGING_DIR_HOST)/lib/pkgconfig/python.pc \
+		$(STAGING_DIR_HOST)/lib/pkgconfig/python2.pc \
+		$(STAGING_DIR_HOST)/lib/pkgconfig/python-$(PYTHON_VERSION).pc \
 		$(1)/usr/lib/pkgconfig
 	$(CP) \
 		$(PKG_INSTALL_DIR)/usr/lib/python$(PYTHON_VERSION)/config \
@@ -189,10 +187,12 @@ endef
 
 define PyPackage/python-light/filespec
 +|/usr/lib/python$(PYTHON_VERSION)
+-|/usr/lib/python$(PYTHON_VERSION)/config
 -|/usr/lib/python$(PYTHON_VERSION)/distutils/cygwinccompiler.py
 -|/usr/lib/python$(PYTHON_VERSION)/distutils/command/wininst*
 -|/usr/lib/python$(PYTHON_VERSION)/ensurepip
 -|/usr/lib/python$(PYTHON_VERSION)/idlelib
+-|/usr/lib/python$(PYTHON_VERSION)/lib2to3
 -|/usr/lib/python$(PYTHON_VERSION)/lib-tk
 -|/usr/lib/python$(PYTHON_VERSION)/lib-dynload/_testcapi.so
 -|/usr/lib/python$(PYTHON_VERSION)/pdb.doc
@@ -222,21 +222,16 @@ HOST_CONFIGURE_ARGS+= \
 	--without-cxx-main \
 	--without-pymalloc \
 	--with-threads \
-	--prefix=$(STAGING_DIR)/host \
-	--exec-prefix=$(STAGING_DIR)/host \
-	--sysconfdir=$(STAGING_DIR_HOST)/host/etc \
-	--localstatedir=$(STAGING_DIR)/host/var \
-	--sbindir=$(STAGING_DIR)/host/bin \
-	--with-system-expat=$(STAGING_DIR)/host \
-	--with-system-ffi=$(STAGING_DIR)/host \
+	--with-system-expat=$(STAGING_DIR_HOST) \
+	--prefix=$(STAGING_DIR_HOST) \
 	--with-ensurepip=upgrade \
 	CONFIG_SITE= \
 	CFLAGS="$(HOST_CFLAGS)"
 
 define Host/Install
+	$(INSTALL_DIR) $(STAGING_DIR_HOST)/bin/
 	$(MAKE) -C $(HOST_BUILD_DIR) install
-	$(INSTALL_DIR) $(STAGING_DIR)/host/bin/
-	$(INSTALL_BIN) $(HOST_BUILD_DIR)/Parser/pgen $(STAGING_DIR)/host/bin/pgen2
+	$(INSTALL_BIN) $(HOST_BUILD_DIR)/Parser/pgen $(STAGING_DIR_HOST)/bin/pgen2
 endef
 
 $(eval $(call HostBuild))
