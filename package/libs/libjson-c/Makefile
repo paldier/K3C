@@ -20,7 +20,6 @@ PKG_LICENSE_FILES:=COPYING
 
 PKG_FIXUP:=autoreconf
 PKG_INSTALL:=1
-PKG_BUILD_PARALLEL:=0
 
 PKG_MAINTAINER:=Felix Fietkau <nbd@openwrt.org>
 
