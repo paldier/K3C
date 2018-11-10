@@ -541,9 +541,8 @@ if hwtype == "atheros" then
 	s:taboption("advanced", Flag, "doth", "802.11h")
 	hidden = s:taboption("general", Flag, "hidden", translate("Hide <abbr title=\"Extended Service Set Identifier\">ESSID</abbr>"))
 	hidden:depends({mode="ap"})
-	hidden:depends({mode="adhoc"})
 	hidden:depends({mode="ap-wds"})
-	hidden:depends({mode="sta-wds"})
+
 	isolate = s:taboption("advanced", Flag, "isolate", translate("Separate Clients"),
 	 translate("Prevents client-to-client communication"))
 	isolate:depends({mode="ap"})
@@ -590,23 +589,55 @@ end
 
 -------------------- MTLK Interface ----------------------
 if hwtype == "mtlk" then
+	mode:value("ap-wds", "%s (%s)" % {translate("Access Point"), translate("WDS")})
+	mode:value("sta-wds", "%s (%s)" % {translate("Client"), translate("WDS")})
 	mode:value("wds", translate("WDS"))
 	mode:value("monitor", translate("Monitor"))
 
+	function mode.write(self, section, value)
+		if value == "ap-wds" then
+			ListValue.write(self, section, "ap")
+			m.uci:set("wireless", section, "wds", 1)
+		elseif value == "sta-wds" then
+			ListValue.write(self, section, "sta")
+			m.uci:set("wireless", section, "wds", 1)
+		else
+			ListValue.write(self, section, value)
+			m.uci:delete("wireless", section, "wds")
+		end
+	end
+
+	function mode.cfgvalue(self, section)
+		local mode = ListValue.cfgvalue(self, section)
+		local wds  = m.uci:get("wireless", section, "wds") == "1"
+
+		if mode == "ap" and wds then
+			return "ap-wds"
+		elseif mode == "sta" and wds then
+			return "sta-wds"
+		else
+			return mode
+		end
+	end
+
 	hidden = s:taboption("general", Flag, "hidden", translate("Hide <abbr title=\"Extended Service Set Identifier\">ESSID</abbr>"))
 	hidden:depends({mode="ap"})
-	hidden:depends({mode="adhoc"})
-	hidden:depends({mode="wds"})
+	hidden:depends({mode="ap-wds"})
+
 
 	isolate = s:taboption("advanced", Flag, "isolate", translate("Separate Clients"),
 	 translate("Prevents client-to-client communication"))
 	isolate:depends({mode="ap"})
 
 	s:taboption("advanced", Flag, "doth", "802.11h")
-	s:taboption("advanced", Flag, "wmm", translate("WMM Mode"))
+	wmm = s:taboption("advanced", Flag, "wmm", translate("WMM Mode"))
+	wmm:depends({mode="ap"})
+	wmm:depends({mode="ap-wds"})
+	wmm.default = wmm.enabled
 
-	bssid:depends({mode="wds"})
 	bssid:depends({mode="adhoc"})
+	bssid:depends({mode="sta"})
+	bssid:depends({mode="sta-wds"})
 	
 	mp = s:taboption("macfilter", ListValue, "macpolicy", translate("MAC-Address Filter"))
 	mp:value("", translate("disable"))

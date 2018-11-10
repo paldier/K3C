@@ -15,10 +15,9 @@ fi
 
 cd /tmp
 cp -s /opt/lantiq/lib/modules/3.10.104/net/mtlkroot.ko /tmp/
-cp -s /opt/lantiq/wave/images/fw_scd_file.scd /tmp/
-cp -s /opt/lantiq/wave/images/hw_scd_file.scd /tmp/
+cp -s /lib/firmware/fw_scd_file.scd /tmp/
+cp -s /lib/firmware/hw_scd_file.scd /tmp/
 cp -s /opt/lantiq/lib/modules/3.10.104/net/mtlk.ko /tmp/
-cp -s /opt/lantiq/wave/images/* /lib/firmware/
 
 echo /opt/lantiq/sbin/hotplug > /proc/sys/kernel/hotplug
 udevd_up=`ps | grep -c udevd`

@@ -28,12 +28,6 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_BASE_NAME)-$(PKG_VERSION)
 
 PKG_DEFAULT_CUSTOM_SOURCE_DIR:=$(shell pwd)
 
-BIN_FOLDER:=bin
-ifeq ($(CONFIG_NEW_FRAMEWORK),y)
- BIN_FOLDER:=opt/lantiq/bin
-endif
-
-
 PKG_BUILD_DIR_HAPD:=$(PKG_BUILD_DIR)/hostapd
 PKG_BUILD_DIR_WPAS:=$(PKG_BUILD_DIR)/wpa_supplicant
 

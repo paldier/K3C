@@ -95,6 +95,7 @@ detect_mtlk() {
 		[ "$type" == "mtlk" ] || {
 
 			mode=ap
+			disabled=0
 			case $phyname in
 				wlan0)
 					[ "$(lantiq_board_name)" == "BlueCave" ] && {
@@ -124,39 +125,50 @@ detect_mtlk() {
 						ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
 					}
 					;;
-#how to fix?
 				wlan1)
 					[ "$(lantiq_board_name)" == "BlueCave" ] && {
-						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						hwmode=11g
+						htmode=HT40+
 						macaddr="$(find_mtlk_mac $phyname)"
 						ssid="OpenWrt-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
-						mode=client
+						mode=sta
+						disabled=1
 					}
 					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
-						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						hwmode=11a
+						htmode=VHT80
 						macaddr="$(find_mtlk_mac $phyname)"
 						ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
-						mode=client
+						mode=sta
+						disabled=1
 					}
 					;;
 				wlan3)
 					[ "$(lantiq_board_name)" == "BlueCave" ] && {
-						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						hwmode=11a
+						htmode=VHT80
 						macaddr="$(find_mtlk_mac $phyname)"
 						ssid="OpenWrt-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
-						mode=client
+						mode=sta
+						disabled=1
 					}
 					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
-						iwinfo $phyname info | grep -q '802.11bgn' || { hwmode=11a; htmode=VHT80; band=5G; }
+						hwmode=11g
+						htmode=HT40+
 						macaddr="$(find_mtlk_mac $phyname)"
 						ssid="K3C-$band-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
-						mode=client
+						mode=sta
+						disabled=1
 					}
 					;;
 			esac
 
 		[ -n "$macaddr" ] && {
 			dev_id="set wireless.${phyname}.macaddr=${macaddr}"
+		}
+		[ "$mode" = "sta" ] && {
+			wds="set wireless.default_${phyname}.wds=1"
+			network="set wireless.default_${phyname}.network=wifi"
 		}
 		config_foreach check_mtlk_device wifi-device
 
@@ -170,12 +182,13 @@ detect_mtlk() {
 			set wireless.${phyname}.htmode=$htmode
 			set wireless.${phyname}.country=CN
 			set wireless.${phyname}.beacon_int=100
-			set wireless.${phyname}.disabled=0
+			set wireless.${phyname}.disabled=$disabled
 			
 			set wireless.default_${phyname}=wifi-iface
 			set wireless.default_${phyname}.device=${phyname}
 			set wireless.default_${phyname}.network=lan
 			set wireless.default_${phyname}.mode=$mode
+			${wds}
 			set wireless.default_${phyname}.ssid=${ssid}
 			set wireless.default_${phyname}.encryption=none
 EOF
