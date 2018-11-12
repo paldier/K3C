@@ -1,16 +1,15 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ubox
-PKG_VERSION:=2015-07-14
+PKG_VERSION:=2015-11-22
 PKG_RELEASE=$(PKG_SOURCE_VERSION)
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=git://nbd.name/luci2/ubox.git
 PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
-PKG_SOURCE_VERSION:=907d046c8929fb74e5a3502a9498198695e62ad8
+PKG_SOURCE_VERSION:=c086167a0154745c677f8730a336ea9cf7d71031
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-$(PKG_SOURCE_VERSION).tar.gz
 CMAKE_INSTALL:=1
-PKG_CHECK_FORMAT_SECURITY:=0
 
 PKG_LICENSE:=GPL-2.0
 PKG_LICENSE_FILES:=
@@ -29,11 +28,17 @@ define Package/ubox
   TITLE:=OpenWrt system helper toolbox
 endef
 
-define Package/ubox/install
-	$(INSTALL_DIR) $(1)/sbin $(1)/usr/sbin $(1)/lib/ $(1)/etc/init.d/
+define Package/logd
+  SECTION:=base
+  CATEGORY:=Base system
+  DEPENDS:=+libubox +libubus +libblobmsg-json +USE_GLIBC:librt
+  TITLE:=OpenWrt system log implementation
+endef
 
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/sbin/{kmodloader,logd,logread,validate_data} $(1)/sbin/
-	$(INSTALL_BIN) ./files/log.init $(1)/etc/init.d/log
+define Package/ubox/install
+	$(INSTALL_DIR) $(1)/sbin $(1)/usr/sbin $(1)/lib/
+
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/sbin/{kmodloader,validate_data} $(1)/sbin/
 	$(INSTALL_DATA) $(PKG_INSTALL_DIR)/usr/lib/libvalidate.so $(1)/lib
 
 	$(LN) ../../sbin/kmodloader $(1)/usr/sbin/rmmod
@@ -43,4 +48,12 @@ define Package/ubox/install
 	$(LN) ../../sbin/kmodloader $(1)/usr/sbin/modprobe
 endef
 
+define Package/logd/install
+	$(INSTALL_DIR) $(1)/sbin $(1)/etc/init.d/
+
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/sbin/{logd,logread} $(1)/sbin/
+	$(INSTALL_BIN) ./files/log.init $(1)/etc/init.d/log
+endef
+
 $(eval $(call BuildPackage,ubox))
+$(eval $(call BuildPackage,logd))

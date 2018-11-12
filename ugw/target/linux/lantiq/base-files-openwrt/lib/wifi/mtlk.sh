@@ -189,6 +189,7 @@ detect_mtlk() {
 			set wireless.default_${phyname}.network=lan
 			set wireless.default_${phyname}.mode=$mode
 			${wds}
+			${network}
 			set wireless.default_${phyname}.ssid=${ssid}
 			set wireless.default_${phyname}.encryption=none
 EOF

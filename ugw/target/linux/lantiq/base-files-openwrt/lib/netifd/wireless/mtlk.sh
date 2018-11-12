@@ -300,31 +300,34 @@ mtlk_hostapd_setup_base() {
 			vht_link_adapt_hw=3
 		[ "$vht_link_adapt_hw" != 0 ] && \
 			vht_capab="$vht_capab[VHT-LINK-ADAPT-$vht_link_adapt_hw]"
-
+		#
+		vht_capab="$vht_capab[BF-ANTENNA-4][SOUNDING-DIMENSION-3]"
 		[ -n "$vht_capab" ] && append base_cfg "vht_capab=$vht_capab" "$N"
 	fi
 #lantiq 5xx
 	append base_cfg "ap_max_num_sta=128" "$N"
 	append base_cfg "acs_num_scans=1" "$N"
-	append base_cfg "obss_interval=0" "$N"
 	append base_cfg "assoc_rsp_rx_mcs_mask=1" "$N"
 	append base_cfg "ignore_40_mhz_intolerant=0" "$N"
 	append base_cfg "acs_vht_dynamic_bw=0" "$N"
 	append base_cfg "acs_policy=0" "$N"
 	append base_cfg "acs_penalty_factors=1 0 0 0 1 0 1 0 1 1 0" "$N"
 	if [ "$enable_ac" != "0" ]; then
+	append base_cfg "obss_interval=0" "$N"
+	append base_cfg "vendor_vht=0" "$N"
 	append base_cfg "acs_fallback_chan=36 40 40" "$N"
 	append base_cfg "acs_numbss_info_file=/tmp/wlan_wave/acs_numbss_info_wlan0.txt" "$N"
 	append base_cfg "acs_smart_info_file=/tmp/wlan_wave/acs_smart_info_wlan0.txt" "$N"
 	append base_cfg "acs_history_file=/tmp/wlan_wave/acs_history_wlan0.txt" "$N"
 	else
+	append base_cfg "obss_interval=300" "$N"
+	append base_cfg "vendor_vht=1" "$N"
 	append base_cfg "acs_fallback_chan=1 5 40" "$N"
 	append base_cfg "acs_numbss_info_file=/tmp/wlan_wave/acs_numbss_info_wlan2.txt" "$N"
 	append base_cfg "acs_smart_info_file=/tmp/wlan_wave/acs_smart_info_wlan2.txt" "$N"
 	append base_cfg "acs_history_file=/tmp/wlan_wave/acs_history_wlan2.txt" "$N"
 	fi
 	append base_cfg "ht_rifs=1" "$N"
-	append base_cfg "vendor_vht=1" "$N"
 
 	hostapd_prepare_device_config "$hostapd_conf_file" nl80211
 	cat >> "$hostapd_conf_file" <<EOF
