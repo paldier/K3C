@@ -2,12 +2,12 @@
 
 # 声明常量
 readonly packageName='com.xunlei.vip.swjsq'
-readonly protocolVersion=300
+readonly protocolVersion=200
 readonly businessType=68
-readonly sdkVersion='3.1.2.185150'
-readonly clientVersion='2.7.2.0'
-readonly agent_xl="android-ok-http-client/xl-acc-sdk/version-$sdkVersion"
-readonly agent_down='okhttp/3.9.1'
+readonly sdkVersion='2.1.1.177662'
+readonly clientVersion='2.4.1.3'
+readonly agent_xl="android-async-http/xl-acc-sdk/version-$sdkVersion"
+readonly agent_down='okhttp/3.4.1'
 readonly agent_up='android-async-http/xl-acc-sdk/version-1.0.0.1'
 readonly client_type_down='android-swjsq'
 readonly client_type_up='android-uplink'
@@ -53,9 +53,11 @@ uci_get_by_bool() {
 
 # 日志和状态栏输出。1 日志文件, 2 系统日志, 4 详细模式, 8 下行状态栏, 16 上行状态栏, 32 失败状态
 _log() {
-	local msg=$1 flag=$2 timestamp=$(date +'%Y/%m/%d %H:%M:%S')
+	local msg=$1
+	local flag=$2
 	[ -z "$msg" ] && return
 	[ -z "$flag" ] && flag=1
+	local timestamp=$(date +'%Y/%m/%d %H:%M:%S')
 
 	[ $logging -eq 0 -a $(( $flag & 1 )) -ne 0 ] && flag=$(( $flag ^ 1 ))
 	if [ $verbose -eq 0 -a $(( $flag & 4 )) -ne 0 ]; then
@@ -143,16 +145,14 @@ swjsq_json() {
 	json_init
 	json_add_string protocolVersion "$protocolVersion"
 	json_add_string sequenceNo "$sequence_xl"
-	json_add_string platformVersion '10'
+	json_add_string platformVersion '2'
 	json_add_string isCompressed '0'
-	json_add_string appid "$businessType"
+	json_add_string businessType "$businessType"
 	json_add_string clientVersion "$clientVersion"
 	json_add_string peerID "$_peerid"
 	json_add_string appName "ANDROID-$packageName"
 	json_add_string sdkVersion "${sdkVersion##*.}"
 	json_add_string devicesign "$_devicesign"
-	json_add_string netWorkType 'WIFI'
-	json_add_string providerName 'OTHER'
 	json_add_string deviceModel 'MI'
 	json_add_string deviceName 'Xiaomi Mi'
 	json_add_string OSVersion "7.1.1"
@@ -167,7 +167,6 @@ swjsq_login() {
 		json_add_string passWord "$password"
 		json_add_string verifyKey
 		json_add_string verifyCode
-		json_add_string isMd5Pwd '0'
 	else
 		access_url='https://mobile-login.xunlei.com/loginkey'
 		json_add_string userName "$_userid"
@@ -241,8 +240,7 @@ swjsq_logout() {
 
 # 获取用户信息
 swjsq_getuserinfo() {
-	local _vasid vasid_down=14 vasid_up=33 outmsg
-	[ $down_acc -ne 0 ] && _vasid="${_vasid}${vasid_down},"; [ $up_acc -ne 0 ] && _vasid="${_vasid}${vasid_up},"
+	[ $1 -eq 1 ] && local _vasid=14 || local _vasid=33
 	swjsq_json
 	json_add_string userID "$_userid"
 	json_add_string sessionID "$_sessionid"
@@ -250,16 +248,17 @@ swjsq_getuserinfo() {
 	json_close_object
 
 	local ret=$($_http_cmd --user-agent="$agent_xl" 'https://mobile-login.xunlei.com/getuserinfo' --post-data="$(json_dump)")
-	_log "getuserinfo is $ret" $(( 1 | 4 ))
+	_log "getuserinfo $1 is $ret" $(( 1 | 4 ))
 	json_cleanup; json_load "$ret" >/dev/null 2>&1
 	json_get_var lasterr "errorCode"
 
+	[ $1 -eq 1 ] && local outmsg="下行提速会员" || local outmsg="上行提速会员"
 	case ${lasterr:=-1} in
 		0)
-			local index=1 can_down=0 vasid isVip isYear expireDate
+			local index vasid isVip isYear expireDate can_upgrade
 			json_select "vipList" >/dev/null 2>&1
 			while : ; do
-				json_select $index >/dev/null 2>&1
+				json_select ${index:=1} >/dev/null 2>&1
 				[ $? -ne 0 ] && break
 				json_get_var vasid "vasid"
 				json_get_var isVip "isVip"
@@ -267,59 +266,28 @@ swjsq_getuserinfo() {
 				json_get_var expireDate "expireDate"
 				json_select ".." >/dev/null 2>&1
 				let index++
-				case ${vasid:-0} in
-					2) [ $down_acc -ne 0 ] && outmsg="迅雷超级会员" || continue;;
-					$vasid_down) outmsg="迅雷快鸟会员";;
-					$vasid_up) outmsg="上行提速会员";;
-					*) continue;;
-				esac
-				if [ ${isVip:-0} -eq 1 -o ${isYear:-0} -eq 1 ]; then
-					outmsg="${outmsg}有效。会员到期时间：${expireDate:0:4}-${expireDate:4:2}-${expireDate:6:2}"
-					[ $vasid -eq $vasid_up ] && _log "$outmsg" $(( 1 | 16 )) || _log "$outmsg" $(( 1 | 8 ))
-					[ $vasid -ne $vasid_up ] && can_down=$(( $can_down | 1 ))
-				else
-					if [ ${#expireDate} -ge 8 ]; then
-						outmsg="${outmsg}已到期。会员到期时间：${expireDate:0:4}-${expireDate:4:2}-${expireDate:6:2}"
-					else
-						outmsg="${outmsg}无效"
-					fi
-					[ $vasid -eq $vasid_up ] && _log "$outmsg" $(( 1 | 16 | 32 )) || _log "$outmsg" $(( 1 | 8 | 32 ))
-					[ $vasid -eq $vasid_up ] && up_acc=0
-				fi
+				([ $1 -eq 1 -a ${vasid:-0} -eq 2 ] || [ ${vasid:-0} -eq $_vasid ]) && \
+					[ ${isVip:-0} -eq 1 -o ${isYear:-0} -eq 1 ] && { can_upgrade=1; break; }
 			done
-			[ $can_down -eq 0 ] && down_acc=0
+			if [ ${can_upgrade:-0} -eq 1 ]; then
+				outmsg="获取${outmsg}信息成功。会员到期时间：${expireDate:0:4}-${expireDate:4:2}-${expireDate:6:2}"; \
+					_log "$outmsg" $(( 1 | $1 * 8 ))
+			else
+				if [ ${#expireDate} -ge 8 ]; then
+					outmsg="${outmsg}已到期。会员到期时间：${expireDate:0:4}-${expireDate:4:2}-${expireDate:6:2}"
+				else
+					outmsg="${outmsg}无效"
+				fi
+				_log "$outmsg" $(( 1 | $1 * 8 | 32 ))
+				[ $1 -eq 1 ] && down_acc=0 || up_acc=0
+			fi
 			;;
 		-1)
-			outmsg="获取迅雷会员信息失败。迅雷服务器未响应，请稍候"; _log "$outmsg";;
+			outmsg="获取${outmsg}信息失败。迅雷服务器未响应，请稍候"; _log "$outmsg";;
 		*)
 			local errorDesc; json_get_var errorDesc "errorDesc"
-			outmsg="获取迅雷会员信息失败。错误代码: ${lasterr}"; \
-				[ -n "$errorDesc" ] && outmsg="${outmsg}，原因: $errorDesc"; _log "$outmsg" $(( 1 | 8 | 32 ));;
-	esac
-
-	[ $lasterr -eq 0 ] && return 0 || return 1
-}
-
-# 登录时间更新
-swjsq_renewal() {
-	xlnetacc_var 1
-	local limitdate=$(date +%Y%m%d -d "1970.01.01-00:00:$(( $(date +%s) + 30 * 24 * 60 * 60 ))")
-
-	access_url='http://api.ext.swjsq.vip.xunlei.com'
-	local ret=$($_http_cmd --user-agent="$user_agent" "$access_url/renewal?${http_args%&dial_account=*}&limitdate=$limitdate")
-	_log "renewal is $ret" $(( 1 | 4 ))
-	json_cleanup; json_load "$ret" >/dev/null 2>&1
-	json_get_var lasterr "errno"
-
-	case ${lasterr:=-1} in
-		0)
-			local outmsg="更新登录时间成功。帐号登录展期：${limitdate:0:4}-${limitdate:4:2}-${limitdate:6:2}"; _log "$outmsg";;
-		-1)
-			local outmsg="更新登录时间失败。迅雷服务器未响应，请稍候"; _log "$outmsg";;
-		*)
-			local message; json_get_var message "richmessage"
-			local outmsg="更新登录时间失败。错误代码: ${lasterr}"; \
-				[ -n "$message" ] && outmsg="${outmsg}，原因: $message"; _log "$outmsg" $(( 1 | 8 | 32 ));;
+			outmsg="获取${outmsg}信息失败。错误代码: ${lasterr}"; \
+				[ -n "$errorDesc" ] && outmsg="${outmsg}，原因: $errorDesc"; _log "$outmsg" $(( 1 | $1 * 8 | 32 ));;
 	esac
 
 	[ $lasterr -eq 0 ] && return 0 || return 1
@@ -386,8 +354,8 @@ isp_bandwidth() {
 			json_select; json_select "max_bandwidth" >/dev/null 2>&1
 			json_get_var max_bandwidth "$stream"
 			json_select
-			cur_bandwidth=$(( ${cur_bandwidth:-0} / 1024 ))
-			max_bandwidth=$(( ${max_bandwidth:-0} / 1024 ))
+			cur_bandwidth=$(expr ${cur_bandwidth:-0} / 1024)
+			max_bandwidth=$(expr ${max_bandwidth:-0} / 1024)
 
 			if [ -n "$bind_dial_account" -a "$bind_dial_account" != "$dial_account" ]; then
 				local outmsg="绑定宽带账号 $bind_dial_account 与当前宽带账号 $dial_account 不一致，请联系迅雷客服解绑（每月仅一次）"; \
@@ -445,7 +413,7 @@ isp_upgrade() {
 			local bandwidth
 			json_select "bandwidth" >/dev/null 2>&1
 			json_get_var bandwidth "downstream"
-			bandwidth=$(( ${bandwidth:-0} / 1024 ))
+			[ ${bandwidth:=0} -ge 1024 ] && bandwidth=$(( $bandwidth / 1024 ))
 			local outmsg="${link_cn}提速成功，带宽已提升到 ${bandwidth}M"; _log "$outmsg" $(( 1 | $1 * 8 ))
 			[ $1 -eq 1 ] && down_acc=2 || up_acc=2
 			;;
@@ -542,7 +510,7 @@ xlnetacc_var() {
 		let sequence_up++
 		access_url=$_portal_up
 		http_args="sequence=${sequence_up}&client_type=${client_type_up}-${clientVersion}&client_version=${client_type_up//-/}-${clientVersion}"
-		user_agent=$agent_down
+		user_agent=$agent_up
 		link_cn="上行"
 	fi
 	http_args="${http_args}&peerid=${_peerid}&userid=${_userid}&sessionid=${_sessionid}&user_type=1&os=android-7.1.1"
@@ -613,16 +581,10 @@ xlnetacc_init() {
 	readonly logging=$(uci_get_by_bool "general" "logging" 1)
 	readonly verbose=$(uci_get_by_bool "general" "verbose" 0)
 	network=$(uci_get_by_name "general" "network" "wan")
-	keepalive=$(uci_get_by_name "general" "keepalive" 10)
-	relogin=$(uci_get_by_name "general" "relogin" 0)
 	readonly username=$(uci_get_by_name "general" "account")
 	readonly password=$(uci_get_by_name "general" "password")
 	local enabled=$(uci_get_by_bool "general" "enabled" 0)
 	([ $enabled -eq 0 ] || [ $down_acc -eq 0 -a $up_acc -eq 0 ] || [ -z "$username" -o -z "$password" -o -z "$network" ]) && return 2
-	([ -z "$keepalive" -o -n "${keepalive//[0-9]/}" ] || [ $keepalive -lt 5 -o $keepalive -gt 60 ]) && keepalive=10
-	readonly keepalive=$(( $keepalive ))
-	([ -z "$relogin" -o -n "${relogin//[0-9]/}" ] || [ $relogin -gt 48 ]) && relogin=0
-	readonly relogin=$(( $relogin * 60 * 60 ))
 
 	[ $logging -eq 1 ] && [ ! -d /var/log ] && mkdir -p /var/log
 	[ -f "$LOGFILE" ] && _log "------------------------------"
@@ -644,7 +606,6 @@ xlnetacc_init() {
 
 	clean_log
 	[ -d /var/state ] || mkdir -p /var/state
-	rm -f "$down_state_file" "$up_state_file"
 	return 0
 }
 
@@ -675,10 +636,9 @@ xlnetacc_main() {
 		done
 
 		# 获取用户信息
-		xlnetacc_retry 'swjsq_getuserinfo'
+		xlnetacc_retry 'swjsq_getuserinfo' 1 1
+		xlnetacc_retry 'swjsq_getuserinfo' 2 1
 		[ $down_acc -eq 0 -a $up_acc -eq 0 ] && break
-		# 登录时间更新
-		xlnetacc_retry 'swjsq_renewal'
 		# 获取提速入口
 		xlnetacc_retry 'swjsq_portal' 1 1
 		xlnetacc_retry 'swjsq_portal' 2 1
@@ -691,11 +651,11 @@ xlnetacc_main() {
 		xlnetacc_retry 'isp_upgrade' 2 1 10 || { sleep 3m; continue; }
 
 		# 心跳保持
-		local timer=$(date +%s)
+#		local retry=1
 		while : ; do
 			clean_log # 清理日志
-			sleep ${keepalive}m
-			[ $relogin -ne 0 -a $(( $(date +%s) - $timer )) -ge $relogin ] && break # 登录超时
+			sleep 10m
+#			[ $retry -ge 144 ] && break || let retry++ # 心跳最多保持24小时，144=24*60/10
 			xlnetacc_retry 'isp_keepalive' 1 2 5 || break
 			xlnetacc_retry 'isp_keepalive' 2 2 5 || break
 		done

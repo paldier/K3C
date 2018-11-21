@@ -50,12 +50,11 @@ define Package/$(PKG_NAME)
 		+$(DRV_RFLIB_PKG_NAME) \
 		+PACKAGE_kmod-ltq_wave500_dp_drv:kmod-ltq_wave500_dp_drv \
 		+PACKAGE_kmod-lantiq_directconnect_support:kmod-lantiq_directconnect_support \
-		@+PACKAGE_ltq-devm:FEATURE_DEVM_WIFILAN \
 		$(DEPENDS_EXTRA) \
+		@+BUSYBOX_CUSTOM \
 		@+BUSYBOX_CONFIG_WC \
 		@+BUSYBOX_CONFIG_WHICH \
 		@+BUSYBOX_CONFIG_AWK \
-		@+BUSYBOX_CONFIG_FEATURE_AWK_MATH \
 		@+BUSYBOX_CONFIG_FIND \
 		@+BUSYBOX_CONFIG_FEATURE_FIND_MTIME \
 		@+BUSYBOX_CONFIG_FEATURE_FIND_PERM \

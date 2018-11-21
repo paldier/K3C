@@ -26,10 +26,9 @@ function index()
 	entry( {"admin", "nas", "amule", "logview"}, call("logread") ).leaf = true
 	entry( {"admin", "nas", "amule", "status"}, call("get_pid") ).leaf = true
 	entry( {"admin", "nas", "amule", "amulecmd"}, call("amulecmd") ).leaf = true
--- post? cbi for CC
-	entry( {"admin", "nas", "amule", "startstop"}, cbi("startstop") ).leaf = true
-	entry( {"admin", "nas", "amule", "down_kad"}, cbi("down_kad") ).leaf = true
-	entry( {"admin", "nas", "amule", "down_ed2k"}, cbi("down_ed2k") ).leaf = true
+	entry( {"admin", "nas", "amule", "startstop"}, post("startstop") ).leaf = true
+	entry( {"admin", "nas", "amule", "down_kad"}, post("down_kad") ).leaf = true
+	entry( {"admin", "nas", "amule", "down_ed2k"}, post("down_ed2k") ).leaf = true
 
 end
 
