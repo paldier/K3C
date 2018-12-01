@@ -23,7 +23,7 @@ define Package/$(PKG_NAME)
   SECTION:=firmware
   CATEGORY:=Lantiq
   TITLE:=k3c mtd part
-  URL:=http://k3c.paldier.tk/
+  URL:=http://k3c.paldier.com/
   MAINTAINER:=paldier
   DEPENDS:=
   MENU:=1

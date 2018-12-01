@@ -33,12 +33,12 @@ define Build/Compile
 endef
 
 define Package/mountd/install
-	$(INSTALL_DIR) $(1)/sbin/ $(1)/etc/config/ $(1)/etc/init.d/ $(1)/opt/lantiq/etc
+	$(INSTALL_DIR) $(1)/sbin/ $(1)/etc/config/ $(1)/etc/init.d/ $(1)/etc/hotplug.d/block/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/mountd $(1)/sbin/
 	$(INSTALL_BIN) ./files/mountd.config $(1)/etc/config/mountd
 	$(INSTALL_BIN) ./files/mountd.init $(1)/etc/init.d/mountd
-	$(INSTALL_BIN) ./files/usb_automount_status.sh $(1)/opt/lantiq/etc/
 	$(INSTALL_BIN) ./files/usb_led.sh $(1)/etc/
+	$(INSTALL_BIN) ./files/15-automount $(1)/etc/hotplug.d/block/
 endef
 #$(INSTALL_DIR) $(1)/mnt
 #cd $(1)/mnt; ln -sf /tmp/mounts usb
