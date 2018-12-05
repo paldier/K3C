@@ -286,7 +286,7 @@ if hwtype == "mtlk" then
 
 	legacyrates = s:taboption("advanced", Flag, "legacy_rates", translate("Allow legacy 802.11b rates"))
 	legacyrates.rmempty = false
-	legacyrates.default = "1"
+	legacyrates.default = "0"
 
 	s:taboption("advanced", Value, "distance", translate("Distance Optimization"),
 		translate("Distance to farthest network member in meters."))
@@ -594,7 +594,7 @@ if hwtype == "mtlk" then
 	wmm = s:taboption("advanced", Flag, "wmm", translate("WMM Mode"))
 	wmm:depends({mode="ap"})
 	wmm:depends({mode="ap-wds"})
-	wmm.default = wmm.enabled
+	wmm.default =1
 
 	bssid:depends({mode="adhoc"})
 	bssid:depends({mode="sta"})
@@ -611,7 +611,7 @@ if hwtype == "mtlk" then
 	ml:depends({macpolicy="deny"})
 	nt.mac_hints(function(mac, name) ml:value(mac, "%s (%s)" %{ mac, name }) end)
 	disassoc_low_ack = s:taboption("general", Flag, "disassoc_low_ack", translate("Disassociate On Low Acknowledgement"),translate("Allow AP mode to disconnect STAs based on low ACK condition"))
-  	disassoc_low_ack.default = disassoc_low_ack.enabled
+  	disassoc_low_ack.default =0
 
 
 end

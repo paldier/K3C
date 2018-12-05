@@ -69,7 +69,6 @@ define Package/$(PKG_NAME)
 		@+PACKAGE_libuuid \
 		@+PACKAGE_uuidgen \
 		@+PACKAGE_hostapd_2_3_wave_5_1_1 \
-		@+PACKAGE_udev \
 		@+PACKAGE_crda \
 		@+PACKAGE_wav500-images
 	URL:=http://www.lantiq.com

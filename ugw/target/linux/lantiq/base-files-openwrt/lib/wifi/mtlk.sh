@@ -96,6 +96,7 @@ detect_mtlk() {
 
 			mode=ap
 			disabled=0
+			network=lan
 			case $phyname in
 				wlan0)
 					[ "$(lantiq_board_name)" == "BlueCave" ] && {
@@ -168,7 +169,7 @@ detect_mtlk() {
 		}
 		[ "$mode" = "sta" ] && {
 			wds="set wireless.default_${phyname}.wds=1"
-			network="set wireless.default_${phyname}.network=wifi"
+			network=wifi
 		}
 		config_foreach check_mtlk_device wifi-device
 
@@ -186,10 +187,9 @@ detect_mtlk() {
 			
 			set wireless.default_${phyname}=wifi-iface
 			set wireless.default_${phyname}.device=${phyname}
-			set wireless.default_${phyname}.network=lan
+			set wireless.default_${phyname}.network=${network}
 			set wireless.default_${phyname}.mode=$mode
 			${wds}
-			${network}
 			set wireless.default_${phyname}.ssid=${ssid}
 			set wireless.default_${phyname}.encryption=none
 EOF

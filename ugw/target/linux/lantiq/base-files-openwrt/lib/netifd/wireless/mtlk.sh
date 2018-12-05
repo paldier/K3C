@@ -677,8 +677,8 @@ drv_mtlk_setup() {
 		frag rts beacon_int htmode
 	json_get_values basic_rate_list basic_rate
 	json_select ..
-#waiting for wlan0 wlan2 up
-	sleep 4
+#waiting for wlan0 wlan2 up 4.5s-5.5s
+	sleep 5
 	find_phy "$1" || {
 		echo "Could not find PHY for device '$1'"
 		wireless_set_retry 0

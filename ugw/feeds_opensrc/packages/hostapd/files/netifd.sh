@@ -192,7 +192,7 @@ hostapd_set_bss_options() {
 	set_default maxassoc 128
 	set_default max_inactivity 60
 	set_default short_preamble 1
-	set_default disassoc_low_ack 1
+	set_default disassoc_low_ack 0
 	set_default hidden 0
 	set_default wmm 1
 	set_default uapsd 1
