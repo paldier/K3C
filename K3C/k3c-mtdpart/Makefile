@@ -13,6 +13,21 @@ PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
 include $(INCLUDE_DIR)/package-version-override.mk
 include $(INCLUDE_DIR)/package.mk
 
+WAVE_TARGET:=k3c
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3c),y)
+ WAVE_TARGET:=k3c
+endif
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cv2),y)
+#k3c for B1/A1/B1G,k3cv2 for B2
+ WAVE_TARGET:=k3cv2
+endif
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_bluecave),y)
+ WAVE_TARGET:=bluecave
+endif
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_easy350_anywan_800m_owrt),y)
+ WAVE_TARGET:=k3c
+endif
 
 CAL_IMAGE	:=calibration.bin
 DEVINFO_IMAGE	:=dev_info.bin
@@ -46,9 +61,9 @@ endef
 
 define Package/$(PKG_NAME)/install
 	mkdir -p $(TARGET_IMG_DIR)
-	cp -f $(PKG_BUILD_DIR)/$(CAL_IMAGE) $(TARGET_IMG_DIR)/
-	cp -f $(PKG_BUILD_DIR)/$(DEVINFO_IMAGE) $(TARGET_IMG_DIR)/
-	cp -f $(PKG_BUILD_DIR)/$(PROINFO_IMAGE) $(TARGET_IMG_DIR)/
+	cp -f $(PKG_BUILD_DIR)/$WAVE_TARGET/$(CAL_IMAGE) $(TARGET_IMG_DIR)/
+	cp -f $(PKG_BUILD_DIR)/$WAVE_TARGET/$(DEVINFO_IMAGE) $(TARGET_IMG_DIR)/
+	cp -f $(PKG_BUILD_DIR)/$WAVE_TARGET/$(PROINFO_IMAGE) $(TARGET_IMG_DIR)/
 endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))

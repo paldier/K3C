@@ -284,28 +284,6 @@ if hwtype == "mtlk" then
 		s:taboption("advanced", Value, "country", translate("Country Code"), translate("Use ISO/IEC 3166 alpha2 country codes."))
 	end
 
-	legacyrates = s:taboption("advanced", Flag, "legacy_rates", translate("Allow legacy 802.11b rates"))
-	legacyrates.rmempty = false
-	legacyrates.default = "0"
-
-	s:taboption("advanced", Value, "distance", translate("Distance Optimization"),
-		translate("Distance to farthest network member in meters."))
-
-	-- external antenna profiles
-	local eal = iw and iw.extant
-	if eal and #eal > 0 then
-		ea = s:taboption("advanced", ListValue, "extant", translate("Antenna Configuration"))
-		for _, eap in ipairs(eal) do
-			ea:value(eap.id, "%s (%s)" %{ eap.name, eap.description })
-			if eap.selected then
-				ea.default = eap.id
-			end
-		end
-	end
-
-	s:taboption("advanced", Value, "frag", translate("Fragmentation Threshold"))
-	s:taboption("advanced", Value, "rts", translate("RTS/CTS Threshold"))
-
 end
 ------------------- Broadcom Device ------------------
 
@@ -897,10 +875,10 @@ for slot=1,4 do
 end
 
 
-if hwtype == "mac80211" or hwtype == "prism2" or hwtype == "mtlk" then
+if hwtype == "mac80211" or hwtype == "prism2" then
 
 	-- Probe 802.11r support (and EAP support as a proxy for Openwrt)
-	local has_80211r = 1
+	local has_80211r = (os.execute("hostapd -v11r 2>/dev/null || hostapd -veap 2>/dev/null") == 0)
 
 	ieee80211r = s:taboption("encryption", Flag, "ieee80211r",
 		translate("802.11r Fast Transition"),
@@ -1135,8 +1113,8 @@ if hwtype == "mac80211" or hwtype == "prism2" or hwtype == "mtlk" then
 end
 
 -- ieee802.11w options
-if hwtype == "mac80211" or hwtype == "mtlk" then
-	local has_80211w = 1
+if hwtype == "mac80211" then
+	local has_80211w = (os.execute("hostapd -v11w 2>/dev/null || hostapd -veap 2>/dev/null") == 0)
 	if has_80211w then
 		ieee80211w = s:taboption("encryption", ListValue, "ieee80211w",
 			translate("802.11w Management Frame Protection"),

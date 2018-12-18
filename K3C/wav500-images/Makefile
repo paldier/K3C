@@ -12,6 +12,10 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 WAVE_TARGET:=k3c
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3c),y)
 #k3c from B1,k3cv2 from B2,updated eeprom and PSD
+ WAVE_TARGET:=k3c
+endif
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cv2),y)
+#k3c from B1,k3cv2 from B2,updated eeprom and PSD
  WAVE_TARGET:=k3cv2
 endif
 
@@ -19,7 +23,7 @@ ifeq ($(CONFIG_TARGET_lantiq_xrx500_bluecave),y)
  WAVE_TARGET:=bluecave
 endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_easy350_anywan_800m_owrt),y)
- WAVE_TARGET:=k3cv2
+ WAVE_TARGET:=k3c
 endif
 
 include $(INCLUDE_DIR)/package.mk

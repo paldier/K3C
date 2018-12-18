@@ -129,7 +129,9 @@ define KernelPackage/usb-xhci
 	CONFIG_USB=y \
 	CONFIG_USB_PHY=y \
 	CONFIG_LTQ_DWC3_PHY=y
-  FILES:=$(LINUX_DIR)/drivers/usb/host/xhci-hcd.$(LINUX_KMOD_SUFFIX)
+  FILES:= \
+		$(LINUX_DIR)/drivers/usb/host/xhci-hcd.$(LINUX_KMOD_SUFFIX) \
+		$(LINUX_DIR)/drivers/usb/dwc3/ltq-usb-oc.ko
   AUTOLOAD:=$(call AutoLoad,50,xhci-hcd)
 endef
 

@@ -1,4 +1,4 @@
-local ucursor = require "luci.model.uci"
+local ucursor = require "luci.model.uci".cursor()
 local json = require "luci.jsonc"
 local server_section = arg[1]
 local proto = arg[2] 
@@ -46,7 +46,7 @@ local v2ray = {
         streamSettings = {
             network = server.transport,
             security = (server.tls == '1') and "tls" or "none",
-            allowInsecure = (server.insecure == "1") and true or false,
+            tlsSettings = {allowInsecure = (server.insecure == "1") and true or false,},
             kcpSettings = (server.transport == "kcp") and {
               mtu = tonumber(server.mtu),
               tti = tonumber(server.tti),
@@ -84,4 +84,4 @@ local v2ray = {
         }
     }
 }
-print(json.stringify(v2ray))
+print(json.stringify(v2ray, 1))
