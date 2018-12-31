@@ -46,8 +46,7 @@ cp -s /lib/firmware/hw_scd_file.scd /tmp/
 cp -s /opt/lantiq/lib/modules/3.10.104/net/mtlk.ko /tmp/
 
 echo /opt/lantiq/sbin/hotplug > /proc/sys/kernel/hotplug
-udevd_up=`ps | grep -c udevd`
-[ $udevd_up -gt 1 ] || udevd --daemon
+
 export COUNTRY=00
 crda
 mkdir /tmp/wlan_wave

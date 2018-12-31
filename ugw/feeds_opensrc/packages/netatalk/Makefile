@@ -25,7 +25,7 @@ define Package/netatalk
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Filesystem
-  DEPENDS:=+libdb47 +libgcrypt +libopenssl +avahi-daemon +libavahi-client $(LIBRPC_DEPENDS)
+  DEPENDS:=+libdb47 +libgcrypt +libopenssl +libavahi-client $(LIBRPC_DEPENDS)
   TITLE:=netatalk
   URL:=http://netatalk.sourceforge.net
   MAINTAINER:=W. Michael Petullo <mike@flyn.org>
