@@ -17,11 +17,11 @@ function index()
 --	if page.inreq then
 		local has_switch = false
 
-		uci:foreach("network", "switch",
-			function(s)
-				has_switch = true
-				return false
-			end)
+		--uci:foreach("network", "switch",
+			--function(s)
+				--has_switch = true
+				--return false
+			--end)
 
 		if has_switch then
 			page  = node("admin", "network", "vlan")

@@ -13,5 +13,4 @@ bootup()
 start()
 {
 	bootup
-	/bin/board_detect
 }

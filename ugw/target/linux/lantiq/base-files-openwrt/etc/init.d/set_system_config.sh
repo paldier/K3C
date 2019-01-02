@@ -87,7 +87,7 @@ start()
 {
 	tune_memory_parameters
 	tune_network_parameters
-	set_local_session_learning_for_lro
-	tune_watchdog_timer
+	#set_local_session_learning_for_lro
+	#tune_watchdog_timer
 }
 
