@@ -131,3 +131,16 @@ define Profile/easy350_anywan_800m_owrt/Description
 endef
 $(eval $(call Profile,easy350_anywan_800m_owrt))
 
+define Profile/easy350_anywan_800m_owrt
+  NAME:=easy350_anywan_800m_owrt
+endef
+
+define Profile/k3cp/Description
+        k3c unofficial
+endef
+$(eval $(call Profile,k3cp))
+
+define Profile/k3cp
+  NAME:=k3cp
+endef
+
