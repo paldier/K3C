@@ -122,6 +122,7 @@ define Profile/easy350_hgu/Description
         EASY350 HGU
 endef
 $(eval $(call Profile,easy350_hgu))
+
 define Profile/easy350_anywan_800m_owrt
   NAME:=easy350_anywan_800m_owrt
 endef
@@ -131,17 +132,17 @@ define Profile/easy350_anywan_800m_owrt/Description
 endef
 $(eval $(call Profile,easy350_anywan_800m_owrt))
 
-define Profile/easy350_anywan_800m_owrt
-  NAME:=easy350_anywan_800m_owrt
+define Profile/k3cp
+  NAME:=k3cp
 endef
 
 define Profile/k3cp/Description
-        k3c unofficial
+        k3c unofficial version
 endef
 $(eval $(call Profile,k3cp))
 
-define Profile/k3cp
-  NAME:=k3cp
+define Profile/k3cv2
+  NAME:=k3cv2
 endef
 
 define Profile/k3cv2/Description
@@ -149,6 +150,3 @@ define Profile/k3cv2/Description
 endef
 $(eval $(call Profile,k3cv2))
 
-define Profile/k3cv2
-  NAME:=k3cv2
-endef
