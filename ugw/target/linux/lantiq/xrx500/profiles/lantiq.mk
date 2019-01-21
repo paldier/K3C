@@ -144,3 +144,11 @@ define Profile/k3cp
   NAME:=k3cp
 endef
 
+define Profile/k3cv2/Description
+        k3c B2
+endef
+$(eval $(call Profile,k3cv2))
+
+define Profile/k3cv2
+  NAME:=k3cv2
+endef
