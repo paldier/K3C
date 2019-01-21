@@ -6,7 +6,9 @@ START=21
 
 start()
 {
-local k3cb1 k3cb2 devinfo
+local k3cb1 k3cb2 devinfo ez
+#reset-gpio 5G/2.4G or 2.4G/5G 
+ez=`cat /proc/device-tree/ssx3@18000000/pcie@900000/reset-gpio | grep ""`
 devinfo=`dd if=/dev/mtd7 bs=1 skip=144 count=48 2>/dev/null |grep ec5e22ae5718e4209ca78a96668b5a2f`
 #ec5e22ae5718e4209ca78a96668b5a2f=K3CB2
 #783b5f7beaba3069be724ae1325a9033=K3CB1
@@ -31,6 +33,11 @@ elif  [ "$k3cb2" = 1 ]; then
 		mv /lib/firmware/cal_wlan1.bin.bk /lib/firmware/cal_wlan1.bin
 		mv /lib/firmware/PSD.bin.bk /lib/firmware/PSD.bin
 	fi
+fi
+if [ -n "$ez" ]; then
+	mv /lib/firmware/cal_wlan0.bin /lib/firmware/cal_wlan2.bin
+	mv /lib/firmware/cal_wlan1.bin /lib/firmware/cal_wlan0.bin
+	mv /lib/firmware/cal_wlan2.bin /lib/firmware/cal_wlan1.bin
 fi
 #--------- init wifi driver   -----------
 if [ ! -n "`lsmod | grep directconnect_datapath`" ]
