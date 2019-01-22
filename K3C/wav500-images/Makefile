@@ -46,8 +46,14 @@ define Build/Compile
 endef
 
 define Package/wav500-images/install
-	$(INSTALL_DIR) -p $(1)/lib/firmware
+	$(INSTALL_DIR) -p $(1)/lib/firmware $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/$(WAVE_TARGET)/* $(1)/lib/firmware/
+#ifeq ($(CONFIG_TARGET_lantiq_xrx500_bluecave),y)
+	#$(INSTALL_BIN) ./files/wifi_start-bluecave.sh $(1)/etc/init.d/wifi_start.sh
+#else
+	#$(INSTALL_BIN) ./files/wifi_start.sh $(1)/etc/init.d/
+#endif
+
 endef
 
 $(eval $(call BuildPackage,wav500-images))
