@@ -86,7 +86,7 @@ check_mtlk_device() {
 }
 
 detect_mtlk() {
-	local macaddr
+	local macaddr ez
 
 	for phyname in wlan0 wlan2; do
 	{
@@ -106,10 +106,18 @@ detect_mtlk() {
 						ssid="OpenWrt-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
 					}
 					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						ez=`cat /proc/device-tree/ssx3@18000000/pcie@900000/reset-gpio | grep ""`
+						if [ "-z ez" ];then
 						hwmode=11a
 						htmode=VHT80
 						macaddr="$(find_mtlk_mac $phyname)"
 						ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						else
+						hwmode=11g
+						htmode=HT40+
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						fi
 					}
 					;;
 				wlan2)
@@ -120,10 +128,18 @@ detect_mtlk() {
 						ssid="OpenWrt-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
 					}
 					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						ez=`cat /proc/device-tree/ssx3@18000000/pcie@900000/reset-gpio | grep ""`
+						if [ "-z ez" ];then
 						hwmode=11g
 						htmode=HT40+
 						macaddr="$(find_mtlk_mac $phyname)"
 						ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						else
+						hwmode=11a
+						htmode=VHT80
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						fi
 					}
 					;;
 				wlan1)
@@ -131,17 +147,27 @@ detect_mtlk() {
 						hwmode=11g
 						htmode=HT40+
 						macaddr="$(find_mtlk_mac $phyname)"
-						ssid="OpenWrt-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						ssid="OpenWrt-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
 						mode=sta
 						disabled=1
 					}
 					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						ez=`cat /proc/device-tree/ssx3@18000000/pcie@900000/reset-gpio | grep ""`
+						if [ "-z ez" ];then
 						hwmode=11a
 						htmode=VHT80
 						macaddr="$(find_mtlk_mac $phyname)"
 						ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
 						mode=sta
 						disabled=1
+						else
+						hwmode=11g
+						htmode=HT40+
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						mode=sta
+						disabled=1
+						fi
 					}
 					;;
 				wlan3)
@@ -154,12 +180,22 @@ detect_mtlk() {
 						disabled=1
 					}
 					[ "$(lantiq_board_name)" == "Phicomm K3C" ] && {
+						ez=`cat /proc/device-tree/ssx3@18000000/pcie@900000/reset-gpio | grep ""`
+						if [ "-z ez" ];then
 						hwmode=11g
 						htmode=HT40+
 						macaddr="$(find_mtlk_mac $phyname)"
-						ssid="K3C-$band-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						ssid="K3C-2.4G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
 						mode=sta
 						disabled=1
+						else
+						hwmode=11a
+						htmode=VHT80
+						macaddr="$(find_mtlk_mac $phyname)"
+						ssid="K3C-5G-$(echo $macaddr | awk -F ":" '{print $4""$5""$6 }'| tr a-z A-Z)"
+						mode=sta
+						disabled=1
+						fi
 					}
 					;;
 			esac

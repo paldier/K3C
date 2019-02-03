@@ -208,4 +208,9 @@ o.rmempty = true
 
 m:section(SimpleSection, nil, sessionbtn .. use_websocket .. aria2rpctxt)
 
+local apply = luci.http.formvalue("cbi.apply")
+if apply then
+	os.execute("/etc/init.d/aria2 restart >/dev/null 2>&1 &")
+end
+
 return m

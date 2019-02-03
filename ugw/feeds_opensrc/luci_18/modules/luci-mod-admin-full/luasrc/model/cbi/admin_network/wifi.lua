@@ -67,6 +67,11 @@ function m.parse(map)
 		luci.http.redirect(luci.dispatcher.build_url("admin/network/wireless", arg[1]))
 		return
 	end
+	if m:get(wdev:name(), "type") == "mtlk" and new_cc and new_cc ~= old_cc then
+		luci.sys.call("iw reg set %s" % ut.shellquote(new_cc))
+		luci.http.redirect(luci.dispatcher.build_url("admin/network/wireless", arg[1]))
+		return
+	end
 end
 
 m.title = luci.util.pcdata(wnet:get_i18n())
@@ -568,11 +573,14 @@ if hwtype == "mtlk" then
 	 translate("Prevents client-to-client communication"))
 	isolate:depends({mode="ap"})
 
-	s:taboption("advanced", Flag, "doth", "802.11h")
+	doth = s:taboption("advanced", Flag, "doth", "802.11h")
+	doth:depends({mode="ap"})
+	doth:depends({mode="ap-wds"})
+	doth.default =doth.enabled
 	wmm = s:taboption("advanced", Flag, "wmm", translate("WMM Mode"))
 	wmm:depends({mode="ap"})
 	wmm:depends({mode="ap-wds"})
-	wmm.default =1
+	wmm.default =wmm.enabled
 
 	bssid:depends({mode="adhoc"})
 	bssid:depends({mode="sta"})

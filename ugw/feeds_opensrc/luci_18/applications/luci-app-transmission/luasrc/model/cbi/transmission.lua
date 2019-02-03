@@ -12,6 +12,8 @@ local webinstalled = luci.model.ipkg.installed("transmission-web")
 local button = ""
 if running and webinstalled then
 	button = "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<input type=\"button\" value=\" " .. translate("Open Web Interface") .. " \" onclick=\"window.open('http://'+window.location.hostname+':" .. trport .. "')\"/>"
+elseif running then
+	button = "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<input type=\"button\" value=\" " .. translate("Open Web Interface") .. " \" onclick=\"window.open('http://'+window.location.hostname+':" .. trport .. "')\"/>"
 end
 
 m = Map("transmission", "Transmission", translate("Transmission daemon is a simple bittorrent client, here you can configure the settings.") .. button)
@@ -216,5 +218,10 @@ seed_queue_size:depends("seed_queue_enabled", "true")
 scrape_paused_torrents_enabled=queueing:option(Flag, "scrape_paused_torrents_enabled", translate("Scrape paused torrents enabled"))
 scrape_paused_torrents_enabled.enabled="true"
 scrape_paused_torrents_enabled.disabled="false"
+
+local apply = luci.http.formvalue("cbi.apply")
+if apply then
+	os.execute("/etc/init.d/transmission restart >/dev/null 2>&1 &")
+end
 
 return m

@@ -393,7 +393,7 @@ mtlk_generate_mac() {
 }
 
 find_phy() {
-        phyname="$1"
+	phyname="$1"
 	[ -n "$phy" -a -d /sys/class/ieee80211/$phy ] && return 0
 	[ -n "$path" ] && {
 		for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
@@ -602,7 +602,7 @@ mtlk_setup_vif() {
 	}
 
 	set_default vif_txpower "$txpower"
-	[ -z "$vif_txpower" ] || iw dev "$ifname" set txpower fixed "${vif_txpower%%.*}00"
+####[ -z "$vif_txpower" ] || iw dev "$ifname" set txpower fixed "${vif_txpower%%.*}00"
 
 	case "$mode" in
 		mesh)
