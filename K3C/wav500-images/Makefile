@@ -14,6 +14,9 @@ ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3c),y)
 #k3c from B1,k3cv2 from B2,updated eeprom and PSD
  WAVE_TARGET:=k3c
 endif
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3ca1),y)
+ WAVE_TARGET:=k3cv2
+endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cv2),y)
 #k3c from B1,k3cv2 from B2,updated eeprom and PSD
  WAVE_TARGET:=k3cv2
