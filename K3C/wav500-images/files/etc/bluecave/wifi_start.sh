@@ -1,12 +1,11 @@
 #!/bin/sh /etc/rc.common
 
-# Copyright (c) 2018 paldier <paldier@hotmail.com>
+# Copyright (c) 2018-2019 paldier <paldier@hotmail.com>
 
 START=21
 
 start()
 {
-
 #--------- init wifi driver   -----------
 if [ ! -n "`lsmod | grep directconnect_datapath`" ]
 then
@@ -31,5 +30,6 @@ cp -s /opt/lantiq/bin/logserver /tmp/
 /tmp/logserver -f /tmp/dev/mtlkroot0 -s /tmp/fw_scd_file.scd &
 
 insmod mtlk.ko ap=1,1 fastpath=1,1 ahb_off=1
+/usr/sbin/wifireload &
 }
 

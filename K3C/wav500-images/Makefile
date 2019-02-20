@@ -3,7 +3,7 @@ include $(INCLUDE_DIR)/version.mk
 
 PKG_NAME:=wav500-images
 PKG_VERSION:=1
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=GPL-2.0
 
 PKG_MAINTAINER:=paldier <paldier@hotmail.com>
@@ -18,7 +18,13 @@ ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cv2),y)
 #k3c from B1,k3cv2 from B2,updated eeprom and PSD
  WAVE_TARGET:=k3cv2
 endif
-
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cc1),y)
+#k3cc1 eeprom and PSD
+ WAVE_TARGET:=k3cc1
+endif
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cp),y)
+ WAVE_TARGET:=k3c
+endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_bluecave),y)
  WAVE_TARGET:=bluecave
 endif
@@ -48,12 +54,7 @@ endef
 define Package/wav500-images/install
 	$(INSTALL_DIR) -p $(1)/lib/firmware $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/$(WAVE_TARGET)/* $(1)/lib/firmware/
-#ifeq ($(CONFIG_TARGET_lantiq_xrx500_bluecave),y)
-	#$(INSTALL_BIN) ./files/wifi_start-bluecave.sh $(1)/etc/init.d/wifi_start.sh
-#else
-	#$(INSTALL_BIN) ./files/wifi_start.sh $(1)/etc/init.d/
-#endif
-
+	$(INSTALL_BIN) ./files/etc/$(WAVE_TARGET)/wifi_start.sh $(1)/etc/init.d/
 endef
 
 $(eval $(call BuildPackage,wav500-images))

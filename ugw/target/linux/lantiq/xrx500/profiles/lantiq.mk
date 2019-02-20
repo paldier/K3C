@@ -150,3 +150,11 @@ define Profile/k3cv2/Description
 endef
 $(eval $(call Profile,k3cv2))
 
+define Profile/k3cc1
+  NAME:=k3cc1
+endef
+
+define Profile/k3cc1/Description
+        k3c C1
+endef
+$(eval $(call Profile,k3cc1))

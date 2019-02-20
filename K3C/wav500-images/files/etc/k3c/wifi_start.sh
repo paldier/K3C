@@ -13,6 +13,9 @@ ez=`cat /proc/device-tree/ssx3@18000000/pcie@900000/reset-gpio | grep ""`
 ezf=`dd if=/lib/firmware/cal_wlan0.bin skip=40 bs=1 count=7 2>/dev/null | grep "UAA"`
 #ec5e22ae5718e4209ca78a96668b5a2f=K3CB2
 #783b5f7beaba3069be724ae1325a9033=K3CB1
+#65e230b0e840d4dbd6eeae23ce62c554=K3CC1
+#0df1cf08d70206570f880cc707dfdce2=K3CA1
+#A1=B1=B1G B2=C1? or C1=B1G?
 #null?lost mtd4 mtd6 mtd7
 devinfo=`dd if=/dev/mtd7 bs=1 skip=144 count=48 2>/dev/null |grep ec5e22ae5718e4209ca78a96668b5a2f`
 
