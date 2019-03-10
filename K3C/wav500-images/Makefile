@@ -23,7 +23,7 @@ ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cv2),y)
 endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cc1),y)
 #k3cc1 eeprom and PSD
- WAVE_TARGET:=k3cc1
+ WAVE_TARGET:=k3c
 endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cp),y)
  WAVE_TARGET:=k3c

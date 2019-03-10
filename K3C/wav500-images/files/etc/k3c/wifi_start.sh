@@ -1,12 +1,13 @@
 #!/bin/sh /etc/rc.common
 
-# Copyright (c) 2018 paldier <paldier@hotmail.com>
+# Copyright (c) 2018-2019 paldier <paldier@hotmail.com>
 
 START=21
 
 start()
 {
 local k3cb1 k3cb2 devinfo ez ezf
+#check for unofficial version
 #reset-gpio 5G/2.4G or 2.4G/5G 
 ez=`cat /proc/device-tree/ssx3@18000000/pcie@900000/reset-gpio | grep ""`
 #5G or 2.4G
@@ -15,31 +16,7 @@ ezf=`dd if=/lib/firmware/cal_wlan0.bin skip=40 bs=1 count=7 2>/dev/null | grep "
 #783b5f7beaba3069be724ae1325a9033=K3CB1
 #65e230b0e840d4dbd6eeae23ce62c554=K3CC1
 #0df1cf08d70206570f880cc707dfdce2=K3CA1
-#A1=B1=B1G B2=C1? or C1=B1G?
-#null?lost mtd4 mtd6 mtd7
-devinfo=`dd if=/dev/mtd7 bs=1 skip=144 count=48 2>/dev/null |grep ec5e22ae5718e4209ca78a96668b5a2f`
-
-[ -n "$devinfo" ] && k3cb2=1 && k3cb1=0
-[ -z "$devinfo" ] && k3cb2=0 && k3cb1=1
-if [ "$k3cb1" = 1 ]; then
-	if [ -e "/lib/firmware/cal_wlan0.bin.b1" ]; then
-		mv /lib/firmware/cal_wlan0.bin /lib/firmware/cal_wlan0.bin.bk
-		mv /lib/firmware/cal_wlan1.bin /lib/firmware/cal_wlan1.bin.bk
-		mv /lib/firmware/PSD.bin /lib/firmware/PSD.bin.bk
-		mv /lib/firmware/cal_wlan0.bin.b1 /lib/firmware/cal_wlan0.bin
-		mv /lib/firmware/cal_wlan1.bin.b1 /lib/firmware/cal_wlan1.bin
-		mv /lib/firmware/PSD.bin.b1 /lib/firmware/PSD.bin
-	fi
-elif  [ "$k3cb2" = 1 ]; then
-	if [ -e "/lib/firmware/cal_wlan0.bin.bk" ]; then
-		mv /lib/firmware/cal_wlan0.bin /lib/firmware/cal_wlan0.bin.b1
-		mv /lib/firmware/cal_wlan1.bin /lib/firmware/cal_wlan1.bin.b1
-		mv /lib/firmware/PSD.bin /lib/firmware/PSD.bin.b1
-		mv /lib/firmware/cal_wlan0.bin.bk /lib/firmware/cal_wlan0.bin
-		mv /lib/firmware/cal_wlan1.bin.bk /lib/firmware/cal_wlan1.bin
-		mv /lib/firmware/PSD.bin.bk /lib/firmware/PSD.bin
-	fi
-fi
+#B1=B1G=C1 B2=A1
 if [ -n "$ez" ]; then
 	if [ -n "$ezf" ]; then
 		mv /lib/firmware/cal_wlan0.bin /lib/firmware/cal_wlan2.bin
