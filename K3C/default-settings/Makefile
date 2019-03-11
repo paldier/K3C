@@ -16,6 +16,15 @@ PKG_BUILD_DIR := $(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk
 
+ FILE_TARGET:=zzz-default-settings
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cc1),y)
+ FILE_TARGET:=zzz-default-settings-en
+endif
+
+ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3ca1),y)
+ FILE_TARGET:=zzz-default-settings-en
+endif
+
 define Package/default-settings
   SECTION:=luci
   CATEGORY:=LuCI
@@ -43,10 +52,7 @@ define Package/default-settings/install
 	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/i18n
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/*.lmo $(1)/usr/lib/lua/luci/i18n/
-ifeq ($(or $(CONFIG_TARGET_lantiq_xrx500_k3cc1),$(CONFIG_TARGET_lantiq_xrx500_k3ca1)),y)
-	$(INSTALL_BIN) ./files/zzz-default-settings-en $(1)/etc/uci-defaults/99-default-settings
-else
-	$(INSTALL_BIN) ./files/zzz-default-settings $(1)/etc/uci-defaults/99-default-settings
+	$(INSTALL_BIN) ./files/$(FILE_TARGET) $(1)/etc/uci-defaults/99-default-settings
 endef
 
 $(eval $(call BuildPackage,default-settings))

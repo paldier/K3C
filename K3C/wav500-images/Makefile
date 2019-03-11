@@ -9,20 +9,18 @@ PKG_LICENSE:=GPL-2.0
 PKG_MAINTAINER:=paldier <paldier@hotmail.com>
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
-WAVE_TARGET:=k3c
+#k3cb1=k3cb1g=k3cc1,k3ca1=k3cb2
+ WAVE_TARGET:=k3c
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3c),y)
-#k3c from B1,k3cv2 from B2,updated eeprom and PSD
  WAVE_TARGET:=k3c
 endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3ca1),y)
  WAVE_TARGET:=k3cv2
 endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cv2),y)
-#k3c from B1,k3cv2 from B2,updated eeprom and PSD
  WAVE_TARGET:=k3cv2
 endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cc1),y)
-#k3cc1 eeprom and PSD
  WAVE_TARGET:=k3c
 endif
 ifeq ($(CONFIG_TARGET_lantiq_xrx500_k3cp),y)
