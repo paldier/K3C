@@ -155,7 +155,7 @@ define Profile/k3cv2
 endef
 
 define Profile/k3cv2/Description
-        k3c B2/A1
+        k3c B2
 endef
 $(eval $(call Profile,k3cv2))
 
@@ -167,3 +167,12 @@ define Profile/k3cc1/Description
         k3c C1
 endef
 $(eval $(call Profile,k3cc1))
+
+define Profile/k3ca1
+  NAME:=k3ca1
+endef
+
+define Profile/k3ca1/Description
+        K3C A1
+endef
+$(eval $(call Profile,k3ca1))
