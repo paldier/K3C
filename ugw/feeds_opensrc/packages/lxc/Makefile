@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=lxc
-PKG_VERSION:=1.1.5
+PKG_VERSION:=2.0.8
 PKG_RELEASE:=3
 
 PKG_LICENSE:=LGPL-2.1+ BSD-2-Clause GPL-2.0
@@ -16,7 +16,7 @@ PKG_MAINTAINER:=Luka Perkov <luka@openwrt.org>
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=http://linuxcontainers.org/downloads/lxc/
-PKG_MD5SUM:=dd9684dde0a58ed13f4f49c855b79a1a
+PKG_MD5SUM:=7bfd95280522d7936c0979dfea92cdb5
 
 PKG_BUILD_DEPENDS:=lua
 PKG_BUILD_PARALLEL:=1
@@ -27,9 +27,9 @@ PKG_FIXUP:=autoreconf
 include $(INCLUDE_DIR)/package.mk
 
 LXC_APPLETS_BIN += \
-	attach autostart cgroup clone config console create destroy device \
-	execute freeze info monitor snapshot start stop unfreeze unshare \
-	usernsexec wait
+	attach autostart cgroup checkconfig checkpoint config console copy create destroy device \
+	execute freeze info ls monitor snapshot start stop top unfreeze unshare \
+	usernsexec wait update-config user-nic
 
 LXC_APPLETS_LIB += \
 	monitord user-nic
@@ -168,9 +168,10 @@ define Package/lxc/install
 endef
 
 define Package/lxc-auto/install
-	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d $(1)/etc/hotplug.d/iface
 	$(INSTALL_CONF) ./files/lxc-auto.config $(1)/etc/config/lxc-auto
 	$(INSTALL_BIN) ./files/lxc-auto.init $(1)/etc/init.d/lxc-auto
+	$(INSTALL_BIN) ./files/06-lxc-notify $(1)/etc/hotplug.d/iface/06-lxc-notify
 endef
 
 define Package/lxc-common/conffiles

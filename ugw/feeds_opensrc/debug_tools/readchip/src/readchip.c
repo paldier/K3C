@@ -72,6 +72,11 @@ u32 grx500_check_efuse() {
 				if(dev_configid!= config_id) 
 					printf("\tWrong config fusing (0x%08x) vs (0x%08x) for id (0x%04x)\n",dev_configid,config_id,id) ;
 				break;
+		case 0x002F : 	
+				config_id = 0x40082000;
+				if(dev_configid!= config_id) 
+					printf("\tWrong config fusing (0x%08x) vs (0x%08x) for id (0x%04x)\n",dev_configid,config_id,id) ;
+				break;
 		default :	printf("Error -> Not a GRX350/550 series device!!!\n");
 				break ;
 	}	
@@ -120,6 +125,8 @@ int main(int argc, char** argv) {
 			case 0x0026 : 	printf("G350-6 Pxb4395el-1200");
 				break;
 			case 0x0028 : 	printf("G350-8 Pxb4395el-1600");
+				break;
+			case 0x002F : 	printf("IRX200 Pxb4320el-1600");
 				break;
 			default :	printf("Unknown");
 				break ;

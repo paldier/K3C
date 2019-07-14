@@ -1,59 +1,314 @@
 #!/bin/sh /etc/rc.common
 
-. /lib/functions.sh
+START=70
 
-START=99
-STOP=00
+uci_container_list=""
+default_container_path='/srv/lxc/'
+ugw_max_ram=240000
+net_count=0
 
-run_command() {
-	local command="$1"
-	$command
+get_all_lxc_pids()
+{
+	lxc_pids="$(grep -w lxc-start /proc/*/stat 2>/dev/null|cut -d'/' -f3)"
 }
 
-start_container() {
-	local cfg="$1"
-	local name
+verify_containers(){
+	local container_data
+	local c_name
+	local container_valid="false"
+	local ret="
+";
+	local i j
+	
+	get_all_lxc_pids
 
-	config_get name "$cfg" name
-	config_list_foreach "$cfg" command run_command
-	if [ -n "$name" ]; then
-		/usr/bin/lxc-start -n "$name"
+	for i in $lxc_pids; do
+		container_valid="false"
+		container_data="$(strings /proc/$i/cmdline)"
+		c_name="${container_data/lxc-start$ret}"
+		c_name="${c_name/$ret*}"
+		
+		container_path="${container_data/lxc-start$ret$c_name$ret}"
+		container_path="${container_path/$ret*}"
+		
+		for j in $uci_container_list; do
+			if [ "$c_name" = "$j" ]; then
+				if [ "$1" = "kill_all" ]; then
+					container_valid="false"
+				else
+					container_valid="true"
+					break
+				fi
+			fi
+		done
+
+		if [ "$container_valid" = "false" -a -n "$c_name" ]; then
+			kill_container $c_name 0 $container_path
+		fi
+	done
+	lxc-ls -f
+}
+
+get_lxc_state()
+{
+	local info ret
+	ret="
+";
+	container_state=""; container_pid=""
+	info=$(lxc-info -n $1 -P $2); info=${info// /};
+	container_state="${info/*State:}";
+	container_state="${container_state/$info}";
+	container_state="${container_state/$ret*}";
+	container_state="${container_state:-NA}";
+
+	container_pid="${info/*PID:}";
+	container_pid="${container_pid/$info}";
+	container_pid="${container_pid/$ret*}";
+	container_pid="${container_pid:-NA}";
+}
+
+status_write()
+{
+	[ -f /tmp/lxc-status ] && {
+		sed -i '/^<'$1'>/d' /tmp/lxc-status
+	}
+	[ -n "$2" -a "$2" = "start" ] && {
+		echo "<$1> Started" >> /tmp/lxc-status
+	}
+}
+
+kill_container(){
+	local timeout=0
+	if [ $2 -ge $timeout ]; then
+		timeout=$2
+	fi
+	echo "Killing $1 in $timeout seconds"
+	lxc-stop -n $1 -k -P $3
+	status_write "$1" stop
+}
+
+start_container(){
+	local mem_status
+	mem_status=$(get_mem_status)
+	if [ "$mem_status" = "mem_available" ];then
+		echo "Starting the container: $1"
+		lxc-start -n $1 -P $2 && {
+			status_write "$1" start
+		}
+	else
+		echo "Cannot start $1: Insufficient memory"
 	fi
 }
 
-max_timeout=0
+get_mem_status(){
+	local mem_total=$(grep -w MemTotal /proc/meminfo |  awk '{print $2}')
+	local mem_free=$(grep -w MemFree /proc/meminfo |  awk '{print $2}')
+	local mem_buffer=$(grep -w Buffers /proc/meminfo |  awk '{print $2}')
+	local mem_cached=$(grep -w Cached /proc/meminfo |  awk '{print $2}')
+	local mem_min
+	local mem_free_total=$(($mem_free + $mem_buffer + $mem_cached ))
 
-stop_container() {
-	local cfg="$1"
-	local name timeout
+	mem_min=$(($ugw_max_ram + 3000 - $mem_total + $mem_free_total))
+	if [ $mem_free -gt $mem_min ];then
+		echo "mem_available"
+	fi
+}
 
-	config_get name "$cfg" name
-	config_get timeout "$cfg" timeout 300
+container_add() {
+	local download_url
+	local include_path
+	local arch
+	local container_path
+	local utsname
+	local network_type
+	local network_flags
+	local network_link
+	local network_hwaddr
+	local network_name
+	local network_mtu
+	local network_ipv4
+	local network_ipv4_gw
+	local mount_auto
+	local mount_entry
+	local container_name
+	local container_path
+	local config_file
+	local container_state
+	local freeze
 
-	if [ "$max_timeout" -lt "$timeout" ]; then
-		max_timeout=$timeout
+	config_get container_name $1 container_name
+	config_get container_state $1 container_state
+	config_get download_url $1 download_url
+	config_get include_path $1 include_path
+	config_get arch $1 arch
+	config_get utsname $1 utsname 
+	config_get network_ipv4_gw $1 network_ipv4_gw
+	config_get mount_auto $1 mount_auto
+	config_get mount_entry $1 mount_entry
+	config_get container_command $1 container_command
+	config_get kill_timeout $1 kill_timeout
+	config_get container_path $1 container_path
+	config_get freeze $1 freeze
+
+	if [ "$container_path" = "default" -o -z "$container_path" ];then
+		container_path=$default_container_path
+	fi
+	
+	rootfs_path=$container_path/$container_name/rootfs/
+	config_file=$container_path/$container_name/config
+	
+	if [ ! -d $container_path/$container_name ]; then
+		mkdir -p $container_path/$container_name
 	fi
 
-	if [ -n "$name" ]; then
-		if [ "$timeout" = "0" ]; then
-			/usr/bin/lxc-stop -n "$name" &
-		else
-			/usr/bin/lxc-stop -n "$name" -t $timeout &
+	if [ ! -d "$rootfs_path" ]; then
+		if [ "$container_command" != "destroy" ]; then
+			mkdir -p $rootfs_path
+			cd $rootfs_path
+			wget $download_url
+			tar -xzf container*
+			rm -f container*
+			cd -
+			if [ ! -d "$rootfs_path/etc" ]; then
+				echo "Failed to download $container_name tarball from: $download_url"
+				rm -rf $rootfs_path
+			fi
 		fi
 	fi
+	get_lxc_state $container_name $container_path;
+	uci_container_list="$uci_container_list $container_name"
+
+	if [ "$container_command" = "down" ] && [ "$container_state" = "RUNNING" -o "$container_state" = "FROZEN" ]; then
+		kill_container $container_name $kill_timeout $container_path
+	fi
+
+	rm -f $config_file
+	touch $config_file
+
+	echo -e "#-----------Container configuration file----------#" >> $config_file
+	[ -n "$include_path" ] && echo -e "lxc.include = $include_path" >> $config_file
+	[ -n "$arch" ] && echo -e "lxc.arch = $arch" >> $config_file
+	echo -e "\n#--------Container Specific Configurations--------#" >> $config_file
+	[ -n "$rootfs_path" ] && echo -e "lxc.rootfs = $rootfs_path" >> $config_file
+	[ -n "$utsname" ] && echo -e "lxc.utsname = $utsname" >> $config_file
+	echo -e "\n#--------------Network Configurations-------------#" >> $config_file
+	config_list_foreach "$1" interfaces handle_interfaces $config_file
+#       config_foreach handle_network_params network $config_file
+	[ -n "$network_ipv4_gw" ] && echo -e "lxc.network.0.ipv4.gateway = $network_ipv4_gw" >> $config_file
+	echo -e "\n#--------------CGroups Configurations-------------#" >> $config_file
+	config_list_foreach "$1" cgroup handle_groups $config_file
+	echo -e "\n#--------------Additional Configurations----------#" >> $config_file
+	config_list_foreach "$1" mount_auto handle_mount_auto $config_file
+	config_list_foreach "$1" mount_entry handle_mount_paths $config_file $rootfs_path
+	config_list_foreach "$1" extra_configs handle_extra_configs $config_file $rootfs_path
+	
+	if [ "$container_command" = "up" ]; then
+		if [ "$container_state" = "STOPPED" -o "$container_state" = "NA" ]; then
+		start_container $container_name $container_path
+		fi
+	fi
+
+	if [ "$freeze" = "1" ]; then
+		if [ "$container_state" = "RUNNING" ]; then
+			echo "$container_name : Freezing container processes"
+			lxc-freeze -n $container_name $container_path
+		fi
+	fi
+
+	if [ "$freeze" = "0" ]; then 
+		if [ "$container_state" = "FROZEN" ]; then
+			echo "$container_name : Thawing container processes"
+			lxc-unfreeze -n $container_name $container_path
+		fi
+	fi
+	
+	if [ "$container_command" = "destroy" -a -d $rootfs_path ]; then
+		echo "Destroying the container: $container_name"
+		lxc-destroy -n $container_name -f -P $container_path
+		rm -rf $container_path
+		echo "$container_name destroyed successfully"
+	fi
+	net_count=0
 }
 
-start() {
+handle_network_params(){
+	local type
+	local flags
+	local link
+	local hwaddr
+	local name
+	local mtu
+	local ipv4
+	if [ "$1" = "$3" ]; then
+		config_get type $1 type
+		config_get flags $1 flags
+		config_get link $1 link
+		config_get hwaddr $1 hwaddr
+		config_get name $1 name
+		config_get mtu $1 mtu
+		config_get ipv4 $1 ipv4
+	
+		[ -n "$type" ] && echo -e "lxc.network.$net_count.type = $type" >> $2
+		[ -n "$flags" ] && echo -e "lxc.network.$net_count.flags = $flags" >> $2
+		[ -n "$link" ] && echo -e "lxc.network.$net_count.link = $link" >> $2
+		[ -n "$hwaddr" ] && echo -e "lxc.network.$net_count.hwaddr = $hwaddr" >> $2
+		[ -n "$name" ] && echo -e "lxc.network.$net_count.name = $name" >> $2
+		[ -n "$mtu" ] && echo -e "lxc.network.$net_count.mtu = $mtu" >> $2
+		[ -n "$ipv4" ] && echo -e "lxc.network.$net_count.ipv4 = $ipv4" >> $2
+	
+		# Will add few more configurations here for other network modes
+	
+		echo -e "" >> $2
+		net_count=$(( $net_count + 1 ))
+	fi
+}
+
+handle_interfaces(){
+	local config_file="$2"
+	local iface="$1"
+	config_foreach handle_network_params network $config_file $iface
+
+}
+
+handle_groups(){
+	[ -n "$1" ] && echo -e "lxc.cgroup.$1" >> $2
+}
+
+handle_mount_auto(){
+	[ -n "$1" ] && echo -e "lxc.mount.auto = $1" >> $2
+}
+
+handle_mount_paths(){
+	local a=0
+	local i=0
+	for i in $1; do
+		if [ $a -eq 0 ];then
+			[ -n "$1" -a -d "$i" ] && echo -e "lxc.mount.entry = $1" >> $2
+		fi
+		if [ $a -eq 1 ];then
+			mkdir -p $3$i
+			break
+		fi
+		a=$(( $a + 1 ))
+	done
+}
+
+handle_extra_configs(){
+	[ -n "$1" ] && echo -e "$1" >> $2
+}
+
+init_config() {
 	config_load lxc-auto
-	config_foreach start_container container
+	config_foreach container_add container
 }
 
 stop() {
-	config_load lxc-auto
-	config_foreach stop_container container
-	# ensure e.g. shutdown doesn't occur before maximum timeout on
-	# containers that are shutting down
-	if [ $max_timeout -gt 0 ]; then
-		sleep $max_timeout
-	fi
+	verify_containers kill_all
 }
+
+start() {
+	insmod /lib/modules/3.10.104/veth.ko
+	init_config
+	verify_containers
+}
+

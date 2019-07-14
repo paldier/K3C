@@ -40,6 +40,7 @@ define KernelPackage/$(PKG_NAME)
   DEPENDS:=@!TARGET_lantiq_xrx500 
   TITLE:=pecostat Kernel Support
   FILES:=$(PKG_BUILD_DIR)/pecostat_noIRQ.$(LINUX_KMOD_SUFFIX)
+  AUTOLOAD:=$(call AutoLoad,44,pecostat_noIRQ)
 endef
 
 define KernelPackage/$(PKG_NAME)/description

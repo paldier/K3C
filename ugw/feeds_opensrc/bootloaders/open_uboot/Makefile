@@ -87,6 +87,10 @@ ifdef CONFIG_TARGET_lantiq_xrx500
 UBOOT_PLATFORM:=grx500
 endif
 
+ifdef CONFIG_TARGET_lantiq_xrx500_sec
+UBOOT_PLATFORM:=grx500
+endif
+
 ifdef CONFIG_TARGET_lantiq_xrx500_4kec
 UBOOT_PLATFORM:=grx500
 endif
